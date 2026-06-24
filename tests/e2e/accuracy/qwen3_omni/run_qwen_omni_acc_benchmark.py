@@ -33,7 +33,7 @@ Prerequisites
 
 * **Seed-TTS** optional extras for WER/SIM/UTMOS::
 
-    pip install 'vllm-omni[seed-tts-eval]'
+    pip install 'vllm-omni[dev]'
 
 Examples
 --------

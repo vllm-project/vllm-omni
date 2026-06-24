@@ -249,6 +249,7 @@ def _make_runner():
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        streaming_output=False,
     )
     runner.device = torch.device("cpu")
     runner.pipeline = _StepPipeline()
@@ -267,6 +268,7 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        streaming_output=False,
     )
     runner.device = device
     runner.pipeline = _DistributedStepPipeline(mode=mode, device=device)
@@ -327,7 +329,7 @@ def _make_cached_scheduler_output(request_id="req-1", step_id=1, finished_req_id
 
 def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:
     engine = object.__new__(DiffusionEngine)
-    engine.od_config = SimpleNamespace(model_class_name="QwenImagePipeline")
+    engine.od_config = SimpleNamespace(model_class_name="QwenImagePipeline", streaming_output=False)
     engine.pre_process_func = None
     engine.post_process_func = None
     engine.scheduler = scheduler
@@ -563,6 +565,7 @@ class TestRunner:
             step_execution=True,
             model_class_name="RequestOnlyPipeline",
             parallel_config=SimpleNamespace(use_hsdp=False),
+            streaming_output=False,
         )
         runner.device = torch.device("cpu")
         runner.pipeline = None
@@ -710,6 +713,7 @@ class TestExecutor:
 
     def test_execute_step_passes_through_runner_output(self, mocker: MockerFixture):
         executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(streaming_output=False)
         executor._ensure_open = lambda: None
         expected = RunnerOutput(request_id="req-step", step_index=1, finished=False, result=None)
         executor.collective_rpc = mocker.Mock(return_value=expected)

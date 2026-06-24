@@ -912,11 +912,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             self._cudagraph_wrapper.compile_shapes,
         )
 
-    def disable_cudagraph(self):
-        self._cudagraph_enabled = False
-        self._cudagraph_wrapper = None
-        logger.info("CUDA Graph disabled for decoder")
-
     def forward(self, codes):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")

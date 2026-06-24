@@ -27,6 +27,17 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 logger = init_logger(__name__)
 
 
+def _qwen3_tts_empty_finished_payload():
+    """Empty-but-finished stage payload. Returned instead of None on a degenerate
+    talker take so the Stage-1 wait gate releases (code2wav handles empty codec
+    input -> 0-sample audio, request finished) rather than the connector silently
+    dropping the request and Stage-1 hanging to connector_get_max_wait."""
+    return {
+        "codes": {"audio": torch.zeros(0, dtype=torch.long)},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+
+
 def talker2code2wav(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -474,7 +485,7 @@ def talker2code2wav_full_payload(
             type(pooling_output).__name__,
             rid,
         )
-        return None
+        return _qwen3_tts_empty_finished_payload()
 
     # codes.audio — try flat dotted first (flatten_payload), then nested fallback.
     audio = pooling_output.get("codes.audio")
@@ -489,7 +500,7 @@ def talker2code2wav_full_payload(
             list(pooling_output.keys()),
             rid,
         )
-        return None
+        return _qwen3_tts_empty_finished_payload()
     audio = audio.to(torch.long)
     audio = _filter_audio_codes_qwen3_tts(audio)
     if audio.numel() == 0:
@@ -498,7 +509,7 @@ def talker2code2wav_full_payload(
             "filter (negative/all-zero/out-of-range rows dropped) for req=%s.",
             rid,
         )
-        return None
+        return _qwen3_tts_empty_finished_payload()
 
     output_token_ids = list(getattr(request, "output_token_ids", None) or [])
     seq_len = max(len(output_token_ids) - 1, 0)

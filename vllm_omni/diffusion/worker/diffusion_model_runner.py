@@ -152,10 +152,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         logger.info("Model runner: Model loaded successfully.")
 
+        if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
+            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+            self.od_config.step_execution = True
+
         if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                f"{self.od_config.model_class_name} does not support that contract."
+            )
+        if self.od_config.streaming_output and not self.supports_step_mode():
+            raise ValueError(
+                "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
@@ -168,8 +177,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                self._compile_transformer("transformer")
-                self._compile_transformer("transformer_2")
+                if hasattr(self.pipeline, "setup_compile"):
+                    try:
+                        self.pipeline.setup_compile()
+                    except Exception as exc:
+                        logger.warning(
+                            "Model runner: setup_compile() failed (%s); running without compile.",
+                            exc,
+                        )
+                else:
+                    self._compile_transformer("transformer")
+                    self._compile_transformer("transformer_2")
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
@@ -306,8 +324,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 # num_inference_steps at all (i.e., just resets state and clears
                 # stale residuals).
                 num_inference_steps = req.sampling_params.num_inference_steps
-                if self.od_config.cache_backend == "tea_cache" and num_inference_steps is None:
-                    num_inference_steps = 0
+                if num_inference_steps is None and self.od_config.cache_backend in (
+                    "tea_cache",
+                    "step_cache",
+                ):
+                    # TeaCache refresh ignores the value; step_cache refresh is a
+                    # no-op (per-chunk state resets in the denoise loop). DreamZero often
+                    # leaves sampling_params.num_inference_steps unset and uses the
+                    # pipeline default instead.
+                    num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
                 if num_inference_steps is not None:
                     self.cache_backend.refresh(self.pipeline, num_inference_steps)
@@ -341,7 +366,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and self.od_config.enable_cache_dit_summary
             ):
                 cache_summary(self.pipeline, details=True)
-
             return output
 
     # ------------------------------------------------------------------
@@ -441,7 +465,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         scatter_latents(states, input_batch)
 
         for state in states:
-            if interrupted or state.denoise_completed:
+            if interrupted or state.request_denoise_completed:
                 self.state_cache.pop(state.request_id, None)
 
     def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
@@ -476,7 +500,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
-                noise_pred = self.pipeline.denoise_step(input_batch)
+                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
@@ -499,15 +523,24 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                         )
                         offset = offset + row_num
-                        if req.denoise_completed:
+                        if self.od_config.streaming_output:
+                            should_decode = req.chunk_denoise_completed
+                        else:
+                            should_decode = req.denoise_completed
+
+                        if should_decode:
                             result = self.pipeline.post_decode(req)
                         else:
                             result = None
+                        # finished should be computed after post_decode() advanced chunk_index
+                        finished = (
+                            req.request_denoise_completed if self.od_config.streaming_output else req.denoise_completed
+                        )
                         runner_output_list.append(
                             RunnerOutput(
                                 request_id=req.request_id,
                                 step_index=req.step_index,
-                                finished=req.denoise_completed,
+                                finished=finished,
                                 result=result,
                             )
                         )

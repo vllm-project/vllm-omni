@@ -486,3 +486,32 @@ def test_full_payload_omits_left_context_size_without_ref():
     assert payload["meta"]["finished"].item() is True
     assert "left_context_size" not in payload["meta"]
     assert len(payload["codes"]["audio"]) == _Q * 2
+
+
+@pytest.mark.parametrize(
+    "pooling_output",
+    [
+        pytest.param(SimpleNamespace(codes="not-a-dict"), id="non_dict_output"),
+        pytest.param({}, id="missing_codes_audio"),
+        pytest.param({"codes.audio": torch.zeros((3, _Q), dtype=torch.long)}, id="all_codes_filtered"),
+    ],
+)
+def test_full_payload_emits_empty_finished_payload_on_degenerate_take(pooling_output):
+    """Regression for #4463.
+
+    A degenerate talker take used to return ``None`` from
+    ``talker2code2wav_full_payload``. The connector treats ``None`` as "drop the
+    request", but Stage-1 was already scheduled to receive it, so its wait gate
+    polls to ``connector_get_max_wait`` (~300s) and the orchestrator aborts — one
+    stuck request stalls the whole two-stage pipeline. Each degenerate case
+    (non-dict pooling_output, missing ``codes.audio``, all codec frames dropped by
+    the filter) must instead return an empty-but-finished payload so the gate
+    releases and the request finishes immediately with zero-length audio.
+    """
+    request = SimpleNamespace(request_id="r", output_token_ids=[0, 1, 2])
+
+    payload = talker2code2wav_full_payload(transfer_manager=None, pooling_output=pooling_output, request=request)
+
+    assert payload is not None
+    assert payload["meta"]["finished"].item() is True
+    assert payload["codes"]["audio"].numel() == 0

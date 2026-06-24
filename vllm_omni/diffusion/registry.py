@@ -156,6 +156,11 @@ _DIFFUSION_MODELS = {
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
     ),
+    "Gr00tN1d7Pipeline": (
+        "gr00t",
+        "pipeline_gr00t",
+        "Gr00tN1d7Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -270,6 +275,16 @@ _DIFFUSION_MODELS = {
         "cosmos3",
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
+    ),
+    "SoulXSingerPipeline": (
+        "soulx_singer",
+        "pipeline_soulx_singer_svs",
+        "PipelineSoulXSingerSVS",
+    ),
+    "SoulXSingerSVCPipeline": (
+        "soulx_singer",
+        "pipeline_soulx_singer_svc",
+        "PipelineSoulXSingerSVC",
     ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
@@ -484,6 +499,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX23Pipeline": "get_ltx2_post_process_func",
     "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
+    "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
@@ -554,6 +571,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
+    "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",
+    "SoulXSingerSVCPipeline": "get_soulxsinger_svc_pre_process_func",
 }
 
 

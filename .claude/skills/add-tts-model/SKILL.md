@@ -305,13 +305,72 @@ def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
     ]
 ```
 
+### Test Case Writing (CI Levels)
+
+**Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming (`test_{slug}.py` / `test_{slug}_expansion.py`), Buildkite wiring, and copy-paste run commands. Also read [CI_5levels.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/CI_5levels.md) and [tests_style.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/tests_style.md).
+
+Classify the model's **CI priority** first (high / medium / low). High-priority TTS models are typically those on the integration hot path or listed in tracking issues such as [#1832](https://github.com/vllm-project/vllm-omni/issues/1832); medium and low tiers cover the long tail. When unsure, ask the reviewer which tier applies.
+
+| Priority | Required test levels | Files & markers |
+|----------|---------------------|-----------------|
+| **High** | **L1** unit/logic · **L2** online smoke · **L3** online + offline integration · **L4** feature + performance | See table below |
+| **Medium** | **L3** online + offline · **L4** feature only | Skip dedicated L1/L2 unless fixing a logic bug |
+| **Low** | **L4** feature only | One or two `*_expansion.py` parametrized cases |
+
+**Per-level deliverables (TTS / `pytest.mark.tts`):**
+
+| Level | Location | Marker | CI pipeline | Notes |
+|-------|----------|--------|-------------|-------|
+| **L1** | `tests/model_executor/…`, `tests/entrypoints/openai_api/…`, stage-processor tests | `core_model` + `cpu` | `test-ready.yml` | Prompt assembly, async_chunk helpers, `serving_speech` validation — no GPU |
+| **L2** | `tests/e2e/online_serving/test_{slug}.py` | **`core_model` + `advanced_model`** (both on baseline smoke) + `tts` + `@hardware_test(...)` | `test-ready.yml` (`ready` label) | Default deploy smoke: single `/v1/audio/speech` or offline `OmniRunner` path |
+| **L3** | `tests/e2e/online_serving/test_{slug}.py` **and** `tests/e2e/offline_inference/test_{slug}.py` | Baseline smoke: **`core_model` + `advanced_model`**; heavier cases: `advanced_model` only (+ `tts`) | `test-merge.yml` **or** merged into nightly TTS function job | Streaming, voice clone, batch/queue, async_chunk |
+| **L4** | `tests/e2e/online_serving/test_{slug}_expansion.py`, optional offline expansion | `full_model` + `tts` | `test-nightly.yml` (`:full_moon: TTS · Function Test with L4`) | Feature matrix; perf → `tests/dfx/perf/tests/test_tts.json` |
+
+**L2 & L3 online — same file, dual marks on the baseline smoke:** The **first / simplest** case in `test_{slug}.py` (default deploy, single non-streaming `/v1/audio/speech` or equivalent offline path) should carry **both** `@pytest.mark.core_model` **and** `@pytest.mark.advanced_model` on the **same** function so it runs in L2 (`test-ready.yml`, `--run-level core_model`, basic validation) and L3 (`test-merge.yml`, `--run-level advanced_model`, deeper validation) without duplicating the test. In-tree examples: `test_voxcpm2_tts.py::test_text_to_audio_001`, `test_qwen3_tts_customvoice.py::test_text_to_audio_001`.
+
+Heavier scenarios in the same file use **`advanced_model` only** (streaming, extra languages, concurrency, async_chunk, batch). Example: `test_voice_clone_en_streaming_001` → `advanced_model` only. When migrating L3 to nightly, move those heavier cases into `test_{slug}_expansion.py` with `full_model` and drop the dedicated merge job (see `test_ming_tts_expansion.py`, `test_glm_tts_expansion.py`).
+
+```python
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_voice_clone_en_non_streaming_001(omni_server, openai_client) -> None:
+    openai_client.send_audio_speech_request({...})
+```
+
+**L4 consolidation:** Prefer parametrized `OmniServerParams` rows (`default`, `async_chunk`, feature flags) in one expansion module rather than many merge-only files ([#1832](https://github.com/vllm-project/vllm-omni/issues/1832)).
+
+**L4 performance (high-priority models):** Add latency / throughput / stress rows in `tests/dfx/perf/tests/test_tts.json`, or a dedicated `tests/dfx/perf/tests/test_{slug}.json` when the model must not join the shared nightly server matrix before integration lands (see VoxCPM2 / Coqui XTTS pattern). Register the model in `benchmarks/tts/model_configs.yaml` for local `bench_tts.py`. Wire a **separate** `test-nightly.yml` Perf Test step when the JSON is not merged into `test_tts.json` yet.
+
+**Keep model-specific code inside test modules — not `tests/helpers/{slug}.py`:**
+
+- Put `MODEL`, deploy path, vendored `REF_AUDIO_URL`, `get_prompt()`, and inline `request_config` dicts **in each** `test_{slug}.py`, `test_{slug}_expansion.py`, offline `test_{slug}.py`, and L1 `test_{slug}_*.py` as needed.
+- **Do not** add `tests/helpers/{slug}.py` (or `tests/helpers/{model_name}.py`) to deduplicate constants or request builders across those files. A little duplication is intentional; follow in-tree references such as `tests/e2e/online_serving/test_glm_tts.py` and `tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py`.
+- `tests/helpers/` is for **repo-wide** harness code only (`mark.py`, `media.py`, `runtime.py`, `stage_config.py`, `assertions.py`, `fixtures/`). Import those; do not extend the tree with per-model modules.
+
+**Runtime send helpers (`tests/helpers/runtime.py`) — online and offline e2e:**
+
+| Path | Fixture | Call |
+|------|---------|------|
+| Online `/v1/*` | `openai_client` | `openai_client.send_*_request(request_config)` |
+| Offline inference | `omni_runner_handler` | `omni_runner_handler.send_*_request(request_config)` |
+
+1. **Grep `runtime.py` first** — reuse `send_omni_request`, `send_diffusion_request`, `send_audio_speech_request` (online + offline Qwen-style TTS), `send_single_stage_tts_request` (Coqui XTTS / MOSS-TTS-Nano offline), etc.
+2. **No matching helper** → add `send_<feature>_request` (or `send_<route>_http_request` for negative/dfx) in **`runtime.py`** with general `assert_*` bundled inside, **then** call it from the test.
+3. **Test file** holds `request_config` dicts only — not `omni.generate`, not `_collect_audio()`, not raw HTTP/SDK.
+4. Wire `tests/helpers/runtime.py` into Buildkite `source_file_dependencies` when you add helpers.
+
+See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers** for full tables and exceptions.
+
 ### Deliverables
 
 - Updated `serving_speech.py` with all 5 integration points (single commit)
 - Client scripts and server launcher under `examples/online_serving/text_to_speech/<model>/`
 - Gradio demo with streaming and voice cloning UI in the same dir
-- E2E online serving test (`tests/e2e/online_serving/test_<model>.py`)
-- Buildkite CI entry in `.buildkite/test-merge.yml`
+- E2E tests per **Test Case Writing (CI Levels)** above (priority tier determines L1–L4 scope)
+- Buildkite wired per level: `test-ready.yml` (L1/L2), `test-merge.yml` or nightly function job (L3), `test-nightly.yml` (L4) — see [vllm-omni-test skill](../vllm-omni-test/SKILL.md)
 - New section in `examples/online_serving/text_to_speech/README.md` (table row + per-model section). Do **not** create a top-level `examples/online_serving/<model>/` dir or a per-model `README.md` inside `text_to_speech/<model>/`.
 
 ### E2E test pitfalls to avoid
@@ -326,9 +385,9 @@ def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
 - **Use the harness readiness gate.** The fixture waits for HTTP 200 on
   `/health`; don't add `time.sleep` in tests. If warmup is incomplete, make
   `/health` return non-200 until you're actually ready.
-- **Mark with `@pytest.mark.core_model` + `hardware_test(res={"cuda": "H100"})`**
-  so the test lands in `test-ready.yml` (triggered by the `ready` label) rather
-  than only nightly.
+- **Mark tests per the CI Levels table** — baseline smoke: `core_model` + `advanced_model`; heavier cases: `advanced_model` only; L4 expansion: `full_model`
+- **No per-model helper modules** — do not create `tests/helpers/{slug}.py`; keep constants and `request_config` payloads in the test file
+- **Online and offline e2e go through `runtime.py`** — `openai_client.send_audio_speech_request` (online); `omni_runner_handler.send_audio_speech_request` (Qwen-style offline) or `send_single_stage_tts_request` (single-stage offline). Add a new `send_*_request` in `runtime.py` when none fits; do not embed `omni.generate` or HTTP in tests
 
 ## Phase 4: Async Chunk (Streaming)
 
@@ -461,8 +520,8 @@ Use this checklist when integrating a new TTS model:
 - [ ] Voice cloning works (if supported)
 - [ ] All response formats work (wav, mp3, flac, pcm)
 - [ ] Client scripts and server launcher created
-- [ ] E2E online serving test written (`tests/e2e/online_serving/test_<model>.py`)
-- [ ] Buildkite CI entry added to `.buildkite/test-merge.yml`
+- [ ] E2E tests added per model priority tier (see **Test Case Writing (CI Levels)**)
+- [ ] Buildkite entries match level: `test-ready.yml` / `test-merge.yml` or nightly TTS job / `test-nightly.yml`
 - [ ] Gradio demo working
 - [ ] Documentation added (offline + online docs, nav, supported models)
 
@@ -500,5 +559,6 @@ Project docs and adjacent skills:
 - [TTS audio skill](../vllm-omni-audio-tts/SKILL.md) — supported models and usage
 - [Fish Speech integration](../vllm-omni-audio-tts/references/fish-speech.md) — complete example of Phases 1–3
 - [Qwen3-TTS reference](../vllm-omni-audio-tts/references/qwen-tts.md) — complete example of all 5 phases
+- [vllm-omni-test skill](../vllm-omni-test/SKILL.md) — L1–L4 markers, naming, Buildkite wiring, run commands
 - [Adding a TTS model (developer guide)](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/model/adding_tts_model.md)
 - `plan/voxcpm2_native_ar_design.md` — VoxCPM2's vLLM-native AR + side-computation pattern (distinct from the generator-based single-stage described above)

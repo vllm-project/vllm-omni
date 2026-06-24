@@ -24,7 +24,7 @@ Check the model's HF repo for `model_index.json`. This determines your path:
 
 | Scenario | How to identify | Migration path |
 |----------|----------------|----------------|
-| **Already supported** | `_class_name` in `model_index.json` matches a key in `_DIFFUSION_MODELS` in `registry.py` | Skip to Step 5 (test) and Step 7 (docs) |
+| **Already supported** | `_class_name` in `model_index.json` matches a key in `_DIFFUSION_MODELS` in `registry.py` | Skip implementation, then validate model-specific examples, tests, and docs as needed |
 | **Diffusers-based** | Has standard `model_index.json` with `_diffusers_version`, subfolders for `transformer/`, `vae/`, etc. | Follow **Path A** below |
 | **Custom/private repo** | No diffusers `model_index.json`, weights in non-standard format, custom model code in a separate git repo | Follow **Path B** below |
 | **Hybrid** | Has some diffusers components (VAE) but custom transformer/fusion | Mix of Path A and Path B |
@@ -52,7 +52,7 @@ vllm_omni/diffusion/models/your_model_name/
 2. Replace attention with `vllm_omni.diffusion.attention.layer.Attention` (QKV shape: `[B, seq, heads, head_dim]`).
 3. Add `od_config: OmniDiffusionConfig | None = None` to `__init__`.
 4. Add `load_weights()` method mapping diffusers weight names to vllm-omni names.
-5. Add class attributes: `_repeated_blocks`, `_layerwise_offload_blocks_attr`.
+5. Add class attributes for acceleration features such as `_repeated_blocks` and `_layerwise_offload_blocks_attrs` (see [references/transformer-adaptation.md](references/transformer-adaptation.md) for examples).
 
 ### A4. Adapt pipeline
 
@@ -78,13 +78,34 @@ class YourPipeline(nn.Module):
 
 Add post/pre-process functions in the same pipeline file. Register them in `registry.py`.
 
+### A4.1 Add progress bar support (recommended)
+
+For pipelines with a standard denoising loop, prefer the existing progress bar pattern instead of hand-rolled logging.
+
+```python
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+
+class YourPipeline(nn.Module, ProgressBarMixin):
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        # ... prepare timesteps / latents ...
+        with self.progress_bar(total=len(timesteps)) as progress_bar:
+            for i, t in enumerate(timesteps):
+                # predict noise / scheduler step
+                latents = ...
+                progress_bar.update()
+
+        return DiffusionOutput(output=output)
+```
+
+For custom loop structures, follow `vllm_omni/diffusion/models/progress_bar.py` and existing pipelines using `ProgressBarMixin`.
+
 ### A5. Register, test, docs → continue at Step 4 below.
 
 ---
 
 ## Path B: Custom/Private Repo Model
 
-For models without a diffusers pipeline — weights in custom format, model code in a private repo. Real examples: DreamID-Omni, BAGEL, HunyuanImage3.
+For models without a diffusers pipeline — weights in custom format, model code in a private repo. Real examples: DreamID-Omni, BAGEL, HunyuanImage3. See [references/custom-model-patterns.md](references/custom-model-patterns.md) for concrete custom-model integration patterns.
 
 ### B1. Understand the reference repo
 
@@ -134,7 +155,7 @@ Copy the essential model files into `vllm_omni/diffusion/models/<name>/` and ada
 
 ### B4. Handle custom weight loading
 
-Custom models have two patterns for weight loading:
+Custom models have two common patterns for weight loading:
 
 **Pattern 1: Bypass standard loader** (DreamID-Omni style)
 
@@ -149,8 +170,10 @@ class CustomPipeline(nn.Module):
         self.vae = custom_init_vae(model, device=self.device)
         self.text_encoder = custom_init_text_encoder(model, device=self.device)
         self.transformer = CustomFusionModel(CONFIG)
-        load_custom_checkpoint(self.transformer,
-            checkpoint_path=os.path.join(model, "model.safetensors"))
+        load_custom_checkpoint(
+            self.transformer,
+            checkpoint_path=os.path.join(model, "model.safetensors"),
+        )
         # NO weights_sources defined — bypasses standard loader
 
     def load_weights(self, weights):
@@ -162,6 +185,8 @@ class CustomPipeline(nn.Module):
 When weights are in safetensors format but need name remapping:
 
 ```python
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
 class CustomPipeline(nn.Module):
     def __init__(self, *, od_config, prefix=""):
         super().__init__()
@@ -187,7 +212,9 @@ class CustomPipeline(nn.Module):
             # Remap original weight names to vllm-omni module names
             name = self._remap_weight_name(name)
             if name in params:
-                default_weight_loader(params[name], tensor)
+                param = params[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, tensor)
                 loaded.add(name)
         return loaded
 ```
@@ -281,16 +308,43 @@ For Omni or custom models, create:
 ### Step 7: Update Documentation
 
 Required updates:
-1. `docs/user_guide/diffusion/parallelism_acceleration.md` — parallelism support table
+1. `docs/user_guide/diffusion/parallelism/overview.md` — parallelism support overview/table
 2. `docs/user_guide/diffusion/cpu_offload_diffusion.md` — if CPU offload supported (add to supported models table)
-3. `docs/user_guide/diffusion/teacache.md` — if TeaCache supported
-4. `docs/user_guide/diffusion/cache_dit_acceleration.md` — if Cache-DiT supported
-5. `examples/offline_inference/xxx/README.md` — offline example docs
-6. `examples/online_serve/xxx/README.md` — online serve docs
+3. `docs/user_guide/diffusion/cache_acceleration/teacache.md` — if TeaCache supported
+4. `docs/user_guide/diffusion/cache_acceleration/cache_dit.md` — if Cache-DiT supported
+5. Offline example docs under `examples/offline_inference/<name>/` (`README.md` or category-specific `.md`)
+6. `examples/online_serving/<name>/README.md` — online serving docs
 
-### Step 8: Add E2E Tests (Recommended)
+### Step 8: Add E2E Tests
 
-Create `tests/e2e/online_serving/test_your_model_expansion.py`.
+**Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming, Buildkite wiring, and run commands. Also read [l4_functionality_tests.inc.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_examples/l4_functionality_tests.inc.md) and [CI_5levels.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/CI_5levels.md).
+
+Classify the model's **CI priority** first:
+
+| Priority | Required test levels | Files & markers |
+|----------|---------------------|-----------------|
+| **High** (listed in [#1832](https://github.com/vllm-project/vllm-omni/issues/1832) or on the diffusion hot path) | **L1** · **L2** online · **L3** online + offline · **L4** feature + performance | See table below |
+| **Medium** (*normal priority* in L4 docs) | **L3** online + offline · **L4** feature only | Fewer L4 parametrized rows |
+| **Low** | **L4** feature only | One or two `*_expansion.py` cases |
+
+**Per-level deliverables (diffusion / `pytest.mark.diffusion`):**
+
+| Level | Location | Marker | CI pipeline | Notes |
+|-------|----------|--------|-------------|-------|
+| **L1** | `tests/diffusion/models/{slug}/`, `tests/diffusion/cache/`, transformer unit tests | `core_model` + `cpu` | `test-ready.yml` | Weight remap, `_sp_plan`, cache enabler registration, shape contracts |
+| **L2** | `tests/e2e/online_serving/test_{slug}.py` (and offline if the category is offline-first) | **`core_model` + `advanced_model`** (both on baseline smoke) + `diffusion` + `@hardware_test` / `hardware_marks` | `test-ready.yml` | Default deploy smoke — minimal `num_inference_steps`, single prompt |
+| **L3** | `tests/e2e/online_serving/test_{slug}.py` **and** `tests/e2e/offline_inference/test_{slug}.py` when offline matters | Baseline smoke: **`core_model` + `advanced_model`**; heavier cases: `advanced_model` only (+ `diffusion`) | `test-merge.yml` **or** merged into nightly diffusion function job | Real weights, streaming/API paths, LoRA/offload smoke |
+| **L4** | `tests/e2e/online_serving/test_{slug}_expansion.py` (+ offline expansion if needed) | `full_model` + `diffusion` | `test-nightly.yml` (X2I / X2V / X2A function groups) | Feature combos per [#1832](https://github.com/vllm-project/vllm-omni/issues/1832); perf → `tests/dfx/perf/tests/test_{model}_vllm_omni.json` |
+
+**L2 & L3 online — same file, dual marks on the baseline smoke:** The **first / simplest** case in `test_{slug}.py` (default deploy, minimal steps, single prompt) should carry **both** `@pytest.mark.core_model` and `@pytest.mark.advanced_model` on the **same** function so L2 (`test-ready.yml`) and L3 (`test-merge.yml`) share one smoke test. Heavier deploy variants or API paths in the same file use **`advanced_model` only**. When L3 moves to nightly, migrate those heavier cases into `test_{slug}_expansion.py` with `full_model` and remove the dedicated `test-merge.yml` job (see `test_longcat_image_expansion.py`, `test_qwen_image_expansion.py`).
+
+**L4 design (high priority):** Combine multiple supported features (Cache-DiT, TP, USP, CFG, HSDP, CPU offload, quantization) into **few parametrized** `OmniServerParams` rows so each feature appears in at least one case without exploding GPU jobs. Shard single-GPU vs multi-GPU cases across the nightly X2I/X2V function steps (1-GPU vs `distributed_cuda`).
+
+**L4 design (medium / low):** One or two parametrized rows covering the best quality/perf trade-off; skip perf JSON unless the model is high priority.
+
+**Reference implementations:** `tests/e2e/online_serving/test_qwen_image_edit_expansion.py`, `tests/e2e/online_serving/test_longcat_image_expansion.py`, `tests/e2e/online_serving/test_hunyuan_video_15_expansion.py`.
+
+**Keep model-specific code inside test modules — not `tests/helpers/{slug}.py`:** deploy constants, prompts, sampling dicts, and inline `request_config` / `form_data` belong in each `test_{slug}.py` and `test_{slug}_expansion.py`. Do not add per-model files under `tests/helpers/`; reuse only repo-wide harness (`mark`, `media`, `runtime`, `stage_config`, `assertions`). **L2+ online/offline e2e:** reuse or add `send_*_request` in `tests/helpers/runtime.py` — tests call the handler, not raw `omni.generate` / HTTP. See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers**.
 
 ### Step 9: Add Cache-DiT Acceleration
 
@@ -510,7 +564,7 @@ class YourTransformer(nn.Module):
 #### 10e. Update parallelism documentation
 
 After adding parallelism support, update:
-1. `docs/user_guide/diffusion/parallelism_acceleration.md` — add your model to the support table
+1. `docs/user_guide/diffusion/parallelism/overview.md` — add your model to the support overview/table
 2. Record which parallelism methods are supported (USP, Ring, CFG, TP, HSDP, VAE-Patch)
 
 ### Step 11: Add CPU Offload Support
@@ -568,6 +622,7 @@ See the [Profiling Single-Stage Diffusion](../../../docs/contributing/profiling.
 
 ## Reference Files
 
+- [vllm-omni-test skill](../vllm-omni-test/SKILL.md) — L1–L4 markers, naming, Buildkite wiring, run commands
 - [Transformer Adaptation](references/transformer-adaptation.md) — porting transformers from diffusers
 - [Custom Model Patterns](references/custom-model-patterns.md) — patterns for non-diffusers models
 - [Parallelism Patterns](references/parallelism-patterns.md) — TP, SP/USP, CFG parallel, HSDP implementation details

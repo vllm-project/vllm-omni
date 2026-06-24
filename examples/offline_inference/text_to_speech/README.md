@@ -23,6 +23,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
+| IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
 
 ## Common Quick Start
@@ -369,6 +370,20 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 ```
 Streaming requires `async_chunk: true` in the stage config.
 
+### Word Timestamps
+Generate a WAV offline and a JSON sidecar with word-level timestamps from
+`Qwen/Qwen3-ForcedAligner-0.6B`:
+```bash
+python examples/offline_inference/text_to_speech/qwen3_tts/word_timestamps.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B \
+    --text "Hello world." \
+    --output-dir /tmp/qwen3_tts_timestamps
+```
+The script writes `qwen3_tts_word_timestamps.wav` and
+`qwen3_tts_word_timestamps.json`. On machines without a local CUDA toolkit,
+set `VLLM_USE_FLASHINFER_SAMPLER=0` to avoid FlashInfer sampler JIT.
+
 ### Batched decoding
 The Code2Wav stage supports batched decoding through the SpeechTokenizer. Pass multiple prompts via `--txt-prompts` and set `--batch-size` accordingly. To raise `max_num_seqs` on either stage, point `--stage-configs-path` at a stage configs YAML with the desired values (see `vllm_omni/model_executor/stage_configs/` for templates):
 ```bash
@@ -422,6 +437,50 @@ Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [
 
 ---
 
+## IndexTTS-2
+
+2-stage TTS pipeline (GPT AR talker + S2Mel CFM DiT + BigVGAN vocoder) at 22.05 kHz. Every request requires reference audio for zero-shot voice cloning. Supports emotion conditioning via audio, text, or 8-dim vector.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model IndexTeam/IndexTTS-2 \
+    --text "你好，这是一个语音合成测试。" \
+    --ref-audio /path/to/reference.wav
+```
+
+### Emotion control
+```bash
+# Emotion from reference audio
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model IndexTeam/IndexTTS-2 \
+    --text "今天天气真好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-audio /path/to/happy.wav
+
+# Emotion from 8-dim vector (happy angry sad afraid disgusted melancholy surprised calm)
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model IndexTeam/IndexTTS-2 \
+    --text "今天天气真好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-vector 1.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+
+# Emotion from text description
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model IndexTeam/IndexTTS-2 \
+    --text "今天天气真好！" \
+    --ref-audio /path/to/ref.wav \
+    --emo-text "happy and excited"
+```
+
+### Notes
+- `--ref-audio` is **required** — IndexTTS-2 does not support text-only synthesis.
+- Stage 0 (AR Talker): GPT-2 generates mel codes from text + reference audio.
+- Stage 1 (S2Mel + BigVGAN): CFM DiT converts mel codes to waveform at 22.05 kHz.
+- Deploy config: `vllm_omni/deploy/indextts2.yaml`. Stage 1 runs with `enforce_eager: true` (DiT has dynamic shapes).
+
+---
+
 ## Voxtral TTS
 
 Voxtral-4B-TTS (Mistral). Has its own argparse surface; uses voice presets and the `mistral_common` `SpeechRequest` protocol.
@@ -462,3 +521,100 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+
+---
+
+## SoulX-Singer
+
+Singing voice synthesis (SVS) and conversion (SVC) at 24 kHz. Script: `soulxsinger/end2end.py`. Deploy: `vllm_omni/deploy/soulxsinger_svs.yaml` or `soulxsinger_svc.yaml`.
+
+### Prerequisites
+
+Download DiT and preprocess weights, then set up separate SVS / SVC view directories. Copy `soulxsinger/utils/phoneme/phone_set.json` from upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) into the model weights dir as `phoneme/phone_set.json` — HuggingFace does not ship it.
+
+```bash
+# 1. DiT weights
+export BASE=path/to/SoulX-Singer
+export PREPROCESS=path/to/SoulX-Singer-Preprocess
+export SVC_DIR=path/to/SoulX-Singer-svc
+
+huggingface-cli download Soul-AILab/SoulX-Singer --local-dir "$BASE"
+
+# 2. Preprocess weights (required)
+huggingface-cli download Soul-AILab/SoulX-Singer-Preprocess --local-dir "$PREPROCESS"
+export SOULX_PREPROCESS_WEIGHTS_DIR="$PREPROCESS"
+
+# 3. SVS / SVC view directories
+mkdir -p "$SVC_DIR"
+cp $BASE/{config.yaml,README.md,assets} $SVC_DIR
+mv $BASE/model-svc.pt $SVC_DIR/model-svc.pt
+
+cat > "$BASE/config.json" <<'EOF'
+{
+  "model_type": "soulxsinger",
+  "architectures": ["SoulXSingerPipeline"],
+  "max_num_seqs": 1
+}
+EOF
+
+cat > "$SVC_DIR/config.json" <<'EOF'
+{
+  "model_type": "soulxsinger",
+  "architectures": ["SoulXSingerSVCPipeline"],
+  "max_num_seqs": 1
+}
+EOF
+```
+
+`config.yaml` hyper-parameters live under `$BASE`; each view's `config.json` `architectures` field is the single source of truth for SVS vs SVC. Point `--model` at the matching directory (`$BASE` for SVS, `$SVC_DIR` for SVC). Deploy YAML is chosen automatically from `config.json`; optional `--svs` / `--svc` only assert the mode matches.
+
+**Online preprocess** is the default: pass `--prompt-audio` and `--target-audio`, and the worker runs vocal separation, F0, and (for SVS) lyrics/MIDI before DiT. Install only what your run needs:
+
+```bash
+pip install "BS-RoFormer"   # vocal sep + F0 on GPU — SVS and SVC
+```
+
+Mandarin SVS also needs FunASR and Chinese G2P; `ffmpeg` must be on `PATH`:
+
+```bash
+# install optional dependencies:
+pip install -e ".[soulx-svs]"
+```
+
+English SVS adds NeMo ASR and NLTK data; pass `--language English`:
+
+```bash
+pip install "nemo_toolkit[asr]==2.6.1" lhotse==1.32.2
+python -c "import nltk; nltk.download('cmudict'); nltk.download('averaged_perceptron_tagger_eng')"
+```
+
+**Precomputed metadata** is the alternative: pass both `--prompt-metadata-path` and `--target-metadata-path` and skip online ASR/ROSVOT — none of the packages above are required. JSON can be produced by integrated preprocess on a prior run, or by upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) `preprocess/` scripts if you prefer to run that outside vLLM-Omni.
+
+### Quick start
+
+```bash
+# SVS — default demo audio: tests/assets/soulxsinger/zh_prompt.mp3 + music.mp3
+python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
+    --model "$BASE" \
+    --preprocess-weights-dir "$PREPROCESS" \
+    --control score \
+    --num-inference-steps 32 \
+    -o output.wav
+
+python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
+    --model "$SVC_DIR" \
+    --preprocess-weights-dir "$PREPROCESS" \
+    --svc \
+    --num-inference-steps 32 \
+    -o output_svc.wav
+```
+
+`SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. Long SVS targets are handled in one request. See `end2end.py --help` for `--pitch-shift`, `--vocal-sep`, `--auto-shift`, and language/control options.
+
+### Notes
+
+- Output: 24 kHz mono WAV; batch only.
+- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` on.
+- SVS `--control`: `score` or `melody`. MIDI / lyric QC: upstream `midi_editor` only.
+
+---
