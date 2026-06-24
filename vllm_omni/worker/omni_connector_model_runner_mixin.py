@@ -110,7 +110,7 @@ class OmniConnectorModelRunnerMixin:
 
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
-        logger.info(
+        logger.debug(
             "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
             self._stage_id,
             self._async_chunk,
@@ -1154,7 +1154,7 @@ class OmniConnectorModelRunnerMixin:
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
 
         if chunk_id == 0:
-            logger.info(
+            logger.debug(
                 "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
                 self._stage_id,
                 request_id,
@@ -1252,7 +1252,7 @@ class OmniConnectorModelRunnerMixin:
 
         active_requests = getattr(self, "requests", None)
         if active_requests is not None and request_id not in active_requests:
-            logger.info("Skip receiving KV cache for inactive request %s", request_id)
+            logger.debug("Skip receiving KV cache for inactive request %s", request_id)
             return False
 
         primary_ok = False
@@ -1272,7 +1272,7 @@ class OmniConnectorModelRunnerMixin:
                 if cfg_kvs and hasattr(req, "sampling_params") and req.sampling_params is not None:
                     for key, value in cfg_kvs.items():
                         setattr(req.sampling_params, key, value)
-                    logger.info("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
+                    logger.debug("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
             except Exception:
                 logger.exception("Failed to collect CFG KV caches for %s", request_id)
 
@@ -1657,7 +1657,7 @@ class OmniConnectorModelRunnerMixin:
 
             _recv_poll_count += 1
             if _recv_poll_count % 5000 == 1:
-                logger.info(
+                logger.debug(
                     "[Stage-%s] _recv_loop: polling %s pending reqs: %s (poll#%s)",
                     self._stage_id,
                     len(pending_ids),

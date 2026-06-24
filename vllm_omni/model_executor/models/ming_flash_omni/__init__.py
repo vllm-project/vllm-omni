@@ -1,20 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 The vLLM-Omni team.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from .ming_flash_omni import MingFlashOmniForConditionalGeneration
-from .ming_flash_omni_talker import MingFlashOmniTalkerForConditionalGeneration
-from .ming_flash_omni_thinker import (
-    MingFlashOmniThinkerDummyInputsBuilder,
-    MingFlashOmniThinkerForConditionalGeneration,
-    MingFlashOmniThinkerMultiModalProcessor,
-    MingFlashOmniThinkerProcessingInfo,
-)
-
-__all__ = [
-    "MingFlashOmniForConditionalGeneration",
-    "MingFlashOmniTalkerForConditionalGeneration",
-    "MingFlashOmniThinkerForConditionalGeneration",
-    "MingFlashOmniThinkerProcessingInfo",
-    "MingFlashOmniThinkerMultiModalProcessor",
-    "MingFlashOmniThinkerDummyInputsBuilder",
-]
+# NOTE: Do not import model classes in this file. Importing any
+# submodule in this package triggers __init__.py execution, and
+# both the model registry and pipeline registry import submodules
+# directly — heavy imports here would be loaded as a side effect
+# even though nothing depends on these re-exports.
