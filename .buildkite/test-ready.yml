@@ -346,6 +346,36 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+      - label: "Omni · MiMo-V2.5-ASR Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_mimo_v2_5_asr.py
+          - vllm_omni/model_executor/models/mimo_audio/
+          - vllm_omni/model_executor/stage_input_processors/mimo_audio.py
+          - vllm_omni/deploy/mimo_audio.yaml
+          - examples/online_serving/mimo_audio/chat_template.jinja
+        timeout_in_minutes: 30
+        commands:
+          - |
+            timeout 30m bash -c "
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              pytest -s -v tests/e2e/online_serving/test_mimo_v2_5_asr.py \
+                -m 'core_model and cuda' --run-level 'core_model' \
+                -k test_audio_to_text_asr_smoke
+            "
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
       - label: "TTS · VoxCPM2 Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_voxcpm2_tts.py
