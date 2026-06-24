@@ -73,6 +73,18 @@ _MODEL_COEFFICIENTS = {
         3.20000000e00,
         -2.00000000e-02,
     ],
+    # HunyuanVideo-1.5 transformer coefficients
+    # Source: TeaCache paper (https://arxiv.org/abs/2411.19108), Table 2 / official repo
+    # Maps time_embed rel_l1 distance to output rel_l1 distance for HunyuanVideo architecture.
+    # Inherited from HunyuanVideo-1.0 (same dual-stream transformer design); not yet
+    # empirically validated on 1.5-specific checkpoints.
+    "HunyuanVideo15Transformer3DModel": [
+        -3.03318725e05,
+        4.33749085e04,
+        -2.43574639e03,
+        6.41855817e01,
+        -6.37294591e-01,
+    ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
 }

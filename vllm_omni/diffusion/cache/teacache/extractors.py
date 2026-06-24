@@ -1187,6 +1187,179 @@ def extract_flux_context(
     )
 
 
+def extract_hunyuan_video_15_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.LongTensor,
+    encoder_hidden_states: torch.Tensor,
+    encoder_attention_mask: torch.Tensor,
+    timestep_r: torch.LongTensor | None = None,
+    encoder_hidden_states_2: torch.Tensor | None = None,
+    encoder_attention_mask_2: torch.Tensor | None = None,
+    image_embeds: torch.Tensor | None = None,
+    image_embeds_mask: torch.Tensor | None = None,
+    attention_kwargs: dict[str, Any] | None = None,
+    return_dict: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for HunyuanVideo15Transformer3DModel.
+
+    HunyuanVideo-1.5 uses a dual-stream transformer (image + text tokens processed
+    jointly). The modulated input is extracted from the first transformer block's
+    AdaLayerNormZero output on the image hidden states, which is sensitive to the
+    timestep embedding and serves as a reliable cache decision signal.
+
+    Args:
+        module: HunyuanVideo15Transformer3DModel instance
+        hidden_states: Video latent tensor [B, C, T, H, W]
+        timestep: Diffusion timestep
+        encoder_hidden_states: Primary text encoder outputs
+        encoder_attention_mask: Mask for primary text encoder
+        timestep_r: Optional second timestep (for flow matching)
+        encoder_hidden_states_2: Secondary text encoder outputs (ByT5)
+        encoder_attention_mask_2: Mask for secondary text encoder
+        image_embeds: Image conditioning embeddings (zeros for T2V)
+        image_embeds_mask: Mask for image embeddings
+        attention_kwargs: Additional attention arguments
+        return_dict: Whether to return Transformer2DModelOutput
+        **kwargs: Additional keyword arguments
+
+    Returns:
+        CacheContext with all information needed for generic caching
+    """
+
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must have transformer_blocks")
+
+    # ============================================================================
+    # PREPROCESSING (mirrors HunyuanVideo15Transformer3DModel.forward)
+    # ============================================================================
+    batch_size, num_channels, num_frames, height, width = hidden_states.shape
+
+    # The extractor is called from the pipeline-level TeaCache probe, outside the
+    # transformer's own forward(). Manually unshard root-level params (time_embed,
+    # x_embedder, etc.) and transformer_blocks[0] params (norm1) so submodules
+    # can be called directly without going through the FSDP pre-forward hook chain.
+    try:
+        from torch.distributed.fsdp._fully_shard._fully_shard import FSDPModule as _FSDPModule
+    except ImportError:
+        _FSDPModule = None
+
+    block0 = module.transformer_blocks[0]
+    _root_is_fsdp = _FSDPModule is not None and isinstance(module, _FSDPModule)
+    _block0_is_fsdp = _FSDPModule is not None and isinstance(block0, _FSDPModule)
+
+    try:
+        if _root_is_fsdp:
+            module.unshard()
+        if _block0_is_fsdp:
+            block0.unshard()
+
+        temb = module.time_embed(timestep, timestep_r=timestep_r)
+        hidden_states = module.x_embedder(hidden_states)
+
+        enc_hs = module.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
+        enc_hs = enc_hs + module.cond_type_embed(torch.zeros_like(enc_hs[:, :, 0], dtype=torch.long))
+
+        enc_hs_2 = module.context_embedder_2(encoder_hidden_states_2)
+        enc_hs_2 = enc_hs_2 + module.cond_type_embed(torch.ones_like(enc_hs_2[:, :, 0], dtype=torch.long))
+
+        enc_hs_3 = module.image_embedder(image_embeds)
+        if image_embeds_mask is not None:
+            enc_attn_mask_3 = image_embeds_mask
+        else:
+            is_t2v = torch.all(image_embeds == 0)
+            if is_t2v:
+                enc_hs_3 = enc_hs_3 * 0.0
+                enc_attn_mask_3 = torch.zeros(
+                    (batch_size, enc_hs_3.shape[1]),
+                    dtype=encoder_attention_mask.dtype,
+                    device=encoder_attention_mask.device,
+                )
+            else:
+                enc_attn_mask_3 = torch.ones(
+                    (batch_size, enc_hs_3.shape[1]),
+                    dtype=encoder_attention_mask.dtype,
+                    device=encoder_attention_mask.device,
+                )
+        enc_hs_3 = enc_hs_3 + module.cond_type_embed(2 * torch.ones_like(enc_hs_3[:, :, 0], dtype=torch.long))
+
+        # Token reordering: [valid_image, valid_byte5, valid_mllm, padding]
+        enc_attn_mask_bool = encoder_attention_mask.bool()
+        enc_attn_mask_2_bool = encoder_attention_mask_2.bool()
+        enc_attn_mask_3_bool = enc_attn_mask_3.bool()
+        new_enc_hs = []
+        new_enc_attn_mask = []
+        for text, text_mask, text_2, text_mask_2, image, image_mask in zip(
+            enc_hs,
+            enc_attn_mask_bool,
+            enc_hs_2,
+            enc_attn_mask_2_bool,
+            enc_hs_3,
+            enc_attn_mask_3_bool,
+        ):
+            new_enc_hs.append(
+                torch.cat(
+                    [
+                        image[image_mask],
+                        text_2[text_mask_2],
+                        text[text_mask],
+                        image[~image_mask],
+                        torch.zeros_like(text_2[~text_mask_2]),
+                        torch.zeros_like(text[~text_mask]),
+                    ],
+                    dim=0,
+                )
+            )
+            new_enc_attn_mask.append(
+                torch.cat(
+                    [
+                        image_mask[image_mask],
+                        text_mask_2[text_mask_2],
+                        text_mask[text_mask],
+                        image_mask[~image_mask],
+                        text_mask_2[~text_mask_2],
+                        text_mask[~text_mask],
+                    ],
+                    dim=0,
+                )
+            )
+        encoder_hidden_states = torch.stack(new_enc_hs)
+        encoder_attention_mask = torch.stack(new_enc_attn_mask)
+
+        # SP padding mask (same logic as transformer forward)
+        hidden_states_mask = getattr(module, "_cached_sp_mask", None)
+        if hidden_states_mask is None:
+            ctx_fwd = get_forward_context()
+            if ctx_fwd.sp_original_seq_len is not None and ctx_fwd.sp_padding_size > 0:
+                padded_seq_len = ctx_fwd.sp_original_seq_len + ctx_fwd.sp_padding_size
+                hidden_states_mask = torch.ones(
+                    batch_size, padded_seq_len, dtype=torch.bool, device=hidden_states.device
+                )
+                hidden_states_mask[:, ctx_fwd.sp_original_seq_len :] = False
+                module._cached_sp_mask = hidden_states_mask
+
+        # ============================================================================
+        # EXTRACT MODULATED INPUT (for cache decision)
+        # Use first transformer block's norm1 output on image hidden states.
+        # ============================================================================
+        # AdaLayerNormZero returns (norm_hs, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+        norm_hidden_states, _, _, _, _ = block0.norm1(hidden_states, emb=temb)
+    finally:
+        if _block0_is_fsdp:
+            block0.reshard()
+        if _root_is_fsdp:
+            module.reshard()
+
+    return CacheContext(
+        modulated_input=norm_hidden_states,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1202,6 +1375,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "Flux2Transformer2DModel": extract_flux2_context,
     "LongCatImageTransformer2DModel": extract_longcat_context,
     "FluxTransformer2DModel": extract_flux_context,
+    "HunyuanVideo15Transformer3DModel": extract_hunyuan_video_15_context,
     # Future models:
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,
 }
