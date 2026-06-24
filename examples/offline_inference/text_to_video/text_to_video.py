@@ -19,6 +19,15 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 _MODEL_PRESETS = {
+    "vace": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 81,
+        "num_inference_steps": 30,
+        "guidance_scale": 5.0,
+        "fps": 16,
+        "output": "vace_t2v_output.mp4",
+    },
     "wan": {
         "height": 720,
         "width": 1280,
@@ -61,6 +70,8 @@ _MODEL_PRESETS = {
 
 def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
+    if "vace" in model_lower:
+        return _MODEL_PRESETS["vace"]
     if "cosmos" in model_lower:
         return _MODEL_PRESETS["cosmos"]
     if "hunyuan" in model_lower:
@@ -381,7 +392,7 @@ def main():
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
 
     omni = Omni(**omni_kwargs)
-    model_class_name = get_model_class_name(omni)
+    model_class_name = get_model_class_name(omni) or model_class_name
     declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
@@ -419,7 +430,6 @@ def main():
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
 
     sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
-
     # Route model-specific knobs through extra_body, filtered against the model's
     # declared extra_body_params. Models without a declaration only forward explicit
     # --extra-body JSON (preserving the generic flags' legacy behavior).

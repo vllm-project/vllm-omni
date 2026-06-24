@@ -6,6 +6,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 
 | Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM (BF16) |
 |---|---|---|---|---|---|
+| `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | 480x832 | 81 | 30 | 5.0 | ~20 GiB (RTX 5090, VAE tiling) |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
@@ -29,6 +30,28 @@ python text_to_video.py \
   --num-inference-steps 40 \
   --fps 16 \
   --output t2v_out.mp4
+```
+
+### Wan2.1 VACE (T2V)
+
+VACE text-to-video uses this shared entrypoint. Conditional VACE tasks use
+the shared [`image_to_video.py`](../image_to_video/README.md#wan21-vace-conditional-tasks)
+entrypoint, which constructs the pipeline-native conditioning data from the
+provided media inputs. No explicit mode parameter is required.
+
+```bash
+python text_to_video.py \
+  --model Wan-AI/Wan2.1-VACE-1.3B-diffusers \
+  --prompt "A sleek, humanoid robot stands in a vast warehouse filled with neatly stacked cardboard boxes on industrial shelves." \
+  --seed 0 \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --num-inference-steps 30 \
+  --guidance-scale 5.0 \
+  --flow-shift 5.0 \
+  --vae-use-tiling \
+  --output vace_t2v_output.mp4
 ```
 
 LTX2 example:
