@@ -27,6 +27,7 @@ from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3
     HiggsAudioV3Config,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 __all__ = [
     "HiggsAudioV3Code2Wav",
@@ -126,7 +127,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
             else:
                 raise FileNotFoundError(f"No cached snapshot for {tokenizer_id}")
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = current_omni_platform.get_torch_device()
         quantizer, fc2, acoustic_decoder, _cfg = load_higgs_audio_codec(tokenizer_dir, device)
         self.quantizer = quantizer
         self.fc2 = fc2
@@ -278,7 +279,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
         )
 
         if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
 
         # The bundled codec may use boson-ai key naming. Try remapping.
         needs_remap = any(k.startswith("quantizer.vq.layers.") for k in codec_state)
