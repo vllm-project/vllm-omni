@@ -94,9 +94,7 @@ def test_krea2_swiglu_no_bias():
 def test_krea2_text_fusion_block_structure():
     from vllm_omni.diffusion.models.krea2.krea2_transformer import Krea2TextFusionBlock
 
-    block = Krea2TextFusionBlock(
-        _TEXT_DIM, _TEXT_HEADS, _TEXT_KV_HEADS, _TEXT_INTERMEDIATE, eps=1e-5
-    )
+    block = Krea2TextFusionBlock(_TEXT_DIM, _TEXT_HEADS, _TEXT_KV_HEADS, _TEXT_INTERMEDIATE, eps=1e-5)
     params = _param_names(block)
 
     assert "norm1.weight" in params

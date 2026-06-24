@@ -29,33 +29,26 @@ from vllm_omni.platforms import current_omni_platform
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Krea 2 text-to-image generation")
-    p.add_argument("--model", default="krea-ai/krea-2-medium",
-                   help="HF repo or local path to a Krea 2 checkpoint.")
-    p.add_argument("--prompt", default="a cup of coffee on the table",
-                   help="Text prompt for image generation.")
-    p.add_argument("--negative-prompt", default=None,
-                   help="Negative prompt for CFG (ignored when guidance=0).")
-    p.add_argument("--steps", type=int, default=28,
-                   help="Number of denoising steps (28 base, 8 distilled).")
-    p.add_argument("--guidance", type=float, default=4.5,
-                   help="Guidance scale (4.5 base, 0 distilled).")
+    p.add_argument("--model", default="krea-ai/krea-2-medium", help="HF repo or local path to a Krea 2 checkpoint.")
+    p.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
+    p.add_argument("--negative-prompt", default=None, help="Negative prompt for CFG (ignored when guidance=0).")
+    p.add_argument("--steps", type=int, default=28, help="Number of denoising steps (28 base, 8 distilled).")
+    p.add_argument("--guidance", type=float, default=4.5, help="Guidance scale (4.5 base, 0 distilled).")
     p.add_argument("--height", type=int, default=1024)
     p.add_argument("--width", type=int, default=1024)
     p.add_argument("--seed", type=int, default=142)
-    p.add_argument("--output", default="krea2_output.png",
-                   help="Output image path.")
-    p.add_argument("--num-images", type=int, default=1,
-                   help="Number of images to generate per prompt.")
-    p.add_argument("--quantization", type=str, default=None,
-                   choices=["fp8", "int8"],
-                   help="Quantization method for the transformer.")
-    p.add_argument("--cfg-parallel-size", type=int, default=1,
-                   choices=[1, 2],
-                   help="GPUs used for CFG parallelism.")
-    p.add_argument("--tensor-parallel-size", type=int, default=1,
-                   help="GPUs used for tensor parallelism.")
-    p.add_argument("--enforce-eager", action="store_true",
-                   help="Disable torch.compile.")
+    p.add_argument("--output", default="krea2_output.png", help="Output image path.")
+    p.add_argument("--num-images", type=int, default=1, help="Number of images to generate per prompt.")
+    p.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "int8"],
+        help="Quantization method for the transformer.",
+    )
+    p.add_argument("--cfg-parallel-size", type=int, default=1, choices=[1, 2], help="GPUs used for CFG parallelism.")
+    p.add_argument("--tensor-parallel-size", type=int, default=1, help="GPUs used for tensor parallelism.")
+    p.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
     p.add_argument("--enable-cpu-offload", action="store_true")
     current_omni_platform.pre_register_and_update(p)
     return p.parse_args()
@@ -63,9 +56,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    generator = torch.Generator(
-        device=current_omni_platform.device_type
-    ).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
     is_distilled = "tdm" in args.model.lower() or "distill" in args.model.lower()
     if is_distilled and args.steps == 28:

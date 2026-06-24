@@ -33,9 +33,7 @@ class Krea2RMSNorm(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         dtype = hidden_states.dtype
-        hidden_states = F.rms_norm(
-            hidden_states.float(), (self.dim,), weight=self.weight + 1.0, eps=self.eps
-        )
+        hidden_states = F.rms_norm(hidden_states.float(), (self.dim,), weight=self.weight + 1.0, eps=self.eps)
         return hidden_states.to(dtype)
 
 
@@ -134,9 +132,7 @@ class Krea2TextFusionBlock(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), attention_mask=attention_mask
-        )
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states), attention_mask=attention_mask)
         hidden_states = hidden_states + self.ff(self.norm2(hidden_states))
         return hidden_states
 
@@ -186,9 +182,7 @@ class Krea2TextFusion(nn.Module):
         for block in self.layerwise_blocks:
             hidden_states = block(hidden_states.contiguous())
 
-        hidden_states = hidden_states.reshape(batch_size, seq_len, num_text_layers, dim).permute(
-            0, 1, 3, 2
-        )
+        hidden_states = hidden_states.reshape(batch_size, seq_len, num_text_layers, dim).permute(0, 1, 3, 2)
         hidden_states = self.projector(hidden_states).squeeze(-1)
 
         for block in self.refiner_blocks:
@@ -247,9 +241,7 @@ class Krea2TimestepEmbedding(nn.Module):
 
     def forward(self, timestep: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         half = self.embed_dim // 2
-        freqs = torch.exp(
-            -math.log(1e4) * torch.arange(half, dtype=torch.float32, device=timestep.device) / half
-        )
+        freqs = torch.exp(-math.log(1e4) * torch.arange(half, dtype=torch.float32, device=timestep.device) / half)
         args = (timestep.float() * 1e3)[:, None, None] * freqs
         emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1).to(dtype)
         return self.linear_2(F.gelu(self.linear_1(emb), approximate="tanh"))
@@ -412,9 +404,7 @@ class Krea2Transformer2DModel(nn.Module):
             image_mask = encoder_attention_mask.new_ones((batch_size, image_seq_len))
             attention_mask = torch.cat([encoder_attention_mask, image_mask], dim=1)
 
-        encoder_hidden_states = self.text_fusion(
-            encoder_hidden_states, attention_mask=text_attention_mask
-        )
+        encoder_hidden_states = self.text_fusion(encoder_hidden_states, attention_mask=text_attention_mask)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
         hidden_states = self.img_in(hidden_states)

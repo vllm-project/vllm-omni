@@ -79,11 +79,7 @@ def get_krea2_post_process_func(od_config: OmniDiffusionConfig):
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = (
-            2 ** len(vae_config["temporal_downsample"])
-            if "temporal_downsample" in vae_config
-            else 8
-        )
+        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
@@ -142,9 +138,7 @@ class Krea2Pipeline(
             local_files_only=local_files_only,
         ).to(self._execution_device)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model, subfolder="tokenizer", local_files_only=local_files_only
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.vae = from_pretrained_with_prefetch(
             AutoencoderKLQwenImage.from_pretrained,
@@ -154,9 +148,7 @@ class Krea2Pipeline(
             local_files_only=local_files_only,
         ).to(self._execution_device)
 
-        transformer_kwargs = get_transformer_config_kwargs(
-            od_config.tf_model_config, Krea2Transformer2DModel
-        )
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Krea2Transformer2DModel)
         self.transformer = Krea2Transformer2DModel(
             od_config=od_config,
             quant_config=od_config.quantization_config,
@@ -169,9 +161,7 @@ class Krea2Pipeline(
         self.is_distilled = model_config.get("is_distilled", False)
         self.patch_size = 2
 
-        self.vae_scale_factor = (
-            2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
-        )
+        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
 
         self._guidance_scale = 0.0
         self._current_timestep = None
@@ -205,14 +195,10 @@ class Krea2Pipeline(
             return_tensors="pt",
         ).to(device)
 
-        suffix_tokens = self.tokenizer(
-            [PROMPT_TEMPLATE_SUFFIX] * len(text), return_tensors="pt"
-        ).to(device)
+        suffix_tokens = self.tokenizer([PROMPT_TEMPLATE_SUFFIX] * len(text), return_tensors="pt").to(device)
 
         input_ids = torch.cat([text_tokens.input_ids, suffix_tokens.input_ids], dim=1)
-        attention_mask = torch.cat(
-            [text_tokens.attention_mask, suffix_tokens.attention_mask], dim=1
-        ).bool()
+        attention_mask = torch.cat([text_tokens.attention_mask, suffix_tokens.attention_mask], dim=1).bool()
 
         position_ids = (attention_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
         position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -223,9 +209,7 @@ class Krea2Pipeline(
             position_ids=position_ids,
             output_hidden_states=True,
         )
-        hidden_states = torch.stack(
-            [outputs.hidden_states[i] for i in self.text_encoder_select_layers], dim=2
-        )
+        hidden_states = torch.stack([outputs.hidden_states[i] for i in self.text_encoder_select_layers], dim=2)
 
         hidden_states = hidden_states[:, prefix_idx:]
         attention_mask = attention_mask[:, prefix_idx:]
@@ -237,18 +221,12 @@ class Krea2Pipeline(
         num_images_per_prompt: int = 1,
         max_sequence_length: int = 512,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prompt_embeds, prompt_embeds_mask = self.get_text_hidden_states(
-            prompt, max_sequence_length
-        )
+        prompt_embeds, prompt_embeds_mask = self.get_text_hidden_states(prompt, max_sequence_length)
         batch_size, seq_len, num_text_layers, dim = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1, 1)
-        prompt_embeds = prompt_embeds.view(
-            batch_size * num_images_per_prompt, seq_len, num_text_layers, dim
-        )
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, num_text_layers, dim)
         prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt)
-        prompt_embeds_mask = prompt_embeds_mask.view(
-            batch_size * num_images_per_prompt, seq_len
-        )
+        prompt_embeds_mask = prompt_embeds_mask.view(batch_size * num_images_per_prompt, seq_len)
         return prompt_embeds, prompt_embeds_mask
 
     def prepare_latents(
@@ -265,9 +243,7 @@ class Krea2Pipeline(
         latent_width = width // self.vae_scale_factor
         shape = (batch_size, num_channels_latents, latent_height, latent_width)
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        return pack_latents(
-            latents, batch_size, num_channels_latents, latent_height, latent_width, self.patch_size
-        )
+        return pack_latents(latents, batch_size, num_channels_latents, latent_height, latent_width, self.patch_size)
 
     def prepare_timesteps(
         self,
@@ -337,9 +313,11 @@ class Krea2Pipeline(
                 continue
 
             self._current_timestep = t
-            timestep = (t / self.scheduler.config.num_train_timesteps).expand(
-                latents.shape[0]
-            ).to(dtype=latents.dtype, device=latents.device)
+            timestep = (
+                (t / self.scheduler.config.num_train_timesteps)
+                .expand(latents.shape[0])
+                .to(dtype=latents.dtype, device=latents.device)
+            )
 
             positive_kwargs = {
                 "hidden_states": latents,
@@ -409,17 +387,11 @@ class Krea2Pipeline(
         max_sequence_length: int = 512,
         **kwargs: Any,
     ) -> DiffusionOutput:
-        prompt = (
-            [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
-            or prompt
-        )
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
         elif req.prompts:
-            negative_prompt = [
-                "" if isinstance(p, str) else (p.get("negative_prompt") or "")
-                for p in req.prompts
-            ]
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
         default_size = 1024
         height = req.sampling_params.height or height or default_size
@@ -427,9 +399,7 @@ class Krea2Pipeline(
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
-            req.sampling_params.guidance_scale
-            if req.sampling_params.guidance_scale_provided
-            else guidance_scale
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else guidance_scale
         )
         generator = req.sampling_params.generator or generator
         num_images_per_prompt = (
@@ -488,13 +458,9 @@ class Krea2Pipeline(
 
         grid_height = height // (self.vae_scale_factor * self.patch_size)
         grid_width = width // (self.vae_scale_factor * self.patch_size)
-        position_ids = prepare_position_ids(
-            prompt_embeds.shape[1], grid_height, grid_width, self._execution_device
-        )
+        position_ids = prepare_position_ids(prompt_embeds.shape[1], grid_height, grid_width, self._execution_device)
 
-        timesteps, num_inference_steps = self.prepare_timesteps(
-            num_inference_steps, sigmas, latents.shape[1]
-        )
+        timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
         self._num_timesteps = len(timesteps)
 
         latents = self.diffuse(
