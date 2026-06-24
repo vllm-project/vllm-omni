@@ -88,7 +88,7 @@ curl -s http://127.0.0.1:8091/v1/chat/completions \
 
 ### Optional knobs
 
-Pass image-gen overrides via the diffusion-stage `sampling_params_list[1].extra_args.image_gen`:
+Pass image-gen overrides as flat keys on the diffusion-stage `sampling_params_list[1].extra_args`:
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -97,25 +97,48 @@ Pass image-gen overrides via the diffusion-stage `sampling_params_list[1].extra_
 | `cfg` | 2.0 | Classifier-free guidance scale. |
 | `seed` | 42 | Per-request RNG seed (deterministic when ByT5 is also seed-stable). |
 | `byte5_text` | (auto) | Override the glyph text for ByT5 enhancement; raw strings are auto-wrapped to Ming's `Text "...". ` format. |
-| `negative_prompt` | empty | Real CFG negative conditioning (must be set on **stage-0 thinker** `sampling_params` so `expand_cfg_prompts` spawns the companion). |
+| `negative_prompt` | empty | Real CFG negative conditioning (set on **stage-0 thinker** `extra_args` so `expand_cfg_prompts` spawns the companion). |
 
 Example with all the knobs:
 
 ```bash
 curl http://127.0.0.1:8091/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-      "model": "Jonathan1909/Ming-flash-omni-2.0",
-      "modalities": ["image"],
-      "sampling_params_list": [
-        {"temperature":0.4,"top_p":0.9,"top_k":1,"max_tokens":1,"seed":42,
-         "extra_args":{"image_gen":{"negative_prompt":"ugly, blurry, distorted"}}},
-        {"seed":42,"extra_args":{"image_gen":{
-            "steps":6,"cfg":1.5,"height":512,"width":512,"seed":123,
-            "byte5_text":["理解与生成统一"]}}}
-      ],
-      "messages": [{"role": "user", "content": "Draw a poster."}]
-    }' | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' | base64 -d > ming_imagegen_knobs.png
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Jonathan1909/Ming-flash-omni-2.0",
+    "modalities": ["image"],
+    "sampling_params_list": [
+      {
+        "temperature": 0.4,
+        "top_p": 0.9,
+        "top_k": 1,
+        "max_tokens": 1,
+        "seed": 42,
+        "extra_args": {
+          "negative_prompt": "ugly, blurry, distorted"
+        }
+      },
+      {
+        "seed": 42,
+        "extra_args": {
+          "steps": 6,
+          "cfg": 1.5,
+          "height": 512,
+          "width": 512,
+          "seed": 123,
+          "byte5_text": ["理解与生成统一"]
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Draw a poster."
+      }
+    ]
+  }' \
+  | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
+  | base64 -d > ming_imagegen_knobs.png
 ```
 
 ### img2img (reference image)
