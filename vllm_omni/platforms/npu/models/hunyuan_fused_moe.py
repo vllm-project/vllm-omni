@@ -44,7 +44,7 @@ def _set_hunyuan_fused_moe_forward_context(num_tokens: int) -> None:
 
 def _init_mc2_group_for_diffusion(
     world_size: int,
-    expert_parallel_size: int,
+    mc2_group_size: int,
     backend: str,
     local_rank: int,
     group_ranks: list[list[int]] | None = None,
@@ -54,16 +54,13 @@ def _init_mc2_group_for_diffusion(
     if getattr(vllm_ascend_parallel_state, "_MC2", None) is not None:
         return
     if group_ranks is None:
-        if world_size % expert_parallel_size != 0:
-            raise ValueError(
-                f"world_size ({world_size}) must be divisible by expert_parallel_size ({expert_parallel_size})"
-            )
-        all_ranks = torch.arange(world_size).reshape(-1, expert_parallel_size)
+        if world_size % mc2_group_size != 0:
+            raise ValueError(f"world_size ({world_size}) must be divisible by mc2_group_size ({mc2_group_size})")
+        all_ranks = torch.arange(world_size).reshape(-1, mc2_group_size)
         group_ranks = [x.tolist() for x in all_ranks.unbind(0)]
-    elif any(len(ranks) != expert_parallel_size for ranks in group_ranks):
+    elif any(len(ranks) != mc2_group_size for ranks in group_ranks):
         raise ValueError(
-            f"All MC2 groups must have expert_parallel_size ({expert_parallel_size}) ranks, "
-            f"but got group_ranks={group_ranks}"
+            f"All MC2 groups must have mc2_group_size ({mc2_group_size}) ranks, but got group_ranks={group_ranks}"
         )
     vllm_ascend_parallel_state._MC2 = vllm_init_model_parallel_group(
         group_ranks,
@@ -112,16 +109,16 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
     tp_size = get_tensor_model_parallel_world_size()
     dp_size = get_data_parallel_world_size()
     if vllm_config.parallel_config.enable_expert_parallel:
-        expert_parallel_size = get_ep_group().world_size
+        mc2_group_size = get_ep_group().world_size
     else:
-        expert_parallel_size = dp_size * tp_size
+        mc2_group_size = dp_size * tp_size
     backend = torch.distributed.get_backend(get_world_group().device_group)
     local_rank = get_world_group().local_rank
     if vllm_config.parallel_config.enable_expert_parallel:
         _sync_ascend_ep_group_for_diffusion()
     _init_mc2_group_for_diffusion(
         world_size=world_size,
-        expert_parallel_size=expert_parallel_size,
+        mc2_group_size=mc2_group_size,
         backend=backend,
         local_rank=local_rank,
         group_ranks=get_expert_parallel_group_ranks() if vllm_config.parallel_config.enable_expert_parallel else None,
