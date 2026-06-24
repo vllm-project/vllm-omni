@@ -100,11 +100,12 @@ class RingAttentionFunc(torch.autograd.Function):
             if not is_causal or step <= comm.rank:
                 step_k = k
                 step_v = v
-                if step == 0 and joint_tensor_key is not None:
+                # Always concatenate joint tensors when present (both strategies)
+                if joint_tensor_key is not None:
                     if joint_strategy == "front":
                         step_k = torch.cat([joint_tensor_key, step_k], dim=1)
                         step_v = torch.cat([joint_tensor_value, step_v], dim=1)
-                    else:
+                    else:  # rear
                         step_k = torch.cat([step_k, joint_tensor_key], dim=1)
                         step_v = torch.cat([step_v, joint_tensor_value], dim=1)
 
