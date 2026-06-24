@@ -404,6 +404,65 @@ def test_pad_prompt_embeds_keeps_last_tokens_and_builds_mask():
         JoyImageEditPipeline._pad_prompt_embeds([first], max_sequence_length=0)
 
 
+@pytest.mark.parametrize(
+    ("prompt_embeds", "prompt_embeds_mask", "match"),
+    [
+        (
+            torch.zeros(2, 4),
+            torch.ones(2, 4, dtype=torch.long),
+            "prompt_embeds must be a 3D tensor",
+        ),
+        (
+            torch.zeros(2, 4, 8),
+            torch.ones(2, 4, 1, dtype=torch.long),
+            "prompt_embeds_mask must be a 2D tensor",
+        ),
+        (
+            torch.zeros(2, 4, 8),
+            torch.ones(3, 4, dtype=torch.long),
+            "same batch size",
+        ),
+        (
+            torch.zeros(2, 4, 8),
+            torch.ones(2, 5, dtype=torch.long),
+            "same sequence length",
+        ),
+    ],
+)
+def test_encode_prompt_validates_precomputed_embeds_and_mask_shapes(
+    prompt_embeds,
+    prompt_embeds_mask,
+    match,
+):
+    pipeline = object.__new__(JoyImageEditPipeline)
+
+    with pytest.raises(ValueError, match=match):
+        JoyImageEditPipeline.encode_prompt(
+            pipeline,
+            "prompt",
+            Image.new("RGB", (16, 16)),
+            num_images_per_prompt=1,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+        )
+
+
+def test_encode_prompt_validation_uses_negative_parameter_names():
+    pipeline = object.__new__(JoyImageEditPipeline)
+
+    with pytest.raises(ValueError, match="negative_prompt_embeds_mask must be a 2D tensor"):
+        JoyImageEditPipeline.encode_prompt(
+            pipeline,
+            "",
+            Image.new("RGB", (16, 16)),
+            num_images_per_prompt=1,
+            prompt_embeds=torch.zeros(1, 4, 8),
+            prompt_embeds_mask=torch.ones(1, 4, 1, dtype=torch.long),
+            embeds_name="negative_prompt_embeds",
+            mask_name="negative_prompt_embeds_mask",
+        )
+
+
 def test_last_layer_capture_passes_mm_token_type_ids():
     class FakeDecoderLayer(torch.nn.Module):
         def forward(self, hidden_states):

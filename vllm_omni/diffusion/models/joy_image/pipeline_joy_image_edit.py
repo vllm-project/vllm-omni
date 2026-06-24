@@ -554,6 +554,36 @@ class JoyImageEditPipeline(
         )
         return prompt_embeds.to(dtype=dtype, device=self.device), prompt_mask.to(device=self.device)
 
+    @staticmethod
+    def _validate_prompt_embeds_and_mask(
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        *,
+        embeds_name: str = "prompt_embeds",
+        mask_name: str = "prompt_embeds_mask",
+    ) -> None:
+        """Fail early for precomputed prompt embeds before attention uses them."""
+        if prompt_embeds.ndim != 3:
+            raise ValueError(
+                f"{embeds_name} must be a 3D tensor of shape "
+                f"(batch, sequence_length, hidden_size), got shape {tuple(prompt_embeds.shape)}."
+            )
+        if prompt_embeds_mask.ndim != 2:
+            raise ValueError(
+                f"{mask_name} must be a 2D tensor of shape "
+                f"(batch, sequence_length), got shape {tuple(prompt_embeds_mask.shape)}."
+            )
+        if prompt_embeds.shape[0] != prompt_embeds_mask.shape[0]:
+            raise ValueError(
+                f"{embeds_name} and {mask_name} must have the same batch size, got "
+                f"{prompt_embeds.shape[0]} and {prompt_embeds_mask.shape[0]}."
+            )
+        if prompt_embeds.shape[1] != prompt_embeds_mask.shape[1]:
+            raise ValueError(
+                f"{embeds_name} and {mask_name} must have the same sequence length, got "
+                f"{prompt_embeds.shape[1]} and {prompt_embeds_mask.shape[1]}."
+            )
+
     def encode_prompt(
         self,
         prompt: str | list[str],
@@ -561,6 +591,8 @@ class JoyImageEditPipeline(
         num_images_per_prompt: int,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
+        embeds_name: str = "prompt_embeds",
+        mask_name: str = "prompt_embeds_mask",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
         if prompt_embeds is None:
@@ -569,7 +601,13 @@ class JoyImageEditPipeline(
                 image,
             )
         if prompt_embeds_mask is None:
-            raise ValueError("prompt_embeds_mask must be provided with prompt_embeds.")
+            raise ValueError(f"{mask_name} must be provided with {embeds_name}.")
+        self._validate_prompt_embeds_and_mask(
+            prompt_embeds,
+            prompt_embeds_mask,
+            embeds_name=embeds_name,
+            mask_name=mask_name,
+        )
         prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
         prompt_embeds_mask = prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
         return prompt_embeds, prompt_embeds_mask
@@ -785,6 +823,8 @@ class JoyImageEditPipeline(
                 num_images_per_prompt=num_images_per_prompt,
                 prompt_embeds=negative_prompt_embeds,
                 prompt_embeds_mask=negative_prompt_embeds_mask,
+                embeds_name="negative_prompt_embeds",
+                mask_name="negative_prompt_embeds_mask",
             )
         else:
             negative_prompt_embeds = None
