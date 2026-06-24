@@ -271,18 +271,9 @@ class Wan22I2VPipeline(
         )
         if self.has_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            t2_quant = transformer_2_config.get("quantization_config")
-            if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-                from vllm_omni.quantization.factory import build_quant_config
-
-                method = t2_quant["quant_method"]
-                kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
-                t2_quant = build_quant_config(method, **kwargs)
-            else:
-                t2_quant = None
             self.transformer_2 = create_transformer_from_config(
                 transformer_2_config,
-                quant_config=t2_quant,
+                quant_config=od_config.quantization_config,
             )
         else:
             self.transformer_2 = None

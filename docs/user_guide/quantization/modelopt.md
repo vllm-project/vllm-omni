@@ -77,12 +77,72 @@ backend and quality validation.
 | FLUX.2-klein 4B | `feizhai123/flux2-klein-4b-modelopt-fp8` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
 | HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-fp8` | MoE diffusion transformer | Validated for ModelOpt FP8 checkpoints |
 | HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8` | MoE diffusion transformer | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
-| Wan2.2 | Not available | Diffusion transformer | Not validated |
+| Wan2.2 T2V A14B | `nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4` | Dual DiT transformers | Validated for ModelOpt NVFP4 checkpoints |
+| Wan2.2 T2V A14B | ModelOpt mixed FP8/NVFP4 export | Dual DiT transformers | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
 
 For full serving commands and benchmark context, see
 [`recipes/Qwen/Qwen-Image.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image.md)
 and
 [`recipes/Tencent/HunyuanImage-3.0-Instruct.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md).
+
+#### Wan2.2 T2V A14B ModelOpt NVFP4 and Mixed FP8/NVFP4
+
+Wan2.2 T2V A14B uses two DiT transformer stages, `transformer` and
+`transformer_2`. ModelOpt checkpoints may carry a separate
+`quantization_config` in each transformer subfolder, and vLLM-Omni resolves
+each transformer from its own checkpoint config.
+
+For the validated mixed checkpoint, each transformer policy uses dynamic FP8
+for sensitive linear layers and NVFP4 for the remaining quantized linear
+layers:
+
+```text
+FP8_PER_CHANNEL_PER_TOKEN: 54 layers
+NVFP4:                    340 layers
+```
+
+The NVIDIA NVFP4 checkpoint keeps several sensitive blocks in BF16 via its
+`ignore` policy. The mixed checkpoint routes those sensitive linear layers to
+FP8 instead, while keeping the heavier linear layers on NVFP4. Tokenizer,
+scheduler, text encoder, and VAE stay on the base BF16 components.
+
+Start a mixed checkpoint with CUTLASS selected for both NVFP4 and FP8 linear
+kernels:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+VLLM_NVFP4_GEMM_BACKEND=cutlass \
+vllm serve /path/to/Wan2.2-T2V-A14B-Diffusers-NVFP4-sensitive-dynfp8 \
+  --omni \
+  --host 0.0.0.0 \
+  --port 8091 \
+  --trust-remote-code \
+  --force-cutlass-fp8
+```
+
+For serving benchmarks, the following numbers were measured on one B300 with
+8 text-to-video requests, max concurrency 4, 832x480 resolution, 33 frames,
+16 FPS, 50 denoising steps, and seed 42:
+
+| Config | Throughput | Mean latency | P50 latency | P99 latency | Peak VRAM |
+|--------|-----------:|-------------:|------------:|------------:|----------:|
+| BF16 | 0.024 req/s | 133.44s | 163.22s | 164.23s | 75,758 MiB |
+| NVIDIA NVFP4 | 0.034 req/s | 95.40s | 116.15s | 118.22s | 43,502 MiB |
+| Mixed NVFP4+dynFP8 | 0.035 req/s | 93.11s | 114.12s | 114.15s | 39,520 MiB |
+
+Quality was checked against the BF16 baseline with the same prompt, seed,
+resolution, and generation settings. Lower LPIPS and MAE are better; higher
+PSNR is better.
+
+| Quantized checkpoint vs BF16 | LPIPS | PSNR | MAE |
+|------------------------------|------:|-----:|----:|
+| NVIDIA NVFP4 | 0.4161 | 18.1474 dB | 0.079288 |
+| Mixed NVFP4+dynFP8 | 0.3938 | 18.8338 dB | 0.073189 |
+
+Both quantized checkpoints pass the quality gate. In this run, the mixed
+NVFP4+dynFP8 checkpoint is slightly closer to BF16 on perceptual and
+pixel-level similarity metrics while also using less peak memory in the
+serving benchmark.
 
 ### Multi-Stage Omni/TTS Model
 

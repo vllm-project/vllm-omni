@@ -336,6 +336,37 @@ def _patch_chat_template_registry():
 _patch_chat_template_registry()
 
 
+import vllm.model_executor.layers.quantization.modelopt as _modelopt  # noqa: E402
+
+_original_modelopt_mixed_get_quant_method = _modelopt.ModelOptMixedPrecisionConfig.get_quant_method
+_MODELOPT_MIXED_FP8_METHODS = {
+    "FP8_PER_CHANNEL_PER_TOKEN": _modelopt.ModelOptFp8PcPtLinearMethod,
+    "FP8_PB_WO": _modelopt.ModelOptFp8PbWoLinearMethod,
+}
+
+
+def _modelopt_fp8_config(config, quant_algo: str):
+    return _modelopt.ModelOptFp8Config(
+        quant_method=quant_algo,
+        is_checkpoint_fp8_serialized=True,
+        kv_cache_quant_method=config.kv_cache_quant_method,
+        exclude_modules=[],
+    )
+
+
+def _patched_modelopt_mixed_get_quant_method(self, layer, prefix):
+    if isinstance(layer, _modelopt.LinearBase) and not self.is_layer_excluded(prefix):
+        quant_algo = self._resolve_quant_algo(prefix)
+        method_cls = _MODELOPT_MIXED_FP8_METHODS.get(quant_algo)
+        if method_cls is not None:
+            return method_cls(_modelopt_fp8_config(self, quant_algo))
+
+    return _original_modelopt_mixed_get_quant_method(self, layer, prefix)
+
+
+_modelopt.ModelOptMixedPrecisionConfig.get_quant_method = _patched_modelopt_mixed_get_quant_method
+
+
 def _patch_scaled_mm_fp8_contiguous_activation():
     """Support batched diffusion activations on the ModelOpt FP8 (ScaledMM) path.
 

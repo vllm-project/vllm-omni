@@ -16,6 +16,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
@@ -165,6 +166,7 @@ def create_transformer_from_config(
         quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
 
     if quant_config is not None:
+        configure_quant_config(quant_config, WanTransformer3DModel)
         kwargs["quant_config"] = quant_config
     if prefix:
         kwargs["prefix"] = prefix

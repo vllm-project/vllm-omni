@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
+    WeightsMapper,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -783,6 +784,17 @@ class WanTransformer3DModel(nn.Module):
 
     _repeated_blocks = ["WanTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["blocks"]
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".ffn.net.0.": ".ffn.net_0.",
+            ".ffn.net.2.": ".ffn.net_2.",
+            ".to_out.0.": ".to_out.",
+        },
+        orig_to_new_suffix={
+            ".ffn.net.2": ".ffn.net_2",
+            ".to_out.0": ".to_out",
+        },
+    )
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
@@ -856,6 +868,7 @@ class WanTransformer3DModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
+        self.quant_config = quant_config
 
         # Store config for compatibility
         self.config = type(
@@ -1123,15 +1136,14 @@ class WanTransformer3DModel(nn.Module):
             # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
             # through to the else branch and are loaded directly.
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if f"{weight_name}." not in original_name:
                     continue
                 lookup_name = original_name.replace(weight_name, param_name)
                 # Skip weights that belong to PP stages other than this one
                 if is_pp_missing_parameter(lookup_name, self) or lookup_name not in params_dict:
                     break
                 param = params_dict[lookup_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                param.weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight

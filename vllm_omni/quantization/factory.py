@@ -201,6 +201,7 @@ _MODEL_OPT_FP8_ALGOS = {
 }
 _MODEL_OPT_NVFP4_ALGOS = {
     "NVFP4",
+    "W4A16_NVFP4",
 }
 _MODEL_OPT_MIXED_ALGOS = {
     "MIXED_PRECISION",
@@ -211,12 +212,17 @@ def _normalize_method_name(method: Any) -> str:
     return str(method).lower().replace("-", "_")
 
 
-def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
+def _get_modelopt_quant_algo(config: Mapping[str, Any]) -> str:
     quantization = config.get("quantization")
     if isinstance(quantization, Mapping):
-        quant_algo = str(quantization.get("quant_algo", "")).upper()
-    else:
-        quant_algo = str(config.get("quant_algo", "")).upper()
+        quant_algo = quantization.get("quant_algo")
+        if quant_algo:
+            return str(quant_algo).upper()
+    return str(config.get("quant_algo", "")).upper()
+
+
+def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
+    quant_algo = _get_modelopt_quant_algo(config)
 
     method = config.get("method", config.get("quant_method"))
     normalized_method = _normalize_method_name(method) if method is not None else None
@@ -423,41 +429,64 @@ def resolve_quant_config_from_disk(
             return build_quant_config(disk_qc)
         return quant_config
 
-    if not isinstance(disk_qc, Mapping) or "quant_method" not in disk_qc:
+    if not isinstance(disk_qc, Mapping):
         return quant_config
 
-    qc_method: str = disk_qc["quant_method"]
-    qc_kwargs: dict[str, Any] = {k: v for k, v in disk_qc.items() if k != "quant_method"}
+    disk_spec = dict(disk_qc)
+    raw_method = disk_spec.get("quant_method", disk_spec.get("method"))
+    detected_modelopt_method = _detect_modelopt_method(disk_spec)
+    if detected_modelopt_method is None and raw_method is None:
+        return quant_config
+
+    disk_method = detected_modelopt_method or str(raw_method)
+    qc_kwargs: dict[str, Any] = {k: v for k, v in disk_spec.items() if k not in {"method", "quant_method"}}
 
     if quant_config is None:
         logger.info(
             "Auto-detected quantization from config.json: method=%s kwargs=%s",
-            qc_method,
+            disk_method,
             qc_kwargs,
         )
-        return build_quant_config(qc_method, **qc_kwargs)
+        return build_quant_config(disk_spec)
 
     active_method = _normalize_quant_method_alias(quant_config.get_name())
-    disk_method = _normalize_quant_method_alias(qc_method)
-    if active_method != disk_method:
+    normalized_disk_method = _normalize_quant_method_alias(disk_method)
+    if active_method != normalized_disk_method:
         raise ValueError(
-            f"Checkpoint config.json declares quant_method={qc_method!r} but the "
+            f"Checkpoint config.json declares quant_method={raw_method!r} "
+            f"(resolved as {disk_method!r}) but the "
             f"active quantization config is {quant_config.get_name()!r}. "
             "Pass a matching --quantization flag or omit it for auto-detection."
         )
 
+    if detected_modelopt_method is not None:
+        disk_quant_algo = _get_modelopt_quant_algo(disk_spec)
+        if detected_modelopt_method == "modelopt_mixed":
+            logger.info("Using per-transformer checkpoint ModelOpt mixed policy.")
+            return build_quant_config(disk_spec)
+
+        active_quant_algo = str(getattr(quant_config, "quant_method", "")).upper()
+        serialized_flag = {
+            "modelopt": "is_checkpoint_fp8_serialized",
+            "modelopt_fp4": "is_checkpoint_nvfp4_serialized",
+        }.get(detected_modelopt_method)
+        active_is_serialized = serialized_flag is None or bool(getattr(quant_config, serialized_flag, False))
+        if active_quant_algo != disk_quant_algo or not active_is_serialized:
+            logger.info("Using checkpoint ModelOpt config for quant_algo=%s.", disk_quant_algo)
+            return build_quant_config(disk_spec)
+
     if _disk_marks_serialized(qc_kwargs, quant_config):
         logger.info(
             "config.json marks checkpoint as serialized; switching to offline %s mode.",
-            qc_method,
+            disk_method,
         )
-        return build_quant_config(qc_method, **qc_kwargs)
+        return build_quant_config(disk_spec)
 
     # AutoRound MXFP8 checkpoints use data_type="mx_fp" instead of
     # is_checkpoint_*_serialized; rebuild so the offline path is selected.
     if qc_kwargs.get("data_type") == "mx_fp":
         logger.info("config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP8.")
-        return build_quant_config(qc_method, **qc_kwargs)
+        return build_quant_config(disk_spec)
 
     if (
         "ignored_layers" in qc_kwargs
@@ -465,6 +494,6 @@ def resolve_quant_config_from_disk(
         and set(qc_kwargs.get("ignored_layers") or []) != set(quant_config.ignored_layers or [])
     ):
         logger.info("config.json ignored_layers differs from active config; rebuilding quant_config.")
-        return build_quant_config(qc_method, **qc_kwargs)
+        return build_quant_config(disk_spec)
 
     return quant_config
