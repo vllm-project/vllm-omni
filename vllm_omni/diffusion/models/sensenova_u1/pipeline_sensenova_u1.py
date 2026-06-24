@@ -31,7 +31,6 @@ import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -485,39 +484,6 @@ def _optimized_scale(positive_flat, negative_flat):
 
 
 # ---------------------------------------------------------------------------
-# Gen-only FP8 wrapper
-# ---------------------------------------------------------------------------
-
-
-class _GenOnlyQuantConfig:
-    """Wraps an inner QuantizationConfig so only ``*_mot_gen`` layers are quantized.
-
-    SenseNova-U1 uses Mixture-of-Tokenizers with duplicate weights per layer:
-    understanding path (``qkv_proj``, ``mlp``) and generation path
-    (``qkv_proj_mot_gen``, ``mlp_mot_gen``).  The RFC requires FP8 only on the
-    gen-path GEMMs during denoising; und-path layers stay in BF16.
-
-    This is *not* a full ``QuantizationConfig`` subclass — it only needs to
-    satisfy the duck-typed interface that ``LinearBase.__init__`` uses:
-    ``get_quant_method(layer, prefix)``.  The outer registry and weight-loader
-    still operate on the original config stored in ``od_config.quantization_config``.
-    """
-
-    def __init__(self, inner: QuantizationConfig):
-        self._inner = inner
-
-    def get_quant_method(self, layer, prefix: str = ""):
-        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-
-        if "mot_gen" in prefix:
-            return self._inner.get_quant_method(layer, prefix)
-        return UnquantizedLinearMethod()
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
-# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -538,30 +504,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
     support_image_input = True
 
-    # Model-specific parameters accepted via ``extra_body`` in the online
-    # serving API.  The serving layer reads this set and forwards matching
-    # keys from the request payload to ``OmniDiffusionSamplingParams.extra_args``.
-    EXTRA_BODY_PARAMS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "think",
-            "cfg_scale",
-            "cfg_norm",
-            "timestep_shift",
-            "t_eps",
-            "img_cfg_scale",
-            "max_tokens",
-        }
-    )
-
-    # Keys from ``DiffusionOutput.custom_output`` that should be surfaced in
-    # the API response ``metrics`` dict.  The serving layer reads this set and
-    # copies matching entries from ``custom_output`` into the response.
-    EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "think_text",
-        }
-    )
-
     # CPU-offload protocol: language_model carries the denoising blocks; the
     # vision and FM modules are lightweight encoders pinned on GPU during the
     # diffusion loop. There is no separate VAE.
@@ -569,6 +511,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
     _vae_modules: ClassVar[list[str]] = []
     _resident_modules: ClassVar[list[str]] = ["fm_modules"]
+
+    # Top-level module(s) the diffusion LoRA manager scans (both MoT branches).
+    # TODO: promote to a shared LoRA contract/mixin instead of per-pipeline opt-in.
+    _lora_components: ClassVar[list[str]] = ["language_model"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -583,17 +529,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_start_token_id = self.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
 
-        # Language model (TP-aware).
-        # Wrap quant_config so only gen-path (mot_gen) layers are quantized;
-        # understanding-path layers stay in BF16.
-        quant_config = od_config.quantization_config
-        if quant_config is not None:
-            quant_config = _GenOnlyQuantConfig(quant_config)
+        # Language model (TP-aware)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
-            quant_config=quant_config,
             prefix="language_model",
         )
+        # We define this for Cache DiT compatibility
+        self.transformer = self.language_model.model
 
         # Vision model (understanding branch)
         self.vision_model = NEOVisionModel(self.vis_cfg)
@@ -1494,6 +1436,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()

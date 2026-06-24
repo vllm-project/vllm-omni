@@ -8,8 +8,8 @@ import json
 import logging
 import math
 import os
-from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -26,15 +26,17 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.base_config import (
-        QuantizationConfig,
-    )
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 logger = logging.getLogger(__name__)
 
@@ -151,12 +153,19 @@ def get_helios_pre_process_func(
     return pre_process_func
 
 
-class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
+class HeliosPipeline(
+    nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
 
     Supports T2V, I2V (with image input), and V2V (with video input).
     Implements chunked video generation with multi-term memory history context.
     """
+
+    supports_step_execution: ClassVar[bool] = True
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,
@@ -259,6 +268,640 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
     @property
     def current_timestep(self):
         return self._current_timestep
+
+    def _stage1_sigmas(self, num_steps: int) -> np.ndarray:
+        # DMD drops the last timestep in set_timesteps(). Only compensate for
+        # the one-step dummy-run edge case; otherwise preserve the historical
+        # stage-1 schedule used by request-level forward().
+        sigma_count = num_steps + 2 if self.is_distilled and num_steps == 1 else num_steps + 1
+        return np.linspace(0.999, 0.0, sigma_count)[:-1]
+
+    def prepare_encode(
+        self,
+        state: DiffusionRequestState,
+        **kwargs: Any,
+    ) -> DiffusionRequestState:
+        """Initialize Helios request state for chunk-wise step execution."""
+        del kwargs
+        req = OmniDiffusionRequest(
+            prompts=state.prompts or [],
+            sampling_params=state.sampling,
+            request_id=state.request_id,
+        )
+        extra = getattr(state.sampling, "extra_args", {}) or {}
+
+        history_sizes = sorted(extra.get("history_sizes", [16, 2, 1]), reverse=True)
+        num_latent_frames_per_chunk = int(extra.get("num_latent_frames_per_chunk", 9))
+        keep_first_frame = bool(extra.get("keep_first_frame", True))
+        frame_num = int(extra.get("frame_num", 132))
+        height = (int(state.sampling.height or extra.get("height", 384)) // 16) * 16
+        width = (int(state.sampling.width or extra.get("width", 640)) // 16) * 16
+        num_frames = max(int(state.sampling.num_frames or frame_num), 1)
+        num_steps = int(state.sampling.num_inference_steps or extra.get("num_inference_steps", 50))
+        output_type = extra.get("output_type", "np")
+
+        image = extra.get("image")
+        video = extra.get("video")
+        if image is not None and video is not None:
+            raise ValueError("image and video cannot be provided simultaneously")
+        if len(req.prompts) > 1:
+            raise ValueError("Helios step execution supports a single prompt, not a batched request.")
+
+        prompt = None
+        negative_prompt = None
+        if len(req.prompts) == 1:
+            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
+            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+        if prompt is None:
+            raise ValueError("Prompt is required for Helios generation.")
+
+        guidance_scale = float(extra.get("guidance_scale", 5.0))
+        if state.sampling.guidance_scale_provided:
+            guidance_scale = state.sampling.guidance_scale
+        self._guidance_scale = guidance_scale
+
+        device = self.device
+        dtype = self.transformer.dtype
+        generator = state.sampling.generator
+        if generator is None and state.sampling.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(state.sampling.seed)
+            state.sampling.generator = generator
+
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            num_videos_per_prompt=state.sampling.num_outputs_per_prompt or 1,
+            max_sequence_length=state.sampling.max_sequence_length or 226,
+            device=device,
+            dtype=dtype,
+        )
+        batch_size = prompt_embeds.shape[0]
+
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(self.vae.device, self.vae.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            self.vae.device, self.vae.dtype
+        )
+
+        add_noise_to_image_latents = bool(extra.get("add_noise_to_image_latents", True))
+        image_noise_sigma_min = float(extra.get("image_noise_sigma_min", 0.111))
+        image_noise_sigma_max = float(extra.get("image_noise_sigma_max", 0.135))
+        add_noise_to_video_latents = bool(extra.get("add_noise_to_video_latents", True))
+        video_noise_sigma_min = float(extra.get("video_noise_sigma_min", 0.111))
+        video_noise_sigma_max = float(extra.get("video_noise_sigma_max", 0.135))
+
+        fake_image_latents = None
+        image_latents = None
+        if image is not None:
+            image_latents, fake_image_latents = self.prepare_image_latents(
+                image,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                num_latent_frames_per_chunk=num_latent_frames_per_chunk,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+
+        if image_latents is not None and add_noise_to_image_latents:
+            image_noise_sigma = (
+                torch.rand(1, device=device, generator=generator) * (image_noise_sigma_max - image_noise_sigma_min)
+                + image_noise_sigma_min
+            )
+            image_latents = (
+                image_noise_sigma * randn_tensor(image_latents.shape, generator=generator, device=device)
+                + (1 - image_noise_sigma) * image_latents
+            )
+            fake_image_noise_sigma = (
+                torch.rand(1, device=device, generator=generator) * (video_noise_sigma_max - video_noise_sigma_min)
+                + video_noise_sigma_min
+            )
+            fake_image_latents = (
+                fake_image_noise_sigma * randn_tensor(fake_image_latents.shape, generator=generator, device=device)
+                + (1 - fake_image_noise_sigma) * fake_image_latents
+            )
+
+        video_latents = None
+        if video is not None:
+            image_latents, video_latents = self.prepare_video_latents(
+                video,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                num_latent_frames_per_chunk=num_latent_frames_per_chunk,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+
+        if video_latents is not None and add_noise_to_video_latents:
+            image_noise_sigma = (
+                torch.rand(1, device=device, generator=generator) * (image_noise_sigma_max - image_noise_sigma_min)
+                + image_noise_sigma_min
+            )
+            image_latents = (
+                image_noise_sigma * randn_tensor(image_latents.shape, generator=generator, device=device)
+                + (1 - image_noise_sigma) * image_latents
+            )
+            noisy_latents_chunks = []
+            num_latent_chunks = video_latents.shape[2] // num_latent_frames_per_chunk
+            for i in range(num_latent_chunks):
+                chunk_start = i * num_latent_frames_per_chunk
+                chunk_end = chunk_start + num_latent_frames_per_chunk
+                latent_chunk = video_latents[:, :, chunk_start:chunk_end, :, :]
+                chunk_frames = latent_chunk.shape[2]
+                frame_sigmas = (
+                    torch.rand(chunk_frames, device=device, generator=generator)
+                    * (video_noise_sigma_max - video_noise_sigma_min)
+                    + video_noise_sigma_min
+                )
+                frame_sigmas = frame_sigmas.view(1, 1, chunk_frames, 1, 1)
+                noisy_chunk = (
+                    frame_sigmas * randn_tensor(latent_chunk.shape, generator=generator, device=device)
+                    + (1 - frame_sigmas) * latent_chunk
+                )
+                noisy_latents_chunks.append(noisy_chunk)
+            video_latents = torch.cat(noisy_latents_chunks, dim=2)
+
+        num_channels_latents = self.transformer.config.in_channels
+        window_num_frames = (num_latent_frames_per_chunk - 1) * self.vae_scale_factor_temporal + 1
+        num_latent_chunk = max(1, (num_frames + window_num_frames - 1) // window_num_frames)
+        num_history_latent_frames = sum(history_sizes)
+        total_generated_latent_frames = 0
+        if not keep_first_frame:
+            history_sizes[-1] = history_sizes[-1] + 1
+
+        history_latents = torch.zeros(
+            batch_size,
+            num_channels_latents,
+            num_history_latent_frames,
+            height // self.vae_scale_factor_spatial,
+            width // self.vae_scale_factor_spatial,
+            device=device,
+            dtype=torch.float32,
+        )
+        if fake_image_latents is not None:
+            history_latents = torch.cat([history_latents[:, :, :-1, :, :], fake_image_latents], dim=2)
+            total_generated_latent_frames += 1
+        if video_latents is not None:
+            history_frames = history_latents.shape[2]
+            video_frames = video_latents.shape[2]
+            if video_frames < history_frames:
+                keep_frames = history_frames - video_frames
+                history_latents = torch.cat([history_latents[:, :, :keep_frames, :, :], video_latents], dim=2)
+            else:
+                history_latents = video_latents
+            total_generated_latent_frames += video_latents.shape[2]
+
+        if keep_first_frame:
+            indices = torch.arange(0, sum([1, *history_sizes, num_latent_frames_per_chunk]))
+            (
+                indices_prefix,
+                indices_latents_history_long,
+                indices_latents_history_mid,
+                indices_latents_history_1x,
+                indices_hidden_states,
+            ) = indices.split([1, *history_sizes, num_latent_frames_per_chunk], dim=0)
+            indices_latents_history_short = torch.cat([indices_prefix, indices_latents_history_1x], dim=0)
+        else:
+            indices = torch.arange(0, sum([*history_sizes, num_latent_frames_per_chunk]))
+            (
+                indices_latents_history_long,
+                indices_latents_history_mid,
+                indices_latents_history_short,
+                indices_hidden_states,
+            ) = indices.split([*history_sizes, num_latent_frames_per_chunk], dim=0)
+
+        state.prompt_embeds = prompt_embeds
+        state.negative_prompt_embeds = negative_prompt_embeds
+        state.do_true_cfg = self.do_classifier_free_guidance
+        state.chunk_index = 0
+        state.step_in_chunk = 0
+        state.total_chunks = num_latent_chunk
+        state.extra.update(
+            {
+                "attention_kwargs": extra.get("attention_kwargs", {}) or {},
+                "batch_size": batch_size,
+                "dtype": dtype,
+                "generator": generator,
+                "guidance_scale": guidance_scale,
+                "height": height,
+                "history_latents": history_latents,
+                "history_sizes": history_sizes,
+                "history_video": None,
+                "image_latents": image_latents,
+                "indices_hidden_states": indices_hidden_states.unsqueeze(0),
+                "indices_latents_history_long": indices_latents_history_long.unsqueeze(0),
+                "indices_latents_history_mid": indices_latents_history_mid.unsqueeze(0),
+                "indices_latents_history_short": indices_latents_history_short.unsqueeze(0),
+                "is_amplify_first_chunk": bool(extra.get("is_amplify_first_chunk", False)),
+                "is_enable_stage2": bool(extra.get("is_enable_stage2", False)),
+                "is_skip_first_chunk": bool(extra.get("is_skip_first_chunk", False)),
+                "keep_first_frame": keep_first_frame,
+                "latents_mean": latents_mean,
+                "latents_std": latents_std,
+                "num_channels_latents": num_channels_latents,
+                "num_history_latent_frames": num_history_latent_frames,
+                "num_latent_frames_per_chunk": num_latent_frames_per_chunk,
+                "num_steps": num_steps,
+                "output_type": output_type,
+                "pyramid_num_inference_steps_list": extra.get("pyramid_num_inference_steps_list", [10, 10, 10]),
+                "pyramid_num_stages": int(extra.get("pyramid_num_stages", 3)),
+                "total_generated_latent_frames": total_generated_latent_frames,
+                "use_cfg_zero_star": bool(extra.get("use_cfg_zero_star", False)),
+                "use_zero_init": bool(extra.get("use_zero_init", True)),
+                "vae_dtype": self.vae.dtype,
+                "width": width,
+                "window_num_frames": window_num_frames,
+                "zero_steps": int(extra.get("zero_steps", 1)),
+            }
+        )
+        self._prepare_next_chunk(state)
+        return state
+
+    def _prepare_next_chunk(self, state: DiffusionRequestState) -> None:
+        extra = state.extra
+        k = state.chunk_index
+        is_first_chunk = k == 0
+        is_second_chunk = k == 1
+        history_sizes = extra["history_sizes"]
+        history_latents = extra["history_latents"]
+        keep_first_frame = extra["keep_first_frame"]
+        image_latents = extra["image_latents"]
+        num_history_latent_frames = extra["num_history_latent_frames"]
+
+        if keep_first_frame:
+            latents_history_long, latents_history_mid, latents_history_1x = history_latents[
+                :, :, -num_history_latent_frames:
+            ].split(history_sizes, dim=2)
+            if image_latents is None and is_first_chunk:
+                latents_prefix = torch.zeros(
+                    (
+                        extra["batch_size"],
+                        extra["num_channels_latents"],
+                        1,
+                        latents_history_1x.shape[-2],
+                        latents_history_1x.shape[-1],
+                    ),
+                    device=latents_history_1x.device,
+                    dtype=latents_history_1x.dtype,
+                )
+            else:
+                latents_prefix = image_latents
+            latents_history_short = torch.cat([latents_prefix, latents_history_1x], dim=2)
+        else:
+            latents_history_long, latents_history_mid, latents_history_short = history_latents[
+                :, :, -num_history_latent_frames:
+            ].split(history_sizes, dim=2)
+
+        state.latents = self.prepare_latents(
+            extra["batch_size"],
+            extra["num_channels_latents"],
+            extra["height"],
+            extra["width"],
+            extra["window_num_frames"],
+            dtype=torch.float32,
+            device=self.device,
+            generator=extra["generator"],
+            latents=None,
+        )
+        extra["stage1_start_latents"] = state.latents
+        extra.update(
+            {
+                "is_first_chunk": is_first_chunk,
+                "is_second_chunk": is_second_chunk,
+                "latents_history_long": latents_history_long,
+                "latents_history_mid": latents_history_mid,
+                "latents_history_short": latents_history_short,
+            }
+        )
+
+        if not extra["is_enable_stage2"]:
+            patch_size = self.transformer.config.patch_size
+            image_seq_len = (state.latents.shape[-1] * state.latents.shape[-2] * state.latents.shape[-3]) // (
+                patch_size[0] * patch_size[1] * patch_size[2]
+            )
+            sigmas = self._stage1_sigmas(extra["num_steps"])
+            mu = calculate_shift(image_seq_len)
+            self.scheduler.set_timesteps(extra["num_steps"], device=self.device, sigmas=sigmas, mu=mu)
+            state.timesteps = self.scheduler.timesteps
+            state.chunk_num_steps = len(state.timesteps)
+        else:
+            self._prepare_stage2_chunk(state)
+
+        state.step_in_chunk = 0
+        state.step_index = 0
+        self._num_timesteps = state.chunk_num_steps
+
+    def _prepare_stage2_chunk(self, state: DiffusionRequestState) -> None:
+        extra = state.extra
+        batch_size, num_channel, num_frames_lat, height, width = state.latents.shape
+        latents_flat = state.latents.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames_lat, num_channel, height, width
+        )
+        for _ in range(extra["pyramid_num_stages"] - 1):
+            height //= 2
+            width //= 2
+            latents_flat = F.interpolate(latents_flat, size=(height, width), mode="bilinear") * 2
+        state.latents = latents_flat.reshape(batch_size, num_frames_lat, num_channel, height, width).permute(
+            0, 2, 1, 3, 4
+        )
+        extra["stage2_height"] = height
+        extra["stage2_width"] = width
+        extra["stage2_start_point_list"] = [state.latents] if self.is_distilled else None
+        extra["stage_index"] = 0
+        extra["stage_step_index"] = 0
+        amplify_first_chunk = extra["is_amplify_first_chunk"] and extra["is_first_chunk"]
+        state.chunk_num_steps = sum(
+            self._stage2_effective_num_steps(int(num_steps), amplify_first_chunk)
+            for num_steps in extra["pyramid_num_inference_steps_list"]
+        )
+        self._set_stage2_timesteps(state)
+
+    def _stage2_effective_num_steps(self, num_steps: int, is_amplify_first_chunk: bool) -> int:
+        if self.is_distilled and is_amplify_first_chunk:
+            return num_steps * 2
+        return num_steps
+
+    def _set_stage2_timesteps(self, state: DiffusionRequestState) -> None:
+        extra = state.extra
+        patch_size = self.transformer.config.patch_size
+        image_seq_len = (state.latents.shape[-1] * state.latents.shape[-2] * state.latents.shape[-3]) // (
+            patch_size[0] * patch_size[1] * patch_size[2]
+        )
+        mu = calculate_shift(image_seq_len)
+        stage_index = extra["stage_index"]
+        self.scheduler.set_timesteps(
+            extra["pyramid_num_inference_steps_list"][stage_index],
+            stage_index=stage_index,
+            device=self.device,
+            mu=mu,
+            is_amplify_first_chunk=extra["is_amplify_first_chunk"] and extra["is_first_chunk"],
+        )
+        state.timesteps = self.scheduler.timesteps
+        state.step_index = extra["stage_step_index"]
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        states: Sequence[DiffusionRequestState],
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        del kwargs
+        if len(states) != 1:
+            raise ValueError("Helios step execution supports a single request, not a batched request.")
+        state = states[0]
+        if state.extra["is_enable_stage2"]:
+            return self._denoise_stage2_step(state)
+        return self._denoise_stage1_step(state, input_batch.latents, input_batch.timesteps)
+
+    def _denoise_stage1_step(
+        self,
+        state: DiffusionRequestState,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        extra = state.extra
+        batch_size = latents.shape[0]
+        t = timesteps
+        self._current_timestep = t
+        timestep = t.expand(batch_size)
+        transformer_kwargs = {
+            "hidden_states": latents.to(extra["dtype"]),
+            "timestep": timestep,
+            "indices_hidden_states": extra["indices_hidden_states"],
+            "indices_latents_history_short": extra["indices_latents_history_short"],
+            "indices_latents_history_mid": extra["indices_latents_history_mid"],
+            "indices_latents_history_long": extra["indices_latents_history_long"],
+            "latents_history_short": extra["latents_history_short"].to(extra["dtype"]),
+            "latents_history_mid": extra["latents_history_mid"].to(extra["dtype"]),
+            "latents_history_long": extra["latents_history_long"].to(extra["dtype"]),
+            "attention_kwargs": extra["attention_kwargs"],
+            "return_dict": False,
+        }
+        if extra["use_cfg_zero_star"] and state.do_true_cfg:
+            noise_pred = self.transformer(
+                encoder_hidden_states=state.prompt_embeds,
+                **transformer_kwargs,
+            )[0]
+            noise_uncond = self.transformer(
+                encoder_hidden_states=state.negative_prompt_embeds,
+                **transformer_kwargs,
+            )[0]
+            positive_flat = noise_pred.view(batch_size, -1)
+            negative_flat = noise_uncond.view(batch_size, -1)
+            alpha_cfg = optimized_scale(positive_flat, negative_flat)
+            alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1))).to(noise_pred.dtype)
+            if (state.step_in_chunk <= extra["zero_steps"]) and extra["use_zero_init"]:
+                return noise_pred * 0.0
+            return noise_uncond * alpha_cfg + extra["guidance_scale"] * (noise_pred - noise_uncond * alpha_cfg)
+
+        positive_kwargs = {
+            "encoder_hidden_states": state.prompt_embeds,
+            **transformer_kwargs,
+        }
+        negative_kwargs = (
+            {
+                "encoder_hidden_states": state.negative_prompt_embeds,
+                **transformer_kwargs,
+            }
+            if state.do_true_cfg
+            else None
+        )
+        return self.predict_noise_maybe_with_cfg(
+            do_true_cfg=state.do_true_cfg,
+            true_cfg_scale=extra["guidance_scale"],
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+
+    def _denoise_stage2_step(self, state: DiffusionRequestState) -> torch.Tensor:
+        extra = state.extra
+        latents = state.latents
+        assert latents is not None
+        batch_size = latents.shape[0]
+        t = state.current_timestep
+        assert t is not None
+        self._current_timestep = t
+        timestep = t.expand(batch_size).to(torch.int64)
+        transformer_kwargs = {
+            "hidden_states": latents.to(extra["dtype"]),
+            "timestep": timestep,
+            "indices_hidden_states": extra["indices_hidden_states"],
+            "indices_latents_history_short": extra["indices_latents_history_short"],
+            "indices_latents_history_mid": extra["indices_latents_history_mid"],
+            "indices_latents_history_long": extra["indices_latents_history_long"],
+            "latents_history_short": extra["latents_history_short"].to(extra["dtype"]),
+            "latents_history_mid": extra["latents_history_mid"].to(extra["dtype"]),
+            "latents_history_long": extra["latents_history_long"].to(extra["dtype"]),
+            "attention_kwargs": extra["attention_kwargs"],
+            "return_dict": False,
+        }
+        noise_pred = self.transformer(encoder_hidden_states=state.prompt_embeds, **transformer_kwargs)[0]
+        if state.do_true_cfg:
+            noise_uncond = self.transformer(encoder_hidden_states=state.negative_prompt_embeds, **transformer_kwargs)[0]
+            if extra["use_cfg_zero_star"]:
+                positive_flat = noise_pred.view(batch_size, -1)
+                negative_flat = noise_uncond.view(batch_size, -1)
+                alpha_cfg = optimized_scale(positive_flat, negative_flat)
+                alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1))).to(noise_pred.dtype)
+                if (
+                    extra["stage_index"] == 0
+                    and extra["stage_step_index"] <= extra["zero_steps"]
+                    and extra["use_zero_init"]
+                ):
+                    noise_pred = noise_pred * 0.0
+                else:
+                    noise_pred = noise_uncond * alpha_cfg + extra["guidance_scale"] * (
+                        noise_pred - noise_uncond * alpha_cfg
+                    )
+            else:
+                noise_pred = noise_uncond + extra["guidance_scale"] * (noise_pred - noise_uncond)
+        return noise_pred
+
+    def step_scheduler(
+        self,
+        state: DiffusionRequestState,
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs
+        if state.extra["is_enable_stage2"]:
+            self._step_scheduler_stage2(state, noise_pred)
+        else:
+            t = state.current_timestep
+            assert t is not None
+            if self.is_distilled:
+                state.latents = self.scheduler.step(
+                    noise_pred,
+                    t,
+                    state.latents,
+                    return_dict=False,
+                    cur_sampling_step=state.step_in_chunk,
+                    dmd_noisy_tensor=state.extra["stage1_start_latents"],
+                    dmd_sigmas=self.scheduler.sigmas,
+                    dmd_timesteps=self.scheduler.timesteps,
+                    all_timesteps=state.timesteps,
+                )[0]
+            else:
+                state.latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, state.latents, state.do_true_cfg)
+            state.step_in_chunk += 1
+            state.step_index = state.step_in_chunk
+
+    def _step_scheduler_stage2(self, state: DiffusionRequestState, noise_pred: torch.Tensor) -> None:
+        extra = state.extra
+        t = state.current_timestep
+        assert t is not None and state.latents is not None
+        start_points = extra["stage2_start_point_list"]
+        state.latents = self.scheduler.step(
+            noise_pred,
+            t,
+            state.latents,
+            return_dict=False,
+            cur_sampling_step=extra["stage_step_index"],
+            dmd_noisy_tensor=start_points[extra["stage_index"]] if start_points is not None else None,
+            dmd_sigmas=self.scheduler.sigmas,
+            dmd_timesteps=self.scheduler.timesteps,
+            all_timesteps=state.timesteps,
+        )[0]
+        extra["stage_step_index"] += 1
+        state.step_in_chunk += 1
+        state.step_index = extra["stage_step_index"]
+
+        if extra["stage_step_index"] < len(state.timesteps):
+            return
+        if extra["stage_index"] >= extra["pyramid_num_stages"] - 1:
+            return
+
+        extra["stage_index"] += 1
+        extra["stage_step_index"] = 0
+        extra["stage2_height"] *= 2
+        extra["stage2_width"] *= 2
+        batch_size, num_channel, num_frames_cur = state.latents.shape[:3]
+        latents_flat = state.latents.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames_cur,
+            num_channel,
+            extra["stage2_height"] // 2,
+            extra["stage2_width"] // 2,
+        )
+        latents_flat = F.interpolate(latents_flat, size=(extra["stage2_height"], extra["stage2_width"]), mode="nearest")
+        state.latents = latents_flat.reshape(
+            batch_size,
+            num_frames_cur,
+            num_channel,
+            extra["stage2_height"],
+            extra["stage2_width"],
+        ).permute(0, 2, 1, 3, 4)
+
+        ori_sigma = 1 - self.scheduler.ori_start_sigmas[extra["stage_index"]]
+        gamma = self.scheduler.config.gamma
+        alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
+        beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
+        patch_size = self.transformer.config.patch_size
+        noise = self.sample_block_noise(
+            batch_size,
+            num_channel,
+            state.latents.shape[2],
+            extra["stage2_height"],
+            extra["stage2_width"],
+            patch_size,
+            generator=extra["generator"],
+        ).to(device=self.device, dtype=extra["dtype"])
+        state.latents = alpha * state.latents + beta * noise
+        if self.is_distilled and extra["stage2_start_point_list"] is not None:
+            extra["stage2_start_point_list"].append(state.latents)
+        self._set_stage2_timesteps(state)
+
+    def post_decode(
+        self,
+        state: DiffusionRequestState,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        del kwargs
+        extra = state.extra
+        is_first_chunk = extra["is_first_chunk"]
+        is_second_chunk = extra["is_second_chunk"]
+        if extra["keep_first_frame"] and (
+            (is_first_chunk and extra["image_latents"] is None) or (extra["is_skip_first_chunk"] and is_second_chunk)
+        ):
+            extra["image_latents"] = state.latents[:, :, 0:1, :, :]
+
+        extra["total_generated_latent_frames"] += state.latents.shape[2]
+        extra["history_latents"] = torch.cat([extra["history_latents"], state.latents], dim=2)
+        real_history_latents = extra["history_latents"][:, :, -extra["total_generated_latent_frames"] :]
+        current_latents = (
+            real_history_latents[:, :, -extra["num_latent_frames_per_chunk"] :].to(extra["vae_dtype"])
+            / extra["latents_std"]
+            + extra["latents_mean"]
+        )
+        current_video = self.vae.decode(current_latents, return_dict=False)[0]
+        if extra["history_video"] is None:
+            extra["history_video"] = current_video
+        else:
+            extra["history_video"] = torch.cat([extra["history_video"], current_video], dim=2)
+
+        output = current_latents if extra["output_type"] == "latent" else current_video
+        completed_chunk_index = state.chunk_index
+        state.chunk_index += 1
+        finished = state.request_denoise_completed
+        if not finished:
+            self._prepare_next_chunk(state)
+        else:
+            self._current_timestep = None
+            if current_omni_platform.is_available():
+                current_omni_platform.empty_cache()
+
+        return DiffusionOutput(
+            output=output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else {},
+            chunk_index=completed_chunk_index,
+            total_chunks=state.total_chunks,
+            finished=finished,
+        )
 
     def forward(
         self,

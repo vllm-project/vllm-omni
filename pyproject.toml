@@ -40,6 +40,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
+    "websockets>=15.0.1",
     "datasets>=2.14.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
@@ -66,11 +67,18 @@ dev = [
     "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
     "torchdiffeq>=0.2.5", # for covo_audio Test
     "FlagEmbedding", # for hunyuan_image3 tests
-    "kernels<0.15.0" # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
+    "kernels<0.15.0", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
+    "s3tokenizer>=0.3.0" # for tts test
 ]
 
 demo = [
-    "gradio>=6.7.0",
+    "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
+    "requests>=2.28.0",  # cli/stream_client HTTP
+    "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
+]
+
+forced-aligner = [
+    "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
 ]
 
 # Local-test-only extras
@@ -88,6 +96,12 @@ local = [
 # who only need other models; opt in with `pip install vllm-omni[minicpmo]`.
 minicpmo = [
     "stepaudio2-minicpmo",
+]
+
+# Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
+# as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
+quack = [
+    "quack-kernels>=0.3.11",
 ]
 
 docs = [
@@ -174,6 +188,7 @@ ignore = [
 # These files keep upstream conventions (star imports, long lines, math-symbol
 # argument names) so they stay easy to diff against upstream releases.
 "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
+"vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
@@ -221,6 +236,7 @@ markers = [
     "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
+    "sp: Sequence parallelism tests",
     "example: Doc example code tests",
     # platform markers
     "cpu: Tests that run on CPU",
@@ -274,6 +290,7 @@ extend-ignore-identifiers-re = [
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
     ".*[Nn][Dd]3.*",
+    ".*updator.*",
     "byt5.*",
 ]
 extend-ignore-re = [
@@ -286,5 +303,12 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+# Step-Audio reasoning parser streams `</think>` tokens split across chunks
+# (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
+# parser logic and tests and is not a typo of "the"/"this".
+thi = "thi"
 ND = "ND"
 byt5 = "byt5"
+# "seeked" is the standard HTML media element DOM event name (fires when a
+# seek completes), used by the word-timestamps Gradio demo. Not a typo.
+seeked = "seeked"

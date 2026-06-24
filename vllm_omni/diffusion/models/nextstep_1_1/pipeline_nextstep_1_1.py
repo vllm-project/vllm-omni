@@ -5,7 +5,7 @@
 import os
 import re
 from collections.abc import Iterable
-from typing import Literal
+from typing import ClassVar, Literal
 
 import numpy as np
 import torch
@@ -28,6 +28,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import AutoencoderKL
 from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep import (
     NextStepConfig,
@@ -131,7 +132,7 @@ def get_nextstep11_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class NextStep11Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """
     NextStep-1.1 Pipeline for text-to-image generation.
 
@@ -139,6 +140,10 @@ class NextStep11Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
     model from StepFun. It uses an LLM backbone with a flow matching head
     to generate images autoregressively.
     """
+
+    _dit_modules: ClassVar[list[str]] = ["model"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,

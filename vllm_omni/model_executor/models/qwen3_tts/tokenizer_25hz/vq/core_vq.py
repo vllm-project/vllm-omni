@@ -33,7 +33,6 @@
 
 import random
 import typing as tp
-from math import ceil
 
 import numpy as np
 import torch
@@ -43,10 +42,6 @@ from torch import nn
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-def round_up_multiple(num, mult):
-    return ceil(num / mult) * mult
 
 
 def default(val: tp.Any, d: tp.Any) -> tp.Any:
