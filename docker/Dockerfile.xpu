@@ -101,7 +101,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH}"
 
-ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
+ENV LD_LIBRARY_PATH="/opt/intel/oneapi/ccl/2021.15/lib:$LD_LIBRARY_PATH:/usr/local/lib/"
 
 ENV VLLM_TARGET_DEVICE=xpu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn

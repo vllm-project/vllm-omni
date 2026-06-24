@@ -106,9 +106,6 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self.hidden_projection = Qwen3OmniMoeTalkerResizeMLP(self.config)
         self.codec_head = nn.Linear(self.config.text_config.hidden_size, self.config.text_config.vocab_size, bias=False)
 
-        self.rope_deltas = None
-        self.spatial_merge_size = self.config.spatial_merge_size
-
         self.vocab_size = self.config.code_predictor_config.vocab_size
         self.num_code_groups = self.config.code_predictor_config.num_code_groups
 

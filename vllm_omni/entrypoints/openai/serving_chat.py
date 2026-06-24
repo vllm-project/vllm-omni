@@ -486,21 +486,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         for k, v in engine_prompt_image.items()
                     }
 
-                # Forward image_gen extra_args from diffusion-stage sampling
-                # params into the prompt dict so that thinker2imagegen can
-                # access them (e.g. byte5_text for ByT5 glyph rendering).
-                if hasattr(request, "sampling_params_list") and request.sampling_params_list:
-                    for sp_raw in request.sampling_params_list:
-                        ea = (
-                            (sp_raw.get("extra_args") or {})
-                            if isinstance(sp_raw, dict)
-                            else (getattr(sp_raw, "extra_args", None) or {})
-                        )
-                        ig = ea.get("image_gen") or {}
-                        if ig:
-                            tprompt["image_gen_extra_args"] = ig
-                            break
-
                 engine_prompts = [tprompt]
                 # Store height/width for applying to diffusion stage sampling params later
                 _image_gen_height = height

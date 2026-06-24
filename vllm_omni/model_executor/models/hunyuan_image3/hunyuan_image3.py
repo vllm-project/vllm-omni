@@ -2008,10 +2008,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # the bidirectional MM region and biased AR ratio prediction toward
         # the first image's bucket.
         timestep_mask = input_ids == self._timestep_token_id
-        n_timestep = int(timestep_mask.sum().item())
-        if n_timestep > 0:
-            timestep_input = torch.zeros((n_timestep,), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-            inputs_embeds[timestep_mask] = self._timestep_encode(timestep_input)
+        timestep_input = torch.zeros((), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        timestep_embed = self._timestep_encode(timestep_input).to(inputs_embeds.dtype)
+        inputs_embeds = torch.where(timestep_mask.unsqueeze(-1), timestep_embed, inputs_embeds)
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds

@@ -40,6 +40,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
+    "websockets>=15.0.1",
     "datasets>=2.14.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
@@ -118,6 +119,12 @@ docs = [
     "pydantic",
 ]
 
+soulx-svs = [
+    "funasr>=1.0.0",
+    "g2pM>=0.1.2.5",
+    "g2p-en>=2.1.0",
+    "ToJyutping>=3.2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-omni"
