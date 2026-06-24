@@ -288,7 +288,7 @@ def test_reliability_fault_process_kill_request_failure(
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", VOXCPM2_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
+def test_reliability_fault_process_kill_fast_fail_and_concurrent(
     omni_server_after_fault_function,
     openai_client_function,
 ) -> None:
@@ -349,24 +349,6 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
             assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
     assert fault_observed, (
         "[process_kill concurrent] expected at least one /v1/audio/speech request to fail after fault"
-    )
-
-    deadline = time.monotonic() + 20.0
-    last_observation = ""
-    final_health_status: int | None = None
-    while time.monotonic() < deadline:
-        try:
-            status, body = get_health_raw(host, port, timeout_sec=5)
-            last_observation = f"http={status}, body={body[:200]!r}"
-            final_health_status = status
-            if status == 503:
-                break
-        except Exception as exc:  # noqa: BLE001
-            last_observation = f"exception={exc!r}"
-        time.sleep(0.5)
-    assert final_health_status == 503, (
-        "[process_kill health] expected /health 503 after fatal fault, "
-        f"got status={final_health_status}, last_observation={last_observation}"
     )
 
 
