@@ -2,6 +2,7 @@
 Configuration module for vLLM-Omni.
 """
 
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.config.omni_config import (
@@ -21,6 +22,7 @@ from vllm_omni.config.omni_config import (
     VllmOmniGenerationStageConfig,
     VllmOmniOrchestratorConfig,
 )
+from vllm_omni.config.pipeline_registry import register_pipeline
 from vllm_omni.config.stage_config import (
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,

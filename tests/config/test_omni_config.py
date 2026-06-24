@@ -26,9 +26,8 @@ from vllm_omni.config.omni_config import (
     VllmOmniDiffusionStageConfig,
     VllmOmniGenerationStageConfig,
 )
-from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
-    _PIPELINE_REGISTRY,
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
@@ -59,9 +58,17 @@ def _load_default_deploy(model_type: str) -> DeployConfig:
     return DeployConfig()
 
 
-@pytest.mark.parametrize("model_type", sorted(_OMNI_PIPELINES))
+def _resolve_pipeline_or_skip(model_type: str) -> PipelineConfig:
+    registered = OMNI_PIPELINES[model_type]
+    pipeline = registered(None) if callable(registered) else registered
+    if pipeline is None:
+        pytest.skip(f"Pipeline {model_type!r} requires an HF config to resolve")
+    return pipeline
+
+
+@pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
 def test_vllm_omni_config_from_registry_matches_merge_pipeline_deploy(model_type: str):
-    pipeline = _PIPELINE_REGISTRY[model_type]
+    pipeline = _resolve_pipeline_or_skip(model_type)
     legacy_deploy = _load_default_deploy(model_type)
 
     legacy_stages = merge_pipeline_deploy(pipeline, legacy_deploy)
@@ -123,11 +130,12 @@ def test_resolve_execution_mode_rejects_unknown_execution_type():
 
 def test_from_registry_preserves_current_pipeline_config_object():
     omni_config = VllmOmniConfig.from_registry("minicpmo_4_5")
+    pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")
 
-    assert omni_config.pipeline_config is _PIPELINE_REGISTRY["minicpmo_4_5"]
+    assert omni_config.pipeline_config is pipeline
     assert not hasattr(omni_config, "pipeline")
     assert "hf_config_predicate" in {f.name for f in fields(PipelineConfig)}
-    assert omni_config.pipeline_config.hf_config_predicate is _PIPELINE_REGISTRY["minicpmo_4_5"].hf_config_predicate
+    assert omni_config.pipeline_config.hf_config_predicate is pipeline.hf_config_predicate
 
 
 def test_from_registry_normalizes_stage_engine_extras_without_expanding_stage_deploy_config():
@@ -306,7 +314,7 @@ def test_from_registry_records_loaded_deploy_path_on_orchestrator_config():
 
 
 def test_from_registry_dispatches_async_chunk_processors_without_mutating_topology():
-    pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
 
     async_config = VllmOmniConfig.from_registry("qwen3_tts")
     assert async_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_async_chunk")
@@ -577,7 +585,7 @@ def test_from_registry_preserves_diffusion_parallel_mask_sp_padding(tmp_path):
 
 
 def test_from_registry_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
-    pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("qwen3_tts"))[0]
     omega_stage = legacy_stage.to_omegaconf()
     omni_stage = VllmOmniConfig.from_registry("qwen3_tts").stage_by_id(legacy_stage.stage_id)
@@ -596,7 +604,7 @@ def test_from_registry_matches_stage_config_to_omegaconf_behavior_for_representa
 
 
 def test_from_registry_matches_to_omegaconf_diffusion_parallel_config():
-    pipeline = _PIPELINE_REGISTRY["hunyuan_image3_dit"]
+    pipeline = _resolve_pipeline_or_skip("hunyuan_image3_dit")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("hunyuan_image3_dit"))[0]
     omega_stage = legacy_stage.to_omegaconf()
     omni_stage = VllmOmniConfig.from_registry("hunyuan_image3_dit").stage_by_id(legacy_stage.stage_id)
@@ -624,7 +632,7 @@ def test_from_registry_matches_build_engine_args_dict_behavior_for_representativ
     from vllm_omni.engine import stage_init_utils
 
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
-    pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("qwen3_tts"))[0]
     omega_stage = legacy_stage.to_omegaconf()
     legacy_engine_args = build_engine_args_dict(

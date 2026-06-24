@@ -21,7 +21,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
-    _PIPELINE_REGISTRY,
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
@@ -231,6 +230,19 @@ def _resolve_deploy_path(model_type: str, deploy_config_path: str | None = None)
         if candidate.exists():
             return candidate
     return deploy_path
+
+
+def _registered_pipeline_keys() -> list[str]:
+    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+
+    return sorted(OMNI_PIPELINES)
+
+
+def _resolve_registered_pipeline(model_type: str) -> PipelineConfig | None:
+    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+
+    registered = OMNI_PIPELINES[model_type]
+    return registered(None) if callable(registered) else registered
 
 
 @config
@@ -1230,13 +1242,17 @@ class VllmOmniConfig:
             deploy = DeployConfig()
 
         pipeline_key = deploy.pipeline or model_type
-        if pipeline_key not in _PIPELINE_REGISTRY:
+        if pipeline_key not in _registered_pipeline_keys():
             raise KeyError(
                 f"Pipeline {pipeline_key!r} not in registry "
                 f"(resolved from {deploy_path.name!r}). Available: "
-                f"{sorted(_PIPELINE_REGISTRY.keys())}"
+                f"{_registered_pipeline_keys()}"
             )
-        pipeline = _PIPELINE_REGISTRY[pipeline_key]
+        pipeline = _resolve_registered_pipeline(pipeline_key)
+        if pipeline is None:
+            raise ValueError(
+                f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig without an HF config"
+            )
 
         deploy_for_registry = copy.deepcopy(deploy)
         if cli_overrides.get("async_chunk") is not None:
