@@ -35,6 +35,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import AsyncOmni, Omni
+from vllm_omni.model_executor.models.tada_tts import prompt_utils
 
 logger = logging.getLogger(__name__)
 
@@ -54,185 +55,13 @@ _DEFAULT_PROMPTS = [
 ]
 
 
-def _get_tokenizer(model_name: str, _cache: dict = {}):
-    """Load (and cache) the model's tokenizer (Llama-3.2 by default)."""
-    if model_name not in _cache:
-        from transformers import AutoTokenizer
-
-        # TADA uses the Llama-3.2 tokenizer.
-        _cache[model_name] = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    return _cache[model_name]
-
-
-def _model_shift_acoustic(model_name: str, _cache: dict = {}) -> int:
-    """Read shift_acoustic from the model config (default 5)."""
-    if model_name not in _cache:
-        from transformers import AutoConfig
-
-        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        _cache[model_name] = int(getattr(cfg, "shift_acoustic", 5))
-    return _cache[model_name]
-
-
-def _prefix_text(system_prompt: str = "", user_turn: str | None = None) -> str:
-    """Build the chat-template prefix (system/user/assistant headers). Zero-shot uses an
-    empty system prompt and no user turn."""
-    prefix = f"<|start_header_id|>system<|end_header_id|>{system_prompt}<|eot_id|>"
-    if user_turn:
-        prefix += f"<|start_header_id|>user<|end_header_id|>{user_turn}<|eot_id|>"
-    prefix += "<|start_header_id|>assistant<|end_header_id|>"
-    return prefix
-
-
-def _build_prompt(text: str, model_name: str) -> tuple[dict, int]:
-    """Build a prompt for TADA TTS, returning ``(prompt_dict, walk_len)``.
-
-    The model walks the input text one token per step, emitting one acoustic frame each, so
-    the sequence is split into:
-      * ``prompt_token_ids`` = ``[BOS] + tokenize(chat-template headers)`` — prefilled.
-      * ``tada_walk_ids``    = ``tokenize(text) + [<|eot_id|>] * shift_acoustic`` — forced one
-        per decode step by the AR stage's ``preprocess``. The trailing eot tokens flush the
-        final frames.
-    ``walk_len`` sets ``max_tokens`` so generation stops on consuming the last walk token.
-    """
-    tok = _get_tokenizer(model_name)
-    shift = _model_shift_acoustic(model_name)
-    bos_id = tok.bos_token_id
-    eot_id = tok.convert_tokens_to_ids("<|eot_id|>")
-
-    prefix_ids = tok.encode(_prefix_text(), add_special_tokens=False)
-    text_ids = tok.encode(text, add_special_tokens=False)
-
-    prompt_token_ids = [bos_id] + prefix_ids
-    walk_ids = text_ids + [eot_id] * shift
-
-    prompt = {
-        "prompt_token_ids": prompt_token_ids,
-        "additional_information": {
-            "tada_walk_ids": walk_ids,
-            # Acoustic lags text by shift_acoustic, so the first `shift` decode frames
-            # carry the chat-template header tail, not the text — drop them.
-            "tada_trim_lead": shift,
-        },
-    }
-    return prompt, len(walk_ids)
-
-
-def _stage0_sampling_params(omni, walk_len: int):
-    """Per-request sampling params: stage-0 walks exactly ``walk_len`` tokens.
-
-    ``max_tokens = walk_len`` enforces TADA's fixed length; ``ignore_eos`` stops the
-    discarded sampled token from ending generation early; ``temperature = 0`` makes the
-    (unused) text sample deterministic and cheap. Stage-1 (vocoder) params are kept.
-    """
-    import copy
-
-    sp_list = [copy.deepcopy(sp) for sp in omni.default_sampling_params_list]
-    sp0 = sp_list[0]
-    sp0.max_tokens = walk_len
-    sp0.ignore_eos = True
-    sp0.temperature = 0.0
-    return sp_list
-
-
-def _get_encoder(codec_path: str, model_name: str, _cache: dict = {}):
-    """Load (and cache) the vendored TADA encoder+aligner from local codec weights.
-
-    Runs in the example process (offline, CPU) to build voice-cloning prompts — it is
-    never imported by the serving worker.
-    """
-    if "enc" not in _cache:
-        from vllm_omni.model_executor.models.tada_tts.codec.encoder import Encoder
-
-        _cache["enc"] = Encoder.from_local(codec_path, model_name, device="cpu", dtype=torch.float32)
-    return _cache["enc"]
-
-
-def _build_ref_prompt(
-    text: str, ref_audio: str, ref_text: str, model_name: str, num_transition_steps: int = 5
-) -> tuple[dict, int]:
-    """Build a voice-cloning prompt from a reference wav and its transcript.
-
-    Encodes the reference audio to per-token acoustic features + a token→frame alignment
-    (durations), then constructs:
-      * ``prompt_token_ids`` = ``[BOS] + headers + transcript[:-N]`` — prefilled with the
-        reference acoustic substituted over the transcript region so the voice enters the KV
-        cache; see ``_add_prompt_acoustic_embeds`` in the AR stage.
-      * ``tada_walk_ids``    = ``transcript[-N:] + tokenize(text) + [<|eot_id|>]*shift`` —
-        walked in decode. The first ``N`` walked tokens (transcript tail) form a transition
-        that smooths the prompt→synthesis boundary; their frames are fed back but dropped from
-        the output (``tada_trim_lead``).
-    """
-    import numpy as np
-    import soundfile as sf
-    import torch.nn.functional as Fnn
-    from transformers import AutoConfig
-
-    tok = _get_tokenizer(model_name)
-    shift = _model_shift_acoustic(model_name)
-    ntc = int(getattr(AutoConfig.from_pretrained(model_name, trust_remote_code=True), "num_time_classes", 256))
-    codec_path = os.environ.get("TADA_CODEC_PATH") or os.path.join(
-        os.path.dirname(os.path.abspath(model_name)), "tada-codec"
-    )
-    enc = _get_encoder(codec_path, model_name)
-
-    wav, sr = sf.read(ref_audio)
-    wav_t = torch.tensor(np.asarray(wav), dtype=torch.float32).reshape(1, -1)
-    out = enc(wav_t, text=ref_text, sample_rate=sr)
-    token_values = out.token_values[0]  # [Tp, feat_dim] (normalised)
-    token_positions = out.token_positions[0].long()  # [Tp]
-
-    # Per-token durations from the alignment positions.
-    sel = token_positions.float()
-    prev = Fnn.pad(sel, (1, 0), value=1)[:-1]
-    time_gaps = Fnn.pad((sel - prev).clamp(0, ntc - 1), (1, 0), value=0)  # [Tp+1]
-    tb = time_gaps[:-1].long()
-    ta = time_gaps[1:].long()
-
-    bos_id = tok.bos_token_id
-    eot_id = tok.convert_tokens_to_ids("<|eot_id|>")
-    prefix_ids = tok.encode(_prefix_text(), add_special_tokens=False)
-    transcript_ids = tok.encode(ref_text, add_special_tokens=False)
-    synth_ids = tok.encode(text, add_special_tokens=False)
-
-    n = min(token_values.shape[0], len(transcript_ids))
-    token_values, tb, ta, transcript_ids = token_values[:n], tb[:n], ta[:n], transcript_ids[:n]
-
-    # Split off the transition tail (keep >=1 prompt token).
-    n_trans = max(0, min(num_transition_steps, n - 1))
-    n_prompt = n - n_trans
-    prompt_ids = transcript_ids[:n_prompt]
-    transition_ids = transcript_ids[n_prompt:]
-
-    prefill_ids = [bos_id] + prefix_ids + prompt_ids
-    walk_ids = transition_ids + synth_ids + [eot_id] * shift
-    prefix_len = len(prefix_ids)
-
-    prompt = {
-        "prompt_token_ids": prefill_ids,
-        "additional_information": {
-            "tada_walk_ids": walk_ids,
-            # Drop the leading frames that are not the requested text: the acoustic stream
-            # lags the text by ``shift_acoustic``, so the first ``shift`` decode frames carry
-            # the prompt-transcript tail and the next ``n_trans`` carry the transition tokens.
-            "tada_trim_lead": n_trans + shift,
-            # Prefix-padded prompt arrays (without BOS).
-            "tada_prompt_acoustic": Fnn.pad(token_values[:n_prompt], (0, 0, prefix_len, 0)).contiguous(),
-            "tada_prompt_masks": Fnn.pad(torch.ones(n_prompt, dtype=torch.long), (prefix_len, 0)).contiguous(),
-            "tada_prompt_tb": Fnn.pad(tb[:n_prompt], (prefix_len, 0)).contiguous(),
-            "tada_prompt_ta": Fnn.pad(ta[:n_prompt], (prefix_len, 0)).contiguous(),
-        },
-    }
-    return prompt, len(walk_ids)
-
-
 def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
     """Write accumulated audio to a WAV file."""
     audio_data = mm.get("model_outputs") or mm.get("audio")
     if audio_data is None:
         logger.warning("No audio in multimodal_output for request %s", request_id)
         return
-    sr_raw = mm.get("sr", 44100)
+    sr_raw = mm.get("sr", 24000)
     sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
     sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
@@ -256,14 +85,10 @@ def _make_prompt(text: str, args, model_name: str) -> tuple[dict, int]:
     if args.ref_audio:
         if not args.ref_text:
             raise ValueError("--ref-audio requires --ref-text (the reference transcript).")
-        return _build_ref_prompt(
-            text,
-            args.ref_audio,
-            args.ref_text,
-            model_name,
-            num_transition_steps=args.num_transition_steps,
+        return prompt_utils.build_voice_clone_prompt(
+            text, args.ref_audio, args.ref_text, model_name, num_transition_steps=args.num_transition_steps
         )
-    return _build_prompt(text, model_name)
+    return prompt_utils.build_zeroshot_prompt(text, model_name)
 
 
 def main(args):
@@ -284,7 +109,7 @@ def main(args):
     # (max_tokens). The engine persists across calls.
     for text in texts:
         prompt, walk_len = _make_prompt(text, args, model_name)
-        sampling_params_list = _stage0_sampling_params(omni, walk_len)
+        sampling_params_list = prompt_utils.apply_walk_sampling_params(omni.default_sampling_params_list, walk_len)
         for stage_outputs in omni.generate([prompt], sampling_params_list=sampling_params_list):
             output = stage_outputs.request_output
             mm = output.outputs[0].multimodal_output or {}
@@ -313,7 +138,7 @@ async def main_streaming(args):
     for i, text in enumerate(texts):
         request_id = str(i)
         prompt, walk_len = _make_prompt(text, args, model_name)
-        sampling_params_list = _stage0_sampling_params(omni, walk_len)
+        sampling_params_list = prompt_utils.apply_walk_sampling_params(omni.default_sampling_params_list, walk_len)
         t_start = time.perf_counter()
         chunk_idx = 0
         consumed = 0  # list case: chunks already taken
