@@ -21,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -151,7 +152,7 @@ def _collect_images(outputs: list) -> list[torch.Tensor]:
         ro_item = getattr(out, "request_output", out)
         for completion in getattr(ro_item, "outputs", None) or []:
             mm = getattr(completion, "multimodal_output", None)
-            if not isinstance(mm, dict) or "image" not in mm:
+            if not isinstance(mm, Mapping) or "image" not in mm:
                 raise RuntimeError(f"Missing image in multimodal output: {mm}")
             payload = mm["image"]
             for tensor in payload if isinstance(payload, list) else [payload]:
