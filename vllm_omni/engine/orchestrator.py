@@ -1155,6 +1155,34 @@ class Orchestrator:
                 exc_info=True,
             )
 
+    def _record_stage_submit(
+        self,
+        *,
+        req_state: OrchestratorRequestState,
+        next_logical: int,
+        src_stage_id: int,
+        src_replica_id: int | None,
+        next_pool: StagePool,
+        req_id: str,
+        t_submit_start: float,
+    ) -> None:
+        """Record submission timestamp and emit the transfer-edge metric.
+
+        Called at the end of every _forward_to_* helper to avoid repeating the
+        same three-line tail (stage_submit_ts / perf_counter delta / emit_tx_edge)
+        in each branch.
+        """
+        req_state.stage_submit_ts[next_logical] = _time.time()
+        _tx_ms = (_time.perf_counter() - t_submit_start) * 1000.0
+        self._emit_tx_edge(
+            from_stage=src_stage_id,
+            from_replica=src_replica_id if src_replica_id is not None else 0,
+            to_stage=next_logical,
+            to_pool=next_pool,
+            request_id=req_id,
+            tx_ms=_tx_ms,
+        )
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -1178,150 +1206,237 @@ class Orchestrator:
         _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
-            companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
-            expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
-            if expected > len(companion_outputs):
-                logger.warning(
-                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs arrived; "
-                    "downstream CFG conditioning may degrade",
-                    req_id,
-                    len(companion_outputs),
-                    expected,
-                )
-            diffusion_source_outputs = [output, *companion_outputs]
-            if next_client.custom_process_input_func is not None:
-                _t_ar2d = _time.perf_counter()
-                _fn = next_client.custom_process_input_func
-                _extra_kwargs: dict[str, Any] = {}
-                # TODO: replace signature probe with explicit kwarg contract.
-                try:
-                    import inspect as _inspect
-
-                    if "sampling_params" in _inspect.signature(_fn).parameters:
-                        _extra_kwargs["sampling_params"] = params
-                except (TypeError, ValueError):
-                    pass
-                diffusion_prompt = _fn(
-                    diffusion_source_outputs,
-                    req_state.prompt,
-                    requires_multimodal_data,
-                    **_extra_kwargs,
-                )
-                _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
-                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
-                logger.info(
-                    "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
-                    req_id,
-                    _dt_ar2d,
-                    src_stage_id,
-                    next_logical,
-                )
-                if isinstance(diffusion_prompt, list):
-                    if not diffusion_prompt:
-                        error_output = OmniRequestOutput.from_error(
-                            req_id,
-                            f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
-                        )
-                        logger.warning(
-                            "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
-                            "routing terminal error output",
-                            req_id,
-                            src_stage_id,
-                            next_logical,
-                        )
-                        await self.output_async_queue.put(
-                            OutputMessage(
-                                request_id=req_id,
-                                stage_id=next_logical,
-                                engine_outputs=error_output,
-                                metrics=None,
-                                finished=True,
-                            )
-                        )
-                        await self._cleanup_request_ids(
-                            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                        )
-                        return
-                    if already_submitted and len(diffusion_prompt) == 1:
-                        diffusion_prompt = diffusion_prompt[0]
-            else:
-                diffusion_prompt = req_state.prompt
-
-            if already_submitted:
-                await next_pool.submit_update(req_id, req_state, diffusion_prompt)
-            else:
-                await next_pool.submit_initial(
-                    req_id,
-                    req_state,
-                    diffusion_prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                            request_id=req_id,
-                        )
-                    },
-                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
-                )
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            self._emit_tx_edge(
-                from_stage=src_stage_id,
-                from_replica=src_replica_id if src_replica_id is not None else 0,
-                to_stage=next_logical,
-                to_pool=next_pool,
-                request_id=req_id,
-                tx_ms=_tx_ms,
+            await self._forward_to_diffusion_stage(
+                req_id,
+                src_stage_id,
+                next_logical,
+                next_pool,
+                next_client,
+                output,
+                params,
+                req_state,
+                already_submitted,
+                requires_multimodal_data,
+                src_replica_id=src_replica_id,
+                t_submit_start=_t_submit_start,
             )
-            return
-
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
-        if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
-            params = self._build_pd_decode_params(req_id, params)
-
-            # Use the original user prompt for the decode stage (not processed embeddings)
-            original_prompt = req_state.prompt
-            raw_decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
-
-            decode_inputs: list[dict[str, Any]] = []
-            for decode_input in raw_decode_inputs:
-                if isinstance(decode_input, dict):
-                    decode_inputs.append(decode_input)
-                    continue
-                prompt_token_ids = getattr(decode_input, "prompt_token_ids", None)
-                if prompt_token_ids is None:
-                    raise TypeError(
-                        "[Orchestrator][PD] decode input must be dict or have prompt_token_ids, "
-                        f"got {type(decode_input).__name__} for req={req_id}"
-                    )
-                decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
-
-            for decode_input in decode_inputs:
-                request = build_engine_core_request_from_tokens(
-                    request_id=req_id,
-                    prompt=decode_input,
-                    params=params,
-                    model_config=next_pool.stage_vllm_config.model_config,
-                    mm_features=req_state.mm_features,
-                    resumable=next_stage_resumable,
-                )
-                request.external_req_id = request.request_id
-                if already_submitted:
-                    await next_pool.submit_update(req_id, req_state, request)
-                else:
-                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            self._emit_tx_edge(
-                from_stage=src_stage_id,
-                from_replica=src_replica_id if src_replica_id is not None else 0,
-                to_stage=next_logical,
-                to_pool=next_pool,
-                request_id=req_id,
-                tx_ms=_tx_ms,
+        elif self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
+            await self._forward_to_pd_decode_stage(
+                req_id,
+                src_stage_id,
+                next_logical,
+                next_pool,
+                params,
+                req_state,
+                already_submitted,
+                next_stage_resumable,
+                src_replica_id=src_replica_id,
+                t_submit_start=_t_submit_start,
             )
-            return
+        else:
+            await self._forward_to_llm_stage(
+                req_id,
+                src_stage_id,
+                next_logical,
+                next_pool,
+                next_client,
+                source_outputs,
+                params,
+                req_state,
+                already_submitted,
+                next_stage_resumable,
+                src_replica_id=src_replica_id,
+                t_submit_start=_t_submit_start,
+            )
 
+    async def _forward_to_diffusion_stage(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        next_logical: int,
+        next_pool: Any,
+        next_client: Any,
+        output: Any,
+        params: Any,
+        req_state: OrchestratorRequestState,
+        already_submitted: bool,
+        requires_multimodal_data: bool,
+        *,
+        src_replica_id: int | None = None,
+        t_submit_start: float = 0.0,
+    ) -> None:
+        """Forward AR output to a downstream diffusion stage."""
+        companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
+        expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
+        if expected > len(companion_outputs):
+            logger.warning(
+                "[Orchestrator] req=%s: only %d/%d CFG companion outputs arrived; "
+                "downstream CFG conditioning may degrade",
+                req_id,
+                len(companion_outputs),
+                expected,
+            )
+        diffusion_source_outputs = [output, *companion_outputs]
+        if next_client.custom_process_input_func is not None:
+            _t_ar2d = _time.perf_counter()
+            _fn = next_client.custom_process_input_func
+            _extra_kwargs: dict[str, Any] = {}
+            # TODO: replace signature probe with explicit kwarg contract.
+            try:
+                import inspect as _inspect
+
+                if "sampling_params" in _inspect.signature(_fn).parameters:
+                    _extra_kwargs["sampling_params"] = params
+            except (TypeError, ValueError):
+                pass
+            diffusion_prompt = _fn(
+                diffusion_source_outputs,
+                req_state.prompt,
+                requires_multimodal_data,
+                **_extra_kwargs,
+            )
+            _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+            req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
+            logger.info(
+                "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
+                req_id,
+                _dt_ar2d,
+                src_stage_id,
+                next_logical,
+            )
+            if isinstance(diffusion_prompt, list):
+                if not diffusion_prompt:
+                    error_output = OmniRequestOutput.from_error(
+                        req_id,
+                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
+                    )
+                    logger.warning(
+                        "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                        "routing terminal error output",
+                        req_id,
+                        src_stage_id,
+                        next_logical,
+                    )
+                    await self.output_async_queue.put(
+                        OutputMessage(
+                            request_id=req_id,
+                            stage_id=next_logical,
+                            engine_outputs=error_output,
+                            metrics=None,
+                            finished=True,
+                        )
+                    )
+                    await self._cleanup_request_ids(
+                        [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                    )
+                    return
+                if already_submitted and len(diffusion_prompt) == 1:
+                    diffusion_prompt = diffusion_prompt[0]
+        else:
+            diffusion_prompt = req_state.prompt
+
+        if already_submitted:
+            await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+        else:
+            await next_pool.submit_initial(
+                req_id,
+                req_state,
+                diffusion_prompt,
+                submit_kwargs={
+                    "kv_sender_info": self._build_kv_sender_info(
+                        list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
+                        request_id=req_id,
+                    )
+                },
+                params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+            )
+        self._record_stage_submit(
+            req_state=req_state,
+            next_logical=next_logical,
+            src_stage_id=src_stage_id,
+            src_replica_id=src_replica_id,
+            next_pool=next_pool,
+            req_id=req_id,
+            t_submit_start=t_submit_start,
+        )
+
+    async def _forward_to_pd_decode_stage(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        next_logical: int,
+        next_pool: Any,
+        params: Any,
+        req_state: OrchestratorRequestState,
+        already_submitted: bool,
+        next_stage_resumable: bool,
+        *,
+        src_replica_id: int | None = None,
+        t_submit_start: float = 0.0,
+    ) -> None:
+        """Forward prefill output to a PD-disaggregated decode stage."""
+        params = self._build_pd_decode_params(req_id, params)
+
+        # Use the original user prompt for the decode stage (not processed embeddings)
+        original_prompt = req_state.prompt
+        raw_decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
+
+        decode_inputs: list[dict[str, Any]] = []
+        for decode_input in raw_decode_inputs:
+            if isinstance(decode_input, dict):
+                decode_inputs.append(decode_input)
+                continue
+            prompt_token_ids = getattr(decode_input, "prompt_token_ids", None)
+            if prompt_token_ids is None:
+                raise TypeError(
+                    "[Orchestrator][PD] decode input must be dict or have prompt_token_ids, "
+                    f"got {type(decode_input).__name__} for req={req_id}"
+                )
+            decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
+
+        for decode_input in decode_inputs:
+            request = build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=decode_input,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                mm_features=req_state.mm_features,
+                resumable=next_stage_resumable,
+            )
+            request.external_req_id = request.request_id
+            if already_submitted:
+                await next_pool.submit_update(req_id, req_state, request)
+            else:
+                await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+
+        self._record_stage_submit(
+            req_state=req_state,
+            next_logical=next_logical,
+            src_stage_id=src_stage_id,
+            src_replica_id=src_replica_id,
+            next_pool=next_pool,
+            req_id=req_id,
+            t_submit_start=t_submit_start,
+        )
+
+    async def _forward_to_llm_stage(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        next_logical: int,
+        next_pool: Any,
+        next_client: Any,
+        source_outputs: list[Any],
+        params: Any,
+        req_state: OrchestratorRequestState,
+        already_submitted: bool,
+        next_stage_resumable: bool,
+        *,
+        src_replica_id: int | None = None,
+        t_submit_start: float = 0.0,
+    ) -> None:
+        """Forward output to a downstream LLM (AR or generation) stage."""
         if req_state.pd_prefill_multimodal_output is not None:
             req_state.streaming.bridge_states.setdefault(
                 "pd_prefill_multimodal_output_by_req",
@@ -1405,15 +1520,14 @@ class Orchestrator:
             else:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
-        req_state.stage_submit_ts[next_logical] = _time.time()
-        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-        self._emit_tx_edge(
-            from_stage=src_stage_id,
-            from_replica=src_replica_id if src_replica_id is not None else 0,
-            to_stage=next_logical,
-            to_pool=next_pool,
-            request_id=req_id,
-            tx_ms=_tx_ms,
+        self._record_stage_submit(
+            req_state=req_state,
+            next_logical=next_logical,
+            src_stage_id=src_stage_id,
+            src_replica_id=src_replica_id,
+            next_pool=next_pool,
+            req_id=req_id,
+            t_submit_start=t_submit_start,
         )
 
     async def _prewarm_async_chunk_stages(
