@@ -7,7 +7,6 @@ import torch
 import vllm.forward_context as _vllm_fc
 from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
-from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import (
     init_model_parallel_group as vllm_init_model_parallel_group,
 )
@@ -17,7 +16,6 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import _MoECommMethods
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_data_parallel_world_size,
     get_expert_parallel_group_ranks,
     get_world_group,
 )
@@ -104,25 +102,20 @@ def _select_moe_comm_method(vllm_config: VllmConfig) -> MoECommType | None:
 
 
 def prepare_hunyuan_fused_moe_runtime() -> None:
-    world_size = torch.distributed.get_world_size()
     vllm_config = omni_get_ctx().vllm_config
-    tp_size = get_tensor_model_parallel_world_size()
-    dp_size = get_data_parallel_world_size()
     if vllm_config.parallel_config.enable_expert_parallel:
+        world_size = torch.distributed.get_world_size()
+        backend = torch.distributed.get_backend(get_world_group().device_group)
+        local_rank = get_world_group().local_rank
         mc2_group_size = get_ep_group().world_size
-    else:
-        mc2_group_size = dp_size * tp_size
-    backend = torch.distributed.get_backend(get_world_group().device_group)
-    local_rank = get_world_group().local_rank
-    if vllm_config.parallel_config.enable_expert_parallel:
         _sync_ascend_ep_group_for_diffusion()
-    _init_mc2_group_for_diffusion(
-        world_size=world_size,
-        mc2_group_size=mc2_group_size,
-        backend=backend,
-        local_rank=local_rank,
-        group_ranks=get_expert_parallel_group_ranks() if vllm_config.parallel_config.enable_expert_parallel else None,
-    )
+        _init_mc2_group_for_diffusion(
+            world_size=world_size,
+            mc2_group_size=mc2_group_size,
+            backend=backend,
+            local_rank=local_rank,
+            group_ranks=get_expert_parallel_group_ranks(),
+        )
 
     moe_comm_type = _select_moe_comm_method(vllm_config=vllm_config)
     _ensure_forward_context_attr("num_tokens", int | None, None)
