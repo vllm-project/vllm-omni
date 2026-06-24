@@ -66,7 +66,7 @@ class TimestepEmbedder(nn.Module):
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+    def timestep_embedding(t, dim, max_period=10000) -> torch.Tensor:
         """
         Create sinusoidal timestep embeddings.
 
@@ -233,7 +233,6 @@ class VibeVoiceDiffusionHead(PreTrainedModel):
 
     Args:
         config (`VibeVoiceDiffusionHeadConfig`): Model configuration
-        latent_size (`int`, optional): Size of the latent space. If not provided, uses `config.latent_size`.
     """
 
     config_class = VibeVoiceDiffusionHeadConfig
@@ -297,7 +296,7 @@ class VibeVoiceDiffusionHead(PreTrainedModel):
         noisy_images,
         timesteps,
         condition,
-    ):
+    ) -> torch.Tensor:
         """
         Forward pass of the prediction head.
 
