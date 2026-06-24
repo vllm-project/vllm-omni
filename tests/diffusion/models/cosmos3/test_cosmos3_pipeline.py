@@ -19,9 +19,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 class StubScheduler:
-    def __init__(self, timesteps: list[int] | None = None, *, flow_shift: float = 1.0) -> None:
+    def __init__(
+        self,
+        timesteps: list[int] | None = None,
+        *,
+        flow_shift: float = 1.0,
+        use_karras_sigmas: bool = True,
+    ) -> None:
         self.timesteps = torch.tensor(timesteps or [9, 3], dtype=torch.int64)
-        self.config = SimpleNamespace(num_train_timesteps=1000, flow_shift=flow_shift)
+        self.config = SimpleNamespace(
+            num_train_timesteps=1000,
+            flow_shift=flow_shift,
+            use_karras_sigmas=use_karras_sigmas,
+        )
         self.set_timesteps_calls: list[tuple[int, torch.device]] = []
         self.step_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
@@ -54,8 +64,10 @@ class StubCosmos3VAE:
             latents_mean=[0.0] * z_dim,
             latents_std=[1.0] * z_dim,
         )
+        self.encode_input_shapes: list[tuple[int, ...]] = []
 
     def encode(self, video: torch.Tensor):
+        self.encode_input_shapes.append(tuple(video.shape))
         latent_frames = (video.shape[2] - 1) // self.config.scale_factor_temporal + 1
         latent_height = video.shape[-2] // self.config.scale_factor_spatial
         latent_width = video.shape[-1] // self.config.scale_factor_spatial
@@ -192,6 +204,8 @@ def make_cosmos3_pipeline():
         pipeline._base_scheduler_config = pipeline.scheduler.config
         pipeline._engine_init_flow_shift = 1.0
         pipeline._current_flow_shift = 1.0
+        pipeline._base_scheduler_use_karras_sigmas = True
+        pipeline._current_scheduler_use_karras_sigmas = True
         pipeline._guidance_scale = None
         pipeline._num_timesteps = None
         pipeline._cosmos3_branch_caches = None
@@ -288,11 +302,25 @@ def stub_real_pipeline_init(monkeypatch: pytest.MonkeyPatch):
             return self
 
     class _StubDiffusersScheduler:
-        config = SimpleNamespace(flow_shift=1.0)
+        from_config_calls: list[dict[str, Any]] = []
+
+        def __init__(self, *, flow_shift: float = 1.0, use_karras_sigmas: bool = True) -> None:
+            self.config = SimpleNamespace(flow_shift=flow_shift, use_karras_sigmas=use_karras_sigmas)
 
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
             return cls()
+
+        @classmethod
+        def from_config(cls, config, **kwargs):
+            cls.from_config_calls.append({"config": config, "kwargs": dict(kwargs)})
+            return cls(
+                flow_shift=kwargs.get("flow_shift", getattr(config, "flow_shift", 1.0)),
+                use_karras_sigmas=kwargs.get(
+                    "use_karras_sigmas",
+                    getattr(config, "use_karras_sigmas", True),
+                ),
+            )
 
     class _StubVideoProcessor:
         def __init__(self, *args, **kwargs) -> None:
@@ -303,6 +331,7 @@ def stub_real_pipeline_init(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(pipeline_cosmos3, "UniPCMultistepScheduler", _StubDiffusersScheduler)
     monkeypatch.setattr(pipeline_cosmos3, "VideoProcessor", _StubVideoProcessor)
     monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cpu"))
+    return _StubDiffusersScheduler
 
 
 def _make_od_config(*, sound_gen: bool) -> SimpleNamespace:
@@ -338,10 +367,72 @@ def test_pipeline_init_skips_tokenizer_when_sound_disabled(stub_real_pipeline_in
 
     pipeline = Cosmos3OmniDiffusersPipeline(od_config=_make_od_config(sound_gen=False))
 
+    assert stub_real_pipeline_init.from_config_calls == []
     assert pipeline._sound_tokenizer is None
     assert pipeline.transformer.sound_gen is False
     assert not hasattr(pipeline.transformer, "audio_proj_in")
     assert not hasattr(pipeline.transformer, "audio_proj_out")
+    assert pipeline._base_scheduler_use_karras_sigmas is True
+    assert pipeline._current_scheduler_use_karras_sigmas is True
+
+
+def test_pipeline_init_rebuilds_scheduler_with_cosmos3_defaults(stub_real_pipeline_init) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    od_config = _make_od_config(sound_gen=False)
+    od_config.flow_shift = 2.5
+
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+    assert stub_real_pipeline_init.from_config_calls
+    call = stub_real_pipeline_init.from_config_calls[-1]
+    assert getattr(call["config"], "flow_shift") == 1.0
+    assert call["kwargs"] == {"flow_shift": 2.5}
+    assert pipeline._engine_init_flow_shift == 2.5
+    assert pipeline._base_scheduler_use_karras_sigmas is True
+
+
+def test_set_flow_shift_restores_checkpoint_scheduler_mode(
+    make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    class RecordingScheduler:
+        from_config_calls: list[dict[str, Any]] = []
+
+        def __init__(self, *, flow_shift: float, use_karras_sigmas: bool) -> None:
+            self.config = SimpleNamespace(flow_shift=flow_shift, use_karras_sigmas=use_karras_sigmas)
+
+        @classmethod
+        def from_config(cls, config, **kwargs):
+            cls.from_config_calls.append({"config": config, "kwargs": dict(kwargs)})
+            return cls(
+                flow_shift=kwargs.get("flow_shift", getattr(config, "flow_shift", 1.0)),
+                use_karras_sigmas=kwargs.get(
+                    "use_karras_sigmas",
+                    getattr(config, "use_karras_sigmas", True),
+                ),
+            )
+
+    monkeypatch.setattr(pipeline_cosmos3, "UniPCMultistepScheduler", RecordingScheduler)
+    pipeline = make_cosmos3_pipeline()
+
+    pipeline._set_flow_shift(10.0, use_karras_sigmas=False)
+    assert RecordingScheduler.from_config_calls[-1]["kwargs"] == {
+        "flow_shift": 10.0,
+        "use_karras_sigmas": False,
+    }
+    assert pipeline._current_flow_shift == 10.0
+    assert pipeline._current_scheduler_use_karras_sigmas is False
+
+    pipeline._set_flow_shift(10.0)
+    assert RecordingScheduler.from_config_calls[-1]["kwargs"] == {"flow_shift": 10.0}
+    assert pipeline._current_flow_shift == 10.0
+    assert pipeline._current_scheduler_use_karras_sigmas is True
+
+    pipeline._set_flow_shift(10.0)
+    assert len(RecordingScheduler.from_config_calls) == 2
 
 
 def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
@@ -709,7 +800,7 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
     assert latents.shape == (1, 2, 2, 2, 3)
 
-    pipeline._encode_conditioning_video = lambda *args, **kwargs: torch.full((1, 2, 2, 2, 3), 5.0)
+    pipeline._encode_conditioning_image_latent = lambda *args, **kwargs: torch.full((1, 2, 1, 2, 3), 5.0)
     i2v_latents, velocity_mask, image_latent = pipeline._prepare_latents_i2v(
         torch.zeros(1, 3, 16, 24), 16, 24, 5, torch.Generator(device="cpu").manual_seed(0)
     )
@@ -759,6 +850,44 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     torch.testing.assert_close(action, clean)
 
 
+def test_prepare_latents_i2v_encodes_only_conditioning_frame(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def record_to_vae_device(tensor: torch.Tensor, *, pin_cpu: bool = False) -> torch.Tensor:
+        assert pin_cpu is True
+        calls.append(("to_vae_device", tuple(tensor.shape)))
+        return tensor
+
+    class RecordingVAE(StubCosmos3VAE):
+        def encode(self, video: torch.Tensor):
+            calls.append(("encode", tuple(video.shape)))
+            return super().encode(video)
+
+    pipeline._to_vae_device = record_to_vae_device
+    pipeline.vae = RecordingVAE(z_dim=2)
+    generator = torch.Generator(device="cpu").manual_seed(0)
+
+    latents, velocity_mask, image_latent = pipeline._prepare_latents_i2v(
+        torch.zeros(1, 3, 16, 24),
+        16,
+        24,
+        9,
+        generator,
+    )
+
+    assert calls == [
+        ("to_vae_device", (1, 3, 16, 24)),
+        ("encode", (1, 3, 1, 16, 24)),
+    ]
+    assert pipeline.vae.encode_input_shapes[-1] == (1, 3, 1, 16, 24)
+    assert latents.shape == (1, 2, 3, 2, 3)
+    assert image_latent.shape == (1, 2, 1, 2, 3)
+    torch.testing.assert_close(latents[:, :, 0:1], image_latent)
+    assert not torch.allclose(latents[:, :, 1:], image_latent.expand(-1, -1, 2, -1, -1))
+    assert velocity_mask.tolist() == [[[[[0.0]], [[1.0]], [[1.0]]]]]
+
+
 def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
@@ -790,6 +919,9 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         image_latent=torch.full((1, 2, 1, 1, 1), 7.0),
     )
     torch.testing.assert_close(i2v[:, :, 0:1], torch.full((1, 2, 1, 1, 1), 7.0))
+    i2v_noise = pipeline.scheduler.step_calls[-1][0]
+    torch.testing.assert_close(i2v_noise[:, :, 0:1], torch.zeros(1, 2, 1, 1, 1))
+    torch.testing.assert_close(i2v_noise[:, :, 1:2], torch.full((1, 2, 1, 1, 1), 2.0))
 
     pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
     video_result, action_result = pipeline.diffuse(
@@ -955,7 +1087,12 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     pipeline._encode_video_tensor = fake_encode
     pipeline._prepare_transfer_latents = fake_prepare
     pipeline.diffuse_transfer = fake_diffuse_transfer
-    pipeline._set_flow_shift = lambda target: captured.setdefault("flow_shifts", []).append(target)
+
+    def fake_set_flow_shift(target, *, use_karras_sigmas=None):
+        captured.setdefault("flow_shifts", []).append(target)
+        captured.setdefault("scheduler_use_karras_sigmas", []).append(use_karras_sigmas)
+
+    pipeline._set_flow_shift = fake_set_flow_shift
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 5, 16, 16, device="meta")
 
     control = torch.zeros(3, 5, 16, 16, dtype=torch.uint8)
@@ -988,6 +1125,8 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     assert captured["format_frame_rate"] == expected_fps
     assert captured["shared_kwargs"]["fps"] == expected_fps
     assert captured["flow_shifts"] == [10.0]
+    # Transfer uses the V2V flow-sigma schedule (karras off) so flow_shift applies.
+    assert captured["scheduler_use_karras_sigmas"] == [False]
     assert output.custom_output["fps"] == expected_fps
     assert output.output["video"].device.type == "meta"
 
@@ -1001,7 +1140,7 @@ def test_forward_transfer_runs_multichunk_overlap_path(
 
     pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16)
     pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(2), _mask(), _ids(1), _mask())
-    pipeline._set_flow_shift = lambda target: captured.setdefault("flow_shifts", []).append(target)
+    pipeline._set_flow_shift = lambda target, **_kwargs: captured.setdefault("flow_shifts", []).append(target)
 
     original_prepare = pipeline._prepare_transfer_latents
 
@@ -1107,7 +1246,18 @@ class TestForwardRouting:
     def _install_forward_stubs(self, pipeline):
         captured: dict[str, object] = {"diffuse_calls": [], "prepare_calls": []}
 
-        def fake_format(prompt, negative_prompt, num_frames, frame_rate, height, width, *args, **kwargs):
+        def fake_format(
+            prompt,
+            negative_prompt,
+            num_frames,
+            frame_rate,
+            height,
+            width,
+            max_sequence_length,
+            sp,
+            use_system_prompt=False,
+            is_t2i=False,
+        ):
             captured["format"] = {
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
@@ -1115,7 +1265,8 @@ class TestForwardRouting:
                 "frame_rate": frame_rate,
                 "height": height,
                 "width": width,
-                "is_t2i": kwargs["is_t2i"],
+                "use_system_prompt": use_system_prompt,
+                "is_t2i": is_t2i,
             }
             return _ids(2), _mask(), _ids(1), _mask()
 
@@ -1134,7 +1285,12 @@ class TestForwardRouting:
 
         pipeline._format_and_tokenize_prompts = fake_format
         pipeline._prepare_latents = fake_prepare
-        pipeline._set_flow_shift = lambda target: captured.setdefault("flow_shifts", []).append(target)
+
+        def fake_set_flow_shift(target, *, use_karras_sigmas=None):
+            captured.setdefault("flow_shifts", []).append(target)
+            captured.setdefault("scheduler_use_karras_sigmas", []).append(use_karras_sigmas)
+
+        pipeline._set_flow_shift = fake_set_flow_shift
         pipeline.diffuse = fake_diffuse
         pipeline._decode_latents = lambda latents: latents
         return captured
@@ -1145,12 +1301,24 @@ class TestForwardRouting:
             (
                 {"prompt": "A painted robot", "modalities": ["image"]},
                 make_sampling_params(num_outputs_per_prompt=2),
-                {"key": "image", "is_t2i": True, "flow": [3.0], "steps": [50, 50], "frames": 1},
+                {
+                    "key": "image",
+                    "is_t2i": True,
+                    "flow": [3.0],
+                    "steps": [50, 50],
+                    "frames": 1,
+                },
             ),
             (
                 "A warehouse robot",
                 make_sampling_params(),
-                {"key": "video", "is_t2i": False, "flow": [1.0], "steps": [35], "frames": 189},
+                {
+                    "key": "video",
+                    "is_t2i": False,
+                    "flow": [1.0],
+                    "steps": [35],
+                    "frames": 189,
+                },
             ),
         ],
     )
@@ -1170,6 +1338,7 @@ class TestForwardRouting:
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
         assert captured["format"]["num_frames"] == expected["frames"]
         assert captured["flow_shifts"] == expected["flow"]
+        assert captured["scheduler_use_karras_sigmas"] == [None]
         assert [call[0] for call in pipeline.scheduler.set_timesteps_calls] == expected["steps"]
 
     def test_forward_i2v_sound_and_action_routes(self, make_cosmos3_pipeline) -> None:
@@ -1221,6 +1390,7 @@ class TestForwardRouting:
             )
         )
         assert captured["flow_shifts"][-1] == 10.0
+        assert captured["scheduler_use_karras_sigmas"][-1] is False
         assert captured["format"]["negative_prompt"] == ""
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is v2v_mask
         assert captured["diffuse_calls"][-1]["condition_latents"] is v2v_condition
@@ -1337,6 +1507,7 @@ class TestForwardRouting:
             "frame_rate": 15.0,
             "height": 16,
             "width": 16,
+            "use_system_prompt": False,
             "is_t2i": False,
         }
         assert "flow_shifts" not in captured

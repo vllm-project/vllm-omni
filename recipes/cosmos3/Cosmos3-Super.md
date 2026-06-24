@@ -57,7 +57,10 @@ vllm serve nvidia/Cosmos3-Super \
 
 Guardrails are on by default (gated `nvidia/Cosmos-1.0-Guardrail` — `pip install
 cosmos-guardrail`, accept the license, set `HF_TOKEN`); add `--no-guardrails` to
-disable. `--enable-layerwise-offload` reduces VRAM on smaller GPUs.
+disable. `--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
+generation from ~83 GB to ~55 GB per GPU (2-GPU) with BF16-level quality (T2V
+composition can shift at the same seed).
 
 #### Verification
 

@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -46,6 +47,30 @@ else:
     )
 
 logger = init_logger(__name__)
+
+
+def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return only M-RoPE kwargs accepted by the model implementation."""
+    method = getattr(model, "get_mrope_input_positions")
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return kwargs
+
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return kwargs
+
+    accepted = {
+        name
+        for name, param in signature.parameters.items()
+        if name not in {"self", "input_tokens"}
+        and param.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    }
+    return {key: value for key, value in kwargs.items() if key in accepted}
 
 
 class OmniGPUModelRunner(GPUModelRunner):
@@ -338,7 +363,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 kwargs["target_w"] = target_w
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
-                **kwargs,
+                **_filter_mrope_kwargs_for_model(self.model, kwargs),
             )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
@@ -1353,8 +1378,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         combined_hidden_states: dict[str, torch.Tensor] | None = None,
         combined_multimodal_outputs: dict[str, object] | None = None,
         req_ids_filter: set[str] | None = None,
+        req_ids: list[str] | None = None,
+        query_start_loc_cpu: object | None = None,
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
+        req_ids = req_ids if req_ids is not None else self.input_batch.req_ids
+        if query_start_loc_cpu is None:
+            query_start_loc_cpu = self.query_start_loc.cpu
+            if callable(query_start_loc_cpu):
+                query_start_loc_cpu = query_start_loc_cpu()
         try:
             # execute the custom postprocess function
             # TODO(Peiqi): do we have a more elegant way to do this?
@@ -1362,7 +1394,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 postprocess_uses_hidden_states = getattr(self.model, "postprocess_uses_hidden_states", True)
                 postprocess_uses_multimodal_outputs = getattr(self.model, "postprocess_uses_multimodal_outputs", True)
                 postprocess_uses_req_infos = getattr(self.model, "postprocess_uses_req_infos", True)
-                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                for req_index, req_id in enumerate(req_ids):
                     if req_ids_filter is not None and req_id not in req_ids_filter:
                         continue
                     req_infos = self.model_intermediate_buffer.get(req_id, {}) if postprocess_uses_req_infos else {}
@@ -1371,7 +1403,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                             # Combined hidden states contains all hidden states for every request
                             hidden_states_slice = combined_hidden_states[req_id]
                         else:
-                            start_offset = int(self.query_start_loc.cpu[req_index])
+                            start_offset = int(query_start_loc_cpu[req_index])
                             sched_tokens = int(num_scheduled_tokens_np[req_index])
                             s, e = start_offset, start_offset + sched_tokens
                             # only consider to store data into update dict.
@@ -1401,7 +1433,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
                     self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
-            logger.error(f"Error merging for requests:{self.input_batch.req_ids} additional information update: {e}")
+            logger.error(f"Error merging for requests:{req_ids} additional information update: {e}")
             import traceback
 
             traceback.print_exc()

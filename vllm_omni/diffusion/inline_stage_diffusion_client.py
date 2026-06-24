@@ -134,12 +134,18 @@ class InlineStageDiffusionClient(StageClientBase):
                 kv_sender_info=kv_sender_info,
             )
 
-            results = await self._engine.step(request)
-            result = results[0]
-            if not result.request_id:
-                result.request_id = request_id
-
-            self._output_queue.put_nowait(result)
+            if self.od_config.streaming_output:
+                async for results in self._engine.step_streaming(request):
+                    result = results[0]
+                    if not result.request_id:
+                        result.request_id = request_id
+                    self._output_queue.put_nowait(result)
+            else:
+                results = await self._engine.step(request)
+                result = results[0]
+                if not result.request_id:
+                    result.request_id = request_id
+                self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
         except Exception as e:

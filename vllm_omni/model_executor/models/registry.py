@@ -305,6 +305,17 @@ _OMNI_MODELS = {
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
     ),
+    ## IndexTTS2
+    "IndexTTS2TalkerForConditionalGeneration": (
+        "indextts2",
+        "indextts2_talker",
+        "IndexTTS2TalkerForConditionalGeneration",
+    ),
+    "IndexTTS2S2MelDecoder": (
+        "indextts2",
+        "indextts2_s2mel_decoder",
+        "IndexTTS2S2MelDecoder",
+    ),
     ## Ming-flash-omni-2.0
     "MingFlashOmniForConditionalGeneration": (
         "ming_flash_omni",
@@ -342,6 +353,11 @@ _OMNI_MODELS = {
         "minicpmo_4_5",
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
+    ),
+    "AuraQwen3VLForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_vl",
+        "AuraQwen3VLForConditionalGeneration",
     ),
 }
 
