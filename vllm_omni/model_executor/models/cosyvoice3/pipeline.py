@@ -4,8 +4,10 @@
 
 Stage 0: Talker   — text prompt → speech tokens (LLM autoregressive).
 Stage 1: Code2Wav — flow-matching decoder → acoustic features → waveform.
-  * ``sync_process_input_func`` runs when ``deploy.async_chunk=false``:
-    stage 1 builds full-sequence flow input via ``text2flow``.
+  * ``sync_process_input_func`` (``text2flow_token_only``) runs when
+    ``deploy.async_chunk=false``: stage 1 builds full-sequence flow input
+    from the emitted speech tokens. ``text2flow`` is the
+    ``custom_process_input_func`` variant.
   * ``async_chunk_process_next_stage_input_func`` runs when
     ``deploy.async_chunk=true``: stage 0 streams codec chunks to stage 1
     through the shared-memory connector.

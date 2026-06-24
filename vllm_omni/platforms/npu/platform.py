@@ -31,6 +31,16 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     _omni_enum = OmniPlatformEnum.NPU
     dist_backend: str = "hccl"
 
+    # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
+    def __init__(self) -> None:
+        from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
+            apply_qwen3_tts_code2wav_patch,
+        )
+
+        apply_qwen3_tts_code2wav_patch()
+        apply_310p_patches()
+
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         super().set_device(device)
@@ -46,6 +56,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker"
+
+    @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+        from vllm_ascend.ascend_config import init_ascend_config
+
+        init_ascend_config(vllm_config)
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:

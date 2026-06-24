@@ -1,5 +1,6 @@
 """Stage input processor for Fish Speech S2 Pro: Slow AR → DAC Decoder."""
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -91,14 +92,14 @@ def _select_backlog_chunk_size(
     return backlog_chunk_size
 
 
-def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
-    """Extract the last frame of audio codes from the pooling output."""
-    audio_codes = pooling_output.get("audio_codes")
+def _extract_last_frame(multimodal_output: dict[str, Any]) -> torch.Tensor | None:
+    """Extract the last frame of audio codes from the multimodal output."""
+    audio_codes = multimodal_output.get("audio_codes")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
-        valid = pooling_output.get("audio_code_valid")
+        valid = multimodal_output.get("audio_code_valid")
         if isinstance(valid, torch.Tensor) and valid.numel() > 0:
             is_valid = bool(valid.reshape(-1)[-1].item())
         elif valid is not None:
@@ -146,7 +147,7 @@ def slow_ar_to_dac_decoder(
 
 def slow_ar_to_dac_decoder_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -160,8 +161,8 @@ def slow_ar_to_dac_decoder_async_chunk(
     finished = bool(is_finished or request.is_finished())
     cfg = _get_connector_extra(transfer_manager)
 
-    if isinstance(pooling_output, dict):
-        frame = _extract_last_frame(pooling_output)
+    if isinstance(multimodal_output, Mapping):
+        frame = _extract_last_frame(multimodal_output)
         if frame is not None:
             transfer_manager.code_prompt_token_ids[request_id].append(frame.detach())
     elif not finished:

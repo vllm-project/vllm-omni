@@ -11,6 +11,10 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <th>Level</th>
       <th>Scope & Focus</th>
+      <th>Model Coverage Strategy</th>
+      <th>Feature Coverage Strategy</th>
+      <th>Interface Coverage Strategy</th>
+      <th>Tags</th>
       <th>Time Cost</th>
       <th>Test Dir</th>
       <th>Doc</th>
@@ -24,12 +28,20 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>Contribution Guideline & PR checklist</td>
       <td>/</td>
       <td>/</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
       <td>.github/PULL_REQUEST_TEMPLATE.md <a href="../tests_style/"> Test Style (PR Checklist)</a></td>
       <td>/</td>
       <td>/</td>
     </tr>
     <tr>
       <td>CI Failure Description</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
       <td>/</td>
       <td>/</td>
       <td><a href="../failures/"> CI Failures</a></td>
@@ -39,6 +51,10 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L1</strong><br>(Unit & Logic)</td>
       <td>Unit tests for components like entrypoints, models</td>
+      <td>/</td>
+      <td>/</td>
+      <td>/</td>
+      <td><code>core_model and cpu</code></td>
       <td rowspan="2">&lt;15min</td>
       <td>/tests/{component_name}/test_xxx</td>
       <td>
@@ -50,10 +66,18 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     </tr>
     <tr>
       <td><strong>L2</strong><br>(E2E across models & GPU-required UT)</td>
-      <td>Online & Offline (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
+      <td>Online (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
+      <td>High-priority models + online basic scenarios + request success validation</td>
+      <td>High-priority features (using random lightweight models)</td>
+      <td>High-priority interfaces (using random lightweight models)</td>
+      <td><code>core_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>
+        <strong>Model tests:</strong><br>
         /tests/e2e/online_serving/test_{model_name}.py<br>
-        /tests/e2e/offline_inference/test_{model_name}.py
+        <strong>Feature tests:</strong><br>
+        /tests/{component_name}/test_xxx<br>
+        <strong>Interface tests:</strong><br>
+        /tests/entrypoints/test_xxx
       </td>
       <td>
         <a href="#chapter-1-l1-l2-level-testing-unit-testing-and-basic-end-to-end-verification">Chapter 1</a><br>
@@ -65,10 +89,19 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L3</strong><br>(Important Perf & Integration & Accuracy)</td>
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
+      <td>High/medium-priority models with real weights + online/offline key scenarios + basic accuracy validation</td>
+      <td>Medium-priority features (using random lightweight models)</td>
+      <td>Medium-priority interfaces (using random lightweight models)</td>
+      <td><code>advanced_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;30min</td>
       <td>
+        <strong>Model tests:</strong><br>
         /tests/e2e/online_serving/test_{model_name}.py<br>
-        /tests/e2e/offline_inference/test_{model_name}.py
+        /tests/e2e/offline_inference/test_{model_name}.py<br>
+        <strong>Feature tests:</strong><br>
+        /tests/{component_name}/test_xxx<br>
+        <strong>Interface tests:</strong><br>
+        /tests/entrypoints/test_xxx
       </td>
       <td>
         <a href="#chapter-2-l3-level-testing-core-integration-performance-and-accuracy-verification">Chapter 2</a><br>
@@ -79,18 +112,27 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     </tr>
     <tr>
       <td><strong>L4</strong><br>(Perf & Integration & Accuracy)</td>
-      <td>Online & Offline: full functional scenarios + performance test + doc test</td>
+      <td>Online: full functional scenarios + performance test + doc test + accuracy test</td>
+      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium/low-priority models: function and doc testing</td>
+      <td>Low-priority features (using random lightweight models)</td>
+      <td>Low-priority interfaces (using random lightweight models)</td>
+      <td><code>full_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;3 hour</td>
       <td>
-        <strong>Full Function:</strong><br>
+        <strong>Model tests:</strong><br>
         /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
-        /tests/e2e/offline_inference/test_{model_name}_expansion.py<br>
+        <strong>Feature tests:</strong><br>
+        /tests/{component_name}/test_xxx<br>
+        <strong>Interface tests:</strong><br>
+        /tests/entrypoints/test_xxx<br>
         <strong>Performance:</strong><br>
         /tests/dfx/perf/tests/test_qwen_omni.json (Omni), test_tts.json (TTS),<br>
         and /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
         <strong>Doc Test:</strong><br>
         tests/example/online_serving/test_{model_name}.py<br>
-        tests/example/offline_inference/test_{model_name}.py
+        tests/example/offline_inference/test_{model_name}.py<br>
+        <strong>Accuracy Test:</strong><br>
+        /tests/e2e/accuracy/test_{model_name}.py
       </td>
       <td>
         <a href="#chapter-3-l4-level-testing-full-functionality-performance-and-documentation-testing">Chapter 3</a><br>
@@ -101,7 +143,11 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     </tr>
     <tr>
       <td><strong>L5</strong><br>(Stability & Reliability)</td>
-      <td>Online & Offline: long-term stability test + reliability test</td>
+      <td>Online: long-term stability test + reliability test</td>
+      <td>Long-term stability and reliability testing for high-priority models</td>
+      <td>/</td>
+      <td>Invalid-parameter validation for high-priority interfaces</td>
+      <td><code>slow and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td> Depends on reality </td>
       <td>
         <strong>Stability:</strong><br>
@@ -268,6 +314,120 @@ Before entering specific testing levels, the project establishes two common spec
 1.  ***PR Checklist ([Tests Style](../ci/tests_style.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
 2.  ***CI Failure Explanation ([CI Failures](../ci/failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
 
+## Notes
+
+### Diff-aware Buildkite uploads (`source_file_dependencies`)
+
+L2 (`.buildkite/test-ready.yml`) and L3 (`.buildkite/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
+
+#### What `source_file_dependencies` is
+
+- A **uploader-only** YAML key on a Buildkite step or group. **Buildkite does not understand it**; `upload_pipeline.py` always **removes** it from the YAML that is uploaded.
+- A list of path **prefixes** (directories or individual files). If **any** changed file in the diff equals a prefix or starts with `prefix/`, the step is kept; otherwise the step (or entire group) is **omitted** from the uploaded pipeline.
+
+#### When filtering runs
+
+| Build context | Changed files used for matching |
+| --- | --- |
+| Pull request | `git diff --name-only origin/<base>...<BUILDKITE_COMMIT>` |
+| `main` branch push | `git diff --name-only <commit>^..<commit>` |
+| Other (e.g. local dry-run, non-PR branch) | Diff cannot be resolved → **no filtering**; all steps are uploaded and `source_file_dependencies` is still stripped |
+
+Docs-only PRs are handled earlier in bootstrap (`pipeline.yml`) via skip-ci logic; `source_file_dependencies` applies only to the **uploaded** L2/L3 test pipelines.
+
+#### Where it is configured
+
+| Level | Pipeline file | Upload entry |
+| --- | --- | --- |
+| L2 | `.buildkite/test-ready.yml` | `upload_pipeline.py --upload .buildkite/test-ready.yml` (from `pipeline.yml`) |
+| L3 | `.buildkite/test-merge.yml` | `upload_pipeline.py --upload .buildkite/test-merge.yml` (from `pipeline.yml`) |
+
+Steps **without** `source_file_dependencies` are always uploaded (subject to the usual label conditions: `ready` for L2, `merge-test` for L3).
+
+#### Current skip policy (L2 / L3)
+
+To balance CI cost and coverage:
+
+- **Always run** (no `source_file_dependencies`): baseline groups outside E2E Test—e.g. Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
+- **Diff-gated** (`source_file_dependencies` set): **every leaf job under the E2E Test group** in `test-ready.yml` and `test-merge.yml`, regardless of queue (`mithril-h100-pool`, `gpu_1_queue`, or `gpu_4_queue`). Each step lists the smallest set of prefixes that should trigger it—typically:
+  - pytest file(s) exercised by the job (online and/or offline);
+  - model code under `vllm_omni/model_executor/models/` or `vllm_omni/diffusion/models/`;
+  - related `vllm_omni/model_executor/stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable.
+
+Adding a new E2E step: add `source_file_dependencies` on the leaf job with those prefixes. Prefer **per-step** deps rather than a broad group-level list unless every child shares the same paths.
+
+#### YAML examples
+
+H100 E2E (kubernetes / `mithril-h100-pool`):
+
+```yaml
+      - label: "Diffusion · Qwen Image Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image.py
+          - vllm_omni/diffusion/models/qwen_image/
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' ...
+        agents:
+          queue: "mithril-h100-pool"
+```
+
+Docker E2E (`gpu_1_queue` / `gpu_4_queue`)—same key, same upload-time filtering:
+
+```yaml
+      - label: "TTS · Qwen3-TTS CustomVoice Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py ...
+        agents:
+          queue: "gpu_4_queue"
+```
+
+A **group** may also define `source_file_dependencies`; nested steps inherit filtering as a unit—the whole group is dropped if no prefix matches.
+
+#### Local dry-run
+
+```bash
+# Render filtered YAML to stdout (no upload)
+python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-ready.yml
+
+# Confirm uploader-only keys are stripped
+python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-merge.yml | grep source_file_dependencies
+# (no output expected)
+```
+
+On a PR build, Buildkite logs from `upload_pipeline.py` include lines such as `skip '…' (no changes under …)` for omitted steps.
+
+#### Related
+
+- Implementation: `.buildkite/scripts/upload_pipeline.py`
+- L2/L3 diff skip does **not** replace label-based triggers (`ready`, `merge-test`); it only reduces which steps appear **after** the pipeline is already scheduled.
+
+### Test helper environment variables
+
+Some shared helpers under `tests/helpers/` honor optional environment variables for local debugging. These are **not** set in CI by default.
+
+| Variable | Accepted values | Description |
+| -------- | --------------- | ----------- |
+| `VLLM_OMNI_KEEP_REQUEST_MEDIA` | `1`, `true`, `yes` (case-insensitive) | When enabled, temporary WAV files created by `tests.helpers.media.convert_audio_bytes_to_text` are **not** deleted when the pytest process exits. By default, each call writes a unique file under the system temp directory via `tempfile.mkstemp` and registers `atexit` cleanup. Use this when debugging audio output validation (Whisper transcription, keyword checks, text–audio similarity). The saved path is logged as `audio data is saved: <path>`. |
+
+Example (Linux / macOS):
+
+```bash
+export VLLM_OMNI_KEEP_REQUEST_MEDIA=1
+pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -k test_mix_to_text_audio
+```
+
+Example (Windows PowerShell):
+
+```powershell
+$env:VLLM_OMNI_KEEP_REQUEST_MEDIA = "1"
+pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -k test_mix_to_text_audio
+```
+
 ## Chapter 1: L1 & L2 Level Testing - Unit Testing and Basic End-to-End Verification
 
 ### 1.1 Testing Purpose
@@ -302,6 +462,7 @@ A clear directory structure is key to managing test cases efficiently.
 ### 1.4 Execution Method and Example
 
 -   ***Trigger Timing***: **`PR with ready label`**. That is, when a developer adds a "ready for review" or similar label to a PR on platforms like GitHub, L1 and L2 tests are automatically triggered.
+-   ***Diff-aware step skipping***: On L2, **E2E Test** jobs may be omitted at pipeline upload when the PR diff does not touch their [`source_file_dependencies`](#diff-aware-buildkite-uploads-source_file_dependencies) prefixes (H100 and docker queues alike); non-E2E groups still always upload. See [Diff-aware Buildkite uploads](#diff-aware-buildkite-uploads-source_file_dependencies).
 -   ***Execution Environment***: L1 uses ***CPU*** environment; L2 requires ***GPU*** environment.
 -   ***Script Example***:
 
@@ -404,7 +565,8 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
 ### 2.4 Execution Method and Example
 
--   ***Trigger Timing***: **`PR Merged`**. Automatically triggered after code review is approved and merged into the main branch.
+-   ***Trigger Timing***: **`PR Merged`**. Automatically triggered after code review is approved and merged into the main branch (typically via `merge-test` label on the PR before merge).
+-   ***Diff-aware step skipping***: Same [`source_file_dependencies`](#diff-aware-buildkite-uploads-source_file_dependencies) mechanism as L2—**all E2E Test** leaf steps are diff-gated; other L3 groups always upload. See [Diff-aware Buildkite uploads](#diff-aware-buildkite-uploads-source_file_dependencies).
 -   ***Execution Environment***: ***GPU*** servers.
 -   ***Script Example***:
 
@@ -519,6 +681,8 @@ L3 level testing executes after code is merged into the main branch. Its core pu
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
     **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model and full_model perform deep validation.
+
+    **Audio output debugging**: Deep validation may transcribe returned audio via `convert_audio_bytes_to_text` (Whisper). If an audio keyword or text–audio similarity assertion fails, set `VLLM_OMNI_KEEP_REQUEST_MEDIA=1` before running pytest to keep the intermediate WAV files for inspection (see [Test helper environment variables](#test-helper-environment-variables)).
 
 -   ***Run Command (L3 merge)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
 

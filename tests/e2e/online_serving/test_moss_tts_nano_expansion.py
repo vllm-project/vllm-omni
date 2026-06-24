@@ -25,11 +25,10 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 # ``omni`` for all tests; 001/002 also get ``full_model`` via ``TestMossTtsNanoFull`` (003 is core+advanced only, no full_model).
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
-
-_SKIP_ISSUE_3168 = pytest.mark.skip(
-    reason="https://github.com/vllm-project/vllm-omni/issues/3168",
-)
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.tts,
+]
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Nano"
 REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS-Nano/main/assets/audio/zh_1.wav"

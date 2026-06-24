@@ -85,7 +85,22 @@ def _get_wan22_feature_cases():
     """
     cases = []
 
-    # ---- CUDA cases (unchanged) ----
+    # ---- CUDA cases ----
+
+    # Single-card: CPU offload (applies to all models)
+    for model_path, model_key in WAN22_MODELS:
+        cases.append(
+            pytest.param(
+                OmniServerParams(
+                    model=model_path,
+                    server_args=["--enable-cpu-offload"],
+                ),
+                id=f"{model_key}_cpu_offload",
+                marks=CUDA_SINGLE_CARD_MARKS,
+            )
+        )
+
+    # Single-card: Cache-DiT (applies to all models)
     for model_path, model_key in WAN22_MODELS:
         cases.append(
             pytest.param(

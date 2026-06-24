@@ -8,6 +8,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model]
 
@@ -16,7 +17,7 @@ OMNI_MODEL = "Qwen/Qwen2.5-Omni-7B"
 OMNI_STAGE_CONFIG = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
 
 
-async def _noop(**kw):
+async def _noop(*args, **kw):
     pass
 
 
@@ -61,6 +62,7 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._final_output_handler = lambda: None
     omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params
     omni._compute_final_stage_id = lambda output_modalities: 0
+    omni._compute_final_output_stage_ids = lambda output_modalities: [0]
     omni._process_orchestrator_results = fake_process_results
     omni._log_summary_and_cleanup = lambda request_id: omni.request_states.pop(request_id, None)
     return omni
@@ -193,6 +195,48 @@ def test_generate_accepts_request_after_repeated_cancellations():
         for batch, prefix in zip(aborted_request_batches, ["cancel-0-", "cancel-1-", "cancel-2-"]):
             assert len(batch) == 1
             assert batch[0].startswith(prefix)
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_yields_streaming_diffusion_chunks_before_final():
+    """AsyncOmni.generate yields every intermediate diffusion chunk before the final one."""
+
+    async def streaming_process_results(request_id, metrics, final_stage_id_for_e2e, req_start_ts, wall_start_ts):
+        del metrics, final_stage_id_for_e2e, req_start_ts, wall_start_ts
+        yield OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=[],
+            final_output_type="image",
+            custom_output={"chunk": 0},
+            finished=False,
+        )
+        yield OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=[],
+            final_output_type="image",
+            custom_output={"chunk": 1},
+            finished=True,
+        )
+
+    async def run_test():
+        omni = get_async_omni_instance()
+        omni._process_orchestrator_results = streaming_process_results
+
+        outputs = []
+        async for output in AsyncOmni.generate(
+            omni,
+            prompt={"prompt": "a cat"},
+            request_id="req-stream",
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["image"],
+        ):
+            outputs.append(output)
+
+        assert len(outputs) == 2
+        assert [output.finished for output in outputs] == [False, True]
+        assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
 
     asyncio.run(run_test())
 

@@ -63,6 +63,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     stream_finished: torch.Tensor
     req_id: list[str]
     left_context_size: int
+    right_holdback_size: int
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
     next_stage_prompt_len: int
@@ -127,6 +128,7 @@ class EmbeddingsStruct(_StructBase):
     voice: torch.Tensor | None = None
     speech_feat: torch.Tensor | None = None
     speech_token: torch.Tensor | None = None
+    speech_token_len: torch.Tensor | None = None
     embedding: torch.Tensor | None = None
     thinker_reply: torch.Tensor | None = None
 
@@ -150,6 +152,7 @@ class MetaStruct(_StructBase):
     stream_finished: torch.Tensor | None = None
     req_id: list[str] | None = None
     left_context_size: int | None = None
+    right_holdback_size: int | None = None
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None

@@ -39,7 +39,6 @@ def run_tts(args) -> None:
     payload = {
         "model": args.model,
         "input": args.text,
-        "voice": "default",
         "response_format": args.response_format,
     }
 
