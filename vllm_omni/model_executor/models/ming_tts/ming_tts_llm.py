@@ -369,7 +369,10 @@ class MingLLMModel(nn.Module):
         # Fast path: CUDAGraph-captured flow head (CFM sampling + Aggregator +
         # stop head). Falls back permanently to the eager path on any failure.
         sampled_token_latent = next_embeds = stop_probs = None
-        graph_exec = self._maybe_build_cfm_graph(z_diff_cond)
+        # cfg < 1e-5 disables CFG; the eager flow head handles this with a
+        # dedicated unconditional branch (c=zeros) that the captured graph does
+        # not replicate, so fall back to eager there to match FlowLoss.sample.
+        graph_exec = self._maybe_build_cfm_graph(z_diff_cond) if cfg_scale >= 1e-5 else None
         if graph_exec is not None:
             try:
                 sampled_token_latent, next_embeds, stop_full = graph_exec.execute(
