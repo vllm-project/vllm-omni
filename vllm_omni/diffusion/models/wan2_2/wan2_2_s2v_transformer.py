@@ -1504,20 +1504,22 @@ class WanS2VTransformer3DModel(nn.Module):
         is_fsdp = hasattr(self, "unshard") and hasattr(self, "reshard")
         if is_fsdp:
             self.unshard()
-        audio_input = torch.cat(
-            [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
-            dim=-1,
-        )
-        audio_emb_res = self.casual_audio_encoder(audio_input)
-        result = {}
-        if self.enable_adain:
-            audio_emb_global, audio_emb = audio_emb_res
-            result["audio_emb_global"] = audio_emb_global[:, motion_frames[1] :]
-        else:
-            audio_emb = audio_emb_res
-        result["audio_emb"] = audio_emb[:, motion_frames[1] :, :]
-        if is_fsdp:
-            self.reshard()
+        try:
+            audio_input = torch.cat(
+                [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
+                dim=-1,
+            )
+            audio_emb_res = self.casual_audio_encoder(audio_input)
+            result = {}
+            if self.enable_adain:
+                audio_emb_global, audio_emb = audio_emb_res
+                result["audio_emb_global"] = audio_emb_global[:, motion_frames[1] :]
+            else:
+                audio_emb = audio_emb_res
+            result["audio_emb"] = audio_emb[:, motion_frames[1] :, :]
+        finally:
+            if is_fsdp:
+                self.reshard()
         return result
 
     def forward(
