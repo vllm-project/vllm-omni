@@ -20,7 +20,8 @@ from tests.helpers.stage_config import get_deploy_config_path
 MODEL = "k2-fsa/OmniVoice"
 DEPLOY_CONFIG = get_deploy_config_path("omnivoice.yaml")
 
-# (model, stage_config_path, extra_omni_kwargs) - see ``omni_runner`` in tests.helpers.fixtures.runtime
+# OmniRunner tuple: model, legacy stage config path, extra Omni kwargs.
+# The migrated test passes deploy_config through extra Omni kwargs.
 _OMNI_RUNNER_PARAM = (
     MODEL,
     None,

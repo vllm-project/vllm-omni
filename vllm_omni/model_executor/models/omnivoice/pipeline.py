@@ -14,7 +14,7 @@ from vllm_omni.config.stage_config import (
 
 OMNIVOICE_PIPELINE = PipelineConfig(
     model_type="omnivoice",
-    model_arch="OmniVoiceForConditionalGeneration",
+    model_arch="OmniVoicePipeline",
     stages=(
         StagePipelineConfig(
             stage_id=0,
