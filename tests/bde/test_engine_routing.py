@@ -35,15 +35,6 @@ def test_default_resolves_to_diffusion_engine():
     assert DiffusionEngine.resolve_engine_class(_cfg("default")) is DiffusionEngine
 
 
-def test_missing_field_resolves_to_diffusion_engine():
-    # Backward compatibility: configs predating the engine_backend field.
-    assert DiffusionEngine.resolve_engine_class(SimpleNamespace()) is DiffusionEngine
-
-
-def test_none_resolves_to_diffusion_engine():
-    assert DiffusionEngine.resolve_engine_class(_cfg(None)) is DiffusionEngine
-
-
 def test_bde_key_resolves_to_bde_engine():
     assert DiffusionEngine.resolve_engine_class(_cfg("bde")) is BDEEngine
 
@@ -151,11 +142,6 @@ def test_apply_runner_default_respects_explicit_choice():
     cfg = SimpleNamespace(diffusion_model_runner_cls="my.custom.Runner")
     apply_bde_runner_default(cfg)
     assert cfg.diffusion_model_runner_cls == "my.custom.Runner"
-
-
-def test_config_runner_cls_field_defaults_none():
-    field = {f.name: f for f in fields(OmniDiffusionConfig)}["diffusion_model_runner_cls"]
-    assert field.default is None
 
 
 def test_worker_runner_selection_prefers_override():

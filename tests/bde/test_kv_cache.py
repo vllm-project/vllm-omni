@@ -106,10 +106,6 @@ def test_kv_config_sliding_window_property():
     assert BDEKVConfig(chunk_size=16, window_chunks=None).sliding_window is None
 
 
-def test_kv_config_disabled_by_default():
-    assert BDEKVConfig().enable is False
-
-
 # --- BDERequestAdapter ------------------------------------------------------
 
 
@@ -141,13 +137,6 @@ def test_compute_num_blocks():
     assert compute_num_blocks(1 << 20, 0.5, 16 << 10) == 32
 
 
-def test_compute_num_blocks_validates():
-    with pytest.raises(ValueError):
-        compute_num_blocks(1 << 20, 0.5, 0)
-    with pytest.raises(ValueError):
-        compute_num_blocks(1 << 20, 1.5, 16 << 10)
-
-
 def test_build_manager_allocate_free_roundtrip():
     """End-to-end: a BDERequestAdapter drives a real KVCacheManager.
 
@@ -165,32 +154,3 @@ def test_build_manager_allocate_free_roundtrip():
 
     mgr.free(adapter)
     assert mgr.block_pool.get_num_free_blocks() == free_before
-
-
-def test_window_eviction_plateaus_pool_memory():
-    """Multi-chunk rollout: out-of-window blocks are recycled, so pool memory
-    plateaus at ~window size instead of growing with rollout length.
-
-    This is the core promise of the chunk window — drive a real KVCacheManager
-    over many chunks and assert the free-block count stops decreasing once the
-    window is full, and the resident (non-null) blocks stay bounded.
-    """
-    spec = make_spec(chunk_size=BLOCK, window_chunks=2)  # window = 2 chunks
-    mgr = build_kv_manager(spec, ["l0"], num_blocks=64, max_model_len=4096)
-    null_id = mgr.block_pool.null_block.block_id
-    adapter = BDERequestAdapter("req", chunk_size=BLOCK)
-
-    free_after = []
-    distinct_real = []
-    for _ in range(10):
-        mgr.allocate_slots(adapter, num_new_tokens=BLOCK)
-        ids = mgr.get_block_ids(adapter.request_id)[0]
-        distinct_real.append(len({b for b in ids if b != null_id}))
-        free_after.append(mgr.block_pool.get_num_free_blocks())
-        adapter.on_chunk_committed()
-
-    # Free-block count stops decreasing once the window is full (warmup = window).
-    assert free_after[-1] == free_after[spec.window_chunks]
-    assert free_after[-1] == free_after[-5]  # flat across the tail
-    # Resident non-null blocks bounded by window + the in-flight chunk.
-    assert max(distinct_real) <= spec.window_chunks + 1

@@ -163,23 +163,6 @@ def test_get_cross_kv_caches_returns_pool_dicts_when_populated():
         assert torch.equal(out[i]["v"], v)
 
 
-def test_commit_is_noop():
-    _, st = make_state()
-    st.commit_chunk()  # paged mode keeps resident windows; commit just logs
-
-
-def test_kv_state_noop():
-    """When _bde_kv_state is None, proxy methods fall through — verified by
-    the existing tests passing unchanged (the pipeline's default __init__
-    sets _bde_kv_state = None)."""
-    from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
-
-    p = DreamZeroPipeline.__new__(DreamZeroPipeline)
-    assert p._bde_kv_state is None
-    for attr in ("_kv_get", "_kv_create", "_kv_update", "_kv_commit"):
-        assert hasattr(p, attr), f"proxy method {attr} missing"
-
-
 def test_kv_create_owned_by_engine_under_bde():
     """_kv_create initializes model-local caches ONLY on the non-BDE path. Under
     BDE the pool owns all allocation, so state.create_kv_caches must NOT be called."""

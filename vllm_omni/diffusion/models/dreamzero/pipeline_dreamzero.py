@@ -56,7 +56,6 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
-_log = logger
 MAX_DREAMZERO_SESSIONS = 64
 
 
@@ -107,7 +106,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _kv_get(self, state, is_negative):
         s = self._bde_kv_state
         if s is not None:
-            _log.debug("BDE KV get (neg=%s): %d layers", is_negative, s.num_layers)
+            logger.debug("BDE KV get (neg=%s): %d layers", is_negative, s.num_layers)
             return s.get_kv_caches(is_negative)
         return state.get_kv_caches(is_negative)
 
@@ -123,7 +122,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _kv_update(self, state, layer_idx, updated_kv, is_negative, seq_len=None):
         s = self._bde_kv_state
         if s is not None:
-            _log.debug("BDE KV write: layer %d neg=%s shape=%s", layer_idx, is_negative, tuple(updated_kv.shape))
+            logger.debug("BDE KV write: layer %d neg=%s shape=%s", layer_idx, is_negative, tuple(updated_kv.shape))
             s.update_kv_cache(layer_idx, updated_kv, is_negative, seq_len)
         else:
             state.update_kv_cache(layer_idx, updated_kv, is_negative=is_negative)
@@ -131,7 +130,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _kv_commit(self):
         s = self._bde_kv_state
         if s is not None:
-            _log.debug("BDE KV commit: pos=%d chunks neg=%d chunks", s.pos.completed_chunks, s.neg.completed_chunks)
+            logger.debug("BDE KV commit: pos=%d chunks neg=%d chunks", s.pos.completed_chunks, s.neg.completed_chunks)
             s.commit_chunk()
 
     def _kv_get_cross(self, state, is_negative):
@@ -174,7 +173,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 v_img = ca.v_img(img_ctx).unflatten(2, (n, d))
             s.kv_cache.write_cross_kv(i, is_negative, k, v, k_img, v_img)
         s._cross_populated[is_negative] = True
-        _log.info(
+        logger.info(
             "BDE CROSS POPULATE [%s]: %d layers, text=%s img=%s",
             "neg" if is_negative else "pos",
             len(self.transformer.blocks),
@@ -448,7 +447,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state = kwargs.get("dreamzero_state", self.state)
             is_neg = kwargs.get("is_negative", False)
             if self._bde_kv_state is not None:
-                _log.info(
+                logger.info(
                     "BDE pipeline predict_noise -> write-back: is_neg=%s seq_len=%s current_start_frame=%s layers=%d",
                     is_neg,
                     kwargs.get("seq_len"),

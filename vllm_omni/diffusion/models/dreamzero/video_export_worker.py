@@ -9,21 +9,6 @@ import torch
 class DreamZeroVideoExportWorkerExtension:
     """DreamZero worker RPCs used by offline example video export."""
 
-    def gpu_mem_stats(self) -> dict:
-        """Peak GPU memory (GiB) for this worker's device, for profiling.
-
-        ``max_memory_reserved`` is the caching-allocator high-water mark (the best
-        in-process proxy for "peak VRAM"); ``max_memory_allocated`` is the live
-        tensor high-water mark. Both are monotonic from process start, so the
-        end-of-run values capture the whole rollout's peak.
-        """
-        dev = torch.accelerator.current_device_index()
-        return {
-            "device": int(dev),
-            "peak_reserved_gib": torch.accelerator.max_memory_reserved(dev) / (1024**3),
-            "peak_allocated_gib": torch.accelerator.max_memory_allocated(dev) / (1024**3),
-        }
-
     @staticmethod
     def _latents_to_uint8_frames(decoded: torch.Tensor) -> torch.Tensor:
         decoded = decoded.squeeze(0).permute(1, 2, 3, 0).contiguous()
