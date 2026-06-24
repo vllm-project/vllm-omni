@@ -392,11 +392,6 @@ def parse_args() -> argparse.Namespace:
         help="Enable CPU offloading for diffusion models.",
     )
     parser.add_argument(
-        "--disable-pin-cpu-memory",
-        action="store_true",
-        help="Disable pinned CPU memory when CPU or layerwise offloading is enabled.",
-    )
-    parser.add_argument(
         "--enable-layerwise-offload",
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
