@@ -23,7 +23,7 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 1
+    max_num_seqs: 4
     gpu_memory_utilization: 0.5
     enforce_eager: true
     trust_remote_code: true
@@ -42,7 +42,7 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    max_num_seqs: 1
+    max_num_seqs: 4
     gpu_memory_utilization: 0.3
     enforce_eager: true
     trust_remote_code: true

@@ -398,7 +398,29 @@ steps:
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/ -m "full_model and L4 and tts" --run-level "full_model" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_voxcpm2_tts_expansion.py
+          - pytest -s -v tests/e2e/ -m "full_model and L4 and tts" --run-level "full_model" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_voxcpm2_tts_expansion.py --ignore=tests/e2e/online_serving/test_fish_speech_batch.py
+        agents:
+          queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      - label: ":full_moon: TTS · Fish Speech E2E Test with L4"
+        timeout_in_minutes: 90
+        commands:
+          - pip install descript-audiotools descript-audio-codec
+          - pip install fish-speech --no-deps
+          - pip install 'protobuf>=5.0'
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/e2e/online_serving/test_fish_speech_batch.py -m "full_model and L4 and tts" --run-level "full_model"
         agents:
           queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:

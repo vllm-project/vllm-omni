@@ -137,3 +137,27 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_concurrent_text_to_audio(omni_server, openai_client) -> None:
+    """
+    Test concurrent text+audio output generation exercises Code2Wav batching.
+    Deploy Setting: default yaml (max_num_seqs=4 on decoder stage)
+    Input Modal: text
+    Output Modal: text + audio
+    Datasets: 4 concurrent requests
+    """
+    messages = dummy_messages_from_mix_data(content_text="Count from one to five.")
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+    }
+
+    openai_client.send_omni_request(request_config, request_num=4)
