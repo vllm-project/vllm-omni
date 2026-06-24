@@ -41,47 +41,20 @@ def _set_hunyuan_fused_moe_forward_context(num_tokens: int) -> None:
 
 
 def _init_mc2_group_for_diffusion(
-    world_size: int,
-    mc2_group_size: int,
     backend: str,
     local_rank: int,
-    group_ranks: list[list[int]] | None = None,
+    group_ranks: list[list[int]],
 ) -> None:
     import vllm_ascend.distributed.parallel_state as vllm_ascend_parallel_state
 
     if getattr(vllm_ascend_parallel_state, "_MC2", None) is not None:
         return
-    if group_ranks is None:
-        if world_size % mc2_group_size != 0:
-            raise ValueError(f"world_size ({world_size}) must be divisible by mc2_group_size ({mc2_group_size})")
-        all_ranks = torch.arange(world_size).reshape(-1, mc2_group_size)
-        group_ranks = [x.tolist() for x in all_ranks.unbind(0)]
-    elif any(len(ranks) != mc2_group_size for ranks in group_ranks):
-        raise ValueError(
-            f"All MC2 groups must have mc2_group_size ({mc2_group_size}) ranks, but got group_ranks={group_ranks}"
-        )
     vllm_ascend_parallel_state._MC2 = vllm_init_model_parallel_group(
         group_ranks,
         local_rank,
         backend,
         group_name="mc2",
     )
-
-
-def _sync_ascend_ep_group_for_diffusion() -> None:
-    """Make vllm-ascend use vLLM's EP group for expert placement.
-
-    vllm-omni maps diffusion SP to vLLM PCP and CFG to vLLM DP, so vLLM's
-    FusedMoE computes EP from TP * PCP * DP. vllm-ascend keeps its own
-    parallel-state module, so mirror the vLLM EP group there without changing
-    FusedMoE's tp_size/pcp_size/dp_size inputs.
-    """
-    import vllm_ascend.distributed.parallel_state as vllm_ascend_parallel_state
-
-    omni_ep_group = get_ep_group()
-    ascend_ep_group = getattr(vllm_ascend_parallel_state, "_EP", None)
-    if ascend_ep_group is not omni_ep_group:
-        vllm_ascend_parallel_state._EP = omni_ep_group
 
 
 def _select_moe_comm_method(vllm_config: VllmConfig) -> MoECommType | None:
@@ -104,14 +77,9 @@ def _select_moe_comm_method(vllm_config: VllmConfig) -> MoECommType | None:
 def prepare_hunyuan_fused_moe_runtime() -> None:
     vllm_config = omni_get_ctx().vllm_config
     if vllm_config.parallel_config.enable_expert_parallel:
-        world_size = torch.distributed.get_world_size()
         backend = torch.distributed.get_backend(get_world_group().device_group)
         local_rank = get_world_group().local_rank
-        mc2_group_size = get_ep_group().world_size
-        _sync_ascend_ep_group_for_diffusion()
         _init_mc2_group_for_diffusion(
-            world_size=world_size,
-            mc2_group_size=mc2_group_size,
             backend=backend,
             local_rank=local_rank,
             group_ranks=get_expert_parallel_group_ranks(),
