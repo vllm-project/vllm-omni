@@ -22,6 +22,14 @@ if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
 
 
+# Marker key the runner-level finish sentinel sets on its (otherwise
+# empty) ``pooling_output`` so a model's async-chunk stage-input hook can flush a
+# terminal payload (e.g. code2wav's trailing partial codec).  The legacy
+# scheduler-driven ``OmniChunkTransferAdapter`` never sets it, so adapter-driven
+# hook calls are unaffected.
+ASYNC_FINISH_SENTINEL_KEY = "__async_finish_sentinel__"
+
+
 class HiddenStates(TypedDict, total=False):
     output: torch.Tensor
     trailing_text: torch.Tensor

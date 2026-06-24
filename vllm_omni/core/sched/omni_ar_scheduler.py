@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -22,6 +23,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
+    uses_async_chunk_coordinator,
+    uses_async_chunk_model_runner_transport,
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
@@ -80,19 +83,45 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
         model_config = self.vllm_config.model_config
+        # Async-chunk receive waiting and model-runner transport ownership are
+        # separate: stage-0 producers do not need recv coordination, but Qwen3
+        # producers still send chunks from the model runner rather than through
+        # the legacy scheduler adapter.
+        _async_coord = uses_async_chunk_coordinator(model_config)
+        _async_model_runner_transport = uses_async_chunk_model_runner_transport(model_config)
         self.chunk_transfer_adapter = None
-        if getattr(model_config, "async_chunk", False):
+        # Coordinator-path segment-finished ids pending emission to the runner
+        # (resumable realtime stops); drained into OmniSchedulerOutput each schedule.
+        self._omni_pending_segment_finished: set[str] = set()
+        self._omni_pending_upstream_segment_finished: set[str] = set()
+        if getattr(model_config, "async_chunk", False) and not _async_model_runner_transport:
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         self.input_coordinator: OmniSchedulingCoordinator | None = None
-        if uses_full_payload_input_coordinator(model_config):
+        if uses_full_payload_input_coordinator(model_config) or _async_coord:
             self.input_coordinator = OmniSchedulingCoordinator(
                 scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
-                async_chunk=False,
+                async_chunk=_async_coord,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+
+    def add_request(self, request: Request) -> None:
+        existing = self.requests.get(request.request_id)
+        if (
+            existing is not None
+            and existing.streaming_queue is not None
+            and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+            and StreamingUpdate.from_request(request) is None
+            and getattr(self.vllm_config.model_config, "stage_id", 0) == 0
+            and uses_async_chunk_model_runner_transport(self.vllm_config.model_config)
+        ):
+            self._omni_pending_segment_finished.add(existing.request_id)
+            self.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+            return
+
+        super().add_request(request)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -205,6 +234,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
+    def _finish_input_coordinator_terminal_only_requests(self) -> None:
+        input_coordinator = getattr(self, "input_coordinator", None)
+        if input_coordinator is None:
+            return
+        if not getattr(input_coordinator, "_async_chunk", False):
+            return
+
+        terminal_only_req_ids = set(input_coordinator.finished_requests) - set(
+            input_coordinator.requests_with_ready_chunks
+        )
+        if not terminal_only_req_ids:
+            return
+
+        final_output_req_ids: set[str] = set()
+        if getattr(self.vllm_config.model_config, "final_output", False):
+            final_output_req_ids = {req_id for req_id in terminal_only_req_ids if req_id in self.requests}
+            input_coordinator.requests_with_ready_chunks.update(final_output_req_ids)
+
+        live_req_ids = [
+            req_id for req_id in terminal_only_req_ids if req_id in self.requests and req_id not in final_output_req_ids
+        ]
+        if live_req_ids:
+            # A connector finish without a ready chunk is a control signal, not
+            # model input. Finish it here so the base scheduler never runs the
+            # request with a metadata-only payload.
+            self.finish_requests(live_req_ids, RequestStatus.FINISHED_STOPPED)
+
+        for req_id in terminal_only_req_ids - final_output_req_ids:
+            input_coordinator.finished_requests.discard(req_id)
+
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -215,6 +274,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
         self._consume_pending_connector_output(model_mode="ar")
+        self._finish_input_coordinator_terminal_only_requests()
         self._process_pending_input_timeouts()
 
         if self.chunk_transfer_adapter:
@@ -265,6 +325,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
             if self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
+            if self.input_coordinator:
+                # Mirror the adapter postprocess on the coordinator path so the
+                # per-cycle ready-chunk flags (requests_with_ready_chunks) are cleared
+                # after each scheduler step. Without this, a streamed multi-chunk request
+                # stays flagged "ready" after its first chunk and never re-enters the
+                # per-cycle wait/clear cadence the adapter path gets for free.
+                self.input_coordinator.postprocess_scheduler_output(scheduler_output, self.requests)
             # Add information about requests needing KV cache transfer
             finished_reqs = self.get_finished_requests_needing_kv_transfer()
         except Exception:
@@ -410,6 +477,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
                 stopped = True
 
+            upstream_segment_finished = req_id in self._omni_pending_upstream_segment_finished
+            if (
+                upstream_segment_finished
+                and not stopped
+                and getattr(self.vllm_config.model_config, "final_output", False)
+            ):
+                # Final-output stages must flush each realtime segment locally.
+                # Intermediate stages keep running so they can forward later
+                # segments and emit their own downstream segment sentinels.
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
+
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
@@ -424,6 +503,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.resumable = False
                     stopped = True
 
+            self._omni_pending_upstream_segment_finished.discard(req_id)
+
             if stopped:
                 if model_runner_output.routed_experts is not None:
                     routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
@@ -434,6 +515,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 is_segment_finished = True
                 finished = self._handle_stopped_request(request)
                 if not finished:
+                    # Coordinator-path stages (talker/code2wav) have no scheduler-side
+                    # save_async(is_segment_finished); record the segment stop so the
+                    # runner emits an is_segment_finished terminal (flushing this
+                    # segment's audio tail) to the downstream stage next cycle.
+                    if self.input_coordinator is not None and not upstream_segment_finished:
+                        self._omni_pending_segment_finished.add(request.request_id)
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
                         if self.vllm_config.model_config.stage_id != 0:
@@ -864,6 +951,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def has_requests(self) -> bool:
         """Check if there are any requests to process, including KV transfers."""
+        if self._omni_pending_segment_finished:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "async chunk pending segment terminal keeps scheduler active: request_ids=%s",
+                    sorted(self._omni_pending_segment_finished),
+                )
+            return True
         # [Omni] Also check for pending KV transfers
         if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
             return True

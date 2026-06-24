@@ -17,7 +17,9 @@ class _DummyInputBatch:
         self.vocab_size = 10
 
 
-def _make_runner(multimodal_outputs):
+def _make_runner(multimodal_outputs, req_ids=None, req_id_to_index=None):
+    req_ids = req_ids or ["req-1"]
+    req_id_to_index = req_id_to_index or {"req-1": 0}
     runner = object.__new__(GPUGenerationModelRunner)
     runner.execute_model_state = ExecuteModelState(
         None,
@@ -32,6 +34,8 @@ def _make_runner(multimodal_outputs):
         None,
         multimodal_outputs,
         None,
+        req_ids,
+        req_id_to_index,
     )
     runner.kv_connector_output = None
     runner.input_batch = _DummyInputBatch()
@@ -83,3 +87,26 @@ def test_sample_tokens_dict_output():
     assert "audio" in output.multimodal_outputs[0]
     assert "unused" not in output.multimodal_outputs[0]
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
+
+
+def test_sample_tokens_uses_execute_snapshot_when_input_batch_mutates():
+    multimodal_outputs = {
+        "model_outputs": [torch.randn(1, 2)],
+        "sr": [torch.tensor(24_000, dtype=torch.int32)],
+    }
+    runner = _make_runner(
+        multimodal_outputs,
+        req_ids=["req-1"],
+        req_id_to_index={"req-1": 0},
+    )
+    runner.input_batch.req_ids = ["req-1", "req-2", "req-3"]
+    runner.input_batch.req_id_to_index = {"req-1": 0, "req-2": 1, "req-3": 2}
+    runner.input_batch.num_reqs = 3
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+
+    assert output.req_ids == ["req-1"]
+    assert output.req_id_to_index == {"req-1": 0}
+    assert len(output.multimodal_outputs) == 1
+    assert output.multimodal_outputs[0]["model_outputs"].shape == (1, 2)
+    assert output.multimodal_outputs[0]["sr"].item() == 24_000

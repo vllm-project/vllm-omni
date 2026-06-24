@@ -57,7 +57,13 @@ def _to_cpu(value):
 
 
 def to_payload_element(
-    element: object, idx: int, start: int, end: int, pass_lists_through: bool = False, seq_len: int | None = None
+    element: object,
+    idx: int,
+    start: int,
+    end: int,
+    pass_lists_through: bool = False,
+    seq_len: int | None = None,
+    clone_tensors: bool = True,
 ):
     """Build an mm payload element corresponding to one request index
     from an element containing 0 or more CPU tensors.
@@ -76,6 +82,10 @@ def to_payload_element(
             sliced per request. The prefix cache passthrough also passes
             the total scheduled token count here so 1D (seq_len,) metadata
             that is intentionally not cached is still split per request.
+        clone_tensors: Whether request-invariant tensor values should be
+            cloned before returning. Keep this enabled for local postprocess
+            paths; send-only connector payloads can disable it because the
+            sender has already frozen a CPU payload for transfer.
     """
     # Cached per-token tensors are merged elsewhere; here a first dim
     # equal to seq_len means a per-request slice is required.
@@ -85,19 +95,27 @@ def to_payload_element(
     # and running a model without prefix caching.
     elif isinstance(element, dict):
         return {
-            sk: to_payload_element(sv, idx, start, end, pass_lists_through=pass_lists_through, seq_len=seq_len)
+            sk: to_payload_element(
+                sv,
+                idx,
+                start,
+                end,
+                pass_lists_through=pass_lists_through,
+                seq_len=seq_len,
+                clone_tensors=clone_tensors,
+            )
             for sk, sv in element.items()
         }
     elif isinstance(element, list):
         # For lists, clone tensors to avoid cross-request aliasing
         if pass_lists_through:
-            return [elem.clone() if isinstance(elem, torch.Tensor) else elem for elem in element]
+            return [elem.clone() if clone_tensors and isinstance(elem, torch.Tensor) else elem for elem in element]
         element = element[idx] if idx < len(element) else element[0]
-        if isinstance(element, torch.Tensor):
+        if clone_tensors and isinstance(element, torch.Tensor):
             element = element.clone()
         return element
     elif isinstance(element, torch.Tensor):
         # List-derived tensor payloads are request-invariant; clone to
         # avoid accidental cross-request aliasing on downstream mutation.
-        return element.clone()
+        return element.clone() if clone_tensors else element
     return element

@@ -73,6 +73,57 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+CODE2WAV_NUM_QUANTIZERS = 16
+
+
+def _reshape_code2wav_input_ids(
+    input_ids: torch.Tensor,
+    seq_token_counts: list[int] | None,
+) -> torch.Tensor:
+    input_ids_flatten = input_ids.reshape(-1)
+    if seq_token_counts is None:
+        pad_size = (-input_ids_flatten.shape[0]) % CODE2WAV_NUM_QUANTIZERS
+        if pad_size:
+            input_ids_flatten = torch.cat(
+                [
+                    input_ids_flatten,
+                    input_ids_flatten.new_zeros(pad_size),
+                ]
+            )
+        return input_ids_flatten.reshape(1, CODE2WAV_NUM_QUANTIZERS, -1)
+
+    split_codes = torch.split(input_ids_flatten, seq_token_counts, dim=0)
+    code_seq_lens = [(code.shape[0] + CODE2WAV_NUM_QUANTIZERS - 1) // CODE2WAV_NUM_QUANTIZERS for code in split_codes]
+    max_seq_len = max(code_seq_lens, default=0)
+    codes = torch.zeros(
+        (len(split_codes), CODE2WAV_NUM_QUANTIZERS, max_seq_len),
+        device=input_ids.device,
+        dtype=input_ids.dtype,
+    )
+    for idx, (code, seq_len) in enumerate(zip(split_codes, code_seq_lens)):
+        if seq_len == 0:
+            continue
+        padded_len = seq_len * CODE2WAV_NUM_QUANTIZERS
+        if code.shape[0] < padded_len:
+            code = torch.cat([code, code.new_zeros(padded_len - code.shape[0])])
+        codes[idx, :, :seq_len] = code.reshape(CODE2WAV_NUM_QUANTIZERS, seq_len)
+    return codes
+
+
+def _normalize_code2wav_left_context_sizes(
+    left_context_sizes: list[int | None],
+    seq_token_counts: list[int] | None,
+) -> list[int]:
+    normalized = [0 if value is None else int(value) for value in left_context_sizes]
+    if seq_token_counts is None:
+        return normalized
+
+    expected_len = len(seq_token_counts)
+    if len(normalized) < expected_len:
+        normalized.extend([0] * (expected_len - len(normalized)))
+    return normalized[:expected_len]
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -190,6 +241,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                 ("hidden_states", "last"),
                 ("hidden_states", "trailing_text"),
                 ("embed", "tts_pad_projected"),
+                # async-chunk thinker decode cache is consumed every Talker step;
+                # keep it GPU-resident to avoid per-step CPU->GPU copies.
+                ("embed", "decode"),
+                ("embed", "cached_decode"),
                 # talker MTP codec codes must stay on GPU to avoid a per-step D2H
                 # sync stall; build_mm_cpu handles the eventual D2H at payload time.
                 ("codes", "audio"),
@@ -427,36 +482,23 @@ class Qwen3OmniMoeForConditionalGeneration(
             seq_token_counts: list[int] | None = kwargs.get("seq_token_counts")
 
             # Extract codec codes from input
-            if input_ids.shape[0] % 16 == 0:
-                if seq_token_counts is not None:
-                    max_seq_len = max(seq_token_counts) // 16
-                    batch_size = len(seq_token_counts)
-                    split_codes = torch.split(input_ids, seq_token_counts, dim=0)
-                    codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
-                    for idx, code in enumerate(split_codes):
-                        seq_len = code.shape[0] // 16
-                        codes[idx, :, :seq_len] = code.reshape(16, seq_len)
-                else:
-                    codes = input_ids.reshape(1, 16, -1)
-            else:
-                if seq_token_counts is None:
-                    logger.debug(
-                        "Code2Wav warmup input length %s is not divisible by 16; padding with zeros.",
-                        input_ids.shape[0],
-                    )
-                else:
+            num_input_ids = input_ids.numel()
+
+            if seq_token_counts is not None:
+                if sum(seq_token_counts) != num_input_ids:
                     logger.warning_once(
-                        "Code2Wav input length is not divisible by 16; padding with zeros. "
-                        "This is expected only during cudagraph warmup."
+                        "Code2Wav received scheduler token counts that do not match input_ids; "
+                        "returning request-aligned empty audio for this step."
                     )
-                input_ids_flatten = input_ids.reshape(-1)
-                input_ids_flatten = torch.cat(
-                    [
-                        input_ids_flatten,
-                        torch.zeros(16 - input_ids.shape[0] % 16, dtype=torch.long, device=input_ids.device),
-                    ]
+                    return [torch.empty((1, 0), dtype=torch.float32, device=input_ids.device) for _ in seq_token_counts]
+            elif num_input_ids % CODE2WAV_NUM_QUANTIZERS != 0:
+                logger.debug(
+                    "Code2Wav warmup input length %s is not divisible by %s; padding with zeros.",
+                    num_input_ids,
+                    CODE2WAV_NUM_QUANTIZERS,
                 )
-                codes = input_ids_flatten.reshape(1, 16, -1)
+
+            codes = _reshape_code2wav_input_ids(input_ids, seq_token_counts)
 
             # Generate audio from codec codes
             # Get every request's left_context_size from runtime_additional_information (passed via kwargs)
@@ -464,10 +506,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             if runtime_additional_information is not None:
                 for info in runtime_additional_information:
                     meta = info.get("meta", {})
-                    if "left_context_size" in meta:
-                        left_context_size.append(meta["left_context_size"])
+                    left_context_size.append(meta.get("left_context_size", 0))
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
+            left_context_size = _normalize_code2wav_left_context_sizes(left_context_size, seq_token_counts)
             audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
 
             return audio_tensors
@@ -507,8 +549,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                     embed["tts_bos"] = [bos_eos_pad[0]]
                     embed["tts_eos"] = [bos_eos_pad[1]]
                     embed["tts_pad"] = [bos_eos_pad[2]]
-            except Exception:
-                # Best-effort; absence will be handled by talker with fallbacks
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # Best-effort; absence will be handled by talker fallbacks.
                 pass
 
             # Return text-only output (with multimodal sidecar)
@@ -538,6 +580,20 @@ class Qwen3OmniMoeForConditionalGeneration(
             return OmniOutput(text_hidden_states=talker_hidden, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "code2wav":
             audio_tensors = model_outputs
+            seq_token_counts = kwargs.get("seq_token_counts")
+            if seq_token_counts is not None and len(audio_tensors) != len(seq_token_counts):
+                non_empty_indices = [idx for idx, token_count in enumerate(seq_token_counts) if token_count > 0]
+                if len(audio_tensors) == len(non_empty_indices):
+                    empty_dtype = audio_tensors[0].dtype if audio_tensors else torch.float32
+                    empty_device = audio_tensors[0].device if audio_tensors else torch.device("cpu")
+                    audio_by_index = dict(zip(non_empty_indices, audio_tensors, strict=True))
+                    audio_tensors = [
+                        audio_by_index.get(
+                            idx,
+                            torch.empty((1, 0), dtype=empty_dtype, device=empty_device),
+                        )
+                        for idx in range(len(seq_token_counts))
+                    ]
             sample_rate = defs.resolve_audio_sample_rate(self.code2wav_config)
             # `sr` is the audio sample rate metadata consumed by downstream
             # audio serving and stage-local audio metrics.
@@ -731,7 +787,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
-        update_dict.setdefault("meta", {})["num_processed_tokens"] = meta.get("num_processed_tokens", 0) + span_len
+        # Async-chunk decode: the talker may emit a pad while waiting for the
+        # next thinker decode embed to stream in; in that case it must NOT advance
+        # num_processed_tokens (else the awaited token is skipped). Prefill and the
+        # non-async path leave the flag unset -> default True -> advance as before.
+        advance_num_processed_tokens = update_dict.pop("_advance_num_processed_tokens", True)
+        update_dict.setdefault("meta", {})["num_processed_tokens"] = meta.get("num_processed_tokens", 0) + (
+            span_len if advance_num_processed_tokens else 0
+        )
         return input_ids, input_embeds, update_dict
 
     def talker_mtp(
@@ -1026,33 +1089,53 @@ class Qwen3OmniMoeForConditionalGeneration(
         embed = payload.get("embed", {})
         meta = payload.get("meta", {})
 
-        cached_thinker_decode_embeds = embed.get("cached_decode", None)
-        thinker_decode_embed = embed.get("decode", None)
-        start_index = meta.get("num_processed_tokens", 0)
-
-        if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
-            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
-            thinker_embed = cached_thinker_decode_embeds[start_index]
-            if thinker_decode_embed is not None:
-                thinker_decode_embed = thinker_decode_embed.to(device)
-                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
-                update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
-
-        elif thinker_decode_embed is not None:
-            thinker_embed = thinker_decode_embed
-            if thinker_embed.device != device:
-                thinker_embed = thinker_embed.to(device)
-
+        cached_decode_embed = embed.get("cached_decode", None)
+        current_decode_embed = embed.get("decode", None)
+        if isinstance(cached_decode_embed, torch.Tensor) and isinstance(current_decode_embed, torch.Tensor):
+            cached_decode_embed = cached_decode_embed.to(
+                device=current_decode_embed.device,
+                dtype=current_decode_embed.dtype,
+            )
+            cached_len = int(cached_decode_embed.shape[0])
+            if current_decode_embed.shape[0] >= cached_len and torch.equal(
+                current_decode_embed[:cached_len], cached_decode_embed
+            ):
+                thinker_decode_embed = current_decode_embed
+            else:
+                thinker_decode_embed = torch.cat([cached_decode_embed, current_decode_embed], dim=0)
+        elif isinstance(cached_decode_embed, torch.Tensor):
+            thinker_decode_embed = cached_decode_embed
         else:
-            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
-            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
+            thinker_decode_embed = current_decode_embed
+        start_index = meta.get("num_processed_tokens", 0)
+        # cached_decode is the prefix of the cumulative decode sequence; consume
+        # by absolute index so repeated async syncs cannot drop handoff rows.
+        base = meta.get("prefill_consumed_text_tokens", 0)
+        avail = thinker_decode_embed.shape[0] if isinstance(thinker_decode_embed, torch.Tensor) else 0
+        idx = start_index - base
+
+        if isinstance(thinker_decode_embed, torch.Tensor) and 0 <= idx < avail:
+            thinker_embed = thinker_decode_embed[idx].to(device)
+            update_dict["_advance_num_processed_tokens"] = True
             if meta.get("eos_emitted", False):
+                update_dict.setdefault("meta", {})["eos_emitted"] = False
+            return self.talker.text_projection(thinker_embed).to(device)
+
+        # No (more) thinker decode embed available at this index yet.
+        if bool(meta.get("finished", False)) and idx >= avail:
+            # Thinker finished and the talker consumed everything: emit one EOS
+            # then pad. Do not advance past the terminal token.
+            if meta.get("eos_emitted", False):
+                update_dict["_advance_num_processed_tokens"] = False
                 return self.tts_pad_embed.to(device)
             update_dict.setdefault("meta", {})["eos_emitted"] = True
+            update_dict["_advance_num_processed_tokens"] = False
             return self.tts_eos_embed.to(device)
 
-        update_dict.setdefault("embed", {})["decode"] = None
-        return self.talker.text_projection(thinker_embed).to(device)
+        # Talker outran the thinker stream: emit pad and WAIT (do not advance),
+        # so the not-yet-arrived thinker token is consumed once it lands.
+        update_dict["_advance_num_processed_tokens"] = False
+        return self.tts_pad_embed.to(device)
 
     def talker_preprocess_decode(
         self, input_ids: torch.Tensor, input_embeds: torch.Tensor, update_dict: OmniPayload, payload: OmniPayload

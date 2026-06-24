@@ -26,6 +26,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
+    uses_async_chunk_coordinator,
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
@@ -39,22 +40,41 @@ from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 logger = init_logger(__name__)
 
 
+def _extend_all_token_ids_if_available(request: Request, padding: int) -> None:
+    if padding <= 0:
+        return
+    all_token_ids = getattr(request, "_all_token_ids", None)
+    if isinstance(all_token_ids, list):
+        all_token_ids.extend([0] * padding)
+
+
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
+        # Allowlisted async-chunk stages use the coordinator + runner mixin;
+        # other stages keep the legacy adapter.
+        _async_coord = uses_async_chunk_coordinator(model_config)
+        # Coordinator stages complete on the terminal chunk signal, not only on
+        # the prompt-length heuristic, so code2wav can drain the final chunk.
+        self._async_chunk_coordinator_active = _async_coord
         self.chunk_transfer_adapter = None
-        if getattr(model_config, "async_chunk", False):
+        if getattr(model_config, "async_chunk", False) and not _async_coord:
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         self._pending_finish_reqs: list[Request] = []
         self.input_coordinator: OmniSchedulingCoordinator | None = None
-        if uses_full_payload_input_coordinator(model_config):
+        if uses_full_payload_input_coordinator(model_config) or _async_coord:
             self.input_coordinator = OmniSchedulingCoordinator(
                 scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
-                async_chunk=False,
+                async_chunk=_async_coord,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        # Async coordinator terminal trackers. Code2wav must finish on the
+        # producer's terminal marker after the request has emitted output.
+        self._deferred_terminal_chunk_req_ids: set[str] = set()
+        self._deferred_terminal_request_metadata: dict[str, dict] = {}
+        self._reqs_with_generation_output: set[str] = set()
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -80,6 +100,25 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         cached_prompt_token_ids: dict[str, list[int]] = {}
         cached_additional_information: dict[str, dict | None] = {}
+
+        def _ensure_terminal_placeholder(request: Request) -> int:
+            # A terminal-ready coordinator request can still have a connector-
+            # delivered payload queued even when its prompt length has not grown.
+            # Grow by one placeholder so the scheduler runs a drain step instead
+            # of treating required_tokens == 0 as completion.
+            if not isinstance(request.prompt_token_ids, list):
+                request.prompt_token_ids = list(request.prompt_token_ids)
+            current_len = len(request.prompt_token_ids)
+            target_len = max(current_len, request.num_computed_tokens + 1)
+            max_model_len = getattr(self, "max_model_len", None)
+            if isinstance(max_model_len, int) and max_model_len > 0:
+                target_len = min(target_len, max_model_len)
+            missing = target_len - current_len
+            if missing > 0:
+                request.prompt_token_ids.extend([0] * missing)
+                request.num_prompt_tokens = len(request.prompt_token_ids)
+                _extend_all_token_ids_if_available(request, missing)
+            return max(0, len(request.prompt_token_ids) - request.num_computed_tokens)
 
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -112,12 +151,39 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 break
             # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
-                if self.chunk_transfer_adapter is not None and self.chunk_transfer_adapter.is_done_receiving_chunks(
-                    request.request_id
-                ):
-                    self._pending_finish_reqs.append(request)
-                req_index += 1
-                continue
+                if self.chunk_transfer_adapter is not None:
+                    # Adapter path (legacy, unchanged): defer the finish to
+                    # update_from_output via _pending_finish_reqs.
+                    if self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id):
+                        self._pending_finish_reqs.append(request)
+                    req_index += 1
+                    continue
+                if self._async_chunk_coordinator_active and self.input_coordinator is not None:
+                    # A terminal-ready coordinator request may still have queued
+                    # payload. Drain it with a placeholder step; otherwise defer
+                    # finish emission through _pending_finish_reqs, matching the
+                    # adapter path.
+                    if request.request_id in self.input_coordinator.requests_with_ready_chunks:
+                        required_tokens = _ensure_terminal_placeholder(request)
+                        if required_tokens <= 0:
+                            request.stop_reason = (
+                                None if self.input_coordinator.chunk_stream_completed(request.request_id) else "length"
+                            )
+                            self._pending_finish_reqs.append(request)
+                            req_index += 1
+                            continue
+                        # required_tokens > 0: fall through to allocation below so the
+                        # placeholder step actually runs and drains the ready payload.
+                    elif self.input_coordinator.chunk_stream_completed(request.request_id):
+                        self._pending_finish_reqs.append(request)
+                        req_index += 1
+                        continue
+                    else:
+                        req_index += 1
+                        continue
+                else:
+                    req_index += 1
+                    continue
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
@@ -167,6 +233,28 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     self.waiting.pop_request()
                     self._pending_finish_reqs.append(request)
                     continue
+                else:
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+            # async-chunk coordinator path: same empty-prompt guard, but a
+            # terminal-ready request still gets a one-token placeholder so the
+            # terminal stage can drain its ready payload before finishing.
+            if (
+                self._async_chunk_coordinator_active
+                and self.input_coordinator is not None
+                and len(request.prompt_token_ids) == 0
+            ):
+                stream_completed = self.input_coordinator.chunk_stream_completed(request.request_id)
+                if stream_completed and request.request_id not in self.input_coordinator.requests_with_ready_chunks:
+                    request = self.waiting.pop_request()
+                    self._pending_finish_reqs.append(request)
+                    continue
+                if stream_completed:
+                    # Terminal chunk arrived but a payload is still queued: grow a
+                    # placeholder and fall through to schedule the drain step.
+                    _ensure_terminal_placeholder(request)
                 else:
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
@@ -331,6 +419,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             if self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output)
+            if self.input_coordinator:
+                # Mirror the adapter postprocess on the coordinator path so per-cycle
+                # ready-chunk flags are cleared (see omni_ar_scheduler for full rationale).
+                self.input_coordinator.postprocess_scheduler_output(scheduler_output)
 
         except Exception:
             # If anything goes wrong, leave the original output unchanged
@@ -349,6 +441,28 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.input_coordinator.restore_queues(self.waiting, self.running)
 
         return self._wrap_omni_scheduler_output(scheduler_output)
+
+    def _queue_completed_generation_requests(self) -> None:
+        if not self._async_chunk_coordinator_active or self.input_coordinator is None:
+            return
+
+        pending_req_ids = {request.request_id for request in self._pending_finish_reqs}
+        completed_req_ids = set(self.input_coordinator.finished_requests)
+        completed_req_ids.update(getattr(self.input_coordinator, "_completed_chunk_streams", set()))
+        for req_id in completed_req_ids:
+            if req_id in pending_req_ids:
+                continue
+            if req_id in self.input_coordinator.requests_with_ready_chunks:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            if req_id not in self._reqs_with_generation_output:
+                continue
+            if request.num_computed_tokens < len(request.prompt_token_ids):
+                continue
+            self._pending_finish_reqs.append(request)
+            pending_req_ids.add(req_id)
 
     def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.
@@ -389,6 +503,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         return finished
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
+        # Drop consumer-side terminal-completeness trackers for the freed
+        # request (no-op outside the async-chunk coordinator path).
+        self._deferred_terminal_chunk_req_ids.discard(request.request_id)
+        self._deferred_terminal_request_metadata.pop(request.request_id, None)
+        self._reqs_with_generation_output.discard(request.request_id)
+
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
@@ -423,6 +543,88 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+
+        # Read this cycle's terminal-chunk signal and producer metadata.
+        # Only consumed on the async-chunk coordinator path; for the adapter /
+        # full-payload paths these stay empty and the blocks below are skipped.
+        omni_output = getattr(model_runner_output, "omni_connector_output", None)
+        chunk_finished_req_ids_now = set(omni_output.chunk_finished_req_ids) if omni_output else set()
+        chunk_ready_req_ids_now = set(omni_output.chunk_ready_req_ids) if omni_output else set()
+        request_metadata_now = (
+            dict(omni_output.request_metadata) if omni_output and omni_output.request_metadata else {}
+        )
+        # Under async scheduling a terminal chunk-finished signal can arrive in an
+        # empty connector-only output one cycle before the final output payload.
+        # Preserve that terminal marker and merge it into the next real model
+        # output for the same request so the last audio frame and terminal state
+        # are evaluated together.  Gated on the async-chunk coordinator path so the
+        # adapter / full-payload deployments are untouched.
+        if (
+            self._async_chunk_coordinator_active
+            and chunk_finished_req_ids_now
+            and not getattr(model_runner_output, "req_ids", None)
+            and not pooler_outputs
+            and not mm_outputs
+        ):
+            handled_finish_only_req_ids: set[str] = set()
+            for req_id in set(chunk_finished_req_ids_now):
+                request = self.requests.get(req_id)
+                if request is None or req_id not in self._reqs_with_generation_output:
+                    continue
+                terminal_prompt_len = len(request.prompt_token_ids)
+                if req_metadata := request_metadata_now.get(req_id):
+                    code_predictor_codes = req_metadata.get("code_predictor_codes")
+                    if code_predictor_codes is not None and len(code_predictor_codes) > 0:
+                        terminal_prompt_len = len(code_predictor_codes)
+                    else:
+                        next_stage_prompt_len = req_metadata.get("next_stage_prompt_len")
+                        if isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
+                            terminal_prompt_len = next_stage_prompt_len
+                if request.num_computed_tokens < terminal_prompt_len:
+                    continue
+                # If terminal codes arrived with the finish signal, let the next
+                # decode step emit the final payload and finish together.
+                # Finish-only sentinels have no payload to wait for.
+                _co_arrived_codes = request_metadata_now.get(req_id, {}).get("code_predictor_codes")
+                if req_id in chunk_ready_req_ids_now and _co_arrived_codes is not None and len(_co_arrived_codes) > 0:
+                    continue
+                # Emit coordinator-only finishes through the normal scheduler output path.
+                self._pending_finish_reqs.append(request)
+                handled_finish_only_req_ids.add(req_id)
+            remaining_ids = set(chunk_finished_req_ids_now) - handled_finish_only_req_ids
+            if remaining_ids:
+                self._deferred_terminal_chunk_req_ids.update(remaining_ids)
+                for req_id in remaining_ids:
+                    if req_id in request_metadata_now:
+                        self._deferred_terminal_request_metadata[req_id] = dict(request_metadata_now[req_id])
+            chunk_finished_req_ids_now = remaining_ids
+        elif (
+            self._async_chunk_coordinator_active
+            and self._deferred_terminal_chunk_req_ids
+            and getattr(model_runner_output, "req_ids", None)
+        ):
+            carried_req_ids = self._deferred_terminal_chunk_req_ids.intersection(
+                getattr(model_runner_output, "req_ids", None)
+            )
+            if carried_req_ids:
+                chunk_finished_req_ids_now.update(carried_req_ids)
+                for req_id in carried_req_ids:
+                    if req_id not in request_metadata_now:
+                        if (deferred_meta := self._deferred_terminal_request_metadata.get(req_id)) is not None:
+                            request_metadata_now[req_id] = dict(deferred_meta)
+                    self._deferred_terminal_chunk_req_ids.discard(req_id)
+                    self._deferred_terminal_request_metadata.pop(req_id, None)
+
+        # Sweep stale deferred entries for requests no longer tracked, preventing
+        # unbounded growth if a request disappears without being freed.
+        if self._deferred_terminal_chunk_req_ids:
+            stale = self._deferred_terminal_chunk_req_ids - set(self.requests)
+            if stale:
+                self._deferred_terminal_chunk_req_ids -= stale
+                for rid in stale:
+                    self._deferred_terminal_request_metadata.pop(rid, None)
+
+        self._queue_completed_generation_requests()
 
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
         perf_stats: PerfStats | None = None
@@ -500,19 +702,56 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             kv_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
+            if pooler_output is not None or mm_output is not None:
+                self._reqs_with_generation_output.add(req_id)
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
 
+            # Terminal-completeness gate (async-chunk coordinator path only).
+            # The true total code length comes from producer metadata -- not the
+            # chunks-arrived-so-far prompt length -- so resolve it before deciding
+            # the request is done.  Defaults to the current prompt length for every
+            # other path (request_metadata_now is empty there).
+            terminal_prompt_len = len(request.prompt_token_ids)
+            if req_metadata := request_metadata_now.get(req_id):
+                code_predictor_codes = req_metadata.get("code_predictor_codes")
+                if code_predictor_codes is not None and len(code_predictor_codes) > 0:
+                    terminal_prompt_len = len(code_predictor_codes)
+                else:
+                    next_stage_prompt_len = req_metadata.get("next_stage_prompt_len")
+                    if isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
+                        terminal_prompt_len = next_stage_prompt_len
+            reached_terminal_chunk = (
+                self._async_chunk_coordinator_active
+                and req_id in chunk_finished_req_ids_now
+                and pooler_output is not None
+                and request.num_computed_tokens >= terminal_prompt_len
+            )
+
             # Diffusion request: completes in one step; mark finished and free resources
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
-                or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
+                or (
+                    self.chunk_transfer_adapter is None
+                    and not self._async_chunk_coordinator_active
+                    and request.num_computed_tokens >= request.num_prompt_tokens
+                )
                 or (
                     self.chunk_transfer_adapter is not None
                     and self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
+                or (
+                    # async-chunk coordinator path: complete only when the upstream
+                    # chunk stream is complete, mirroring the legacy-adapter clause
+                    # above instead of the plain-gen heuristic.
+                    self._async_chunk_coordinator_active
+                    and self.input_coordinator is not None
+                    and self.input_coordinator.chunk_stream_completed(request.request_id)
+                    and request.num_computed_tokens >= len(request.prompt_token_ids)
+                )
+                or reached_terminal_chunk
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
@@ -600,6 +839,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         request.request_id,
                         getattr(request, "external_req_id", None),
                     )
+                # Coordinator path: release the request from the coordinator's
+                # tracking sets too (the adapter path uses cleanup() above).
+                if self._async_chunk_coordinator_active and self.input_coordinator is not None:
+                    self.input_coordinator.free_finished_request(request.request_id)
             outputs[request.client_index].append(
                 OmniEngineCoreOutput(
                     request_id=request.request_id,

@@ -19,6 +19,7 @@ class OmniConnectorOutput:
     Attributes:
         chunk_ready_req_ids: Request IDs with newly arrived chunks this cycle.
         chunk_finished_req_ids: Request IDs whose final chunk has arrived.
+        chunk_segment_finished_req_ids: Request IDs whose current realtime segment ended.
         request_metadata: Lightweight scheduling metadata keyed by request ID
             (e.g. next_stage_prompt_len, code_predictor_codes, left_context_size).
             Full payloads are owned by the Model Runner's local cache.
@@ -30,6 +31,7 @@ class OmniConnectorOutput:
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
     chunk_finished_req_ids: set[str] = field(default_factory=set)
+    chunk_segment_finished_req_ids: set[str] = field(default_factory=set)
     request_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)

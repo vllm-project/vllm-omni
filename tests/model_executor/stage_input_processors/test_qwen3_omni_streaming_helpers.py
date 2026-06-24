@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for Qwen3-Omni streaming thinker→talker / talker→codec helpers (PR #2581)."""
+"""Unit tests for Qwen3-Omni streaming thinker→talker / talker→codec helpers."""
 
 from __future__ import annotations
 
@@ -17,6 +17,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture(autouse=True)
 def _streaming_context() -> SimpleNamespace:
     return SimpleNamespace(bridge_states={})
+
+
+class _TensorCopySentinel:
+    def detach(self):
+        raise AssertionError("tensor copy should not be reached")
 
 
 def test_get_streaming_talker_tokens_first_segment(_streaming_context: SimpleNamespace) -> None:
@@ -105,6 +110,31 @@ def test_streaming_input_prefill_chunk_is_cached() -> None:
     assert cached["ids"]["prompt"] == request.prompt_token_ids
 
 
+def test_streaming_input_placeholder_chunk_is_not_sent() -> None:
+    transfer_manager = SimpleNamespace(_pending_streaming_prefills={})
+    request = SimpleNamespace(
+        external_req_id="rt-placeholder",
+        output_token_ids=[],
+        all_token_ids=[151644, 872],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+    thinker_emb = _TensorCopySentinel()
+    thinker_hid = _TensorCopySentinel()
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False,
+        request,
+        thinker_emb,
+        thinker_hid,
+        transfer_manager,
+    )
+
+    assert payload is None
+    assert transfer_manager._pending_streaming_prefills == {}
+
+
 def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
     transfer_manager = SimpleNamespace(
         _pending_streaming_prefills={
@@ -124,7 +154,7 @@ def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
         additional_information=None,
     )
     thinker_emb = torch.full((1, 3), 3.0)
-    thinker_hid = torch.full((1, 3), 4.0)
+    thinker_hid = _TensorCopySentinel()
 
     payload = q3._construct_thinker2talker_streaming_input_async_chunk(
         False,
@@ -135,11 +165,53 @@ def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
     )
 
     assert payload is not None
-    assert payload.embed.prefill.shape == (3, 3)
-    assert payload.hidden_states.output.shape == (3, 3)
+    assert payload.embed.prefill.shape == (2, 3)
+    assert torch.equal(payload.embed.decode, thinker_emb)
+    assert payload.hidden_states.output.shape == (2, 3)
     assert payload.ids.all == [151644, 872, 100]
     assert payload.ids.prompt == [151644, 872]
+    assert payload.ids.output == [101]
     assert "rt-2" not in transfer_manager._pending_streaming_prefills
+
+
+def test_thinker2talker_finish_flushes_cached_first_payload() -> None:
+    cached_prefill = torch.ones(2, 3)
+    cached_hidden = torch.full((2, 3), 2.0)
+    transfer_manager = SimpleNamespace(
+        put_req_chunk={},
+        request_payload={
+            "rt-finish": {
+                "embed": {"prefill": cached_prefill},
+                "hidden_states": {"output": cached_hidden},
+                "ids": {"all": [151644, 872], "prompt": [151644, 872]},
+                "meta": {"finished": torch.tensor(False)},
+            }
+        },
+        _pending_streaming_prefills={},
+    )
+    request = SimpleNamespace(
+        external_req_id="rt-finish",
+        output_token_ids=[],
+        all_token_ids=[151644, 872],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        {q3.ASYNC_FINISH_SENTINEL_KEY: True},
+        request,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload["meta"]["finished"].item() is True
+    assert torch.equal(payload["embed"]["prefill"], cached_prefill)
+    assert torch.equal(payload["hidden_states"]["output"], cached_hidden)
+    assert payload["ids"]["prompt"] == [151644, 872]
+    assert transfer_manager.request_payload == {}
+    assert transfer_manager.put_req_chunk == {}
 
 
 def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
@@ -250,6 +322,50 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["next_stage_prompt_len"] > 0
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
+
+
+def test_thinker2talker_async_chunk_accepts_flattened_runner_payload() -> None:
+    transfer_manager = SimpleNamespace(put_req_chunk={}, request_payload={})
+    request = SimpleNamespace(
+        external_req_id="thinker",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+        resumable=False,
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(2, 2),
+        "hidden_states.layer_24": torch.full((2, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_async_chunk(transfer_manager, pooling_output, request, is_finished=False)
+
+    assert payload is None
+    assert "thinker" in transfer_manager.request_payload
+    cached = transfer_manager.request_payload["thinker"]
+    assert cached["embed"]["prefill"].shape == (2, 2)
+    assert cached["hidden_states"]["output"].shape == (2, 2)
+
+
+def test_thinker2talker_async_chunk_decode_allows_missing_resumable_attr() -> None:
+    transfer_manager = SimpleNamespace(put_req_chunk={"thinker": 1}, request_payload={})
+    request = SimpleNamespace(
+        external_req_id="thinker",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(1, 2),
+        "hidden_states.layer_24": torch.full((1, 2), 2.0),
+    }
+
+    payload = q3.thinker2talker_async_chunk(transfer_manager, pooling_output, request, is_finished=False)
+
+    assert payload is not None
+    assert payload.embed.decode.shape == (1, 2)
+    assert payload.meta.finished.item() is False
 
 
 def test_accumulator_replaces_keys_in_replace_set() -> None:

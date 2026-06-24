@@ -93,4 +93,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
-    pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    pending_connector_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    segment_finished_req_ids: set[str] = field(default_factory=set)

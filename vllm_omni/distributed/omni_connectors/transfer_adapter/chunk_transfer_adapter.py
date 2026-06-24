@@ -96,6 +96,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return bool(value) if value is not None else False
 
     @staticmethod
+    def _struct_has_non_meta_payload(payload: OmniPayloadStruct) -> bool:
+        for field in payload.__struct_fields__:
+            if field == "meta":
+                continue
+            value = getattr(payload, field, None)
+            if value is None:
+                continue
+            nested_fields = getattr(value, "__struct_fields__", None)
+            if nested_fields is not None:
+                if any(getattr(value, nested_field, None) is not None for nested_field in nested_fields):
+                    return True
+                continue
+            return True
+        return False
+
+    @staticmethod
     def _confirmed_num_computed_tokens(request: Request) -> int:
         # vLLM async scheduling advances num_computed_tokens with output
         # placeholders before the corresponding token is committed. Connector
@@ -167,7 +183,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request: Request object
             is_segment_finished: whether the segment of request is finished
         """
-        is_finished = request.is_finished() and not request.resumable
+        # A final realtime chunk can be both segment-finished and request-finished.
+        # Do not mask request completion just because the session is resumable;
+        # non-final segment stops already report request.is_finished() as False.
+        is_finished = request.is_finished()
 
         confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
 
@@ -292,7 +311,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
-        raw_mm = task["multimodal_output"]
+        raw_mm = task.get("multimodal_output", task.get("pooling_output"))
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
@@ -323,6 +342,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()
+        if (
+            isinstance(payload_data, OmniPayloadStruct)
+            and payload_data.meta is not None
+            and not (is_segment_finished or is_finished)
+            and not self._struct_has_non_meta_payload(payload_data)
+        ):
+            logger.debug(
+                "[Stage-%s] Skip metadata-only non-terminal payload for %s",
+                stage_id,
+                connector_put_key,
+            )
+            return
         if payload_data.meta is None:
             payload_data.meta = MetaStruct()
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)

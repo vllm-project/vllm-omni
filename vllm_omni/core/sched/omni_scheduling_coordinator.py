@@ -19,6 +19,7 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
+import vllm_omni.platforms as omni_platforms
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
 logger = init_logger(__name__)
@@ -82,6 +83,73 @@ def uses_full_payload_input_coordinator(model_config: Any) -> bool:
     return key in _FULL_PAYLOAD_INPUT_STAGES
 
 
+# (model_arch, model_stage) whose async-chunk RECEIVE is coordinated by
+# OmniSchedulingCoordinator. Producer-only stages are intentionally absent: they
+# still use the model-runner transport below, but do not need scheduler
+# WAITING_FOR_CHUNK state because they have no upstream chunk producer.
+_ASYNC_CHUNK_COORDINATOR_STAGES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("Qwen3OmniMoeForConditionalGeneration", "talker"),
+        ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+    }
+)
+
+
+# (model_arch, model_stage) pairs whose async-chunk transport is owned by
+# OmniConnectorModelRunnerMixin rather than the legacy scheduler adapter.
+_ASYNC_CHUNK_MODEL_RUNNER_TRANSPORT_STAGES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("Qwen3OmniMoeForConditionalGeneration", "thinker"),
+        ("Qwen3OmniMoeForConditionalGeneration", "talker"),
+        ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+    }
+)
+
+
+def _supports_async_chunk_model_runner_transport_platform() -> bool:
+    # NPU AR runners do not currently inherit OmniConnectorModelRunnerMixin.
+    # Keep them on the legacy transfer adapter until the transport side is wired.
+    platform = omni_platforms.current_omni_platform
+    return not platform.is_npu()
+
+
+def _uses_shared_memory_connector(model_config: Any) -> bool:
+    connector_config = getattr(model_config, "stage_connector_config", None)
+    if connector_config is None:
+        return True
+    if isinstance(connector_config, dict):
+        name = connector_config.get("name", "SharedMemoryConnector")
+    else:
+        name = getattr(connector_config, "name", None)
+    return isinstance(name, str) and name.strip() == "SharedMemoryConnector"
+
+
+def uses_async_chunk_model_runner_transport(model_config: Any) -> bool:
+    """Returns True iff async-chunk put/get is owned by the model runner."""
+    if not getattr(model_config, "async_chunk", False):
+        return False
+    key = (
+        getattr(model_config, "model_arch", None),
+        getattr(model_config, "model_stage", None),
+    )
+    if key not in _ASYNC_CHUNK_MODEL_RUNNER_TRANSPORT_STAGES:
+        return False
+    if not _uses_shared_memory_connector(model_config):
+        return False
+    return _supports_async_chunk_model_runner_transport_platform()
+
+
+def uses_async_chunk_coordinator(model_config: Any) -> bool:
+    """Returns True iff this stage needs scheduler WAITING_FOR_CHUNK state."""
+    key = (
+        getattr(model_config, "model_arch", None),
+        getattr(model_config, "model_stage", None),
+    )
+    if key not in _ASYNC_CHUNK_COORDINATOR_STAGES:
+        return False
+    return uses_async_chunk_model_runner_transport(model_config)
+
+
 class OmniSchedulingCoordinator:
     """Pure-scheduling coordinator for chunk and full_payload input waiting.
 
@@ -98,28 +166,34 @@ class OmniSchedulingCoordinator:
 
         self.finished_requests: set[str] = set()
         self.requests_with_ready_chunks: set[str] = set()
+        self._completed_chunk_streams: set[str] = set()
         self._full_payload_input_received: set[str] = set()
 
         self._waiting_for_chunk_waiting: deque[Any] = deque()
         self._waiting_for_chunk_running: deque[Any] = deque()
 
-        # Request IDs that were newly registered for chunk recv this cycle.
-        # The engine/Model Runner should call register_chunk_recv() for these
-        # so the bg thread starts polling.
-        self.pending_chunk_registrations: list[Any] = []
-
         # Requests waiting for full_payload stage input (WAITING_FOR_INPUT).
         self._waiting_for_input: deque[Any] = deque()
-        # Per-cycle list of minimal handles to ship to the model runner so it
-        # can call register_chunk_recv().  Typed concretely (not list[Any]) so
-        # the surrounding OmniSchedulerOutput stays msgspec-friendly across
-        # default, PD-disagg, and multi-node executor IPC paths.
-        self.pending_input_registrations: list[OmniChunkRecvHandle] = []
+        # Per-cycle list of minimal handles shipped to the model runner so it
+        # can call register_chunk_recv() (so the bg thread starts polling).
+        # Populated by BOTH the async-chunk park (process_pending_chunks) and the
+        # full-payload park (process_pending_full_payload_inputs); carried on
+        # OmniSchedulerOutput by _wrap_omni_scheduler_output.  Typed concretely
+        # (not list[Any]) so the surrounding OmniSchedulerOutput stays
+        # msgspec-friendly across default, PD-disagg, and multi-node executor IPC.
+        self.pending_connector_registrations: list[OmniChunkRecvHandle] = []
 
         # Monotonic timestamp recording when each request first entered
         # WAITING_FOR_CHUNK or WAITING_FOR_INPUT.  Used by
         # collect_timed_out_request_ids() to detect orphaned waits.
         self._waiting_since: dict[str, float] = {}
+        # The input timeout safety net is scoped to full-payload input waits;
+        # async chunk waits may pause without being force-failed here.
+        self._waiting_for_input_req_ids: set[str] = set()
+
+    def chunk_stream_completed(self, request_id: str) -> bool:
+        """Return whether no more async chunks are expected for the request."""
+        return request_id in self.finished_requests or request_id in self._completed_chunk_streams
 
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
@@ -143,9 +217,18 @@ class OmniSchedulingCoordinator:
         if self._stage_id == 0 or not self._async_chunk:
             return
 
+        # Retain readiness for requests not yet surfaced into the waiting/running
+        # queues: a bg recv can complete before the request appears in a queue,
+        # and the connector output clears chunk_ready_req_ids after this cycle.
+        # Without an unconditional retain, that first ready signal is lost during
+        # the queue scan below and the request hangs in WAITING_FOR_CHUNK forever.
+        self.requests_with_ready_chunks.update(chunk_ready_req_ids)
+
         terminal_ready_req_ids = chunk_ready_req_ids.intersection(chunk_finished_req_ids)
         self.finished_requests.update(chunk_finished_req_ids - terminal_ready_req_ids)
-        self.pending_chunk_registrations = []
+        # Reset the carried registration list; the full-payload pass (which runs
+        # after this in async-chunk mode) must NOT re-clear it (see its guard).
+        self.pending_connector_registrations = []
 
         self._process_chunk_queue(
             waiting_queue,
@@ -159,7 +242,7 @@ class OmniSchedulingCoordinator:
             RequestStatus.RUNNING,
             chunk_ready_req_ids,
         )
-        self.finished_requests.update(terminal_ready_req_ids)
+        self._completed_chunk_streams.update(terminal_ready_req_ids)
 
         while len(running_queue) > self._scheduler_max_num_seqs:
             request = running_queue.pop()
@@ -194,13 +277,18 @@ class OmniSchedulingCoordinator:
                 self._stage_id,
                 stage_recv_req_ids,
             )
-        self.pending_input_registrations = []
+        # Only the full-payload path owns this reset.  In async-chunk mode this
+        # method runs AFTER process_pending_chunks (which already reset + filled
+        # the list), so re-clearing here would drop the chunk recv registrations.
+        if not self._async_chunk:
+            self.pending_connector_registrations = []
 
         remaining: deque[Any] = deque()
         for request in self._waiting_for_input:
             if request.request_id in stage_recv_req_ids:
                 request.status = RequestStatus.WAITING
                 self._waiting_since.pop(request.request_id, None)
+                self._waiting_for_input_req_ids.discard(request.request_id)
                 waiting_queue.add_request(request)
             else:
                 remaining.append(request)
@@ -219,9 +307,10 @@ class OmniSchedulingCoordinator:
                         continue
                     request.status = RequestStatus.WAITING_FOR_INPUT
                     self._waiting_since.setdefault(request.request_id, time.monotonic())
+                    self._waiting_for_input_req_ids.add(request.request_id)
                     to_remove.append(request)
                     self._waiting_for_input.append(request)
-                    self.pending_input_registrations.append(
+                    self.pending_connector_registrations.append(
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
                             external_req_id=getattr(request, "external_req_id", None),
@@ -231,10 +320,12 @@ class OmniSchedulingCoordinator:
                     if request.request_id in stage_recv_req_ids:
                         request.status = RequestStatus.WAITING
                         self._waiting_since.pop(request.request_id, None)
+                        self._waiting_for_input_req_ids.discard(request.request_id)
                     else:
                         to_remove.append(request)
+                        self._waiting_for_input_req_ids.add(request.request_id)
                         self._waiting_for_input.append(request)
-                        self.pending_input_registrations.append(
+                        self.pending_connector_registrations.append(
                             OmniChunkRecvHandle(
                                 request_id=request.request_id,
                                 external_req_id=getattr(request, "external_req_id", None),
@@ -259,16 +350,30 @@ class OmniSchedulingCoordinator:
         self._full_payload_input_received.discard(request_id)
         self.finished_requests.discard(request_id)
         self.requests_with_ready_chunks.discard(request_id)
+        self._completed_chunk_streams.discard(request_id)
         self._waiting_since.pop(request_id, None)
+        self._waiting_for_input_req_ids.discard(request_id)
+        for queue_attr in (
+            "_waiting_for_chunk_waiting",
+            "_waiting_for_chunk_running",
+            "_waiting_for_input",
+        ):
+            queue = getattr(self, queue_attr)
+            setattr(
+                self,
+                queue_attr,
+                deque(request for request in queue if request.request_id != request_id),
+            )
 
     def collect_timed_out_request_ids(
         self,
         timeout_s: float,
     ) -> set[str]:
-        """Return IDs of requests that have been waiting longer than *timeout_s*.
+        """Return full-payload input waits older than *timeout_s*.
 
-        Uses ``_waiting_since`` timestamps (always up-to-date) to detect
-        timed-out requests.  This method is safe to call at any point in
+        Uses ``_waiting_since`` timestamps plus ``_waiting_for_input_req_ids``
+        to detect timed-out full-payload input waits.  This method is safe to
+        call at any point in
         the scheduling cycle — it does **not** rely on coordinator internal
         queues (which are empty after ``restore_queues()``).
 
@@ -283,7 +388,7 @@ class OmniSchedulingCoordinator:
         now = time.monotonic()
         timed_out_ids: set[str] = set()
         for req_id, start_time in self._waiting_since.items():
-            if now - start_time > timeout_s:
+            if req_id in self._waiting_for_input_req_ids and now - start_time > timeout_s:
                 timed_out_ids.add(req_id)
         if not timed_out_ids:
             return set()
@@ -304,8 +409,9 @@ class OmniSchedulingCoordinator:
 
         for req_id in timed_out_ids:
             self._waiting_since.pop(req_id, None)
+            self._waiting_for_input_req_ids.discard(req_id)
             logger.warning(
-                "[Coordinator stage-%s] Request %s timed out waiting for chunk/input (waited > %.0fs)",
+                "[Coordinator stage-%s] Request %s timed out waiting for connector input (waited > %.0fs)",
                 self._stage_id,
                 req_id,
                 timeout_s,
@@ -451,16 +557,25 @@ class OmniSchedulingCoordinator:
                     continue
                 if request.request_id in self.finished_requests:
                     continue
+                if request.request_id in self._completed_chunk_streams:
+                    continue
                 if request.status == RequestStatus.WAITING_FOR_INPUT:
                     continue
                 if request.request_id in chunk_ready_req_ids:
                     self.requests_with_ready_chunks.add(request.request_id)
                     continue
-                self.pending_chunk_registrations.append(request)
+                # Register bg-thread chunk recv through SchedulerOutput so the
+                # runner's register_chunk_recv() starts polling.
+                self.pending_connector_registrations.append(
+                    OmniChunkRecvHandle(
+                        request_id=request.request_id,
+                        external_req_id=getattr(request, "external_req_id", None),
+                    )
+                )
                 request.status = RequestStatus.WAITING_FOR_CHUNK
                 self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
-                if request.request_id in chunk_ready_req_ids:
+                if request.request_id in self.requests_with_ready_chunks:
                     request.status = target_status
                     self.requests_with_ready_chunks.add(request.request_id)
                     self._waiting_since.pop(request.request_id, None)

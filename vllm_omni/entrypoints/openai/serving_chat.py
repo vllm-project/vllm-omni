@@ -1869,29 +1869,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if req_state is not None and req_state_audio_ref is None:
                         req_state_audio_ref = req_state
                     now_ts = time.time()
-                    if req_state is not None and req_state.first_audio_ts is None:
-                        req_state.first_audio_ts = now_ts
-                        stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
-                        # The orchestrator binds requests by their internal id,
-                        # not the user-visible external id, so look up the
-                        # replica with req_state.request_id (internal).
-                        replica_id = (
-                            stage_pools[omni_res.stage_id].get_bound_replica_id(req_state.request_id)
-                            if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
-                            else None
-                        )
-                        req_state.audio_emit_stage_id = omni_res.stage_id
-                        req_state.audio_emit_replica_id = replica_id
-                        observe_audio_first_packet(
-                            self.engine_client.mod_metrics,
-                            stage_id=omni_res.stage_id,
-                            replica_id=replica_id,
-                            arrival_ts=req_state.request_arrival_ts,
-                            now_ts=now_ts,
-                        )
+                    chunk_bytes = audio_chunk_pcm_bytes(omni_res)
 
                     role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    if not choices_data:
+                        continue
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -1905,9 +1888,28 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             stop_reason_emitted[choice.index] = True
                     # Record per-chunk PCM byte count + arrival timestamp for
                     # audio_underrun_s / audio_continuity_ok_total at finalize.
-                    if req_state is not None and req_state.request_arrival_ts > 0:
-                        chunk_bytes = audio_chunk_pcm_bytes(omni_res)
-                        if chunk_bytes > 0:
+                    if chunk_bytes > 0:
+                        if req_state is not None and req_state.first_audio_ts is None:
+                            req_state.first_audio_ts = now_ts
+                            stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                            # The orchestrator binds requests by their internal id,
+                            # not the user-visible external id, so look up the
+                            # replica with req_state.request_id (internal).
+                            replica_id = (
+                                stage_pools[omni_res.stage_id].get_bound_replica_id(req_state.request_id)
+                                if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
+                                else None
+                            )
+                            req_state.audio_emit_stage_id = omni_res.stage_id
+                            req_state.audio_emit_replica_id = replica_id
+                            observe_audio_first_packet(
+                                self.engine_client.mod_metrics,
+                                stage_id=omni_res.stage_id,
+                                replica_id=replica_id,
+                                arrival_ts=req_state.request_arrival_ts,
+                                now_ts=now_ts,
+                            )
+                        if req_state is not None and req_state.request_arrival_ts > 0:
                             req_state.audio_chunk_arrivals_s.append(max(now_ts - req_state.request_arrival_ts, 0.0))
                             req_state.audio_chunk_bytes.append(chunk_bytes)
                             if req_state.audio_sample_rate is None:
@@ -2495,6 +2497,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             audio_tensor = audio_data
         if audio_tensor is None:
+            if stream:
+                return [
+                    ChatCompletionResponseStreamChoice(
+                        index=output.index,
+                        delta=DeltaMessage(),
+                        logprobs=None,
+                        finish_reason=output.finish_reason,
+                        stop_reason=output.stop_reason,
+                        token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                    )
+                    for output in final_res.outputs
+                    if output.finish_reason is not None
+                ]
             return self._create_error_response("Audio generation completed but no audio was produced.")
         audio_tensor = audio_tensor.detach().cpu().float().numpy()
 

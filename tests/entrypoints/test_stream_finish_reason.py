@@ -118,6 +118,20 @@ def _make_audio_omni_output(
     )
 
 
+def _make_empty_audio_omni_output(
+    request_id: str = "test-req",
+    finish_reason: str | None = "stop",
+    index: int = 0,
+) -> OmniRequestOutput:
+    omni_res = _make_audio_omni_output(request_id=request_id, index=index)
+    output = omni_res.request_output.outputs[0]
+    output.finish_reason = finish_reason
+    output.multimodal_output = {"audio": []}
+    omni_res.request_output.finished = finish_reason is not None
+    omni_res.finished = finish_reason is not None
+    return omni_res
+
+
 def _mock_audio_choices(index: int = 0, role: str = "assistant"):
     return [
         ChatCompletionResponseStreamChoice(
@@ -129,7 +143,7 @@ def _mock_audio_choices(index: int = 0, role: str = "assistant"):
     ]
 
 
-def _build_serving_chat():
+def _build_serving_chat(mock_audio_choice: bool = True):
     """Create a minimal OmniOpenAIServingChat for testing."""
     mock_engine = MagicMock()
     mock_engine.errored = False
@@ -149,12 +163,13 @@ def _build_serving_chat():
         chat_template=None,
         chat_template_content_format="auto",
     )
-    instance._create_audio_choice = MagicMock(
-        side_effect=lambda omni_res, role, request, stream=False: _mock_audio_choices(
-            index=omni_res.request_output.outputs[0].index,
-            role=role,
+    if mock_audio_choice:
+        instance._create_audio_choice = MagicMock(
+            side_effect=lambda omni_res, role, request, stream=False: _mock_audio_choices(
+                index=omni_res.request_output.outputs[0].index,
+                role=role,
+            )
         )
-    )
     return instance
 
 
@@ -367,6 +382,47 @@ async def test_declared_modality_not_produced_emits_fallback_stop():
     # chunk must appear at end.
     assert finish_reasons.count("stop") == 1, f"Expected 1 stop, got {finish_reasons}"
     assert finish_reasons[-1] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_empty_terminal_audio_stream_emits_stop_choice():
+    serving_chat = _build_serving_chat(mock_audio_choice=False)
+    request = _make_request(modalities=["audio"])
+
+    async def result_generator():
+        yield _make_empty_audio_omni_output(finish_reason="stop")
+
+    raw_lines = await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    chunks = _parse_sse_chunks(raw_lines)
+    assert not any("error" in chunk for chunk in chunks)
+    choices = [choice for chunk in chunks for choice in chunk.get("choices", [])]
+    assert [choice["finish_reason"] for choice in choices] == ["stop"]
+    assert choices[0]["delta"] == {}
+
+
+def test_empty_nonterminal_audio_stream_is_skipped():
+    serving_chat = _build_serving_chat(mock_audio_choice=False)
+    request = _make_request(modalities=["audio"])
+
+    choices = serving_chat._create_audio_choice(
+        _make_empty_audio_omni_output(finish_reason=None),
+        "assistant",
+        request,
+        stream=True,
+    )
+
+    assert choices == []
 
 
 @pytest.mark.asyncio

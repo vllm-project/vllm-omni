@@ -7,15 +7,6 @@ from typing import Any
 
 import torch
 
-THINKER_DECODE_EMBEDDINGS_KEY = "thinker_decode_embeddings"
-THINKER_OUTPUT_TOKEN_IDS_KEY = "thinker_output_token_ids"
-THINKER_DECODE_TOKEN_START_KEY = "thinker_decode_embeddings_token_start"
-THINKER_DECODE_TOKEN_END_KEY = "thinker_decode_embeddings_token_end"
-
-CACHED_THINKER_DECODE_EMBEDDINGS_KEY = "cached_thinker_decode_embeddings"
-CACHED_THINKER_DECODE_TOKEN_START_KEY = "cached_thinker_decode_embeddings_token_start"
-CACHED_THINKER_DECODE_TOKEN_END_KEY = "cached_thinker_decode_embeddings_token_end"
-
 TensorSpan = tuple[torch.Tensor, int, int]
 
 

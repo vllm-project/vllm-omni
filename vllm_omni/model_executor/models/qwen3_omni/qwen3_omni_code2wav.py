@@ -262,6 +262,12 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
 
             batch_wav = torch.cat(wavs, dim=-1)
 
+        if seq_token_counts is not None and len(seq_token_counts) != codes.shape[0]:
+            logger.warning_once(
+                "chunked_decode: seq_token_counts length does not match codes batch size; "
+                "falling back to codes.shape[-1]. This is expected during cudagraph warmup."
+            )
+            seq_token_counts = None
         if seq_token_counts is not None:
             code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in seq_token_counts]
         else:
@@ -296,12 +302,16 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
-        if not (left_context_size and seq_token_counts and len(left_context_size) == len(seq_token_counts)):
+        valid_metadata = (
+            left_context_size and seq_token_counts and len(left_context_size) == len(seq_token_counts) == codes.shape[0]
+        )
+        if not valid_metadata:
             logger.warning_once(
                 "chunked_decode_streaming: missing/invalid left_context_size or seq_token_counts; "
-                "defaulting to left_context_size=zeros(len(codes)). This is expected during cudagraph warmup."
+                "defaulting to current codes batch metadata. This is expected during cudagraph warmup."
             )
             left_context_size = [0] * codes.shape[0]
+            seq_token_counts = None
         # Decode chunk
         wavs = []
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:

@@ -30,6 +30,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors,
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_async_chunk_coordinator
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -74,9 +75,12 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
 
 
 class OmniGPUModelRunner(GPUModelRunner):
+    _SEGMENT_RUNTIME_PRESERVED_KEYS: frozenset[str] = frozenset(("omni_final_stage_id",))
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
+        self._segment_runtime_reset_req_ids: set[str] = set()
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
         # The Omni tensor prefix cache will be allocated
@@ -477,6 +481,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._downstream_payload_cache.pop(req_id, None)
             if hasattr(self, "_talker_mtp_generators"):
                 self._talker_mtp_generators.pop(req_id, None)
+            reset_req_ids = getattr(self, "_segment_runtime_reset_req_ids", None)
+            if reset_req_ids is not None:
+                reset_req_ids.discard(req_id)
             if cleanup_finished_request is not None:
                 cleanup_finished_request(req_id)
 
@@ -1322,6 +1329,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                 cache.pop(req_id, None)
         for req_id, payload in staged.items():
             self._update_intermediate_buffer(req_id, payload)
+        if staged:
+            work_available = getattr(self, "_work_available", None)
+            if work_available is not None:
+                work_available.set()
 
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
@@ -1642,6 +1653,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self.model, "has_preprocess") or hasattr(self.model, "enable_update_additional_information"):
             if self.vllm_config.model_config.async_chunk:
                 self._update_additional_information(scheduler_output)
+                # The coordinator/mixin async-chunk path delivers the heavy
+                # stage payload (e.g. thinker embed.prefill) via the worker-local
+                # _local_stage_payload_cache, NOT via scheduler
+                # additional_information (which _update_additional_information
+                # reads).  Bridge the cache into model_intermediate_buffer the
+                # same way full-payload mode does, before the model's preprocess
+                # reads it.  The legacy adapter async-chunk path still carries the
+                # payload in additional_information, so it needs no extra sync.
+                if uses_async_chunk_coordinator(self.vllm_config.model_config):
+                    self._sync_local_stage_payloads()
             else:
                 # In full-payload (non-async-chunk) mode, connector-delivered
                 # stage payloads must override any earlier engine-level
@@ -1927,6 +1948,63 @@ class OmniGPUModelRunner(GPUModelRunner):
         else:
             dest[key] = value
 
+    @staticmethod
+    def _merge_runtime_tensor_sequence(
+        existing_tensor: torch.Tensor,
+        incoming_tensor: torch.Tensor,
+        *,
+        append: bool,
+        replace_mismatch: bool = False,
+    ) -> torch.Tensor:
+        incoming_tensor = incoming_tensor.to(device=existing_tensor.device, dtype=existing_tensor.dtype)
+        if existing_tensor.ndim != incoming_tensor.ndim or existing_tensor.shape[1:] != incoming_tensor.shape[1:]:
+            return incoming_tensor
+
+        existing_len = int(existing_tensor.shape[0])
+        incoming_len = int(incoming_tensor.shape[0])
+        if not append:
+            if incoming_len >= existing_len and torch.equal(incoming_tensor[:existing_len], existing_tensor):
+                return incoming_tensor
+            if existing_len >= incoming_len and torch.equal(existing_tensor[:incoming_len], incoming_tensor):
+                return existing_tensor
+            if replace_mismatch:
+                return incoming_tensor
+            if existing_len >= incoming_len:
+                return existing_tensor
+            return incoming_tensor
+
+        if incoming_len >= existing_len and torch.equal(incoming_tensor[:existing_len], existing_tensor):
+            return incoming_tensor
+        if existing_len >= incoming_len and torch.equal(existing_tensor[:incoming_len], incoming_tensor):
+            return existing_tensor
+        return torch.cat([existing_tensor, incoming_tensor], dim=0)
+
+    @staticmethod
+    def _truthy_scalar(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            return value.numel() == 1 and bool(value.item())
+        return bool(value)
+
+    @staticmethod
+    def _has_segment_prefill(upd: dict) -> bool:
+        embed = upd.get("embed")
+        return isinstance(embed, dict) and isinstance(embed.get("prefill"), torch.Tensor)
+
+    @classmethod
+    def _should_reset_segment_runtime_buffer(cls, existing: dict, upd: dict, *, reset_pending: bool = False) -> bool:
+        if not cls._has_segment_prefill(upd):
+            return False
+        if reset_pending:
+            return True
+        meta = existing.get("meta")
+        return isinstance(meta, dict) and cls._truthy_scalar(meta.get("is_segment_finished"))
+
+    @classmethod
+    def _reset_segment_runtime_buffer(cls, existing: dict) -> None:
+        for key in tuple(existing):
+            if key not in cls._SEGMENT_RUNTIME_PRESERVED_KEYS:
+                existing.pop(key, None)
+
     def _update_intermediate_buffer(self, req_id: str, upd: dict) -> None:
         if not isinstance(upd, dict) or not upd:
             return
@@ -1938,10 +2016,35 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
             gpu_keys = self.model.gpu_resident_buffer_keys
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
+        reset_req_ids = getattr(self, "_segment_runtime_reset_req_ids", None)
+        reset_pending = reset_req_ids is not None and req_id in reset_req_ids
+        reset_meta = None
+        if reset_pending:
+            meta = existing.get("meta")
+            if isinstance(meta, dict):
+                reset_meta = {k: meta[k] for k in ("num_processed_tokens", "resumable") if k in meta}
+        if self._should_reset_segment_runtime_buffer(existing, upd, reset_pending=reset_pending):
+            self._reset_segment_runtime_buffer(existing)
+            if reset_meta:
+                existing.setdefault("meta", {}).update(reset_meta)
+            if reset_req_ids is not None:
+                reset_req_ids.discard(req_id)
+        has_segment_prefill = self._has_segment_prefill(upd)
         for k, v in upd.items():
             if isinstance(v, dict):
                 existing_sub = existing.setdefault(k, {})
                 for qual, val in v.items():
+                    existing_val = existing_sub.get(qual)
+                    if isinstance(existing_val, torch.Tensor) and isinstance(val, torch.Tensor):
+                        if k == "embed" and qual == "decode":
+                            val = self._merge_runtime_tensor_sequence(existing_val, val, append=True)
+                        elif (k, qual) in {("embed", "prefill"), ("hidden_states", "output")}:
+                            val = self._merge_runtime_tensor_sequence(
+                                existing_val,
+                                val,
+                                append=False,
+                                replace_mismatch=(k == "embed" or has_segment_prefill),
+                            )
                     self._store_value(existing_sub, qual, val, {q for tk, q in gpu_keys if tk == k})
             else:
                 self._store_value(existing, k, v, set())
@@ -1954,10 +2057,13 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def _update_streaming_input_additional_info(self, req_id):
         # For streaming input prefill case only. Set num processed tokens = 0 for new segment input
-        cached_additional_info = self.model_intermediate_buffer.get(req_id, {})
-        if cached_additional_info:
-            merged_info = dict(cached_additional_info)
-            merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
-            merged_info.setdefault("meta", {})["resumable"] = True
-            self.model_intermediate_buffer[req_id] = merged_info
-            setattr(self.requests[req_id], "additional_information_cpu", merged_info)
+        reset_req_ids = getattr(self, "_segment_runtime_reset_req_ids", None)
+        if reset_req_ids is None:
+            reset_req_ids = set()
+            self._segment_runtime_reset_req_ids = reset_req_ids
+        reset_req_ids.add(req_id)
+
+        cached_additional_info = self.model_intermediate_buffer.setdefault(req_id, {})
+        cached_additional_info.setdefault("meta", {})["num_processed_tokens"] = 0
+        cached_additional_info.setdefault("meta", {})["resumable"] = True
+        setattr(self.requests[req_id], "additional_information_cpu", cached_additional_info)

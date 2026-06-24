@@ -242,12 +242,34 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
     assert cleanup_calls == []  # no terminal cleanup; meta.finished is false
 
 
+def test_send_single_request_skips_nonterminal_meta_only_struct(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-meta-only", RequestStatus.WAITING, external_req_id="ext-meta-only")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        meta=MetaStruct(finished=torch.tensor(False, dtype=torch.bool)),
+    )
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {
+            "pooling_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert not connector.put.called
+    assert adapter.put_req_chunk.get("ext-meta-only", 0) == 0
+
+
 def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatch):
     """Pin the contract: an explicitly empty ``OmniPayloadStruct()`` passes
     the ``payload_data is None`` check and gets sent. To skip a chunk, the
-    producer must return ``None``, not an empty struct. (Filtering empty
-    structs at the adapter would require introspecting all struct fields on
-    every send and was rejected for cost vs. value.)
+    producer must return ``None``, not an empty struct. The adapter only filters
+    metadata-only non-terminal placeholders because they carry no consumable
+    downstream payload.
     """
     adapter, connector = build_adapter(stage_id=1)
     request = _req("req-empty", RequestStatus.WAITING, external_req_id="ext-empty")

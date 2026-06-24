@@ -10,6 +10,7 @@ import gc
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -37,11 +38,28 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
+from vllm_omni.worker.gpu_ar_model_runner import _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = logging.getLogger(__name__)
+
+
+class ExecuteModelState(NamedTuple):
+    scheduler_output: SchedulerOutput
+    logits: torch.Tensor | None
+    spec_decode_metadata: Any
+    spec_decode_common_attn_metadata: Any
+    hidden_states: torch.Tensor | None
+    hidden_states_cpu: torch.Tensor | None
+    sample_hidden_states: torch.Tensor | None
+    aux_hidden_states: list[torch.Tensor] | None
+    ec_connector_output: Any
+    cudagraph_stats: Any
+    multimodal_outputs: Any
+    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
+    req_ids: list[str] | None = None
+    req_id_to_index: dict[str, int] | None = None
 
 
 class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
@@ -112,7 +130,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             self.routed_experts_capturer.clear_buffer()
 
         if hasattr(self, "_omni_connector"):
-            for request in getattr(scheduler_output, "pending_input_registrations", []):
+            for request in getattr(scheduler_output, "pending_connector_registrations", []):
                 self.register_chunk_recv(request)
             self.recv_full_payload_inputs(scheduler_output)
             if self._pending_full_payload_send:
@@ -187,8 +205,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     "logprobs for prompt tokens, tokens, please disable "
                     "it when the requests need prompt logprobs"
                 )
-            num_reqs = self.input_batch.num_reqs
-            req_ids = self.input_batch.req_ids
+            req_ids = self.input_batch.req_ids.copy()
+            req_id_to_index = self.input_batch.req_id_to_index.copy()
+            num_reqs = len(req_ids)
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
@@ -362,6 +381,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats,
             multimodal_outputs,
             slot_mappings,  # OMNI: pass slot_mappings for upstream v1 API compatibility
+            req_ids,
+            req_id_to_index,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -408,6 +429,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats,
             multimodal_outputs_raw,
             slot_mappings,  # OMNI: unpack slot_mappings for upstream v1 API compatibility
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
         ) = self.execute_model_state
         self.execute_model_state = None
 
@@ -416,15 +439,21 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.speculative_config is not None:
             self.finalize_kv_connector()
 
-        # Build per-request multimodal_outputs list (dedicated channel).
-        # pooler_output is no longer used for multimodal data.
+        if req_ids_output_copy is None or req_id_to_index_output_copy is None:
+            req_ids_output_copy = self.input_batch.req_ids.copy()
+            req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+        else:
+            req_ids_output_copy = req_ids_output_copy.copy()
+            req_id_to_index_output_copy = req_id_to_index_output_copy.copy()
+        num_reqs = len(req_ids_output_copy)
+
         multimodal_outputs: list[dict[str, object]] = []
         if isinstance(multimodal_outputs_raw, torch.Tensor):
             assert multimodal_outputs_raw.shape[0] == 1, (
                 "model should return a single tensor, to return multiple tensors, use a dict"
             )
-            assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
-            for i in range(self.input_batch.num_reqs):
+            assert multimodal_outputs_raw.shape[0] == num_reqs
+            for i in range(num_reqs):
                 multimodal_outputs.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs_raw, list):
             assert len(multimodal_outputs_raw) == 1, (
@@ -435,7 +464,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs_raw, Mapping):
-            num_reqs = self.input_batch.num_reqs
             for i in range(num_reqs):
                 mm_payload = {}
                 for key, out in multimodal_outputs_raw.items():
@@ -453,9 +481,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 multimodal_outputs.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
-        # [Omni] Copy req_id mappings to avoid async scheduling mutation.
-        req_ids_output_copy = self.input_batch.req_ids.copy()
-        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
         routed_experts_lists = None
         if self.routed_experts_initialized:
             routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)

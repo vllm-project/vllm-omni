@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -39,12 +40,18 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    uses_async_chunk_model_runner_transport,
+)
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.omni_connector_model_runner_mixin import (
+    OmniConnectorModelRunnerMixin,
+    _AsyncChunkRequestAdapter,
+)
 
 logger = init_logger(__name__)
 
@@ -254,6 +261,26 @@ def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]
     return result
 
 
+def _set_nested_payload_value(payload: dict[str, object], key: str, value: object) -> None:
+    if "." not in key:
+        payload[key] = value
+        return
+
+    type_key, qualifier = key.split(".", 1)
+    sub_payload = payload.setdefault(type_key, {})
+    if not isinstance(sub_payload, dict):
+        payload[key] = value
+        return
+
+    if type_key == "hidden_states" and qualifier.startswith("layer_"):
+        layers = sub_payload.setdefault("layers", {})
+        if isinstance(layers, dict):
+            layers[int(qualifier.removeprefix("layer_"))] = value
+        return
+
+    sub_payload[qualifier] = value
+
+
 class ExecuteModelState(NamedTuple):
     scheduler_output: SchedulerOutput
     logits: torch.Tensor | None
@@ -312,6 +339,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._async_chunk_segment_terminal_sent: set[str] = set()
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -396,11 +424,94 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         cached = self._downstream_payload_cache.get(req_id)
         if cached is not None:
             return cached
-        # Conservative default: keep payload if marker is missing.
         final_stage_id = self._request_final_stage_id(req_id)
+        if final_stage_id == 0:
+            self._downstream_payload_cache[req_id] = False
+            return False
+        if (
+            uses_async_chunk_model_runner_transport(getattr(self, "model_config", None))
+            and getattr(self, "_custom_process_func", None) is not None
+        ):
+            self._downstream_payload_cache[req_id] = True
+            return True
+        # Conservative default: keep payload if marker is missing.
         needs_payload = final_stage_id is None or final_stage_id > 0
         self._downstream_payload_cache[req_id] = needs_payload
         return needs_payload
+
+    def _resolve_transfer_request_id(self, req_id: str) -> str:
+        mapped = self._request_ids_mapping.get(req_id)
+        if mapped is not None:
+            return mapped
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return req_id
+        external_req_id = getattr(req_state, "external_req_id", None)
+        if external_req_id is not None:
+            return str(external_req_id)
+        return req_id
+
+    def _send_async_chunk_finish_sentinels(self, finished_req_ids: set[str]) -> None:
+        for rid in finished_req_ids:
+            ext_id = self._request_ids_mapping.get(rid) or self._resolve_transfer_request_id(rid)
+            has_sent_chunk = ext_id in self._put_req_chunk
+            has_cached_payload = ext_id in self._send_side_request_payload or ext_id in self._pending_streaming_prefills
+            if not has_sent_chunk and not has_cached_payload:
+                if not self._request_needs_downstream_stage_payload(rid):
+                    continue
+            snapshot = self._send_side_request_snapshot.get(ext_id)
+            if snapshot is not None:
+                snapshot.is_finished = lambda: True
+                request: Any = snapshot
+            else:
+                request = SimpleNamespace(request_id=rid, req_id=rid, external_req_id=ext_id, is_finished=lambda: True)
+            self.enqueue_finish_sentinel(request, ext_id)
+
+    def _async_chunk_segment_terminal_ready(self, req_id: str) -> bool:
+        info = self.model_intermediate_buffer.get(req_id)
+        if not isinstance(info, dict):
+            return True
+        meta = info.get("meta")
+        if not isinstance(meta, dict):
+            return True
+        if not self._payload_truthy_scalar(meta.get("is_segment_finished")):
+            return True
+        model_stage = getattr(getattr(self, "model_config", None), "model_stage", None)
+        if model_stage != "talker":
+            return True
+        return self._payload_truthy_scalar(meta.get("eos_emitted"))
+
+    def _async_chunk_segment_terminal_sent_ids(self) -> set[str]:
+        sent = getattr(self, "_async_chunk_segment_terminal_sent", None)
+        if sent is None:
+            sent = self._async_chunk_segment_terminal_sent = set()
+        return sent
+
+    def _should_skip_async_chunk_payload_after_segment_terminal(self, req_id: str, ext_id: str) -> bool:
+        sent = self._async_chunk_segment_terminal_sent_ids()
+        if ext_id not in sent:
+            return False
+        info = self.model_intermediate_buffer.get(req_id)
+        meta = info.get("meta") if isinstance(info, dict) else None
+        if isinstance(meta, dict) and not self._payload_truthy_scalar(meta.get("eos_emitted")):
+            sent.discard(ext_id)
+            return False
+        return True
+
+    def _send_async_chunk_segment_sentinels(self, segment_finished_req_ids: set[str]) -> None:
+        sent = self._async_chunk_segment_terminal_sent_ids()
+        for rid in segment_finished_req_ids:
+            ext_id = self._request_ids_mapping.get(rid) or self._resolve_transfer_request_id(rid)
+            ready = self._async_chunk_segment_terminal_ready(rid)
+            if ext_id in sent or not ready:
+                continue
+            snapshot = self._send_side_request_snapshot.get(ext_id)
+            if snapshot is not None:
+                request: Any = snapshot
+            else:
+                request = SimpleNamespace(request_id=rid, req_id=rid, external_req_id=ext_id, is_finished=lambda: False)
+            if self.enqueue_finish_sentinel(request, ext_id, is_segment_finished=True):
+                sent.add(ext_id)
 
     def _resolve_pooler_payload_req_ids(self, req_ids_output_copy: list[str]) -> tuple[str, list[str]]:
         downstream_req_ids = [rid for rid in req_ids_output_copy if self._request_needs_downstream_stage_payload(rid)]
@@ -504,6 +615,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._downstream_payload_cache.clear()
         if hasattr(self, "model_intermediate_buffer"):
             self.model_intermediate_buffer.clear()
+        if hasattr(self, "_async_chunk_segment_terminal_sent"):
+            self._async_chunk_segment_terminal_sent.clear()
 
         # 5. Release all CUDA graphs unconditionally (upstream only does this
         #    on ROCm; on CUDA the graphs are only freed by Python GC during
@@ -750,17 +863,23 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         audio_sparse_output: bool,
         sparse_mm_index: dict[str, int],
         seq_len: int,
+        nested_payload: dict[str, object] | None = None,
+        build_flat_payload: bool = True,
     ) -> dict[str, object]:
         if combined_multimodal_outputs:
-            return self._build_combined_prefix_cache_mm_payload(
+            combined_payload = self._build_combined_prefix_cache_mm_payload(
                 combined_multimodal_outputs,
                 rid=rid,
                 idx=idx,
             )
+            if nested_payload is not None:
+                for mm_key, value in combined_payload.items():
+                    _set_nested_payload_value(nested_payload, mm_key, value)
+            return combined_payload if build_flat_payload else {}
 
-        mm_payload: dict[str, object] = {}
+        mm_payload: dict[str, object] | None = {} if build_flat_payload else None
         if not mm_cpu:
-            return mm_payload
+            return mm_payload or {}
 
         for mm_key, mm_val in mm_cpu.items():
             if mm_key in {"meta.req_id", "meta.sparse_audio"}:
@@ -778,17 +897,28 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                     continue
                 sparse_val = mm_val[sparse_idx]
-                mm_payload[mm_key] = sparse_val.clone() if isinstance(sparse_val, torch.Tensor) else sparse_val
+                value = (
+                    sparse_val.clone() if build_flat_payload and isinstance(sparse_val, torch.Tensor) else sparse_val
+                )
+                if mm_payload is not None:
+                    mm_payload[mm_key] = value
+                if nested_payload is not None:
+                    _set_nested_payload_value(nested_payload, mm_key, value)
                 continue
-            mm_payload[mm_key] = to_payload_element(
+            value = to_payload_element(
                 element=mm_val,
                 idx=idx,
                 start=start,
                 end=end,
                 pass_lists_through=False,
                 seq_len=seq_len,
+                clone_tensors=build_flat_payload,
             )
-        return mm_payload
+            if mm_payload is not None:
+                mm_payload[mm_key] = value
+            if nested_payload is not None:
+                _set_nested_payload_value(nested_payload, mm_key, value)
+        return mm_payload or {}
 
     def _build_omni_pooler_payload(
         self,
@@ -805,6 +935,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         audio_sparse_output: bool,
         sparse_mm_index: dict[str, int],
         seq_len: int,
+        nested_payload: dict[str, object] | None = None,
+        build_flat_payload: bool = True,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         if not audio_sparse_output:
@@ -819,7 +951,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     end,
                 )
             if req_hidden_states is not None:
-                payload["hidden"] = req_hidden_states
+                if build_flat_payload:
+                    payload["hidden"] = req_hidden_states
+                if nested_payload is not None:
+                    nested_payload["hidden"] = req_hidden_states
 
         mm_payload = self._build_omni_mm_payload(
             combined_multimodal_outputs=combined_multimodal_outputs,
@@ -831,6 +966,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             audio_sparse_output=audio_sparse_output,
             sparse_mm_index=sparse_mm_index,
             seq_len=seq_len,
+            nested_payload=nested_payload,
+            build_flat_payload=build_flat_payload,
         )
         payload.update(mm_payload)
         return payload
@@ -892,7 +1029,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         )
 
         if hasattr(self, "_omni_connector"):
-            for request in getattr(scheduler_output, "pending_input_registrations", []):
+            for request in getattr(scheduler_output, "pending_connector_registrations", []):
                 self.register_chunk_recv(request)
             self.recv_full_payload_inputs(scheduler_output)
             if self._pending_full_payload_send:
@@ -900,6 +1037,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
+            if uses_async_chunk_model_runner_transport(getattr(self, "model_config", None)):
+                async_finished = set(getattr(scheduler_output, "finished_req_ids", set()))
+                if async_finished:
+                    self._send_async_chunk_finish_sentinels(async_finished)
+                segment_finished = set(getattr(scheduler_output, "segment_finished_req_ids", set()))
+                if segment_finished:
+                    self._send_async_chunk_segment_sentinels(segment_finished)
 
         if self.omni_prefix_cache is not None and scheduler_output.finished_req_ids:
             self.omni_prefix_cache.commit_deferred_mm_outputs(
@@ -1340,6 +1484,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return None
         return [_ensure_tensor_values(payload) if payload else {} for payload in per_req_payloads]
 
+    def _should_build_local_multimodal_outputs(self, *, runner_transport: bool) -> bool:
+        model_config = self.vllm_config.model_config
+        engine_output_type = (getattr(model_config, "engine_output_type", None) or "").lower()
+        if engine_output_type == "text":
+            return False
+        if (
+            runner_transport
+            and engine_output_type == "latent"
+            and getattr(self, "_custom_process_func", None) is not None
+        ):
+            return False
+        return True
+
     def _snapshot_query_start_loc_cpu(self) -> Any:
         query_start_loc_cpu = self.query_start_loc.cpu
         if callable(query_start_loc_cpu):
@@ -1542,14 +1699,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             multimodal_outputs=multimodal_outputs,
         )
 
-        needs_pooler_payload = len(downstream_req_ids) > 0
+        runner_transport = uses_async_chunk_model_runner_transport(getattr(self, "model_config", None))
+        needs_downstream_payload = len(downstream_req_ids) > 0
+        needs_full_payload_accumulation = self._should_accumulate_full_payload_output()
+        needs_pooler_payload = needs_downstream_payload and (
+            needs_full_payload_accumulation
+            or self._should_build_local_multimodal_outputs(runner_transport=runner_transport)
+        )
+        needs_send_payload = needs_downstream_payload and runner_transport
+        needs_payload = needs_pooler_payload or needs_send_payload
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         include_hidden_payload = self._model_omni_pooler_payload_include_hidden()
         needs_scheduled_hidden_payload = (
             include_hidden_payload
-            and needs_pooler_payload
+            and needs_payload
             and (self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states())
         )
         self._stage_deferred_prefix_cache_mm_outputs(
@@ -1581,7 +1746,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # OmniModelRunnerOutput.pooler_output (which is set to None below).
         # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
-        if needs_pooler_payload:
+        async_chunk_send_payloads: list[dict[str, object]] | None = None
+        if needs_payload:
             mm_cpu = None
             if self.omni_prefix_cache is not None:
                 (
@@ -1615,16 +1781,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         query_start_loc_cpu=query_start_loc_cpu,
                     )
 
-            pooler_output = []
+            pooler_output = [] if needs_pooler_payload else None
+            async_chunk_send_payloads = [] if needs_send_payload else None
             with record_function_or_nullcontext("omni_output_builder:build_pooler_payloads"):
                 for rid in req_ids_output_copy:
                     if rid not in downstream_req_id_set:
-                        pooler_output.append({})
+                        if pooler_output is not None:
+                            pooler_output.append({})
+                        if async_chunk_send_payloads is not None:
+                            async_chunk_send_payloads.append({})
                         continue
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
+                    send_payload: dict[str, object] | None = {} if async_chunk_send_payloads is not None else None
                     payload = self._build_omni_pooler_payload(
                         rid=rid,
                         idx=idx,
@@ -1638,18 +1809,59 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         audio_sparse_output=audio_sparse_output,
                         sparse_mm_index=sparse_mm_index,
                         seq_len=seq_len,
+                        nested_payload=send_payload,
+                        build_flat_payload=pooler_output is not None,
                     )
-                    pooler_output.append(flatten_payload(payload))
+                    if pooler_output is not None:
+                        pooler_output.append(flatten_payload(payload))
+                    if async_chunk_send_payloads is not None:
+                        async_chunk_send_payloads.append(send_payload or {})
 
-        if pooler_output and self._should_accumulate_full_payload_output():
+        if pooler_output and needs_full_payload_accumulation:
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
                 for i, rid in enumerate(req_ids_output_copy):
                     req_state = self.requests.get(rid)
                     if req_state is not None and pooler_output[i]:
                         self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
 
+        if async_chunk_send_payloads is not None:
+            with record_function_or_nullcontext("omni_output_builder:send_async_chunks"):
+                for i, rid in enumerate(req_ids_output_copy):
+                    payload = async_chunk_send_payloads[i]
+                    if rid not in downstream_req_id_set or not payload:
+                        continue
+                    req_state = self.requests.get(rid)
+                    if req_state is None:
+                        continue
+                    ext_id = self._resolve_transfer_request_id(rid)
+                    if self._should_skip_async_chunk_payload_after_segment_terminal(rid, ext_id):
+                        continue
+                    wrapped = _AsyncChunkRequestAdapter(req_state, external_req_id=ext_id, finished=False)
+                    if (
+                        self.send_chunk(request=wrapped, pooling_output=payload)
+                        and ext_id not in self._send_side_request_snapshot
+                    ):
+                        self._send_side_request_snapshot[ext_id] = self._snapshot_request_for_send(wrapped, ext_id)
+
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             multimodal_outputs = self._build_multimodal_outputs(pooler_output)
+
+        if runner_transport and downstream_req_id_set:
+            segment_finished_now: set[str] = set()
+            for rid in downstream_req_id_set:
+                info = self.model_intermediate_buffer.get(rid)
+                if not isinstance(info, dict):
+                    continue
+                meta = info.get("meta")
+                if not isinstance(meta, dict):
+                    continue
+                if self._payload_truthy_scalar(meta.get("is_segment_finished")) and self._payload_truthy_scalar(
+                    meta.get("eos_emitted")
+                ):
+                    segment_finished_now.add(rid)
+                    meta["is_segment_finished"] = False
+            if segment_finished_now:
+                self._send_async_chunk_segment_sentinels(segment_finished_now)
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None

@@ -9,6 +9,7 @@ update payloads early.
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,10 +18,12 @@ import pytest
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.outputs import OmniConnectorOutput
 
 # isort: on
 
@@ -440,3 +443,137 @@ class TestPurgeFinishedFromRunning:
 
         assert held_ref is sched.running
         assert held_ref == [alive]
+
+
+class _FinishOnlyInputCoordinatorStub:
+    def __init__(self) -> None:
+        self.freed: list[str] = []
+        self.finished_requests: set[str] = set()
+        self.requests_with_ready_chunks: set[str] = set()
+        self._completed_chunk_streams: set[str] = set()
+
+    def free_finished_request(self, request_id: str) -> None:
+        self.freed.append(request_id)
+
+    def chunk_stream_completed(self, request_id: str) -> bool:
+        return request_id in self.finished_requests or request_id in self._completed_chunk_streams
+
+
+class _FinishOnlySchedulerStub(OmniGenerationScheduler):
+    def __init__(self, request: Request) -> None:
+        self._async_chunk_coordinator_active = True
+        self._pending_finish_reqs: list[Request] = []
+        self._deferred_terminal_chunk_req_ids: set[str] = set()
+        self._deferred_terminal_request_metadata: dict[str, dict] = {}
+        self._reqs_with_generation_output = {request.request_id}
+        self.requests = {request.request_id: request}
+        self.running = [request]
+        self.waiting = SimpleNamespace(remove_requests=lambda _reqs: None)
+        self.skipped_waiting = SimpleNamespace(remove_requests=lambda _reqs: None)
+        self.input_coordinator = _FinishOnlyInputCoordinatorStub()
+        self.chunk_transfer_adapter = None
+        self.connector = None
+        self.perf_metrics = None
+        self.kv_cache_manager = SimpleNamespace(take_events=lambda: None)
+        self.kv_event_publisher = SimpleNamespace(publish=lambda _batch: None)
+        self.structured_output_manager = SimpleNamespace(should_advance=lambda _req: False)
+        self.recompute_kv_load_failures = False
+        self.finished_req_ids_dict: dict[int, set[str]] = {}
+        self.log_stats = False
+        self.freed: list[str] = []
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        return True
+
+    def _free_request(self, request: Request, delay_free_blocks: bool = False):
+        self.freed.append(request.request_id)
+        self.requests.pop(request.request_id, None)
+        return None
+
+    def make_stats(self, *args, **kwargs):
+        return None
+
+
+def _empty_scheduler_output() -> SchedulerOutput:
+    return SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+
+def _finish_only_model_output(request_id: str):
+    return SimpleNamespace(
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        multimodal_outputs=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={},
+        routed_experts=None,
+        req_ids=[],
+        omni_connector_output=OmniConnectorOutput(
+            chunk_finished_req_ids={request_id},
+        ),
+    )
+
+
+class TestAsyncChunkFinishOnlyOutput:
+    def test_multimodal_request_finishes_on_connector_only_terminal(self) -> None:
+        request = _make_request(request_id="req-mm-terminal")
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        sched = _FinishOnlySchedulerStub(request)
+
+        outputs = sched.update_from_output(
+            _empty_scheduler_output(),
+            _finish_only_model_output(request.request_id),
+        )
+
+        client_outputs = outputs[request.client_index].outputs
+        assert len(client_outputs) == 1
+        assert client_outputs[0].request_id == request.request_id
+        assert client_outputs[0].finish_reason.name == "STOP"
+        assert sched.freed == [request.request_id]
+        assert sched.input_coordinator.freed == [request.request_id]
+
+    def test_multimodal_request_finishes_from_stored_coordinator_terminal(self) -> None:
+        request = _make_request(request_id="req-mm-stored-terminal")
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        sched = _FinishOnlySchedulerStub(request)
+        sched.input_coordinator.finished_requests.add(request.request_id)
+
+        outputs = sched.update_from_output(
+            _empty_scheduler_output(),
+            SimpleNamespace(
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=None,
+                multimodal_outputs=None,
+                num_nans_in_logits=None,
+                kv_connector_output=None,
+                cudagraph_stats=None,
+                req_id_to_index={},
+                routed_experts=None,
+                req_ids=[],
+                omni_connector_output=OmniConnectorOutput(),
+            ),
+        )
+
+        client_outputs = outputs[request.client_index].outputs
+        assert len(client_outputs) == 1
+        assert client_outputs[0].request_id == request.request_id
+        assert client_outputs[0].finish_reason.name == "STOP"
+        assert sched.freed == [request.request_id]
+        assert sched.input_coordinator.freed == [request.request_id]
