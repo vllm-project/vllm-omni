@@ -47,7 +47,7 @@ _MODEL_PRESETS = {
         "guidance_scale": 1.0,
         "fps": 25,
         "frame_rate": 25,
-        "output": "joyai_echo_output.mp4"
+        "output": "joyai_echo_output.mp4",
     },
     "cosmos": {
         "height": 720,
