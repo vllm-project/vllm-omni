@@ -35,6 +35,8 @@ stages:
     async_scheduling: false
     max_num_batched_tokens: 8192
     max_model_len: 8192
+    # Pin the unquantized MoE kernel (wer diff between vllm 0.22 vs 0.23)
+    moe_backend: triton
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
