@@ -10,6 +10,9 @@ Install the LongCat Avatar optional runtime dependencies before running the exam
 pip install "vllm-omni[longcat-video-avatar]"
 ```
 
+The example uses the `imageio_ffmpeg` executable installed by vLLM-Omni's
+`imageio[ffmpeg]` dependency.
+
 ## Quick Start
 
 ```bash

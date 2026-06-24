@@ -6,6 +6,8 @@ import json
 import re
 import subprocess
 import tempfile
+import wave
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -84,20 +86,19 @@ def _frames_to_uint8(frames):
     return np.clip(frames_np, 0, 255).astype(np.uint8)
 
 
-def _media_duration(path: Path) -> float:
-    output = subprocess.check_output(
-        [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_entries",
-            "format=duration",
-            str(path),
-        ]
-    )
-    return float(json.loads(output)["format"]["duration"])
+@lru_cache(maxsize=1)
+def _ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise RuntimeError("LongCat Avatar example requires the Python imageio[ffmpeg] dependency.") from exc
+
+
+def _wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as audio:
+        return audio.getnframes() / float(audio.getframerate())
 
 
 def _save_video_with_audio(frames, output_path: Path, audio_path: str, fps: int) -> None:
@@ -116,11 +117,12 @@ def _save_video_with_audio(frames, output_path: Path, audio_path: str, fps: int)
             writer.close()
 
         duration = len(frames_np) / fps
-        subprocess.run(["ffmpeg", "-y", "-i", audio_path, "-t", f"{duration}", str(crop_audio)], check=True)
-        audio_duration = _media_duration(crop_audio)
+        ffmpeg = _ffmpeg_exe()
+        subprocess.run([ffmpeg, "-y", "-i", audio_path, "-t", f"{duration}", str(crop_audio)], check=True)
+        audio_duration = _wav_duration(crop_audio)
         subprocess.run(
             [
-                "ffmpeg",
+                ffmpeg,
                 "-y",
                 "-i",
                 str(temp_video),
@@ -134,7 +136,7 @@ def _save_video_with_audio(frames, output_path: Path, audio_path: str, fps: int)
         )
         subprocess.run(
             [
-                "ffmpeg",
+                ffmpeg,
                 "-y",
                 "-i",
                 str(crop_video),
@@ -197,10 +199,7 @@ def _create_merged_audio_for_case(
         filter_complex += f"concat=n={len(sorted_paths)}:v=0:a=1"
     else:
         raise NotImplementedError(f"Unsupported LongCat Avatar audio_type {audio_type!r}.")
-    subprocess.run(
-        ["ffmpeg", "-y", *inputs, "-filter_complex", filter_complex, str(output_path)],
-        check=True,
-    )
+    subprocess.run([_ffmpeg_exe(), "-y", *inputs, "-filter_complex", filter_complex, str(output_path)], check=True)
     return str(output_path)
 
 

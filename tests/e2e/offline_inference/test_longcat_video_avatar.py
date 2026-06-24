@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from collections.abc import Generator
 
 import numpy as np
 import pytest
@@ -15,10 +16,6 @@ from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar impo
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-MODEL = prepare_longcat_video_avatar_model_for_omni(
-    os.environ.get("LONGCAT_AVATAR_TEST_MODEL", "meituan-longcat/LongCat-Video-Avatar-1.5"),
-    use_int8=True,
-)
 BASE_MODEL_DIR = os.environ.get("LONGCAT_AVATAR_TEST_BASE_MODEL_DIR")
 PROMPT = "A person speaks calmly while facing the camera."
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
@@ -82,7 +79,7 @@ def _sampling(
     )
 
 
-def _omni_runner_param():
+def _omni_runner_kwargs() -> dict:
     additional_config = {
         "model_type": "avatar-v1.5",
         "resolution": "480p",
@@ -91,14 +88,20 @@ def _omni_runner_param():
     }
     if BASE_MODEL_DIR:
         additional_config["base_model_dir"] = BASE_MODEL_DIR
-    return (
-        MODEL,
-        None,
-        {
-            "model_class_name": "LongCatVideoAvatarPipeline",
-            "additional_config": additional_config,
-        },
+    return {
+        "model_class_name": "LongCatVideoAvatarPipeline",
+        "additional_config": additional_config,
+    }
+
+
+@pytest.fixture(scope="module")
+def longcat_omni_runner() -> Generator[OmniRunner, None, None]:
+    model = prepare_longcat_video_avatar_model_for_omni(
+        os.environ.get("LONGCAT_AVATAR_TEST_MODEL", "meituan-longcat/LongCat-Video-Avatar-1.5"),
+        use_int8=True,
     )
+    with OmniRunner(model, seed=42, stage_configs_path=None, **_omni_runner_kwargs()) as runner:
+        yield runner
 
 
 def _generate_avatar_frames(
@@ -148,14 +151,9 @@ def _assert_frames(frames, *, expected_size: tuple[int, int], expected_count: in
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
-@pytest.mark.parametrize(
-    "omni_runner",
-    [_omni_runner_param()],
-    indirect=True,
-)
-def test_longcat_video_avatar_at2v(omni_runner: OmniRunner, synthetic_audio_path):
+def test_longcat_video_avatar_at2v(longcat_omni_runner: OmniRunner, synthetic_audio_path):
     frames = _generate_avatar_frames(
-        omni_runner,
+        longcat_omni_runner,
         stage="at2v",
         audio_path=synthetic_audio_path,
     )
@@ -165,18 +163,13 @@ def test_longcat_video_avatar_at2v(omni_runner: OmniRunner, synthetic_audio_path
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
-@pytest.mark.parametrize(
-    "omni_runner",
-    [_omni_runner_param()],
-    indirect=True,
-)
 def test_longcat_video_avatar_ai2v(
-    omni_runner: OmniRunner,
+    longcat_omni_runner: OmniRunner,
     synthetic_audio_path,
     synthetic_image_path,
 ):
     frames = _generate_avatar_frames(
-        omni_runner,
+        longcat_omni_runner,
         stage="ai2v",
         audio_path=synthetic_audio_path,
         image_path=synthetic_image_path,
@@ -187,18 +180,13 @@ def test_longcat_video_avatar_ai2v(
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
-@pytest.mark.parametrize(
-    "omni_runner",
-    [_omni_runner_param()],
-    indirect=True,
-)
 def test_longcat_video_avatar_multi_speaker_ai2v(
-    omni_runner: OmniRunner,
+    longcat_omni_runner: OmniRunner,
     synthetic_multi_audio_paths,
     synthetic_image_path,
 ):
     frames = _generate_avatar_frames(
-        omni_runner,
+        longcat_omni_runner,
         stage="ai2v",
         audio_path=synthetic_multi_audio_paths,
         image_path=synthetic_image_path,
@@ -216,18 +204,13 @@ def test_longcat_video_avatar_multi_speaker_ai2v(
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
-@pytest.mark.parametrize(
-    "omni_runner",
-    [_omni_runner_param()],
-    indirect=True,
-)
 def test_longcat_video_avatar_single_speaker_ai2v_avc_continuation(
-    omni_runner: OmniRunner,
+    longcat_omni_runner: OmniRunner,
     synthetic_audio_path,
     synthetic_image_path,
 ):
     frames = _generate_avatar_frames(
-        omni_runner,
+        longcat_omni_runner,
         stage="ai2v",
         audio_path=synthetic_audio_path,
         image_path=synthetic_image_path,
@@ -244,18 +227,13 @@ def test_longcat_video_avatar_single_speaker_ai2v_avc_continuation(
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
-@pytest.mark.parametrize(
-    "omni_runner",
-    [_omni_runner_param()],
-    indirect=True,
-)
 def test_longcat_video_avatar_multi_speaker_ai2v_avc_continuation(
-    omni_runner: OmniRunner,
+    longcat_omni_runner: OmniRunner,
     synthetic_multi_audio_paths,
     synthetic_image_path,
 ):
     frames = _generate_avatar_frames(
-        omni_runner,
+        longcat_omni_runner,
         stage="ai2v",
         audio_path=synthetic_multi_audio_paths,
         image_path=synthetic_image_path,
