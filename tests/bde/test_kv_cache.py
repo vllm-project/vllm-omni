@@ -20,7 +20,7 @@ from vllm_omni.experimental.bde.kv_cache import (
     build_kv_manager,
     compute_num_blocks,
 )
-from vllm_omni.experimental.bde.kv_cache.chunk_window import chunk_window_skipped_tokens
+from vllm_omni.experimental.bde.kv_cache.paged import chunk_window_skipped_tokens
 
 BLOCK = 16
 

@@ -73,7 +73,7 @@ def test_state_close_frees_both_branch_blocks():
     evicted, close() must free the blocks both adapters hold, or session churn
     leaks pool ownership (review P1).
     """
-    from vllm_omni.experimental.bde.kv_cache.gather import BDEKVState
+    from vllm_omni.experimental.bde.kv_cache.state import BDEKVState
 
     kv = make_cache(chunk_size=16, window_chunks=2)
     free_total = kv.manager.block_pool.get_num_free_blocks()

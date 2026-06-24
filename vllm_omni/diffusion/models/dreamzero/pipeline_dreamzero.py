@@ -108,15 +108,16 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         s = self._bde_kv_state
         if s is not None:
             _log.debug("BDE KV get (neg=%s): %d layers", is_negative, s.num_layers)
-            return s.get_kv_caches(is_negative, lambda: state.get_kv_caches(is_negative))
+            return s.get_kv_caches(is_negative)
         return state.get_kv_caches(is_negative)
 
     def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
-        # Always create the model-local caches for the non-BDE fallback path.
-        # Under BDE both self-attn and cross-attn KV are pool-backed — the
-        # state caches created here are unused when _bde_kv_state is set.
-        # Cross-attn is populated eagerly in _kv_populate_cross after text
-        # encoding; self-attn is routed through _kv_get / _kv_update.
+        # Under BDE the pool owns all KV allocation: self-attn is allocated per
+        # chunk in _kv_update and read via _kv_get (empty window at prefill start),
+        # cross-attn is populated eagerly in _kv_populate_cross. No model-local
+        # caches are created. Only the non-BDE path needs them.
+        if self._bde_kv_state is not None:
+            return
         state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
 
     def _kv_update(self, state, layer_idx, updated_kv, is_negative, seq_len=None):
@@ -142,7 +143,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """
         s = self._bde_kv_state
         if s is not None:
-            return s.get_cross_kv_caches(is_negative, lambda: state.get_crossattn_caches(is_negative))
+            return s.get_cross_kv_caches(is_negative)
         return state.get_crossattn_caches(is_negative)
 
     def _kv_populate_cross(self, context: torch.Tensor, clip_feature, is_negative: bool) -> None:

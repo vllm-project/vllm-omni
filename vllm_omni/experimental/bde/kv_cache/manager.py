@@ -12,22 +12,136 @@ thin.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    KVCacheTensor,
+)
+from vllm.v1.request import RequestStatus
 
-from vllm_omni.experimental.bde.kv_cache.adapter import BDERequestAdapter
-from vllm_omni.experimental.bde.kv_cache.chunk_window import ChunkWindowSpec
 from vllm_omni.experimental.bde.kv_cache.config import BDEKVConfig
-from vllm_omni.experimental.bde.kv_cache.gather import (
+from vllm_omni.experimental.bde.kv_cache.paged import (
+    ChunkWindowSpec,
     allocate_kv_pool,
     build_window_slots,
+    chunk_slot_mapping,
     pool_gather_window,
     pool_write_chunk,
+    resident_block_ids,
 )
-from vllm_omni.experimental.bde.kv_cache.pool import build_kv_manager, compute_num_blocks
-from vllm_omni.experimental.bde.kv_cache.slot_mapping import chunk_slot_mapping, resident_block_ids
 
 _log = init_logger(__name__)
+
+
+class BDERequestAdapter:
+    """Duck-types the subset of ``vllm.v1.request.Request`` that the
+    ``KVCacheManager`` reads (``allocate_slots`` / ``get_computed_blocks`` /
+    ``free`` and the coordinator they call into).
+
+    It is intentionally NOT a full ``Request``. The conformance test exercises a
+    real ``KVCacheManager`` against this adapter so the surface cannot silently
+    drift across vLLM versions.
+
+    A BDE request advances one *chunk* at a time: ``allocate_slots`` is called
+    once per chunk and ``num_computed_tokens`` advances only when a chunk is
+    committed (:meth:`on_chunk_committed`), so the ``T`` denoise steps of a chunk
+    reuse the same slots.
+    """
+
+    def __init__(
+        self,
+        request_id: str,
+        *,
+        chunk_size: int,
+        prefill_prefix_tokens: int = 0,
+    ) -> None:
+        self.request_id = request_id
+        self._chunk_size = chunk_size
+        self._prefill = prefill_prefix_tokens
+        self._completed_chunks = 0
+        # Filled only when cross-request prefix reuse is enabled (Phase 3).
+        self.block_hashes: list = []
+        self.skip_reading_prefix_cache = True
+        self.num_preemptions = 0
+        # vLLM watermark gate reads this; map the request lifecycle onto it.
+        self.status = RequestStatus.WAITING
+
+    @property
+    def num_computed_tokens(self) -> int:
+        """Persistent KV already materialized (committed chunks + prefill)."""
+        return self._prefill + self._completed_chunks * self._chunk_size
+
+    @property
+    def num_tokens(self) -> int:
+        """Total tokens once the in-flight chunk is committed."""
+        return self._prefill + (self._completed_chunks + 1) * self._chunk_size
+
+    @property
+    def num_prompt_tokens(self) -> int:
+        """The prefill prefix length (read by ``cache_blocks`` when caching)."""
+        return self._prefill
+
+    @property
+    def completed_chunks(self) -> int:
+        return self._completed_chunks
+
+    def on_chunk_committed(self) -> None:
+        """Advance by one chunk. Call once per chunk, not per denoise step."""
+        self._completed_chunks += 1
+
+
+def compute_num_blocks(
+    available_bytes: int,
+    gpu_memory_fraction: float,
+    page_size_bytes: int,
+) -> int:
+    """Number of KV blocks that fit in ``fraction`` of the memory budget."""
+    if page_size_bytes <= 0:
+        raise ValueError(f"page_size_bytes must be positive, got {page_size_bytes}")
+    if not 0.0 < gpu_memory_fraction <= 1.0:
+        raise ValueError(f"gpu_memory_fraction must be in (0, 1], got {gpu_memory_fraction}")
+    budget = int(available_bytes * gpu_memory_fraction)
+    return max(0, budget // page_size_bytes)
+
+
+def build_kv_manager(
+    spec: KVCacheSpec,
+    layer_names: Sequence[str],
+    num_blocks: int,
+    max_model_len: int,
+    *,
+    enable_caching: bool = False,
+) -> KVCacheManager:
+    """Build a ``KVCacheManager`` with a single KV cache group for ``spec``.
+
+    Args:
+        spec: The KV cache spec for the group (e.g. a ``ChunkWindowSpec``).
+        layer_names: Attention layers sharing this group's block table.
+        num_blocks: Total physical blocks in the pool.
+        max_model_len: Upper bound on a request's sequence length.
+        enable_caching: Cross-request prefix caching (Phase 3); off in Phase 1.
+    """
+    layer_names = list(layer_names)
+    group = KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
+    tensors = [KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=layer_names)]
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=tensors,
+        kv_cache_groups=[group],
+    )
+    return KVCacheManager(
+        config,
+        max_model_len=max_model_len,
+        scheduler_block_size=spec.block_size,
+        hash_block_size=spec.block_size,
+        enable_caching=enable_caching,
+    )
 
 
 class BDEKVCache:

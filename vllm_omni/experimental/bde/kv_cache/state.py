@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pool write + window gather for the BDE engine (Phase 1).
+"""BDEKVState — per-request bridge between a model rollout and the BDE KV pool.
+
+This is the one model-facing piece of the KV stack (everything in ``paged.py`` /
+``manager.py`` is engine-generic). A second model (e.g. the Cosmos port) adds a
+sibling here that reuses the same pool primitives.
 
 Phase 1 keeps the existing attention kernel unchanged — it only changes *where*
 the past-window KV comes from (the pool) and *where* the committed chunk's KV is
 stored (the pool). The model's ``self_attn`` still receives a contiguous
 ``(batch, window, n_heads, head_dim)`` K/V pair; the gather materializes that
-tensor from the resident pool blocks. The per-forward gather copy is the
-deliberate Phase-1 simplification the fused paged backend retires in Phase 2.
+tensor from the resident pool blocks.
 """
 
 from __future__ import annotations
@@ -16,103 +19,9 @@ import os
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.bde.kv_cache.paged import _drop_batch, pool_write_chunk
+
 _log = init_logger(__name__)
-
-
-def allocate_kv_pool(
-    num_blocks: int,
-    block_size: int,
-    num_layers: int,
-    num_kv_heads: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Allocate per-layer paged K and V pools on *device*.
-
-    Each pool is a contiguous ``(num_blocks * block_size, num_kv_heads, head_dim)``
-    tensor — a flat address space indexed by ``slot = block_id * block_size + offset``.
-    The slot mapping (``bde.kv_cache.slot_mapping``) tells writes and gathers where
-    each token lives.
-    """
-    k_pools: list[torch.Tensor] = []
-    v_pools: list[torch.Tensor] = []
-    for _ in range(num_layers):
-        k_pools.append(torch.empty(num_blocks * block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
-        v_pools.append(torch.empty(num_blocks * block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
-    return k_pools, v_pools
-
-
-def pool_write_chunk(
-    k_pool: torch.Tensor,
-    v_pool: torch.Tensor,
-    new_k: torch.Tensor,
-    new_v: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    """Write the committed chunk's K/V into pool slots (in place).
-
-    ``new_k`` / ``new_v`` shape: ``(batch, chunk_size, num_kv_heads, head_dim)``.
-    ``slot_mapping`` shape: ``(chunk_size,)`` — one physical slot per token position.
-    The batch dim is written to the same slots (multi-batch writes the same
-    positions; the caller is responsible for per-sequence bookkeeping).
-
-    This is the *commit* write — called once per chunk, after the last denoise step.
-    """
-    k_pool[slot_mapping] = new_k[0]  # batch index 0
-    v_pool[slot_mapping] = new_v[0]
-
-
-def build_window_slots(window_block_ids: list[int], block_size: int, device: torch.device) -> torch.Tensor:
-    """Flat slot index covering all resident blocks, in table order.
-
-    Vectorized (no Python loop): ``slot = block_id * block_size + offset`` for every
-    ``offset in [0, block_size)``. The window's blocks are identical across all layers
-    within a forward, so this is built once per forward and shared.
-    """
-    if not window_block_ids:
-        raise ValueError("window_block_ids is empty — no blocks are resident")
-    starts = torch.tensor(window_block_ids, dtype=torch.long, device=device) * block_size
-    offsets = torch.arange(block_size, device=device)
-    return (starts[:, None] + offsets[None, :]).reshape(-1)
-
-
-def pool_gather_window(
-    k_pool: torch.Tensor,
-    v_pool: torch.Tensor,
-    window_block_ids: list[int],
-    block_size: int,
-    max_attention_size: int,
-    *,
-    slots: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Materialize the resident window K/V as a contiguous tensor.
-
-    Gathers all slots belonging to ``window_block_ids`` (in table order), trims to
-    the last ``max_attention_size`` tokens (matching the existing ``cat`` + slice),
-    and returns a ``(2, batch, window_tokens, n_heads, head_dim)`` tensor — exactly
-    the format DreamZero's attention expects as ``kv_cache``. Pass a precomputed
-    ``slots`` (from :func:`build_window_slots`) to share the index across layers.
-    """
-    if slots is None:
-        slots = build_window_slots(window_block_ids, block_size, k_pool.device)
-    # Gather then trim to the attention window.
-    wk = k_pool[slots]  # (window_slots, n_heads, head_dim)
-    wv = v_pool[slots]
-    wk = wk[-max_attention_size:]  # (window, n_heads, head_dim)
-    wv = wv[-max_attention_size:]
-    # Add the batch dim then stack as (2, batch, window, n_heads, head_dim).
-    wk = wk.unsqueeze(0)  # (1, window, n_heads, head_dim)
-    wv = wv.unsqueeze(0)
-    window = torch.stack([wk, wv], dim=0)  # (2, 1, window, n_heads, head_dim)
-    return window
-
-
-def _drop_batch(t: torch.Tensor) -> torch.Tensor:
-    """``(1, L, n_heads, head_dim)`` -> ``(L, n_heads, head_dim)``; pass 3-D through."""
-    if t.dim() == 4 and t.shape[0] == 1:
-        return t[0]
-    return t
 
 
 class BDEKVState:
@@ -162,12 +71,11 @@ class BDEKVState:
     def _adapter(self, is_negative: bool):
         return self.neg if is_negative else self.pos
 
-    def get_kv_caches(self, is_negative: bool, fallback) -> list:
+    def get_kv_caches(self, is_negative: bool) -> list:
+        # Engine owns the read end-to-end: at prefill start the adapter has no
+        # resident blocks, so gather returns zero-length windows (the empty seed
+        # the model concatenates against) — no model-local fallback needed.
         branch = "neg" if is_negative else "pos"
-        if self._committed[is_negative] == 0:  # nothing committed yet (prefill start)
-            out = fallback()
-            _log.info("BDE GET   [%s] source=model-local-empty layers=%d", branch, len(out))
-            return out
         cached = self._gather_cache[is_negative] if self._memo_enabled else None
         if cached is not None:  # window unchanged this forward -> reuse (no re-gather)
             return cached
@@ -185,11 +93,20 @@ class BDEKVState:
         )
         return windows
 
-    def get_cross_kv_caches(self, is_negative: bool, fallback) -> list[dict]:
-        """Return pool-backed cross-attn cache dicts, or fallback if not populated."""
-        if self._cross_populated[is_negative] and self.kv_cache.cross_attn_length > 0:
-            return [self.kv_cache.read_cross_kv(i, is_negative) for i in range(self.num_layers)]
-        return fallback()
+    def get_cross_kv_caches(self, is_negative: bool) -> list[dict]:
+        """Return pool-backed cross-attn cache dicts.
+
+        Under BDE the cross-attn pool is always populated by ``_kv_populate_cross``
+        before the first read, so this must never be reached unpopulated — if it
+        were, the model would lazily project and write cross KV itself, violating
+        engine ownership. Fail loud rather than fall back to the model.
+        """
+        if not (self._cross_populated[is_negative] and self.kv_cache.cross_attn_length > 0):
+            raise RuntimeError(
+                "BDE cross-attn read before _kv_populate_cross (neg=%s, cross_attn_length=%d) "
+                "— the engine must own all cross KV" % (is_negative, self.kv_cache.cross_attn_length)
+            )
+        return [self.kv_cache.read_cross_kv(i, is_negative) for i in range(self.num_layers)]
 
     def update_kv_cache(self, layer_idx: int, updated_kv: torch.Tensor, is_negative: bool, seq_len) -> None:
         branch = "neg" if is_negative else "pos"
