@@ -19,6 +19,13 @@ from vllm_omni.model_extras.bagel import (
 from vllm_omni.model_extras.bagel import (
     build_text_to_image_prompt as build_bagel_text_to_image_prompt,
 )
+from vllm_omni.model_extras.cosmos3 import (
+    COSMOS3_EXTRA_BODY_PARAMS,
+    COSMOS3_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.cosmos3 import (
+    build_text_to_image_prompt as build_cosmos3_text_to_image_prompt,
+)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -83,6 +90,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "SenseNovaU1Pipeline": {
         "extra_body_params": SENSENOVA_U1_EXTRA_BODY_PARAMS,
         "extra_output_params": SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
+    },
+    "Cosmos3OmniDiffusersPipeline": {
+        "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
+        "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+        "text_to_image_prompt_builder": build_cosmos3_text_to_image_prompt,
     },
     "MagiHumanPipeline": {
         "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,

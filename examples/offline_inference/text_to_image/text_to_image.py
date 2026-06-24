@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import functools
 import json
 import time
 from pathlib import Path
@@ -38,14 +39,18 @@ def is_nextstep_model(model_name: str) -> bool:
     return False
 
 
-def parse_profiler_config(value: str) -> dict[str, Any]:
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
     try:
         config = json.loads(value)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
     if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
     return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 def parse_args() -> argparse.Namespace:
@@ -269,7 +274,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--extra-body",
-        type=parse_profiler_config,
+        type=functools.partial(parse_json_object, flag_name="--extra-body"),
         default=None,
         help=(
             "Model-specific generation params as a JSON object, e.g. "
@@ -425,6 +430,10 @@ def main():
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)

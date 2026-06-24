@@ -38,7 +38,7 @@ def test_commit_records_only_spoken():
     assert p.commit("</silence>").action.value == "silence"
     assert p.brain.response_records == []
     assert p.commit("</response> hello").action.value == "response"
-    assert p.brain.response_records == [("0.0s", "hello")]
+    assert p.brain.response_records == [("0.0 seconds", "hello")]
 
 
 def test_commit_dedup_default_is_exact_match_only():

@@ -9,6 +9,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
+| `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
 | `BestWishYsh/Helios-Base` / `Helios-Mid` / `Helios-Distilled` | 384x640 | 99 | 50 | 5.0 / 5.0 / 1.0 | — |
 
 ## Local CLI Usage
@@ -101,6 +102,20 @@ python text_to_video.py \
   --output quick_test.mp4
 ```
 
+### Cosmos3
+
+```bash
+python text_to_video.py \
+  --model nvidia/Cosmos3-Nano \
+  --prompt "A robot arm is cleaning a plate in the kitchen." \
+  --negative-prompt "blurry, distorted, low quality, jittery, deformed" \
+  --height 720 --width 1280 --num-frames 189 --fps 24 \
+  --num-inference-steps 35 --guidance-scale 6.0 \
+  --extra-body '{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false,
+                 "use_resolution_template": false, "use_duration_template": false}' \
+  --output cosmos3_t2v.mp4
+```
+
 ### Helios (T2V)
 
 Helios ships three variants. Model-specific knobs (declared in
@@ -167,6 +182,7 @@ python text_to_video.py \
 - `--audio-sample-rate`: audio sample rate for embedded audio (when the pipeline returns audio).
 - `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
 - `--flow-shift`: scheduler flow_shift parameter.
+- `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
 
 ### Wan2.2-specific
 

@@ -603,6 +603,7 @@ class OmniBase(PDDisaggregationMixin):
             metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
+            finished=finished,
         )
 
     def shutdown(self, timeout: float | None = None) -> None:
