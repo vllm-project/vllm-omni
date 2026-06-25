@@ -33,6 +33,62 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize legacy diffusion kwargs before config construction."""
+    normalized = dict(kwargs)
+
+    # Backwards-compatibility: older callers may use a diffusion-specific
+    # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
+    if "static_lora_scale" in normalized:
+        if "lora_scale" not in normalized:
+            normalized["lora_scale"] = normalized["static_lora_scale"]
+        normalized.pop("static_lora_scale", None)
+
+    # Backwards-compatibility: map "quantization" to "quantization_config"
+    # so callers using the old field name still work.
+    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
+        normalized["quantization_config"] = normalized.pop("quantization")
+    else:
+        normalized.pop("quantization", None)
+
+    # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
+    if normalized.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in normalized:
+        normalized["diffusion_kv_cache_dtype"] = normalized.pop("kv_cache_dtype")
+    else:
+        normalized.pop("kv_cache_dtype", None)
+    if normalized.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in normalized:
+        normalized["diffusion_kv_cache_skip_steps"] = normalized.pop("kv_cache_skip_steps")
+    else:
+        normalized.pop("kv_cache_skip_steps", None)
+    if normalized.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in normalized:
+        normalized["diffusion_kv_cache_skip_layers"] = normalized.pop("kv_cache_skip_layers")
+    else:
+        normalized.pop("kv_cache_skip_layers", None)
+
+    # Handle "diffusion_attention_backend" shorthand: merge into
+    # diffusion_attention_config before field filtering.
+    diffusion_attn_backend = normalized.pop("diffusion_attention_backend", None)
+    if diffusion_attn_backend is not None:
+        existing = normalized.get("diffusion_attention_config")
+        normalized["diffusion_attention_config"] = parse_attention_config(
+            existing,
+            attention_backend=diffusion_attn_backend,
+        )
+
+    # Check environment variable as fallback for cache_backend.
+    # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
+    if "cache_backend" not in normalized:
+        cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
+        normalized["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+
+    # Convert optional YAML null values to empty containers.
+    for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
+        if key in normalized and normalized[key] is None:
+            normalized[key] = {}
+
+    return normalized
+
+
 def parse_kv_cache_skip_selector(
     selector: str | list[int] | tuple[int, ...] | set[int] | None,
 ) -> set[int] | None:
@@ -1083,55 +1139,7 @@ class OmniDiffusionConfig:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
-        # Backwards-compatibility: older callers may use a diffusion-specific
-        # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale"
-        # before constructing the dataclass to avoid TypeError on unknown fields.
-        if "static_lora_scale" in kwargs:
-            if "lora_scale" not in kwargs:
-                kwargs["lora_scale"] = kwargs["static_lora_scale"]
-            kwargs.pop("static_lora_scale", None)
-
-        # Backwards-compatibility: map "quantization" to "quantization_config"
-        # so callers using the old field name still work.
-        if "quantization" in kwargs and kwargs.get("quantization_config", None) is None:
-            kwargs["quantization_config"] = kwargs.pop("quantization")
-        else:
-            kwargs.pop("quantization", None)
-
-        # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-        if kwargs.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in kwargs:
-            kwargs["diffusion_kv_cache_dtype"] = kwargs.pop("kv_cache_dtype")
-        else:
-            kwargs.pop("kv_cache_dtype", None)
-        if kwargs.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in kwargs:
-            kwargs["diffusion_kv_cache_skip_steps"] = kwargs.pop("kv_cache_skip_steps")
-        else:
-            kwargs.pop("kv_cache_skip_steps", None)
-        if kwargs.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in kwargs:
-            kwargs["diffusion_kv_cache_skip_layers"] = kwargs.pop("kv_cache_skip_layers")
-        else:
-            kwargs.pop("kv_cache_skip_layers", None)
-
-        # Handle "diffusion_attention_backend" shorthand: merge into
-        # diffusion_attention_config before field filtering.
-        diffusion_attn_backend = kwargs.pop("diffusion_attention_backend", None)
-        if diffusion_attn_backend is not None:
-            existing = kwargs.get("diffusion_attention_config")
-            kwargs["diffusion_attention_config"] = parse_attention_config(
-                existing,
-                attention_backend=diffusion_attn_backend,
-            )
-
-        # Check environment variable as fallback for cache_backend
-        # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
-        if "cache_backend" not in kwargs:
-            cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
-            kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
-
-        # Convert optional YAML null values to empty containers.
-        for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
-            if key in kwargs and kwargs[key] is None:
-                kwargs[key] = {}
+        kwargs = normalize_omni_diffusion_kwargs(kwargs)
 
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
