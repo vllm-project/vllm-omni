@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Start an LVSA-enabled vLLM-Omni server for Wan or HunyuanVideo.
 #
-# LVSA is enabled purely through environment variables that the `lvsa-vllm-omni`
-# plugin reads when vLLM-Omni loads its `general_plugins` entry points — nothing
-# in vLLM-Omni core is modified. Watch the log for "[LVSA] engaged" to confirm
-# sparse attention is active for your request geometry.
+# LVSA is selected as the attention backend via --diffusion-attention-config (see
+# below); the `LVSA_*` env vars only tune it. The `lvsa-vllm-omni` plugin registers
+# itself through vLLM-Omni's `general_plugins` entry points — nothing in vLLM-Omni
+# core is modified. Watch the log for "[LVSA] Geometry detected" to confirm sparse
+# attention is active for your request geometry.
 #
 #   MODEL=/path/to/Wan2.1-T2V-1.3B-Diffusers MODEL_FAMILY=wan     FRAMES=161 bash serve_lvsa.sh
 #   MODEL=/path/to/HunyuanVideo-1.5-...       MODEL_FAMILY=hunyuan FRAMES=193 bash serve_lvsa.sh
@@ -32,13 +33,13 @@ export LVSA_ROTATE_KEYFRAMES=${LVSA_ROTATE_KEYFRAMES:-1}
 
 echo "[lvsa-app] serving $MODEL ($MODEL_FAMILY) on :$PORT"
 echo "[lvsa-app]   LVSA backend=$BACKEND  T_lat=$T_LAT (frames=$FRAMES)  reference=$REFERENCE"
-echo "[lvsa-app]   confirm activation by grep '\\[LVSA\\] engaged' in this log"
+echo "[lvsa-app]   confirm activation by grep '\\[LVSA\\] Geometry detected' in this log"
 
 # vLLM-Omni 0.22 selects the LVSA attention backend per-role via
-# --diffusion-attention-config (the DIFFUSION_ATTENTION_BACKEND env var was
-# removed). The backend is what drives sparse attention here; it engages under
-# tensor-parallel too, unlike the LVSA_*_HOOK monkey-patch path (which falls
-# back to dense under sequence-parallel), so we deliberately do NOT set a hook.
+# --diffusion-attention-config. The backend is what drives sparse attention
+# here; it engages under tensor-parallel too, unlike the LVSA_*_HOOK monkey-patch
+# path (which falls back to dense under sequence-parallel), so we deliberately do
+# NOT set a hook.
 exec vllm serve "$MODEL" --omni --host 0.0.0.0 --port "$PORT" \
      --diffusion-attention-config '{"per_role": {"self": {"backend": "LVSA"}}}' \
      --init-timeout 1800 ${EXTRA_ARGS:-}

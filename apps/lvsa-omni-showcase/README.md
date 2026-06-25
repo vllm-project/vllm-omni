@@ -21,8 +21,8 @@ Wan 2.1 1.3B, single A100 80 GB, mean over 5 prompts (Dense vs LVSA-FlashInfer):
 The speedup **grows with length** (LVSA is the dense regime at 1× by design, so
 the win starts at 2×), and quality *improves* at extension — LVSA's rotating
 keyframes prevent the looping/static output dense produces beyond its horizon
-(VQeval loop-quality +16–30 at ≥3×). At long horizons dense **OOMs on 80 GB**
-(HunyuanVideo ≥2×, Wan/Cosmos 6×) where LVSA still generates.
+(VQeval loop-quality +27 to +34 at ≥3×). At long horizons dense **OOMs on 80 GB**
+(HunyuanVideo ≥2×, Wan2.1-14B and Cosmos at 6×) where LVSA still generates.
 
 → Full sweep (5 models × 6 horizons, VQeval + VBench-Long) and the
 quality-metric methodology:
@@ -42,6 +42,21 @@ git clone https://github.com/JiusiServe/LongVideoSparseAttention.git
 
 # 3. this showcase's client dep
 pip install requests
+```
+
+FlashInfer (used by the default `flashinfer` backend) **ships with vLLM** — step 1
+already pulls the pinned `flashinfer-python` + `flashinfer-cubin`, so the fused
+backend works with no extra install. Two optional extras:
+
+```bash
+# (optional) faster startup — prebuilt JIT cache, matched to your CUDA + flashinfer
+CU=cu128   # match your CUDA: cu121 / cu124 / cu128 / …
+FIVER=$(python -c "import importlib.metadata as m; print(m.version('flashinfer-python'))")
+pip install --extra-index-url "https://flashinfer.ai/whl/${CU}" \
+  "flashinfer-jit-cache==${FIVER}+${CU}"
+
+# (fallback) no FlashInfer in your environment? run the SDPA backend instead:
+export LVSA_BACKEND=sdpa
 ```
 
 ```bash
