@@ -33,7 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
-from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
+from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_ASR_PIPELINE, AURA_OMNI_PIPELINE, AURA_VL_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
     BAGEL_SINGLE_STAGE_PIPELINE,

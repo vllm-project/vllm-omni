@@ -118,4 +118,3 @@ python examples/online_serving/aura_omni/split_services_client.py \
   --tts-ref-audio /data/yrr/vllm-omni/tests/assets/qwen3_tts/clone_2.wav \
   --tts-ref-text "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 ```
-
