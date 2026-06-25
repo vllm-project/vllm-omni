@@ -137,6 +137,13 @@ class CampplusTRT:
             stream.synchronize()
         return out
 
+    def close(self) -> None:
+        """Release the TensorRT execution context and engine (GPU memory)."""
+        with self._lock:
+            # Drop the execution context before the engine it was created from.
+            self.context = None
+            self.engine = None
+
 
 # Process-wide cache: the mm processor is re-created per request (the deploy
 # config disables the mm-processor object cache), so building a fresh
@@ -155,3 +162,15 @@ def get_campplus_trt(onnx_path: str, device: str | torch.device) -> CampplusTRT:
         inst = CampplusTRT(onnx_path, device)
         _CAMPPLUS_CACHE[key] = inst
     return inst
+
+
+def clear_campplus_trt_cache() -> int:
+    """Release every cached TensorRT campplus engine. Returns count cleared."""
+    insts = list(_CAMPPLUS_CACHE.values())
+    _CAMPPLUS_CACHE.clear()
+    for inst in insts:
+        try:
+            inst.close()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("campplus TRT close failed: %s", exc)
+    return len(insts)
