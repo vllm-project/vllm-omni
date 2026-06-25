@@ -733,6 +733,7 @@ stages:
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type"),
         [
             ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image"),
+            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text"),
             ("omnivoice.yaml", "omnivoice", 1, "audio"),
         ],
     )
