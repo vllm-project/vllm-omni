@@ -110,7 +110,7 @@ def _build_s2st_request_config(omni_server, audio_base64: str) -> dict:
     }
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_single_s2st_request(omni_server, openai_client) -> None:
     """Test single speech-to-speech request via chat completions API."""
     request_config = _build_s2st_request_config(
@@ -120,7 +120,7 @@ def test_single_s2st_request(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("request_num", [2, 4])
 def test_concurrent_s2st_requests(omni_server, openai_client, request_num: int) -> None:
     """Test concurrent speech-to-speech requests."""
