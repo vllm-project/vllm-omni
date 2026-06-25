@@ -564,7 +564,6 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
-        images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
         rid_key = str(req_id)
@@ -594,11 +593,7 @@ class OmniBase(PDDisaggregationMixin):
             stage_id=stage_id,
             final_output_type=output_type,
             request_output=engine_outputs,
-            images=images,
-            trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),
-            trajectory_timesteps=getattr(engine_outputs, "trajectory_timesteps", None),
-            trajectory_log_probs=getattr(engine_outputs, "trajectory_log_probs", None),
-            trajectory_decoded=getattr(engine_outputs, "trajectory_decoded", None),
+            _multimodal_output=getattr(engine_outputs, "_multimodal_output", {}),
             _custom_output=getattr(engine_outputs, "_custom_output", {}),
             metrics=response_metrics,
             stage_durations=stage_durations,

@@ -249,14 +249,14 @@ class DiffusionEngine:
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
-        if output.output is None:
+        if output.multimodal_output is None or output.multimodal_output == {}:
             logger.warning("Output is None, returning empty OmniRequestOutput")
             return format_empty_diffusion_outputs(request, finished=output.finished)
 
         # When CPU offload is enabled, move output to CPU before
         # post-processing to avoid device OOM — model weights may still
         # reside on the device and leave no headroom for intermediates.
-        output_data = output.output
+        output_data = output.multimodal_output
         if self.od_config.enable_cpu_offload:
             output_data = _move_tensor_tree_to_cpu(output_data)
 

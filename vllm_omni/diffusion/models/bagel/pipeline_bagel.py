@@ -857,11 +857,13 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         custom["image"] = img
 
         return DiffusionOutput(
-            output=img,
-            trajectory_latents=trajectory_latents_stacked,
-            trajectory_timesteps=trajectory_timesteps_stacked,
-            trajectory_log_probs=trajectory_log_probs_stacked,
-            trajectory_decoded=trajectory_decoded,
+            multimodal_output={
+                "image": img,
+                "trajectory_latents": trajectory_latents_stacked,
+                "trajectory_timesteps": trajectory_timesteps_stacked,
+                "trajectory_log_probs": trajectory_log_probs_stacked,
+                "trajectory_decoded": trajectory_decoded,
+            }, 
             custom_output=custom,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )

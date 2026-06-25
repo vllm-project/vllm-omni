@@ -388,7 +388,7 @@ class vLLMOmniHttpServerLocal:
             final_res = output
         assert final_res is not None
 
-        diffusion_output = self._to_tensor(final_res.images[0]).float() / 255.0
+        diffusion_output = self._to_tensor(final_res.multimodal_output["images"][0]).float() / 255.0
 
         mm_output = final_res.custom_output or {}
 
