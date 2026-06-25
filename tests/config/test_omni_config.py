@@ -733,7 +733,6 @@ def test_diffusion_config_field_classification_covers_current_fields():
     classified_fields = (
         omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
         | omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
-        | omni_config_module._DIFFUSION_PARALLEL_CONFIG_FIELDS
         | omni_config_module._DIFFUSION_ONLY_CONFIG_FIELDS
     )
 

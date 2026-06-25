@@ -168,10 +168,6 @@ def _copy_value(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
-def _copy_if_not_none(value: Any) -> Any:
-    return None if value is None else _copy_value(value)
-
-
 def _config_kwargs(overrides: Mapping[str, Any]) -> dict[str, Any]:
     return {name: _copy_value(value) for name, value in overrides.items() if value is not None}
 
@@ -667,12 +663,8 @@ _DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
         "prompt_file_path",
     }
 )
-_DIFFUSION_PARALLEL_CONFIG_FIELDS = frozenset()
 _DIFFUSION_ONLY_CONFIG_FIELDS = (
-    _DIFFUSION_CONFIG_FIELDS
-    - _DIFFUSION_SHARED_CONFIG_FIELDS
-    - _DIFFUSION_RUNTIME_CONFIG_FIELDS
-    - _DIFFUSION_PARALLEL_CONFIG_FIELDS
+    _DIFFUSION_CONFIG_FIELDS - _DIFFUSION_SHARED_CONFIG_FIELDS - _DIFFUSION_RUNTIME_CONFIG_FIELDS
 )
 _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
     {

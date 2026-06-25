@@ -73,7 +73,6 @@ __all__ = [
     "StageType",
     "StageExecutionType",
     "StagePipelineConfig",
-    "StageType",
     "load_deploy_config",
     "merge_pipeline_deploy",
     "register_pipeline",
