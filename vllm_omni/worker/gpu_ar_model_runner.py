@@ -1338,15 +1338,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return None
         if per_req_payloads is None:
             return None
-        wire: list[dict[str, torch.Tensor] | None] = []
+        wire_payloads: list[dict[str, torch.Tensor] | None] = []
         for payload in per_req_payloads:
             if not payload:
-                wire.append(None)
+                wire_payloads.append(None)
             else:
-                wire.append(_ensure_tensor_values(payload))
-        if all(item is None for item in wire):
+                wire_payloads.append(_ensure_tensor_values(payload))
+        if all(item is None for item in wire_payloads):
             return None
-        return wire
+        return wire_payloads
 
     def _snapshot_query_start_loc_cpu(self) -> Any:
         query_start_loc_cpu = self.query_start_loc.cpu

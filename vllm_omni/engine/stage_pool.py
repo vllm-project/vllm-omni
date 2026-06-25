@@ -451,10 +451,12 @@ class StagePool:
                 for replica in self._hub.get_replicas_for_stage(self.stage_id).replicas:
                     if replica.input_addr == input_addr:
                         return (outputs_qsize, max(int(replica.queue_length), 0))
+            # Distributed dispatch (pick): request_id -> input_addr in _affinity.
             inflight = sum(
                 1 for input_addr in self._affinity.values() if self._addr_to_replica_id.get(input_addr) == replica_id
             )
         else:
+            # Legacy local dispatch (select_replica_id): request_id -> replica_id.
             inflight = sum(1 for bound_replica_id in self._request_bindings.values() if bound_replica_id == replica_id)
         return (outputs_qsize, inflight)
 
