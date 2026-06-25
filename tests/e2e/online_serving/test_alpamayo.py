@@ -11,10 +11,11 @@ delivery), server-side history fusion, AR chain-of-thought generation and the
 inline flow-matching trigger.
 
 Scope note: this asserts the server returns a 200 with non-empty chain-of-thought
-reasoning. It does NOT assert the predicted trajectory in the response body —
-the action payload rides on ``message.multimodal_output`` which the upstream
-``ChatCompletionResponseChoice`` schema drops on serialization. The numerical
-trajectory check lives in the offline test
+reasoning AND that the predicted trajectory survives in the response body under
+``message.multimodal_output["actions"]`` (preserved by
+``OmniChatCompletionResponse``'s ``model_serializer``, since the base
+``ChatCompletionResponseChoice.message`` schema would otherwise drop the extra
+field). The numerical minADE-vs-GT check lives in the offline test
 (``tests/e2e/offline_inference/test_alpamayo.py``), which reads
 ``ro.multimodal_output["actions"]`` directly.
 

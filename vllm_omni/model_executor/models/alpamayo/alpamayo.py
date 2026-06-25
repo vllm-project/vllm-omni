@@ -26,6 +26,7 @@ import logging
 import os
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -51,6 +52,51 @@ logger = logging.getLogger(__name__)
 # Default discrete-trajectory-token layout (overridden from hf_config when present).
 _DEFAULT_TRAJ_TOKEN_START_IDX = 151669
 _DEFAULT_TRAJ_VOCAB_SIZE = 4000
+
+# Guard rails for the request-supplied ``robot_obs`` (arrives via vllm_xargs ->
+# sampling_params.extra_args, possibly as a JSON string). These bound the work
+# the model path does on untrusted input: an oversized or malformed payload is
+# rejected early (logged + skipped) instead of reaching tokenization / tensor
+# construction. A real ego history is a few hundred 3-vectors, well under these.
+_ROBOT_OBS_MAX_JSON_BYTES = 1 << 20  # 1 MiB cap on the JSON string form
+_ROBOT_OBS_MAX_ELEMS = 200_000  # cap on element count of each history array
+
+
+def _validate_robot_obs(robot_obs: object) -> dict | None:
+    """Return a well-formed ``robot_obs`` dict, or ``None`` if it fails validation.
+
+    Checks (fail early, never raise into the model path):
+      - is a dict carrying both ``ego_history_xyz`` and ``ego_history_rot``;
+      - each array is list/ndarray/tensor with a bounded element count.
+    """
+    if not isinstance(robot_obs, dict):
+        logger.warning("Alpamayo15: robot_obs is not a dict (got %s); skipping fusion.", type(robot_obs).__name__)
+        return None
+    hx = robot_obs.get("ego_history_xyz")
+    hr = robot_obs.get("ego_history_rot")
+    if hx is None or hr is None:
+        logger.warning("Alpamayo15: robot_obs missing ego_history_xyz/ego_history_rot; skipping fusion.")
+        return None
+    for key, val in (("ego_history_xyz", hx), ("ego_history_rot", hr)):
+        if not isinstance(val, (list, np.ndarray, torch.Tensor)):
+            logger.warning(
+                "Alpamayo15: robot_obs['%s'] has unsupported type %s; skipping fusion.", key, type(val).__name__
+            )
+            return None
+        try:
+            n_elems = int(np.asarray(val).size) if not isinstance(val, torch.Tensor) else int(val.numel())
+        except Exception as e:
+            logger.warning("Alpamayo15: robot_obs['%s'] is not array-like (%s); skipping fusion.", key, e)
+            return None
+        if n_elems > _ROBOT_OBS_MAX_ELEMS:
+            logger.warning(
+                "Alpamayo15: robot_obs['%s'] has %d elements (> %d cap); skipping fusion.",
+                key,
+                n_elems,
+                _ROBOT_OBS_MAX_ELEMS,
+            )
+            return None
+    return robot_obs
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -290,7 +336,6 @@ class Alpamayo15ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return
         import json
 
-        import numpy as np
         from vllm.forward_context import get_forward_context
 
         from vllm_omni.model_executor.models.alpamayo.processing import (
@@ -311,8 +356,16 @@ class Alpamayo15ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             # ``robot_obs`` carries ego_history as a dict (Python clients) or a
             # JSON string (HTTP clients, whose vllm_xargs values must be flat).
+            # Validate size + schema before consuming it in the model path.
             robot_obs = ea.get("robot_obs")
             if isinstance(robot_obs, str):
+                if len(robot_obs) > _ROBOT_OBS_MAX_JSON_BYTES:
+                    logger.warning(
+                        "Alpamayo15: robot_obs JSON is %d bytes (> %d cap); skipping fusion.",
+                        len(robot_obs),
+                        _ROBOT_OBS_MAX_JSON_BYTES,
+                    )
+                    continue
                 try:
                     robot_obs = json.loads(robot_obs)
                 except Exception as je:
@@ -320,10 +373,11 @@ class Alpamayo15ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
             if not robot_obs:
                 continue
-            hx = robot_obs.get("ego_history_xyz")
-            hr = robot_obs.get("ego_history_rot")
-            if hx is None or hr is None:
+            robot_obs = _validate_robot_obs(robot_obs)
+            if robot_obs is None:
                 continue
+            hx = robot_obs["ego_history_xyz"]
+            hr = robot_obs["ego_history_rot"]
 
             lo, hi = qsl[i], qsl[i + 1]
             req_slice = input_ids[lo:hi]

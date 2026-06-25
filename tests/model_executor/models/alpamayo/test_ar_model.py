@@ -19,7 +19,10 @@ from vllm_omni.model_executor.models.alpamayo.alpamayo import (
     Alpamayo15ForConditionalGeneration as AlpamayoConditionalGeneration,
 )
 
-_MODEL_15 = "/data/models/Alpamayo-1.5-10B"
+# Real-checkpoint path for the (skipped-unless-present) partition test. Override
+# with ALPAMAYO_MODEL when the weights live elsewhere; the default is the
+# canonical local mount. The skipif guard keeps this no-op in CI.
+_MODEL_15 = os.environ.get("ALPAMAYO_MODEL", "/data/models/Alpamayo-1.5-10B")
 
 
 # --------------------------------------------------------------------------- #
@@ -53,6 +56,35 @@ def test_traj_logit_mask_handles_none_and_oversized_bounds():
     out = AlpamayoConditionalGeneration._apply_traj_logit_mask(logits, 90, 9999)
     assert torch.isneginf(out[:, 90:]).all()
     assert out[:, :90].eq(0).all()
+
+
+# --------------------------------------------------------------------------- #
+# robot_obs validation (request-supplied payload guard)
+# --------------------------------------------------------------------------- #
+def test_validate_robot_obs_accepts_well_formed():
+    from vllm_omni.model_executor.models.alpamayo.alpamayo import _validate_robot_obs
+
+    ok = {
+        "ego_history_xyz": [[1.0, 2.0, 3.0]],
+        "ego_history_rot": [[[1, 0, 0], [0, 1, 0], [0, 0, 1]]],
+    }
+    assert _validate_robot_obs(ok) is ok
+    # tensors are also accepted
+    tens = {"ego_history_xyz": torch.zeros(1, 4, 3), "ego_history_rot": torch.zeros(1, 4, 3, 3)}
+    assert _validate_robot_obs(tens) is tens
+
+
+def test_validate_robot_obs_rejects_malformed():
+    from vllm_omni.model_executor.models.alpamayo.alpamayo import (
+        _ROBOT_OBS_MAX_ELEMS,
+        _validate_robot_obs,
+    )
+
+    assert _validate_robot_obs("not-a-dict") is None
+    assert _validate_robot_obs({"ego_history_xyz": [[1, 2, 3]]}) is None  # missing rot
+    assert _validate_robot_obs({"ego_history_xyz": 5, "ego_history_rot": 6}) is None  # wrong type
+    oversized = {"ego_history_xyz": list(range(_ROBOT_OBS_MAX_ELEMS + 1)), "ego_history_rot": [1]}
+    assert _validate_robot_obs(oversized) is None  # over element cap
 
 
 # --------------------------------------------------------------------------- #
