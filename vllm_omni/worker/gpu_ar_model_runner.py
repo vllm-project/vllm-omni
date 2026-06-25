@@ -1649,7 +1649,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                     pooler_output.append(flatten_payload(payload))
 
-        pooler_inter, pooler_client = partition_payload_list(pooler_output or [])
+        pooler_output = pooler_output or []
+        if self._async_chunk:
+            pooler_inter, pooler_client = partition_payload_list(pooler_output)
+        else:
+            pooler_inter, pooler_client = None, pooler_output
 
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
