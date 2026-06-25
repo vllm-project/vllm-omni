@@ -2500,10 +2500,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             sample_rate = int(sr_raw)
 
+        audio_params = getattr(request, "audio", None)
+        if isinstance(audio_params, dict):
+            audio_format = audio_params.get("format", "wav")
+        else:
+            audio_format = "wav"
+        if audio_format == "pcm16":
+            audio_format = "pcm"
+
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
             sample_rate=sample_rate,
-            response_format="wav",
+            response_format=audio_format,
             speed=1.0,
             base64_encode=True,
         )

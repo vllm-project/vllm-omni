@@ -59,9 +59,22 @@ class AudioMixin:
 
         soundfile_format, media_type, kwargs = supported_formats[response_format]
 
-        with BytesIO() as buffer:
-            soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
-            audio_data = buffer.getvalue()
+        try:
+            with BytesIO() as buffer:
+                soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
+                audio_data = buffer.getvalue()
+        except Exception:
+            if response_format == "wav":
+                raise
+            logger.warning(
+                "Failed to encode audio as '%s' (libsndfile may lack codec support), falling back to 'wav'.",
+                response_format,
+            )
+            response_format = "wav"
+            soundfile_format, media_type, kwargs = supported_formats["wav"]
+            with BytesIO() as buffer:
+                soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
+                audio_data = buffer.getvalue()
 
         if base64_encode:
             import base64
