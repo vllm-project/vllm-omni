@@ -146,7 +146,11 @@ class OrchestratorMonitor:
             self._roll_window(now_mono)
 
     def _roll_window(self, now_mono: float) -> None:
-        sampled = self._replica_sampler()
+        try:
+            sampled = self._replica_sampler()
+        except Exception:
+            logger.exception("[OrchestratorMonitor] replica sampling failed")
+            sampled = {}
         self._duration_s.append(max(now_mono - self._window_start_mono, 1e-9))
         self._loop_idle_buf.append(self._loop_idle)
         self._loop_active_buf.append(self._loop_active)

@@ -77,6 +77,16 @@ def test_register_replica_backfills_prior_windows(tmp_path, monkeypatch):
     assert series["inflight"] == [0, 0]
 
 
+def test_note_loop_survives_sampler_failure():
+    def bad_sampler() -> dict[str, tuple[int, int]]:
+        raise RuntimeError("sampler failed")
+
+    monitor = OrchestratorMonitor(replica_sampler=bad_sampler)
+    monitor.register_replica(0, 0)
+    monitor.note_loop(idle=True)
+    monitor.flush()
+
+
 def test_flush_is_idempotent(tmp_path, monkeypatch):
     out_path = tmp_path / "orch_monitor.json"
     monkeypatch.setenv("VLLM_OMNI_ORCH_MONITOR_PATH", str(out_path))
