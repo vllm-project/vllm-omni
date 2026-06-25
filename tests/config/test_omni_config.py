@@ -39,6 +39,8 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
 
