@@ -17,7 +17,7 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
-from vllm_omni.diffusion.memory.base import MemoryObject
+from vllm_omni.experimental.world_models.memory.base import MemoryObject
 
 logger = logging.getLogger(__name__)
 

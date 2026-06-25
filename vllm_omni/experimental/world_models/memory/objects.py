@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.memory.base import MemoryObject
+from vllm_omni.experimental.world_models.memory.base import MemoryObject
 
 
 class PagedKV(MemoryObject):

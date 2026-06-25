@@ -14,12 +14,12 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_omni.diffusion.memory import SessionMemoryManager
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import (
     FRAMES_PER_CHUNK,
     DreamZeroState,
 )
-from vllm_omni.diffusion.models.dreamzero.state_dreamzero_adapter import DreamZeroStateAdapter
+from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
+from vllm_omni.experimental.world_models.memory import SessionMemoryManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

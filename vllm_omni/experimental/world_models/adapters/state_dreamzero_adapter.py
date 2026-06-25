@@ -27,10 +27,14 @@ from typing import cast
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.memory.base import MemoryObject
-from vllm_omni.diffusion.memory.manager import SessionMemoryManager
-from vllm_omni.diffusion.memory.objects import EncodeOnceKV, LatentBuffer, PagedKV
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import FRAMES_PER_CHUNK
+from vllm_omni.experimental.world_models.memory.base import MemoryObject
+from vllm_omni.experimental.world_models.memory.manager import SessionMemoryManager
+from vllm_omni.experimental.world_models.memory.objects import (
+    EncodeOnceKV,
+    LatentBuffer,
+    PagedKV,
+)
 
 logger = logging.getLogger(__name__)
 
