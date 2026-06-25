@@ -11,6 +11,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from client_schedule import (
+    CAMERA_FILES,
+    DEFAULT_NUM_AR_CHUNKS,
+    build_ar_observations,
+)
 from PIL import Image
 
 from vllm_omni import Omni
@@ -20,13 +25,6 @@ from vllm_omni.outputs import OmniRequestOutput
 WORKER_EXTENSION = "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
 ASSET_REPO_ID = "YangshenDeng/vllm-omni-dreamzero-assets"
 DEFAULT_SESSION_PREFIX = "dreamzero-export"
-RELATIVE_OFFSETS = [-23, -16, -8, 0]
-ACTION_HORIZON = 24
-CAMERA_FILES = {
-    "observation/exterior_image_0_left": "exterior_image_1_left.mp4",
-    "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
-    "observation/wrist_image_left": "wrist_image_left.mp4",
-}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -49,6 +47,17 @@ def _parse_args() -> argparse.Namespace:
         default="Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan",
     )
     parser.add_argument("--session-id", default=None)
+    parser.add_argument(
+        "--num-chunks",
+        type=int,
+        default=DEFAULT_NUM_AR_CHUNKS,
+        help="Number of 4-frame chunks to send after the initial frame (default: 15).",
+    )
+    parser.add_argument(
+        "--repeat-chunk-observations",
+        action="store_true",
+        help="Repeat the last valid chunk observation when bundled assets run out of frames.",
+    )
     parser.add_argument("--save-input-video", action="store_true")
     parser.add_argument("--save-gif", action="store_true")
     parser.add_argument("--save-actions", action="store_true")
@@ -84,57 +93,25 @@ def _load_camera_frames(video_dir: Path) -> dict[str, np.ndarray]:
     return camera_frames
 
 
-def _build_frame_schedule(total_frames: int, num_chunks: int) -> list[list[int]]:
-    chunks: list[list[int]] = []
-    current_frame = 23
-    for _ in range(num_chunks):
-        indices = [max(current_frame + offset, 0) for offset in RELATIVE_OFFSETS]
-        if indices[-1] >= total_frames:
-            break
-        chunks.append(indices)
-        current_frame += ACTION_HORIZON
-    return chunks
-
-
-def _make_obs_from_video(
-    camera_frames: dict[str, np.ndarray],
-    frame_indices: list[int],
-    *,
+def _build_observations(
+    video_dir: Path,
     prompt: str,
     session_id: str,
-) -> dict:
-    obs: dict = {}
-    for camera_key, all_frames in camera_frames.items():
-        selected = all_frames[frame_indices]
-        obs[camera_key] = selected[0] if len(frame_indices) == 1 else selected
-
-    obs["observation/joint_position"] = np.zeros(7, dtype=np.float32)
-    obs["observation/cartesian_position"] = np.zeros(6, dtype=np.float32)
-    obs["observation/gripper_position"] = np.zeros(1, dtype=np.float32)
-    obs["prompt"] = prompt
-    obs["session_id"] = session_id
-    return obs
-
-
-def _build_observations(video_dir: Path, prompt: str, session_id: str) -> tuple[dict[str, np.ndarray], list[dict]]:
+    *,
+    num_chunks: int,
+    repeat_chunk_observations: bool,
+) -> tuple[dict[str, np.ndarray], list[dict]]:
     camera_frames = _load_camera_frames(video_dir)
-    total_frames = min(frames.shape[0] for frames in camera_frames.values())
-    chunks = _build_frame_schedule(total_frames, 1)
-    observations = [
-        _make_obs_from_video(camera_frames, [0], prompt=prompt, session_id=session_id),
-    ]
-    if chunks:
-        observations.append(
-            _make_obs_from_video(
-                camera_frames,
-                chunks[0],
-                prompt=prompt,
-                session_id=session_id,
-            )
-        )
+    observations = build_ar_observations(
+        camera_frames,
+        prompt=prompt,
+        session_id=session_id,
+        num_chunks=num_chunks,
+        repeat_chunk_observations=repeat_chunk_observations,
+    )
     if len(observations) < 2:
-        raise RuntimeError("Need at least two DreamZero example observations to export a prediction video.")
-    return camera_frames, observations[:2]
+        raise RuntimeError("Need at least two DreamZero observations to export a prediction video.")
+    return camera_frames, observations
 
 
 def _extract_latents(output: OmniRequestOutput) -> torch.Tensor:
@@ -229,6 +206,26 @@ def _run_generation(
     return omni, outputs
 
 
+def _decode_accumulated_with_worker(omni: Omni, session_id: str) -> np.ndarray:
+    """Decode server-side accumulated latents when the pipeline supports it."""
+    stage_client = omni.engine.stage_clients[0]
+    engine = getattr(stage_client, "_engine", None)
+    if engine is None:
+        raise RuntimeError("DreamZero export requires inline diffusion stage access.")
+
+    decoded = engine.executor.collective_rpc(
+        "decode_accumulated_video_latents_to_uint8",
+        args=(session_id,),
+        unique_reply_rank=0,
+        exec_all_ranks=True,
+    )
+    if isinstance(decoded, torch.Tensor):
+        decoded = decoded.numpy()
+    if not isinstance(decoded, np.ndarray):
+        raise TypeError(f"Unexpected decoded output type: {type(decoded)!r}")
+    return decoded
+
+
 def _decode_with_worker(omni: Omni, full_latents: torch.Tensor) -> np.ndarray:
     stage_client = omni.engine.stage_clients[0]
     engine = getattr(stage_client, "_engine", None)
@@ -248,6 +245,15 @@ def _decode_with_worker(omni: Omni, full_latents: torch.Tensor) -> np.ndarray:
     return decoded
 
 
+def _decode_video(omni: Omni, session_id: str, outputs: list[OmniRequestOutput]) -> np.ndarray:
+    """Decode full AR rollout by concatenating per-step latents from all outputs."""
+    latent_steps = [_extract_latents(output) for output in outputs]
+    latent_t = [step.shape[2] for step in latent_steps]
+    print(f"Decoding {len(latent_steps)} latent steps, latent_t={latent_t}, total_t={sum(latent_t)}")
+    full_latents = torch.cat(latent_steps, dim=2)
+    return _decode_with_worker(omni, full_latents)
+
+
 def main() -> None:
     args = _parse_args()
     session_id = args.session_id or f"{DEFAULT_SESSION_PREFIX}-{uuid.uuid4()}"
@@ -256,6 +262,12 @@ def main() -> None:
         video_dir=args.video_dir,
         prompt=args.prompt,
         session_id=session_id,
+        num_chunks=args.num_chunks,
+        repeat_chunk_observations=args.repeat_chunk_observations,
+    )
+    print(
+        f"Running {len(observations)} inferences "
+        f"(1 initial + {len(observations) - 1} chunks; requested {args.num_chunks} post-initial chunks)"
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -273,17 +285,19 @@ def main() -> None:
             deploy_config_path=args.deploy_config,
             observations=observations,
         )
-        latent_steps = [_extract_latents(output) for output in outputs]
-        full_latents = torch.cat(latent_steps, dim=2)
-        frames = _decode_with_worker(omni, full_latents)
+        frames = _decode_video(omni, session_id, outputs)
     finally:
         if omni is not None:
             omni.close()
 
+    expected_frames = 8 * len(observations) + 1
     mp4_path = args.output_dir / f"{args.output_stem}.mp4"
 
     _write_mp4(mp4_path, frames, fps=args.fps)
-    print(f"SAVED_MP4={mp4_path}")
+    print(
+        f"SAVED_MP4={mp4_path} frames={len(frames)} "
+        f"expected≈{expected_frames} duration≈{len(frames) / max(args.fps, 1):.1f}s"
+    )
 
     if args.save_gif:
         gif_path = args.output_dir / f"{args.output_stem}.gif"
@@ -294,8 +308,10 @@ def main() -> None:
         npz_path = args.output_dir / f"{args.output_stem}_actions.npz"
         np.savez(
             npz_path,
-            step0=np.asarray(outputs[0].multimodal_output.get("actions")),
-            step1=np.asarray(outputs[1].multimodal_output.get("actions")),
+            **{
+                f"step{index}": np.asarray(output.multimodal_output.get("actions"))
+                for index, output in enumerate(outputs)
+            },
         )
         print(f"SAVED_ACTIONS={npz_path}")
 

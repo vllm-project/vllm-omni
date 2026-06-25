@@ -53,6 +53,32 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    # Step-Audio2 models
+    "StepAudio2ForCausalLM": (
+        "step_audio2",
+        "step_audio2",
+        "StepAudio2ForConditionalGeneration",
+    ),
+    "StepAudio2ForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2",
+        "StepAudio2ForConditionalGeneration",
+    ),
+    "StepAudio2ThinkerForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2_thinker",
+        "StepAudio2ThinkerForConditionalGeneration",
+    ),
+    "StepAudio2Token2WavModel": (
+        "step_audio2",
+        "step_audio2_token2wav",
+        "StepAudio2Token2WavForConditionalGeneration",
+    ),
+    "StepAudio2Token2WavForConditionalGeneration": (
+        "step_audio2",
+        "step_audio2_token2wav",
+        "StepAudio2Token2WavForConditionalGeneration",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",
@@ -155,6 +181,22 @@ _OMNI_MODELS = {
         "mimo_audio",
         "mimo_audio_code2wav",
         "MiMoAudioToken2WavForConditionalGenerationVLLM",
+    ),
+    ## ming-tts
+    "MingTTSForConditionalGeneration": (
+        "ming_tts",
+        "ming_tts",
+        "MingTTSForConditionalGeneration",
+    ),
+    "MingLLMModel": (
+        "ming_tts",
+        "ming_tts_llm",
+        "MingLLMModel",
+    ),
+    "MingAudioVAEModel": (
+        "ming_tts",
+        "ming_tts_audio_vae",
+        "MingAudioVAEModel",
     ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
@@ -263,6 +305,17 @@ _OMNI_MODELS = {
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
     ),
+    ## IndexTTS2
+    "IndexTTS2TalkerForConditionalGeneration": (
+        "indextts2",
+        "indextts2_talker",
+        "IndexTTS2TalkerForConditionalGeneration",
+    ),
+    "IndexTTS2S2MelDecoder": (
+        "indextts2",
+        "indextts2_s2mel_decoder",
+        "IndexTTS2S2MelDecoder",
+    ),
     ## Ming-flash-omni-2.0
     "MingFlashOmniForConditionalGeneration": (
         "ming_flash_omni",
@@ -300,6 +353,11 @@ _OMNI_MODELS = {
         "minicpmo_4_5",
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
+    ),
+    "AuraQwen3VLForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_vl",
+        "AuraQwen3VLForConditionalGeneration",
     ),
 }
 

@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2, or HunyuanVideo-1.5.
+Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2, HunyuanVideo-1.5, or Wan2.1 VACE.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
 - HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
+- Wan2.1 VACE: first/last-frame, inpainting, and reference conditioning
 
 Usage:
     # Wan I2V-A14B (MoE)
@@ -30,9 +31,16 @@ Usage:
     python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
         --image input.jpg --prompt "A cat playing with yarn" \
         --flow-shift 5.0 --guidance-scale 6.0
+
+    # Cosmos3 I2V (image conditioning)
+    python image_to_video.py --model nvidia/Cosmos3-Nano \
+        --image input.jpg --prompt "The scene comes to life with smooth, natural motion." \
+        --num-frames 189 --num-inference-steps 35 --guidance-scale 6.0 --fps 24 \
+        --extra-body '{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false}'
 """
 
 import argparse
+import functools
 import json
 import time
 from pathlib import Path
@@ -43,39 +51,59 @@ import PIL.Image
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import (
+    build_image_to_video_prompt,
+    get_extra_body_params,
+    get_model_class_name,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 
-def parse_profiler_config(value: str) -> dict[str, Any]:
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
     try:
         config = json.loads(value)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
     if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
     return config
 
 
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video from an image (Wan2.2, LTX2, HunyuanVideo-1.5).")
+    parser = argparse.ArgumentParser(
+        description="Generate a video from one or more images (Wan2.2, LTX2, HunyuanVideo-1.5, or Wan2.1 VACE)."
+    )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers I2V model ID or local path (Wan2.2 or HunyuanVideo-1.5).",
+        help="Diffusers I2V model ID or local path (Wan2.2, HunyuanVideo-1.5, or Wan2.1 VACE).",
     )
     parser.add_argument(
         "--model-class-name",
         default=None,
         help="Override model class name (e.g., LTX2ImageToVideoPipeline).",
     )
-    parser.add_argument("--image", required=True, help="Path to input image.")
+    parser.add_argument("--image", help="Path to the first-frame or source image.")
+    parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
+    parser.add_argument("--mask-image", help="Path to an inpainting mask (used by models such as VACE).")
+    parser.add_argument(
+        "--reference-image",
+        action="append",
+        default=None,
+        help="Path to a reference image. Repeat to provide multiple references.",
+    )
     parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG scale.")
+    parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
         "--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise (MoE only)."
     )
@@ -83,8 +111,10 @@ def parse_args() -> argparse.Namespace:
         "--height", type=int, default=None, help="Video height (auto-calculated from image if not set)."
     )
     parser.add_argument("--width", type=int, default=None, help="Video width (auto-calculated from image if not set).")
-    parser.add_argument("--num-frames", type=int, default=81, help="Number of frames.")
-    parser.add_argument("--num-inference-steps", type=int, default=50, help="Sampling steps.")
+    parser.add_argument("--num-frames", type=int, default=None, help="Number of frames. Default: model-specific.")
+    parser.add_argument(
+        "--num-inference-steps", type=int, default=None, help="Sampling steps. Default: model-specific."
+    )
     parser.add_argument("--boundary-ratio", type=float, default=0.875, help="Boundary split ratio for MoE models.")
     parser.add_argument(
         "--frame-rate",
@@ -93,7 +123,10 @@ def parse_args() -> argparse.Namespace:
         help="Optional generation frame rate (used by models like LTX2). Defaults to --fps.",
     )
     parser.add_argument(
-        "--flow-shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
+        "--flow-shift",
+        type=float,
+        default=None,
+        help="Scheduler flow_shift. Default: model-specific (Wan 5.0, Cosmos3 10.0).",
     )
     parser.add_argument(
         "--sample-solver",
@@ -244,6 +277,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
+    parser.add_argument(
+        "--extra-body",
+        type=functools.partial(parse_json_object, flag_name="--extra-body"),
+        default=None,
+        help=(
+            "Model-specific generation params as a JSON object. Keys are filtered "
+            "against the model's declared extra_body_params (see vllm_omni/model_extras), "
+            "so unknown keys for the chosen model are silently dropped. "
+            'Cosmos3 V2V example: \'{"condition_frame_indexes_vision": [0, 1], '
+            '"condition_video_keep": "first", "flow_shift": 10.0, '
+            '"max_sequence_length": 4096, "guardrails": false}\'.'
+        ),
+    )
     return parser.parse_args()
 
 
@@ -267,31 +313,63 @@ def main():
     model_name = str(args.model).lower() if args.model is not None else ""
     model_class_name = args.model_class_name
     is_ltx2 = "ltx2" in model_name or (model_class_name and "ltx2" in model_class_name.lower())
+    is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
     if model_class_name is None and is_ltx2:
         model_class_name = "LTX2ImageToVideoPipeline"
 
-    # Load input image
-    image = PIL.Image.open(args.image).convert("RGB")
+    image = PIL.Image.open(args.image).convert("RGB") if args.image else None
+    last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
+    mask_image = PIL.Image.open(args.mask_image).convert("L") if args.mask_image else None
+    reference_images = (
+        [PIL.Image.open(path).convert("RGB") for path in args.reference_image] if args.reference_image else None
+    )
+    dimension_image = image or last_image or (reference_images[0] if reference_images else None)
+    if dimension_image is None:
+        raise ValueError("Provide --image, --last-image, or at least one --reference-image.")
 
-    fps = args.fps if args.fps is not None else (24 if is_ltx2 else 16)
+    # Per-model generation defaults, applied only when the matching flag is omitted.
+    # Cosmos3 would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
+    if is_cosmos:
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            6.0,
+            189,
+            35,
+            10.0,
+            1280 * 720,
+            16,
+        )
+    elif is_ltx2:
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 24, 4.0, 121, 40, 5.0, 512 * 768, 32
+    else:  # Wan2.2 / HunyuanVideo-1.5
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 16, 5.0, 81, 50, 5.0, 480 * 832, 16
+
+    fps = args.fps if args.fps is not None else d_fps
     frame_rate = args.frame_rate if args.frame_rate is not None else float(fps)
-    guidance_scale = args.guidance_scale if args.guidance_scale is not None else (4.0 if is_ltx2 else 5.0)
-    num_frames = args.num_frames if args.num_frames is not None else (121 if is_ltx2 else 81)
-    num_inference_steps = args.num_inference_steps if args.num_inference_steps is not None else (40 if is_ltx2 else 50)
+    guidance_scale = args.guidance_scale if args.guidance_scale is not None else d_guidance
+    num_frames = args.num_frames if args.num_frames is not None else d_num_frames
+    num_inference_steps = args.num_inference_steps if args.num_inference_steps is not None else d_steps
+    flow_shift = args.flow_shift if args.flow_shift is not None else d_flow_shift
 
-    # Calculate dimensions if not provided
+    # Calculate dimensions if not provided (model-aware max area).
     height = args.height
     width = args.width
     if height is None or width is None:
-        # Default to 480P area for Wan2.2 I2V, 512x768 area for LTX2
-        max_area = 512 * 768 if is_ltx2 else 480 * 832
-        mod_value = 32 if is_ltx2 else 16
-        calc_height, calc_width = calculate_dimensions(image, max_area=max_area, mod_value=mod_value)
+        calc_height, calc_width = calculate_dimensions(dimension_image, max_area=d_max_area, mod_value=d_mod)
         height = height or calc_height
         width = width or calc_width
 
-    # Resize image to target dimensions
-    image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+    media_inputs: dict[str, Any] = {}
+    if image is not None:
+        media_inputs["image"] = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+    if last_image is not None:
+        media_inputs["last_image"] = last_image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+    if mask_image is not None:
+        media_inputs["mask"] = mask_image.resize((width, height), PIL.Image.Resampling.NEAREST)
+    if reference_images is not None:
+        media_inputs["reference_images"] = [
+            reference.resize((width, height), PIL.Image.Resampling.LANCZOS) for reference in reference_images
+        ]
 
     # Configure cache based on backend type
     cache_config = None
@@ -342,7 +420,7 @@ def main():
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
-        flow_shift=args.flow_shift,
+        flow_shift=flow_shift,
         diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
         diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
         diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
@@ -357,7 +435,13 @@ def main():
     )
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
+    model_class_name = get_model_class_name(omni) or model_class_name
+    declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -367,8 +451,8 @@ def main():
     print(f"\n{'=' * 60}")
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
-    print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Frames: {args.num_frames}")
+    print(f"  Inference steps: {num_inference_steps}")
+    print(f"  Frames: {num_frames}")
     print(f"  Solver: {args.sample_solver}")
     print(f"  diffusion_kv_cache_dtype(config): {args.diffusion_kv_cache_dtype}")
     print(f"  diffusion_kv_cache_skip_steps(config): {args.diffusion_kv_cache_skip_steps}")
@@ -381,30 +465,43 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
+    prompt_dict = build_image_to_video_prompt(
+        model_class_name=model_class_name,
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        media_inputs=media_inputs,
+        height=height,
+        width=width,
+        num_frames=num_frames,
+    )
+    sampling_params = OmniDiffusionSamplingParams(
+        height=height,
+        width=width,
+        generator=generator,
+        guidance_scale=guidance_scale,
+        guidance_scale_2=args.guidance_scale_high,
+        boundary_ratio=args.boundary_ratio,
+        num_inference_steps=num_inference_steps,
+        num_frames=num_frames,
+        frame_rate=frame_rate,
+        extra_args={
+            "sample_solver": args.sample_solver,
+            "flow_shift": flow_shift,
+        },
+    )
+
+    # Route model-specific knobs through extra_body, filtered against the model's
+    # declared extra_body_params. Models without a declaration only forward explicit
+    # --extra-body JSON (e.g. Cosmos3 V2V's condition_frame_indexes_vision).
+    extra_body = dict(args.extra_body or {})
+    if declared_extra_body_params:
+        apply_declared_extra_args(sampling_params, declared_extra_body_params, extra_body)
+    elif extra_body:
+        sampling_params.extra_args.update({k: v for k, v in extra_body.items() if v is not None})
+
     generation_start = time.perf_counter()
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
-    frames = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-            "multi_modal_data": {"image": image},
-        },
-        OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            generator=generator,
-            guidance_scale=guidance_scale,
-            guidance_scale_2=args.guidance_scale_high,
-            boundary_ratio=args.boundary_ratio,
-            num_inference_steps=num_inference_steps,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            extra_args={
-                "sample_solver": args.sample_solver,
-                "flow_shift": args.flow_shift,
-            },
-        ),
-    )
+    frames = omni.generate(prompt_dict, sampling_params)
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 

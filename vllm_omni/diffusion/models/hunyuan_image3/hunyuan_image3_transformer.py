@@ -5,11 +5,13 @@ import inspect
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, cast
 
 import numpy as np
 import regex as re
 import torch
+from cache_dit import ForwardPattern
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -58,6 +60,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -460,6 +463,22 @@ class Resolution:
         self.w = self.width = size[1]
         self.r = self.ratio = self.height / self.width
 
+        self.extra_res = set()
+
+    def match(self, width, height) -> tuple[int, int]:
+        if not self.extra_res:
+            return self.w, self.h
+        else:
+            ret_w, ret_h = self.w, self.h
+            target_area = width * height
+            min_area_diff = abs((self.w * self.h) - target_area)
+            for res in self.extra_res:
+                area_diff = abs((res[0] * res[1]) - target_area)
+                if area_diff < min_area_diff:
+                    min_area_diff = area_diff
+                    ret_w, ret_h = res[0], res[1]
+            return (ret_w, ret_h)
+
     def __getitem__(self, idx):
         if idx == 0:
             return self.h
@@ -470,6 +489,19 @@ class Resolution:
 
     def __str__(self):
         return f"{self.h}x{self.w}"
+
+    def __repr__(self) -> str:
+        if not self.extra_res:
+            return "{" + f"{self.h}x{self.w}" + "}"
+        else:
+            ret_str = "{" + f"[{self.h}x{self.w}]"
+            for er in self.extra_res:
+                ret_str = ret_str + f"[{er[0]}x{er[1]}]"
+            ret_str = ret_str + "}"
+            return ret_str
+
+    def append(self, res: "Resolution"):
+        self.extra_res.add((res.w, res.h))
 
 
 # Baked-in extras matching the official model's
@@ -482,6 +514,10 @@ HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
     "1280x720",
     "768x1024",
     "720x1280",
+    "512x512",
+    "640x640",
+    "768x768",
+    "896x896",
 )
 
 
@@ -502,12 +538,17 @@ class ResolutionGroup:
 
         if extra_resolutions is not None:
             for er in extra_resolutions:
-                if not any(r.ratio == er.ratio for r in self.data):
+                for r in self.data:
+                    if r.ratio == er.ratio:
+                        r.append(er)
+                        break
+                else:
                     self.data.append(er)
 
         self.ratio = np.array([x.ratio for x in self.data])
         self.attr = ["" for _ in range(len(self.data))]
         self.prefix_space = 0
+        logger.debug(f"ResolutionGroup: {self}")
 
     def __len__(self):
         return len(self.data)
@@ -523,13 +564,27 @@ class ResolutionGroup:
         res_str += (
             f"\n{prefix}ID: height width   ratio {' ' * max(0, attr_maxlen - 4)}count  h/16 w/16    tokens\n{prefix}"
         )
-        res_str += ("\n" + prefix).join(
-            [
+
+        rows = []
+        for i, x in enumerate(self.data):
+            main_row = (
                 f"{i:2d}: ({x.h:4d}, {x.w:4d})  {self.ratio[i]:.4f}  {self.attr[i]:>{attr_maxlen}s}  "
                 f"({x.h // 16:3d}, {x.w // 16:3d})  {x.h // 16 * x.w // 16:6d}"
-                for i, x in enumerate(self.data)
-            ]
-        )
+            )
+            rows.append(main_row)
+            extra_val = getattr(x, "extra_res", None)
+            if extra_val:
+                for sub_h, sub_w in sorted(list(extra_val)):
+                    sub_ratio = sub_h / sub_w
+                    sub_h16, sub_w16 = sub_h // 16, sub_w // 16
+                    sub_tokens = sub_h16 * sub_w16
+                    sub_row = (
+                        f"    ({sub_h:4d}, {sub_w:4d})  {sub_ratio:.4f}  {' ' * attr_maxlen}  "
+                        f"({sub_h16:3d}, {sub_w16:3d})  {sub_tokens:6d}"
+                    )
+                    rows.append(sub_row)
+
+        res_str += ("\n" + prefix).join(rows)
         res_str += f"\n{prefix_close})"
         return res_str
 
@@ -568,13 +623,20 @@ class ResolutionGroup:
     def get_target_size(self, width, height):
         ratio = height / width
         idx = np.argmin(np.abs(self.ratio - ratio))
-        reso = self.data[idx]
-        return reso.w, reso.h
+        w, h = self.data[idx].match(width, height)
+        return w, h
 
     def get_base_size_and_ratio_index(self, width, height):
         ratio = height / width
         idx = np.argmin(np.abs(self.ratio - ratio))
         return self.base_size, idx
+
+
+@lru_cache(maxsize=4)
+def get_cached_resolution_group(base_size: int) -> ResolutionGroup:
+    extra_res_tuple = tuple(Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS)
+    extra_resolutions = list(extra_res_tuple) if extra_res_tuple else None
+    return ResolutionGroup(base_size=base_size, extra_resolutions=extra_resolutions)
 
 
 class ImageInfo:
@@ -1005,9 +1067,10 @@ class ImageKVCacheManager:
         assert self.image_kv_cache_lens is not None
         if position_ids is not None:
             assert position_ids.shape == (bs, q_len)
-            assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens), (
-                "The first current position must immediately follow each sample's cached prompt KV."
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens.to(position_ids.device)), (
+                    "The first current position must immediately follow each sample's cached prompt KV."
+                )
         new_key = torch.cat([cached_key, key], dim=1)
         new_value = torch.cat([cached_value, value], dim=1)
         return new_key.contiguous(), new_value.contiguous()
@@ -1406,10 +1469,7 @@ class HunyuanImage3ImageProcessor:
     def __init__(self, config):
         self.config = config
 
-        self.reso_group = ResolutionGroup(
-            base_size=config.image_base_size,
-            extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
-        )
+        self.reso_group = get_cached_resolution_group(base_size=config.image_base_size)
         self.vae_processor = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -1446,6 +1506,7 @@ class HunyuanImage3ImageProcessor:
         token_height = image_height // (self.config.vae_downsample_factor[0] * self.config.patch_size)
         token_width = image_width // (self.config.vae_downsample_factor[1] * self.config.patch_size)
         base_size, ratio_idx = self.reso_group.get_base_size_and_ratio_index(image_size[1], image_size[0])
+
         image_info = ImageInfo(
             image_type="gen_image",
             image_width=image_width,
@@ -1959,6 +2020,13 @@ class HunyuanImagePostprocessor(nn.Module):
 
 
 class HunyuanImage3Model(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_4,
+        },
+        check_forward_pattern=False,
+    )
+
     _sp_plan = {
         # Split custom_pos_emb tuple elements (cos, sin) at model forward input
         "pre_processor": {
@@ -2148,7 +2216,6 @@ class HunyuanImage3Model(nn.Module):
             return tensor[offset * units : offset * units + units]
 
         for name, loaded_weight in weights:
-            # print(f"Loading weight name: {name}, tp_rank: {tp_rank}", flush=True)
             if contains_unexpected_keyword(name, unexpected_keywords):
                 logger.warning("Skipping unexpected weight name: %s", name)
                 continue

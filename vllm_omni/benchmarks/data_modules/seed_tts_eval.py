@@ -33,7 +33,7 @@ https://github.com/zhaochenyang20/seed-tts-eval):
 
 Enable with ``SEED_TTS_WER_EVAL=1`` or ``--seed-tts-wer-eval``. Install optional deps::
 
-    pip install 'vllm-omni[seed-tts-eval]'
+    pip install 'vllm-omni[dev]'
 
 Env: ``SEED_TTS_EVAL_DEVICE`` (e.g. ``cuda:0``, ``cpu``); ``SEED_TTS_HF_WHISPER_MODEL``
 defaults to ``openai/whisper-large-v3`` (override for debugging only).
@@ -446,7 +446,7 @@ def _missing_deps_message(lang: str) -> str | None:
         import jiwer  # noqa: F401
         from zhon.hanzi import punctuation  # noqa: F401
     except ImportError as e:
-        return f"Seed-TTS WER eval needs jiwer and zhon ({e!s}). Install: pip install 'vllm-omni[seed-tts-eval]'"
+        return f"Seed-TTS WER eval needs jiwer and zhon ({e!s}). Install: pip install 'vllm-omni[dev]'"
     try:
         import scipy.signal  # noqa: F401
         import soundfile  # noqa: F401
@@ -457,13 +457,13 @@ def _missing_deps_message(lang: str) -> str | None:
             import torch  # noqa: F401
             from transformers import WhisperForConditionalGeneration  # noqa: F401
         except ImportError as e:
-            return f"English WER needs torch and transformers ({e!s}). Install: pip install 'vllm-omni[seed-tts-eval]'"
+            return f"English WER needs torch and transformers ({e!s}). Install: pip install 'vllm-omni[dev]'"
     else:
         try:
             import zhconv  # noqa: F401
             from funasr import AutoModel  # noqa: F401
         except ImportError as e:
-            return f"Chinese WER needs funasr and zhconv ({e!s}). Install: pip install 'vllm-omni[seed-tts-eval]'"
+            return f"Chinese WER needs funasr and zhconv ({e!s}). Install: pip install 'vllm-omni[dev]'"
     return None
 
 

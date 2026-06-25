@@ -57,8 +57,9 @@ vLLM-Omni is flexible and easy to use with:
 
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
-- Omni-modality models (e.g. Qwen-Omni)
-- Multi-modality generation models (e.g. Qwen-Image)
+- **Omni-modality models** (e.g. Qwen3-Omni, Cosmos, HunyuanImage, BAGEL)
+- **TTS models** (e.g. Qwen3-TTS, VoxCPM2, Ming-Omni-TTS, CosyVoice3)
+- **Diffusion models** — image, video, and audio generation (e.g. Qwen-Image, Wan2.2, FLUX)
 
 ## Getting Started
 
@@ -67,6 +68,7 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 - [Installation](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)
 - [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
 - [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
+- [Deployment Recipes](https://recipes.vllm.ai) for vLLM-Omni model serving
 
 ## Contributing
 

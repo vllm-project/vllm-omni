@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -11,6 +11,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
@@ -19,7 +20,7 @@ from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
 
-class MammothModa2DiTPipeline(nn.Module):
+class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
@@ -27,6 +28,10 @@ class MammothModa2DiTPipeline(nn.Module):
     and outputs image tensors via diffusion transformer + VAE decode.
 
     """
+
+    _dit_modules: ClassVar[list[str]] = ["gen_transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["gen_image_condition_refiner"]
+    _vae_modules: ClassVar[list[str]] = ["gen_vae"]
 
     have_multimodal_outputs = True
 

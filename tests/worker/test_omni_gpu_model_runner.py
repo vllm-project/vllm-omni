@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -22,6 +22,7 @@ class DummyInputBatch:
 
     def __init__(self, req_ids):
         self.req_ids = req_ids
+        self.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
 
 
 class DummyReqState:
@@ -95,10 +96,42 @@ class CaptureTalkerMTP(torch.nn.Module):
         return req_embeds, codes
 
 
+class StrictMRoPEModel:
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        raise NotImplementedError
+
+
+class FlexibleMRoPEModel:
+    def get_mrope_input_positions(self, input_tokens, mm_features=None, **kwargs):
+        raise NotImplementedError
+
+
 @contextmanager
 def _noop_forward_context(*args, **kwargs):
     """A no-op context manager to replace vLLM forward context in CPU tests."""
     yield
+
+
+def test_filter_mrope_kwargs_for_strict_model_signature():
+    kwargs = {
+        "mm_features": ["audio"],
+        "hf_config": object(),
+        "image_grid_thw": [],
+    }
+
+    assert _filter_mrope_kwargs_for_model(StrictMRoPEModel(), kwargs) == {
+        "mm_features": ["audio"],
+    }
+
+
+def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
+    kwargs = {
+        "mm_features": ["video"],
+        "hf_config": object(),
+        "video_grid_thw": [[1, 2, 3]],
+    }
+
+    assert _filter_mrope_kwargs_for_model(FlexibleMRoPEModel(), kwargs) is kwargs
 
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):

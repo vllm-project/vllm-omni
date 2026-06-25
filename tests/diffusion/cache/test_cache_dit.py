@@ -5,6 +5,7 @@
 Model specific tests for CacheDiT enablement.
 """
 
+import sys
 from unittest.mock import Mock, patch
 
 import pytest
@@ -12,36 +13,49 @@ import torch
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
 
 import vllm_omni.diffusion.cache.cache_dit_backend as cd_backend
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig, CacheDiTBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
+from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
+from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
 from vllm_omni.platforms import current_omni_platform
 
+# NOTE: We patch DreamID Omni's modules here with mocks so that we can import and inspect
+# the class even though the dependency may not be set up correctly; this is ok for these
+# tests because we just inspect it and never initialize the model.
+for mod in ("dreamid_omni", "dreamid_omni.modules", "dreamid_omni.modules.model"):
+    sys.modules.setdefault(mod, Mock())
+# isort: split
+from vllm_omni.diffusion.models.dreamid_omni.fusion import FusionModel as DreamIdOmniModel  # noqa: E402
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-SEPARATE_CFG_ENABLERS = [
-    cd_backend.enable_cache_for_dreamid_omni,
-    cd_backend.enable_cache_for_ltx2,
-    cd_backend.enable_cache_for_helios,
-    cd_backend.enable_cache_for_wan22,
-    cd_backend.enable_cache_for_longcat_image,
-    cd_backend.enable_cache_for_cosmos3,
+SEPARATE_CFG_TRANSFORMERS = [
+    DreamIdOmniModel,
+    LTX2VideoTransformer3DModel,
+    HeliosTransformer3DModel,
+    LongCatImageTransformer2DModel,
+    Cosmos3VFMTransformer,
 ]
 
 SAMPLE_CACHE_CONFIG = DiffusionCacheConfig()
 
 
-@pytest.mark.parametrize("enabler", SEPARATE_CFG_ENABLERS)
+@pytest.mark.parametrize("transformer_model", SEPARATE_CFG_TRANSFORMERS)
+def test_cache_dit_configs_have_separate_cfg(transformer_model):
+    """Check models with separate CFG set has_separate_cfg=True in their configs."""
+    assert hasattr(transformer_model, "_cache_dit_adapter_config")
+    assert isinstance(transformer_model._cache_dit_adapter_config, CacheDiTAdapterConfig)
+    assert transformer_model._cache_dit_adapter_config.has_separate_cfg is True
+
+
 @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
 @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
-def test_separate_cfg(mock_cache_dit, mock_block_adapter, enabler):
-    """Ensure that custom enablers for models with separate CFG pass
-    the param through to cache_dit correctly.
-
-    Regression test for: https://github.com/vllm-project/vllm-omni/pull/2860
-    """
+def test_separate_wan22_custom_enabler_has_separate_cfg(mock_cache_dit, mock_block_adapter):
+    """Ensure that Wan22, which has a custom enabler, setts custom CFG correctly."""
     mock_pipeline = Mock()
-    enabler(mock_pipeline, SAMPLE_CACHE_CONFIG)
+    cd_backend.enable_cache_for_wan22(mock_pipeline, SAMPLE_CACHE_CONFIG)
 
     mock_cache_dit.enable_cache.assert_called_once()
     adapter_kwargs = mock_block_adapter.call_args.kwargs
@@ -55,6 +69,7 @@ def test_cosmos3_cache_dit_wraps_gen_layers(mock_cache_dit, mock_block_adapter):
     mock_pipeline = Mock()
     gen_layers = object()
     mock_pipeline.transformer.gen_layers = gen_layers
+    mock_pipeline.transformer._cache_dit_adapter_config = Cosmos3VFMTransformer._cache_dit_adapter_config
 
     cd_backend.enable_cache_for_cosmos3(mock_pipeline, SAMPLE_CACHE_CONFIG)
 

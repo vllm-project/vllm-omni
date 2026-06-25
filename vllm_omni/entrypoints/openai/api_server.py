@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import base64
 import dataclasses
 import io
 import json
@@ -20,7 +19,6 @@ from numbers import Integral
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
-import httpx
 import numpy as np
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
@@ -34,7 +32,6 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http, terminate_if_errored
-from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
@@ -56,10 +53,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
-from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
@@ -71,6 +65,16 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.serve.utils.api_utils import (
+    load_aware_call,
+    process_lora_modules,
+    validate_json_request,
+    with_cancellation,
+)
+from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
@@ -78,13 +82,8 @@ from vllm.entrypoints.speech_to_text.transcription.serving import (
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
-from vllm.entrypoints.utils import (
-    create_error_response,
-    load_aware_call,
-    process_lora_modules,
-    with_cancellation,
-)
 from vllm.logger import init_logger
+from vllm.multimodal.media import MediaConnector
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
@@ -110,6 +109,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
+    ResponseFormat,
 )
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
@@ -126,18 +126,26 @@ from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServin
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage, ReferenceVideo
-from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
+from vllm_omni.entrypoints.openai.serving_video import (
+    OmniOpenAIServingVideo,
+    ReferenceAudio,
+    ReferenceImage,
+    ReferenceVideo,
+)
+from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
-from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
@@ -340,6 +348,38 @@ def _create_engine_error_json_response(
     return JSONResponse(content=payload, status_code=status_code)
 
 
+def _error_response_to_json_response(
+    err: ErrorResponse,
+    *,
+    status_code: HTTPStatus | int | None = None,
+    default_status_code: HTTPStatus | int = HTTPStatus.BAD_REQUEST,
+) -> JSONResponse:
+    resolved_status = int(
+        status_code
+        if status_code is not None
+        else (err.error.code if err.error and err.error.code is not None else default_status_code)
+    )
+    payload = err.model_dump()
+    if err.error:
+        payload["error"]["code"] = resolved_status
+    return JSONResponse(content=payload, status_code=resolved_status)
+
+
+def _create_speech_error_json_response(
+    raw_request: Request,
+    message: str,
+    *,
+    err_type: str = "BadRequestError",
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+) -> JSONResponse:
+    err = base(raw_request).create_error_response(
+        message=message,
+        err_type=err_type,
+        status_code=status_code,
+    )
+    return _error_response_to_json_response(err, status_code=status_code)
+
+
 class _DiffusionServingModels:
     """Minimal OpenAIServingModels implementation for diffusion-only servers.
 
@@ -425,6 +465,15 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
+    # In vllm-omni's multi-process architecture, create_engine_config() runs
+    # in the subprocess (StageEngineCoreProc), not in the API server process.
+    # Propagate reasoning_parser from CLI args into structured_outputs_config
+    # here so that OmniOpenAIServingChat receives the correct value.
+    # (Upstream vLLM does this in EngineArgs.create_engine_config().)
+    if hasattr(args, "reasoning_parser") and args.reasoning_parser:
+        if not args.structured_outputs_config.reasoning_parser:
+            args.structured_outputs_config.reasoning_parser = args.reasoning_parser
+
     # Load logging config for uvicorn if specified
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
@@ -458,6 +507,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        # Start background processes
+        await STORAGE_MANAGER.start()
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -631,6 +683,7 @@ async def build_async_omni_from_stage_config(
     try:
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
+        kwargs.setdefault("log_stats", not args.disable_log_stats)
         async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -719,6 +772,11 @@ async def omni_init_app_state(
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
+            model_name=model_name,
+            stage_configs=diffusion_stage_configs,
+        )
+        state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
+            engine_client=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
         )
@@ -1039,7 +1097,11 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+        engine_client,
+        state.openai_serving_models,
+        request_logger=request_logger,
+        model_name=model_name,
+        forced_aligner_config=build_forced_aligner_config(args),
     )
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
@@ -1054,7 +1116,7 @@ async def omni_init_app_state(
         speech_service=state.openai_serving_speech,
     )
     state.openai_streaming_video = (
-        OmniStreamingVideoHandler(
+        create_streaming_video_handler(
             chat_service=state.openai_serving_chat,
             engine_client=engine_client,
         )
@@ -1176,7 +1238,7 @@ _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
     "/v1/audio/speech",
     dependencies=[Depends(validate_json_request)],
     responses={
-        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
+        HTTPStatus.OK.value: {"content": {"audio/*": {}, "text/event-stream": {}}},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -1207,14 +1269,16 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Speech API",
             )
-        return base_server.create_error_response(message="The model does not support Speech API")
+        err = base_server.create_error_response(
+            message="The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return result
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1243,14 +1307,16 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Speech API",
             )
-        return base_server.create_error_response(message="The model does not support Speech API")
+        err = base_server.create_error_response(
+            message="The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return JSONResponse(content=result.model_dump())
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1281,14 +1347,16 @@ async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_r
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Audio Generate API",
             )
-        return base_server.create_error_response(message="The model does not support Audio Generate API")
+        err = base_server.create_error_response(
+            message="The model does not support Audio Generate API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_audio_generate(request, raw_request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return result
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1318,7 +1386,12 @@ async def list_voices(raw_request: Request):
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     # Get all speakers (both model built-in and uploaded)
     speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
@@ -1350,6 +1423,7 @@ async def list_voices(raw_request: Request):
     responses={
         HTTPStatus.OK.value: {"model": dict},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
@@ -1391,12 +1465,17 @@ async def upload_voice(
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     try:
         if speaker_embedding is not None and audio_sample is not None:
-            return base(raw_request).create_error_response(
-                message="'audio_sample' and 'speaker_embedding' are mutually exclusive"
+            return _create_speech_error_json_response(
+                raw_request, "'audio_sample' and 'speaker_embedding' are mutually exclusive"
             )
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
@@ -1409,23 +1488,29 @@ async def upload_voice(
                 speaker_description=speaker_description,
             )
         else:
-            return base(raw_request).create_error_response(
-                message="Either 'audio_sample' or 'speaker_embedding' must be provided"
+            return _create_speech_error_json_response(
+                raw_request, "Either 'audio_sample' or 'speaker_embedding' must be provided"
             )
 
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
+        return _create_speech_error_json_response(raw_request, str(e))
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
-        return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
+        return _create_speech_error_json_response(
+            raw_request,
+            f"Failed to upload voice: {str(e)}",
+            err_type="InternalServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 @router.delete(
     "/v1/audio/voices/{name}",
     responses={
         HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
@@ -1445,24 +1530,36 @@ async def delete_voice(name: str, raw_request: Request):
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     try:
         # Delete the voice
         success = await handler.delete_voice(name)
         if not success:
-            return JSONResponse(
-                content={"success": False, "error": f"Voice '{name}' not found"},
-                status_code=HTTPStatus.NOT_FOUND.value,
+            return _create_speech_error_json_response(
+                raw_request,
+                f"Voice '{name}' not found",
+                err_type="NotFoundError",
+                status_code=HTTPStatus.NOT_FOUND,
             )
 
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
 
     except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
+        return _create_speech_error_json_response(raw_request, str(e))
     except Exception as e:
         logger.exception(f"Failed to delete voice '{name}': {e}")
-        return base(raw_request).create_error_response(message=f"Failed to delete voice: {str(e)}")
+        return _create_speech_error_json_response(
+            raw_request,
+            f"Failed to delete voice: {str(e)}",
+            err_type="InternalServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 @router.websocket("/v1/audio/speech/stream")
@@ -1496,6 +1593,23 @@ async def streaming_video_chat(websocket: WebSocket):
             {
                 "type": "error",
                 "message": "Streaming video chat is not available",
+            }
+        )
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
+
+
+@router.websocket("/v1/realtime/video")
+async def streaming_video_output(websocket: WebSocket):
+    """WebSocket endpoint for streaming generated video output chunks."""
+    handler = getattr(websocket.app.state, "openai_streaming_video_output", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "Streaming video generation is not available",
             }
         )
         await websocket.close()
@@ -1592,6 +1706,7 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
 @router.post(
     "/v1/images/generations",
     dependencies=[Depends(validate_json_request)],
+    response_model=None,
     responses={
         HTTPStatus.OK.value: {"model": ImageGenerationResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -1600,7 +1715,9 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
     },
 )
 @with_cancellation
-async def generate_images(request: ImageGenerationRequest, raw_request: Request):
+async def generate_images(
+    request: ImageGenerationRequest, raw_request: Request
+) -> ImageGenerationResponse | StreamingResponse:
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
@@ -1792,12 +1909,18 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         }
         if request.size:
             response_kwargs["size"] = size_str
-        return ImageGenerationResponse(**response_kwargs)
+        response = ImageGenerationResponse(**response_kwargs)
+        if request.response_format != ResponseFormat.FILE:
+            return response
+        return response.stream_response()
 
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as e:
+        logger.info("Client error during image generation: %s", e)
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -1914,17 +2037,23 @@ async def edit_images(
         # Match the offline path: RGB normalize when the caller opts into
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
-        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
+        pil_images = await _load_input_images(
+            input_images_list,
+            engine_client.model_config,
+            normalize_rgb=normalize_edit_images_rgb,
+        )
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # Mask role is different (alpha channel matters); never normalize.
-            loaded = await _load_input_images([mask_image], normalize_rgb=False)
+            loaded = await _load_input_images([mask_image], engine_client.model_config, normalize_rgb=False)
             prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
+            loaded = await _load_input_images(
+                [reference_image], engine_client.model_config, normalize_rgb=normalize_edit_images_rgb
+            )
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
@@ -2153,6 +2282,9 @@ async def edit_images(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as e:
+        logger.info("Client error during image edit: %s", e)
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
@@ -2312,7 +2444,8 @@ def _check_max_generated_image_size(
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                f"size of {max_generated_image_size} pixels.",
+                f"size of {max_generated_image_size} pixels. You can reduce the requested size "
+                f"or increase the server's --max-generated-image-size limit.",
             )
     elif resolution is not None:
         # When resolution is set, the output size is resolution * resolution
@@ -2320,7 +2453,8 @@ def _check_max_generated_image_size(
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
-                f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+                f"exceeds the maximum allowed size of {max_generated_image_size} pixels. "
+                f"You can reduce the requested size or increase the server's --max-generated-image-size limit.",
             )
 
 
@@ -2406,41 +2540,41 @@ def _extract_images_from_result(result: Any) -> list[Any]:
 
 async def _load_input_images(
     inputs: list[str],
+    model_config: Any,
     *,
     normalize_rgb: bool = True,
 ) -> list[Image.Image]:
+    """Load images from data URIs, http(s) URLs, file:// URIs, or UploadFiles.
+
+    http(s) and ``file:`` URLs are fetched through vLLM's ``MediaConnector`` which
+    respects ``--allowed-media-domains`` and ``--allowed-local-media-path``
+    to prevent SSRF.
     """
-    convert to PIL.Image.Image list
-    """
+
     if isinstance(inputs, str):
         inputs = [inputs]
+
+    connector = MediaConnector(
+        allowed_local_media_path=model_config.allowed_local_media_path,
+        allowed_media_domains=model_config.allowed_media_domains,
+    )
 
     images: list[Image.Image] = []
 
     for inp in inputs:
-        # 1. URL + base64
-        if isinstance(inp, str) and inp.startswith("data:image"):
+        if isinstance(inp, str):
+            # http(s), data: and file: all handled by MediaConnector
             try:
-                _, b64_data = inp.split(",", 1)
-                image_bytes = base64.b64decode(b64_data)
-                img = Image.open(io.BytesIO(image_bytes))
-                images.append(img)
+                # Use RGBA to preserve alpha for transparent PNG.
+                result = await connector.fetch_image_async(
+                    inp,
+                    image_mode="RGBA",
+                )
+                images.append(result.media)
             except Exception as e:
-                raise ValueError(f"Invalid base64 image: {e}")
-
-        # 2. URL
-        elif isinstance(inp, str) and inp.startswith("http"):
-            async with httpx.AsyncClient(timeout=60) as client:
-                try:
-                    resp = await client.get(inp)
-                    resp.raise_for_status()
-                    img = Image.open(io.BytesIO(resp.content))
-                    images.append(img)
-                except Exception as e:
-                    raise ValueError(f"Failed to download image from URL {inp}: {e}")
-
-        # 3. UploadFile
+                raise ValueError(f"Failed to load image: {e}") from e
         elif hasattr(inp, "file"):
+            # UploadFile
             try:
                 img_data = await inp.read()
                 img = Image.open(io.BytesIO(img_data))
@@ -2653,6 +2787,9 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
         message = str(exc.detail) if exc.detail else str(exc)
         return VideoError(code=exc.status_code, message=message)
 
+    if isinstance(exc, OmniClientError):
+        return VideoError(code=exc.status_code, message=exc.message)
+
     if isinstance(exc, (EngineGenerateError, EngineDeadError)):
         err = create_error_response(exc)
         return VideoError(code=err.error.code, message=err.error.message)
@@ -2663,12 +2800,11 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     )
 
 
-def _cleanup_video(video_id: str, output_path: str | None):
+async def _cleanup_video(video_id: str):
     try:
-        if output_path is not None:
-            os.remove(output_path)
-    except OSError:
-        logger.warning("Failed to cleanup partial video file '%s' for id=%s", output_path, video_id)
+        await STORAGE_MANAGER.delete(video_id)
+    except Exception:
+        logger.warning("Failed to cleanup partial video file '%s'", video_id)
 
 
 async def _run_video_generation_job(
@@ -2677,6 +2813,7 @@ async def _run_video_generation_job(
     video_id: str,
     reference_image: ReferenceImage | None = None,
     reference_video: ReferenceVideo | None = None,
+    reference_audio: ReferenceAudio | None = None,
     app_state: Any | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
@@ -2686,36 +2823,36 @@ async def _run_video_generation_job(
 
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
-    output_path = None
     try:
         video_bytes, stage_durations, peak_memory_mb, action = await handler.generate_video_bytes(
             request,
             video_id,
             reference_image=reference_image,
             reference_video=reference_video,
+            reference_audio=reference_audio,
         )
 
-        file_name = f"{video_id}.{job.file_extension}"
-        output_path = await STORAGE_MANAGER.save(video_bytes, file_name)
-        logger.info("Video request %s persisted %s output file.", video_id, output_path)
+        save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
+        logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
-        await VIDEO_STORE.update_fields(
-            video_id,
-            {
-                "status": VideoGenerationStatus.COMPLETED,
-                "progress": 100,
-                "file_name": file_name,
-                "completed_at": int(time.time()),
-                "inference_time_s": time.perf_counter() - started_at,
-                "stage_durations": stage_durations,
-                "peak_memory_mb": peak_memory_mb,
-                "action": action,
-            },
-        )
+        updated_fields = {
+            "status": VideoGenerationStatus.COMPLETED,
+            "progress": 100,
+            "file_name": f"{video_id}.{job.file_extension}",
+            "completed_at": save_context.created_at,
+            "inference_time_s": time.perf_counter() - started_at,
+            "stage_durations": stage_durations,
+            "peak_memory_mb": peak_memory_mb,
+            "action": action,
+        }
+        if save_context.expires_at is not None:
+            updated_fields["expires_at"] = save_context.expires_at
+
+        await VIDEO_STORE.update_fields(video_id, updated_fields)
     except (EngineGenerateError, EngineDeadError) as exc:
         logger.exception("Video generation failed (engine error) for id=%s", video_id)
 
-        _cleanup_video(video_id, output_path)
+        await _cleanup_video(video_id)
         await VIDEO_STORE.update_fields(
             video_id,
             {
@@ -2735,7 +2872,7 @@ async def _run_video_generation_job(
     except Exception as exc:
         logger.exception("Video generation failed for id=%s", video_id)
 
-        _cleanup_video(video_id, output_path)
+        await _cleanup_video(video_id)
         await VIDEO_STORE.update_fields(
             video_id,
             {
@@ -2746,12 +2883,15 @@ async def _run_video_generation_job(
             },
         )
     except asyncio.CancelledError:
-        _cleanup_video(video_id, output_path)
+        await _cleanup_video(video_id)
         await VIDEO_STORE.pop(video_id)
         raise
+    finally:
+        if reference_audio is not None and os.path.exists(reference_audio.path):
+            os.unlink(reference_audio.path)
 
 
-VIDEO_SYNC_TIMEOUT_S = 600.0
+VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 
 
 async def _parse_video_form(
@@ -2760,6 +2900,7 @@ async def _parse_video_form(
     input_reference: UploadFile | None = File(default=None),
     image_reference: str | None = Form(default=None),
     video_reference: str | None = Form(default=None),
+    audio_reference: str | None = Form(default=None),
     model: str | None = Form(default=None),
     seconds: SecondStr | None = Form(default=None),
     size: SizeStr | None = Form(default=None),
@@ -2784,7 +2925,14 @@ async def _parse_video_form(
     frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
-) -> tuple[VideoGenerationRequest, "OmniOpenAIServingVideo", str, ReferenceImage | None, ReferenceVideo | None]:
+) -> tuple[
+    VideoGenerationRequest,
+    "OmniOpenAIServingVideo",
+    str,
+    ReferenceImage | None,
+    ReferenceVideo | None,
+    ReferenceAudio | None,
+]:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
 
@@ -2793,6 +2941,7 @@ async def _parse_video_form(
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
     parsed_image_reference = _parse_form_json(image_reference)
     parsed_video_reference = _parse_form_json(video_reference)
+    parsed_audio_reference = _parse_form_json(audio_reference)
 
     provided_references = sum(
         item is not None for item in (parsed_image_reference, parsed_video_reference, input_reference_bytes)
@@ -2810,6 +2959,7 @@ async def _parse_video_form(
         "size": size,
         "image_reference": parsed_image_reference,
         "video_reference": parsed_video_reference,
+        "audio_reference": parsed_audio_reference,
         "user": user,
         "width": width,
         "height": height,
@@ -2876,6 +3026,7 @@ async def _parse_video_form(
             request.image_reference,
             request.video_reference,
             input_reference_bytes,
+            model_config=handler._engine_client.model_config,
             max_video_frames=decode_spec.max_frames,
             video_keep=decode_spec.keep,
         )
@@ -2884,7 +3035,23 @@ async def _parse_video_form(
 
     reference_image = ReferenceImage(data=media_data) if isinstance(media_data, Image.Image) else None
     reference_video = ReferenceVideo(data=media_data) if isinstance(media_data, list) else None
-    return request, handler, effective_model_name, reference_image, reference_video
+
+    reference_audio: ReferenceAudio | None = None
+    if request.audio_reference is not None:
+        audio_connector = MediaConnector(
+            allowed_local_media_path=handler._engine_client.model_config.allowed_local_media_path,
+            allowed_media_domains=handler._engine_client.model_config.allowed_media_domains,
+        )
+        try:
+            audio_path = await decode_audio_url(
+                request.audio_reference.audio_url,
+                audio_connector,
+            )
+        except InvalidInputReferenceError as exc:
+            raise HTTPException(400, detail=str(exc)) from exc
+        reference_audio = ReferenceAudio(path=audio_path)
+
+    return request, handler, effective_model_name, reference_image, reference_video, reference_audio
 
 
 @router.post(
@@ -2904,6 +3071,7 @@ async def create_video(
         str,
         ReferenceImage | None,
         ReferenceVideo | None,
+        ReferenceAudio | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -2911,7 +3079,7 @@ async def create_video(
     Accepts multipart form-data (see ``_parse_video_form`` for parameters),
     persists a queued job record, and starts generation in the background.
     """
-    request, handler, effective_model_name, reference_image, reference_video = ctx
+    request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(
@@ -2921,6 +3089,7 @@ async def create_video(
             ref.id,
             reference_image,
             reference_video,
+            reference_audio,
             app_state=raw_request.app.state,
         )
     )
@@ -2945,6 +3114,7 @@ async def create_video_sync(
         str,
         ReferenceImage | None,
         ReferenceVideo | None,
+        ReferenceAudio | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -2956,7 +3126,7 @@ async def create_video_sync(
     Metadata is returned via response headers ``X-Request-Id``,
     ``X-Model``, and ``X-Inference-Time-S``.
     """
-    request, handler, effective_model_name, reference_image, reference_video = ctx
+    request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
@@ -2967,6 +3137,7 @@ async def create_video_sync(
                 request_id,
                 reference_image=reference_image,
                 reference_video=reference_video,
+                reference_audio=reference_audio,
             ),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
@@ -2979,12 +3150,18 @@ async def create_video_sync(
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
+    except OmniClientError as exc:
+        logger.info("Client error during sync video generation: %s", exc)
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except Exception as exc:
         logger.exception("Sync video generation failed for request_id=%s", request_id)
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
+    finally:
+        if reference_audio is not None and os.path.exists(reference_audio.path):
+            os.unlink(reference_audio.path)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
@@ -3102,7 +3279,7 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     elif job.status is VideoGenerationStatus.FAILED:
         if job.file_name is not None:
             try:
-                await STORAGE_MANAGER.delete(job.file_name)
+                await STORAGE_MANAGER.delete(video_id)
             except Exception:
                 logger.warning("Failed to delete stored artifact for failed video job %s", video_id, exc_info=True)
 
@@ -3112,13 +3289,13 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
     if job.file_name is None:
         raise HTTPException(status_code=409, detail="Video output not yet available. Please try again later.")
 
-    await STORAGE_MANAGER.delete(job.file_name)
+    await STORAGE_MANAGER.delete(video_id)
     await VIDEO_STORE.pop(video_id)
     return VideoDeleteResponse(id=job.id, deleted=True)
 
 
 @router.get("/v1/videos/{video_id}/content")
-async def download_video(video_id: str) -> FileResponse:
+async def download_video(video_id: str) -> Response:
     """Download the generated file for a completed video job.
 
     Args:
@@ -3141,11 +3318,19 @@ async def download_video(video_id: str) -> FileResponse:
     if not job.file_name:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
-    full_path = STORAGE_MANAGER.get_full_file_path(job.file_name)
-    if not os.path.exists(full_path):
+    file_handle = await STORAGE_MANAGER.open(video_id)
+    if file_handle is None:
         raise HTTPException(status_code=404, detail="Generated video file not found on disk")
 
-    return FileResponse(path=full_path, media_type=job.media_type, filename=job.file_name)
+    file_name = job.file_name or f"{video_id}.{job.file_extension}"
+    if isinstance(file_handle, FileStorageHandle):
+        response = FileResponse(path=file_handle.path, media_type=job.media_type, filename=file_name)
+    else:
+        raise HTTPException(
+            status_code=500, detail=f"Server generated an unsupported file storage handle for file id {video_id}"
+        )
+
+    return response
 
 
 @profiler_router.post("/start_profile")
@@ -3164,9 +3349,9 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
         stages = request.stages if request else None
         logger.info("Starting profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        result = await engine_client.start_profile(stages=stages)
+        await engine_client.start_profile(stages=stages)
         logger.info("Profiler started.")
-        return JSONResponse(content=result)
+        return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
         logger.exception("Failed to start profiler: %s", e)
         raise HTTPException(
@@ -3190,9 +3375,9 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
         stages = request.stages if request else None
         logger.info("Stopping profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        result = await engine_client.stop_profile(stages=stages)
+        await engine_client.stop_profile(stages=stages)
         logger.info("Profiler stopped.")
-        return JSONResponse(content=result)
+        return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:
         logger.exception("Failed to stop profiler: %s", e)
         raise HTTPException(

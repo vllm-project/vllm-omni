@@ -18,16 +18,27 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import using_paged_attention
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
-from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE, NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
 
 
+if is_310p():
+    from vllm_ascend._310p.model_runner_310p import NPUModelRunner310 as NPUModelRunner
+else:
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
     def load_model(self, *args, **kwargs) -> None:
+        if is_310p():
+            from vllm_omni.platforms.npu._310p.patch import apply_model_patches
+
+            apply_model_patches(self.model_config)
         NPUModelRunner.load_model(self, *args, **kwargs)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
@@ -208,7 +219,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
+            if getattr(getattr(self, "model", None), "has_preprocess", False):
+                input_ids = self.input_ids.gpu[:num_tokens_padded]
+                inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
+            elif self.supports_mm_inputs and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:
