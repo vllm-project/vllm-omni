@@ -43,6 +43,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
             MingMoeConfig,
+        )
         from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
             MossTTSLocalConfig,
             MossTTSRealtimeConfig,
