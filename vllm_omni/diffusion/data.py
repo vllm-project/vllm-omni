@@ -1145,8 +1145,6 @@ class DiffusionOutput:
     """
     Final output (after pipeline completion)
     """
-    # Not used in the new multimodal output format, but kept for backwards compatibility
-    outputs: list[torch.Tensor] | None = None
 
     # Fields may be replaced with SHM handle dicts by ipc.pack_diffusion_output_shm
     multimodal_output: dict[str, Any] | None = None
