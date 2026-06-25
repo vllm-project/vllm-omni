@@ -19,7 +19,7 @@ from collections.abc import Generator
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 from urllib.parse import quote
 
 import psutil
@@ -305,40 +305,132 @@ class OmniServer:
             time.sleep(2)
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
 
+    @staticmethod
+    def _reap_zombie(proc: "psutil.Process") -> bool:
+        """Reap a zombie child process via ``os.waitpid``.
+
+        ``psutil.Process.wait()`` uses ``pidfd_open`` + ``poll()``, which
+        never fires for a zombie (the zombie is already dead and will not
+        change state).  Since the test process is the parent, we can reap
+        the zombie directly with ``os.waitpid(pid, os.WNOHANG)`` and
+        retrieve its exit code.
+
+        Returns True if the process was a zombie and was reaped.
+        """
+        if proc.status() != psutil.STATUS_ZOMBIE:
+            return False
+        try:
+            os.waitpid(proc.pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        return True
+
+    @staticmethod
+    def _wait_or_reap(proc: "psutil.Process", timeout: int) -> None:
+        """Wait for *proc* to exit, handling zombie state transparently.
+
+        When the process is already a zombie (e.g. orchestrator thread
+        hung during shutdown and the main process exited), ``pidfd_open``
+        + ``poll()`` inside ``psutil`` will never see a state change.
+        Fall back to ``os.waitpid`` to reap the zombie.
+        """
+        if OmniServer._reap_zombie(proc):
+            return
+        try:
+            proc.wait(timeout=timeout)
+        except psutil.TimeoutExpired:
+            OmniServer._reap_zombie(proc)
+
     def _kill_process_tree(self, pid):
+        """Kill the process tree rooted at *pid*.
+
+        Terminate the parent **first** so the OmniServer can gracefully shut
+        down its stage-engine children through the orchestrator.  This avoids
+        the ``subprocess died unexpectedly`` ERROR that the APIServer monitor
+        thread logs when children are killed before the parent, which in turn
+        can cause CI watchdogs to false-trigger on the upstream ``Shutdown
+        initiated`` message.
+
+        When the parent does not exit within the grace period (e.g. CPU-
+        offloaded workers stuck in CUDA D-state), the method falls back to
+        killing children first so the parent can be reaped cleanly.
+        """
         try:
             parent = psutil.Process(pid)
             children = parent.children(recursive=True)
-            all_pids = [pid] + [child.pid for child in children]
 
-            for child in children:
-                try:
-                    child.terminate()
-                except psutil.NoSuchProcess:
-                    pass
-
-            _, still_alive = psutil.wait_procs(children, timeout=10)
-
-            for child in still_alive:
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
-
+            # 1. Terminate the parent first — let it run its graceful
+            #    shutdown cascade (orchestrator → stage pools → engine cores).
             try:
                 parent.terminate()
-                parent.wait(timeout=10)
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+            except psutil.NoSuchProcess:
+                pass
+
+            # 2. Give the parent time to shut down its children cleanly.
+            parent_exited = False
+            try:
+                parent.wait(timeout=15)
+                parent_exited = True
+            except psutil.NoSuchProcess:
+                parent_exited = True
+            except psutil.TimeoutExpired:
+                parent_exited = OmniServer._reap_zombie(parent)
+
+            if not parent_exited:
+                # Parent is stuck — children (e.g. CPU-offloaded CFG workers)
+                # are likely in uninterruptible sleep.  Kill children first
+                # so the parent can be reaped without lingering as a zombie.
+                for child in children:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                psutil.wait_procs(children, timeout=5)
                 try:
                     parent.kill()
                 except psutil.NoSuchProcess:
                     pass
+                OmniServer._wait_or_reap(parent, timeout=5)
+            else:
+                # Parent exited cleanly — clean up any remaining children.
+                for child in children:
+                    try:
+                        if child.is_running():
+                            child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
 
+                gone, still_alive = psutil.wait_procs(children, timeout=10)
+
+                for child in still_alive:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+
+                try:
+                    if parent.is_running() and not OmniServer._reap_zombie(parent):
+                        parent.kill()
+                        parent.wait(timeout=10)
+                except psutil.NoSuchProcess:
+                    pass
+
+            # 3. Final sweep — ``kill -9`` anything that escaped.
             time.sleep(1)
-            alive_processes = []
-            for check_pid in all_pids:
-                if psutil.pid_exists(check_pid):
-                    alive_processes.append(check_pid)
+            alive_processes: list[int] = []
+            for child in children:
+                try:
+                    if child.is_running():
+                        alive_processes.append(child.pid)
+                except psutil.NoSuchProcess:
+                    pass
+            # Only count the parent as alive if it is NOT a zombie
+            # (zombies are already dead — just waiting to be reaped).
+            try:
+                if parent.is_running() and parent.status() != psutil.STATUS_ZOMBIE:
+                    alive_processes.append(parent.pid)
+            except psutil.NoSuchProcess:
+                pass
 
             if alive_processes:
                 print(f"Warning: Processes still alive: {alive_processes}")
@@ -531,10 +623,6 @@ class OmniServerStageCli(OmniServer):
         if self.env_dict is not None:
             env.update(self.env_dict)
 
-        devices = self.stage_runtime_devices.get(stage_id)
-        if devices:
-            self._set_stage_device_env(stage_id, env, devices, replica_id=replica_id)
-
         cmd = self._build_stage_cmd(stage_id, headless=headless, replica_id=replica_id)
         print(f"Launching OmniServerStageCli stage {stage_id} replica {replica_id}: {' '.join(cmd)}")
         # Capture each subprocess's stdout+stderr to a per-stage log file so
@@ -674,6 +762,10 @@ class OmniResponse:
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
     logprobs: list | None = None
+    #: HTTP status + error text for the error-handling path (e.g. validator
+    #: rejections); populated when the OpenAI client raises an APIError.
+    status_code: int | None = None
+    error_message: str | None = None
 
 
 @dataclass
@@ -800,6 +892,12 @@ class OpenAIClientHandler:
                         audio_data.append(content)
                     elif modality == "text" and content:
                         text_content += content
+                # Usage is yielded after the last token
+                if chunk.usage:
+                    result.prompt_tokens = chunk.usage.prompt_tokens
+                    if details := getattr(chunk.usage, "prompt_tokens_details", None):
+                        result.cached_tokens = details.cached_tokens
+
             audio_content = None
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
@@ -1379,6 +1477,8 @@ class OpenAIClientHandler:
 
         - ``send_frames``: optional ``str`` or sequence of ``str`` raw WebSocket text frames (omit when the server
           speaks first, e.g. ``/v1/realtime`` rejection path).
+        - ``ws_skip_types``: optional event ``type`` strings to ignore while waiting for the first matching frame
+          (e.g. ``["session.created"]`` on ``/v1/realtime``).
         - ``timeout``: seconds to wait for the first inbound text frame (default ``120``).
         - ``ws_max_size``: passed through as ``max_size`` to :func:`websockets.connect` when the key is present.
         """
@@ -1392,6 +1492,7 @@ class OpenAIClientHandler:
 
         timeout = float(cfg.get("timeout", 120.0))
         uri = self._build_ws_url(path)
+        skip_types = set(cfg.get("ws_skip_types") or [])
 
         connect_kw: dict[str, Any] = {}
         if "ws_max_size" in cfg:
@@ -1403,16 +1504,19 @@ class OpenAIClientHandler:
             async with websockets.connect(uri, **connect_kw) as ws:
                 for frame in frames:
                     await ws.send(frame)
-                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                if not isinstance(raw, str):
-                    raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
-                if not isinstance(data, dict):
-                    raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
-                return WebSocketJsonResponse(json_body=data)
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                    if not isinstance(raw, str):
+                        raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
+                    if not isinstance(data, dict):
+                        raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
+                    if skip_types and data.get("type") in skip_types:
+                        continue
+                    return WebSocketJsonResponse(json_body=data)
 
         resp = asyncio.run(_recv_first_json_object())
         _run_ws_expectations_from_request_config(cfg, resp)
@@ -1494,6 +1598,8 @@ class OpenAIClientHandler:
             create_kwargs["logprobs"] = request_config["logprobs"]
         if "top_logprobs" in request_config:
             create_kwargs["top_logprobs"] = request_config["top_logprobs"]
+        if "stream_options" in request_config:
+            create_kwargs["stream_options"] = request_config["stream_options"]
         if extra_body:
             create_kwargs["extra_body"] = extra_body
 
@@ -1671,7 +1777,16 @@ class OpenAIClientHandler:
         # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
-        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens"):
+        for key in (
+            "task_type",
+            "ref_text",
+            "ref_audio",
+            "language",
+            "max_new_tokens",
+            "seed",
+            "instructions",
+            "speed",
+        ):
             if key in request_config:
                 extra_body[key] = request_config[key]
 
@@ -2053,6 +2168,102 @@ class OpenAIClientHandler:
             timeout=timeout,
         )
 
+    def send_streaming_video_diffusion_request(
+        self,
+        request_config: dict[str, Any],
+        request_num: int = 1,
+        *,
+        timeout_seconds: float = 600.0,
+    ) -> list[DiffusionResponse]:
+        """
+        Send a native ``/v1/realtime/video`` WebSocket request and return one
+        finalized MP4 artifact assembled from the streamed binary fragments.
+        """
+        if request_num != 1:
+            raise NotImplementedError("Concurrent streaming video diffusion requests are not currently implemented")
+
+        response = asyncio.run(
+            self._send_streaming_video_diffusion_request_once(
+                request_config,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        assert_diffusion_response(response, request_config, run_level=self.run_level)
+        if response.e2e_latency is not None:
+            self._print_client_stat(f"[diffusion.stream] request#1 success in {response.e2e_latency:.3f}s")
+        else:
+            self._print_client_stat("[diffusion.stream] request#1 completed")
+        return [response]
+
+    async def _send_streaming_video_diffusion_request_once(
+        self,
+        request_config: dict[str, Any],
+        *,
+        timeout_seconds: float,
+    ) -> DiffusionResponse:
+        form_data = request_config.get("form_data")
+        if not isinstance(form_data, dict):
+            raise ValueError("Video request_config must contain 'form_data'")
+        payload: dict[str, Any] = {
+            "type": "session.start",
+            **{key: value for key, value in form_data.items() if value is not None},
+        }
+        model = request_config.get("model")
+        if model is not None:
+            payload["model"] = model
+        payload.setdefault("format", "m4s")
+
+        fps = float(payload.get("fps") or 16)
+        stream_format = payload["format"]
+        url = self._build_ws_url("/v1/realtime/video")
+
+        result = DiffusionResponse()
+        chunks: list[bytes] = []
+        start_time = time.perf_counter()
+        deadline = start_time + timeout_seconds
+
+        import websockets
+
+        async with websockets.connect(url, max_size=None) as websocket:
+            await websocket.send(json.dumps(payload))
+
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError(f"Streaming video request did not complete within {timeout_seconds}s")
+
+                message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                if isinstance(message, bytes):
+                    chunks.append(message)
+                    continue
+
+                msg = json.loads(message)
+                msg_type = msg.get("type")
+                if msg_type == "video.start":
+                    stream_format = msg.get("format") or stream_format
+                    continue
+                if msg_type == "session.done":
+                    break
+                if msg_type == "error":
+                    raise RuntimeError(str(msg.get("message", msg)))
+
+        from vllm_omni.diffusion.utils.media_utils import finalize_streaming_video_bytes
+        from vllm_omni.entrypoints.openai.video_api_utils import StreamingVideoFormat
+
+        streamed_bytes = b"".join(chunks)
+        if not streamed_bytes:
+            raise RuntimeError("Streaming video request completed without binary video chunks")
+        result.videos = [
+            finalize_streaming_video_bytes(
+                streamed_bytes,
+                input_format=cast(StreamingVideoFormat, stream_format),
+                fps=fps,
+            )
+        ]
+        result.e2e_latency = time.perf_counter() - start_time
+        result.success = True
+        return result
+
     def _wait_until_video_completed(
         self, video_id: str, poll_interval_seconds: int = 2, timeout_seconds: int = 300
     ) -> None:
@@ -2147,8 +2358,8 @@ class OmniRunner:
         _cache = self._prompt_len_estimate_cache
         try:
             from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
-            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-                Qwen3TTSTalkerForConditionalGeneration,
+            from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+                Qwen3TTSPromptEmbedsBuilder,
             )
 
             if model_name not in _cache:
@@ -2160,7 +2371,7 @@ class OmniRunner:
 
             tok, tcfg = _cache[model_name]
             task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
-            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+            return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
                 additional_information=additional_information,
                 task_type=task_type,
                 tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],

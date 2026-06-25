@@ -305,8 +305,8 @@ class GPUWorker:
         )
 
         # Load model
-        model_loader = DiffusersPipelineLoader(load_config)
-        self.pipeline = model_loader.load_model(od_config, load_device=f"cuda:{rank}")
+        model_loader = DiffusersPipelineLoader(load_config, self.od_config)
+        self.pipeline = model_loader.load_model(load_device=f"cuda:{rank}")
 
         # Setup cache backend
         from vllm_omni.diffusion.cache.selector import get_cache_backend

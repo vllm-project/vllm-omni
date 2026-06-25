@@ -61,8 +61,8 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--height", type=int, default=1024, help="Output image height.")
-    parser.add_argument("--width", type=int, default=1024, help="Output image width.")
+    parser.add_argument("--height", type=int, default=None, help="Output image height.")
+    parser.add_argument("--width", type=int, default=None, help="Output image width.")
     parser.add_argument("--vae-use-tiling", action="store_true", help="Enable VAE tiling.")
     parser.add_argument(
         "--bot-task",
@@ -74,6 +74,12 @@ def parse_args():
     parser.add_argument("--sys-type", type=str, default=None, help="Override system prompt type.")
     parser.add_argument("--deploy-config", type=str, default=None, help="Custom deploy YAML path.")
     parser.add_argument("--stage-configs-path", type=str, default=None, help="Custom legacy stage config YAML path.")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        default=False,
+        help="Enable streaming CoT display; print AR text token-by-token in real time.",
+    )
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-timeout", type=int, default=300, help="Initialization timeout in seconds.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
@@ -107,9 +113,6 @@ def parse_args():
         ),
     )
 
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
@@ -225,11 +228,27 @@ def main():
             prompt_dict["modalities"] = ["text"]
         formatted_prompts.append(prompt_dict)
 
+    from vllm.sampling_params import RequestOutputKind
+
     params_list = list(omni.default_sampling_params_list)
 
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
+    if (args.height is None) != (args.width is None):
+        raise ValueError("--height and --width must both be specified or both omitted.")
+    user_specified_size = args.height is not None and args.width is not None
+    if args.modality in ("img2text", "text2text"):
+        ar_image_size = "auto"
+    elif user_specified_size:
+        ar_image_size = f"{args.width}x{args.height}"
+    else:
+        ar_image_size = None
+    ar_stop_token_ids = resolve_stop_token_ids(
+        task=task, bot_task=bot_task, tokenizer=tokenizer, image_size=ar_image_size
+    )
+    print(
+        f"[AR Config] task={task}, bot_task={bot_task}, image_size={ar_image_size}, stop_token_ids={ar_stop_token_ids}"
+    )
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
@@ -242,6 +261,10 @@ def main():
                 sp.width = args.width
         elif hasattr(sp, "stop_token_ids"):
             sp.stop_token_ids = ar_stop_token_ids
+            # When --stream is set, request DELTA output from the AR stage
+            # so we can display CoT text token-by-token in real time.
+            if args.stream and hasattr(sp, "output_kind"):
+                sp.output_kind = RequestOutputKind.DELTA
 
     print(f"\n{'=' * 60}")
     print("HunyuanImage-3.0 Generation Configuration:")
@@ -270,22 +293,32 @@ def main():
     print(f"  Prompts: {prompts}")
     print(f"{'=' * 60}\n")
 
-    omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
+    # When --stream is set, print AR CoT text token-by-token in real time.
+    # Otherwise, collect and print the full AR text once when stage 0 finishes.
+    omni_outputs = omni.generate(
+        prompts=formatted_prompts,
+        sampling_params_list=params_list,
+        py_generator=True,
+        use_tqdm=False,
+    )
     img_idx = 0
     for req_output in omni_outputs:
         ro = getattr(req_output, "request_output", None)
-        txt = ""
-        if ro and getattr(ro, "outputs", None):
-            txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
-        if not txt:
-            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
-            if isinstance(ar_text, list):
-                txt = "\n".join(text for text in ar_text if text)
-            else:
-                txt = ar_text or ""
-        if txt:
-            print(f"[Output] Text:\n{txt}")
+        stage_id = getattr(req_output, "stage_id", None)
 
+        # AR stage text — each CompletionOutput.text is already a delta when
+        # output_kind=DELTA, so we can print it directly (matching the pattern
+        # in serving_chat.py).
+        if stage_id == 0 and ro and getattr(ro, "outputs", None):
+            for o in ro.outputs:
+                text = getattr(o, "text", "") or ""
+                if text:
+                    print(text, end="", flush=True)
+            # Non-streaming: one shot with full text — emit a trailing newline.
+            if not args.stream:
+                print(flush=True)
+
+        # Collect images from diffusion stage
         images = getattr(req_output, "images", None)
         if not images and ro and hasattr(ro, "images"):
             images = ro.images
@@ -293,7 +326,7 @@ def main():
             for j, img in enumerate(images):
                 save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
                 img.save(save_path)
-                print(f"[Output] Saved image to {save_path}")
+                print(f"\n[Output] Saved image to {save_path}")
             img_idx += 1
 
 

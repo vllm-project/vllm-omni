@@ -10,8 +10,7 @@
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
-#     set true to disable that path in eager mode. NPU platform flips stage 0 to true where
-#     cudagraph is not yet verified.
+#     set true to disable that path in eager mode.
 async_chunk: true
 
 connectors:
@@ -64,6 +63,7 @@ stages:
       top_p: 1.0
 
   - stage_id: 1
+    # Tuned for Base voice clone; CustomVoice / VoiceDesign are TTFA-optimal at 1.
     max_num_seqs: 10
     gpu_memory_utilization: 0.3
     enforce_eager: false
@@ -92,4 +92,4 @@ platforms:
   npu:
     stages:
       - stage_id: 0
-        enforce_eager: true
+        enforce_eager: false

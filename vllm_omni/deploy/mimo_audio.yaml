@@ -4,8 +4,8 @@
 # Default mode is async-chunk streaming on a single GPU (both stages on
 # device 0) through SharedMemoryConnector. For the legacy 2-GPU sync
 # pipeline (stage 1 on a second card), pass ``--no-async-chunk
-# --stage-1-devices 1 --stage-1-max-model-len 18192
-# --stage-1-max-num-batched-tokens 18192`` to the serve CLI.
+# --stage-overrides '{"1": {"devices": "1", "max_model_len": 18192, "max_num_batched_tokens": 18192}}'``
+# to the serve CLI.
 async_chunk: true
 dtype: bfloat16
 

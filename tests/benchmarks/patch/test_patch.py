@@ -133,7 +133,9 @@ async def test_output_tokens_not_assigned_without_metrics(mocker: MockerFixture)
 
     # Assert
     assert output.success is True
-    assert output.output_tokens == 0, "output_tokens should default to 0 when no metrics"
+    # Without server metrics we no longer infer count from SSE chunks because
+    # one chunk may carry multiple tokens. output_tokens stays 0 here.
+    assert output.output_tokens == 0, "output_tokens should be 0 when no server metrics are present"
     assert output.generated_text == "Hello world"
 
 
@@ -277,7 +279,7 @@ async def test_output_tokens_with_missing_num_tokens_out(mocker: MockerFixture):
 
     # Assert
     assert output.success is True
-    assert output.output_tokens == 0, "output_tokens should default to 0 when num_tokens_out is missing"
+    assert output.output_tokens == 0, "output_tokens should be 0 when num_tokens_out is missing"
 
 
 @pytest.mark.asyncio
@@ -577,6 +579,167 @@ class TestTextLatencyAttribute:
 # ============================================================================
 # prompt_len Tests
 # ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_skips_empty_role_chunk_for_ttft_and_itl(mocker: MockerFixture):
+    """Role/empty text chunks must not count toward TTFT or ITL."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"role": "assistant", "content": ""}}],
+                "modality": "text",
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "Hello"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": " world"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks, delay_between_chunks=0.01)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 2
+    assert len(output.itl) == 1
+    assert output.ttft > 0
+    assert output.text_latency - output.ttft == pytest.approx(sum(output.itl), rel=1e-6, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_bundled_tokens_split_itl_from_usage(mocker: MockerFixture):
+    """Multiple tokens in one SSE chunk should expand ITL via usage deltas."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "A"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "BCD"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks, delay_between_chunks=0.02)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 4
+    assert len(output.itl) == 3
+    assert output.text_latency - output.ttft == pytest.approx(sum(output.itl), rel=1e-6, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_output_tokens_prefers_usage_over_metrics(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "Hello"}}],
+                "modality": "text",
+                "metrics": {"num_tokens_out": 5},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 8
+
+
+@pytest.mark.asyncio
+async def test_metrics_only_chunk_updates_output_tokens(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "Text response"}}],
+                "modality": "text",
+            }
+        ),
+        create_sse_chunk(
+            {
+                "modality": "text",
+                "metrics": {"num_tokens_out": 25, "num_tokens_in": 10},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 25
 
 
 @pytest.mark.asyncio

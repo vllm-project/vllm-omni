@@ -3,11 +3,13 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -251,6 +253,13 @@ class FusedBlock(nn.Module):
 
 
 class FusionModel(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "fused_blocks": ForwardPattern.Pattern_0,
+        },
+        has_separate_cfg=True,
+    )
+
     _layerwise_offload_blocks_attrs = ["fused_blocks"]
 
     packed_modules_mapping = {

@@ -64,7 +64,8 @@ container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | hea
 docker pull "${image_name}"
 
 remove_docker_container() {
-   docker rm -f "${container_name}" || docker image rm -f "${image_name}" || true
+   docker ps -aq --filter "name=${container_name}" | xargs -r docker rm -f || true
+   docker image rm -f "${image_name}" || true
 }
 trap remove_docker_container EXIT
 
@@ -107,7 +108,6 @@ if [[ $commands == *"--shard-id="* ]]; then
         --network=host \
         --shm-size=16gb \
         --group-add "$render_gid" \
-        --rm \
         -e MIOPEN_DEBUG_CONV_DIRECT=0 \
         -e MIOPEN_DEBUG_CONV_GEMM=0 \
         -e VLLM_ROCM_USE_AITER=0 \
@@ -140,7 +140,6 @@ else
           --network=host \
           --shm-size=16gb \
           --group-add "$render_gid" \
-          --rm \
           -e MIOPEN_DEBUG_CONV_DIRECT=0 \
           -e MIOPEN_DEBUG_CONV_GEMM=0 \
           -e VLLM_ROCM_USE_AITER=0 \

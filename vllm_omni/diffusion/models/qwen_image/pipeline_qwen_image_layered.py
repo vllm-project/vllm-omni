@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -24,8 +24,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage import (
     AutoencoderKLQwenImage,
 )
@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -202,7 +203,13 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
+class QwenImageLayeredPipeline(
+    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     color_format = "RGBA"
 
     def __init__(
@@ -216,29 +223,45 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         self.device = get_local_device()
         model = od_config.model
         # Check if model is a local path
-        local_files_only = os.path.exists(model)
+        local_files_only = os.path.isdir(model)
 
         # See pipeline_qwen_image_edit_plus: guard against transformers v5
         # multi-worker race on partial subfolder shard sets (Buildkite #1043).
+        qwen_subfolders = ["scheduler", "text_encoder", "vae", "tokenizer", "processor"]
         prefetch_subfolders(
             model,
-            ["scheduler", "text_encoder", "vae", "tokenizer", "processor"],
-            local_files_only=local_files_only,
+            qwen_subfolders,
         )
 
         # modules keep same as transformers & diffusers
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+        # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
+        # half-written cache (missing-shard ``OSError`` *and* the default
+        # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
+        # could not recover) instead of crashing the worker.
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen2_5_VLForConditionalGeneration.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=qwen_subfolders,
+            local_files_only=local_files_only,
         ).to(self.device)
-        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLQwenImage.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=qwen_subfolders,
+            local_files_only=local_files_only,
+        ).to(self.device)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.processor = Qwen2VLProcessor.from_pretrained(
-            model, subfolder="processor", local_files_only=local_files_only
+        self.processor = from_pretrained_with_prefetch(
+            Qwen2VLProcessor.from_pretrained,
+            model,
+            subfolder="processor",
+            prefetch_list=qwen_subfolders,
+            local_files_only=local_files_only,
         )
 
         # modules re-implemented for vLLM-Omni
@@ -832,10 +855,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
-        )
+        txt_seq_lens = txt_seq_lens_from_embeds(prompt_embeds)
+        negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
         is_rgb = torch.tensor([0] * batch_size).to(device=self.device, dtype=torch.long)
 
         latents = self.diffuse(

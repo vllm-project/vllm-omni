@@ -578,11 +578,26 @@ def test_rmsnorm_fused_native_parity_2d_input():
 
 
 def test_rmsnorm_fused_native_parity_custom_weight():
-    """Verify fused and native RMSNorm parity with non-default weights."""
+    """Verify fused and native RMSNorm parity with non-default weights.
+
+    Note: bfloat16 requires wider tolerance because the fused CUDA kernel
+    (vllm._custom_ops.rms_norm) computes in bf16 precision internally,
+    while forward_native uses float32 intermediates. With random custom
+    weights (not the default ones-weight), this precision gap exceeds 1e-3.
+
+    The gap surfaced after upstream vLLM routed RMSNorm through the vLLM IR
+    op (ir.ops.rms_norm) — see upstream commit 40bb17502
+    "[vLLM IR] 1/N Implement IR skeleton and rms_norm op (#33825)" — which
+    changed which fused kernel/precision path the layer dispatches to.
+    """
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     hidden_size = 64
     eps = 1e-6
+
+    # Per-dtype tolerances: bf16 fused kernel has inherent precision limit
+    atol_map = {torch.float32: 1e-3, torch.float16: 1e-3, torch.bfloat16: 2e-2}
+    rtol_map = {torch.float32: 1e-3, torch.float16: 1e-3, torch.bfloat16: 1e-2}
 
     for dtype in [torch.float32, torch.float16, torch.bfloat16]:
         torch.manual_seed(789)
@@ -594,4 +609,4 @@ def test_rmsnorm_fused_native_parity_custom_weight():
         out_fused = norm._forward_fused(x)
         out_native = norm.forward_native(x)
 
-        torch.testing.assert_close(out_fused, out_native, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(out_fused, out_native, atol=atol_map[dtype], rtol=rtol_map[dtype])

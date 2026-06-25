@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for multistage diffusion generation input construction."""
+"""Regression tests for multistage generation input construction."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -61,7 +62,7 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine_prompt["prompt"] == "draw a robot"
     assert engine_prompt["modalities"] == ["img2img"]
     assert engine_prompt["negative_prompt"] == "blurry"
-    assert engine_prompt["mm_processor_kwargs"] == {"target_h": 768, "target_w": 1024}
+    assert engine_prompt["mm_processor_kwargs"] == {"target_h": 768, "target_w": 1024, "vae_generator_seed": 0}
     assert engine_prompt["multi_modal_data"]["img2img"].size == (24, 24)
 
     assert len(sampling_params_list) == 3
@@ -91,6 +92,79 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    image_payload = object()
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="asr", requires_multimodal_data=True),
+            SimpleNamespace(model_stage="aura", requires_multimodal_data=True),
+        ]
+    )
+    serving_chat.model_config = SimpleNamespace(
+        allowed_local_media_path="",
+        allowed_media_domains=None,
+    )
+    request = SimpleNamespace(media_io_kwargs=None)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,abc"}},
+                {"type": "image_pil", "image_pil": image_payload},
+                {"type": "text", "text": "What changed?"},
+            ],
+        }
+    ]
+
+    stripped_messages, deferred_data = asyncio.run(
+        OmniOpenAIServingChat._prepare_multistage_multimodal_inputs(
+            serving_chat,
+            messages,
+            request,
+        )
+    )
+
+    assert deferred_data == {"image": [image_payload]}
+    stripped_content = stripped_messages[0]["content"]
+    assert {"type": "image_pil", "image_pil": image_payload} not in stripped_content
+    assert {"type": "text", "text": "What changed?"} in stripped_content
+
+
+def test_needs_multistage_multimodal_split_noops_for_single_stage(serving_chat):
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="thinker", requires_multimodal_data=True),
+        ]
+    )
+
+    assert serving_chat._needs_multistage_multimodal_split() is False
+
+
+def test_needs_multistage_multimodal_split_noops_for_qwen3_omni(serving_chat):
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="thinker", requires_multimodal_data=True),
+            SimpleNamespace(model_stage="talker", requires_multimodal_data=False),
+            SimpleNamespace(model_stage="code2wav", requires_multimodal_data=False),
+        ]
+    )
+
+    assert serving_chat._needs_multistage_multimodal_split() is False
+
+
+def test_needs_multistage_multimodal_split_detects_aura_handoff(serving_chat):
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(model_stage="asr", requires_multimodal_data=True),
+            SimpleNamespace(model_stage="aura", requires_multimodal_data=True),
+        ]
+    )
+
+    assert serving_chat._needs_multistage_multimodal_split() is True
 
 
 def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders(serving_chat):
@@ -362,4 +436,105 @@ def test_build_multistage_generation_inputs_custom_system_prompt(serving_chat):
     assert marker in out["prompt"], (
         f"custom system_prompt content must reach the rendered prompt; "
         f"marker {marker!r} not found in prompt of length {len(out['prompt'])}"
+    )
+
+
+def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit_size(serving_chat):
+    """When height+width are provided with bot_task, the AR (llm) stage
+    must receive stop_token_ids from resolve_stop_token_ids so AR stops
+    at the correct terminator instead of generating until max_tokens.
+
+    Without this, AR would generate past the cot boundary and produce
+    garbage that the DiT bridge cannot parse.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeTokenizer:
+        SPECIAL = {
+            "<|startoftext|>": 1,
+            "<img>": 2,
+            "<recaption>": 4,
+        }
+
+        def convert_tokens_to_ids(self, tok: str) -> int:
+            return self.SPECIAL.get(tok, 0)
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            return list(range(100, 100 + len(text)))
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    # With height+width and bot_task=think, ar_image_size="1024x768" ->
+    # need_ratio=False -> stop_token_ids=[end_of_think, end_of_recaption]
+    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="draw a cat",
+        extra_body={"bot_task": "think"},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(height=768, width=1024),
+        tokenizer=FakeTokenizer(),
+    )
+
+    # AR stage (index 0) must have stop_token_ids set.
+    ar_params = sampling_params_list[0]
+    assert ar_params.stop_token_ids is not None, (
+        "AR stage must have stop_token_ids set when height+width and bot_task are provided"
+    )
+    assert len(ar_params.stop_token_ids) > 0, "stop_token_ids must be non-empty"
+
+    # Diffusion stage (index 1) must NOT have stop_token_ids set.
+    diff_params = sampling_params_list[1]
+    assert getattr(diff_params, "stop_token_ids", None) is None, "Diffusion stage must not have stop_token_ids set"
+
+
+def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(serving_chat):
+    """Without height+width, ar_image_size=None -> need_ratio=True ->
+    stop_token_ids is set to the ratio range (AR predicts ratio).
+    This still assigns stop_token_ids, but the set is the ratio range,
+    not the terminator.
+
+    Without bot_task at all, ar_stop_token_ids stays None and
+    stop_token_ids is not set on any stage.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.0),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+    images = [Image.new("RGB", (32, 32), color="red")]
+
+    # No height/width, no bot_task -> ar_stop_token_ids=None ->
+    # stop_token_ids not set on any stage.
+    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="draw a cat",
+        extra_body={},
+        reference_images=images,
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+
+    # SamplingParams defaults stop_token_ids=[], not None.
+    # The key contract: it was NOT set by resolve_stop_token_ids,
+    # so it stays as the SamplingParams default (empty list).
+    assert sampling_params_list[0].stop_token_ids == [], (
+        "Without bot_task, AR stage stop_token_ids must be the default empty list"
     )

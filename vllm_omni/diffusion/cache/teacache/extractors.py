@@ -307,12 +307,9 @@ def extract_bagel_context(
     packed_vae_position_ids: torch.LongTensor,
     packed_text_ids: torch.LongTensor,
     packed_text_indexes: torch.LongTensor,
-    packed_indexes: torch.LongTensor,
     packed_position_ids: torch.LongTensor,
     packed_seqlens: torch.IntTensor,
-    key_values_lens: torch.IntTensor,
     past_key_values: Any,
-    packed_key_value_indexes: torch.LongTensor,
     **kwargs: Any,
 ) -> CacheContext:
     """
@@ -326,12 +323,9 @@ def extract_bagel_context(
         packed_vae_position_ids: Position IDs for VAE tokens
         packed_text_ids: Text token IDs
         packed_text_indexes: Indexes for text tokens in packed sequence
-        packed_indexes: Global indexes
         packed_position_ids: Global position IDs
         packed_seqlens: Sequence lengths
-        key_values_lens: KV cache lengths
         past_key_values: KV cache
-        packed_key_value_indexes: KV cache indexes
         **kwargs: Additional keyword arguments
 
     Returns:
@@ -375,10 +369,7 @@ def extract_bagel_context(
             packed_query_sequence=packed_sequence,
             query_lens=packed_seqlens,
             packed_query_position_ids=packed_position_ids,
-            packed_query_indexes=packed_indexes,
             past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=False,
             is_causal=False,
             **extra_inputs,
