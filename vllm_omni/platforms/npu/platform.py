@@ -44,6 +44,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         super().set_device(device)
+
+        # Register vllm_ascend custom ops (torch.ops._C_ascend.*).
+        from vllm_ascend.utils import enable_custom_op
+
+        enable_custom_op()
+
         # Ascend quantized weights are converted from ND to FRACTAL_NZ
         # after loading. Enable internal format so the NZ storage layout
         # is preserved for fused NPU kernels.
