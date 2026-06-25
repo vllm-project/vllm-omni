@@ -226,9 +226,9 @@ steps:
           - |
             failed=0
             for f in $(pytest --collect-only -q tests/e2e/ -m "slow and L4 and tts" --run-level "full_model" | grep '\.py::' | sed -E 's|::.*||' | sort -u); do
-              pytest -s -v "$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
+              pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
             done
-            exit $failed
+            exit $$failed
         agents:
           queue: "gpu_1_queue"
         plugins:
