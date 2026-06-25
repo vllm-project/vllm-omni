@@ -1,8 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
-from PIL import Image
 from vllm.outputs import RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
@@ -394,8 +392,6 @@ class OmniRequestOutput:
 
     def __repr__(self) -> str:
         """Custom repr to properly show image count instead of image objects."""
-        # For images, show count instead of full list
-        images_repr = f"[{len(self.images)} PIL Images]" if self.images else "[]"
 
         # Build repr string
         parts = [

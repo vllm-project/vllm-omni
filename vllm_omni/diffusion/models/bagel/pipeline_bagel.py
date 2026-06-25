@@ -863,7 +863,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 "trajectory_timesteps": trajectory_timesteps_stacked,
                 "trajectory_log_probs": trajectory_log_probs_stacked,
                 "trajectory_decoded": trajectory_decoded,
-            }, 
+            },
             custom_output=custom,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )

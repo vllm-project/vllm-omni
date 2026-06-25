@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any
 
 import diffusers
 import torch
-from PIL import Image
 from pydantic import Field, model_validator
 from typing_extensions import Self
 from vllm.config.utils import config

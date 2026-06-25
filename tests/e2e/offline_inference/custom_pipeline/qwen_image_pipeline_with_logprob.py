@@ -398,7 +398,6 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
                 "trajectory_latents": [_maybe_to_cpu(all_latents)],
                 "trajectory_log_probs": [_maybe_to_cpu(all_log_probs)],
                 "trajectory_timesteps": [_maybe_to_cpu(all_timesteps)],
-
             },
             custom_output={
                 "prompt_embeds": _maybe_to_cpu(prompt_embeds),

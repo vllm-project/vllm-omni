@@ -130,7 +130,7 @@ def format_diffusion_outputs(
             # outputs=outputs,
             metrics=metrics,
             postprocess_output=postprocess_output,
-            is_images_output=is_images_output, 
+            is_images_output=is_images_output,
             is_text_output=is_text_output,
             is_audio_output=is_audio_output,
             audio_sample_rate=audio_sample_rate,
@@ -160,6 +160,7 @@ def _format_audio_multimodal_output(payload: Any, audio_sample_rate: int | None)
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate
     return mm_output
+
 
 def _has_non_audio_postprocess_payload(postprocess_output: DiffusionPostprocessOutput) -> bool:
     return (
@@ -193,7 +194,7 @@ def _format_single_prompt_output(
     diffusion_output: DiffusionOutput,
     metrics: dict[str, Any],
     postprocess_output: DiffusionPostprocessOutput,
-    is_images_output: bool, 
+    is_images_output: bool,
     is_text_output: bool,
     is_audio_output: bool,
     audio_sample_rate: int | None,
@@ -201,7 +202,7 @@ def _format_single_prompt_output(
 ) -> list[OmniRequestOutput]:
     prompt = request.prompts[0]
     request_id = request.request_id
-    
+
     mm_output = _build_multimodal_output(postprocess_output, audio_sample_rate)
 
     if is_images_output:
@@ -210,7 +211,7 @@ def _format_single_prompt_output(
                 request_id=request_id,
                 prompt=prompt,
                 metrics=metrics,
-                multimodal_output=mm_output, 
+                multimodal_output=mm_output,
                 final_output_type="image",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
@@ -239,7 +240,7 @@ def _format_single_prompt_output(
                 request_id=request_id,
                 prompt=prompt,
                 metrics=metrics,
-                multimodal_output=mm_output, 
+                multimodal_output=mm_output,
                 final_output_type="audio",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,

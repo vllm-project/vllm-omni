@@ -831,7 +831,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             # image = self.image_processor.postprocess(image, output_type=output_type)
 
         return DiffusionOutput(
-            multimodal_output={"images": image}, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            multimodal_output={"images": image},
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
