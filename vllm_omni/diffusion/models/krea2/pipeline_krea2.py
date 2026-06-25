@@ -158,7 +158,10 @@ class Krea2Pipeline(
         self.text_encoder_select_layers = DEFAULT_TEXT_ENCODER_SELECT_LAYERS
 
         model_config = od_config.model_config or {}
-        self.is_distilled = model_config.get("is_distilled", False)
+        self.is_distilled = model_config.get(
+            "is_distilled",
+            any(tag in model.lower() for tag in ("turbo", "tdm", "distill")),
+        )
         self.patch_size = 2
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8

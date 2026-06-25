@@ -253,3 +253,42 @@ def test_registry_has_krea2():
 
     assert "Krea2Pipeline" in _DIFFUSION_MODELS
     assert "Krea2Pipeline" in _DIFFUSION_POST_PROCESS_FUNCS
+
+
+def test_krea2_imports():
+    from vllm_omni.diffusion.models.krea2 import Krea2Pipeline, Krea2Transformer2DModel, get_krea2_post_process_func
+
+    assert Krea2Pipeline is not None
+    assert Krea2Transformer2DModel is not None
+    assert callable(get_krea2_post_process_func)
+
+
+@pytest.mark.parametrize(
+    "model_name,expected",
+    [
+        ("krea/Krea-2-Raw", False),
+        ("krea/Krea-2-Turbo", True),
+        ("krea-ai/krea-2-medium", False),
+        ("krea-ai/krea-2-medium-tdm", True),
+        ("/local/path/krea-distilled", True),
+        ("krea/some-other-model", False),
+    ],
+)
+def test_distilled_name_detection(model_name, expected):
+    tags = ("turbo", "tdm", "distill")
+    detected = any(tag in model_name.lower() for tag in tags)
+    assert detected == expected, f"{model_name} should{'not' if not expected else ''} be detected as distilled"
+
+
+def test_denormalize_latents_no_reciprocal():
+    from vllm_omni.diffusion.models.krea2.preprocess_krea2 import denormalize_latents
+
+    latents = torch.ones(1, 4, 1, 2, 2)
+    mean = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    std = torch.tensor([2.0, 3.0, 4.0, 5.0])
+    result = denormalize_latents(latents, mean, std)
+    assert result.shape == latents.shape
+    assert torch.allclose(result[0, 0], torch.tensor(3.0))  # 1*2 + 1 = 3
+    assert torch.allclose(result[0, 1], torch.tensor(5.0))  # 1*3 + 2 = 5
+    assert torch.allclose(result[0, 2], torch.tensor(7.0))  # 1*4 + 3 = 7
+    assert torch.allclose(result[0, 3], torch.tensor(9.0))  # 1*5 + 4 = 9

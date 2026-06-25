@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Generate images with Krea 2 (base or distilled/TDM checkpoint).
+"""Generate images with Krea 2 (base or distilled/Turbo checkpoint).
+
+Note: Krea 2 weights are released under the Krea 2 Community License.
+See the model card at https://huggingface.co/krea/Krea-2-Raw for details.
 
 Usage:
     # Base model (28 steps, guidance 4.5)
-    python krea2_generate.py --model krea-ai/krea-2-medium
+    python krea2_generate.py --model krea/Krea-2-Raw
 
-    # Distilled / TDM model (8 steps, no CFG)
-    python krea2_generate.py --model krea-ai/krea-2-medium-tdm \
-        --steps 8 --guidance 0.0
+    # Distilled / Turbo model (8 steps, no CFG — auto-detected from name)
+    python krea2_generate.py --model krea/Krea-2-Turbo
 
     # Custom prompt and resolution
-    python krea2_generate.py --model krea-ai/krea-2-large \
+    python krea2_generate.py --model krea/Krea-2-Raw \
         --prompt "a serene Vermont mountain lake at dawn" \
         --height 768 --width 1360
 """
@@ -29,7 +31,7 @@ from vllm_omni.platforms import current_omni_platform
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Krea 2 text-to-image generation")
-    p.add_argument("--model", default="krea-ai/krea-2-medium", help="HF repo or local path to a Krea 2 checkpoint.")
+    p.add_argument("--model", default="krea/Krea-2-Raw", help="HF repo or local path to a Krea 2 checkpoint.")
     p.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     p.add_argument("--negative-prompt", default=None, help="Negative prompt for CFG (ignored when guidance=0).")
     p.add_argument("--steps", type=int, default=28, help="Number of denoising steps (28 base, 8 distilled).")
@@ -39,13 +41,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=142)
     p.add_argument("--output", default="krea2_output.png", help="Output image path.")
     p.add_argument("--num-images", type=int, default=1, help="Number of images to generate per prompt.")
-    p.add_argument(
-        "--quantization",
-        type=str,
-        default=None,
-        choices=["fp8", "int8"],
-        help="Quantization method for the transformer.",
-    )
     p.add_argument("--cfg-parallel-size", type=int, default=1, choices=[1, 2], help="GPUs used for CFG parallelism.")
     p.add_argument("--tensor-parallel-size", type=int, default=1, help="GPUs used for tensor parallelism.")
     p.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
@@ -58,7 +53,7 @@ def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
-    is_distilled = "tdm" in args.model.lower() or "distill" in args.model.lower()
+    is_distilled = "turbo" in args.model.lower() or "tdm" in args.model.lower() or "distill" in args.model.lower()
     if is_distilled and args.steps == 28:
         args.steps = 8
     if is_distilled and args.guidance == 4.5:
@@ -74,9 +69,6 @@ def main():
     }
     if is_distilled:
         omni_kwargs["model_config"] = {"is_distilled": True}
-    if args.quantization:
-        omni_kwargs["quantization"] = args.quantization
-
     omni = Omni(**omni_kwargs)
 
     prompt_dict = {"prompt": args.prompt}
