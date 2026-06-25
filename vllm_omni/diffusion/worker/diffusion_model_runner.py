@@ -88,6 +88,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         model = getattr(self.pipeline, attr_name, None)
         if model is None:
             return
+
         try:
             setattr(self.pipeline, attr_name, regionally_compile(model, dynamic=True))
             logger.info("Model runner: %s compiled with torch.compile.", attr_name)

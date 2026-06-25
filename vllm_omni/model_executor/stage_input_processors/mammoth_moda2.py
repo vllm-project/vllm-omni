@@ -11,11 +11,15 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 
 def ar2dit(
     source_outputs: list[Any],
-    prompts: OmniTokensPrompt | TextPrompt | None = None,
+    prompts: OmniTokensPrompt | TextPrompt | list[OmniTokensPrompt | TextPrompt] | None = None,
     _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """Convert AR stage outputs to DiT stage inputs."""
     ar_outputs = source_outputs
+
+    # Normalize prompts to list
+    if not isinstance(prompts, list):
+        prompts = [prompts] if prompts is not None else [{}]
 
     dit_inputs: list[OmniTokensPrompt] = []
     for ar_output, prompt in zip(ar_outputs, prompts):

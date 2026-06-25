@@ -63,8 +63,6 @@ test_params = [
             use_stage_cli=True,
             server_args=[
                 "--no-async-chunk",
-                "--stage-overrides",
-                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
             ],
         ),
         id="default",

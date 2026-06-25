@@ -65,7 +65,7 @@ More failure modes (for example, network jitter and network interruption) will b
 
 ## Source of Conclusions
 
-The behaviors and conclusions above are summarized from current fault injection validation results on `Qwen3-Omni` and `Wan2.2`.
+The behaviors and conclusions above are summarized from current fault injection validation results on **`Qwen3-Omni`**, **`Wan2.2`**, **`HunyuanImage-3.0-Instruct`** (DiT-only, `/v1/images/generations`), and **`VoxCPM2`** (`/v1/audio/speech`). Automated coverage lives under `tests/dfx/reliability/` (`test_reliability_qwen3_omni.py`, `test_reliability_wan22.py`, `test_reliability_hunyuan_image.py`, `test_reliability_voxcpm2.py`) and runs weekly via `.buildkite/test-weekly.yml`.
 
 ### Example: `SIGTERM` fault injection log (Qwen3-Omni)
 

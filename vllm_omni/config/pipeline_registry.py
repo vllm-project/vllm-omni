@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TypeAlias
 
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import (
@@ -81,7 +81,7 @@ from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIP
 
 logger = init_logger(__name__)
 
-PipelineResolverFunc: TypeAlias = Callable[[PreTrainedConfig | None], PipelineConfig | None]
+PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineConfig | None]
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
