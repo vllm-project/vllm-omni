@@ -560,6 +560,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     # Scheduler step
                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    # Re-cast to transformer_dtype before cfg_group.broadcast to avoid dtype mismatches across ranks
+                    latents = latents.to(transformer_dtype)
 
                 # Broadcast updated latents to all ranks
                 cfg_group.broadcast(latents, src=0)
