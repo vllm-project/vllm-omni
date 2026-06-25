@@ -1,0 +1,2489 @@
+#!/usr/bin/env python3
+"""
+Parse pytest-style logs under logs/nightly_jobs (or --log-dir) and emit HTML or Markdown.
+
+Used for **report type nightly** in vllm-omni-test-report. Discovery rules:
+../references/nightly-local-log-layout.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+from kanban_assets_perf_summary import build_assets_perf_summary  # noqa: E402
+from kanban_repo_config import KANBAN_REPO_URL  # noqa: E402
+from laptop_path_defaults import (  # noqa: E402
+    DEFAULT_KANBAN_REPO_ROOT_DISPLAY,
+    DEFAULT_LAPTOP_REPO_ROOT_DISPLAY,
+    resolve_kanban_repo_root,
+    resolve_laptop_repo_root,
+)
+from local_perf_results import (  # noqa: E402
+    collect_local_perf_test_keys,
+    local_perf_result_files,
+    perf_row_matches_local_test,
+    resolve_local_perf_result_dir,
+)
+from nightly_job_log_discovery import discover_job_logs, read_combined_job_logs  # noqa: E402
+from nightly_job_pytest_table import (  # noqa: E402
+    ORG,
+    PIPELINE,
+    collect_nightly_job_log_analyses,
+    fetch_nightly_build,
+)
+from pytest_log_parse import (  # noqa: E402
+    extract_pytest_counts,
+    extract_pytest_duration_display,
+    parse_pytest_log,
+)
+from report_html_theme import EDITORIAL_THEME_CSS  # noqa: E402
+
+
+def _buildkite_token() -> str | None:
+    tok = (os.environ.get("BUILDKITE_API_TOKEN") or os.environ.get("BUILDKITE_TOKEN") or "").strip()
+    return tok or None
+
+
+# Inline SVG paths (24×24, stroke) for HTML report headings — no external assets.
+_SVG_CLIPBOARD = (
+    '<path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>'
+    '<rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>'
+)
+_SVG_CLOUD = '<path d="M18 10h-1.26A8 8 0 1 0 9 22h9a5 5 0 1 0 0-12z"/>'
+_SVG_SERVER = (
+    '<rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>'
+    '<rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>'
+    '<line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>'
+)
+_SVG_ALERT = (
+    '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>'
+    '<line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>'
+)
+_SVG_LIST = '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>'
+_SVG_CODE = '<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>'
+_SVG_MSG = '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'
+_SVG_SPARK = '<path d="m12 3-1.9 5.8L4 10l5.8 1.9L12 18l1.9-5.8L20 10l-6.2-1.9L12 3z"/>'
+_SVG_LOG = (
+    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>'
+    '<polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/>'
+    '<line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/>'
+)
+# Plus-in-circle (new issue)
+_SVG_PLUS_ISSUE = (
+    '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>'
+)
+# Subcollapsible section icons (summary row)
+_SVG_CHART_BARS = (
+    '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>'
+)
+
+VLLM_OMNI_REPO = os.environ.get("VLLM_OMNI_ISSUE_REPO", "https://github.com/vllm-project/vllm-omni").strip().rstrip("/")
+VLLM_OMNI_BUG_ISSUE_TEMPLATE = "400-bug-report.yml"
+# GitHub issue form field ids — must match explicit `id` in vllm-omni
+# `.github/ISSUE_TEMPLATE/400-bug-report.yml` (URL query prefill only works with `id`).
+VLLM_OMNI_BUG_ENV_FIELD_ID = "current-environment"
+VLLM_OMNI_BUG_ENV_COLLECT_PLACEHOLDER = "Your output of `python collect_env.py` here"
+VLLM_OMNI_BUG_ENV_DEFAULT_VALUE = (
+    "<details>\n"
+    "<summary>The output of <code>python collect_env.py</code></summary>\n\n"
+    "```text\n"
+    f"{VLLM_OMNI_BUG_ENV_COLLECT_PLACEHOLDER}\n"
+    "```\n\n"
+    "</details>"
+)
+VLLM_OMNI_BUG_ENV_CI_REPLACEMENT = "ci env"
+VLLM_OMNI_BUG_CODE_VERSION_FIELD_ID = "code-version"
+VLLM_OMNI_BUG_DESCRIBE_FIELD_ID = "bug-description"
+# GitHub issue labels (exact repo names). Local Submit issue: bug only; CI: bug + ci-failure + high priority.
+VLLM_OMNI_BUG_ISSUE_LABELS_CI = ("bug", "ci-failure", "high priority")
+VLLM_OMNI_BUG_ISSUE_LABELS_LOCAL = ("bug",)
+
+
+def _vllm_omni_bug_env_ci_prefill() -> str:
+    return VLLM_OMNI_BUG_ENV_DEFAULT_VALUE.replace(
+        VLLM_OMNI_BUG_ENV_COLLECT_PLACEHOLDER,
+        VLLM_OMNI_BUG_ENV_CI_REPLACEMENT,
+    )
+
+
+# Total raw log bytes (per failing local job) embeddable in HTML; larger logs get a notice + paths only.
+FULL_LOG_EMBED_MAX_BYTES = 2 * 1024 * 1024
+DEFAULT_KANBAN_ASSETS_DIR = (
+    Path(os.environ.get("KANBAN_ASSETS_DIR", "").strip()).resolve()
+    if os.environ.get("KANBAN_ASSETS_DIR", "").strip()
+    else None
+)
+DEFAULT_KANBAN_REPO_ROOT = resolve_kanban_repo_root()
+
+
+@dataclass
+class KanbanAssetsConfig:
+    assets_dir: Path | None
+    repo_root: Path | None
+    expected_remote: str | None = None
+    expected_branch: str | None = None
+    raw_root: Path | None = None
+    refresh_from_raw: bool = False
+    refresh_note: str | None = None
+    refresh_warnings: list[str] = field(default_factory=list)
+
+
+# Keep this list aligned with https://github.com/hsliuustc0106/vllm-omni-kanban/blob/main/scripts/mkdocs_hooks.py and
+# the maintenance note in SKILL.md.
+KANBAN_RAW_MODEL_SYNCS: tuple[tuple[str, str], ...] = (
+    ("qwen3omni", "qwen3_omni"),
+    ("qwen3tts", "qwen3_tts"),
+    ("qwen_image", "qwen_image"),
+    ("qwen_image_edit", "qwen_image_edit"),
+    ("qwen_image_edit_2509", "qwen_image_edit_2509"),
+    ("wan22", "wan22"),
+)
+KANBAN_RAW_PATTERNS = (
+    "result_test_*.json",
+    "diffusion_result_*.json",
+    "benchmark_results_*.json",
+)
+
+
+def _svg_icon(inner: str, *, size: int = 20, extra_class: str = "") -> str:
+    c = f"ico {extra_class}".strip()
+    return (
+        f'<svg class="{c}" width="{size}" height="{size}" viewBox="0 0 24 24" '
+        'aria-hidden="true" focusable="false" fill="none" stroke="currentColor" '
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        f"{inner}</svg>"
+    )
+
+
+def _heading_html(
+    tag: str,
+    icon_paths: str,
+    label_inner: str,
+    *,
+    sub: str | None = None,
+    klass: str | None = None,
+) -> str:
+    """`label_inner` / `sub` are trusted HTML fragments (callers must escape)."""
+    attrs = ""
+    if klass:
+        attrs = f' class="{html.escape(klass)}"'
+    sub_html = ""
+    if sub:
+        sub_html = f'<span class="heading-sub">{sub}</span>'
+    return (
+        f"<{tag}{attrs}>"
+        '<span class="heading-row">'
+        f'<span class="heading-ico">{_svg_icon(icon_paths, size=22)}</span>'
+        f'<span class="heading-text"><span class="heading-label">{label_inner}</span>{sub_html}</span>'
+        "</span>"
+        f"</{tag}>"
+    )
+
+
+def _table_wrap(table_html: str) -> str:
+    return f'<div class="table-scroll">{table_html}</div>'
+
+
+def _details_subcard(
+    title: str,
+    body_html: str,
+    *,
+    open_default: bool = False,
+    details_class: str = "",
+    icon_paths: str | None = None,
+) -> str:
+    """Collapsible sub-section inside Buildkite Test / Local Test cards."""
+    op = " open" if open_default else ""
+    extra = f" {details_class.strip()}" if details_class.strip() else ""
+    te = html.escape(title)
+    if icon_paths:
+        ico = _svg_icon(icon_paths, size=18, extra_class="report-subcard-ico")
+        label = f'<span class="report-subcard-summary-inner">{ico}<span class="report-subcard-title">{te}</span></span>'
+    else:
+        label = f'<span class="report-subcard-title">{te}</span>'
+    return (
+        f'<details class="report-subcard{extra}"{op}>'
+        f'<summary class="report-subcard-summary">{label}</summary>'
+        f'<div class="report-subcard-body">{body_html}</div>'
+        "</details>"
+    )
+
+
+def _github_issue_button_cell() -> str:
+    return (
+        '<td class="issue-action-cell">'
+        '<button type="button" class="btn-github-issue">'
+        f"{_svg_icon(_SVG_PLUS_ISSUE, size=17, extra_class='btn-issue-ico')}"
+        '<span class="btn-issue-text">Submit issue</span>'
+        "</button></td>"
+    )
+
+
+def _github_issue_submit_script() -> str:
+    """Client script: Submit issue opens GitHub bug template with all fields prefilled via URL."""
+    issue_new = f"{VLLM_OMNI_REPO}/issues/new"
+    return f"""
+<script>
+(function () {{
+  var issueBase = {json.dumps(issue_new)};
+  var bugTemplate = {json.dumps(VLLM_OMNI_BUG_ISSUE_TEMPLATE)};
+  var issueEnvFieldId = {json.dumps(VLLM_OMNI_BUG_ENV_FIELD_ID)};
+  var issueEnvCiValue = {json.dumps(_vllm_omni_bug_env_ci_prefill())};
+  var issueEnvLocalValue = {json.dumps(VLLM_OMNI_BUG_ENV_DEFAULT_VALUE)};
+  var issueCodeVersionFieldId = {json.dumps(VLLM_OMNI_BUG_CODE_VERSION_FIELD_ID)};
+  var issueDescribeFieldId = {json.dumps(VLLM_OMNI_BUG_DESCRIBE_FIELD_ID)};
+  var issueLabelsCi = {json.dumps(list(VLLM_OMNI_BUG_ISSUE_LABELS_CI))};
+  var issueLabelsLocal = {json.dumps(list(VLLM_OMNI_BUG_ISSUE_LABELS_LOCAL))};
+  var maxIssueUrlLen = 7800;
+
+  function issueLabelsFor(d) {{
+    return d.env === "ci" ? issueLabelsCi : issueLabelsLocal;
+  }}
+
+  function applyIssueLabels(u, labels) {{
+    if (!labels || !labels.length) return;
+    u.searchParams.set("labels", labels.join(","));
+  }}
+
+  function finalizeIssueUrl(u) {{
+    // URLSearchParams encodes spaces as '+'; GitHub expects '%20' in issue URLs.
+    return u.toString().replace(/\\+/g, "%20");
+  }}
+
+  function resolveVersionLines(d) {{
+    if (d.env === "ci") {{
+      var vllmLine = (d.vllmVer && d.vllmVer.trim()) ? d.vllmVer.trim() : "(not found in Buildkite step log)";
+      var omniLine;
+      if (d.omniVer && d.omniVer.trim()) {{
+        omniLine = d.omniVer.trim();
+      }} else if (d.buildCommit && d.buildCommit.trim()) {{
+        omniLine = d.buildCommit.trim();
+      }} else {{
+        omniLine = "(not found in Buildkite step log)";
+      }}
+      return {{ vllmLine: vllmLine, omniLine: omniLine }};
+    }}
+    return {{ vllmLine: "(pending)", omniLine: "(pending)" }};
+  }}
+
+  function buildCodeVersionFieldValue(d) {{
+    var ver = resolveVersionLines(d);
+    return [
+      "<details>",
+      "<summary>The commit id or version of vllm</summary>",
+      "",
+      "```text",
+      ver.vllmLine,
+      "```",
+      "</details>",
+      "<details>",
+      "<summary>The commit id or version of vllm-omni</summary>",
+      "",
+      "```text",
+      ver.omniLine,
+      "```",
+      "</details>",
+    ].join("\\n");
+  }}
+
+  function buildEnvFieldValue(d) {{
+    return d.env === "ci" ? issueEnvCiValue : issueEnvLocalValue;
+  }}
+
+  function buildDescribeFieldValue(d, excerptOverride) {{
+    var kind = d.isErr ? "pytest ERROR" : "pytest FAILED";
+    var excerpt = excerptOverride !== undefined ? excerptOverride : d.excerpt;
+    var lines = [];
+    if (d.bkBuildUrl && d.bkBuildUrl.trim()) {{
+      lines.push("**Buildkite build:** " + d.bkBuildUrl.trim());
+    }}
+    if (d.bkStepUrl && d.bkStepUrl.trim()) {{
+      var stepUrl = d.bkStepUrl.trim();
+      var stepName = (d.bkStepName && d.bkStepName.trim()) ? d.bkStepName.trim() : "";
+      if (stepName) {{
+        lines.push("**Buildkite step:** [" + stepName + "](" + stepUrl + ")");
+      }} else {{
+        lines.push("**Buildkite step:** " + stepUrl);
+      }}
+    }}
+    if (lines.length) lines.push("");
+    lines.push("**Failure kind:** " + kind);
+    lines.push("**Test node:** `" + d.node + "`");
+    lines.push("");
+    lines.push("**Log reason:**");
+    lines.push((d.reason && d.reason.trim()) ? d.reason.trim() : "(none in report)");
+    lines.push("");
+    lines.push("**Analysis:**");
+    lines.push((d.analysis && d.analysis.trim()) ? d.analysis.trim() : "(none in report)");
+    lines.push("");
+    lines.push("**Error log excerpt:**");
+    lines.push("");
+    lines.push("```text");
+    lines.push(excerpt || "(empty)");
+    lines.push("```");
+    lines.push("");
+    lines.push("---");
+    lines.push(
+      "*Generated from a nightly HTML report. Redact secrets before submitting; "
+      + "complete the checkboxes on GitHub.*"
+    );
+    return lines.join("\\n");
+  }}
+
+  function issueTitle(d) {{
+    var n = d.node.replace(/\\s*\\(ERROR\\)\\s*$/i, "");
+    var t = "[Bug]: Nightly / CI failed - " + n;
+    return t.length > 220 ? t.slice(0, 217) + "..." : t;
+  }}
+
+  function buildIssueUrl(d, opts) {{
+    opts = opts || {{}};
+    var u = new URL(issueBase);
+    u.searchParams.set("template", bugTemplate);
+    u.searchParams.set("title", issueTitle(d));
+    applyIssueLabels(u, issueLabelsFor(d));
+    u.searchParams.set(issueEnvFieldId, buildEnvFieldValue(d));
+    u.searchParams.set(issueCodeVersionFieldId, buildCodeVersionFieldValue(d));
+    u.searchParams.set(
+      issueDescribeFieldId,
+      buildDescribeFieldValue(d, opts.excerpt)
+    );
+    return u;
+  }}
+
+  function submitIssue(d) {{
+    var url = finalizeIssueUrl(buildIssueUrl(d));
+    if (url.length > maxIssueUrlLen) {{
+      var over = url.length - maxIssueUrlLen + 220;
+      var raw = d.excerpt || "";
+      var maxExcerpt = Math.max(400, raw.length - over);
+      var truncated =
+        raw.slice(0, maxExcerpt) +
+        "\\n\\n...(truncated for GitHub URL length; see HTML report for full log)";
+      url = finalizeIssueUrl(buildIssueUrl(d, {{ excerpt: truncated }}));
+    }}
+    if (url.length > maxIssueUrlLen && d.analysis) {{
+      var over2 = url.length - maxIssueUrlLen + 120;
+      var aRaw = d.analysis || "";
+      var maxAnalysis = Math.max(200, aRaw.length - over2);
+      d = Object.assign({{}}, d, {{
+        analysis: aRaw.slice(0, maxAnalysis) + "\\n\\n...(analysis truncated; see HTML report)",
+      }});
+      url = finalizeIssueUrl(buildIssueUrl(d));
+    }}
+    window.open(url, "_blank", "noopener,noreferrer");
+  }}
+
+  function gatherRow(btn) {{
+    var tr = btn.closest("tr");
+    if (!tr || !tr.cells || tr.cells.length < 5) return null;
+    var ctx = tr.getAttribute("data-report-context") || "";
+    var node = tr.cells[0].innerText.trim();
+    var reason = tr.cells[1].innerText.trim();
+    var analysis = tr.cells[2].innerText.trim();
+    var pre = tr.cells[3].querySelector(".log-excerpt--stored, .log-excerpt");
+    var excerpt = pre ? pre.innerText : "";
+    var isErr = node.indexOf("(ERROR)") !== -1;
+    var env = tr.getAttribute("data-issue-env") || "local";
+    var vllmVer = tr.getAttribute("data-vllm-version") || "";
+    var omniVer = tr.getAttribute("data-vllm-omni-version") || "";
+    var buildCommit = tr.getAttribute("data-build-commit") || "";
+    var bkBuildUrl = tr.getAttribute("data-buildkite-build-url") || "";
+    var bkStepUrl = tr.getAttribute("data-buildkite-step-url") || "";
+    var bkStepName = tr.getAttribute("data-buildkite-step-name") || "";
+    return {{
+      ctx: ctx, node: node, reason: reason, analysis: analysis, excerpt: excerpt, isErr: isErr,
+      env: env, vllmVer: vllmVer, omniVer: omniVer, buildCommit: buildCommit,
+      bkBuildUrl: bkBuildUrl, bkStepUrl: bkStepUrl, bkStepName: bkStepName,
+    }};
+  }}
+
+  document.addEventListener("click", function (ev) {{
+    var b = ev.target.closest && ev.target.closest(".btn-github-issue");
+    if (b) {{
+      ev.preventDefault();
+      var d = gatherRow(b);
+      if (d) submitIssue(d);
+    }}
+  }});
+
+  document.querySelectorAll(".btn-view-full-log").forEach(function (btn) {{
+    btn.addEventListener("click", function () {{
+      var id = btn.getAttribute("aria-controls");
+      var panel = id ? document.getElementById(id) : null;
+      if (!panel) return;
+      var nowHidden = !panel.hidden;
+      panel.hidden = nowHidden;
+      btn.setAttribute("aria-expanded", nowHidden ? "false" : "true");
+      btn.textContent = nowHidden ? "View full log" : "Collapse full log";
+    }});
+  }});
+
+  var logExcerptModal = document.getElementById("log-excerpt-modal");
+  function openLogExcerptModal(btn) {{
+    if (!logExcerptModal) return;
+    var id = btn.getAttribute("data-modal-target");
+    var stored = id ? document.getElementById(id) : null;
+    if (!stored) return;
+    var titleEl = logExcerptModal.querySelector("[data-log-modal-title]");
+    var bodyPre = logExcerptModal.querySelector("[data-log-modal-pre]");
+    if (titleEl) {{
+      titleEl.textContent = btn.getAttribute("data-log-title") || "Log excerpt";
+    }}
+    if (bodyPre) {{
+      bodyPre.textContent = stored.textContent;
+    }}
+    logExcerptModal.hidden = false;
+    document.body.classList.add("log-modal-open");
+  }}
+  function closeLogExcerptModal() {{
+    if (!logExcerptModal) return;
+    logExcerptModal.hidden = true;
+    document.body.classList.remove("log-modal-open");
+  }}
+  document.addEventListener("click", function (ev) {{
+    var openBtn = ev.target.closest && ev.target.closest(".btn-view-log-excerpt");
+    if (openBtn) {{
+      ev.preventDefault();
+      openLogExcerptModal(openBtn);
+      return;
+    }}
+    if (ev.target.closest && ev.target.closest("[data-log-modal-close]")) {{
+      ev.preventDefault();
+      closeLogExcerptModal();
+      return;
+    }}
+  }});
+  document.addEventListener("keydown", function (ev) {{
+    if (ev.key === "Escape" && logExcerptModal && !logExcerptModal.hidden) {{
+      closeLogExcerptModal();
+    }}
+  }});
+
+  function applyPerfFilters(scope) {{
+    var testSel = scope.querySelector('select[data-filter-key="test"]');
+    var metricSel = scope.querySelector('select[data-filter-key="metric"]');
+    var statusSel = scope.querySelector('select[data-filter-key="status"]');
+    var rows = scope.querySelectorAll('tr[data-perf-row="1"]');
+    var empty = scope.querySelector("[data-perf-empty]");
+    if (!testSel || !metricSel || !statusSel || !rows.length) return;
+
+    var testVal = testSel.value || "";
+    var metricVal = metricSel.value || "";
+    var statusVal = statusSel.value || "";
+    var visibleCount = 0;
+    rows.forEach(function (row) {{
+      var ok = true;
+      if (testVal && row.getAttribute("data-test") !== testVal) ok = false;
+      if (metricVal && row.getAttribute("data-metric") !== metricVal) ok = false;
+      if (statusVal && row.getAttribute("data-status") !== statusVal) ok = false;
+      row.hidden = !ok;
+      if (ok) visibleCount += 1;
+    }});
+    if (empty) {{
+      empty.hidden = visibleCount !== 0;
+    }}
+  }}
+
+  document.querySelectorAll("[data-perf-filter-scope]").forEach(function (scope) {{
+    scope.querySelectorAll("select[data-filter-key]").forEach(function (sel) {{
+      sel.addEventListener("change", function () {{
+        applyPerfFilters(scope);
+      }});
+    }});
+    applyPerfFilters(scope);
+  }});
+}})();
+</script>
+"""
+
+
+def _md_cell(s: str) -> str:
+    return (s or "").replace("|", "/").replace("\n", " ")
+
+
+def render_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+    cols = len(headers)
+    if not headers:
+        return ""
+    for row in rows:
+        if len(row) != cols:
+            raise ValueError(f"row has {len(row)} cells, expected {cols}: {row!r}")
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * cols) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def render_html_table(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    table_class: str = "",
+    row_classes: list[str] | None = None,
+    cell_suffixes: list[list[str]] | None = None,
+) -> str:
+    cls = f' class="{html.escape(table_class)}"' if table_class else ""
+    parts = [f"<table{cls}>", "<thead><tr>"]
+    for h in headers:
+        parts.append(f"<th>{html.escape(h)}</th>")
+    parts.append("</tr></thead><tbody>")
+    for i, row in enumerate(rows):
+        tr_attr = ""
+        if row_classes and i < len(row_classes) and (row_classes[i] or "").strip():
+            tr_attr = f' class="{html.escape(row_classes[i].strip())}"'
+        parts.append(f"<tr{tr_attr}>")
+        suffix_row = cell_suffixes[i] if cell_suffixes and i < len(cell_suffixes) else None
+        for j, c in enumerate(row):
+            suf = ""
+            if suffix_row is not None and j < len(suffix_row):
+                suf = (suffix_row[j] or "").strip()
+            inner = html.escape(c)
+            if suf:
+                if suf.startswith("↑"):
+                    dcls = "perf-delta perf-delta--up"
+                elif suf.startswith("↓"):
+                    dcls = "perf-delta perf-delta--down"
+                else:
+                    dcls = "perf-delta"
+                inner += f' <span class="{dcls}">{html.escape(suf)}</span>'
+            parts.append(f"<td>{inner}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "\n".join(parts)
+
+
+def _summary_row_kind(info: dict[str, Any] | None) -> str:
+    """``ok`` = no failures/errors; ``fail`` = failures; ``unknown`` = could not classify."""
+    if not info:
+        return "unknown"
+    if info.get("failed_nodes") or info.get("error_nodes"):
+        return "fail"
+    counts = extract_pytest_counts(info.get("summary"))
+    if counts["failed"] or counts["error"]:
+        return "fail"
+    summ = (info.get("summary") or "").strip()
+    if not summ:
+        return "unknown"
+    if re.search(r"\d+\s+(?:passed|failed|skipped|errors?)\b", summ, re.I):
+        return "ok"
+    return "unknown"
+
+
+def _summary_row_kind_bk(rec: dict[str, Any]) -> str:
+    if rec.get("log_error"):
+        return "fail"
+    if not rec.get("raw_url"):
+        return "unknown"
+    return _summary_row_kind(rec.get("info"))
+
+
+def _job_is_clean(info: dict[str, Any]) -> bool:
+    return not info["failed_nodes"] and not info["error_nodes"]
+
+
+def default_log_dir(repo_root: Path) -> Path:
+    return repo_root / "logs" / "nightly_jobs"
+
+
+def _combined_job_log_disk_bytes(paths: list[Path]) -> int | None:
+    """Return total on-disk size of ``paths`` in bytes, or ``None`` if ``stat`` fails."""
+    total = 0
+    for p in paths:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            return None
+    return total
+
+
+# Local Test summary: group jobs by pillar × dimension (folder / job name prefix).
+_LOCAL_SUMMARY_PILLARS = ("Omni", "TTS", "Diffusion")
+_LOCAL_SUMMARY_DIMS = ("Perf", "Acc", "Function", "doc", "stability")
+
+
+def _classify_local_nightly_job_strict(job_name: str) -> tuple[str | None, str | None]:
+    """
+    Prefix form only: ``<pillar>_<dim>`` or ``<dim>_<pillar>`` at start of name
+    (after normalizing spaces/hyphens to underscores).
+    """
+    n = job_name.strip()
+    n = re.sub(r"[\s\-]+", "_", n)
+    n = re.sub(r"_+", "_", n).lower()
+    pillar_key: str | None = None
+    dim_key: str | None = None
+    m = re.match(
+        r"^(omni|tts|diffusion|diff)_(perf|acc|function|doc|stability)(?:_|$)",
+        n,
+    )
+    if m:
+        pillar_key, dim_key = m.group(1), m.group(2)
+    else:
+        m2 = re.match(
+            r"^(perf|acc|function|doc|stability)_(omni|tts|diffusion|diff)(?:_|$)",
+            n,
+        )
+        if m2:
+            dim_key, pillar_key = m2.group(1), m2.group(2)
+    if not pillar_key or not dim_key:
+        return (None, None)
+    if pillar_key == "omni":
+        pillar = "Omni"
+    elif pillar_key == "tts":
+        pillar = "TTS"
+    elif pillar_key in ("diffusion", "diff"):
+        pillar = "Diffusion"
+    else:
+        return (None, None)
+    dim_map = {
+        "perf": "Perf",
+        "acc": "Acc",
+        "function": "Function",
+        "doc": "doc",
+        "stability": "stability",
+    }
+    dim_label = dim_map.get(dim_key)
+    if not dim_label:
+        return (None, None)
+    return (pillar, dim_label)
+
+
+def _classify_local_nightly_job_keywords(job_name: str) -> tuple[str | None, str | None]:
+    """
+    Infer pillar × dim from tokens in the job folder / file stem name
+    (e.g. ``full_moon_Diffusion_X2I_A_T_Accuracy_Test`` → Diffusion / Acc).
+    """
+    name_lower = job_name.strip().lower()
+
+    pillar: str | None = None
+    best_pi = len(name_lower) + 1
+    for pat, plabel in (
+        ("diffusion", "Diffusion"),
+        (r"(?<![a-z0-9])tts(?![a-z0-9])", "TTS"),
+        (r"(?<![a-z0-9])omni(?![a-z0-9])", "Omni"),
+    ):
+        m = re.search(pat, name_lower)
+        if m and m.start() < best_pi:
+            best_pi = m.start()
+            pillar = plabel
+
+    dim: str | None = None
+    best_di = len(name_lower) + 1
+    # Longer / compound keywords first; leftmost match wins for dim
+    for pat, dlabel in (
+        (r"accuracy", "Acc"),
+        (r"performance", "Perf"),
+        (r"functional", "Function"),
+        (r"(?<![a-z0-9])function(?![a-z0-9])", "Function"),
+        (r"documentation", "doc"),
+        (r"(?<![a-z0-9])docs(?![a-z0-9])", "doc"),
+        (r"(?<![a-z0-9])doc(?![a-z0-9])", "doc"),
+        (r"stability", "stability"),
+        (r"(?<![a-z0-9])stable(?![a-z0-9])", "stability"),
+        (r"(?<![a-z0-9])perf(?![a-z0-9])", "Perf"),
+        (r"(?<![a-z0-9])acc(?![a-z0-9])", "Acc"),
+    ):
+        m = re.search(pat, name_lower)
+        if m and m.start() < best_di:
+            best_di = m.start()
+            dim = dlabel
+
+    if pillar and dim:
+        return (pillar, dim)
+    return (None, None)
+
+
+def _classify_local_nightly_job(job_name: str) -> tuple[str | None, str | None]:
+    """
+    Map ``job_name`` (directory or flat file stem) to (pillar, dim).
+
+    1. Strict prefix: ``<pillar>_<dim>`` or reverse (see `_classify_local_nightly_job_strict`).
+    2. Keyword scan: ``diffusion`` / ``omni`` / ``tts`` and ``accuracy`` / ``perf`` / … anywhere in the name.
+    """
+    s = _classify_local_nightly_job_strict(job_name)
+    if s[0] and s[1]:
+        return s
+    return _classify_local_nightly_job_keywords(job_name)
+
+
+def _local_job_rows_with_info(
+    groups: list[tuple[str, list[Path]]],
+) -> list[tuple[str, list[Path], dict[str, Any]]]:
+    out: list[tuple[str, list[Path], dict[str, Any]]] = []
+    for job_name, paths in groups:
+        text = read_job_text(paths)
+        info = parse_pytest_log(text)
+        out.append((job_name, paths, info))
+    return out
+
+
+def _render_local_summary_table_html(
+    chunk: list[tuple[str, list[Path], dict[str, Any]]],
+) -> str:
+    summary_rows_loc: list[list[str]] = []
+    summary_row_cls_loc: list[str] = []
+    for job_name, paths, info in chunk:
+        summary_rows_loc.append(_summary_row_for_job(job_name, paths, info))
+        summary_row_cls_loc.append(f"summary-row summary-row--{_summary_row_kind(info)}")
+    return _table_wrap(
+        render_html_table(
+            [
+                "Job",
+                "Total",
+                "Passed",
+                "Failed",
+                "Skipped",
+                "Errors",
+                "Elapsed time",
+            ],
+            summary_rows_loc,
+            table_class="summary",
+            row_classes=summary_row_cls_loc,
+        )
+    )
+
+
+def _render_local_summary_grouped_html(
+    job_rows: list[tuple[str, list[Path], dict[str, Any]]],
+) -> str:
+    buckets: dict[str, dict[str, list[tuple[str, list[Path], dict[str, Any]]]]] = defaultdict(lambda: defaultdict(list))
+    uncat: list[tuple[str, list[Path], dict[str, Any]]] = []
+    for job_name, paths, info in job_rows:
+        pillar, dim = _classify_local_nightly_job(job_name)
+        if pillar and dim:
+            buckets[pillar][dim].append((job_name, paths, info))
+        else:
+            uncat.append((job_name, paths, info))
+
+    parts: list[str] = []
+    for pillar in _LOCAL_SUMMARY_PILLARS:
+        dim_map = buckets.get(pillar) or {}
+        if not any(dim_map.get(d) for d in _LOCAL_SUMMARY_DIMS):
+            continue
+        dim_blocks: list[str] = []
+        for dim in _LOCAL_SUMMARY_DIMS:
+            chunk = dim_map.get(dim) or []
+            if not chunk:
+                continue
+            chunk.sort(key=lambda t: t[0].lower())
+            tbl = _render_local_summary_table_html(chunk)
+            dim_blocks.append(
+                "\n".join(
+                    [
+                        '<details class="local-summary-dim">',
+                        f'<summary class="local-summary-dim-summary">{html.escape(dim)}</summary>',
+                        f'<div class="local-summary-dim-body">{tbl}</div>',
+                        "</details>",
+                    ]
+                )
+            )
+        parts.append(
+            "\n".join(
+                [
+                    '<details class="local-summary-pillar">',
+                    f'<summary class="local-summary-pillar-summary">{html.escape(pillar)}</summary>',
+                    '<div class="local-summary-pillar-body">',
+                    "\n".join(dim_blocks),
+                    "</div>",
+                    "</details>",
+                ]
+            )
+        )
+
+    if uncat:
+        uncat.sort(key=lambda t: t[0].lower())
+        parts.append(
+            "\n".join(
+                [
+                    '<details class="local-summary-pillar local-summary-pillar--other">',
+                    '<summary class="local-summary-pillar-summary">Other</summary>',
+                    '<div class="local-summary-pillar-body">',
+                    _render_local_summary_table_html(uncat),
+                    "</div>",
+                    "</details>",
+                ]
+            )
+        )
+
+    tail_hints = [
+        '<p class="hint">If there are failures, click <strong>View error log</strong> in the table '
+        "to open logs in a dialog.</p>",
+        '<p class="hint summary-legend">Row background: '
+        '<strong class="summary-legend--ok">green</strong> = no failures/errors for this job; '
+        '<strong class="summary-legend--fail">red</strong> = failures, errors, or log fetch failure; '
+        '<strong class="summary-legend--unk">gray</strong> = no pytest result summary detected.</p>',
+    ]
+    return ("\n".join(parts + tail_hints)) if parts else "\n".join(tail_hints)
+
+
+def _append_local_summary_grouped_markdown(
+    lines: list[str],
+    job_rows: list[tuple[str, list[Path], dict[str, Any]]],
+) -> None:
+    buckets: dict[str, dict[str, list[tuple[str, list[Path], dict[str, Any]]]]] = defaultdict(lambda: defaultdict(list))
+    uncat: list[tuple[str, list[Path], dict[str, Any]]] = []
+    for job_name, paths, info in job_rows:
+        pillar, dim = _classify_local_nightly_job(job_name)
+        if pillar and dim:
+            buckets[pillar][dim].append((job_name, paths, info))
+        else:
+            uncat.append((job_name, paths, info))
+
+    for pillar in _LOCAL_SUMMARY_PILLARS:
+        dim_map = buckets.get(pillar) or {}
+        if not any(dim_map.get(d) for d in _LOCAL_SUMMARY_DIMS):
+            continue
+        lines.append(f"#### {pillar}")
+        lines.append("")
+        for dim in _LOCAL_SUMMARY_DIMS:
+            chunk = dim_map.get(dim) or []
+            if not chunk:
+                continue
+            chunk.sort(key=lambda t: t[0].lower())
+            lines.append(f"##### {dim}")
+            lines.append("")
+            summary_rows: list[list[str]] = [_summary_row_for_job(n, p, i) for n, p, i in chunk]
+            lines.append(
+                render_markdown_table(
+                    [
+                        "Job",
+                        "Total",
+                        "Passed",
+                        "Failed",
+                        "Skipped",
+                        "Errors",
+                        "Elapsed time",
+                    ],
+                    summary_rows,
+                )
+            )
+            lines.append("")
+
+    if uncat:
+        uncat.sort(key=lambda t: t[0].lower())
+        lines.append("#### Other")
+        lines.append("")
+        summary_rows_u = [_summary_row_for_job(n, p, i) for n, p, i in uncat]
+        lines.append(
+            render_markdown_table(
+                [
+                    "Job",
+                    "Total",
+                    "Passed",
+                    "Failed",
+                    "Skipped",
+                    "Errors",
+                    "Elapsed time",
+                ],
+                summary_rows_u,
+            )
+        )
+        lines.append("")
+
+
+def markdown_local_summary_from_log_dir(log_dir: Path) -> str:
+    """
+    Markdown block matching the **grouped Summary** under nightly **Local cluster** (pillar × dim tables).
+
+    Used by ``compose_full_report.py`` for **Test Result → H200 / H800 / A100** when
+    ``--log-dir-h*`` points at a ``nightly_jobs``-style tree.
+    """
+    groups = discover_job_logs(log_dir)
+    lines: list[str] = [
+        f"*Log root:* `{log_dir}` (layout: "
+        f"[references/nightly-local-log-layout.md](references/nightly-local-log-layout.md)).",
+        "",
+        "Same grouping as local **Summary** in nightly HTML/Markdown reports "
+        "(Omni / TTS / Diffusion × Perf / Acc / …):",
+        "",
+    ]
+    if not groups:
+        lines.append(
+            "*No parseable job logs found.* Confirm the directory matches "
+            "[references/nightly-local-log-layout.md](references/nightly-local-log-layout.md)."
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    job_rows = _local_job_rows_with_info(groups)
+    _append_local_summary_grouped_markdown(lines, job_rows)
+    lines.append(
+        "*Per-job failure/error excerpts expand only in the full nightly report; "
+        "this section keeps the summary table only.*"
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def read_job_text(paths: list[Path]) -> str:
+    chunks: list[str] = []
+    for p in paths:
+        try:
+            chunks.append(p.read_text(encoding="utf-8-sig", errors="replace"))
+        except OSError as e:
+            chunks.append(f"\n<<< read error {p}: {e} >>>\n")
+    return "\n".join(chunks)
+
+
+def _read_combined_job_logs(paths: list[Path]) -> str:
+    return read_combined_job_logs(paths, include_headers=True)
+
+
+def _render_full_log_panel_html(paths: list[Path], panel_id: str) -> str:
+    """Button + hidden panel: full concatenated logs, or oversize / stat error notice."""
+    if not paths:
+        return ""
+    tb = _combined_job_log_disk_bytes(paths)
+    if tb is None:
+        inner = '<p class="note full-log-oversize">Unable to read log file metadata.</p>'
+    elif tb > FULL_LOG_EMBED_MAX_BYTES:
+        mib = tb / (1024 * 1024)
+        cap = FULL_LOG_EMBED_MAX_BYTES / (1024 * 1024)
+        lis = "".join(f"<li><code>{html.escape(str(p.resolve()))}</code></li>" for p in paths)
+        inner = (
+            f'<p class="note full-log-oversize">Merged logs are about <strong>{mib:.2f} MiB</strong>, '
+            f"exceeding the embed cap "
+            f"(<strong>{cap:.1f} MiB</strong>); full text not embedded. Open locally:</p>"
+            f'<ul class="full-log-paths">{lis}</ul>'
+        )
+    else:
+        inner = f'<pre class="log-full">{html.escape(_read_combined_job_logs(paths))}</pre>'
+    return (
+        '<div class="full-log-wrap">'
+        '<button type="button" class="btn-view-full-log" aria-expanded="false" '
+        f'aria-controls="{panel_id}">View full log</button>'
+        f'<div id="{panel_id}" class="full-log-panel" hidden>{inner}</div>'
+        "</div>"
+    )
+
+
+def _summary_row_for_job(job_name: str, paths: list[Path], info: dict[str, Any]) -> list[str]:
+    counts = extract_pytest_counts(info["summary"])
+    n_fail = len(info["failed_nodes"])
+    n_err = len(info["error_nodes"])
+
+    if info["summary"] is None and not info["failed_nodes"] and not n_err:
+        total = ok = bad = skip = errc = ""
+    else:
+        fc = counts["failed"] if counts["failed"] else n_fail
+        ec = counts["error"] if counts["error"] else n_err
+        if counts["passed"] or counts["failed"] or counts["skipped"] or counts["error"]:
+            total = str(counts["passed"] + counts["failed"] + counts["skipped"] + counts["error"])
+            ok = str(counts["passed"])
+            bad = str(fc)
+            skip = str(counts["skipped"])
+            errc = str(ec)
+        else:
+            total = ""
+            ok = "?"
+            bad = str(fc)
+            skip = str(counts["skipped"]) if counts["skipped"] else "?"
+            errc = str(ec)
+
+    dur = extract_pytest_duration_display(info.get("summary"))
+    dur_cell = _md_cell(dur) if dur else "—"
+    return [
+        _md_cell(job_name),
+        _md_cell(total),
+        _md_cell(ok),
+        _md_cell(bad),
+        _md_cell(skip),
+        _md_cell(errc),
+        dur_cell,
+    ]
+
+
+def _summary_row_for_bk_rec(rec: dict[str, Any]) -> list[str]:
+    name = rec["name"]
+    if not rec.get("raw_url"):
+        return [_md_cell(name), "", "", "", "", "", "no log URL"]
+    if rec.get("log_error"):
+        return [
+            _md_cell(name),
+            "",
+            "",
+            "",
+            "",
+            "",
+            _md_cell(f"log fetch: {rec['log_error'][:200]}"),
+        ]
+    info = rec.get("info")
+    if not info:
+        return [_md_cell(name), "", "", "", "", "", "—"]
+    return _summary_row_for_job(name, [], info)
+
+
+def _perf_num(v: Any) -> str:
+    if isinstance(v, (int, float)):
+        s = f"{float(v):.4f}".rstrip("0").rstrip(".")
+        return s or "0"
+    return "N/A"
+
+
+def _perf_pct(v: Any) -> str:
+    if isinstance(v, (int, float)):
+        sign = "+" if float(v) >= 0 else ""
+        return f"{sign}{float(v):.2f}%"
+    return "N/A"
+
+
+def _as_num(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _fmt_mtime(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+    except OSError:
+        return ""
+
+
+def _resolve_kanban_raw_root(kanban_cfg: KanbanAssetsConfig) -> Path | None:
+    if kanban_cfg.raw_root is not None:
+        return kanban_cfg.raw_root.resolve()
+    if kanban_cfg.repo_root is not None:
+        return (kanban_cfg.repo_root / "data/buildkite_nightly_raw").resolve()
+    return None
+
+
+def _collect_kanban_raw_files(raw_root: Path | None) -> list[Path]:
+    if raw_root is None or not raw_root.is_dir():
+        return []
+    files: dict[Path, None] = {}
+    for pattern in KANBAN_RAW_PATTERNS:
+        for path in raw_root.rglob(pattern):
+            if path.is_file():
+                files[path] = None
+    return sorted(files)
+
+
+def _build_ids_from_raw_files(raw_root: Path | None, paths: list[Path]) -> list[str]:
+    if raw_root is None:
+        return []
+    ids: set[str] = set()
+    for path in paths:
+        try:
+            rel = path.relative_to(raw_root)
+        except ValueError:
+            continue
+        if not rel.parts:
+            continue
+        head = rel.parts[0]
+        if head.isdigit():
+            ids.add(head)
+    return sorted(ids, key=lambda item: int(item))
+
+
+def _kanban_raw_assets_diagnostic(
+    kanban_cfg: KanbanAssetsConfig,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    assets_dir_txt = str(summary.get("assets_dir") or "")
+    assets_dir = Path(assets_dir_txt) if assets_dir_txt else None
+    history_files = sorted(assets_dir.glob("*_history.json")) if assets_dir and assets_dir.is_dir() else []
+    raw_root = _resolve_kanban_raw_root(kanban_cfg)
+    raw_files = _collect_kanban_raw_files(raw_root)
+    build_ids = _build_ids_from_raw_files(raw_root, raw_files)
+
+    latest_history = max(history_files, key=lambda p: p.stat().st_mtime) if history_files else None
+    latest_raw = max(raw_files, key=lambda p: p.stat().st_mtime) if raw_files else None
+    recommended = ""
+    if kanban_cfg.repo_root:
+        recommended = (
+            "python scripts/nightly_local_log_report.py --kanban-repo-root "
+            f"{kanban_cfg.repo_root} --kanban-refresh-from-raw ..."
+        )
+
+    return {
+        "raw_root": str(raw_root or ""),
+        "raw_exists": bool(raw_root and raw_root.is_dir()),
+        "raw_file_count": len(raw_files),
+        "raw_build_ids": build_ids[-5:],
+        "raw_latest_mtime": _fmt_mtime(latest_raw) if latest_raw else "",
+        "history_file_count": len(history_files),
+        "history_latest_mtime": _fmt_mtime(latest_history) if latest_history else "",
+        "recommended_command": recommended,
+    }
+
+
+def _kanban_repo_dirty(repo: Path) -> tuple[bool | None, str]:
+    proc = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(repo),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return None, detail[:500]
+    return bool(proc.stdout.strip()), proc.stdout.strip()[:500]
+
+
+def _kanban_python(repo: Path) -> str:
+    candidates = (
+        repo / ".venv/bin/python",
+        repo / ".venv/Scripts/python.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
+
+
+def _run_kanban_refresh_from_raw(
+    kanban_repo_root: Path | None,
+    raw_root: Path | None,
+) -> tuple[str | None, list[str]]:
+    if kanban_repo_root is None:
+        return None, ["kanban raw refresh skipped: --kanban-repo-root is required."]
+    repo = kanban_repo_root.resolve()
+    if not repo.is_dir():
+        return None, [f"kanban raw refresh skipped: repo root not found: {repo}"]
+    sync_script = repo / "scripts/sync_buildkite_raw_model_results.py"
+    gen_script = repo / "scripts/generate_charts.py"
+    missing = [str(p) for p in (sync_script, gen_script) if not p.is_file()]
+    if missing:
+        return None, ["kanban raw refresh skipped: missing script(s): " + ", ".join(missing)]
+
+    dirty, detail = _kanban_repo_dirty(repo)
+    if dirty is None:
+        return None, [
+            "kanban raw refresh skipped: unable to verify clean git working tree" + (f"; {detail}" if detail else "")
+        ]
+    if dirty:
+        return None, [
+            "kanban raw refresh skipped: kanban checkout has uncommitted changes. "
+            "Commit or clean that repo before regenerating assets." + (f" Changed entries: {detail}" if detail else "")
+        ]
+
+    warnings: list[str] = []
+    synced_models = 0
+    py = _kanban_python(repo)
+    for model_name, model_keywords in KANBAN_RAW_MODEL_SYNCS:
+        cmd = [
+            py,
+            str(sync_script),
+            "--model-name",
+            model_name,
+            "--model-keywords",
+            model_keywords,
+        ]
+        if raw_root is not None:
+            cmd.extend(["--raw-root", str(raw_root.resolve())])
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            warnings.append(
+                f"kanban raw sync failed for {model_name}: exit {proc.returncode}"
+                + (f"; {detail[:500]}" if detail else "")
+            )
+            continue
+        synced_models += 1
+
+    proc = subprocess.run(
+        [py, str(gen_script)],
+        cwd=str(repo),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        warnings.append(
+            f"kanban generate_charts.py failed: exit {proc.returncode}" + (f"; {detail[:500]}" if detail else "")
+        )
+        return None, warnings
+
+    note = f"kanban raw refresh completed: synced {synced_models} model group(s), regenerated chart history assets."
+    return note, warnings
+
+
+_PERF_TABLE_HEADERS = [
+    "Type",
+    "Config",
+    "Test",
+    "Metric",
+    "latest",
+    "baseline",
+    "vs baseline",
+    "Status",
+]
+
+
+def _render_perf_model_table_html(table_id: str, rows: list[list[str]]) -> str:
+    """Render one model performance table with per-table dropdown filters."""
+    tests = sorted({r[2] for r in rows if len(r) > 2 and r[2]})
+    metrics = sorted({r[3] for r in rows if len(r) > 3 and r[3]})
+    statuses = sorted({r[7] for r in rows if len(r) > 7 and r[7]})
+
+    def _select_html(key: str, label: str, options: list[str]) -> str:
+        opts = ['<option value="">All</option>']
+        for value in options:
+            val = html.escape(value, quote=True)
+            txt = html.escape(value)
+            opts.append(f'<option value="{val}">{txt}</option>')
+        return (
+            '<label class="perf-filter-label">'
+            f"<span>{html.escape(label)}</span>"
+            f'<select class="perf-filter-select" data-filter-key="{html.escape(key, quote=True)}">'
+            + "".join(opts)
+            + "</select></label>"
+        )
+
+    parts: list[str] = [
+        f'<div class="perf-filter-scope" data-perf-filter-scope="{html.escape(table_id, quote=True)}">',
+        '<div class="perf-filter-bar">',
+        _select_html("test", "Test", tests),
+        _select_html("metric", "Metric", metrics),
+        _select_html("status", "Status", statuses),
+        "</div>",
+    ]
+    parts.append('<div class="table-scroll">')
+    parts.append('<table class="summary perf-filter-table">')
+    parts.append("<thead><tr>")
+    for h in _PERF_TABLE_HEADERS:
+        parts.append(f"<th>{html.escape(h)}</th>")
+    parts.append("</tr></thead><tbody>")
+    for row in rows:
+        test_v = html.escape((row[2] if len(row) > 2 else ""), quote=True)
+        metric_v = html.escape((row[3] if len(row) > 3 else ""), quote=True)
+        status_v = html.escape((row[7] if len(row) > 7 else ""), quote=True)
+        parts.append(f'<tr data-perf-row="1" data-test="{test_v}" data-metric="{metric_v}" data-status="{status_v}">')
+        for cell in row:
+            parts.append(f"<td>{html.escape(cell)}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table></div>")
+    parts.append('<p class="note perf-filter-empty" data-perf-empty hidden>No rows match filters.</p>')
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
+def _grouped_rows_from_summary(summary: dict[str, Any]) -> dict[str, list[list[str]]]:
+    grouped_rows: dict[str, list[list[str]]] = {}
+    for item in summary.get("rows", []):
+        model = _md_cell(str(item.get("model") or "unknown"))
+        grouped_rows.setdefault(model, []).append(
+            [
+                _md_cell(str(item.get("model_type") or "")),
+                _md_cell(str(item.get("config_view") or "")),
+                _md_cell(str(item.get("test_name") or "")),
+                _md_cell(str(item.get("metric") or "")),
+                _perf_num(item.get("latest")),
+                _perf_num(item.get("baseline")),
+                _perf_pct(item.get("vs_baseline_pct")),
+                _md_cell(str(item.get("status") or "")),
+            ]
+        )
+    return grouped_rows
+
+
+def _filter_perf_summary_for_local(
+    summary: dict[str, Any],
+    *,
+    local_repo_root: Path,
+) -> dict[str, Any]:
+    result_root = (local_repo_root / "tests/dfx/perf/results").resolve()
+    resolved_dir = resolve_local_perf_result_dir(result_root)
+    perf_files = local_perf_result_files(resolved_dir) if resolved_dir else []
+    local_keys = collect_local_perf_test_keys(resolved_dir)
+
+    out = dict(summary)
+    scope: dict[str, Any] = {
+        "result_root": str(result_root),
+        "resolved_dir": str(resolved_dir) if resolved_dir else "",
+        "perf_file_count": len(perf_files),
+        "test_key_count": len(local_keys),
+    }
+
+    if not perf_files:
+        out["rows"] = []
+        out["status"] = "empty"
+        out["message"] = (
+            f"No local perf JSON under {result_root}. "
+            "Sync tests/dfx/perf/results from the cluster before generating the report."
+        )
+        out["summary"] = {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
+        scope["message"] = (
+            f"No local perf JSON under {result_root}; Local performance baseline comparison "
+            f"shows only synced-result cases."
+        )
+        out["local_perf_scope"] = scope
+        return out
+
+    filtered = [
+        row for row in summary.get("rows", []) if isinstance(row, dict) and perf_row_matches_local_test(row, local_keys)
+    ]
+    stats = {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
+    for row in filtered:
+        st = str(row.get("status") or "n/a")
+        stats[st] = stats.get(st, 0) + 1
+
+    out["rows"] = filtered
+    out["summary"] = stats
+    if filtered:
+        out["status"] = "ok"
+        out["message"] = ""
+        scope["message"] = (
+            f"Synced {len(perf_files)} perf JSON file(s) → showing {len(filtered)} baseline row(s) "
+            f"({len(local_keys)} test key(s))."
+        )
+    else:
+        out["status"] = "empty"
+        out["message"] = (
+            "Local perf JSON present but no kanban history rows matched. "
+            "Run prepare_kanban_before_report.py (manual_* + mkdocs build) then regenerate."
+        )
+        scope["message"] = (
+            f"{len(perf_files)} local perf JSON file(s) present but no kanban history rows matched; "
+            "run prepare_kanban_before_report.py first."
+        )
+    out["local_perf_scope"] = scope
+    return out
+
+
+def _buildkite_perf_rows(
+    kanban_cfg: KanbanAssetsConfig,
+    *,
+    local_repo_root: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, list[list[str]]]]:
+    summary = build_assets_perf_summary(
+        assets_dir=kanban_cfg.assets_dir,
+        kanban_repo_root=kanban_cfg.repo_root,
+        expected_remote=kanban_cfg.expected_remote,
+        expected_branch=kanban_cfg.expected_branch,
+    )
+    if kanban_cfg.refresh_note:
+        summary.setdefault("warnings", []).append(kanban_cfg.refresh_note)
+    for warning in kanban_cfg.refresh_warnings:
+        summary.setdefault("warnings", []).append(warning)
+    if summary.get("status") != "ok" or kanban_cfg.refresh_warnings:
+        summary["raw_fallback"] = _kanban_raw_assets_diagnostic(kanban_cfg, summary)
+    if local_repo_root is not None:
+        summary = _filter_perf_summary_for_local(summary, local_repo_root=local_repo_root)
+    grouped_rows = _grouped_rows_from_summary(summary)
+    return summary, grouped_rows
+
+
+def _kanban_fallback_items(summary: dict[str, Any]) -> list[str]:
+    diag = summary.get("raw_fallback") or {}
+    if not isinstance(diag, dict):
+        return []
+    items = [
+        "Local nightly_jobs is for pass/fail analysis only; Local performance baseline comparison "
+        "shows tests/dfx/perf/results synced cases; Buildkite performance baseline comparison "
+        "reads all models from kanban docs/assets/charts/*_history.json.",
+    ]
+    raw_root = str(diag.get("raw_root") or "")
+    if raw_root:
+        items.append(f"kanban raw root: {raw_root}")
+    raw_count = int(diag.get("raw_file_count") or 0)
+    if diag.get("raw_exists"):
+        items.append(f"raw perf JSON files: {raw_count}")
+    else:
+        items.append("raw perf JSON root is missing or not a directory.")
+    build_ids = diag.get("raw_build_ids") or []
+    if build_ids:
+        items.append("recent raw build ids: " + ", ".join(str(v) for v in build_ids))
+    if diag.get("raw_latest_mtime"):
+        items.append(f"latest raw mtime: {diag.get('raw_latest_mtime')}")
+    items.append(f"history files: {int(diag.get('history_file_count') or 0)}")
+    if diag.get("history_latest_mtime"):
+        items.append(f"latest history mtime: {diag.get('history_latest_mtime')}")
+    if raw_count:
+        items.append(
+            "Raw data is present. Re-run with --kanban-refresh-from-raw to invoke kanban sync "
+            "+ generate_charts before rendering."
+        )
+    elif diag.get("recommended_command"):
+        items.append(f"Refresh command pattern: {diag.get('recommended_command')}")
+    return items
+
+
+def _render_kanban_fallback_html(summary: dict[str, Any]) -> str:
+    items = _kanban_fallback_items(summary)
+    if not items:
+        return ""
+    return (
+        '<div class="note"><strong>Raw data fallback diagnostics:</strong><ul>'
+        + "".join(f"<li>{html.escape(item)}</li>" for item in items)
+        + "</ul></div>"
+    )
+
+
+def _append_kanban_fallback_markdown(lines: list[str], summary: dict[str, Any]) -> None:
+    items = _kanban_fallback_items(summary)
+    if not items:
+        return
+    lines.append("- **Raw data fallback diagnostics:**")
+    for item in items:
+        lines.append(f"  - {_md_cell(item)}")
+
+
+def _render_buildkite_perf_inner_html(
+    kanban_cfg: KanbanAssetsConfig,
+    *,
+    model_subcard_class: str = "report-subcard--bk-perf-model",
+    local_repo_root: Path | None = None,
+) -> str:
+    summary, grouped_rows = _buildkite_perf_rows(
+        kanban_cfg,
+        local_repo_root=local_repo_root,
+    )
+    parts: list[str] = [
+        '<p class="meta"><strong>Data source:</strong> '
+        f"<code>{html.escape(str(summary.get('assets_dir') or ''))}</code></p>"
+    ]
+    local_scope = summary.get("local_perf_scope") or {}
+    if local_scope.get("message"):
+        parts.append(f'<p class="meta"><strong>Local filter:</strong> {html.escape(str(local_scope["message"]))}</p>')
+        if local_scope.get("resolved_dir"):
+            parts.append(
+                '<p class="meta"><strong>Perf JSON:</strong> '
+                f"<code>{html.escape(str(local_scope['resolved_dir']))}</code></p>"
+            )
+    history = summary.get("history") or {}
+    if history:
+        file_count = len(history.get("files") or [])
+        parts.append(
+            '<p class="meta"><strong>History:</strong> '
+            f"{file_count} files, "
+            f"{int(history.get('group_count') or 0)} groups, "
+            f"selection={html.escape(str(history.get('selection') or ''))}"
+            + (
+                f", generated_at=<code>{html.escape(str(history.get('generated_at') or ''))}</code>"
+                if history.get("generated_at")
+                else ""
+            )
+            + "</p>"
+        )
+    warnings = summary.get("warnings") or []
+    if warnings:
+        warn_html = "".join(f"<li>{html.escape(str(w))}</li>" for w in warnings)
+        parts.append(f'<div class="note"><strong>Source config notes:</strong><ul>{warn_html}</ul></div>')
+    if summary.get("status") != "ok":
+        msg = summary.get("message") or "No performance rows available."
+        parts.append(f'<p class="note">{html.escape(str(msg))}</p>')
+        fallback_html = _render_kanban_fallback_html(summary)
+        if fallback_html:
+            parts.append(fallback_html)
+        return "\n".join(parts)
+    parts.append(
+        '<p class="hint">'
+        + (
+            "Showing baseline comparison in kanban history only for cases synced to tests/dfx/perf/results."
+            if local_repo_root is not None
+            else (
+                f"Showing latest day ({html.escape(str(summary.get('latest_day') or 'N/A'))}) "
+                f"model records that include a baseline."
+            )
+        )
+        + "</p>"
+    )
+    stats = summary.get("summary", {})
+    parts.append(
+        '<p class="meta"><strong>Stats:</strong> '
+        f"pass={int(stats.get('pass', 0))}, "
+        f"normal={int(stats.get('normal', 0))}, "
+        f"fail={int(stats.get('fail', 0))}, "
+        f"n/a={int(stats.get('n/a', 0))}</p>"
+    )
+    for i, model_name in enumerate(sorted(grouped_rows.keys())):
+        model_rows = grouped_rows[model_name]
+        table_html = _render_perf_model_table_html(f"perf-model-{i}", model_rows)
+        parts.append(
+            _details_subcard(
+                f"{model_name} ({len(model_rows)} rows)",
+                table_html,
+                open_default=False,
+                details_class=model_subcard_class,
+                icon_paths=_SVG_LIST,
+            )
+        )
+    return "\n".join(parts)
+
+
+def _append_local_perf_baseline_markdown(
+    lines: list[str],
+    kanban_cfg: KanbanAssetsConfig,
+    *,
+    repo_root: Path,
+) -> None:
+    lines.append("## Local performance baseline comparison")
+    lines.append("")
+    summary, grouped_rows = _buildkite_perf_rows(kanban_cfg, local_repo_root=repo_root)
+    _append_buildkite_perf_markdown(lines, summary, grouped_rows)
+
+
+def _append_buildkite_perf_markdown(
+    lines: list[str], summary: dict[str, Any], grouped_rows: dict[str, list[list[str]]]
+) -> None:
+    lines.append(f"- **Data source:** `{summary.get('assets_dir') or ''}`")
+    history = summary.get("history") or {}
+    if history:
+        lines.append(
+            f"- **History:** `{len(history.get('files') or [])}` files / "
+            f"`{int(history.get('group_count') or 0)}` groups / "
+            f"selection `{history.get('selection') or ''}`"
+        )
+        if history.get("generated_at"):
+            lines.append(f"- **History generated_at:** `{history.get('generated_at')}`")
+    for warning in summary.get("warnings") or []:
+        lines.append(f"- **Note:** {_md_cell(str(warning))}")
+    if summary.get("status") != "ok":
+        lines.append(f"- **Description:** {_md_cell(str(summary.get('message') or 'No performance rows available.'))}")
+        _append_kanban_fallback_markdown(lines, summary)
+        lines.append("")
+        return
+    stats = summary.get("summary", {})
+    lines.append(f"- **Latest date:** `{summary.get('latest_day')}`")
+    lines.append(
+        f"- **Stats:** pass `{int(stats.get('pass', 0))}` / "
+        f"normal `{int(stats.get('normal', 0))}` / "
+        f"fail `{int(stats.get('fail', 0))}` / n-a `{int(stats.get('n/a', 0))}`"
+    )
+    lines.append("")
+    lines.append("*Grouped by model (Markdown has no collapse).*")
+    lines.append("")
+    for model_name in sorted(grouped_rows.keys()):
+        lines.append(f"#### {model_name}")
+        lines.append("")
+        lines.append(
+            render_markdown_table(
+                _PERF_TABLE_HEADERS,
+                grouped_rows[model_name],
+            )
+        )
+        lines.append("")
+
+
+def _append_buildkite_markdown(
+    lines: list[str],
+    bk_build: dict[str, Any] | None,
+    bk_jobs: list[dict[str, Any]] | None,
+    bk_note: str | None,
+    kanban_cfg: KanbanAssetsConfig,
+) -> None:
+    lines.append("## Buildkite: latest scheduled nightly (main)")
+    lines.append("")
+    if bk_note:
+        lines.append(bk_note)
+        lines.append("")
+        lines.append("### Performance baseline comparison")
+        lines.append("")
+        summary, grouped_rows = _buildkite_perf_rows(kanban_cfg)
+        _append_buildkite_perf_markdown(lines, summary, grouped_rows)
+        return
+    if not bk_build or bk_jobs is None:
+        lines.append("*(Buildkite section not available.)*")
+        lines.append("")
+        lines.append("### Performance baseline comparison")
+        lines.append("")
+        summary, grouped_rows = _buildkite_perf_rows(kanban_cfg)
+        _append_buildkite_perf_markdown(lines, summary, grouped_rows)
+        return
+    bn = int(bk_build["number"])
+    build_url = f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{bn}"
+    lines.append(f"- **Build:** [{bn}]({build_url})")
+    lines.append(f"- **State:** `{bk_build.get('state') or ''}`")
+    lines.append(f"- **Message:** {_md_cell((bk_build.get('message') or '')[:500])}")
+    co = (bk_build.get("commit") or "")[:12]
+    if co:
+        lines.append(f"- **Commit:** `{co}`")
+    lines.append("")
+    sum_rows = [_summary_row_for_bk_rec(r) for r in bk_jobs]
+    lines.append(
+        render_markdown_table(
+            ["Job", "Total", "Passed", "Failed", "Skipped", "Errors", "Elapsed time"],
+            sum_rows,
+        )
+    )
+    lines.append("")
+    lines.append("*Failed Buildkite steps only: detailed excerpts below. Passing steps are in the table only.*")
+    lines.append("")
+    lines.append("### Performance baseline comparison")
+    lines.append("")
+    summary, grouped_rows = _buildkite_perf_rows(kanban_cfg)
+    _append_buildkite_perf_markdown(lines, summary, grouped_rows)
+    for rec in bk_jobs:
+        info = rec.get("info")
+        if rec.get("log_error"):
+            lines.append(f"### Buildkite step: `{_md_cell(rec['name'])}` (log fetch failed)")
+            lines.append("")
+            lines.append(f"- **Step link:** {rec['step_link']}")
+            lines.append(f"- **Error:** {_md_cell(rec['log_error'][:500])}")
+            lines.append("")
+            continue
+        if not info or _job_is_clean(info):
+            continue
+        lines.append(f"### Buildkite step: `{_md_cell(rec['name'])}`")
+        lines.append("")
+        lines.append(f"- **Step link:** [{rec['step_link']}]({rec['step_link']})")
+        lines.append("")
+        fail_rows: list[list[str]] = []
+        for node in info["failed_nodes"]:
+            fail_rows.append(
+                [
+                    _md_cell(node),
+                    _md_cell(info["failed_reasons"].get(node, "")),
+                    _md_cell(info["failure_analyses"].get(node, "")),
+                    _excerpt_md_cell(info["failure_excerpts"].get(node, "")),
+                ]
+            )
+        for node in info["error_nodes"]:
+            fail_rows.append(
+                [
+                    _md_cell(node) + " (ERROR)",
+                    _md_cell(info["error_reasons"].get(node, "")),
+                    _md_cell(info["error_analyses"].get(node, "")),
+                    _excerpt_md_cell(info["error_excerpts"].get(node, "")),
+                ]
+            )
+        lines.append("#### Failures & errors")
+        lines.append("")
+        lines.append(
+            render_markdown_table(
+                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)"],
+                fail_rows,
+            )
+        )
+        lines.append("")
+
+
+def _excerpt_md_cell(excerpt: str, limit: int = 900) -> str:
+    t = (excerpt or "").replace("\n", " ").strip()
+    if len(t) > limit:
+        t = t[: limit - 1] + "…"
+    return _md_cell(t)
+
+
+def emit_report(
+    *,
+    title: str,
+    repo_root: Path,
+    log_dir: Path,
+    out_fp: Any,
+    bk_build: dict[str, Any] | None = None,
+    bk_jobs: list[dict[str, Any]] | None = None,
+    bk_note: str | None = None,
+    kanban_cfg: KanbanAssetsConfig | None = None,
+) -> None:
+    groups = discover_job_logs(log_dir)
+    if kanban_cfg is None:
+        kanban_cfg = KanbanAssetsConfig(
+            assets_dir=DEFAULT_KANBAN_ASSETS_DIR,
+            repo_root=DEFAULT_KANBAN_REPO_ROOT,
+        )
+
+    lines: list[str] = [
+        f"# {_md_cell(title)}",
+        "",
+    ]
+
+    _append_buildkite_markdown(lines, bk_build, bk_jobs, bk_note, kanban_cfg)
+
+    lines.append("## Local cluster (nightly_jobs)")
+    lines.append("")
+
+    if not groups:
+        lines.append(
+            f"*No job logs found under `{log_dir}`. "
+            "Confirm nightly jobs ran, copy logs from the cluster "
+            "(vllm-omni-local-test references/nightly-local-log-fetch.md), "
+            "and match paths in references/nightly-local-log-layout.md.*"
+        )
+        lines.append("")
+        _append_local_perf_baseline_markdown(lines, kanban_cfg, repo_root=repo_root)
+        print("\n".join(lines), file=out_fp)
+        return
+
+    job_rows = _local_job_rows_with_info(groups)
+
+    lines.append("### Summary")
+    lines.append("")
+    _append_local_summary_grouped_markdown(lines, job_rows)
+    lines.append(
+        "*Failed and errored jobs only: detailed excerpts below. Passing jobs appear in the summary table only.*"
+    )
+    lines.append("")
+    _append_local_perf_baseline_markdown(lines, kanban_cfg, repo_root=repo_root)
+
+    for job_name, paths, info in job_rows:
+        if _job_is_clean(info):
+            continue
+        lines.append(f"### Local job: `{_md_cell(job_name)}`")
+        lines.append("")
+        lines.append(
+            "*Full logs: in the HTML report click **View full log** to expand embedded text, "
+            "or open these files locally.*"
+        )
+        rel = ", ".join(f"`{p.name}`" for p in paths)
+        lines.append(f"- {rel}")
+        lines.append("")
+
+        fail_rows: list[list[str]] = []
+        for node in info["failed_nodes"]:
+            fail_rows.append(
+                [
+                    _md_cell(node),
+                    _md_cell(info["failed_reasons"].get(node, "")),
+                    _md_cell(info["failure_analyses"].get(node, "")),
+                    _excerpt_md_cell(info["failure_excerpts"].get(node, "")),
+                ]
+            )
+        for node in info["error_nodes"]:
+            fail_rows.append(
+                [
+                    _md_cell(node) + " (ERROR)",
+                    _md_cell(info["error_reasons"].get(node, "")),
+                    _md_cell(info["error_analyses"].get(node, "")),
+                    _excerpt_md_cell(info["failure_excerpts"].get(node, "")),
+                ]
+            )
+
+        lines.append("#### Failures & errors")
+        lines.append("")
+        lines.append(
+            render_markdown_table(
+                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)"],
+                fail_rows,
+            )
+        )
+        lines.append("")
+
+    print("\n".join(lines), file=out_fp)
+
+
+def _excerpt_storage_id(report_context: str, node: str, row_index: int) -> str:
+    digest = hashlib.sha1(f"{report_context}\0{node}\0{row_index}".encode()).hexdigest()[:12]
+    return f"log-excerpt-{digest}"
+
+
+def _excerpt_cell_html(
+    excerpt: str,
+    *,
+    storage_id: str,
+    title: str,
+    max_chars: int = 8000,
+) -> str:
+    t = (excerpt or "").strip()
+    if not t:
+        return '<span class="note">—</span>'
+    if len(t) > max_chars:
+        t = t[:max_chars] + "\n... [truncated]"
+    safe_id = html.escape(storage_id)
+    safe_title = html.escape(title, quote=True)
+    return (
+        '<div class="excerpt-cell-inner">'
+        f'<button type="button" class="btn-view-log-excerpt" '
+        f'data-modal-target="{safe_id}" data-log-title="{safe_title}">'
+        "View error log</button>"
+        f'<pre id="{safe_id}" class="log-excerpt log-excerpt--stored" hidden>'
+        f"{html.escape(t)}</pre>"
+        "</div>"
+    )
+
+
+def _log_excerpt_modal_html() -> str:
+    return """
+<div id="log-excerpt-modal" class="log-excerpt-modal" hidden role="dialog" aria-modal="true"
+  aria-labelledby="log-excerpt-modal-title">
+  <div class="log-excerpt-modal-backdrop" data-log-modal-close aria-hidden="true"></div>
+  <div class="log-excerpt-modal-panel">
+    <header class="log-excerpt-modal-header">
+      <h2 id="log-excerpt-modal-title" data-log-modal-title>Log excerpt</h2>
+      <button type="button" class="log-excerpt-modal-close" data-log-modal-close aria-label="Close">&times;</button>
+    </header>
+    <div class="log-excerpt-modal-body">
+      <pre data-log-modal-pre></pre>
+    </div>
+  </div>
+</div>
+"""
+
+
+def _th_labeled(icon_paths: str, text: str, *, col_class: str = "") -> str:
+    cls = f' class="{col_class}"' if col_class else ""
+    return (
+        f'<th scope="col"{cls}>'
+        '<span class="th-lbl">'
+        f"{_svg_icon(icon_paths, size=16, extra_class='th-ico')}"
+        f"<span>{html.escape(text)}</span>"
+        "</span></th>"
+    )
+
+
+def _buildkite_build_url(build: dict[str, Any] | None) -> str:
+    if not build:
+        return ""
+    bn = build.get("number")
+    if bn is None:
+        return ""
+    return f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{int(bn)}"
+
+
+def _issue_row_data_attrs(
+    *,
+    issue_env: str = "local",
+    issue_vllm_version: str = "",
+    issue_vllm_omni_version: str = "",
+    issue_build_commit: str = "",
+    buildkite_build_url: str = "",
+    buildkite_step_url: str = "",
+    buildkite_step_name: str = "",
+) -> str:
+    def aq(s: str) -> str:
+        return html.escape(s or "", quote=True)
+
+    return (
+        f'data-issue-env="{aq(issue_env)}" '
+        f'data-vllm-version="{aq(issue_vllm_version)}" '
+        f'data-vllm-omni-version="{aq(issue_vllm_omni_version)}" '
+        f'data-build-commit="{aq(issue_build_commit)}" '
+        f'data-buildkite-build-url="{aq(buildkite_build_url)}" '
+        f'data-buildkite-step-url="{aq(buildkite_step_url)}" '
+        f'data-buildkite-step-name="{aq(buildkite_step_name)}"'
+    )
+
+
+def _render_failures_table_html(
+    info: dict[str, Any],
+    *,
+    report_context: str = "",
+    issue_env: str = "local",
+    issue_vllm_version: str = "",
+    issue_vllm_omni_version: str = "",
+    issue_build_commit: str = "",
+    buildkite_build_url: str = "",
+    buildkite_step_url: str = "",
+    buildkite_step_name: str = "",
+) -> str:
+    ctx_attr = html.escape(report_context, quote=True)
+    row_ex = _issue_row_data_attrs(
+        issue_env=issue_env,
+        issue_vllm_version=issue_vllm_version,
+        issue_vllm_omni_version=issue_vllm_omni_version,
+        issue_build_commit=issue_build_commit,
+        buildkite_build_url=buildkite_build_url,
+        buildkite_step_url=buildkite_step_url,
+        buildkite_step_name=buildkite_step_name,
+    )
+    parts: list[str] = [
+        '<table class="fail-table">',
+        "<thead><tr>",
+        _th_labeled(_SVG_CODE, "Test node"),
+        _th_labeled(_SVG_MSG, "Log reason"),
+        _th_labeled(_SVG_SPARK, "Analysis"),
+        _th_labeled(_SVG_LOG, "Log excerpt", col_class="excerpt-col"),
+        _th_labeled(_SVG_PLUS_ISSUE, "GitHub Issue"),
+        "</tr></thead>",
+        "<tbody>",
+    ]
+    row_index = 0
+    for node in info["failed_nodes"]:
+        excerpt = info["failure_excerpts"].get(node, "")
+        storage_id = _excerpt_storage_id(report_context, node, row_index)
+        row_index += 1
+        parts.extend(
+            [
+                f'<tr {row_ex} data-report-context="{ctx_attr}">',
+                f'<td class="mono">{html.escape(node)}</td>',
+                f'<td class="reason">{html.escape(info["failed_reasons"].get(node, ""))}</td>',
+                f'<td class="analysis">{html.escape(info["failure_analyses"].get(node, ""))}</td>',
+                f'<td class="excerpt-cell">{_excerpt_cell_html(excerpt, storage_id=storage_id, title=node)}</td>',
+                _github_issue_button_cell(),
+                "</tr>",
+            ]
+        )
+    for node in info["error_nodes"]:
+        label = f"{node} (ERROR)"
+        excerpt = info["error_excerpts"].get(node, "")
+        storage_id = _excerpt_storage_id(report_context, label, row_index)
+        row_index += 1
+        parts.extend(
+            [
+                f'<tr class="row-error" {row_ex} data-report-context="{ctx_attr}">',
+                f'<td class="mono">{html.escape(node)} (ERROR)</td>',
+                f'<td class="reason">{html.escape(info["error_reasons"].get(node, ""))}</td>',
+                f'<td class="analysis">{html.escape(info["error_analyses"].get(node, ""))}</td>',
+                f'<td class="excerpt-cell">{_excerpt_cell_html(excerpt, storage_id=storage_id, title=label)}</td>',
+                _github_issue_button_cell(),
+                "</tr>",
+            ]
+        )
+    parts.append("</tbody></table>")
+    return _table_wrap("\n".join(parts))
+
+
+def _render_buildkite_section_html(
+    build: dict[str, Any] | None,
+    job_records: list[dict[str, Any]] | None,
+    *,
+    note: str | None,
+    kanban_cfg: KanbanAssetsConfig,
+) -> str:
+    summary_inner: list[str] = []
+    fail_inner = '<p class="note">No data: Buildkite step logs were not loaded.</p>'
+
+    if note:
+        summary_inner.append(f'<p class="note">{html.escape(note)}</p>')
+    elif build is None or job_records is None:
+        summary_inner.append('<p class="note">Buildkite section not available.</p>')
+    else:
+        bn = int(build["number"])
+        build_url = f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{bn}"
+        meta_lines: list[str] = [
+            '<div class="meta">',
+            f'<div><strong>Build:</strong> <a href="{html.escape(build_url)}">#{bn}</a></div>',
+            f"<div><strong>State:</strong> {html.escape(str(build.get('state') or ''))}</div>",
+            f"<div><strong>Message:</strong> {html.escape((build.get('message') or '')[:500])}</div>",
+        ]
+        co = (build.get("commit") or "")[:12]
+        if co:
+            meta_lines.append(f"<div><strong>Commit:</strong> {html.escape(co)}</div>")
+        meta_lines.append("</div>")
+        summary_inner = ["".join(meta_lines)]
+        sum_rows = [_summary_row_for_bk_rec(r) for r in job_records]
+        sum_row_cls = [f"summary-row summary-row--{_summary_row_kind_bk(r)}" for r in job_records]
+        summary_inner.append(
+            _table_wrap(
+                render_html_table(
+                    ["Job", "Total", "Passed", "Failed", "Skipped", "Errors", "Elapsed time"],
+                    sum_rows,
+                    table_class="summary",
+                    row_classes=sum_row_cls,
+                )
+            )
+        )
+
+        fail_blocks: list[str] = []
+        for rec in job_records:
+            if rec.get("log_error"):
+                bits_bk_err = [
+                    '<details class="job-fail-details job-fail-details-bk">',
+                    '<summary class="job-fail-details-summary job-fail-details-summary-bk">',
+                    _heading_html(
+                        "h2",
+                        _SVG_ALERT,
+                        html.escape(f"Buildkite step: {rec['name']}"),
+                    ),
+                    '<p class="meta"><strong>Step link:</strong> '
+                    f'<a href="{html.escape(rec["step_link"])}">open</a></p>',
+                    "</summary>",
+                    '<div class="job-fail-details-body">',
+                    f'<p class="note"><strong>Log fetch failed:</strong> {html.escape(rec["log_error"][:600])}</p>',
+                    "</div></details>",
+                ]
+                fail_blocks.append("\n".join(bits_bk_err))
+                continue
+            info = rec.get("info")
+            if not info or _job_is_clean(info):
+                continue
+            bits_bk = [
+                '<details class="job-fail-details job-fail-details-bk">',
+                '<summary class="job-fail-details-summary job-fail-details-summary-bk">',
+                _heading_html(
+                    "h2",
+                    _SVG_ALERT,
+                    html.escape(f"Buildkite step: {rec['name']}"),
+                ),
+                f'<p class="meta"><strong>Step link:</strong> <a href="{html.escape(rec["step_link"])}">open</a></p>',
+                "</summary>",
+                '<div class="job-fail-details-body">',
+                _heading_html(
+                    "h3",
+                    _SVG_LIST,
+                    html.escape("Failures & errors"),
+                    klass="section-failures",
+                ),
+                _render_failures_table_html(
+                    info,
+                    report_context=(f"Buildkite scheduled nightly (main) · build #{bn} · step: {rec['name']}"),
+                    issue_env="ci",
+                    issue_vllm_version=(rec.get("ci_versions") or {}).get("vllm", ""),
+                    issue_vllm_omni_version=(rec.get("ci_versions") or {}).get("vllm_omni", ""),
+                    issue_build_commit=(rec.get("build_commit_short") or ""),
+                    buildkite_build_url=build_url,
+                    buildkite_step_url=str(rec.get("step_link") or ""),
+                    buildkite_step_name=str(rec.get("name") or ""),
+                ),
+                "</div></details>",
+            ]
+            fail_blocks.append("\n".join(bits_bk))
+
+        if fail_blocks:
+            fail_inner = (
+                '<p class="hint">Click each step title to expand or collapse failure details. '
+                "Use <strong>View error log</strong> to open logs in a dialog.</p>\n" + "\n".join(fail_blocks)
+            )
+        else:
+            fail_inner = '<p class="note">No failed steps currently, or no failure/error excerpts for any job.</p>'
+
+    return "\n".join(
+        [
+            '<section class="panel nightly-root nightly-root--buildkite">',
+            _heading_html(
+                "h2",
+                _SVG_CLOUD,
+                html.escape("Buildkite Test"),
+                sub=html.escape("Latest scheduled nightly (main)"),
+            ),
+            _details_subcard(
+                "Summary (per-job execution)",
+                "\n".join(summary_inner),
+                open_default=False,
+                details_class="report-subcard--bk",
+                icon_paths=_SVG_LIST,
+            ),
+            _details_subcard(
+                "Performance baseline comparison",
+                _render_buildkite_perf_inner_html(kanban_cfg),
+                open_default=False,
+                details_class="report-subcard--bk-perf",
+                icon_paths=_SVG_CHART_BARS,
+            ),
+            _details_subcard(
+                "Failure analysis",
+                fail_inner,
+                open_default=False,
+                details_class="report-subcard--bk-fail",
+                icon_paths=_SVG_ALERT,
+            ),
+            "</section>",
+        ]
+    )
+
+
+def _render_buildkite_note_html(note: str) -> str:
+    inner = f'<p class="note">{html.escape(note)}</p>'
+    return "\n".join(
+        [
+            '<section class="panel nightly-root nightly-root--buildkite">',
+            _heading_html(
+                "h2",
+                _SVG_CLOUD,
+                html.escape("Buildkite Test"),
+                sub=html.escape("Latest scheduled nightly (main)"),
+            ),
+            _details_subcard(
+                "Summary (per-job execution)",
+                inner,
+                open_default=False,
+                details_class="report-subcard--bk",
+                icon_paths=_SVG_LIST,
+            ),
+            _details_subcard(
+                "Failure analysis",
+                '<p class="note">No data: Buildkite step logs were not loaded.</p>',
+                open_default=False,
+                details_class="report-subcard--bk-fail",
+                icon_paths=_SVG_ALERT,
+            ),
+            "</section>",
+        ]
+    )
+
+
+def emit_report_html(
+    *,
+    title: str,
+    repo_root: Path,
+    log_dir: Path,
+    out_fp: Any,
+    bk_build: dict[str, Any] | None = None,
+    bk_jobs: list[dict[str, Any]] | None = None,
+    bk_note: str | None = None,
+    kanban_cfg: KanbanAssetsConfig | None = None,
+) -> None:
+    groups = discover_job_logs(log_dir)
+    if kanban_cfg is None:
+        kanban_cfg = KanbanAssetsConfig(
+            assets_dir=DEFAULT_KANBAN_ASSETS_DIR,
+            repo_root=DEFAULT_KANBAN_REPO_ROOT,
+        )
+
+    css = EDITORIAL_THEME_CSS
+
+    body_parts: list[str] = [
+        '<div class="top-bar"><div class="shell top-bar-inner">'
+        '<div class="brand">'
+        f'<div class="brand-mark">{_svg_icon(_SVG_CLIPBOARD, size=30, extra_class="brand-ico")}</div>'
+        '<div class="brand-copy">'
+        f"<h1>{html.escape(title)}</h1>"
+        '<p class="tagline">Nightly test report</p>'
+        "</div></div></div></div>",
+        '<div class="shell">',
+    ]
+
+    body_parts.append(
+        _render_buildkite_section_html(
+            bk_build,
+            bk_jobs,
+            note=bk_note,
+            kanban_cfg=kanban_cfg,
+        )
+    )
+
+    local_chunks: list[str] = [
+        '<section class="panel nightly-root nightly-root--local">',
+        _heading_html(
+            "h2",
+            _SVG_SERVER,
+            html.escape("Local Test"),
+        ),
+    ]
+    job_rows: list[tuple[str, list[Path], dict[str, Any]]] = []
+    if not groups:
+        summary_body = (
+            '<p class="note">No job logs found under this directory. Confirm nightly jobs ran, copy logs '
+            "(see vllm-omni-local-test references/nightly-local-log-fetch.md), "
+            "and match references/nightly-local-log-layout.md.</p>"
+        )
+    else:
+        job_rows = _local_job_rows_with_info(groups)
+        summary_body = _render_local_summary_grouped_html(job_rows)
+    local_chunks.append(
+        _details_subcard(
+            "Summary",
+            summary_body,
+            open_default=False,
+            details_class="",
+            icon_paths=_SVG_LIST,
+        )
+    )
+    local_chunks.append(
+        _details_subcard(
+            "Performance baseline comparison",
+            _render_buildkite_perf_inner_html(
+                kanban_cfg,
+                model_subcard_class="report-subcard--local-perf-model",
+                local_repo_root=repo_root,
+            ),
+            open_default=False,
+            details_class="report-subcard--local-perf-baseline",
+            icon_paths=_SVG_CHART_BARS,
+        )
+    )
+
+    fail_local_parts: list[str] = []
+    local_bk_build_url = _buildkite_build_url(bk_build)
+    if job_rows:
+        full_log_i = 0
+        for job_name, paths, info in job_rows:
+            if _job_is_clean(info):
+                continue
+            log_files = ", ".join(p.name for p in paths)
+            bits = [
+                '<details class="job-fail-details">',
+                '<summary class="job-fail-details-summary">',
+                _heading_html(
+                    "h2",
+                    _SVG_ALERT,
+                    html.escape(f"Failed local job: {job_name}"),
+                ),
+                _render_full_log_panel_html(paths, f"local-full-log-{full_log_i}"),
+                "</summary>",
+                '<div class="job-fail-details-body">',
+                _heading_html(
+                    "h3",
+                    _SVG_LIST,
+                    html.escape("Failures & errors"),
+                    klass="section-failures",
+                ),
+                _render_failures_table_html(
+                    info,
+                    report_context=(f"Local nightly_jobs · job: {job_name} · logs: {log_files}"),
+                    buildkite_build_url=local_bk_build_url,
+                ),
+                "</div></details>",
+            ]
+            fail_local_parts.append("\n".join(bits))
+            full_log_i += 1
+    if fail_local_parts:
+        fail_inner_loc = (
+            '<p class="hint">Click each job title to expand or collapse failed test lists. '
+            "Use <strong>View error log</strong> to open logs in a dialog.</p>\n" + "\n".join(fail_local_parts)
+        )
+    else:
+        fail_inner_loc = '<p class="note">No failures or errors require itemized analysis.</p>'
+    local_chunks.append(
+        _details_subcard(
+            "Failure analysis",
+            fail_inner_loc,
+            open_default=False,
+            details_class="report-subcard--local-fail",
+            icon_paths=_SVG_ALERT,
+        )
+    )
+    local_chunks.append("</section>")
+    body_parts.append("\n".join(local_chunks))
+
+    body_parts.append("</div>")
+    body_parts.append(_log_excerpt_modal_html())
+    doc = _html_document(
+        title,
+        css,
+        "\n".join(body_parts),
+        tail=_github_issue_submit_script(),
+    )
+    print(doc, file=out_fp)
+
+
+def _html_document(title: str, css: str, body: str, *, tail: str = "") -> str:
+    t = html.escape(title)
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{t}</title>
+<style>
+{css}
+</style>
+</head>
+<body>
+{body}
+{tail}
+</body>
+</html>
+"""
+
+
+def _resolve_buildkite_for_report(
+    include: bool,
+    build_no: int | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]:
+    """Return ``(build, job_records, note)``. ``note`` set when section skipped or errored."""
+    if not include:
+        return None, None, None
+    tok = _buildkite_token()
+    if not tok:
+        return (
+            None,
+            None,
+            (
+                "Buildkite section skipped: set BUILDKITE_TOKEN or BUILDKITE_API_TOKEN "
+                "to fetch the latest scheduled nightly on main (vllm/vllm-omni)."
+            ),
+        )
+    try:
+        bk_build = fetch_nightly_build(tok, build_no)
+        bk_jobs = collect_nightly_job_log_analyses(bk_build, tok)
+        return bk_build, bk_jobs, None
+    except Exception as e:
+        return None, None, f"Buildkite section failed: {e}"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Emit HTML by default (use --html-report or stdout). "
+        "Use Markdown only when explicitly requested (--markdown-report / --to-stdout markdown). "
+        "Local nightly job logs plus optional Buildkite latest scheduled nightly (needs token).",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Repository root: default log dir is <repo-root>/logs/nightly_jobs; "
+        f"also shown in the report header (default: $REPO_ROOT or "
+        f"{DEFAULT_LAPTOP_REPO_ROOT_DISPLAY}).",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="Log directory (default: <repo-root>/logs/nightly_jobs; "
+        f"repo-root from --repo-root, $REPO_ROOT, or {DEFAULT_LAPTOP_REPO_ROOT_DISPLAY}).",
+    )
+    parser.add_argument(
+        "--html-report",
+        type=Path,
+        default=None,
+        help="Write HTML report to this file.",
+    )
+    parser.add_argument(
+        "--markdown-report",
+        type=Path,
+        default=None,
+        help="Write Markdown report to this file (optional).",
+    )
+    parser.add_argument(
+        "--to-stdout",
+        choices=("html", "markdown"),
+        default="html",
+        help="Format when printing to stdout and no --html-report/--markdown-report (default: html).",
+    )
+    parser.add_argument(
+        "--no-buildkite",
+        action="store_true",
+        help="Do not call Buildkite API (local logs only).",
+    )
+    parser.add_argument(
+        "--buildkite-build",
+        type=int,
+        default=None,
+        help="Pin Buildkite build number (default: latest scheduled nightly on main).",
+    )
+    parser.add_argument(
+        "--kanban-assets-dir",
+        type=Path,
+        default=DEFAULT_KANBAN_ASSETS_DIR,
+        help=f"Path to {KANBAN_REPO_URL} docs/assets/charts for Buildkite performance summary.",
+    )
+    parser.add_argument(
+        "--kanban-repo-root",
+        type=Path,
+        default=DEFAULT_KANBAN_REPO_ROOT,
+        help=(
+            f"Local clone root of {KANBAN_REPO_URL}; "
+            "resolves docs/assets/charts and enables source validation "
+            f"(default: $KANBAN_REPO_ROOT or {DEFAULT_KANBAN_REPO_ROOT_DISPLAY})."
+        ),
+    )
+    parser.add_argument(
+        "--kanban-expected-remote",
+        default=None,
+        help="Expected kanban upstream remote name (for warning only), e.g. upstream.",
+    )
+    parser.add_argument(
+        "--kanban-expected-branch",
+        default=None,
+        help="Expected kanban branch name (for warning only), e.g. main.",
+    )
+    parser.add_argument(
+        "--kanban-raw-root",
+        type=Path,
+        default=None,
+        help="Optional kanban raw perf artifact root (default: <kanban-repo-root>/data/buildkite_nightly_raw).",
+    )
+    parser.add_argument(
+        "--kanban-refresh-from-raw",
+        action="store_true",
+        help="Opt-in: run kanban raw sync + generate_charts before reading docs/assets/charts history.",
+    )
+    parser.add_argument(
+        "--title",
+        default="Nightly local test report",
+        help="Report title.",
+    )
+    args = parser.parse_args()
+
+    if args.html_report and args.markdown_report:
+        print("Use only one of --html-report or --markdown-report.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.repo_root is not None:
+        repo = args.repo_root.resolve()
+    else:
+        repo = resolve_laptop_repo_root()
+
+    log_dir = args.log_dir.resolve() if args.log_dir else default_log_dir(repo)
+
+    bk_build, bk_jobs, bk_note = _resolve_buildkite_for_report(
+        include=not args.no_buildkite,
+        build_no=args.buildkite_build,
+    )
+    kanban_cfg = KanbanAssetsConfig(
+        assets_dir=args.kanban_assets_dir.resolve() if args.kanban_assets_dir else None,
+        repo_root=args.kanban_repo_root.resolve() if args.kanban_repo_root else None,
+        expected_remote=(args.kanban_expected_remote or "").strip() or None,
+        expected_branch=(args.kanban_expected_branch or "").strip() or None,
+        raw_root=args.kanban_raw_root.resolve() if args.kanban_raw_root else None,
+        refresh_from_raw=bool(args.kanban_refresh_from_raw),
+    )
+    if kanban_cfg.refresh_from_raw:
+        refresh_note, refresh_warnings = _run_kanban_refresh_from_raw(
+            kanban_cfg.repo_root,
+            _resolve_kanban_raw_root(kanban_cfg),
+        )
+        kanban_cfg.refresh_note = refresh_note
+        kanban_cfg.refresh_warnings = refresh_warnings
+
+    if args.html_report:
+        out = args.html_report
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", encoding="utf-8") as fp:
+            emit_report_html(
+                title=args.title,
+                repo_root=repo,
+                log_dir=log_dir,
+                out_fp=fp,
+                bk_build=bk_build,
+                bk_jobs=bk_jobs,
+                bk_note=bk_note,
+                kanban_cfg=kanban_cfg,
+            )
+    elif args.markdown_report:
+        out = args.markdown_report
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", encoding="utf-8") as fp:
+            emit_report(
+                title=args.title,
+                repo_root=repo,
+                log_dir=log_dir,
+                out_fp=fp,
+                bk_build=bk_build,
+                bk_jobs=bk_jobs,
+                bk_note=bk_note,
+                kanban_cfg=kanban_cfg,
+            )
+    else:
+        if args.to_stdout == "markdown":
+            emit_report(
+                title=args.title,
+                repo_root=repo,
+                log_dir=log_dir,
+                out_fp=sys.stdout,
+                bk_build=bk_build,
+                bk_jobs=bk_jobs,
+                bk_note=bk_note,
+                kanban_cfg=kanban_cfg,
+            )
+        else:
+            emit_report_html(
+                title=args.title,
+                repo_root=repo,
+                log_dir=log_dir,
+                out_fp=sys.stdout,
+                bk_build=bk_build,
+                bk_jobs=bk_jobs,
+                bk_note=bk_note,
+                kanban_cfg=kanban_cfg,
+            )
+
+
+if __name__ == "__main__":
+    main()

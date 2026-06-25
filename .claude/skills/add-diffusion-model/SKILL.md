@@ -317,7 +317,7 @@ Required updates:
 
 ### Step 8: Add E2E Tests
 
-**Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming, Buildkite wiring, and run commands. Also read [l4_functionality_tests.inc.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_examples/l4_functionality_tests.inc.md) and [CI_5levels.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/CI_5levels.md).
+**Follow the [vllm-omni-create-testcase skill](../vllm-omni-create-testcase/SKILL.md)** for markers, file naming, Buildkite wiring, and run commands. Also read [l4_functionality_tests.inc.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_examples/l4_functionality_tests.inc.md) and [CI_5levels.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/CI_5levels.md).
 
 Classify the model's **CI priority** first:
 
@@ -344,7 +344,7 @@ Classify the model's **CI priority** first:
 
 **Reference implementations:** `tests/e2e/online_serving/test_qwen_image_edit_expansion.py`, `tests/e2e/online_serving/test_longcat_image_expansion.py`, `tests/e2e/online_serving/test_hunyuan_video_15_expansion.py`.
 
-**Keep model-specific code inside test modules — not `tests/helpers/{slug}.py`:** deploy constants, prompts, sampling dicts, and inline `request_config` / `form_data` belong in each `test_{slug}.py` and `test_{slug}_expansion.py`. Do not add per-model files under `tests/helpers/`; reuse only repo-wide harness (`mark`, `media`, `runtime`, `stage_config`, `assertions`). **L2+ online/offline e2e:** reuse or add `send_*_request` in `tests/helpers/runtime.py` — tests call the handler, not raw `omni.generate` / HTTP. See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers**.
+**Keep model-specific code inside test modules — not `tests/helpers/{slug}.py`:** deploy constants, prompts, sampling dicts, and inline `request_config` / `form_data` belong in each `test_{slug}.py` and `test_{slug}_expansion.py`. Do not add per-model files under `tests/helpers/`; reuse only repo-wide harness (`mark`, `media`, `runtime`, `stage_config`, `assertions`). **L2+ online/offline e2e:** reuse or add `send_*_request` in `tests/helpers/runtime.py` — tests call the handler, not raw `omni.generate` / HTTP. See [vllm-omni-create-testcase skill](../vllm-omni-create-testcase/SKILL.md) § **Runtime send helpers**.
 
 ### Step 9: Add Cache-DiT Acceleration
 
@@ -622,7 +622,7 @@ See the [Profiling Single-Stage Diffusion](../../../docs/contributing/profiling.
 
 ## Reference Files
 
-- [vllm-omni-test skill](../vllm-omni-test/SKILL.md) — L1–L4 markers, naming, Buildkite wiring, run commands
+- [vllm-omni-create-testcase skill](../vllm-omni-create-testcase/SKILL.md) — L1–L4 markers, naming, Buildkite wiring, run commands
 - [Transformer Adaptation](references/transformer-adaptation.md) — porting transformers from diffusers
 - [Custom Model Patterns](references/custom-model-patterns.md) — patterns for non-diffusers models
 - [Parallelism Patterns](references/parallelism-patterns.md) — TP, SP/USP, CFG parallel, HSDP implementation details

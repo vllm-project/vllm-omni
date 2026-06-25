@@ -307,7 +307,7 @@ def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
 
 ### Test Case Writing (CI Levels)
 
-**Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming (`test_{slug}.py` / `test_{slug}_expansion.py`), Buildkite wiring, and copy-paste run commands. Also read [CI_5levels.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/CI_5levels.md) and [tests_style.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/tests_style.md).
+**Follow the [vllm-omni-create-testcase skill](../vllm-omni-create-testcase/SKILL.md)** for markers, file naming (`test_{slug}.py` / `test_{slug}_expansion.py`), Buildkite wiring, and copy-paste run commands. Also read [CI_5levels.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/CI_5levels.md) and [tests_style.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/tests_style.md).
 
 Classify the model's **CI priority** first (high / medium / low). High-priority TTS models are typically those on the integration hot path or listed in tracking issues such as [#1832](https://github.com/vllm-project/vllm-omni/issues/1832); medium and low tiers cover the long tail. When unsure, ask the reviewer which tier applies.
 
@@ -362,7 +362,7 @@ def test_voice_clone_en_non_streaming_001(omni_server, openai_client) -> None:
 3. **Test file** holds `request_config` dicts only — not `omni.generate`, not `_collect_audio()`, not raw HTTP/SDK.
 4. Wire `tests/helpers/runtime.py` into Buildkite `source_file_dependencies` when you add helpers.
 
-See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers** for full tables and exceptions.
+See [vllm-omni-create-testcase skill](../vllm-omni-create-testcase/SKILL.md) § **Runtime send helpers** for full tables and exceptions.
 
 ### Deliverables
 
@@ -370,7 +370,7 @@ See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers
 - Client scripts and server launcher under `examples/online_serving/text_to_speech/<model>/`
 - Gradio demo with streaming and voice cloning UI in the same dir
 - E2E tests per **Test Case Writing (CI Levels)** above (priority tier determines L1–L4 scope)
-- Buildkite wired per level: `test-ready.yml` (L1/L2), `test-merge.yml` or nightly function job (L3), `test-nightly.yml` (L4) — see [vllm-omni-test skill](../vllm-omni-test/SKILL.md)
+- Buildkite wired per level: `test-ready.yml` (L1/L2), `test-merge.yml` or nightly function job (L3), `test-nightly.yml` (L4) — see [vllm-omni-create-testcase skill](../vllm-omni-create-testcase/SKILL.md)
 - New section in `examples/online_serving/text_to_speech/README.md` (table row + per-model section). Do **not** create a top-level `examples/online_serving/<model>/` dir or a per-model `README.md` inside `text_to_speech/<model>/`.
 
 ### E2E test pitfalls to avoid
@@ -559,6 +559,6 @@ Project docs and adjacent skills:
 - [TTS audio skill](../vllm-omni-audio-tts/SKILL.md) — supported models and usage
 - [Fish Speech integration](../vllm-omni-audio-tts/references/fish-speech.md) — complete example of Phases 1–3
 - [Qwen3-TTS reference](../vllm-omni-audio-tts/references/qwen-tts.md) — complete example of all 5 phases
-- [vllm-omni-test skill](../vllm-omni-test/SKILL.md) — L1–L4 markers, naming, Buildkite wiring, run commands
+- [vllm-omni-create-testcase skill](../vllm-omni-create-testcase/SKILL.md) — L1–L4 markers, naming, Buildkite wiring, run commands
 - [Adding a TTS model (developer guide)](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/model/adding_tts_model.md)
 - `plan/voxcpm2_native_ar_design.md` — VoxCPM2's vLLM-native AR + side-computation pattern (distinct from the generator-based single-stage described above)
