@@ -36,9 +36,9 @@ _VISION_END_TOKEN_ID = 151653  # "<|vision_end|>"
 _AR_PATCH_SIZE = 16
 
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
-T2I_STAGE_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
+T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
-_OMNI_RUNNER_PARAM = (MODEL_PATH, None, {"deploy_config": T2I_STAGE_CONFIG})
+_OMNI_RUNNER_PARAM = (MODEL_PATH, None, {"deploy_config": T2I_DEPLOY_CONFIG})
 
 # Golden pixel reference file.  Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
