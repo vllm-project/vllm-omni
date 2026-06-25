@@ -645,10 +645,7 @@ class Orchestrator:
         for stage_id, pool in enumerate(self.stage_pools):
             for replica_id in pool.live_replica_ids():
                 key = replica_key(stage_id, replica_id)
-                samples[key] = (
-                    pool.replica_outputs_queue_size(replica_id),
-                    pool.replica_inflight_count(replica_id),
-                )
+                samples[key] = pool.replica_monitor_sample(replica_id)
         return samples
 
     async def _orchestration_output_handler(self) -> None:

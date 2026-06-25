@@ -20,9 +20,9 @@ def test_replica_key_format():
 
 
 def test_create_orch_monitor_disabled_returns_null_singleton():
-    monitor = create_orch_monitor(enabled=False)
+    monitor = create_orch_monitor(enabled=False, replica_sampler=lambda: {})
     assert monitor is _NULL_ORCH_MONITOR
-    assert create_orch_monitor(enabled=False) is monitor
+    assert create_orch_monitor(enabled=False, replica_sampler=lambda: {}) is monitor
     monitor.note_loop(idle=True)
     monitor.flush()
 

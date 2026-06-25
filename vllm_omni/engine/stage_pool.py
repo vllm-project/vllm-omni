@@ -429,34 +429,34 @@ class StagePool:
             return None
         return cast(StagePoolLLMClient, client)
 
-    def replica_outputs_queue_size(self, replica_id: int) -> int:
-        """Depth of the EngineCore async client's outputs_queue (MP receive backlog)."""
-        if replica_id < 0 or replica_id >= len(self.clients) or self.clients[replica_id] is None:
-            return 0
-        outputs_queue = getattr(self.clients[replica_id], "outputs_queue", None)
-        if outputs_queue is None:
-            return 0
-        try:
-            return max(int(outputs_queue.qsize()), 0)
-        except (AttributeError, NotImplementedError, RuntimeError, ValueError):
-            return 0
+    def replica_monitor_sample(self, replica_id: int) -> tuple[int, int]:
+        """Return (outputs_queue_size, inflight) for orchestrator load diagnostics."""
+        if replica_id < 0 or replica_id >= len(self.clients):
+            return (0, 0)
+        client = self.clients[replica_id]
+        if client is None:
+            return (0, 0)
 
-    def replica_inflight_count(self, replica_id: int) -> int:
-        """Number of logical requests currently bound/routed to this replica."""
-        if replica_id < 0 or replica_id >= len(self.clients) or self.clients[replica_id] is None:
-            return 0
+        outputs_qsize = 0
+        outputs_queue = getattr(client, "outputs_queue", None)
+        if outputs_queue is not None:
+            try:
+                outputs_qsize = max(int(outputs_queue.qsize()), 0)
+            except (AttributeError, NotImplementedError, RuntimeError, ValueError):
+                pass
+
         if self._hub is not None:
-            client = self.clients[replica_id]
             input_addr = self._client_input_addr(client)
             if input_addr is not None:
                 for replica in self._hub.get_replicas_for_stage(self.stage_id).replicas:
                     if replica.input_addr == input_addr:
-                        return max(int(replica.queue_length), 0)
-        bound_legacy = sum(1 for bound_replica_id in self._request_bindings.values() if bound_replica_id == replica_id)
-        bound_affinity = sum(
-            1 for input_addr in self._affinity.values() if self._addr_to_replica_id.get(input_addr) == replica_id
-        )
-        return max(bound_legacy, bound_affinity)
+                        return (outputs_qsize, max(int(replica.queue_length), 0))
+            inflight = sum(
+                1 for input_addr in self._affinity.values() if self._addr_to_replica_id.get(input_addr) == replica_id
+            )
+        else:
+            inflight = sum(1 for bound_replica_id in self._request_bindings.values() if bound_replica_id == replica_id)
+        return (outputs_qsize, inflight)
 
     def release_binding(self, request_id: str) -> None:
         """Drop the route binding for *request_id* in this stage."""

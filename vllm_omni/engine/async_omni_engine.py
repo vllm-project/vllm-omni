@@ -234,7 +234,7 @@ class AsyncOmniEngine:
         # replica) vllm:* wrap stays registered but reads zero. Respects the
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
-        self._enable_orch_monitor = bool(kwargs.get("enable_orch_monitor", False))
+        self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 

@@ -10,6 +10,8 @@ Each 1s window records:
   - duration_s, loop_idle, loop_active (orchestrator poll-loop counts)
   - per-replica outputs_queue_size (MP client outputs_queue backlog)
   - per-replica inflight (requests currently bound/routed to the replica)
+
+See docs/contributing/profiling.md (Orchestrator Monitor).
 """
 
 from __future__ import annotations
@@ -41,21 +43,12 @@ def replica_key(stage_id: int, replica_id: int) -> str:
     return f"stage={stage_id},replica={replica_id}"
 
 
-def _default_output_path() -> str:
+def _resolve_output_path() -> str:
+    env_path = os.environ.get("VLLM_OMNI_ORCH_MONITOR_PATH")
+    if env_path:
+        return env_path
     timestamp = time.strftime("%m%d%H%M", time.localtime())
     return str(Path.cwd() / f"{_DEFAULT_OUTPUT_PREFIX}_{timestamp}.json")
-
-
-def _resolve_output_path() -> str:
-    for env_name in (
-        "VLLM_OMNI_ORCH_MONITOR_PATH",
-        "VLLM_OMNI_ORCH_OBSERVER_PATH",
-        "VLLM_OMNI_ORCH_PROFILE_PATH",
-    ):
-        env_path = os.environ.get(env_name)
-        if env_path:
-            return env_path
-    return _default_output_path()
 
 
 class OrchestratorMonitorBase(Protocol):
@@ -83,7 +76,7 @@ _NULL_ORCH_MONITOR = _NullOrchestratorMonitor()
 def create_orch_monitor(
     *,
     enabled: bool,
-    replica_sampler: ReplicaSampler | None = None,
+    replica_sampler: ReplicaSampler,
 ) -> OrchestratorMonitorBase:
     if not enabled:
         return _NULL_ORCH_MONITOR
@@ -91,9 +84,9 @@ def create_orch_monitor(
 
 
 class OrchestratorMonitor:
-    def __init__(self, *, replica_sampler: ReplicaSampler | None = None) -> None:
+    def __init__(self, *, replica_sampler: ReplicaSampler) -> None:
         self._output_path = _resolve_output_path()
-        self._dumped = False
+        self._flushed = False
         self._replica_sampler = replica_sampler
         self._window_start_mono = time.monotonic()
         self._loop_idle = 0
@@ -115,7 +108,28 @@ class OrchestratorMonitor:
             self._loop_active += 1
 
     def flush(self) -> None:
-        self.dump()
+        if self._flushed:
+            return
+        self._roll_window(time.monotonic())
+        self._flushed = True
+        payload = {
+            "configured_window_s": _WINDOW_S,
+            "windows": {
+                "duration_s": self._duration_s,
+                "loop_idle": self._loop_idle_buf,
+                "loop_active": self._loop_active_buf,
+            },
+            "replicas": dict(sorted(self._replicas.items())),
+        }
+        try:
+            output_path = Path(self._output_path).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, sort_keys=True)
+                f.write("\n")
+            self._log_summary(str(output_path))
+        except OSError:
+            logger.exception("[OrchestratorMonitor] Failed to write log to %s", self._output_path)
 
     def _ensure_replica(self, key: str) -> None:
         if key in self._replicas:
@@ -132,63 +146,30 @@ class OrchestratorMonitor:
             self._roll_window(now_mono)
 
     def _roll_window(self, now_mono: float) -> None:
-        sampled = self._replica_sampler() if self._replica_sampler is not None else {}
+        sampled = self._replica_sampler()
         self._duration_s.append(max(now_mono - self._window_start_mono, 1e-9))
         self._loop_idle_buf.append(self._loop_idle)
         self._loop_active_buf.append(self._loop_active)
         for key, series in self._replicas.items():
             outputs_qsize, inflight = sampled.get(key, (0, 0))
-            series["outputs_queue_size"].append(max(int(outputs_qsize), 0))
-            series["inflight"].append(max(int(inflight), 0))
+            series["outputs_queue_size"].append(outputs_qsize)
+            series["inflight"].append(inflight)
 
         self._loop_idle = 0
         self._loop_active = 0
         self._window_start_mono = now_mono
 
-    def dump(self) -> None:
-        if self._dumped:
-            return
-        self._roll_window(time.monotonic())
-        self._dumped = True
-        payload = {
-            "configured_window_s": _WINDOW_S,
-            "windows": {
-                "duration_s": self._duration_s,
-                "loop_idle": self._loop_idle_buf,
-                "loop_active": self._loop_active_buf,
-            },
-            "replicas": dict(sorted(self._replicas.items())),
-        }
-        summary = self._build_summary()
-        try:
-            output_path = Path(self._output_path).expanduser()
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, sort_keys=True)
-                f.write("\n")
-            self._log_summary(str(output_path), summary)
-        except OSError:
-            logger.exception("[OrchestratorMonitor] Failed to write log to %s", self._output_path)
-
-    def _build_summary(self) -> dict[str, float | int]:
+    def _log_summary(self, output_path: str) -> None:
         loop_idle = sum(self._loop_idle_buf)
         loop_active = sum(self._loop_active_buf)
         loop_total = loop_idle + loop_active
-        return {
-            "windows": len(self._duration_s),
-            "duration_s": sum(self._duration_s),
-            "loop_idle": loop_idle,
-            "loop_active": loop_active,
-            "loop_active_pct": (float(loop_active) / float(loop_total) * 100.0) if loop_total else 0.0,
-        }
-
-    def _log_summary(self, output_path: str, summary: dict[str, float | int]) -> None:
+        loop_active_pct = (float(loop_active) / float(loop_total) * 100.0) if loop_total else 0.0
         logger.info(
             "[OrchestratorMonitor] wrote %s windows=%d duration=%.3fs loop_active=%.1f%%",
             output_path,
-            int(summary["windows"]),
-            float(summary["duration_s"]),
-            float(summary["loop_active_pct"]),
+            len(self._duration_s),
+            sum(self._duration_s),
+            loop_active_pct,
         )
         for key, series in sorted(self._replicas.items()):
             queue_values = series["outputs_queue_size"]
