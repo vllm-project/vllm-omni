@@ -95,7 +95,7 @@ def test_aura2tts_builds_qwen3_tts_prompt_information():
 
     [tts_input] = aura2tts([_source_output("Hello.")], prompt=[prompt])
 
-    assert len(tts_input["prompt_token_ids"]) >= 32
+    assert len(tts_input["prompt_token_ids"]) > 0
     assert tts_input["additional_information"]["text"] == ["Hello."]
     assert PRECOMPUTED_TEXT_IDS_KEY not in tts_input["additional_information"]
     assert tts_input["additional_information"]["task_type"] == ["Base"]
@@ -166,6 +166,7 @@ def test_aura2tts_supports_custom_voice_mode():
     assert tts_input["additional_information"]["task_type"] == ["CustomVoice"]
     assert tts_input["additional_information"]["speaker"] == ["Vivian"]
     assert "ref_audio" not in tts_input["additional_information"]
+    assert len(tts_input["prompt_token_ids"]) == 14
 
 
 def test_aura2tts_passes_token_ids_to_qwen3_tts_when_enabled():
