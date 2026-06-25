@@ -150,6 +150,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return free
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.npu.mem_get_info(device)
+        return free, total
+
+    @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory

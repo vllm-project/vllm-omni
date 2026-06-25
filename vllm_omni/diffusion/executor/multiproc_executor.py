@@ -321,7 +321,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         new_req = scheduler_output.scheduled_new_reqs[0]
         result = self.collective_rpc(
             "execute_model",
-            args=(new_req.req, self.od_config),
+            args=(new_req.req, self.od_config, getattr(scheduler_output, "kv_prefetch_jobs", None)),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
