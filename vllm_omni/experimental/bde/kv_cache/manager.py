@@ -201,18 +201,18 @@ class BDEKVCache:
         # WanI2VCrossAttention (#4154 caches these model-side too). Empty for T2V.
         self._cross_k_img: list[torch.Tensor] = []
         self._cross_v_img: list[torch.Tensor] = []
+
+        # Bytes the cross-attn pools consume directly (K+V, pos+neg, all layers).
+        # Deducted from the self-attn paged-pool budget below so the two
+        # allocations together stay within the GPU free-memory budget.
+        def _cross_pool_bytes(length: int) -> int:
+            return 2 * 2 * length * num_kv_heads * head_size * dtype.itemsize * num_layers
+
+        cross_total_bytes = 0
         if device is not None and cross_attn_length > 0:
             cross_shape = (2, cross_attn_length, num_kv_heads, head_size)
-            bytes_per_element = dtype.itemsize
-            cross_bytes = (
-                2  # K + V
-                * 2  # pos + neg
-                * cross_attn_length
-                * num_kv_heads
-                * head_size
-                * bytes_per_element
-                * num_layers
-            )
+            cross_bytes = _cross_pool_bytes(cross_attn_length)
+            cross_total_bytes += cross_bytes
             for _ in range(num_layers):
                 self._cross_k.append(torch.empty(cross_shape, dtype=dtype, device=device))
                 self._cross_v.append(torch.empty(cross_shape, dtype=dtype, device=device))
@@ -226,6 +226,7 @@ class BDEKVCache:
             )
             if cross_attn_img_length > 0:
                 img_shape = (2, cross_attn_img_length, num_kv_heads, head_size)
+                cross_total_bytes += _cross_pool_bytes(cross_attn_img_length)
                 for _ in range(num_layers):
                     self._cross_k_img.append(torch.empty(img_shape, dtype=dtype, device=device))
                     self._cross_v_img.append(torch.empty(img_shape, dtype=dtype, device=device))
@@ -248,8 +249,10 @@ class BDEKVCache:
         )
         # Each pool block spans all layers' K/V, so size against the per-layer
         # page size times the layer count.
+        # Size the self-attn pool against the memory left after the cross-attn
+        # pools (allocated above), so cross + self-attn stays within the budget.
         num_blocks = compute_num_blocks(
-            available_bytes,
+            max(0, available_bytes - cross_total_bytes),
             config.gpu_memory_fraction,
             self.spec.page_size_bytes * num_layers,
         )

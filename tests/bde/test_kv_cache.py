@@ -13,6 +13,7 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.experimental.bde.kv_cache import (
+    BDEKVCache,
     BDEKVConfig,
     BDERequestAdapter,
     ChunkWindowManager,
@@ -154,3 +155,27 @@ def test_build_manager_allocate_free_roundtrip():
 
     mgr.free(adapter)
     assert mgr.block_pool.get_num_free_blocks() == free_before
+
+
+def test_cross_attn_pool_deducted_from_self_attn_budget():
+    """The cross-attn pool is allocated directly; its bytes are subtracted from
+    the self-attn paged-pool budget so the two together stay within the free
+    memory budget (review: zwhzzz0821)."""
+    L = 512
+    avail = 1 << 30  # 1 GiB
+    kv = BDEKVCache(
+        BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2, gpu_memory_fraction=0.5),
+        num_layers=2,
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float16,
+        block_size=BLOCK,
+        max_model_len=4096,
+        available_bytes=avail,
+        cross_attn_length=L,
+        device=torch.device("cpu"),
+    )
+    cross_bytes = 2 * 2 * L * 4 * 64 * torch.float16.itemsize * 2  # K+V, pos+neg, layers
+    expected = compute_num_blocks(avail - cross_bytes, 0.5, kv.spec.page_size_bytes * 2)
+    assert kv.num_blocks == expected
+    assert expected > 2 * (2 + 1) + 2  # above the min-blocks floor, so the deduction is what's tested

@@ -117,6 +117,13 @@ class BDEKVState:
             # (seq_len), not the cumulative-minus-committed delta. Allocate those
             # frame-blocks once per forward (shared across layers).
             new_count = int(seq_len)
+            # DreamZero appends whole frames each forward and chunk_size ==
+            # frame_seqlen, so seq_len is always a multiple of cs. Guard the
+            # invariant: a non-frame-aligned model would otherwise silently drop
+            # the leading new_count % cs tokens and desync num_computed.
+            assert new_count % cs == 0, (
+                f"BDE expects frame-aligned seq_len (multiple of chunk_size={cs}), got {new_count}"
+            )
             n_chunks = new_count // cs
             slots = []
             for _ in range(n_chunks):

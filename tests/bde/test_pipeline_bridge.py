@@ -183,3 +183,11 @@ def test_kv_create_owned_by_engine_under_bde():
     state = MagicMock()
     p._kv_create(state, 1, "float32", "cpu", 24, 4, 64)
     state.create_kv_caches.assert_not_called()
+
+
+def test_update_kv_cache_requires_frame_aligned_seqlen():
+    """Engine guards the frame-alignment invariant (review: zwhzzz0821) — a
+    non-multiple seq_len would otherwise silently drop the leading remainder."""
+    _, st = make_state()
+    with pytest.raises(AssertionError, match="frame-aligned"):
+        st.update_kv_cache(0, _window(1), False, seq_len=BLOCK + 1)
