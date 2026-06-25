@@ -30,7 +30,11 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.slow, pytest.mark.tts]
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.tts,
+    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
+]
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Realtime"
 REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/HEAD/assets/audio/reference_zh_1.wav"

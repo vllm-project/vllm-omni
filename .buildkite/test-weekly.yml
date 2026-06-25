@@ -225,7 +225,7 @@ steps:
           - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
             failed=0
-            for f in $(pytest --collect-only -q tests/e2e/ -m "slow and L4 and tts" --run-level "full_model" | sed -E 's|::.*||' | sort -u); do
+            for f in $(pytest --collect-only -q tests/e2e/ -m "slow and L4 and tts" --run-level "full_model" | grep '\.py::' | sed -E 's|::.*||' | sort -u); do
               pytest -s -v "$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
             done
             exit $failed

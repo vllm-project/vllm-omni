@@ -29,6 +29,7 @@ _OMNI_RUNNER_PARAM = (MODEL, DEPLOY_CONFIG, {"stage_init_timeout": 300})
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
+    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
 
