@@ -231,8 +231,9 @@ class Mammothmoda2Config(PretrainedConfig):
         architectures: list[str] | None = None,
         **kwargs,
     ) -> None:
+        # Must set llm_config before super().__init__() because the parent's
+        # validation calls get_text_config() which accesses self.llm_config
         self.llm_config = AutoConfig.for_model(**llm_config) if llm_config is not None else None
-        super().__init__(**kwargs)
         self.gen_vae_config = gen_vae_config
         self.gen_dit_config = gen_dit_config
 
@@ -245,9 +246,12 @@ class Mammothmoda2Config(PretrainedConfig):
         self.tokenizer_class = "MammothUTokenizer"
         self.architectures = ["Mammothmoda2Model"]
 
+        super().__init__(**kwargs)
+
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         if self.llm_config is None:
-            return self
+            return None
+        # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config
         return self.llm_config.text_config
 
     def _require_llm_config(self) -> PretrainedConfig:

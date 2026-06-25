@@ -198,6 +198,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         attention_kwargs: dict[str, object],
         vace_context: torch.Tensor | None,
         vace_context_scale: float,
+        boundary_timestep: float | None = None,
     ) -> torch.Tensor:
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -205,6 +206,11 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
                 set_forward_context_denoise_step_idx(step_idx)
+
+                if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                else:
+                    current_model = self.transformer if self.transformer is not None else self.transformer_2
 
                 latent_model_input = latents.to(dtype)
                 timestep = t.expand(latents.shape[0])
@@ -219,6 +225,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                     "vace_context": vace_context,
                     "vace_context_scale": vace_context_scale,
                     "return_dict": False,
+                    "current_model": current_model,
                 }
                 negative_kwargs = (
                     {
@@ -229,6 +236,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                         "vace_context": vace_context,
                         "vace_context_scale": vace_context_scale,
                         "return_dict": False,
+                        "current_model": current_model,
                     }
                     if do_true_cfg
                     else None
@@ -598,7 +606,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                 )
 
         num_reference_images = 0
-        if self.transformer.vace_patch_embedding is not None:
+        # Either expert may be the one loaded (boundary_ratio 0.0/1.0 skips one),
+        # so read it from whichever transformer exists.
+        active_transformer = self.transformer if self.transformer is not None else self.transformer_2
+        if active_transformer.vace_patch_embedding is not None:
             video, mask, ref_images_processed = self.preprocess_conditions(
                 video=source_video,
                 mask=source_mask,
@@ -640,6 +651,19 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
+        # MoE boundary: only the two-expert checkpoints (Wan2.2 A14B) have a
+        # transformer_2 to switch to. For single-expert VACE (e.g. Wan2.1) this
+        # stays None and diffuse() uses the same transformer for every step.
+        boundary_timestep = None
+        if self.transformer_2 is not None:
+            boundary_ratio = (
+                self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+            )
+            if boundary_ratio is None:
+                boundary_ratio = 0.875
+                logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
+            boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -650,6 +674,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             attention_kwargs=attention_kwargs,
             vace_context=vace_context,
             vace_context_scale=vace_context_scale,
+            boundary_timestep=boundary_timestep,
         )
 
         self._current_timestep = None

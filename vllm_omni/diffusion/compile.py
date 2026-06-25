@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
@@ -27,7 +28,11 @@ def _matches_repeated_block(
     return len(parts) >= 2 and parts[-2] in repeated_block_attrs and parts[-1].isdigit()
 
 
-def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: Any) -> nn.Module:
+def regionally_compile(
+    model: nn.Module,
+    *compile_args: Any,
+    **compile_kwargs: Any,
+) -> nn.Module:
     """
     Apply regional compilation to a PyTorch model.
 
@@ -53,8 +58,9 @@ def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: A
     compiled_region_count = 0
     for name, submod in model.named_modules():
         if _matches_repeated_block(name, submod, repeated_blocks, repeated_block_attrs):
-            # Compile this submodule
-            submod.compile(*compile_args, **compile_kwargs)
+            # Compile the block compute while keeping nn.Module.__call__ hooks
+            # outside the compiled graph.
+            submod.forward = torch.compile(submod.forward, *compile_args, **compile_kwargs)
             has_compiled_region = True
             compiled_region_count += 1
 

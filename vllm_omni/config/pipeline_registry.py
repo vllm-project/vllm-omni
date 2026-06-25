@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TypeAlias
 
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import (
@@ -69,7 +69,11 @@ from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
 )
 from vllm_omni.model_executor.models.ming_tts.pipeline import MING_TTS_PIPELINE
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
-from vllm_omni.model_executor.models.moss_tts.pipeline import MOSS_TTS_PIPELINE, MOSS_TTS_REALTIME_PIPELINE
+from vllm_omni.model_executor.models.moss_tts.pipeline import (
+    MOSS_TTS_LOCAL_PIPELINE,
+    MOSS_TTS_PIPELINE,
+    MOSS_TTS_REALTIME_PIPELINE,
+)
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
@@ -83,7 +87,7 @@ from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIP
 
 logger = init_logger(__name__)
 
-PipelineResolverFunc: TypeAlias = Callable[[PreTrainedConfig | None], PipelineConfig | None]
+PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineConfig | None]
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
@@ -120,6 +124,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "mammoth_moda2_ar": MAMMOTH_MODA2_AR_PIPELINE,
     "moss_tts_delay": MOSS_TTS_PIPELINE,
     "moss_tts_realtime": MOSS_TTS_REALTIME_PIPELINE,
+    "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "minicpmo_4_5": MINICPMO_4_5_PIPELINE,
     "higgs_audio_v2": HIGGS_AUDIO_V2_PIPELINE,
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
