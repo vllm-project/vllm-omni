@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import base64
 import dataclasses
 import io
 import json
@@ -20,7 +19,6 @@ from numbers import Integral
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
-import httpx
 import numpy as np
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
@@ -85,6 +83,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
+from vllm.multimodal.media import MediaConnector
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
@@ -110,6 +109,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
+    ResponseFormat,
 )
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
@@ -132,6 +132,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceImage,
     ReferenceVideo,
 )
+from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
@@ -573,15 +574,14 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             **uvicorn_kwargs,
         )
 
-    # NB: Await server shutdown only after the backend context is exited
-    try:
-        await shutdown_task
-    finally:
-        state = getattr(app, "state", None)
-        serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
-        if serving_speech is not None:
-            serving_speech.shutdown()
-        sock.close()
+        try:
+            await shutdown_task
+        finally:
+            state = getattr(app, "state", None)
+            serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
+            if serving_speech is not None:
+                serving_speech.shutdown()
+            sock.close()
 
 
 @asynccontextmanager
@@ -771,6 +771,11 @@ async def omni_init_app_state(
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
+            model_name=model_name,
+            stage_configs=diffusion_stage_configs,
+        )
+        state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
+            engine_client=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
         )
@@ -1594,6 +1599,23 @@ async def streaming_video_chat(websocket: WebSocket):
     await handler.handle_session(websocket)
 
 
+@router.websocket("/v1/realtime/video")
+async def streaming_video_output(websocket: WebSocket):
+    """WebSocket endpoint for streaming generated video output chunks."""
+    handler = getattr(websocket.app.state, "openai_streaming_video_output", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "Streaming video generation is not available",
+            }
+        )
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
+
+
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
@@ -1683,6 +1705,7 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
 @router.post(
     "/v1/images/generations",
     dependencies=[Depends(validate_json_request)],
+    response_model=None,
     responses={
         HTTPStatus.OK.value: {"model": ImageGenerationResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -1691,7 +1714,9 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
     },
 )
 @with_cancellation
-async def generate_images(request: ImageGenerationRequest, raw_request: Request):
+async def generate_images(
+    request: ImageGenerationRequest, raw_request: Request
+) -> ImageGenerationResponse | StreamingResponse:
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
@@ -1883,7 +1908,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         }
         if request.size:
             response_kwargs["size"] = size_str
-        return ImageGenerationResponse(**response_kwargs)
+        response = ImageGenerationResponse(**response_kwargs)
+        if request.response_format != ResponseFormat.FILE:
+            return response
+        return response.stream_response()
 
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -2008,17 +2036,23 @@ async def edit_images(
         # Match the offline path: RGB normalize when the caller opts into
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
-        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
+        pil_images = await _load_input_images(
+            input_images_list,
+            engine_client.model_config,
+            normalize_rgb=normalize_edit_images_rgb,
+        )
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # Mask role is different (alpha channel matters); never normalize.
-            loaded = await _load_input_images([mask_image], normalize_rgb=False)
+            loaded = await _load_input_images([mask_image], engine_client.model_config, normalize_rgb=False)
             prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
+            loaded = await _load_input_images(
+                [reference_image], engine_client.model_config, normalize_rgb=normalize_edit_images_rgb
+            )
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
@@ -2505,41 +2539,41 @@ def _extract_images_from_result(result: Any) -> list[Any]:
 
 async def _load_input_images(
     inputs: list[str],
+    model_config: Any,
     *,
     normalize_rgb: bool = True,
 ) -> list[Image.Image]:
+    """Load images from data URIs, http(s) URLs, file:// URIs, or UploadFiles.
+
+    http(s) and ``file:`` URLs are fetched through vLLM's ``MediaConnector`` which
+    respects ``--allowed-media-domains`` and ``--allowed-local-media-path``
+    to prevent SSRF.
     """
-    convert to PIL.Image.Image list
-    """
+
     if isinstance(inputs, str):
         inputs = [inputs]
+
+    connector = MediaConnector(
+        allowed_local_media_path=model_config.allowed_local_media_path,
+        allowed_media_domains=model_config.allowed_media_domains,
+    )
 
     images: list[Image.Image] = []
 
     for inp in inputs:
-        # 1. URL + base64
-        if isinstance(inp, str) and inp.startswith("data:image"):
+        if isinstance(inp, str):
+            # http(s), data: and file: all handled by MediaConnector
             try:
-                _, b64_data = inp.split(",", 1)
-                image_bytes = base64.b64decode(b64_data)
-                img = Image.open(io.BytesIO(image_bytes))
-                images.append(img)
+                # Use RGBA to preserve alpha for transparent PNG.
+                result = await connector.fetch_image_async(
+                    inp,
+                    image_mode="RGBA",
+                )
+                images.append(result.media)
             except Exception as e:
-                raise ValueError(f"Invalid base64 image: {e}")
-
-        # 2. URL
-        elif isinstance(inp, str) and inp.startswith("http"):
-            async with httpx.AsyncClient(timeout=60) as client:
-                try:
-                    resp = await client.get(inp)
-                    resp.raise_for_status()
-                    img = Image.open(io.BytesIO(resp.content))
-                    images.append(img)
-                except Exception as e:
-                    raise ValueError(f"Failed to download image from URL {inp}: {e}")
-
-        # 3. UploadFile
+                raise ValueError(f"Failed to load image: {e}") from e
         elif hasattr(inp, "file"):
+            # UploadFile
             try:
                 img_data = await inp.read()
                 img = Image.open(io.BytesIO(img_data))
@@ -2991,6 +3025,7 @@ async def _parse_video_form(
             request.image_reference,
             request.video_reference,
             input_reference_bytes,
+            model_config=handler._engine_client.model_config,
             max_video_frames=decode_spec.max_frames,
             video_keep=decode_spec.keep,
         )
@@ -3002,8 +3037,15 @@ async def _parse_video_form(
 
     reference_audio: ReferenceAudio | None = None
     if request.audio_reference is not None:
+        audio_connector = MediaConnector(
+            allowed_local_media_path=handler._engine_client.model_config.allowed_local_media_path,
+            allowed_media_domains=handler._engine_client.model_config.allowed_media_domains,
+        )
         try:
-            audio_path = await decode_audio_url(request.audio_reference.audio_url)
+            audio_path = await decode_audio_url(
+                request.audio_reference.audio_url,
+                audio_connector,
+            )
         except InvalidInputReferenceError as exc:
             raise HTTPException(400, detail=str(exc)) from exc
         reference_audio = ReferenceAudio(path=audio_path)

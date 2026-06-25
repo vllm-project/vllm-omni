@@ -17,8 +17,8 @@ class _FakeSummarizer:
         self.chunks += 1
         return f"summary-of-chunk-{chunk_index}"
 
-    async def compress_to_long_term(self, existing, mids):
-        return (existing + " | " if existing else "") + f"compressed({len(mids)})"
+    async def compress_to_long_term(self, mids):
+        return f"compressed({len(mids)})"
 
 
 class _FakeDelegation:
@@ -42,7 +42,7 @@ def test_query_freshness_and_archive_on_change():
     b.record_response("1 bottle")
     assert b.update_query("now describe") is True
     assert b.memory.qa_history[-1].query == "count bottles"
-    assert b.memory.qa_history[-1].responses == [("0.0s", "1 bottle")]
+    assert b.memory.qa_history[-1].responses == [("0.0 seconds", "1 bottle")]
 
 
 def test_query_in_frame_on_arrival_then_prefix_on_later_chunks():
@@ -71,7 +71,7 @@ async def test_flush_archives_qa_and_summarizes():
     assert summ.chunks == 1
     assert b.chunk_index == 2
     assert b.should_flush() is False
-    assert b.memory.qa_history[-1].responses == [("2.0s", "a person enters")]
+    assert b.memory.qa_history[-1].responses == [("2.0 seconds", "a person enters")]
     assert len(b.memory.mid_term_summaries) == 1
 
 
@@ -83,6 +83,20 @@ async def test_long_term_compression_after_n_chunks():
         await b.flush([("0.0s", "u")])
     assert b.memory.long_term_memory.startswith("compressed(")
     assert b.memory.mid_term_summaries == []
+
+
+@pytest.mark.asyncio
+async def test_long_term_window_caps_blocks():
+    # Long-term memory must not grow unbounded over hours: oldest blocks are dropped
+    # once the sliding window is full (reference window = 15; here 2 for the test).
+    summ = _FakeSummarizer()
+    b = InteractionBrain(
+        summarizer=summ, chunk_frames=1, long_term_every_n_chunks=1, long_term_window=2, frame_seconds=1.0
+    )
+    for _ in range(4):
+        await b.flush([("0.0s", "u")])
+    assert len(b.memory.long_term_blocks) == 2  # capped, not 4
+    assert b.memory.long_term_memory.count("compressed(") == 2
 
 
 @pytest.mark.asyncio

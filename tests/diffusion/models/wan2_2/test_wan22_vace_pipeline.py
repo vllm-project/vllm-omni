@@ -14,6 +14,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace import (
     create_vace_transformer_from_config,
     get_wan22_vace_pre_process_func,
 )
+from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import WanVACETransformer3DModel
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -91,6 +92,10 @@ def test_create_vace_transformer_from_config_maps_vace_specific_keys(monkeypatch
         "vace_layers": [0, 1, 2],
         "vace_in_channels": 132,
     }
+
+
+def test_vace_transformer_layerwise_offloads_conditioning_blocks() -> None:
+    assert WanVACETransformer3DModel._layerwise_offload_blocks_attrs == ["vace_blocks", "blocks"]
 
 
 def test_vace_prepare_masks_encodes_spatial_stride_and_reference_padding() -> None:

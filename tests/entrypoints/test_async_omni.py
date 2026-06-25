@@ -8,6 +8,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model]
 
@@ -194,6 +195,48 @@ def test_generate_accepts_request_after_repeated_cancellations():
         for batch, prefix in zip(aborted_request_batches, ["cancel-0-", "cancel-1-", "cancel-2-"]):
             assert len(batch) == 1
             assert batch[0].startswith(prefix)
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_yields_streaming_diffusion_chunks_before_final():
+    """AsyncOmni.generate yields every intermediate diffusion chunk before the final one."""
+
+    async def streaming_process_results(request_id, metrics, final_stage_id_for_e2e, req_start_ts, wall_start_ts):
+        del metrics, final_stage_id_for_e2e, req_start_ts, wall_start_ts
+        yield OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=[],
+            final_output_type="image",
+            custom_output={"chunk": 0},
+            finished=False,
+        )
+        yield OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=[],
+            final_output_type="image",
+            custom_output={"chunk": 1},
+            finished=True,
+        )
+
+    async def run_test():
+        omni = get_async_omni_instance()
+        omni._process_orchestrator_results = streaming_process_results
+
+        outputs = []
+        async for output in AsyncOmni.generate(
+            omni,
+            prompt={"prompt": "a cat"},
+            request_id="req-stream",
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["image"],
+        ):
+            outputs.append(output)
+
+        assert len(outputs) == 2
+        assert [output.finished for output in outputs] == [False, True]
+        assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
 
     asyncio.run(run_test())
 

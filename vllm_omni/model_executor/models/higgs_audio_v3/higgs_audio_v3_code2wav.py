@@ -23,11 +23,11 @@ from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import (
     build_higgs_audio_acoustic_decoder,
     load_higgs_audio_codec,
 )
-from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
-    HiggsAudioV3Config,
-)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+    HiggsAudioV3Config,
+)
 
 __all__ = [
     "HiggsAudioV3Code2Wav",

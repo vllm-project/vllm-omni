@@ -9,7 +9,7 @@ import inspect
 import queue
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -126,9 +126,14 @@ class DiffusionEngine:
             self.action_post_process_func, "custom_output"
         )
 
+        self.step_execution = bool(getattr(od_config, "step_execution", False))
+        if self.od_config.streaming_output and not self.step_execution:
+            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+            self.od_config.step_execution = True
+            self.step_execution = True
+
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.step_execution = bool(getattr(od_config, "step_execution", False))
         self.scheduler: SchedulerInterface = scheduler or (
             StepScheduler() if self.step_execution else RequestScheduler()
         )
@@ -149,11 +154,15 @@ class DiffusionEngine:
         self._rpc_lock = threading.RLock()
         self._cv = threading.Condition(self._rpc_lock)
         self._out_queue: dict[str, asyncio.Future] = {}
+        self._out_queue_streaming: dict[str, asyncio.Queue[DiffusionOutput]] = {}
         self._closed = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+        if self.step_execution:
+            self.execute_fn = self.executor.execute_step
+        else:
+            self.execute_fn = self.executor.execute_request
 
         try:
             self._dummy_run()
@@ -197,7 +206,37 @@ class DiffusionEngine:
         exec_start_time = time.perf_counter()
         output = await self.async_add_req_and_wait_for_response(request)
         exec_total_time = time.perf_counter() - exec_start_time
+        return self.postprocess_output(request, output, diffusion_engine_start_time, preprocess_time, exec_total_time)
 
+    async def step_streaming(self, request: OmniDiffusionRequest) -> AsyncGenerator[list[OmniRequestOutput], None]:
+        await self._check_and_start_background_loop()
+
+        diffusion_engine_start_time = time.perf_counter()
+
+        preprocess_time = 0.0
+        if self.pre_process_func is not None:
+            preprocess_start_time = time.perf_counter()
+            request = self.pre_process_func(request)
+            preprocess_time = time.perf_counter() - preprocess_start_time
+            logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
+
+        exec_start_time = time.perf_counter()
+        generator = self.async_add_req_and_stream_response(request)
+        async for output in generator:
+            exec_total_time = time.perf_counter() - exec_start_time
+            yield self.postprocess_output(
+                request, output, diffusion_engine_start_time, preprocess_time, exec_total_time
+            )
+
+    def postprocess_output(
+        self,
+        request: OmniDiffusionRequest,
+        output: DiffusionOutput,
+        diffusion_engine_start_time: float,
+        preprocess_time: float,
+        exec_total_time: float,
+    ) -> list[OmniRequestOutput]:
+        """Convert a DiffusionOutput to a list of OmniRequestOutput, attaching profiling metrics."""
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
@@ -212,7 +251,7 @@ class DiffusionEngine:
 
         if output.output is None:
             logger.warning("Output is None, returning empty OmniRequestOutput")
-            return format_empty_diffusion_outputs(request)
+            return format_empty_diffusion_outputs(request, finished=output.finished)
 
         # When CPU offload is enabled, move output to CPU before
         # post-processing to avoid device OOM — model weights may still
@@ -312,11 +351,14 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
 
             if sched_output.is_empty:
-                self._handle_finished_requests(sched_output.finished_req_ids, None)
+                if self.od_config.streaming_output:
+                    self._handle_empty_streaming_requests(sched_output.finished_req_ids)
+                else:
+                    self._handle_finished_requests(sched_output.finished_req_ids, None)
                 continue
 
             try:
-                runner_output = self.execute_fn(sched_output)
+                runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
             except Exception as exc:
                 logger.error(
                     "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
@@ -336,7 +378,14 @@ class DiffusionEngine:
             self._process_aborts_queue()
             self._process_rpc_queue()
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-            self._handle_finished_requests(finished_req_ids, runner_output)
+            if self.od_config.streaming_output:
+                self._handle_step_streaming_runner_output(
+                    finished_req_ids,
+                    sched_output.scheduled_request_ids,
+                    runner_output,
+                )
+            else:
+                self._handle_finished_requests(finished_req_ids, runner_output)
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
@@ -411,6 +460,57 @@ class DiffusionEngine:
             out = self._finalize_finished_request(rid, _output, missing_result_error)
             self._complete_future(fut, out)
 
+    def _handle_empty_streaming_requests(
+        self,
+        finished_ids: set[str],
+        missing_result_error: str = "Diffusion streaming request finished without execution output.",
+    ) -> None:
+        """Mirrors `_handle_finished_requests()` in non-streaming mode when used for empty scheduler output."""
+        for rid in finished_ids:
+            out = self._finalize_finished_request(rid, None, missing_result_error=missing_result_error)
+            self._put_streaming_output_with_cv(rid, out)
+
+    def _handle_step_streaming_runner_output(
+        self,
+        finished_req_ids: set[str],
+        scheduled_request_ids: list[str],
+        runner_output: BaseRunnerOutput,
+    ) -> None:
+        """
+        Deliver partial step-execution outputs in streaming mode.
+
+        Step execution returns one ``RunnerOutput`` per scheduled request per
+        engine tick. Most denoise steps have ``result=None``; chunk boundaries
+        return a ``DiffusionOutput`` that must be delivered even before the
+        scheduler marks the request finished.
+        """
+        delivered_finished_req_ids: set[str] = set()
+
+        # finished_ids may have some requests that are not scheduler in this round.
+        # First handle this-round requests.
+        for request_id in scheduled_request_ids:
+            req_output = runner_output.get_request_output(request_id)
+            if request_id in finished_req_ids:
+                # This entire request is finished (this is the last chunk)
+                out = self._finalize_finished_request(
+                    request_id,
+                    req_output,
+                    missing_result_error="Diffusion streaming execution finished without a final output.",
+                )
+                self._put_streaming_output_with_cv(request_id, out)
+                delivered_finished_req_ids.add(request_id)
+            elif req_output is not None and req_output.result is not None:
+                # This is a non-terminal chunk. So it is not in scheduler's finished_req_ids, but still need delivering.
+                self._put_streaming_output_with_cv(request_id, req_output.result)
+
+        # Then handle other requests that are finished in this round.
+        for request_id in finished_req_ids - delivered_finished_req_ids:
+            out = self._finalize_finished_request(
+                request_id,
+                missing_result_error="Diffusion streaming request finished without execution output.",
+            )
+            self._put_streaming_output_with_cv(request_id, out)
+
     @staticmethod
     def make_engine(
         config: OmniDiffusionConfig,
@@ -430,9 +530,14 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
-            fut = self.main_loop.create_future()
-            request_id = self.scheduler.add_request(request)
-            self._out_queue[request_id] = fut
+            if not self.od_config.streaming_output:
+                fut = self.main_loop.create_future()
+                request_id = self.scheduler.add_request(request)
+                self._out_queue[request_id] = fut
+            else:
+                queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+                request_id = self.scheduler.add_request(request)
+                self._out_queue_streaming[request_id] = queue
             self._cv.notify_all()
 
         return request_id
@@ -448,11 +553,38 @@ class DiffusionEngine:
             logger.error(f"Wait for response failed: {e}")
             raise
 
+    async def get_streaming_result(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
+        """Mirrors `get_result()` in non-streaming mode."""
+        with self._cv:
+            queue = self._out_queue_streaming.get(request_id)
+        if queue is None:
+            raise RuntimeError(f"Request {request_id} not found in output queue.")
+        try:
+            while True:
+                output: DiffusionOutput = await queue.get()
+                yield output
+                if output.finished:
+                    break
+        except Exception as e:
+            logger.error(f"Wait for response failed: {e}")
+            raise
+        finally:
+            # In streaming mode, an output queue is maintained until the terminal chunk is met.
+            # So unlike the non-streaming mode where output Future is popped in `_handle_finished_requests` (immediately
+            # after the request is returned), the streaming mode needs to pop the output queue here (one layer above).
+            with self._cv:
+                if self._out_queue_streaming.get(request_id) is queue:
+                    self._out_queue_streaming.pop(request_id, None)
+
     async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         # No lock needed: add_request is already protected by self._cv, and
         # all executor calls are serialized inside the busy loop.
         request_id = self.add_request(request)
         return await self.get_result(request_id)
+
+    def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
+        request_id = self.add_request(request)
+        return self.get_streaming_result(request_id)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
@@ -475,7 +607,7 @@ class DiffusionEngine:
                 # within _dummy_run, only one request will be scheduled
                 request_id = sched_output.scheduled_request_ids[0]
                 try:
-                    runner_output = self.execute_fn(sched_output)
+                    runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
                 except EngineDeadError:
                     raise
                 except Exception as exc:
@@ -495,10 +627,10 @@ class DiffusionEngine:
                 if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
-                    runner_output = runner_output.get_request_output(target_request_id)
+                    req_output = runner_output.get_request_output(target_request_id)
                     return self._finalize_finished_request(
                         target_request_id,
-                        runner_output=runner_output,
+                        runner_output=req_output,
                         missing_result_error="Diffusion execution finished without a final output.",
                     )
 
@@ -693,8 +825,28 @@ class DiffusionEngine:
         else:
             _set_result()
 
+    def _put_streaming_queue_output(
+        self,
+        queue: asyncio.Queue[DiffusionOutput],
+        output: DiffusionOutput,
+    ) -> None:
+        """Append to streaming output queue in a safe event loop. Mirrors `_complete_future()` in non-streaming mode."""
+        loop = self.main_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(queue.put_nowait, output)
+        else:
+            queue.put_nowait(output)
+
+    def _put_streaming_output_with_cv(self, request_id: str, output: DiffusionOutput) -> None:
+        with self._cv:
+            queue = self._out_queue_streaming.get(request_id)
+        if queue is None:
+            return
+        self._put_streaming_queue_output(queue, output)
+
     def close(self) -> None:
         pending_futures: list[asyncio.Future] = []
+        pending_streaming_queues: list[asyncio.Queue[DiffusionOutput]] = []
         with self._cv:
             if self._closed and self._shutdown_complete:
                 return
@@ -703,12 +855,16 @@ class DiffusionEngine:
                 if self.stop_event is not None:
                     self.stop_event.set()
                 pending_futures = list(self._out_queue.values())
+                pending_streaming_queues = list(self._out_queue_streaming.values())
                 self._out_queue.clear()
+                self._out_queue_streaming.clear()
                 self._cv.notify_all()
 
         closed_output = DiffusionOutput(error="DiffusionEngine is closed.")
         for fut in pending_futures:
             self._complete_future(fut, closed_output)
+        for streaming_queue in pending_streaming_queues:
+            self._put_streaming_queue_output(streaming_queue, closed_output)
 
         worker_thread = self.worker_thread
         if worker_thread is not None:

@@ -521,3 +521,100 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+
+---
+
+## SoulX-Singer
+
+Singing voice synthesis (SVS) and conversion (SVC) at 24 kHz. Script: `soulxsinger/end2end.py`. Deploy: `vllm_omni/deploy/soulxsinger_svs.yaml` or `soulxsinger_svc.yaml`.
+
+### Prerequisites
+
+Download DiT and preprocess weights, then set up separate SVS / SVC view directories. Copy `soulxsinger/utils/phoneme/phone_set.json` from upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) into the model weights dir as `phoneme/phone_set.json` — HuggingFace does not ship it.
+
+```bash
+# 1. DiT weights
+export BASE=path/to/SoulX-Singer
+export PREPROCESS=path/to/SoulX-Singer-Preprocess
+export SVC_DIR=path/to/SoulX-Singer-svc
+
+huggingface-cli download Soul-AILab/SoulX-Singer --local-dir "$BASE"
+
+# 2. Preprocess weights (required)
+huggingface-cli download Soul-AILab/SoulX-Singer-Preprocess --local-dir "$PREPROCESS"
+export SOULX_PREPROCESS_WEIGHTS_DIR="$PREPROCESS"
+
+# 3. SVS / SVC view directories
+mkdir -p "$SVC_DIR"
+cp $BASE/{config.yaml,README.md,assets} $SVC_DIR
+mv $BASE/model-svc.pt $SVC_DIR/model-svc.pt
+
+cat > "$BASE/config.json" <<'EOF'
+{
+  "model_type": "soulxsinger",
+  "architectures": ["SoulXSingerPipeline"],
+  "max_num_seqs": 1
+}
+EOF
+
+cat > "$SVC_DIR/config.json" <<'EOF'
+{
+  "model_type": "soulxsinger",
+  "architectures": ["SoulXSingerSVCPipeline"],
+  "max_num_seqs": 1
+}
+EOF
+```
+
+`config.yaml` hyper-parameters live under `$BASE`; each view's `config.json` `architectures` field is the single source of truth for SVS vs SVC. Point `--model` at the matching directory (`$BASE` for SVS, `$SVC_DIR` for SVC). Deploy YAML is chosen automatically from `config.json`; optional `--svs` / `--svc` only assert the mode matches.
+
+**Online preprocess** is the default: pass `--prompt-audio` and `--target-audio`, and the worker runs vocal separation, F0, and (for SVS) lyrics/MIDI before DiT. Install only what your run needs:
+
+```bash
+pip install "BS-RoFormer"   # vocal sep + F0 on GPU — SVS and SVC
+```
+
+Mandarin SVS also needs FunASR and Chinese G2P; `ffmpeg` must be on `PATH`:
+
+```bash
+# install optional dependencies:
+pip install -e ".[soulx-svs]"
+```
+
+English SVS adds NeMo ASR and NLTK data; pass `--language English`:
+
+```bash
+pip install "nemo_toolkit[asr]==2.6.1" lhotse==1.32.2
+python -c "import nltk; nltk.download('cmudict'); nltk.download('averaged_perceptron_tagger_eng')"
+```
+
+**Precomputed metadata** is the alternative: pass both `--prompt-metadata-path` and `--target-metadata-path` and skip online ASR/ROSVOT — none of the packages above are required. JSON can be produced by integrated preprocess on a prior run, or by upstream [SoulX-Singer](https://github.com/Soul-AILab/SoulX-Singer) `preprocess/` scripts if you prefer to run that outside vLLM-Omni.
+
+### Quick start
+
+```bash
+# SVS — default demo audio: tests/assets/soulxsinger/zh_prompt.mp3 + music.mp3
+python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
+    --model "$BASE" \
+    --preprocess-weights-dir "$PREPROCESS" \
+    --control score \
+    --num-inference-steps 32 \
+    -o output.wav
+
+python examples/offline_inference/text_to_speech/soulxsinger/end2end.py \
+    --model "$SVC_DIR" \
+    --preprocess-weights-dir "$PREPROCESS" \
+    --svc \
+    --num-inference-steps 32 \
+    -o output_svc.wav
+```
+
+`SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. Long SVS targets are handled in one request. See `end2end.py --help` for `--pitch-shift`, `--vocal-sep`, `--auto-shift`, and language/control options.
+
+### Notes
+
+- Output: 24 kHz mono WAV; batch only.
+- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` on.
+- SVS `--control`: `score` or `melody`. MIDI / lyric QC: upstream `midi_editor` only.
+
+---

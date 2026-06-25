@@ -24,7 +24,7 @@ def test_dreamzero_vla_resolves_to_dreamzero_config(monkeypatch):
 
 def test_dreamzero_config_sets_model_class_and_policy_config(monkeypatch):
     monkeypatch.setattr(
-        "vllm_omni.config.stage_config.StageConfigFactory._auto_detect_model_type",
+        "vllm_omni.config.config_factory.StageConfigFactory._auto_detect_model_type",
         classmethod(lambda _cls, _model, trust_remote_code=True: ("vla", None)),
     )
     monkeypatch.setattr(
