@@ -484,7 +484,7 @@ class DreamIDOmniPipeline(
         self,
         request: DiffusionRequestBatch,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         """Main forward pass for DreamID-Omni pipeline for R2AV task."""
         # Extract parameters from request
         r_prompts = request.prompts[0]
@@ -605,4 +605,4 @@ class DreamIDOmniPipeline(
         video_latents_for_vae = video_noise_for_decode.unsqueeze(0)
         generated_video = self.vae_model_video.wrapped_decode(video_latents_for_vae).squeeze(0).cpu().float().numpy()
 
-        return [DiffusionOutput(output=(generated_video, generated_audio))]
+        return DiffusionOutput(output=(generated_video, generated_audio))

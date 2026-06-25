@@ -306,7 +306,7 @@ class StableDiffusionXLPipeline(
         num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         if req.num_reqs != 1:
             raise ValueError("StableDiffusionXLPipeline currently supports single-request forward.")
 
@@ -415,12 +415,10 @@ class StableDiffusionXLPipeline(
             latents = latents / self.vae.config.scaling_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return [
-            DiffusionOutput(
-                output=image,
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            )
-        ]
+        return DiffusionOutput(
+            output=image,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

@@ -206,7 +206,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         return tokens
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Generate speech audio from text, optionally with voice cloning.
 
         Accepts either a plain text prompt or a structured dict:
@@ -247,11 +247,9 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
                     if len(audio_field) == 1:
                         audio_field = audio_field[0]
                     elif len(audio_field) > 1:
-                        return [
-                            DiffusionOutput(
-                                error=f"OmniVoice voice cloning supports a single reference audio; got {len(audio_field)}"  # noqa: E501
-                            )
-                        ]
+                        return DiffusionOutput(
+                            error=f"OmniVoice voice cloning supports a single reference audio; got {len(audio_field)}"  # noqa: E501
+                        )
                     else:
                         audio_field = None
                 if audio_field is not None:
@@ -268,13 +266,13 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
                 instruct = mm_kwargs.get("instruct")
 
             if not text:
-                return [DiffusionOutput(error="Empty text prompt")]
+                return DiffusionOutput(error="Empty text prompt")
             lang = lang or "None"
             instruct = instruct or "None"
         else:
             text = str(prompt)
             if not text:
-                return [DiffusionOutput(error="Empty text prompt")]
+                return DiffusionOutput(error="Empty text prompt")
 
         device = self.device
         num_cb = self.config.num_audio_codebook
@@ -374,7 +372,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         # Decode tokens to audio
         audio = self.decoder(tokens)  # [1, 1, samples]
 
-        return [DiffusionOutput(output=audio)]
+        return DiffusionOutput(output=audio)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from model directory (not from the iterator).

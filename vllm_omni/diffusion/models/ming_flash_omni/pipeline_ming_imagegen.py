@@ -279,7 +279,7 @@ class MingImagePipeline(ZImagePipeline):
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Run one text-to-image generation request.
 
         Args:
@@ -479,7 +479,7 @@ class MingImagePipeline(ZImagePipeline):
                 raw.float().min().item(),
                 raw.float().max().item(),
             )
-        return [DiffusionOutput(output=raw)]
+        return DiffusionOutput(output=raw)
 
 
 # ----------------------------------------------------------------------

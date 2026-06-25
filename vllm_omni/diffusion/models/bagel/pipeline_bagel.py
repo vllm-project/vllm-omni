@@ -341,7 +341,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
@@ -733,13 +733,11 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     if "<|im_start|>" in text_output:
                         text_output = text_output.split("<|im_start|>")[-1]
 
-            return [
-                DiffusionOutput(
-                    output=text_output,
-                    custom_output={"text_output": text_output},
-                    stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-                )
-            ]
+            return DiffusionOutput(
+                output=text_output,
+                custom_output={"text_output": text_output},
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
 
         # ---- Image generation (text2img / img2img) ----
         if req.sampling_params.seed is not None:
@@ -853,17 +851,15 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         # uses this pattern.
         custom["image"] = img
 
-        return [
-            DiffusionOutput(
-                output=img,
-                trajectory_latents=trajectory_latents_stacked,
-                trajectory_timesteps=trajectory_timesteps_stacked,
-                trajectory_log_probs=trajectory_log_probs_stacked,
-                trajectory_decoded=trajectory_decoded,
-                custom_output=custom,
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            )
-        ]
+        return DiffusionOutput(
+            output=img,
+            trajectory_latents=trajectory_latents_stacked,
+            trajectory_timesteps=trajectory_timesteps_stacked,
+            trajectory_log_probs=trajectory_log_probs_stacked,
+            trajectory_decoded=trajectory_decoded,
+            custom_output=custom,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         state = self.state_dict()

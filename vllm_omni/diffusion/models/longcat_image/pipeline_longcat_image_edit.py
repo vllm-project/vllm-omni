@@ -559,7 +559,7 @@ class LongCatImageEditPipeline(
         output_type: str | None = "pil",
         return_dict: bool = True,
         joint_attention_kwargs: dict[str, Any] | None = None,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         if len(req.prompts) > 1:
@@ -726,11 +726,9 @@ class LongCatImageEditPipeline(
                 latents = latents.to(dtype=self.vae.dtype)
 
             image = self.vae.decode(latents, return_dict=False)[0]
-        return [
-            DiffusionOutput(
-                output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-            )
-        ]
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

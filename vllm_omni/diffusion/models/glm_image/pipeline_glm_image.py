@@ -670,7 +670,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         return kv_caches
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """
         Main generation forward pass.
 
@@ -899,11 +899,9 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         latents = latents * latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
-        return [
-            DiffusionOutput(
-                output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-            )
-        ]
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load transformer weights."""

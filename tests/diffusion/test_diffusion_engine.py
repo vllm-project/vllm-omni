@@ -444,6 +444,7 @@ async def test_async_add_req_and_wait_for_response():
     engine._closed = False
     engine._loop_started = False
     engine.main_loop = None
+    engine.supports_request_batch = False
 
     engine._finalize_finished_request = lambda rid, out, err: out.result
 

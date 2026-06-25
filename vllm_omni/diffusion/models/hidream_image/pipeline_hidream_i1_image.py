@@ -896,7 +896,7 @@ class HiDreamI1ImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfi
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 128,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
         prompt = extracted_prompt or prompt
 
@@ -1050,11 +1050,9 @@ class HiDreamI1ImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfi
 
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return [
-            DiffusionOutput(
-                output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-            )
-        ]
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

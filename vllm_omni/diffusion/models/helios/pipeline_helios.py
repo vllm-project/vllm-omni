@@ -309,7 +309,7 @@ class HeliosPipeline(
         use_zero_init: bool = True,
         zero_steps: int = 1,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         if pyramid_num_inference_steps_list is None:
             pyramid_num_inference_steps_list = [10, 10, 10]
         if history_sizes is None:
@@ -670,11 +670,9 @@ class HeliosPipeline(
         else:
             output = history_video
 
-        return [
-            DiffusionOutput(
-                output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-            )
-        ]
+        return DiffusionOutput(
+            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def _stage1_sample(
         self,

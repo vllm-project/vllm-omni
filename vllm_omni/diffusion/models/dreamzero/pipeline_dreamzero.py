@@ -733,7 +733,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return transform, transform.transform_input(robot_obs)
 
     @torch.no_grad()
-    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
         """Full inference step. Called by DiffusionEngine.step()."""
         if req.num_reqs != 1:
             raise ValueError("DreamZeroPipeline only supports single-request forward.")
@@ -745,16 +745,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             is_dummy_warmup = prompt == "dummy run" and req.sampling_params.num_inference_steps == 1
             if is_dummy_warmup:
                 logger.info("Skipping DreamZero dummy warmup request without robot_obs.")
-                return [
-                    DiffusionOutput(
-                        output={
-                            "actions": np.zeros(
-                                (self.action_horizon, self.max_action_dim),
-                                dtype=np.float32,
-                            ),
-                        },
-                    )
-                ]
+                return DiffusionOutput(
+                    output={
+                        "actions": np.zeros(
+                            (self.action_horizon, self.max_action_dim),
+                            dtype=np.float32,
+                        ),
+                    },
+                )
             raise KeyError("robot_obs")
         session_id = str(extra_args.get("session_id") or "default")
         state = self._get_or_create_state(session_id)
@@ -982,17 +980,15 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         actions_np = action_out.squeeze(0).float().cpu().numpy()  # (horizon, max_action_dim)
         actions_np = transform.transform_action_output(actions_np)
 
-        return [
-            DiffusionOutput(
-                output={
-                    "actions": actions_np,
-                    # Source `video_pred` is normalized VAE latent output, not RGB.
-                    # Use `decode_video_latents()` for DreamZero-equivalent debug
-                    # video decoding.
-                    "video": video_out.transpose(1, 2).cpu(),
-                },
-            )
-        ]
+        return DiffusionOutput(
+            output={
+                "actions": actions_np,
+                # Source `video_pred` is normalized VAE latent output, not RGB.
+                # Use `decode_video_latents()` for DreamZero-equivalent debug
+                # video decoding.
+                "video": video_out.transpose(1, 2).cpu(),
+            },
+        )
 
     # -----------------------------------------------------------------------
     # Action denormalization

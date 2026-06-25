@@ -776,7 +776,7 @@ class Flux2KleinPipeline(
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int, ...] = (9, 18, 27),
         padding_mask_crop: int | None = None,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         r"""
         Function invoked when calling the pipeline for generation.
 
@@ -1215,11 +1215,9 @@ class Flux2KleinPipeline(
                 latents = latents.to(self.vae.dtype)
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return [
-            DiffusionOutput(
-                output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-            )
-        ]
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

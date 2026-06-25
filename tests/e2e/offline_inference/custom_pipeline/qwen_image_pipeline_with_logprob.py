@@ -240,7 +240,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         sde_window_range: tuple[int, int] = (0, 5),
         sde_type: Literal["sde", "cps"] = "sde",
         logprobs: bool = True,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         if req.num_reqs != 1:
             raise ValueError("QwenImagePipelineWithLogProbForTest supports only single-request forward.")
         request = req.requests[0]
@@ -288,7 +288,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         else:
             # Both prompt_ids and prompt_embeds are None (e.g. during warmup/dummy run).
             # Return a minimal dummy output to avoid crashing.
-            return [DiffusionOutput(output=None, custom_output={})]
+            return DiffusionOutput(output=None, custom_output={})
 
         if isinstance(negative_prompt_ids, list):
             negative_prompt_ids = torch.tensor(negative_prompt_ids, device=self.device)
@@ -398,17 +398,15 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return [
-            DiffusionOutput(
-                output=_maybe_to_cpu(image),
-                trajectory_latents=_maybe_to_cpu(all_latents),
-                trajectory_log_probs=_maybe_to_cpu(all_log_probs),
-                trajectory_timesteps=_maybe_to_cpu(all_timesteps),
-                custom_output={
-                    "prompt_embeds": _maybe_to_cpu(prompt_embeds),
-                    "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
-                    "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
-                    "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
-                },
-            )
-        ]
+        return DiffusionOutput(
+            output=_maybe_to_cpu(image),
+            trajectory_latents=_maybe_to_cpu(all_latents),
+            trajectory_log_probs=_maybe_to_cpu(all_log_probs),
+            trajectory_timesteps=_maybe_to_cpu(all_timesteps),
+            custom_output={
+                "prompt_embeds": _maybe_to_cpu(prompt_embeds),
+                "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
+                "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),
+                "negative_prompt_embeds_mask": _maybe_to_cpu(negative_prompt_embeds_mask),
+            },
+        )

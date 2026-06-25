@@ -556,7 +556,7 @@ class Wan22Pipeline(
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         # Get parameters from request or arguments
         if len(req.prompts) > 1:
             raise ValueError(
@@ -848,11 +848,9 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
-        return [
-            DiffusionOutput(
-                output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-            )
-        ]
+        return DiffusionOutput(
+            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def predict_noise(
         self,

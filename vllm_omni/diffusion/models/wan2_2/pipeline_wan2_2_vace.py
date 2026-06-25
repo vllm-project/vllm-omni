@@ -475,7 +475,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         attention_kwargs: dict | None = None,
         vace_context_scale: float | list[float] = 1.0,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         """Generate or edit video using VACE.
 
         The mode is determined by which inputs are provided in the request:
@@ -676,7 +676,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
-        return [DiffusionOutput(output=output)]
+        return DiffusionOutput(output=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

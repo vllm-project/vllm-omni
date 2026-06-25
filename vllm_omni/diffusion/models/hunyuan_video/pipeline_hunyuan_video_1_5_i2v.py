@@ -484,7 +484,7 @@ class HunyuanVideo15I2VPipeline(
         output_type: str | None = "np",
         generator: torch.Generator | list[torch.Generator] | None = None,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         if len(req.prompts) > 1:
             raise ValueError("This model only supports a single prompt per request.")
         if len(req.prompts) == 1:
@@ -643,7 +643,7 @@ class HunyuanVideo15I2VPipeline(
             latents = latents.to(self.vae.dtype) / self.vae.config.scaling_factor
             output = self.vae.decode(latents, return_dict=False)[0]
 
-        return [DiffusionOutput(output=output)]
+        return DiffusionOutput(output=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

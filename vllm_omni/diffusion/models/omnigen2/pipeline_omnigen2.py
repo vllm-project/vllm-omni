@@ -1029,7 +1029,7 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
         latents: torch.FloatTensor | None = None,
         verbose: bool = False,
         step_func=None,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning(
                 "OmniGen2 only supports a single prompt per request. "
@@ -1169,7 +1169,7 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
 
         image = F.interpolate(image, size=(ori_height, ori_width), mode="bilinear")
 
-        return [DiffusionOutput(output=image)]
+        return DiffusionOutput(output=image)
 
     def processing(
         self,

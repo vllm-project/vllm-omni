@@ -883,7 +883,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         return system_prompt + f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
     @torch.inference_mode()
-    def _forward_text(self, p, input_images) -> list[DiffusionOutput]:
+    def _forward_text(self, p, input_images) -> DiffusionOutput:
         """Text output path for text2text and img2text."""
         extra_args = p.extra_args
         max_tokens = int(extra_args.get("max_tokens", 512))
@@ -929,12 +929,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             temperature=temperature,
         )
         logger.info("Text generation: %d chars", len(text_output))
-        return [
-            DiffusionOutput(
-                output=text_output,
-                custom_output={"text_output": text_output},
-            )
-        ]
+        return DiffusionOutput(
+            output=text_output,
+            custom_output={"text_output": text_output},
+        )
 
     # -----------------------------------------------------------------------
     # Main forward (T2I / IT2I / T2T / I2T)
@@ -1218,7 +1216,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         p = self._parse_request(req)
         self.top_cfg.t_eps = p.t_eps
 
@@ -1232,7 +1230,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             return self._forward_it2i(p, input_images)
         return self._forward_t2i(p)
 
-    def _forward_t2i(self, p) -> list[DiffusionOutput]:
+    def _forward_t2i(self, p) -> DiffusionOutput:
         """Text-to-image generation path."""
         ns = self._init_noise_and_schedule(p)
 
@@ -1278,7 +1276,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         }
         return self._run_denoising_loop(ns, caches, p, think_text)
 
-    def _forward_it2i(self, p, input_images: list[Image.Image]) -> list[DiffusionOutput]:
+    def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
         """Image-to-image (editing) generation path with dual CFG."""
         ns = self._init_noise_and_schedule(p)
 
@@ -1394,7 +1392,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
         return self._run_denoising_loop(ns, caches, p, think_text)
 
-    def _run_denoising_loop(self, ns, caches, p, think_text="") -> list[DiffusionOutput]:
+    def _run_denoising_loop(self, ns, caches, p, think_text="") -> DiffusionOutput:
         """Shared denoising loop for both T2I and IT2I."""
         merge_size = self.merge_size
         image_prediction = ns.image_prediction
@@ -1441,7 +1439,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         custom = {}
         if think_text:
             custom["think_text"] = think_text
-        return [DiffusionOutput(output=img, custom_output=custom)]
+        return DiffusionOutput(output=img, custom_output=custom)
 
     # -----------------------------------------------------------------------
     # Weight loading

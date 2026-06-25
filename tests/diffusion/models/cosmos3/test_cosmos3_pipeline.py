@@ -751,7 +751,7 @@ class TestForwardRouting:
         pipeline = make_cosmos3_pipeline()
         captured = self._install_forward_stubs(pipeline)
 
-        output = pipeline.forward(make_request_batch(prompt, sampling_params))[0]
+        output = pipeline.forward(make_request_batch(prompt, sampling_params))
 
         assert expected["key"] in output.output
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
@@ -819,7 +819,6 @@ class TestForwardRouting:
                 make_sampling_params(num_frames=9, frame_rate=3.0),
             )
         )
-        output = output[0]
         assert captured["diffuse_calls"][-1]["sound_latents"] is sound_latents
         assert output.output["audio_sample_rate"] == 10
 
@@ -843,7 +842,6 @@ class TestForwardRouting:
                 ),
             )
         )
-        output = output[0]
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert output.custom_output["action"].shape == (1, 2, 2)
         assert "action_only_output" not in output.custom_output
@@ -911,7 +909,7 @@ class TestForwardRouting:
             AssertionError("RoboLab should not decode video")
         )
 
-        outputs = pipeline.forward(make_request_batch("ignored", make_sampling_params()))
+        output = pipeline.forward(make_request_batch("ignored", make_sampling_params()))
 
         assert captured["format"] == {
             "prompt": "Pick the cube.",
@@ -929,8 +927,6 @@ class TestForwardRouting:
         assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
-        assert len(outputs) == 1
-        output = outputs[0]
         assert output.output == {}
         assert output.custom_output["action_only_output"] is True
         assert output.custom_output["action"].shape == (1, 2, 2)

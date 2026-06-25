@@ -228,21 +228,19 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning("InternVLAA1Pipeline only supports a single prompt/request; taking the first sample.")
         extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
         batch_inputs = extra_args.get("batch_inputs")
         if batch_inputs is None:
-            return [
-                DiffusionOutput(
-                    error=(
-                        "InternVLAA1Pipeline.forward expects sampling_params.extra_args['batch_inputs'] "
-                        "with pre-built repo-side inputs."
-                    ),
-                    post_process_func=get_internvla_a1_post_process_func(self.od_config),
-                )
-            ]
+            return DiffusionOutput(
+                error=(
+                    "InternVLAA1Pipeline.forward expects sampling_params.extra_args['batch_inputs'] "
+                    "with pre-built repo-side inputs."
+                ),
+                post_process_func=get_internvla_a1_post_process_func(self.od_config),
+            )
 
         output, decoded = self._predict_actions(
             batch_inputs,
@@ -252,10 +250,8 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         custom_output: dict[str, Any] = {}
         if decoded is not None:
             custom_output["decoded"] = decoded
-        return [
-            DiffusionOutput(
-                output=output,
-                custom_output=custom_output,
-                post_process_func=get_internvla_a1_post_process_func(self.od_config),
-            )
-        ]
+        return DiffusionOutput(
+            output=output,
+            custom_output=custom_output,
+            post_process_func=get_internvla_a1_post_process_func(self.od_config),
+        )

@@ -570,7 +570,7 @@ class NextStep11Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelin
         generator: torch.Generator | None = None,
         seed: int | None = None,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         """
         Generate images from text prompts.
 
@@ -711,12 +711,10 @@ class NextStep11Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelin
         sampled_images = self.vae.decode(latents.to(self.vae.dtype)).sample
         sampled_images = sampled_images.detach().cpu().to(torch.float32)
 
-        return [
-            DiffusionOutput(
-                output=sampled_images,
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            )
-        ]
+        return DiffusionOutput(
+            output=sampled_images,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load model weights."""

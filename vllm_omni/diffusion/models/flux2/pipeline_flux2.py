@@ -880,7 +880,7 @@ class Flux2Pipeline(
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int, ...] = (10, 20, 30),
         caption_upsample_temperature: float = None,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
@@ -1145,7 +1145,7 @@ class Flux2Pipeline(
                 latents = latents.to(self.vae.dtype)
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return [DiffusionOutput(output=image)]
+        return DiffusionOutput(output=image)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

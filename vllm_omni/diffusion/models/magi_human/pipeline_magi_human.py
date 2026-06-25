@@ -2171,7 +2171,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
         image_path: str | None = None,
         audio_path: str | None = None,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         if len(req.prompts) >= 1:
             p = req.prompts[0]
             prompt = p if isinstance(p, str) else p.get("prompt", prompt)
@@ -2303,4 +2303,4 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
         torch.accelerator.empty_cache()
         audio_np = self._decode_audio(final_latent_audio)
 
-        return [DiffusionOutput(output=(videos_np, audio_np))]
+        return DiffusionOutput(output=(videos_np, audio_np))

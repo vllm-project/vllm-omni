@@ -47,6 +47,43 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 logger = init_logger(__name__)
 
 
+def _normalize_pipeline_outputs(
+    outputs: object,
+    *,
+    expected_count: int,
+    allow_single_output: bool,
+    pipeline_name: str,
+) -> list[DiffusionOutput]:
+    if isinstance(outputs, DiffusionOutput):
+        if allow_single_output and expected_count == 1:
+            return [outputs]
+        raise RuntimeError(
+            f"{pipeline_name}.forward returned a single DiffusionOutput; "
+            "request-batch forward must return list[DiffusionOutput]."
+        )
+
+    if not isinstance(outputs, list):
+        raise RuntimeError(
+            f"{pipeline_name}.forward returned {type(outputs).__name__}; "
+            "expected DiffusionOutput or list[DiffusionOutput]."
+        )
+
+    if len(outputs) != expected_count:
+        raise RuntimeError(
+            f"{pipeline_name}.forward returned {len(outputs)} outputs for {expected_count} requests; "
+            "expected exactly one DiffusionOutput per request."
+        )
+
+    bad_index = next((idx for idx, output in enumerate(outputs) if not isinstance(output, DiffusionOutput)), None)
+    if bad_index is not None:
+        raise RuntimeError(
+            f"{pipeline_name}.forward returned list item {bad_index} with type "
+            f"{type(outputs[bad_index]).__name__}; expected DiffusionOutput."
+        )
+
+    return outputs
+
+
 class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
@@ -332,8 +369,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
                     batch = DiffusionRequestBatch(requests=[req])
-                    outputs = self.pipeline.forward(batch)
-                    output = outputs[0]
+                    raw_outputs = self.pipeline.forward(batch)
+                    output = _normalize_pipeline_outputs(
+                        raw_outputs,
+                        expected_count=1,
+                        allow_single_output=True,
+                        pipeline_name=type(self.pipeline).__name__,
+                    )[0]
 
             if is_primary:
                 self._record_peak_memory(output)
@@ -413,7 +455,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 with record_function("pipeline_forward_batch"):
                     if not getattr(self.pipeline, "supports_request_batch", False):
                         raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
-                    outputs = self.pipeline.forward(batch)
+                    raw_outputs = self.pipeline.forward(batch)
+                    outputs = _normalize_pipeline_outputs(
+                        raw_outputs,
+                        expected_count=len(reqs),
+                        allow_single_output=False,
+                        pipeline_name=type(self.pipeline).__name__,
+                    )
 
             if is_primary and outputs:
                 self._record_peak_memory(outputs[0])
@@ -425,13 +473,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and od_config.enable_cache_dit_summary
             ):
                 cache_summary(self.pipeline, details=True)
-
-        if len(outputs) != len(reqs):
-            raise RuntimeError(
-                f"pipeline.forward returned {len(outputs)} outputs for {len(reqs)} requests; "
-                "expected exactly one DiffusionOutput per request "
-                f"(pipeline={type(self.pipeline).__name__})."
-            )
 
         return BatchRunnerOutput.from_list(
             [

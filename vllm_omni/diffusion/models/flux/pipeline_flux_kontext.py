@@ -493,7 +493,7 @@ class FluxKontextPipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
         sigmas: list[float] | None = None,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         # Handle multiple prompts - only take the first one, similar to Flux2KleinPipeline
         if len(req.prompts) > 1:
             logger.warning(
@@ -709,7 +709,7 @@ class FluxKontextPipeline(
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return [DiffusionOutput(output=image)]
+        return DiffusionOutput(output=image)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

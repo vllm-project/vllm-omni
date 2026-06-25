@@ -668,7 +668,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         resolution: int = 640,
         cfg_normalize: bool = False,
         use_en_prompt: bool = False,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         """Forward pass for image layered."""
 
         # 1. Get preprocessed image from request (pre-processing is done in DiffusionEngine)
@@ -911,11 +911,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             for bidx in range(b):
                 images.append(image[bidx * f : (bidx + 1) * f])
 
-        return [
-            DiffusionOutput(
-                output=images, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-            )
-        ]
+        return DiffusionOutput(
+            output=images, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

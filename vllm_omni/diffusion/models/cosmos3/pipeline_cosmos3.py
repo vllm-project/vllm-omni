@@ -2178,7 +2178,7 @@ class Cosmos3OmniDiffusersPipeline(
     def forward(
         self,
         req: DiffusionRequestBatch,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         if req.num_reqs != 1:
             raise ValueError("Cosmos3OmniDiffusersPipeline currently supports single-request forward.")
         pipeline_start = time.time()
@@ -2191,7 +2191,7 @@ class Cosmos3OmniDiffusersPipeline(
         sp = req.sampling_params
         robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
         if robolab_inputs is not None:
-            return [self._forward_robolab_policy(sp, robolab_inputs, pipeline_start)]
+            return self._forward_robolab_policy(sp, robolab_inputs, pipeline_start)
 
         if isinstance(prompt_data, str):
             prompt = prompt_data
@@ -2532,22 +2532,20 @@ class Cosmos3OmniDiffusersPipeline(
             if _is_rank_zero():
                 logger.info("Decoding sound...")
             audio = self._decode_sound_latents(sound_latents, target_audio_samples)
-            return [DiffusionOutput(output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate})]
+            return DiffusionOutput(output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate})
 
         if action_enabled:
             if action_latents is None or raw_action_dim is None or domain_id is None:
                 raise ValueError("Cosmos3 action generation finished without action latents.")
             action = action_latents[:, :, :raw_action_dim].detach().cpu()
-            return [
-                DiffusionOutput(
-                    output={"video": video},
-                    custom_output={
-                        "action": action,
-                        "raw_action_dim": raw_action_dim,
-                        "action_mode": action_mode,
-                        "domain_id": domain_id,
-                    },
-                )
-            ]
+            return DiffusionOutput(
+                output={"video": video},
+                custom_output={
+                    "action": action,
+                    "raw_action_dim": raw_action_dim,
+                    "action_mode": action_mode,
+                    "domain_id": domain_id,
+                },
+            )
 
-        return [DiffusionOutput(output={"image": video} if is_t2i else {"video": video})]
+        return DiffusionOutput(output={"image": video} if is_t2i else {"video": video})

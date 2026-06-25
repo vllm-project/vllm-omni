@@ -11,7 +11,9 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.diffusion]
 
@@ -88,9 +90,10 @@ class _DummyPipeline:
     def __init__(self, output):
         self._output = output
         self.forward_calls = 0
+        self.last_req = None
 
     def forward(self, req):
-        del req
+        self.last_req = req
         self.forward_calls += 1
         return [self._output]
 
@@ -98,8 +101,23 @@ class _DummyPipeline:
 class _SingleRequestBatchPipeline:
     supports_request_batch = False
 
+    def __init__(self):
+        self.last_req = None
+
     def forward(self, req):
-        return [SimpleNamespace(output=req.prompts[0])]
+        self.last_req = req
+        return [DiffusionOutput(output=req.prompts[0])]
+
+
+class _SingleRequestDiffusionOutputPipeline:
+    supports_request_batch = False
+
+    def __init__(self):
+        self.last_req = None
+
+    def forward(self, req):
+        self.last_req = req
+        return DiffusionOutput(output=req.prompts[0])
 
 
 def _make_request(skip_cache_refresh: bool = True):
@@ -120,7 +138,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
     runner.device = torch.device("cpu")
-    runner.pipeline = _DummyPipeline(output=SimpleNamespace(output="ok"))
+    runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="ok"))
     runner.cache_backend = cache_backend
     runner.offload_backend = None
     runner.prompt_embed_cache = None
@@ -167,14 +185,9 @@ def test_pipeline_forward_contract_uses_request_batch_static_contract():
     for class_name, forward in sorted(class_forwards.items()):
         req_arg = next((arg for arg in forward.args.args if arg.arg == "req"), None)
         req_annotation = _annotation_text(req_arg.annotation if req_arg is not None else None)
-        return_annotation = _annotation_text(forward.returns)
         supports_request_batch = _supports_request_batch_value(class_defs[class_name])
         inherits_request_batch_support = _class_inherits_explicit_request_batch_support(class_name, class_defs)
 
-        if req_annotation == "OmniDiffusionRequest":
-            failures.append(f"{class_paths[class_name]}:{class_name}.forward annotates req as OmniDiffusionRequest")
-        if return_annotation == "DiffusionOutput":
-            failures.append(f"{class_paths[class_name]}:{class_name}.forward returns single DiffusionOutput")
         if supports_request_batch is True and not _return_annotation_is_diffusion_output_list(forward.returns):
             failures.append(
                 f"{class_paths[class_name]}:{class_name} declares supports_request_batch=True "
@@ -185,6 +198,14 @@ def test_pipeline_forward_contract_uses_request_batch_static_contract():
                 f"{class_paths[class_name]}:{class_name} inherits request-batch support; "
                 "declare supports_request_batch explicitly"
             )
+        if req_annotation == "OmniDiffusionRequest":
+            failures.append(f"{class_paths[class_name]}:{class_name}.forward annotates req as OmniDiffusionRequest")
+        if supports_request_batch is not True and not inherits_request_batch_support:
+            if _return_annotation_is_diffusion_output_list(forward.returns):
+                failures.append(
+                    f"{class_paths[class_name]}:{class_name}.forward is not request-batch capable "
+                    "but returns list[DiffusionOutput]"
+                )
 
     assert not failures, "\n".join(failures)
 
@@ -213,7 +234,8 @@ def test_e2e_custom_qwen_pipeline_uses_request_batch_contract():
     req_arg = next(arg for arg in forward.args.args if arg.arg == "req")
 
     assert _annotation_text(req_arg.annotation) == "DiffusionRequestBatch"
-    assert _return_annotation_is_diffusion_output_list(forward.returns)
+    assert _supports_request_batch_value(class_def) is False
+    assert _annotation_text(forward.returns) == "DiffusionOutput"
 
 
 @pytest.mark.core_model
@@ -276,6 +298,25 @@ def test_execute_model_passes_single_request_batch_to_non_admission_pipeline(mon
     output = DiffusionModelRunner.execute_model(runner, req)
 
     assert output.output == "a prompt"
+    assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
+    assert runner.pipeline.last_req.num_reqs == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipeline(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _SingleRequestDiffusionOutputPipeline()
+    runner._record_peak_memory = lambda output: None
+    req = _make_request(skip_cache_refresh=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = DiffusionModelRunner.execute_model(runner, req)
+
+    assert output.output == "a prompt"
+    assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
+    assert runner.pipeline.last_req.num_reqs == 1
 
 
 class _BatchPipeline:
@@ -294,7 +335,14 @@ class _BatchPipeline:
 class _SingleRequestPipeline:
     def forward(self, batch):
         del batch
-        return [SimpleNamespace(output="single")]
+        return [DiffusionOutput(output="single")]
+
+
+class _BatchSingleOutputPipeline:
+    supports_request_batch = True
+
+    def forward(self, batch):
+        return DiffusionOutput(output=batch.prompts[0])
 
 
 def _make_batch_runner(pipeline):
@@ -333,7 +381,7 @@ def test_execute_model_batch_rejects_output_count_mismatch(monkeypatch):
         model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
     )
     # forward returns 1 output for 2 scheduled requests
-    runner = _make_batch_runner(_BatchPipeline(outputs=[SimpleNamespace(output="only-one")]))
+    runner = _make_batch_runner(_BatchPipeline(outputs=[DiffusionOutput(output="only-one")]))
     sched = _make_scheduler_output(num_reqs=2)
 
     with pytest.raises(RuntimeError, match="returned 1 outputs for 2 requests"):
@@ -347,7 +395,7 @@ def test_execute_model_batch_routes_one_output_per_request(monkeypatch):
     monkeypatch.setattr(
         model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
     )
-    outs = [SimpleNamespace(output="a"), SimpleNamespace(output="b")]
+    outs = [DiffusionOutput(output="a"), DiffusionOutput(output="b")]
     runner = _make_batch_runner(_BatchPipeline(outputs=outs))
     sched = _make_scheduler_output(num_reqs=2)
 
@@ -371,6 +419,20 @@ def test_execute_model_batch_rejects_pipeline_without_request_batch_support(monk
     sched = _make_scheduler_output(num_reqs=2)
 
     with pytest.raises(RuntimeError, match="does not support request-batch forward"):
+        DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_batch_rejects_single_diffusion_output(monkeypatch):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(
+        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
+    )
+    runner = _make_batch_runner(_BatchSingleOutputPipeline())
+    sched = _make_scheduler_output(num_reqs=1)
+
+    with pytest.raises(RuntimeError, match="request-batch forward must return list\\[DiffusionOutput\\]"):
         DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
 
 
