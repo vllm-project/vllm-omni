@@ -2596,7 +2596,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if self._tts_tokenizer is None:
             model_name = self.engine_client.model_config.model
-            self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)
+            trust_remote_code = bool(getattr(self.engine_client.model_config, "trust_remote_code", False))
+            self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
 
         ref_text = request.ref_text
         prompt_waveform = self._build_ming_prompt_waveform(ref_audio_data) if ref_text is not None else None
@@ -3585,10 +3586,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._tts_model_type == "ming_tts" and sampling_params_list:
             import copy
 
-            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import TEXT_EOS_TOKEN_ID
+            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+                MOE_TEXT_EOS_TOKEN_ID,
+                TEXT_EOS_TOKEN_ID,
+            )
+
+            hf_config = self.engine_client.model_config.hf_config
+            is_moe = getattr(hf_config, "model_type", "") == "bailingmm"
+            stop_token_id = MOE_TEXT_EOS_TOKEN_ID if is_moe else TEXT_EOS_TOKEN_ID
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].stop_token_ids = [int(TEXT_EOS_TOKEN_ID)]
+            sampling_params_list[0].stop_token_ids = [int(stop_token_id)]
             if request.max_new_tokens is not None:
                 # Ming emits TEXT_EOS after the latent decode budget is exhausted, so
                 # Stage-0 needs one extra token beyond ming_max_decode_steps.
