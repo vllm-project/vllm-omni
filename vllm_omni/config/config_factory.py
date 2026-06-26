@@ -123,6 +123,24 @@ class StageConfigFactory:
                             cli_overrides,
                             deploy_config_path,
                         )
+
+        # --- Explicit deploy-config pipeline ---
+        # When auto-detection above resolves nothing (generic/missing HF model_type
+        # and no matching architecture), honor an explicit pipeline key in the deploy config
+        if deploy_config_path is not None:
+            deploy_path = Path(deploy_config_path)
+            if deploy_path.exists():
+                deploy_cfg = load_deploy_config(deploy_path)
+                if deploy_cfg.pipeline:
+                    pipeline_cfg = cls.resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
+                    if pipeline_cfg is not None:
+                        return cls._create_from_registry(
+                            pipeline_cfg.model_type,
+                            pipeline_cfg,
+                            cli_overrides,
+                            deploy_config_path,
+                        )
+
         # Not in the pipeline registry — let the caller fall back to the
         # legacy ``stage_configs/*.yaml`` path (resolve_model_config_path).
         return None
