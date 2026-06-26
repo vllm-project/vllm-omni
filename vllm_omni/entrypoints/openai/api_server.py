@@ -1317,7 +1317,10 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
             return _error_response_to_json_response(result)
-        return JSONResponse(content=result.model_dump())
+        # exclude_none so optional per-item fields are omitted rather than
+        # serialized as null: errored items drop `usage`/`audio_data`/`media_type`,
+        # successful items drop `error`. Matches the documented batch response shape.
+        return JSONResponse(content=result.model_dump(exclude_none=True))
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
     except ValueError as e:
