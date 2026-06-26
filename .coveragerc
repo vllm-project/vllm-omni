@@ -1,0 +1,10 @@
+[run]
+source = vllm_omni
+
+omit =
+    vllm_omni/platforms/npu/*
+    vllm_omni/model_executor/*
+    vllm_omni/diffusion/models/*
+    vllm_omni/platforms/musa/*
+    vllm_omni/platforms/rocm/*
+    vllm_omni/platforms/xpu/*
