@@ -336,7 +336,6 @@ class Krea2Transformer2DModel(nn.Module):
         axes_dims_rope: tuple[int, int, int] = (32, 48, 48),
         rope_theta: float = 1000.0,
         norm_eps: float = 1e-5,
-        quant_config: object | None = None,
     ) -> None:
         super().__init__()
 
@@ -425,8 +424,6 @@ class Krea2Transformer2DModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            if name not in params_dict and ".to_out.0." in name:
-                name = name.replace(".to_out.0.", ".to_out.")
             if name not in params_dict:
                 logger.warning("Skipping unknown weight: %s", name)
                 continue

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -151,7 +152,6 @@ class Krea2Pipeline(
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Krea2Transformer2DModel)
         self.transformer = Krea2Transformer2DModel(
             od_config=od_config,
-            quant_config=od_config.quantization_config,
             **transformer_kwargs,
         )
 
@@ -268,9 +268,7 @@ class Krea2Pipeline(
                 self.scheduler.config.get("max_shift", 1.15),
             )
 
-        accepts_sigmas = "sigmas" in set(
-            __import__("inspect").signature(self.scheduler.set_timesteps).parameters.keys()
-        )
+        accepts_sigmas = "sigmas" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
         if accepts_sigmas:
             self.scheduler.set_timesteps(sigmas=sigmas, mu=mu)
         else:
@@ -293,6 +291,8 @@ class Krea2Pipeline(
             pos = positive_noise_pred
             neg = negative_noise_pred[0] if isinstance(negative_noise_pred, tuple) else negative_noise_pred
         result = pos + true_cfg_scale * (pos - neg)
+        if cfg_normalize:
+            result = self.cfg_normalize_function(pos, result)
         if isinstance(positive_noise_pred, tuple):
             return (result,)
         return result
@@ -480,16 +480,22 @@ class Krea2Pipeline(
 
         self._current_timestep = None
 
-        latents = unpack_latents(latents, height, width, self.vae_scale_factor, self.patch_size)
-        latents = latents.to(self.vae.dtype)
+        if self.od_config.output_type == "latent":
+            image = latents
+        else:
+            latents = unpack_latents(latents, height, width, self.vae_scale_factor, self.patch_size)
+            latents = latents.to(self.vae.dtype)
 
-        latents_mean = torch.tensor(self.vae.config.latents_mean)
-        latents_std = torch.tensor(self.vae.config.latents_std)
-        latents = denormalize_latents(latents, latents_mean, latents_std)
+            latents_mean = torch.tensor(self.vae.config.latents_mean)
+            latents_std = torch.tensor(self.vae.config.latents_std)
+            latents = denormalize_latents(latents, latents_mean, latents_std)
 
-        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(
+            output=image,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
