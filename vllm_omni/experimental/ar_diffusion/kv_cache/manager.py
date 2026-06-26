@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""BDEKVCache — the engine-level KV cache orchestrator for one BDE model.
+"""ARDiffusionKVCache — the engine-level KV cache orchestrator for one AR-Diffusion model.
 
-This is the *body* of BDE's KV management: it owns a vLLM ``KVCacheManager`` (a
+This is the *body* of AR-Diffusion's KV management: it owns a vLLM ``KVCacheManager`` (a
 single chunk-window group) and the per-request adapter lifecycle, and exposes the
 per-chunk operations a rollout needs — allocate, slot mapping, commit, window
 lookup, free. It lives in the model runner (worker / GPU side), co-located with
 the model and the KV tensors; the DreamZero pipeline calls these methods during a
-rollout. The main-process ``BDEEngine`` only selects the engine and is otherwise
+rollout. The main-process ``ARDiffusionEngine`` only selects the engine and is otherwise
 thin.
 """
 
@@ -25,8 +25,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import RequestStatus
 
-from vllm_omni.experimental.bde.kv_cache.config import BDEKVConfig
-from vllm_omni.experimental.bde.kv_cache.paged import (
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowSpec,
     allocate_kv_pool,
     build_window_slots,
@@ -39,7 +39,7 @@ from vllm_omni.experimental.bde.kv_cache.paged import (
 _log = init_logger(__name__)
 
 
-class BDERequestAdapter:
+class ARDiffusionRequestAdapter:
     """Duck-types the subset of ``vllm.v1.request.Request`` that the
     ``KVCacheManager`` reads (``allocate_slots`` / ``get_computed_blocks`` /
     ``free`` and the coordinator they call into).
@@ -48,7 +48,7 @@ class BDERequestAdapter:
     real ``KVCacheManager`` against this adapter so the surface cannot silently
     drift across vLLM versions.
 
-    A BDE request advances one *chunk* at a time: ``allocate_slots`` is called
+    A AR-Diffusion request advances one *chunk* at a time: ``allocate_slots`` is called
     once per chunk and ``num_computed_tokens`` advances only when a chunk is
     committed (:meth:`on_chunk_committed`), so the ``T`` denoise steps of a chunk
     reuse the same slots.
@@ -144,8 +144,8 @@ def build_kv_manager(
     )
 
 
-class BDEKVCache:
-    """Owns the paged KV pool + per-request lifecycle for a BDE model.
+class ARDiffusionKVCache:
+    """Owns the paged KV pool + per-request lifecycle for a AR-Diffusion model.
 
     Build once per loaded model (dimensions known); then per request:
     ``begin_request`` → per chunk (``allocate_chunk`` → ``chunk_write_slots`` →
@@ -154,7 +154,7 @@ class BDEKVCache:
 
     def __init__(
         self,
-        config: BDEKVConfig,
+        config: ARDiffusionKVConfig,
         *,
         num_layers: int,
         num_kv_heads: int,
@@ -168,11 +168,11 @@ class BDEKVCache:
         device: torch.device | None = None,
     ) -> None:
         if not config.enable:
-            raise ValueError("BDEKVCache built with a disabled BDEKVConfig")
+            raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
         if config.window_chunks is None:
             raise ValueError("Phase 1 requires a bounded window (window_chunks)")
         if config.chunk_size <= 0:
-            raise ValueError("BDEKVConfig.chunk_size must be set (> 0)")
+            raise ValueError("ARDiffusionKVConfig.chunk_size must be set (> 0)")
 
         self.config = config
         self.block_size = block_size
@@ -182,7 +182,7 @@ class BDEKVCache:
         self.dtype = dtype
         self.cross_attn_length = cross_attn_length
         self.device = device or torch.device("cpu")
-        self._adapters: dict[str, BDERequestAdapter] = {}
+        self._adapters: dict[str, ARDiffusionRequestAdapter] = {}
 
         # -- cross-attention pool (static, one-time-fill) -----------------------
         # Cross-attn KV is computed once from the text encoder and never changes.
@@ -217,7 +217,7 @@ class BDEKVCache:
                 self._cross_k.append(torch.empty(cross_shape, dtype=dtype, device=device))
                 self._cross_v.append(torch.empty(cross_shape, dtype=dtype, device=device))
             _log.info(
-                "BDE cross-attn pool: %d layers × (%d tok × %d heads × %d) = %.1f MiB",
+                "AR-Diffusion cross-attn pool: %d layers × (%d tok × %d heads × %d) = %.1f MiB",
                 num_layers,
                 cross_attn_length,
                 num_kv_heads,
@@ -231,7 +231,7 @@ class BDEKVCache:
                     self._cross_k_img.append(torch.empty(img_shape, dtype=dtype, device=device))
                     self._cross_v_img.append(torch.empty(img_shape, dtype=dtype, device=device))
                 _log.info(
-                    "BDE cross-attn IMG pool: %d layers × %d img-tok (I2V)",
+                    "AR-Diffusion cross-attn IMG pool: %d layers × %d img-tok (I2V)",
                     num_layers,
                     cross_attn_img_length,
                 )
@@ -266,7 +266,7 @@ class BDEKVCache:
         min_blocks = 2 * (config.window_chunks + 1) + 2
         if num_blocks < min_blocks:
             _log.warning(
-                "BDE KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
+                "AR-Diffusion KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
                 "floor (2 CFG branches x (window_chunks=%d + 1) + 2 headroom)",
                 num_blocks,
                 min_blocks,
@@ -333,19 +333,19 @@ class BDEKVCache:
 
     # -- request lifecycle ---------------------------------------------------
 
-    def begin_request(self, request_id: str, *, prefill_prefix_tokens: int = 0) -> BDERequestAdapter:
-        adapter = BDERequestAdapter(
+    def begin_request(self, request_id: str, *, prefill_prefix_tokens: int = 0) -> ARDiffusionRequestAdapter:
+        adapter = ARDiffusionRequestAdapter(
             request_id,
             chunk_size=self.spec.chunk_size,
             prefill_prefix_tokens=prefill_prefix_tokens,
         )
         self._adapters[request_id] = adapter
-        _log.debug("BDE begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
+        _log.debug("AR-Diffusion begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
         return adapter
 
-    def end_request(self, adapter: BDERequestAdapter) -> None:
+    def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
         _log.debug(
-            "BDE end_request: req=%s chunks=%d free=%d",
+            "AR-Diffusion end_request: req=%s chunks=%d free=%d",
             adapter.request_id,
             adapter.completed_chunks,
             self.manager.block_pool.get_num_free_blocks(),
@@ -355,18 +355,18 @@ class BDEKVCache:
 
     # -- per-chunk operations ------------------------------------------------
 
-    def allocate_chunk(self, adapter: BDERequestAdapter) -> list[int]:
+    def allocate_chunk(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         """Allocate a chunk's blocks (evicting out-of-window blocks first).
 
         Returns the request's full block table (incl. null_block placeholders).
         """
         blocks = self.manager.allocate_slots(adapter, num_new_tokens=self.spec.chunk_size)
         if blocks is None:
-            raise RuntimeError("BDE KV pool exhausted while allocating a chunk")
+            raise RuntimeError("AR-Diffusion KV pool exhausted while allocating a chunk")
         table = self.block_table(adapter)
         resident = resident_block_ids(table, self.null_block_id)
         _log.debug(
-            "BDE allocate_chunk: req=%s chunk=%d table_len=%d resident=%d free=%d",
+            "AR-Diffusion allocate_chunk: req=%s chunk=%d table_len=%d resident=%d free=%d",
             adapter.request_id,
             adapter.completed_chunks,
             len(table),
@@ -375,10 +375,10 @@ class BDEKVCache:
         )
         return table
 
-    def block_table(self, adapter: BDERequestAdapter) -> list[int]:
+    def block_table(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         return list(self.manager.get_block_ids(adapter.request_id)[0])
 
-    def chunk_write_slots(self, adapter: BDERequestAdapter) -> torch.Tensor:
+    def chunk_write_slots(self, adapter: ARDiffusionRequestAdapter) -> torch.Tensor:
         """Slot mapping for the in-flight chunk — the K/V write target."""
         return chunk_slot_mapping(
             self.block_table(adapter),
@@ -387,23 +387,23 @@ class BDEKVCache:
             self.block_size,
         )
 
-    def window_block_ids(self, adapter: BDERequestAdapter) -> list[int]:
+    def window_block_ids(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         """Resident (non-null) blocks the read path gathers the window from."""
         return resident_block_ids(self.block_table(adapter), self.null_block_id)
 
-    def commit_chunk(self, adapter: BDERequestAdapter) -> None:
+    def commit_chunk(self, adapter: ARDiffusionRequestAdapter) -> None:
         """Advance the adapter by one chunk after its K/V is written.
 
         This is the standalone per-chunk advance used by the unit lifecycle and the
         ``tests/bde`` suite. In the DreamZero production path the advance happens
-        elsewhere: :meth:`BDEKVState.update_kv_cache` (gather.py) calls
+        elsewhere: :meth:`ARDiffusionKVState.update_kv_cache` (gather.py) calls
         ``adapter.on_chunk_committed()`` directly as it allocates each frame-chunk,
-        and the pipeline's ``_kv_commit`` -> :meth:`BDEKVState.commit_chunk` is only
+        and the pipeline's ``_kv_commit`` -> :meth:`ARDiffusionKVState.commit_chunk` is only
         a no-op log. Call once per chunk, not per denoise step.
         """
-        _log.debug("BDE commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
+        _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
-        _log.debug("BDE commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
+        _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
     # -- pool-backed K/V access (Step 4 — gather / write) --------------------
 
@@ -412,12 +412,12 @@ class BDEKVCache:
         layer_index: int,
         new_k: torch.Tensor,
         new_v: torch.Tensor,
-        adapter: BDERequestAdapter,
+        adapter: ARDiffusionRequestAdapter,
     ) -> None:
         """Write one layer's committed-chunk K/V into the pool."""
         slots = self.chunk_write_slots(adapter)
         _log.debug(
-            "BDE write: req=%s layer=%d chunk=%d shapes=%s dev=%s",
+            "AR-Diffusion write: req=%s layer=%d chunk=%d shapes=%s dev=%s",
             adapter.request_id,
             layer_index,
             adapter.completed_chunks,
@@ -432,7 +432,7 @@ class BDEKVCache:
             slots,
         )
 
-    def gather_window(self, layer_index: int, adapter: BDERequestAdapter) -> torch.Tensor:
+    def gather_window(self, layer_index: int, adapter: ARDiffusionRequestAdapter) -> torch.Tensor:
         """Gather the resident-window K/V for one layer.
 
         Returns a ``(2, 1, window, n_heads, head_dim)`` tensor — the format
@@ -447,7 +447,7 @@ class BDEKVCache:
             self.spec.sliding_window,
         )
         _log.debug(
-            "BDE gather: req=%s layer=%d blocks=%s window=%s dev=%s",
+            "AR-Diffusion gather: req=%s layer=%d blocks=%s window=%s dev=%s",
             adapter.request_id,
             layer_index,
             window_ids,
@@ -456,7 +456,7 @@ class BDEKVCache:
         )
         return window
 
-    def gather_window_all_layers(self, adapter: BDERequestAdapter) -> list[torch.Tensor]:
+    def gather_window_all_layers(self, adapter: ARDiffusionRequestAdapter) -> list[torch.Tensor]:
         """Gather the resident-window K/V for every layer in one shot.
 
         The window's block table is identical across layers within a forward, so
@@ -479,7 +479,7 @@ class BDEKVCache:
             for i in range(self.num_layers)
         ]
         _log.debug(
-            "BDE gather-all: req=%s layers=%d blocks=%d window=%s",
+            "AR-Diffusion gather-all: req=%s layers=%d blocks=%d window=%s",
             adapter.request_id,
             self.num_layers,
             len(window_ids),

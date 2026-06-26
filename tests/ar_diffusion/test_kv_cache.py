@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the BDE KV cache helpers (Phase 1, PR-2).
+"""Unit tests for the AR-Diffusion KV cache helpers (Phase 1, PR-2).
 
 Covers the request adapter, the chunk-window spec/manager (registration + the
 eviction policy), and the pool builder — exercised against the installed vLLM
@@ -12,16 +12,16 @@ from vllm.v1.kv_cache_interface import KVCacheSpecKind, get_kv_cache_spec_kind
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import RequestStatus
 
-from vllm_omni.experimental.bde.kv_cache import (
-    BDEKVCache,
-    BDEKVConfig,
-    BDERequestAdapter,
+from vllm_omni.experimental.ar_diffusion.kv_cache import (
+    ARDiffusionKVCache,
+    ARDiffusionKVConfig,
+    ARDiffusionRequestAdapter,
     ChunkWindowManager,
     ChunkWindowSpec,
     build_kv_manager,
     compute_num_blocks,
 )
-from vllm_omni.experimental.bde.kv_cache.paged import chunk_window_skipped_tokens
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import chunk_window_skipped_tokens
 
 BLOCK = 16
 
@@ -99,19 +99,19 @@ def test_reset_at_boundary_drops_completed_past_sink():
     assert skip == 32
 
 
-# --- BDEKVConfig ------------------------------------------------------------
+# --- ARDiffusionKVConfig ------------------------------------------------------------
 
 
 def test_kv_config_sliding_window_property():
-    assert BDEKVConfig(chunk_size=16, window_chunks=3).sliding_window == 48
-    assert BDEKVConfig(chunk_size=16, window_chunks=None).sliding_window is None
+    assert ARDiffusionKVConfig(chunk_size=16, window_chunks=3).sliding_window == 48
+    assert ARDiffusionKVConfig(chunk_size=16, window_chunks=None).sliding_window is None
 
 
-# --- BDERequestAdapter ------------------------------------------------------
+# --- ARDiffusionRequestAdapter ------------------------------------------------------
 
 
 def test_adapter_advances_per_chunk_not_per_step():
-    a = BDERequestAdapter("r0", chunk_size=16)
+    a = ARDiffusionRequestAdapter("r0", chunk_size=16)
     assert a.num_computed_tokens == 0
     assert a.num_tokens == 16  # in-flight chunk
     a.on_chunk_committed()
@@ -120,14 +120,14 @@ def test_adapter_advances_per_chunk_not_per_step():
 
 
 def test_adapter_accounts_for_prefill_prefix():
-    a = BDERequestAdapter("r0", chunk_size=16, prefill_prefix_tokens=4)
+    a = ARDiffusionRequestAdapter("r0", chunk_size=16, prefill_prefix_tokens=4)
     assert a.num_computed_tokens == 4
     assert a.num_prompt_tokens == 4
     assert a.num_tokens == 20
 
 
 def test_adapter_status_is_vllm_enum():
-    assert isinstance(BDERequestAdapter("r0", chunk_size=16).status, RequestStatus)
+    assert isinstance(ARDiffusionRequestAdapter("r0", chunk_size=16).status, RequestStatus)
 
 
 # --- pool / manager ---------------------------------------------------------
@@ -139,7 +139,7 @@ def test_compute_num_blocks():
 
 
 def test_build_manager_allocate_free_roundtrip():
-    """End-to-end: a BDERequestAdapter drives a real KVCacheManager.
+    """End-to-end: a ARDiffusionRequestAdapter drives a real KVCacheManager.
 
     This is the adapter conformance check — if the adapter were missing an
     attribute the manager reads, allocate_slots/free would raise here.
@@ -148,7 +148,7 @@ def test_build_manager_allocate_free_roundtrip():
     mgr = build_kv_manager(spec, ["layer0"], num_blocks=16, max_model_len=1024)
     free_before = mgr.block_pool.get_num_free_blocks()
 
-    adapter = BDERequestAdapter("req-0", chunk_size=BLOCK)
+    adapter = ARDiffusionRequestAdapter("req-0", chunk_size=BLOCK)
     blocks = mgr.allocate_slots(adapter, num_new_tokens=BLOCK, full_sequence_must_fit=True)
     assert blocks is not None
     assert mgr.block_pool.get_num_free_blocks() < free_before
@@ -163,8 +163,8 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
     memory budget (review: zwhzzz0821)."""
     L = 512
     avail = 1 << 30  # 1 GiB
-    kv = BDEKVCache(
-        BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2, gpu_memory_fraction=0.5),
+    kv = ARDiffusionKVCache(
+        ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2, gpu_memory_fraction=0.5),
         num_layers=2,
         num_kv_heads=4,
         head_size=64,

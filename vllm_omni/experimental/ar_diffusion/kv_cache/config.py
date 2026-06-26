@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration for BDE engine-level KV cache management."""
+"""Configuration for AR-Diffusion engine-level KV cache management."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ from dataclasses import dataclass
 
 
 @dataclass
-class BDEKVConfig:
-    """Settings for the BDE paged KV cache.
+class ARDiffusionKVConfig:
+    """Settings for the AR-Diffusion paged KV cache.
 
-    Disabled by default: when ``enable`` is False the BDE engine behaves exactly
+    Disabled by default: when ``enable`` is False the AR-Diffusion engine behaves exactly
     like the base ``DiffusionEngine`` (no pool, no paged KV).
     """
 
@@ -24,7 +24,7 @@ class BDEKVConfig:
     sink_chunks: int = 0
     # DreamZero-style window reset vs. VGGT-style sliding replace.
     reset_at_boundary: bool = False
-    # Fraction of free device memory budgeted for the BDE KV pool.
+    # Fraction of free device memory budgeted for the AR-Diffusion KV pool.
     gpu_memory_fraction: float = 0.1
 
     @property

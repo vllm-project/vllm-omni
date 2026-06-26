@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Generic paging mechanics + chunk-window eviction spec for the BDE engine.
+"""Generic paging mechanics + chunk-window eviction spec for the AR-Diffusion engine.
 
 Engine-generic, model-agnostic primitives — the layer a second model (e.g. the
 Cosmos port) reuses unchanged. Three concerns live here:

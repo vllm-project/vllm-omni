@@ -1,28 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for BDEKVCache — the engine-level KV orchestration body (Phase 1)."""
+"""Tests for ARDiffusionKVCache — the engine-level KV orchestration body (Phase 1)."""
 
 import pytest
 import torch
 
-from vllm_omni.experimental.bde.kv_cache import BDEKVCache, BDEKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVCache, ARDiffusionKVConfig
 
 DIMS = dict(num_layers=2, num_kv_heads=4, head_size=64, dtype=torch.float16, block_size=16)
 
 
 def make_cache(*, chunk_size=16, window_chunks=2, available_bytes=1 << 24):
-    cfg = BDEKVConfig(enable=True, chunk_size=chunk_size, window_chunks=window_chunks)
-    return BDEKVCache(cfg, max_model_len=4096, available_bytes=available_bytes, **DIMS)
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=chunk_size, window_chunks=window_chunks)
+    return ARDiffusionKVCache(cfg, max_model_len=4096, available_bytes=available_bytes, **DIMS)
 
 
 def test_requires_enabled_config():
     with pytest.raises(ValueError):
-        BDEKVCache(BDEKVConfig(enable=False), max_model_len=256, available_bytes=1 << 20, **DIMS)
+        ARDiffusionKVCache(ARDiffusionKVConfig(enable=False), max_model_len=256, available_bytes=1 << 20, **DIMS)
 
 
 def test_requires_bounded_window():
-    cfg = BDEKVConfig(enable=True, chunk_size=16, window_chunks=None)
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=16, window_chunks=None)
     with pytest.raises(ValueError):
-        BDEKVCache(cfg, max_model_len=256, available_bytes=1 << 20, **DIMS)
+        ARDiffusionKVCache(cfg, max_model_len=256, available_bytes=1 << 20, **DIMS)
 
 
 def test_full_request_lifecycle_and_eviction():
@@ -67,20 +67,20 @@ def test_num_computed_advances_per_chunk():
 
 
 def test_state_close_frees_both_branch_blocks():
-    """BDEKVState.close() returns both CFG branches' pool blocks to the pool.
+    """ARDiffusionKVState.close() returns both CFG branches' pool blocks to the pool.
 
     This is the primitive the runner's LRU eviction relies on: when a session is
     evicted, close() must free the blocks both adapters hold, or session churn
     leaks pool ownership (review P1).
     """
-    from vllm_omni.experimental.bde.kv_cache.state import BDEKVState
+    from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
     kv = make_cache(chunk_size=16, window_chunks=2)
     free_total = kv.manager.block_pool.get_num_free_blocks()
 
     pos = kv.begin_request("bde__s")
     neg = kv.begin_request("bde__s__neg")
-    state = BDEKVState(kv, pos, neg, num_layers=kv.num_layers)
+    state = ARDiffusionKVState(kv, pos, neg, num_layers=kv.num_layers)
     for _ in range(3):
         for adapter in (pos, neg):
             kv.allocate_chunk(adapter)

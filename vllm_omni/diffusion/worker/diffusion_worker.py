@@ -209,8 +209,8 @@ class DiffusionWorker:
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner. An od_config override (e.g. the BDE engine selecting
-        # BDEModelRunner) takes precedence; unset falls back to the platform default,
+        # Create model runner. An od_config override (e.g. the AR-Diffusion engine selecting
+        # ARDiffusionModelRunner) takes precedence; unset falls back to the platform default,
         # so existing models are unaffected. The override must be an explicit import-
         # path string — guard with isinstance so a non-string (e.g. a Mock od_config
         # in tests) doesn't shadow the platform hook.

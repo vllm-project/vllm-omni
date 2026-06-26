@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Slot-mapping / block-table tests for the BDE engine (Phase 1, Step 3)."""
+"""Slot-mapping / block-table tests for the AR-Diffusion engine (Phase 1, Step 3)."""
 
 import pytest
 import torch
 
-from vllm_omni.experimental.bde.kv_cache import (
-    BDERequestAdapter,
+from vllm_omni.experimental.ar_diffusion.kv_cache import (
+    ARDiffusionRequestAdapter,
     ChunkWindowSpec,
     build_kv_manager,
     chunk_slot_mapping,
@@ -61,7 +61,7 @@ def test_blocktable_build_single_request():
     spec = make_spec()
     mgr = build_kv_manager(spec, ["l0"], num_blocks=16, max_model_len=1024)
     null_id = mgr.block_pool.null_block.block_id
-    adapter = BDERequestAdapter("req", chunk_size=BLOCK)
+    adapter = ARDiffusionRequestAdapter("req", chunk_size=BLOCK)
 
     mgr.allocate_slots(adapter, num_new_tokens=BLOCK)
     block_ids = mgr.get_block_ids(adapter.request_id)[0]

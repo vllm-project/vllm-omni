@@ -115,11 +115,6 @@ class DreamZeroState:
         # Concatenated along T before decode (matches upstream video_across_time).
         self.video_latents_across_time = saved_video_latents
 
-        # KV cache once robot-policy diffusion supports that integration.
-        self.kv_cache = None
-        self.kv_cache_neg = None
-        self.crossattn_cache = None
-        self.crossattn_cache_neg = None
         self.current_start_frame = 0
 
         self.clip_feas = None
@@ -166,57 +161,3 @@ class DreamZeroState:
     def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
         """Determine if state should be reset before this forward()."""
         return self.reset_reason(text_tokens, num_video_frames, local_attn_size) is not None
-
-    # ------------------------------------------------------------------
-    # KV cache management
-    # ------------------------------------------------------------------
-
-    def create_kv_caches(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        num_layers: int,
-        num_heads: int,
-        head_dim: int,
-    ) -> None:
-        """Initialize empty KV caches and cross-attention caches."""
-        self.kv_cache = [
-            torch.zeros(2, batch_size, 0, num_heads, head_dim, dtype=dtype, device=device) for _ in range(num_layers)
-        ]
-        self.kv_cache_neg = [
-            torch.zeros(2, batch_size, 0, num_heads, head_dim, dtype=dtype, device=device) for _ in range(num_layers)
-        ]
-
-        self.crossattn_cache = [
-            {"is_init": False, "k": None, "v": None, "k_img": None, "v_img": None} for _ in range(num_layers)
-        ]
-        self.crossattn_cache_neg = [
-            {"is_init": False, "k": None, "v": None, "k_img": None, "v_img": None} for _ in range(num_layers)
-        ]
-
-    def update_kv_cache(
-        self,
-        layer_index: int,
-        updated_kv: torch.Tensor,
-        is_negative: bool = False,
-    ) -> None:
-        """Update a single layer's KV cache after prefill."""
-        cache = self.kv_cache_neg if is_negative else self.kv_cache
-        if cache is None:
-            raise RuntimeError("KV caches not initialized, call create_kv_caches first.")
-        cache[layer_index] = updated_kv.clone()
-
-    def get_kv_caches(self, is_negative: bool = False) -> list[torch.Tensor]:
-        """Get KV caches for the specified branch."""
-        cache = self.kv_cache_neg if is_negative else self.kv_cache
-        if cache is None:
-            raise RuntimeError("KV caches not initialized.")
-        return cache
-
-    def get_crossattn_caches(self, is_negative: bool = False) -> list[dict[str, bool | torch.Tensor | None]]:
-        """Get cross-attention caches for the specified branch."""
-        cache = self.crossattn_cache_neg if is_negative else self.crossattn_cache
-        if cache is None:
-            raise RuntimeError("Cross-attn caches not initialized.")
-        return cache

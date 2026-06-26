@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""BDEModelRunner — the diffusion model runner for the BDE engine.
+"""ARDiffusionModelRunner — the diffusion model runner for the AR-Diffusion engine.
 
 Subclasses ``DiffusionModelRunner`` and owns the engine-level KV cache
-(:class:`BDEKVCache`). It brackets a request's rollout with the KV lifecycle
-(``begin_request`` / ``end_request``) and exposes the live ``BDEKVCache`` so the
+(:class:`ARDiffusionKVCache`). It brackets a request's rollout with the KV lifecycle
+(``begin_request`` / ``end_request``) and exposes the live ``ARDiffusionKVCache`` so the
 model pipeline (DreamZero) can drive the per-chunk allocate / slot-mapping /
 gather / commit operations during ``pipeline.forward``.
 
-When KV management is disabled (the Phase-1 default), the runner is
-behavior-preserving — it simply defers to the base ``DiffusionModelRunner``.
+Selecting the AR-Diffusion engine enables KV management (no env gate); the KV
+parameters come from ``od_config.ar_diffusion_kv_config`` (deploy/command arg).
 """
 
 from __future__ import annotations
 
 import dataclasses
-import os
 from collections import OrderedDict
 
 import torch
@@ -24,54 +23,45 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import MAX_DREAMZERO_SESSIONS
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.experimental.bde.kv_cache.config import BDEKVConfig
-from vllm_omni.experimental.bde.kv_cache.state import BDEKVState
-from vllm_omni.experimental.bde.kv_cache.manager import BDEKVCache
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 
 logger = init_logger(__name__)
 
 
-def resolve_bde_kv_config(od_config: OmniDiffusionConfig) -> BDEKVConfig:
-    """Resolve the BDE KV config (disabled unless explicitly enabled).
+def resolve_ar_diffusion_kv_config(od_config: OmniDiffusionConfig) -> ARDiffusionKVConfig:
+    """Resolve the AR-Diffusion KV config from the deploy/command arg.
 
-    Precedence: an ``OmniDiffusionConfig`` field (``bde_kv_config`` /
-    ``kv_block_config``), then the ``BDE_KV_ENABLE=1`` env switch (with optional
-    ``BDE_KV_WINDOW_CHUNKS``), else disabled. ``chunk_size`` / ``window_chunks``
-    are finalized from the model geometry at load (see ``_preallocate_kv_cache``).
+    Reads ``od_config.ar_diffusion_kv_config`` (a ``ARDiffusionKVConfig``, a dict of overrides such
+    as ``window_chunks`` / ``gpu_memory_fraction``, or None). Selecting the
+    AR-Diffusion engine implies KV management, so the result is always enabled;
+    ``chunk_size`` / ``window_chunks`` are finalized from the model geometry at load
+    (see ``_preallocate_kv_cache``).
     """
-    raw = getattr(od_config, "bde_kv_config", None)
-    if raw is None:
-        raw = getattr(od_config, "kv_block_config", None)
-    if isinstance(raw, BDEKVConfig):
-        return raw
+    raw = getattr(od_config, "ar_diffusion_kv_config", None)
+    if isinstance(raw, ARDiffusionKVConfig):
+        return dataclasses.replace(raw, enable=True)
     if isinstance(raw, dict):
-        return BDEKVConfig(**raw)
-    if os.environ.get("BDE_KV_ENABLE") == "1":
-        window = os.environ.get("BDE_KV_WINDOW_CHUNKS")
-        gpu_frac = os.environ.get("BDE_KV_GPU_FRACTION")
-        return BDEKVConfig(
-            enable=True,
-            window_chunks=int(window) if window else None,
-            gpu_memory_fraction=float(gpu_frac) if gpu_frac else 0.1,
-        )
-    return BDEKVConfig()
+        return ARDiffusionKVConfig(**{**raw, "enable": True})
+    return ARDiffusionKVConfig(enable=True)
 
 
-class BDEModelRunner(DiffusionModelRunner):
+class ARDiffusionModelRunner(DiffusionModelRunner):
     def __init__(self, vllm_config, od_config: OmniDiffusionConfig, device) -> None:
         super().__init__(vllm_config, od_config, device)
-        self.bde_kv_config = resolve_bde_kv_config(od_config)
+        self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
         # Built after the model is loaded (dimensions known); stays None while KV
         # management is disabled.
-        self.kv_cache: BDEKVCache | None = None
+        self.kv_cache: ARDiffusionKVCache | None = None
         # DreamZero KV is session-scoped (persists across a session's forwards),
-        # so BDE KV state is keyed by session_id and reused, not created per request.
+        # so AR-Diffusion KV state is keyed by session_id and reused, not created per request.
         # Bounded by the same LRU cap as DreamZeroPipeline._states: an evicted
-        # session's BDEKVState owns pool blocks (two CFG adapters), so without a
+        # session's ARDiffusionKVState owns pool blocks (two CFG adapters), so without a
         # bound, session-id churn in a long-running server would leak pool ownership
         # until the KV pool is exhausted. Evicting frees those blocks (state.close()).
-        self._bde_states: OrderedDict[str, BDEKVState] = OrderedDict()
-        self._max_bde_states = MAX_DREAMZERO_SESSIONS
+        self._ar_diffusion_states: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
+        self._max_ar_diffusion_states = MAX_DREAMZERO_SESSIONS
 
     def build_kv_cache(
         self,
@@ -86,14 +76,14 @@ class BDEModelRunner(DiffusionModelRunner):
         cross_attn_length: int = 0,
         cross_attn_img_length: int = 0,
     ) -> None:
-        """Construct the BDEKVCache (preallocating GPU pools on ``self.device``).
+        """Construct the ARDiffusionKVCache (preallocating GPU pools on ``self.device``).
 
         No-op when KV management is disabled.
         """
-        if not self.bde_kv_config.enable:
+        if not self.ar_diffusion_kv_config.enable:
             return
-        self.kv_cache = BDEKVCache(
-            self.bde_kv_config,
+        self.kv_cache = ARDiffusionKVCache(
+            self.ar_diffusion_kv_config,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
@@ -106,11 +96,11 @@ class BDEModelRunner(DiffusionModelRunner):
             device=self.device,
         )
         logger.info(
-            "BDE KV cache enabled: %d blocks, chunk_size=%d, window_chunks=%s, "
+            "AR-Diffusion KV cache enabled: %d blocks, chunk_size=%d, window_chunks=%s, "
             "layers=%d kv_heads=%d head_dim=%d block_size=%d cross_attn_len=%d device=%s",
             self.kv_cache.num_blocks,
-            self.bde_kv_config.chunk_size,
-            self.bde_kv_config.window_chunks,
+            self.ar_diffusion_kv_config.chunk_size,
+            self.ar_diffusion_kv_config.window_chunks,
             num_layers,
             num_kv_heads,
             head_size,
@@ -123,7 +113,7 @@ class BDEModelRunner(DiffusionModelRunner):
 
     def load_model(self, *args, **kwargs):
         super().load_model(*args, **kwargs)
-        if self.bde_kv_config.enable and self.pipeline is not None:
+        if self.ar_diffusion_kv_config.enable and self.pipeline is not None:
             self._preallocate_kv_cache()
 
     def _infer_frame_seqlen(self) -> int:
@@ -149,7 +139,7 @@ class BDEModelRunner(DiffusionModelRunner):
         inferred = self._infer_frame_seqlen()
         if frame_seqlen != inferred:
             logger.warning(
-                "BDE frame_seqlen mismatch: transformer=%d deploy-config=%d; using transformer",
+                "AR-Diffusion frame_seqlen mismatch: transformer=%d deploy-config=%d; using transformer",
                 frame_seqlen,
                 inferred,
             )
@@ -169,12 +159,12 @@ class BDEModelRunner(DiffusionModelRunner):
         # resident window matches max_attention_size exactly (it need not be a whole
         # number of num_frame_per_block causal blocks).
         chunk_size = frame_seqlen
-        window_chunks = self.bde_kv_config.window_chunks or (max_attention_size // frame_seqlen)
+        window_chunks = self.ar_diffusion_kv_config.window_chunks or (max_attention_size // frame_seqlen)
 
-        self.bde_kv_config = dataclasses.replace(self.bde_kv_config, chunk_size=chunk_size, window_chunks=window_chunks)
+        self.ar_diffusion_kv_config = dataclasses.replace(self.ar_diffusion_kv_config, chunk_size=chunk_size, window_chunks=window_chunks)
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
         logger.info(
-            "BDE preallocating (paged): frame_seqlen=%d num_frame_per_block=%d "
+            "AR-Diffusion preallocating (paged): frame_seqlen=%d num_frame_per_block=%d "
             "local_attn_size=%d -> chunk_size=%d window_chunks=%d (window=%d tokens)",
             frame_seqlen,
             num_frame_per_block,
@@ -202,35 +192,35 @@ class BDEModelRunner(DiffusionModelRunner):
 
         kv = self.kv_cache
         # DreamZero KV is session-scoped (the model state persists across a
-        # session's forwards), so the BDE KV state is keyed by session_id and
+        # session's forwards), so the AR-Diffusion KV state is keyed by session_id and
         # reused — matching how pipeline.forward resolves the model-local state.
         extra_args = req.sampling_params.extra_args or {}
         session_id = str(extra_args.get("session_id") or "default")
-        state = self._bde_states.get(session_id)
+        state = self._ar_diffusion_states.get(session_id)
         if state is None:
             pos = kv.begin_request(f"bde__{session_id}")
             neg = kv.begin_request(f"bde__{session_id}__neg")
-            state = BDEKVState(kv, pos, neg, num_layers=kv.num_layers)
-            self._bde_states[session_id] = state
+            state = ARDiffusionKVState(kv, pos, neg, num_layers=kv.num_layers)
+            self._ar_diffusion_states[session_id] = state
             # Evict the least-recently-used session(s) past the cap, freeing their
-            # pool blocks — mirrors DreamZeroPipeline._states so the BDE pool can't
+            # pool blocks — mirrors DreamZeroPipeline._states so the AR-Diffusion pool can't
             # outlive the model-local state map it shadows.
-            while len(self._bde_states) > self._max_bde_states:
-                old_id, old_state = self._bde_states.popitem(last=False)
+            while len(self._ar_diffusion_states) > self._max_ar_diffusion_states:
+                old_id, old_state = self._ar_diffusion_states.popitem(last=False)
                 old_state.close()
-                logger.debug("BDE evicted session=%s (LRU); freed pool blocks", old_id)
+                logger.debug("AR-Diffusion evicted session=%s (LRU); freed pool blocks", old_id)
         # Track recency on every access (hit or miss) so the LRU order is correct.
-        self._bde_states.move_to_end(session_id)
+        self._ar_diffusion_states.move_to_end(session_id)
         logger.debug(
-            "BDE execute_model: req=%s session=%s chunk_size=%d window_chunks=%s num_blocks=%d",
+            "AR-Diffusion execute_model: req=%s session=%s chunk_size=%d window_chunks=%s num_blocks=%d",
             req.request_id,
             session_id,
             kv.spec.chunk_size,
             kv.config.window_chunks,
             kv.num_blocks,
         )
-        self.pipeline._bde_kv_state = state
+        self.pipeline._ar_diffusion_kv_state = state
         try:
             return super().execute_model(req)
         finally:
-            self.pipeline._bde_kv_state = None
+            self.pipeline._ar_diffusion_kv_state = None

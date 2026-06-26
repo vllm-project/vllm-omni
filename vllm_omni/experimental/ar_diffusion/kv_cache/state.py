@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""BDEKVState — per-request bridge between a model rollout and the BDE KV pool.
+"""ARDiffusionKVState — per-request bridge between a model rollout and the AR-Diffusion KV pool.
 
 This is the one model-facing piece of the KV stack (everything in ``paged.py`` /
 ``manager.py`` is engine-generic). A second model (e.g. the Cosmos port) adds a
@@ -19,21 +19,21 @@ import os
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.bde.kv_cache.paged import _drop_batch, pool_write_chunk
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import _drop_batch, pool_write_chunk
 
 _log = init_logger(__name__)
 
 
-class BDEKVState:
-    """Per-request bridge between a DreamZero rollout and the BDE KV pool.
+class ARDiffusionKVState:
+    """Per-request bridge between a DreamZero rollout and the AR-Diffusion KV pool.
 
     Replaces the model-local ``DreamZeroState`` KV methods::
       state.get_kv_caches(neg)    →  bde_state.get_kv_caches(neg)
       state.update_kv_cache(i,kv) →  bde_state.update_kv_cache(i,kv,neg)
       state.create_kv_caches(...) →  no-op (pool is pre-allocated)
 
-    One ``BDEKVState`` per request holds the ``BDEKVCache`` and both CFG adapters
-    (positive / negative). The runner sets ``pipeline._bde_kv_state`` before
+    One ``ARDiffusionKVState`` per request holds the ``ARDiffusionKVCache`` and both CFG adapters
+    (positive / negative). The runner sets ``pipeline._ar_diffusion_kv_state`` before
     ``pipeline.forward(req)``; the pipeline delegates every KV call to it when
     the attribute is present and not None.
 
@@ -59,10 +59,10 @@ class BDEKVState:
         # re-materializing the same tensors ~16x. Memoize the gathered window per
         # branch; invalidate on write-back (window grows) and on reset.
         self._gather_cache: dict[bool, list | None] = {False: None, True: None}
-        # Profiling escape hatch: BDE_KV_NO_MEMO=1 disables the per-forward gather
+        # Profiling escape hatch: AR_DIFFUSION_KV_NO_MEMO=1 disables the per-forward gather
         # memoization so every denoise step re-gathers the window (the pre-memo
         # behavior), for A/B measurement of the memoization win. Default: enabled.
-        self._memo_enabled = os.environ.get("BDE_KV_NO_MEMO") != "1"
+        self._memo_enabled = os.environ.get("AR_DIFFUSION_KV_NO_MEMO") != "1"
         # Cross-attn KV is populated once after text encoding (eager), then
         # read every denoising step.  Reset clears these flags so the next
         # forward repopulates from the new text encoding.
@@ -84,7 +84,7 @@ class BDEKVState:
         if self._memo_enabled:
             self._gather_cache[is_negative] = windows
         _log.info(
-            "BDE GET   [%s] source=paged-gather layers=%d window0=%s resident_blocks=%d/%d",
+            "AR-Diffusion GET   [%s] source=paged-gather layers=%d window0=%s resident_blocks=%d/%d",
             branch,
             self.num_layers,
             tuple(windows[0].shape),
@@ -96,14 +96,14 @@ class BDEKVState:
     def get_cross_kv_caches(self, is_negative: bool) -> list[dict]:
         """Return pool-backed cross-attn cache dicts.
 
-        Under BDE the cross-attn pool is always populated by ``_kv_populate_cross``
+        Under AR-Diffusion the cross-attn pool is always populated by ``_kv_populate_cross``
         before the first read, so this must never be reached unpopulated — if it
         were, the model would lazily project and write cross KV itself, violating
         engine ownership. Fail loud rather than fall back to the model.
         """
         if not (self._cross_populated[is_negative] and self.kv_cache.cross_attn_length > 0):
             raise RuntimeError(
-                "BDE cross-attn read before _kv_populate_cross (neg=%s, cross_attn_length=%d) "
+                "AR-Diffusion cross-attn read before _kv_populate_cross (neg=%s, cross_attn_length=%d) "
                 "— the engine must own all cross KV" % (is_negative, self.kv_cache.cross_attn_length)
             )
         return [self.kv_cache.read_cross_kv(i, is_negative) for i in range(self.num_layers)]
@@ -122,7 +122,7 @@ class BDEKVState:
             # invariant: a non-frame-aligned model would otherwise silently drop
             # the leading new_count % cs tokens and desync num_computed.
             assert new_count % cs == 0, (
-                f"BDE expects frame-aligned seq_len (multiple of chunk_size={cs}), got {new_count}"
+                f"AR-Diffusion expects frame-aligned seq_len (multiple of chunk_size={cs}), got {new_count}"
             )
             n_chunks = new_count // cs
             slots = []
@@ -136,7 +136,7 @@ class BDEKVState:
             # on the next forward's first read of this branch.
             self._gather_cache[is_negative] = None
             _log.info(
-                "BDE WRITE [%s] new_tokens=%d -> %d frame-chunks  resident=%d/%d  storing %d layers",
+                "AR-Diffusion WRITE [%s] new_tokens=%d -> %d frame-chunks  resident=%d/%d  storing %d layers",
                 branch,
                 new_count,
                 n_chunks,
@@ -165,13 +165,13 @@ class BDEKVState:
         frame-chunk. This method exists so the pipeline's ``_kv_commit`` bridge has
         a symmetric call; the resident window is retained across forwards.
         """
-        _log.info("BDE COMMIT (paged; resident window retained across forwards)")
+        _log.info("AR-Diffusion COMMIT (paged; resident window retained across forwards)")
 
     def close(self) -> None:
         """Final teardown — free both branches' resident pool blocks.
 
         Unlike :meth:`reset`, this does **not** restart the adapters: the caller is
-        dropping this ``BDEKVState`` for good (session eviction / shutdown), so the
+        dropping this ``ARDiffusionKVState`` for good (session eviction / shutdown), so the
         blocks return to the ``BlockPool`` and the dead adapters are discarded with
         the state. Frees pool ownership that would otherwise leak when a session is
         evicted from the runner's session map.
@@ -183,9 +183,9 @@ class BDEKVState:
         """Drop this session's KV — mirrors the model-local ``state.reset()``.
 
         DreamZero resets at the attention-window boundary (``should_reset``); the
-        model starts a fresh sliding window, so BDE must free the resident pool
-        blocks and start a fresh adapter for each branch. The ``BDEKVState``
-        object (and thus ``pipeline._bde_kv_state``) is preserved across the reset
+        model starts a fresh sliding window, so AR-Diffusion must free the resident pool
+        blocks and start a fresh adapter for each branch. The ``ARDiffusionKVState``
+        object (and thus ``pipeline._ar_diffusion_kv_state``) is preserved across the reset
         so the runner's session mapping stays valid — only the pool-backed state
         is recycled.
         """
@@ -197,4 +197,4 @@ class BDEKVState:
         self._pending = {False: [], True: []}
         self._gather_cache = {False: None, True: None}
         self._cross_populated = {False: False, True: False}
-        _log.info("BDE RESET [%s/%s] session KV cleared (window boundary)", pos_id, neg_id)
+        _log.info("AR-Diffusion RESET [%s/%s] session KV cleared (window boundary)", pos_id, neg_id)

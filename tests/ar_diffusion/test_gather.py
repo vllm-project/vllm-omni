@@ -3,9 +3,9 @@
 
 import torch
 
-from vllm_omni.experimental.bde.kv_cache import (
-    BDEKVCache,
-    BDEKVConfig,
+from vllm_omni.experimental.ar_diffusion.kv_cache import (
+    ARDiffusionKVCache,
+    ARDiffusionKVConfig,
     allocate_kv_pool,
     pool_gather_window,
     pool_write_chunk,
@@ -76,9 +76,9 @@ def test_pool_write_gather_window_trim():
 
 
 def test_bde_kv_cache_write_gather_integration():
-    """BDEKVCache.write_chunk_kv → gather_window roundtrip through a real manager."""
-    cfg = BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2)
-    kv = BDEKVCache(
+    """ARDiffusionKVCache.write_chunk_kv → gather_window roundtrip through a real manager."""
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2)
+    kv = ARDiffusionKVCache(
         cfg,
         num_layers=1,
         num_kv_heads=N_HEADS,

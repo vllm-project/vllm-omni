@@ -95,58 +95,34 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     Multi-output: predict_noise() returns (video_pred, action_pred).
     CFG: video gets standard CFG, action takes positive branch only.
 
-    BDE KV integration: when ``self._bde_kv_state`` is set by a BDEModelRunner
-    before ``forward()``, the pipeline routes its KV access (get / create / update
-    / commit) through the pool-backed ``BDEKVState`` instead of the model-local
-    ``DreamZeroState``. No BDE imports -- purely duck-typed, inactive by default.
+    KV is managed by the AR-Diffusion engine: ``self._ar_diffusion_kv_state`` is set by the
+    runner before ``forward()`` and the pipeline routes all KV access (get / update /
+    commit / reset) through the pool-backed state. Purely duck-typed (no engine import).
     """
 
-    _bde_kv_state = None  # set by BDEModelRunner when KV management is enabled
+    _ar_diffusion_kv_state = None  # set by the runner before each forward
 
     def _kv_get(self, state, is_negative):
-        s = self._bde_kv_state
-        if s is not None:
-            logger.debug("BDE KV get (neg=%s): %d layers", is_negative, s.num_layers)
-            return s.get_kv_caches(is_negative)
-        return state.get_kv_caches(is_negative)
+        return self._ar_diffusion_kv_state.get_kv_caches(is_negative)
 
     def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
-        # Under BDE the pool owns all KV allocation: self-attn is allocated per
-        # chunk in _kv_update and read via _kv_get (empty window at prefill start),
-        # cross-attn is populated eagerly in _kv_populate_cross. No model-local
-        # caches are created. Only the non-BDE path needs them.
-        if self._bde_kv_state is not None:
-            return
-        state.create_kv_caches(batch_size, dtype, device, num_layers, num_heads, head_dim)
+        # The engine owns all KV allocation: self-attn is allocated per chunk in
+        # _kv_update and read via _kv_get (empty window at prefill start); cross-attn
+        # is populated eagerly in _kv_populate_cross. Nothing to create model-side.
+        return
 
     def _kv_update(self, state, layer_idx, updated_kv, is_negative, seq_len=None):
-        s = self._bde_kv_state
-        if s is not None:
-            logger.debug("BDE KV write: layer %d neg=%s shape=%s", layer_idx, is_negative, tuple(updated_kv.shape))
-            s.update_kv_cache(layer_idx, updated_kv, is_negative, seq_len)
-        else:
-            state.update_kv_cache(layer_idx, updated_kv, is_negative=is_negative)
+        self._ar_diffusion_kv_state.update_kv_cache(layer_idx, updated_kv, is_negative, seq_len)
 
     def _kv_commit(self):
-        s = self._bde_kv_state
-        if s is not None:
-            logger.debug("BDE KV commit: pos=%d chunks neg=%d chunks", s.pos.completed_chunks, s.neg.completed_chunks)
-            s.commit_chunk()
+        self._ar_diffusion_kv_state.commit_chunk()
 
     def _kv_get_cross(self, state, is_negative):
-        """Cross-attn cache: pool-backed when BDE active, model-local otherwise.
-
-        The BDE pool caches both text ``k``/``v`` and (for I2V) the image-token
-        ``k_img``/``v_img`` added by #4154, so the returned dict satisfies the I2V
-        forward without recomputation.
-        """
-        s = self._bde_kv_state
-        if s is not None:
-            return s.get_cross_kv_caches(is_negative)
-        return state.get_crossattn_caches(is_negative)
+        """Cross-attn cache from the engine pool (text k/v + I2V image k_img/v_img)."""
+        return self._ar_diffusion_kv_state.get_cross_kv_caches(is_negative)
 
     def _kv_populate_cross(self, context: torch.Tensor, clip_feature, is_negative: bool) -> None:
-        """Eagerly project cross-attn K/V for all layers into the BDE pool.
+        """Eagerly project cross-attn K/V for all layers into the AR-Diffusion pool.
 
         Caches the session-invariant cross-attn projections once (re-run after a
         window-boundary reset, when ``_cross_populated`` clears): the text ``k``/``v``
@@ -155,8 +131,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         splits off, cached model-side by #4154). Must run after the image is encoded
         so ``clip_feature`` is available.
         """
-        s = self._bde_kv_state
-        if s is None or s._cross_populated.get(is_negative, False):
+        s = self._ar_diffusion_kv_state
+        if s._cross_populated.get(is_negative, False):
             return
         projected = self.transformer.text_embedding(context)
         img_ctx = None
@@ -174,7 +150,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             s.kv_cache.write_cross_kv(i, is_negative, k, v, k_img, v_img)
         s._cross_populated[is_negative] = True
         logger.info(
-            "BDE CROSS POPULATE [%s]: %d layers, text=%s img=%s",
+            "AR-Diffusion CROSS POPULATE [%s]: %d layers, text=%s img=%s",
             "neg" if is_negative else "pos",
             len(self.transformer.blocks),
             tuple(context.shape),
@@ -182,18 +158,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
     def _kv_reset(self, state, *, clear_video_latents: bool = True):
-        """Reset model-local KV and, under BDE, the pooled session window too.
+        """Reset the engine's pooled session window plus the model's non-KV state.
 
-        DreamZero resets its sliding window at the attention-window boundary; the
-        BDE pool must drop the same window so the next forward starts fresh and
-        stays parity-exact with the model-local path. ``clear_video_latents=False``
-        mirrors ``state.reset_inference_state()`` (window-boundary "inference" reset),
-        which keeps the accumulated video latents for export.
+        DreamZero resets at the attention-window boundary; the engine pool drops the
+        same window so the next forward starts fresh. ``clear_video_latents=False``
+        keeps the accumulated video latents for export.
         """
         state.reset(clear_video_latents=clear_video_latents)
-        s = self._bde_kv_state
-        if s is not None:
-            s.reset()
+        self._ar_diffusion_kv_state.reset()
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         """Initialize pipeline components.
@@ -446,9 +418,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if kwargs.get("update_kv_cache", False) and updated_kv_caches:
             state = kwargs.get("dreamzero_state", self.state)
             is_neg = kwargs.get("is_negative", False)
-            if self._bde_kv_state is not None:
+            if self._ar_diffusion_kv_state is not None:
                 logger.info(
-                    "BDE pipeline predict_noise -> write-back: is_neg=%s seq_len=%s current_start_frame=%s layers=%d",
+                    "AR-Diffusion pipeline predict_noise -> write-back: is_neg=%s seq_len=%s current_start_frame=%s layers=%d",
                     is_neg,
                     kwargs.get("seq_len"),
                     kwargs.get("current_start_frame"),
@@ -1087,7 +1059,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             # Auto-reset based on model state (before accumulation). Both a "session"
             # reset and an "inference" (window-boundary) reset clear the model-local
-            # KV window, so route both through _kv_reset to drop the BDE pool window
+            # KV window, so route both through _kv_reset to drop the AR-Diffusion pool window
             # too and stay parity-exact; "inference" keeps the accumulated video
             # latents (reset_inference_state == reset(clear_video_latents=False)).
             reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
@@ -1137,7 +1109,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state.clip_feas = clip_feas.to(dtype=image.dtype)
             state.ys = ys.to(dtype=image.dtype)
 
-            # Eager cross-attn population (BDE only): cache text + image-token K/V
+            # Eager cross-attn population (AR-Diffusion only): cache text + image-token K/V
             # into the pool now that the image is encoded (clip_feas available).
             # Runs on the first forward of a session and after each window-boundary
             # reset (current_start_frame returns to 0); _cross_populated guards re-entry.

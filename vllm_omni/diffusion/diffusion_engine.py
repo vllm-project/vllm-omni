@@ -417,7 +417,7 @@ class DiffusionEngine:
         """Resolve the engine class selected by ``config.engine_backend``.
 
         Mirrors ``DiffusionExecutor.get_class``: accepts the string keys
-        ``"default"`` / ``"bde"``, a ``DiffusionEngine`` subclass, or an import
+        ``"default"`` / ``"ar_diffusion"``, a ``DiffusionEngine`` subclass, or an import
         path string. Kept separate from :meth:`make_engine` so the selection is
         testable without constructing an engine (which runs a dummy forward).
 
@@ -435,12 +435,12 @@ class DiffusionEngine:
             return backend
         if backend == "default":
             return DiffusionEngine
-        if backend == "bde":
-            # Lazy import to avoid a circular dependency (bde.engine imports this
+        if backend == "ar_diffusion":
+            # Lazy import to avoid a circular dependency (ar_diffusion.engine imports this
             # module), mirroring how DiffusionExecutor.get_class imports backends.
-            from vllm_omni.experimental.bde.engine import BDEEngine
+            from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
 
-            return BDEEngine
+            return ARDiffusionEngine
         if isinstance(backend, str):
             try:
                 engine_class = resolve_obj_by_qualname(backend)

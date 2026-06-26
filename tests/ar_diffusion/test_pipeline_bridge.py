@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the BDEKVState pipeline bridge (Step 5)."""
+"""Tests for the ARDiffusionKVState pipeline bridge (Step 5)."""
 
 import pytest
 import torch
 
-from vllm_omni.experimental.bde.kv_cache import BDEKVCache, BDEKVConfig
-from vllm_omni.experimental.bde.kv_cache.state import BDEKVState
+from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVCache, ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 BLOCK = 16
 N_HEADS = 4
@@ -13,8 +13,8 @@ HEAD_DIM = 64
 
 
 def make_state(num_layers=1, window_chunks=4, cross_attn_length=0):
-    cfg = BDEKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
-    kv = BDEKVCache(
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
+    kv = ARDiffusionKVCache(
         cfg,
         num_layers=num_layers,
         num_kv_heads=N_HEADS,
@@ -28,7 +28,7 @@ def make_state(num_layers=1, window_chunks=4, cross_attn_length=0):
     )
     pos = kv.begin_request("r-pos")
     neg = kv.begin_request("r-neg")
-    return kv, BDEKVState(kv, pos, neg, num_layers=num_layers)
+    return kv, ARDiffusionKVState(kv, pos, neg, num_layers=num_layers)
 
 
 def _window(n_chunks):
@@ -36,7 +36,7 @@ def _window(n_chunks):
     return torch.randn(2, 1, n_chunks * BLOCK, N_HEADS, HEAD_DIM)
 
 
-# Approach 2: BDEKVState writes the new tokens into paged pool blocks and gathers
+# Approach 2: ARDiffusionKVState writes the new tokens into paged pool blocks and gathers
 # the resident window back; output mirrors the model-local sliding window.
 
 
@@ -163,23 +163,15 @@ def test_get_cross_kv_caches_returns_pool_dicts_when_populated():
         assert torch.equal(out[i]["v"], v)
 
 
-def test_kv_create_owned_by_engine_under_bde():
-    """_kv_create initializes model-local caches ONLY on the non-BDE path. Under
-    BDE the pool owns all allocation, so state.create_kv_caches must NOT be called."""
+def test_kv_create_is_noop_engine_owns_allocation():
+    """The AR-Diffusion engine owns all KV allocation, so _kv_create never touches
+    the model-local state (DreamZero's model-local KV path was removed)."""
     from unittest.mock import MagicMock
 
     from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
 
     p = DreamZeroPipeline.__new__(DreamZeroPipeline)
-
-    # Non-BDE: model-local caches are created (no recursion).
-    p._bde_kv_state = None
-    state = MagicMock()
-    p._kv_create(state, 1, "float32", "cpu", 24, 4, 64)
-    state.create_kv_caches.assert_called_once_with(1, "float32", "cpu", 24, 4, 64)
-
-    # BDE active: allocation is engine-owned -> no model-local creation.
-    p._bde_kv_state = object()
+    p._ar_diffusion_kv_state = object()
     state = MagicMock()
     p._kv_create(state, 1, "float32", "cpu", 24, 4, 64)
     state.create_kv_caches.assert_not_called()
