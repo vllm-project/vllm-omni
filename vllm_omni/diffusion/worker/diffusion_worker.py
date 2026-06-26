@@ -698,12 +698,14 @@ class WorkerProc:
         self.result_mq = None
         self.result_mq_handle = None
 
-        # Setup result sender (only for rank 0)
-        if gpu_id == 0:
+        # Setup result sender (only on the reply rank). 
+        # Usually rank 0, but the last PP rank under stream-batch PP).
+        self.reply_rank = od_config.reply_rank
+        if gpu_id == self.reply_rank:
             self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
             self.result_mq_handle = self.result_mq.export_handle()
             WorkerProc._shared_result_handle = self.result_mq_handle
-            logger.info(f"Worker {gpu_id} created result MessageQueue")
+            logger.info(f"Worker {gpu_id} created result MessageQueue (reply_rank={self.reply_rank})")
         else:
             handle = getattr(WorkerProc, "_shared_result_handle", None)
             if handle:
@@ -888,7 +890,7 @@ class WorkerProc:
             pipe_writer.send(
                 {
                     "status": "ready",
-                    "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
+                    "result_handle": worker_proc.result_mq_handle if rank == worker_proc.reply_rank else None,
                 }
             )
             worker_proc.worker_busy_loop()

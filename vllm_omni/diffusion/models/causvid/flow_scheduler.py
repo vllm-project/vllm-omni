@@ -1,19 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Per-chunk scheduler wrapper for CausVid stream-batch execution."""
+
 from __future__ import annotations
+
+from typing import Any
 
 import torch
 
-from .fm_solvers_unipc import FlowUniPCMultistepScheduler
 
-
-class LingbotFlowScheduler:
+class CausVidFlowScheduler:
     def __init__(
         self,
-        inner: FlowUniPCMultistepScheduler,
+        inner: Any,
         timesteps: torch.Tensor,
     ) -> None:
+        # Reference to the (already-``set_timesteps``-d) inner scheduler.
         self._inner = inner
         self.timesteps = timesteps
-        # Used by `_convert_flow_pred_to_x0` to look up sigma_t.
         self.sigmas = inner.sigmas
         self._full_timesteps = inner.timesteps
 
@@ -33,7 +38,7 @@ class LingbotFlowScheduler:
         if chunk_step + 1 < self.timesteps.shape[0]:
             next_t = self.timesteps[chunk_step + 1]
             noise = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
-            return (self._inner.add_noise(x0, noise, next_t),)
+            return (self._inner.add_noise(x0, noise, next_t.view(1)),)
         return (x0,)
 
     def add_noise(

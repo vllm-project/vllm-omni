@@ -188,7 +188,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if data["status"] != "ready":
                 raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-            if i == 0:
+            if i == self.od_config.reply_rank:
                 result_handle = data.get("result_handle")
 
             scheduler_infos.append(data)
@@ -357,7 +357,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         result = self.collective_rpc(
             "execute_micro_step",
             args=(scheduler_output,),
-            unique_reply_rank=0,
+            unique_reply_rank=self.od_config.reply_rank,
             exec_all_ranks=True,
         )
 
@@ -390,13 +390,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         # Prepare RPC request message
         # When unique_reply_rank is None, all workers must execute the RPC
-        # but only rank 0 can reply (it's the only one with a result_mq).
+        # but only the reply rank can reply (it owns the result_mq).
         rpc_request = {
             "type": "rpc",
             "method": method,
             "args": args,
             "kwargs": kwargs,
-            "output_rank": unique_reply_rank if unique_reply_rank is not None else 0,
+            "output_rank": unique_reply_rank if unique_reply_rank is not None else self.od_config.reply_rank,
             "exec_all_ranks": unique_reply_rank is None or exec_all_ranks,
         }
 

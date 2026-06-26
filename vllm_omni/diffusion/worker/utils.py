@@ -55,8 +55,6 @@ class DiffusionRequestState:
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
 
-    batched_timesteps: torch.Tensor | None = None
-
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
 
@@ -110,21 +108,6 @@ class DiffusionRequestState:
         # TODO: this is only an approximation for current stepwise mode.
         # A real "new request" signal should eventually come from scheduler/runner state transitions.
         return self.step_index == 0 or self.timesteps is None
-
-
-@dataclass
-class ChunkState:
-    """Per-chunk state for one in-flight chunk of a streaming request.
-
-    Lives inside ``DiffusionRequestState.extra["chunks"]`` (keyed by
-    ``chunk_idx``).
-    """
-
-    idx: int
-    latents: torch.Tensor | None = None
-    step_index: int = 0
-    scheduler: Any | None = None
-    extra: dict[str, Any] = field(default_factory=dict)
 
 
 class BaseRunnerOutput(ABC):

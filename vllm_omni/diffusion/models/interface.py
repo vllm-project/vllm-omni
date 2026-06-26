@@ -95,20 +95,35 @@ def supports_step_execution(pipeline: object) -> bool:
 
 
 @runtime_checkable
-class SupportsMicroStepExecution(SupportsStepExecution, Protocol):
+class SupportsMicroStepExecution(Protocol):
     """Temporal-PP micro-step execution protocol.
 
-    Extends :class:`SupportsStepExecution` with the per-micro-step hooks
-    used by ``DiffusionModelRunner.execute_micro_step``:
-
-    - ``set_pp_recv_dict_buffers`` pre-registers PPGC dict channels for
-      this request to skip the blocking first-call schema exchange.
-    - ``prefetch_tensors`` pre-posts the next-step recv on the comms stream
-      so it overlaps with the current micro-step's compute (latents on the
-      first PP rank, intermediate tensors on the others).
+    Per-micro-step hooks used by ``DiffusionModelRunner.execute_micro_step``:
+    ``prepare_first_chunk`` runs chunk 0 to completion + seeds slots, ``prepare_chunks``
+    rolls the ladder + admits a chunk, ``denoise_step`` + ``step_scheduler`` run one
+    denoise, ``decode_chunks`` decodes the finished chunk, and
+    ``set_pp_recv_dict_buffers`` / ``prefetch_tensors`` manage the PP comms.
     """
 
     supports_micro_step_execution: ClassVar[bool] = True
+
+    def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
+        """Prepare request-level inputs and return initialized state."""
+
+    def prepare_first_chunk(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput | None:
+        """Denoise chunk 0 to completion, seed all KV slots, and decode it."""
+
+    def prepare_chunks(self, state: DiffusionRequestState, **kwargs: Any) -> None:
+        """Roll the ladder one slot and admit the new chunk into ``state.latents``."""
+
+    def denoise_step(self, state: DiffusionRequestState, **kwargs: Any) -> torch.Tensor | None:
+        """Run one denoise step."""
+
+    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        """Run one scheduler step."""
+
+    def decode_chunks(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput | None:
+        """Decode finished chunks; return the merged output once all are decoded."""
 
     def set_pp_recv_dict_buffers(self, state: DiffusionRequestState, **kwargs: Any) -> None:
         """Pre-register PP dict recv buffers and schema cache for this request."""

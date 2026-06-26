@@ -105,27 +105,12 @@ class CachedRequestData:
 
 
 @dataclass
-class Layout:
-    """How the previous latent should be sliced.
-
-    - head [0:len(finished_idxs)] are chunks completing denoising (to decode)
-    - next [len(finished_idxs) : len(finished_idxs)+len(circulating_idxs)] are
-      re-admitted chunks
-    - rank 0 appends len(new_idxs) fresh randn rows at the tail before forwarding.
-    """
-
-    circulating_idxs: list[int]
-    finished_idxs: list[int]
-    new_idxs: list[int]
-
-
-@dataclass
 class RankTask:
-    """One unit of work for a rank in a stream-batch micro-step."""
+    """One unit of work for a rank in a micro-step."""
 
     request_id: str
-    chunk_indices: list[int]
-    layout: Layout
+    slot_chunks: list[int | None]
+    is_last: bool = False
 
 
 @dataclass

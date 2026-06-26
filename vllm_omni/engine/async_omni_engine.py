@@ -1938,6 +1938,7 @@ class AsyncOmniEngine:
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
             "stream_batch": kwargs.get("stream_batch", False),
+            "enable_dynamic_block_schedule": kwargs.get("enable_dynamic_block_schedule", False),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
             "cache_backend": cache_backend,

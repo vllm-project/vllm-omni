@@ -190,6 +190,7 @@ class PipelineParallelMixin:
         buf_idx: int = 0,
         batch_size: int = 1,
         preposted_its: list[AsyncIntermediateTensors] | None = None,
+        use_buffer: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """
         Drop-in replacement for predict_noise_maybe_with_cfg that also handles PP.
@@ -226,11 +227,9 @@ class PipelineParallelMixin:
         n = len(all_kwargs)
         its: list[AsyncIntermediateTensors | None] = [None] * n
         if not pp_group.is_first_rank:
-            # Use recvs pre-posted by the previous step's scheduler_step.
-            # Caller owns the lifecycle in state.extra; we just consume here.
             if preposted_its is not None and len(preposted_its) == n:
                 its = list(preposted_its)
-            else:
+            elif use_buffer:
                 for i in range(n):
                     its[i] = AsyncIntermediateTensors(
                         *pp_group.pipeline_irecv_tensor_dict(
@@ -240,19 +239,25 @@ class PipelineParallelMixin:
                             batch_size=batch_size,
                         )
                     )
+            else:
+                for i in range(n):
+                    its[i] = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict(src=pp_group.group_prev_rank))
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for i, (kwargs, it) in enumerate(zip(all_kwargs, its)):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
-                self._pp_send_work.extend(
-                    pp_group.pipeline_isend_tensor_dict(
-                        result.tensors,
-                        name="intermediate",
-                        segment_idx=i,
-                        batch_size=batch_size,
+                if use_buffer:
+                    self._pp_send_work.extend(
+                        pp_group.pipeline_isend_tensor_dict(
+                            result.tensors,
+                            name="intermediate",
+                            segment_idx=i,
+                            batch_size=batch_size,
+                        )
                     )
-                )
+                else:
+                    self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
 
         # Last rank: run full forward
@@ -290,6 +295,7 @@ class PipelineParallelMixin:
         batch_size: int = 1,
         receive_latents: bool = True,
         buf_idx: int = 0,
+        use_buffer: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Drop-in replacement for scheduler_step_maybe_with_cfg that also handles PP.
@@ -322,19 +328,25 @@ class PipelineParallelMixin:
                 per_request_scheduler,
                 generator,
             )
-            self._pp_send_work = pp_group.pipeline_isend_tensor_dict(
-                {"latents": latents},
-                name="latents",
-                batch_size=batch_size,
-            )
-        if pp_group.is_first_rank and receive_latents:
-            latents = AsyncLatents(
-                *pp_group.pipeline_irecv_tensor_dict(
+            if use_buffer:
+                self._pp_send_work = pp_group.pipeline_isend_tensor_dict(
+                    {"latents": latents},
                     name="latents",
-                    buf_idx=buf_idx,
                     batch_size=batch_size,
                 )
-            )
+            else:
+                self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents})
+        if pp_group.is_first_rank and receive_latents:
+            if use_buffer:
+                latents = AsyncLatents(
+                    *pp_group.pipeline_irecv_tensor_dict(
+                        name="latents",
+                        buf_idx=buf_idx,
+                        batch_size=batch_size,
+                    )
+                )
+            else:
+                latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.group_prev_rank))
         return latents
 
     def _scheduler_step_local(

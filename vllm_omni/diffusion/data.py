@@ -616,12 +616,24 @@ class OmniDiffusionConfig:
     # When True, the engine uses ``StreamBatchScheduler`` and routes execution
     # through ``executor.execute_micro_step``.
     stream_batch: bool = False
+    enable_dynamic_block_schedule: bool = False
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def reply_rank(self) -> int:
+        """Worker rank that owns the result queue and replies to the engine.
+
+        Normally rank 0. Under stream-batch PP the last rank decodes finished
+        chunks and replies, so the result queue lives there instead.
+        """
+        if self.stream_batch and self.parallel_config.pipeline_parallel_size > 1:
+            return self.parallel_config.pipeline_parallel_size - 1
+        return 0
 
     @property
     def is_moe(self) -> bool:

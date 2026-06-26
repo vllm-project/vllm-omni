@@ -48,6 +48,10 @@ class ForwardContext:
     # Used by attention layers to determine if SP communication should be enabled
     _sp_shard_depth: int = 0
 
+    # Temporal PP support
+    stream_xt: torch.Tensor | None = None
+    stream_t: torch.Tensor | None = None
+
     @property
     def sp_active(self) -> bool:
         """Returns True when SP attention parallelism should be enabled.

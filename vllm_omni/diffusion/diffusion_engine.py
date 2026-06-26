@@ -715,6 +715,8 @@ class DiffusionEngine:
             color_format = image_color_format(self.od_config.model_class_name)
             dummy_image = PIL.Image.new(color_format, (width, height))
             prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
+        else:
+            dummy_image = None
 
         if supports_audio_input:
             audio_sr = 16000
