@@ -81,6 +81,7 @@ _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _MOSS_TTS_FULL_MODEL_STAGES = {"moss_tts", "moss_tts_codec"}
+_MOSS_TTS_LOCAL_MODEL_STAGES = {"moss_tts_local", "moss_tts_local_codec"}
 _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
@@ -99,6 +100,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
     | _MOSS_TTS_FULL_MODEL_STAGES
+    | _MOSS_TTS_LOCAL_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
@@ -180,6 +182,18 @@ def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample:
     )
 
     return header
+
+
+def _infer_audio_num_channels(audio: np.ndarray) -> int:
+    """Infer channel count before streaming PCM bytes are wrapped as WAV."""
+    if audio.ndim == 3 and audio.shape[0] == 1:
+        audio = audio[0]
+    if audio.ndim == 2:
+        if audio.shape[0] in (1, 2):
+            return int(audio.shape[0])
+        if audio.shape[1] in (1, 2):
+            return int(audio.shape[1])
+    return 1
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -687,6 +701,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
         if model_stage in _MOSS_TTS_FULL_MODEL_STAGES:
+            return "moss_tts"
+        if model_stage in _MOSS_TTS_LOCAL_MODEL_STAGES:
             return "moss_tts"
         if model_stage in _HIGGS_AUDIO_V2_TTS_MODEL_STAGES:
             return "higgs_audio_v2"
@@ -1675,6 +1691,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             name = ""
         if "realtime" in name:
             return "realtime"
+        if "local" in name:
+            return "local"
         if "ttsd" in name:
             return "ttsd"
         if "soundeffect" in name:
@@ -1701,9 +1719,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return "Input text cannot be empty"
 
         v = self._moss_variant
-        if v in (None, "tts", "realtime"):
+        if v in (None, "tts", "realtime", "local"):
             if request.ref_audio is None:
-                label = "MOSS-TTS-Nano" if v is None else ("MOSS-TTS-Realtime" if v == "realtime" else "MOSS-TTS")
+                label = (
+                    "MOSS-TTS-Nano"
+                    if v is None
+                    else (
+                        "MOSS-TTS-Realtime"
+                        if v == "realtime"
+                        else ("MOSS-TTS-Local-Transformer" if v == "local" else "MOSS-TTS")
+                    )
+                )
                 return f"{label} requires 'ref_audio' (reference audio for voice cloning)."
             return self._validate_ref_audio_format(request.ref_audio)
 
@@ -1806,11 +1832,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["prompt_audio_array"] = [[wav_list, sr]]
             return params
 
-        # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator):
-        # call the upstream processor server-side to produce unified codes ----
+        # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator)
+        # and MOSS-TTS-Local-Transformer-v1.5: call the upstream processor
+        # server-side to produce unified codes. Local-v1.5 ships its own
+        # AutoProcessor (processor_config.json + processing_moss_tts.py) and
+        # reuses this exact build_user_message/encode_audios_from_wav path in
+        # the offline example (examples/.../moss_tts/end2end.py:
+        # _build_unified_codes) -- it is NOT in the same boat as Realtime
+        # (no processor_config.json there), so it must not fall back to the
+        # prompt_audio_array path above (which the talker's preprocess()
+        # never reads -- info_dict["codes"]["ref"] is the only thing it
+        # consumes, so skipping this path silently drops all voice-clone
+        # conditioning and produces unconditioned/garbage audio online). ----
         proc = self._get_moss_processor()
         n_vq = int(getattr(proc.model_config, "n_vq", 32))
-        sr_target = int(getattr(proc.model_config, "sampling_rate", 24000))
+        # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
+        # regardless of its 48 kHz stereo *output* codec -- mirrors the
+        # offline example's hardcoded encode_audios_from_wav(sampling_rate=24000)
+        # for this variant; proc.model_config.sampling_rate there is the
+        # output rate (48000), the wrong value to resample the reference into.
+        sr_target = 24000 if v == "local" else int(getattr(proc.model_config, "sampling_rate", 24000))
 
         # Reference-audio encoding + speaker caching lives in the model package
         # (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
@@ -1837,7 +1878,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
-        if v in ("tts", "realtime"):
+        if v in ("tts", "local"):
             user_kwargs["reference"] = [await _encode_ref(request.ref_audio)]
         elif v == "ttsd":
             refs = [await _encode_ref(request.ref_audio)]
@@ -2555,7 +2596,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if self._tts_tokenizer is None:
             model_name = self.engine_client.model_config.model
-            self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)
+            trust_remote_code = bool(getattr(self.engine_client.model_config, "trust_remote_code", False))
+            self._tts_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
 
         ref_text = request.ref_text
         prompt_waveform = self._build_ming_prompt_waveform(ref_audio_data) if ref_text is not None else None
@@ -2654,7 +2696,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         assert sr_raw is not None, (
                             "First audio chunk must include sample rate metadata for WAV streaming"
                         )
-                        wav_header = _create_wav_header(sample_rate=sample_rate_val, num_channels=1, bits_per_sample=16)
+                        num_channels = _infer_audio_num_channels(np.asarray(chunk_np))
+                        wav_header = _create_wav_header(
+                            sample_rate=sample_rate_val,
+                            num_channels=num_channels,
+                            bits_per_sample=16,
+                        )
                         yield wav_header
                         first_chunk = False
 
@@ -3539,10 +3586,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._tts_model_type == "ming_tts" and sampling_params_list:
             import copy
 
-            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import TEXT_EOS_TOKEN_ID
+            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+                MOE_TEXT_EOS_TOKEN_ID,
+                TEXT_EOS_TOKEN_ID,
+            )
+
+            hf_config = self.engine_client.model_config.hf_config
+            is_moe = getattr(hf_config, "model_type", "") == "bailingmm"
+            stop_token_id = MOE_TEXT_EOS_TOKEN_ID if is_moe else TEXT_EOS_TOKEN_ID
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].stop_token_ids = [int(TEXT_EOS_TOKEN_ID)]
+            sampling_params_list[0].stop_token_ids = [int(stop_token_id)]
             if request.max_new_tokens is not None:
                 # Ming emits TEXT_EOS after the latent decode budget is exhausted, so
                 # Stage-0 needs one extra token beyond ming_max_decode_steps.

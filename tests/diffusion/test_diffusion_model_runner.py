@@ -80,6 +80,7 @@ def _make_request(skip_cache_refresh: bool = True):
         num_inference_steps=4,
     )
     return SimpleNamespace(
+        request_id="req-test",
         prompts=["a prompt"],
         sampling_params=sampling_params,
         skip_cache_refresh=skip_cache_refresh,
@@ -104,9 +105,41 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     runner.kv_transfer_manager = SimpleNamespace(
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
-        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
+        receive_multi_kv_cache_distributed=lambda *a, **k: None,
     )
+    runner._kv_prefetch_enabled = False
     return runner
+
+
+def _make_compile_runner(*, use_hsdp: bool):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = SimpleNamespace(transformer=SimpleNamespace())
+    runner.od_config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=use_hsdp))
+    return runner
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("use_hsdp", [False, True])
+def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
+    runner = _make_compile_runner(use_hsdp=use_hsdp)
+    compile_calls = []
+
+    def _regionally_compile(model, *args, **kwargs):
+        compile_calls.append((model, args, kwargs))
+        return model
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert compile_calls == [
+        (
+            runner.pipeline.transformer,
+            (),
+            {"dynamic": True},
+        )
+    ]
 
 
 @pytest.mark.core_model

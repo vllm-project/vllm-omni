@@ -595,7 +595,6 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
-
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",
