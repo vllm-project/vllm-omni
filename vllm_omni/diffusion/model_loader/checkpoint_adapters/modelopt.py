@@ -172,10 +172,22 @@ class ModelOptFp8CheckpointAdapter:
         state: _AdaptState,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         state.scale_tensors[name] = tensor
-        if target_name is None:
-            state.skipped_scales += 1
-        else:
-            yield name, tensor
+        # OVERLAY FIX (cosmos3 FP8): always pass the scale through, even when it
+        # does not resolve to a model param here. This adapter runs on the raw
+        # checkpoint key namespace, BEFORE a model's own load_weights remap. The
+        # Cosmos3 pipeline splits the diffusers `layers.*` namespace into
+        # `gen_layers.*` / `language_model.layers.*` via `_remap_ckpt_key`, which
+        # this generic adapter cannot express, so `target_name` is None for every
+        # cosmos3 scale. Upstream, this branch silently dropped those scales
+        # (`skipped_scales`) while still yielding the FP8 *weights* (see `adapt`),
+        # leaving the quantized linears with uninitialized weight_scale/
+        # input_scale -> pure-noise output. Yield scales too; the model's
+        # downstream remap + `remapped in allowed` filter decides where they land.
+        # NOTE: do NOT count unresolved-here scales as "skipped" — they are
+        # passed through, not dropped. (The misleading "skipped N scale tensors"
+        # log was just this counter; the real signal is the model's
+        # "kept N/M tensors" remap line.)
+        yield name, tensor
         yield from self._flush_pending_weights(name, state)
 
     def _target_dtype_for_dequantization(
