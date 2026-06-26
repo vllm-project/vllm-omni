@@ -149,7 +149,7 @@ class OmniParallelConfig:
           (``StageDeployConfig``); the deploy layer consumes it separately.
         * ``omni_lb_policy`` — a pipeline-wide load-balancer policy the engine
           reads once at construction (see ``StrategyApplyResult.omni_lb_policy``);
-          it is applied at the engine level, not folded into per-stage args.
+          it is applied at the orchestrator level, not folded into per-stage args.
         """
         kwargs: dict[str, object] = {
             "tensor_parallel_size": self.tensor_parallel_size,

@@ -54,9 +54,9 @@ def test_apply_tp_by_role():
     assert "tensor_parallel_size" not in stages[1].yaml_engine_args
 
 
-def test_apply_by_stage_id():
+def test_apply_by_model_stage():
     stages = _qwen_stages()
-    apply_strategy_specs(stages, {0: [_tp(2)]})
+    apply_strategy_specs(stages, {"thinker": [_tp(2)]})
     assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2
 
 

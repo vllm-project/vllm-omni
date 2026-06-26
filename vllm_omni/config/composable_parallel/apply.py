@@ -19,11 +19,11 @@ Design rules (one writer per axis):
   count must be consistent with the engine world size (``tp * dp * pp``) and the
   replica count, so misconfigurations fail at config time instead of at spawn.
 
-``omni_lb_policy`` is *not* a per-stage config knob: omni reads it once at engine
-construction (``AsyncOmniEngine``), not from stage configs. So a stage_replica
-axis's derived policy is surfaced on :class:`StrategyApplyResult` for the caller
-to pass to the engine; it is never silently written into a stage where it would
-be ignored.
+``omni_lb_policy`` is *not* a per-stage config knob: omni reads it once at
+orchestrator construction (``AsyncOmniEngine``), not from stage configs. So a
+stage_replica axis's derived policy is surfaced on :class:`StrategyApplyResult`
+for the caller to pass to the orchestrator; it is never silently written into a
+stage where it would be ignored.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ _ENGINE_FIELD_BY_KIND: dict[str, str] = {
     "pp": "pipeline_parallel_size",
 }
 
-RoleKey = str | int
+RoleKey = str
 
 
 class StrategyApplyError(ValueError):
@@ -77,13 +77,13 @@ class StrategyApplyResult:
     ``stages`` is the same list passed in (mutated in place and returned for
     convenience). ``omni_lb_policy`` is the pipeline-wide load-balancer policy
     derived from any stage_replica axes (``None`` if none declared one); the
-    caller wires it into the engine, since omni does not read it from stage
-    configs.
+    caller wires it into the orchestrator, since omni does not read it from
+    stage configs.
 
-    ``per_role_config`` is keyed by the role key the caller supplied (which may
-    be a ``model_stage`` string or a ``stage_id`` int). ``per_stage_config`` is
-    the same information keyed by the resolved integer ``stage_id`` — handy for
-    re-validating a stage after later layers (e.g. CLI overrides) have run.
+    ``per_role_config`` is keyed by the role key the caller supplied — a
+    ``model_stage`` name (str). ``per_stage_config`` is the same information
+    keyed by the resolved integer ``stage_id`` — handy for re-validating a
+    stage after later layers (e.g. CLI overrides) have run.
     """
 
     stages: list[Any]
@@ -93,31 +93,13 @@ class StrategyApplyResult:
 
 
 def _resolve_stage(stages: Sequence[Any], key: RoleKey) -> Any:
-    """Find the single stage matching ``key`` (by ``model_stage`` or ``stage_id``).
+    """Find the single stage matching ``key`` by ``model_stage`` name.
 
-    A strategy role key is intentionally matched on *one* of two stage attributes,
-    chosen by the key's runtime type — never both at once:
-
-    * a ``str`` key (e.g. ``"thinker"``) is a human-readable ``model_stage`` name,
-      which is how strategy.yaml authors naturally refer to a stage;
-    * an ``int`` key (e.g. ``1``) is the positional ``stage_id``, used by callers
-      that don't know/care about role names (programmatic overlays, tests).
-
-    Supporting both is a deliberate ergonomics choice, not a fallback chain: the
-    key's type unambiguously selects the lookup field, so there is no precedence
-    to reason about and no risk of a name accidentally matching an id. The
-    ``bool`` guard below exists only because ``bool`` is an ``int`` subclass and
-    would otherwise be silently treated as a stage_id.
+    Role keys are ``model_stage`` names (str) — the same human-readable names
+    that strategy.yaml authors use to refer to a stage (e.g. ``"thinker"``).
     """
-    if isinstance(key, bool):  # guard: bool is an int subclass
-        _fail(f"strategy role key must be str or int, got bool {key!r}")
-
-    if isinstance(key, int):
-        matches = [s for s in stages if getattr(s, "stage_id", None) == key]
-        descriptor = f"stage_id={key}"
-    else:
-        matches = [s for s in stages if getattr(s, "model_stage", None) == key]
-        descriptor = f"model_stage={key!r}"
+    matches = [s for s in stages if getattr(s, "model_stage", None) == key]
+    descriptor = f"model_stage={key!r}"
 
     if not matches:
         available = ", ".join(f"{getattr(s, 'model_stage', '?')!r}(id={getattr(s, 'stage_id', '?')})" for s in stages)
@@ -239,9 +221,9 @@ def apply_strategy_specs(
 
     Args:
         stages: the ``list[StageConfig]`` returned by ``merge_pipeline_deploy``.
-        strategy_specs: maps a role (``model_stage`` string, e.g. ``"thinker"``,
-            or an integer ``stage_id``) to that stage's stack of
-            ``StrategySpec`` (one per declared mesh axis).
+        strategy_specs: maps a role (a ``model_stage`` name, e.g. ``"thinker"``)
+            to that stage's stack of ``StrategySpec`` (one per declared mesh
+            axis). Role keys are ``model_stage`` names (str).
 
     Returns:
         A :class:`StrategyApplyResult` with the mutated stages and the derived

@@ -584,7 +584,7 @@ def parse_args():
         type=str,
         default=None,
         choices=["random", "round-robin", "least-queue-length"],
-        help="StagePool load-balancer policy for replicated stages (engine-level knob).",
+        help="StagePool load-balancer policy for replicated stages (orchestrator-level knob).",
     )
     return parser.parse_args()
 

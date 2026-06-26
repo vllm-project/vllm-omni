@@ -390,9 +390,9 @@ class StageConfigFactory:
         """Overlay derived parallel sizing onto merged stages (opt-in).
 
         ``omni_lb_policy`` cannot be set from stage configs (omni reads it once
-        at engine construction), so a derived non-default policy is logged here
-        and carried on the returned ``StrategyApplyResult`` for the caller to
-        hand to the engine.
+        at orchestrator construction), so a derived non-default policy is logged
+        here and carried on the returned ``StrategyApplyResult`` for the caller
+        to hand to the orchestrator.
 
         Returns the ``StrategyApplyResult`` (or ``None`` when no strategy was
         supplied) so the caller can re-validate the resolved layout once CLI
@@ -406,7 +406,7 @@ class StageConfigFactory:
         if applied.omni_lb_policy is not None:
             logger.info(
                 "[composable_parallel] strategy derived omni_lb_policy=%r; it will be applied "
-                "to the engine unless an explicit --omni-lb-policy was given.",
+                "to the orchestrator unless an explicit --omni-lb-policy was given.",
                 applied.omni_lb_policy,
             )
         return applied

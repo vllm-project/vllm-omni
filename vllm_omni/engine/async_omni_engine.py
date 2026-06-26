@@ -1195,7 +1195,7 @@ class AsyncOmniEngine:
         )
 
         # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
-        # an engine-level knob (read once at construction), so apply it here
+        # an orchestrator-level knob (read once at construction), so apply it here
         # rather than as a per-stage config field.
         self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
 

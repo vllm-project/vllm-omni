@@ -41,8 +41,6 @@ def _stage_replica(size: int, policy: str = "round_robin") -> StrategySpec:
 
 def _qwen_stages():
     pipeline = _PIPELINE_REGISTRY["qwen2_5_omni"]
-    if not _DEPLOY.exists():
-        pytest.skip("qwen2_5_omni deploy config not found")
     deploy = load_deploy_config(_DEPLOY)
     return merge_pipeline_deploy(pipeline, deploy)
 
@@ -100,8 +98,6 @@ def _resolved(stages, role):
 
 
 def test_device_check_survives_cli_override():
-    if not _DEPLOY.exists():
-        pytest.skip("qwen2_5_omni deploy config not found")
     # Strategy replicates the talker (1-GPU template -> valid at apply time),
     # but a CLI --stage_1_devices with 3 ids must NOT slip past the device
     # guard: effective world=1, replicas=2 admits only 1 or 2 device ids.
@@ -114,8 +110,6 @@ def test_device_check_survives_cli_override():
 
 
 def test_cli_overrides_strategy_with_warning():
-    if not _DEPLOY.exists():
-        pytest.skip("qwen2_5_omni deploy config not found")
     # Strategy derives num_replicas=2 for the talker; a CLI override to 3 wins
     # (it is the most explicit user action) but must be surfaced loudly rather
     # than silently. The resulting layout (1 template device) stays valid.
