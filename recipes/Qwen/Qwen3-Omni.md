@@ -271,6 +271,7 @@ From repository root:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Thinking --omni --port 8091 \
   --stage-configs-path vllm_omni/deploy/qwen3_omni_moe_thinking_stage_config.yaml \
+  --tensor-parallel-size 4 \
   --stage-init-timeout 1200 --init-timeout 1800 \
   --gpu-memory-utilization 0.90 \
   --max-model-len 32768 \
