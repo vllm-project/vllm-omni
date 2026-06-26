@@ -44,7 +44,7 @@ class StageRequestStats:
     final_output_type: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, int] = None
+    diffusion_metrics: dict[str, float] = None
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
@@ -579,7 +579,7 @@ class OrchestratorAggregator:
         if final_output_type is not None:
             stats.final_output_type = final_output_type
         stats.diffusion_metrics = (
-            {k: int(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
+            {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
             if req_id in self.diffusion_metrics
             else None
         )
