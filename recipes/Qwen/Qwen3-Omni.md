@@ -28,8 +28,10 @@ serving paths already exercised by repository examples and tests.
 
 - User guide:
   [`docs/user_guide/examples/online_serving/qwen3_omni.md`](../../docs/user_guide/examples/online_serving/qwen3_omni.md)
-- Example guide:
+- Example guide Online Serving:
   [`examples/online_serving/qwen3_omni/README.md`](../../examples/online_serving/qwen3_omni/README.md)
+- Ray batch offline guide:
+  [`examples/offline_inference/qwen3_omni/README.md`](../../examples/offline_inference/qwen3_omni/README.md)
 - Thinking stage config (verified on 2× H100-80G, TP=2):
   [`vllm_omni/deploy/qwen3_omni_moe_thinking_stage_config.yaml`](../../vllm_omni/deploy/qwen3_omni_moe_thinking_stage_config.yaml)
 

@@ -108,3 +108,49 @@ python end2end_async_chunk.py \
 > recommended entry point for non-async-chunk workflows. Only use the
 > async_chunk example when you need the stage-level concurrency semantics
 > described in PR #962 / #1151.
+
+## Ray batch inference (Thinking)
+
+**`batch_inference_ray.py`** uses **Ray Data** and Ray's
+`vLLMEngineProcessorConfig` to run a **single vLLM engine inside a Ray actor**.
+
+### Setup
+
+Use a **vLLM-Omni** environment (e.g. `vllm/vllm-omni-rocm:v0.20.0`).
+
+The stock `vllm-omni-rocm` images do not ship Ray Data LLM; Thus, we need to install the following inside a container.
+
+```bash
+pip uninstall -y uvloop 2>/dev/null || true
+pip install -U "ray[default,data]"
+pip install --no-cache-dir grpcio pyarrow pandas datasets hydra-core omegaconf
+pip install -U qwen-omni-utils librosa soundfile
+pip install --no-cache-dir "uvloop>=0.21"
+```
+
+**Tensor parallelism:** the Thinking audio encoder has 20 attention heads, thus **TP must divide 20** (e.g. TP=2/4 on stock vllm/vllm-omni-rocm:v0.20.0; TP=8 require additional patches).
+
+### Run
+
+From this directory:
+
+```bash
+cd examples/offline_inference/qwen3_omni
+
+python batch_inference_ray.py \
+  model=qwen3_omni_30b_a3b_thinking \
+  dataset=random_mm \
+  query_type=mixed \
+  num_prompts=1024 \
+  input_len=1024 \
+  output_len=4096 \
+  batch_size=256 \
+  n_repeats=2 \
+  vllm.tensor_parallel_size=4 \
+  vllm.gpu_memory_utilization=0.7 \
+  vllm.max_model_len=16384 \
+  vllm.max_num_seqs=512 \
+  vllm.max_num_batched_tokens=65536 \
+  vllm.max_concurrent_batches=8 \
+  vllm.enable_expert_parallel=true
+```
