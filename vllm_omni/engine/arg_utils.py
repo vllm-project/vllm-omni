@@ -9,7 +9,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.engine.output_modality import OutputModality
+from vllm_omni.engine.output_modality import EngineOutputType, OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
 
@@ -143,7 +143,7 @@ class OmniEngineArgs(EngineArgs):
     stage_id: int = 0
     model_stage: str = "thinker"
     model_arch: str | None = None
-    engine_output_type: str | None = None
+    engine_output_type: EngineOutputType | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)

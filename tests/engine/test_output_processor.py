@@ -11,18 +11,17 @@ from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
 
-from vllm_omni.engine.output_modality import OutputModalityNames
 from vllm_omni.engine.output_processor import OmniRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # Audio is explicitly listed as a drainable modality
-AUDIO = OutputModalityNames.AUDIO
+AUDIO = "audio"
 
 # Latent is explicitly not drainable, but the choice doesn't matter here as
 # long as isn't listed as drainable. I.e., could also be arbitrary keys for
 # the purposes of these tests
-LATENT = OutputModalityNames.LATENT
+LATENT = "latent"
 
 # NOTE: detokenizer and logprobs aren't really used here, but we mock them since
 # some of the utils called in vLLM superclass assert require them to be None.

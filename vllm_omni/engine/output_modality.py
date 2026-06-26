@@ -8,31 +8,18 @@ for type-safe multimodal output routing and tensor merging.
 from __future__ import annotations
 
 import re
-from enum import Enum, Flag, StrEnum, auto
+from enum import Enum, Flag, auto
 from typing import Literal, TypeAlias
 
 FinalOutputModalityType: TypeAlias = Literal["text", "image", "audio", "video"]
 
+EngineOutputType: TypeAlias = Literal["text", "image", "audio", "latent"]
 
-class OutputModalityNames(StrEnum):
-    """Keys for output modalities.
-
-    TODO: (Alex) Integrate this with the big-flag enum below + throughout the code
-    for better type safety (currently only used for output processor).
-    """
-
-    TEXT = "text"
-    IMAGE = "image"
-    AUDIO = "audio"
-    LATENT = "latent"
-
-
-# Specify which output modalities may be drained when handling delta messages.
-# For some types, e.g., latents, we need to be careful to ensure the full context
-# is passed as the stream yields due to assumptions in the I/O processing and model
-# when async chunk isn't enabled.
-NON_DRAINABLE_MODALITIES = {OutputModalityNames.TEXT, OutputModalityNames.LATENT}
-DRAINABLE_MODALITIES = {mod for mod in OutputModalityNames if mod not in NON_DRAINABLE_MODALITIES}
+# Modalities whose accumulated tensors are drained per DELTA emission. TEXT is
+# handled by the base detokenizer path (never lands in mm_accumulated), and
+# LATENT needs full-history context for downstream model assumptions, so both
+# stay out of this set.
+DRAINABLE_MODALITIES: frozenset[str] = frozenset({"image", "audio"})
 
 
 class OutputModality(Flag):
