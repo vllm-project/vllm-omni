@@ -1,18 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cosmos3 text/image/video-to-video and text-to-image pipeline for vllm-omni.
+"""Cosmos3 text/image/video/sound/action pipeline for vllm-omni.
 
-Single pipeline class supports T2V, I2V, V2V, and T2I; the mode is selected at
-runtime by:
+One pipeline class serves the Cosmos3 family modes. Output modality is selected
+mainly by ``prompt["modalities"]``:
 
-* ``prompt["modalities"]`` contains ``"image"``: **T2I** (text-to-image).
-* ``prompt["modalities"]`` contains ``"video"`` or is omitted: **T2V**
-  (text-to-video).
-* ``multi_modal_data['image']`` present on the prompt:  **I2V**
-  (handled by :func:`get_cosmos3_pre_process_func`)
-* ``multi_modal_data['video']`` present on the prompt with no action mode:
-  **V2V** (handled by :func:`get_cosmos3_pre_process_func`)
+* ``"image"`` selects T2I (text-to-image) and forces a single visual frame.
+* ``"video"`` or omitted modalities select video generation.
+* ``"audio"`` is accepted for compatibility but does not request sound by
+  itself; sound is enabled with ``generate_sound`` or ``sound_gen``.
 
+Video generation is further specialized by inputs and extra args:
+
+* no image/video input: T2V (text-to-video).
+* ``multi_modal_data["image"]``: I2V (image-to-video).
+* ``multi_modal_data["video"]`` with no action/transfer mode: V2V
+  (video-to-video).
+* transfer hints (``edge``, ``blur``, ``depth``, ``seg``, or ``wsm``): control
+  transfer video generation.
+* ``action_mode``: action-capable video generation. RoboLab/OpenPI observation
+  payloads in ``extra_args["robot_obs"]`` or ``extra_args["observation"]``
+  bypass normal video output and return action-only custom output.
+
+Generated sound is video-only, cannot be combined with action or transfer, and
+is produced from sound latents rather than from ``multi_modal_data["audio"]``.
 """
 
 from __future__ import annotations
@@ -156,14 +167,20 @@ COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 # Post-process function (registered in registry.py)
 # ---------------------------------------------------------------------------
 def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
-    """Pre-process function for T2V, I2V, V2V, and action inputs.
+    """Build the request preprocessor for Cosmos3 image/video inputs.
 
-    For T2V (no image in ``multi_modal_data``), the request is returned
-    unchanged after the optional guardrails check.  For I2V (image present),
-    the conditioning image is loaded, aspect-resized + center-cropped, and
-    stored back on the prompt as ``additional_information.preprocessed_image``.
-    For V2V (video present without action mode), source frames are cropped to
-    the target size and stored as ``additional_information.preprocessed_video``.
+    For plain T2V (no image or video in ``multi_modal_data``), the request is
+    returned unchanged after the optional guardrail check. For I2V, the
+    conditioning image is loaded, aspect-resized, center-cropped, and stored as
+    ``additional_information.preprocessed_image``. For V2V, source frames are
+    cropped to the target size and stored as
+    ``additional_information.preprocessed_video``.
+
+    Action modes reuse image/video preprocessing but use action-specific resize
+    and padding rules. Transfer requests store
+    ``additional_information.preprocessed_transfer_video`` for optional input
+    video conditioning. Cosmos3 sound generation is not driven by
+    ``multi_modal_data["audio"]``; it is enabled later from sampling params.
     """
     from .guardrails import check_text_safety, ensure_initialized, is_guardrails_enabled
 
@@ -470,6 +487,13 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
+    """Build the postprocessor for Cosmos3 image, video, and video+audio output.
+
+    The pipeline returns image payloads as ``{"image": tensor}`` and video
+    payloads as ``{"video": tensor}``. Sound-enabled video returns the same
+    video payload plus ``audio`` and ``audio_sample_rate``. Image output with
+    audio is rejected because Cosmos3 sound generation is video-only.
+    """
     from .guardrails import check_video_safety, is_guardrails_enabled
 
     video_processor = VideoProcessor(vae_scale_factor=16)
@@ -563,6 +587,13 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_cosmos3_action_post_process_func(od_config: OmniDiffusionConfig):
+    """Build the custom-output postprocessor for Cosmos3 action predictions.
+
+    Action modes return predicted action tensors in ``custom_output`` alongside
+    normal video output. RoboLab/OpenPI policy serving marks action-only output
+    and carries observation metadata used here to map model-space actions back
+    to the requested robot action representation.
+    """
     del od_config
 
     def action_post_process_func(action: Any, custom_output: dict[str, Any] | None = None, sampling_params=None):
@@ -598,14 +629,15 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 class Cosmos3OmniDiffusersPipeline(
     nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
 ):
-    """Cosmos3 text/image/video-to-video / text-to-image pipeline.
+    """Cosmos3 text/image/video/sound/action pipeline.
 
     Architecture: Mixture-of-Transformers with Qwen3-VL backbone.
     - Understanding pathway: causal self-attention on text (runs once, K/V cached)
-    - Generation pathway: cross-attention on noisy visual latents (runs each step)
+    - Generation pathway: cross-attention on visual latents and optional
+      transfer-control, action, and sound latents (runs each step)
 
-    Supports T2V, I2V, V2V, and T2I from the same class.  Mode is selected at
-    runtime:
+    Supports T2V, I2V, V2V, T2I, transfer, sound-enabled video, and action
+    generation from the same class. Mode is selected at runtime:
 
     * **T2I** when ``prompt["modalities"]`` contains ``"image"``.  Latent
       T-dim is forced to 1, T2I-specific scheduler defaults are applied (50 steps,
@@ -622,6 +654,17 @@ class Cosmos3OmniDiffusersPipeline(
       ``multi_modal_data['video']`` without an action mode. Explicit latent
       frame indexes are kept clean with ``noisy_frame_mask`` and re-injected
       after each scheduler step.
+    * **Transfer** when ``edge``, ``blur``, ``depth``, ``seg``, or ``wsm`` hints
+      are supplied. Transfer is video-output only and cannot be combined with
+      sound or action generation.
+    * **Sound-enabled video** when ``generate_sound`` or ``sound_gen`` is true.
+      Sound is generated from sound latents, not from ``multi_modal_data['audio']``;
+      T2I, transfer, and action+sound are rejected.
+    * **Action generation** when ``action_mode`` is provided. ``policy`` and
+      ``forward_dynamics`` require an image or video input; ``inverse_dynamics``
+      requires video input. Action predictions are returned in ``custom_output``.
+      RoboLab/OpenPI observations in ``extra_args['robot_obs']`` or
+      ``extra_args['observation']`` return action-only custom output.
     * **T2V** otherwise (default video generation).
     """
 
@@ -1386,7 +1429,14 @@ class Cosmos3OmniDiffusersPipeline(
 
     @staticmethod
     def _is_t2i_request(req: OmniDiffusionRequest) -> bool:
-        """Detect text-to-image mode from request-level prompt modalities."""
+        """Return whether request-level modalities select image output.
+
+        Only ``"image"`` switches Cosmos3 into T2I. ``"video"`` and omitted
+        modalities select video output. ``"text"`` and ``"audio"`` are accepted
+        compatibility values for callers that share prompt schemas, but they do
+        not select text or audio output in this pipeline. ``"image"`` and
+        ``"video"`` cannot be requested together.
+        """
         if not req.prompts:
             return False
         first_prompt = req.prompts[0]
