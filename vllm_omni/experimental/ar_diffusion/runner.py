@@ -7,8 +7,8 @@ Subclasses ``DiffusionModelRunner`` and owns the engine-level KV cache
 model pipeline (DreamZero) can drive the per-chunk allocate / slot-mapping /
 gather / commit operations during ``pipeline.forward``.
 
-Selecting the AR-Diffusion engine enables KV management (no env gate); the KV
-parameters come from ``od_config.ar_diffusion_kv_config`` (deploy/command arg).
+Selecting the AR-Diffusion engine enables KV management (no env gate); optional KV
+parameters come from the deploy yaml's ``model_config["ar_diffusion_kv_config"]``.
 """
 
 from __future__ import annotations
@@ -33,13 +33,17 @@ logger = init_logger(__name__)
 def resolve_ar_diffusion_kv_config(od_config: OmniDiffusionConfig) -> ARDiffusionKVConfig:
     """Resolve the AR-Diffusion KV config from the deploy/command arg.
 
-    Reads ``od_config.ar_diffusion_kv_config`` (a ``ARDiffusionKVConfig``, a dict of overrides such
-    as ``window_chunks`` / ``gpu_memory_fraction``, or None). Selecting the
-    AR-Diffusion engine implies KV management, so the result is always enabled;
-    ``chunk_size`` / ``window_chunks`` are finalized from the model geometry at load
-    (see ``_preallocate_kv_cache``).
+    Selecting the AR-Diffusion engine implies KV management, so the result is always
+    enabled. Optional overrides (``window_chunks`` / ``gpu_memory_fraction`` /
+    ``sink_chunks`` / ``reset_at_boundary``) may be supplied via the deploy yaml as
+    ``model_config["ar_diffusion_kv_config"]``. ``chunk_size`` / ``window_chunks`` are
+    finalized from the model geometry at load (see ``_preallocate_kv_cache``).
     """
     raw = getattr(od_config, "ar_diffusion_kv_config", None)
+    if raw is None:
+        model_config = getattr(od_config, "model_config", None)
+        if isinstance(model_config, dict):
+            raw = model_config.get("ar_diffusion_kv_config")
     if isinstance(raw, ARDiffusionKVConfig):
         return dataclasses.replace(raw, enable=True)
     if isinstance(raw, dict):

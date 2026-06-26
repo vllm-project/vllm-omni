@@ -416,10 +416,10 @@ class DiffusionEngine:
     def resolve_engine_class(config: OmniDiffusionConfig) -> type[DiffusionEngine]:
         """Resolve the engine class selected by ``config.engine_backend``.
 
-        Mirrors ``DiffusionExecutor.get_class``: accepts the string keys
-        ``"default"`` / ``"ar_diffusion"``, a ``DiffusionEngine`` subclass, or an import
-        path string. Kept separate from :meth:`make_engine` so the selection is
-        testable without constructing an engine (which runs a dummy forward).
+        Mirrors ``DiffusionExecutor.get_class``: accepts ``"default"``, a
+        ``DiffusionEngine`` subclass, or an import-path string (e.g. a deploy
+        config's ``engine_backend``). Kept separate from :meth:`make_engine` so the
+        selection is testable without constructing an engine (which runs a dummy forward).
 
         Args:
             config: The configuration for the diffusion engine.
@@ -435,12 +435,6 @@ class DiffusionEngine:
             return backend
         if backend == "default":
             return DiffusionEngine
-        if backend == "ar_diffusion":
-            # Lazy import to avoid a circular dependency (ar_diffusion.engine imports this
-            # module), mirroring how DiffusionExecutor.get_class imports backends.
-            from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
-
-            return ARDiffusionEngine
         if isinstance(backend, str):
             try:
                 engine_class = resolve_obj_by_qualname(backend)

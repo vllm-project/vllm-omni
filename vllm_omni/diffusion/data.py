@@ -493,37 +493,6 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     return None
 
 
-# Model classes that default to the AR-Diffusion (AR-diffusion) engine.
-_AR_DIFFUSION_ENGINE_MODEL_CLASSES = frozenset({"DreamZeroPipeline"})
-
-
-def default_engine_backend_for_model(model_class_name: str | None) -> str | None:
-    """Engine backend a model opts into by default.
-
-    Returns ``"ar_diffusion"`` for AR-diffusion world models (DreamZero today) so they run on
-    the AR-Diffusion engine with engine-level KV cache management; ``None`` keeps the
-    base ``DiffusionEngine``. Extend ``_AR_DIFFUSION_ENGINE_MODEL_CLASSES`` as more AR-DiT
-    models migrate. Applied when ``engine_backend`` is unset (see
-    :func:`resolve_default_engine_backend`); an explicit command/deploy arg overrides.
-    """
-    if model_class_name in _AR_DIFFUSION_ENGINE_MODEL_CLASSES:
-        return "ar_diffusion"
-    return None
-
-
-def resolve_default_engine_backend(model_class_name: str | None, current_backend: str | None) -> str | None:
-    """Engine backend to apply for an auto-routed model, or ``None`` to leave as-is.
-
-    Applies the per-model default (:func:`default_engine_backend_for_model`) when
-    ``current_backend`` is the unset ``"default"`` sentinel; an explicit
-    ``engine_backend`` command/deploy arg is left untouched. Shared by the two
-    routing sites (``enrich_config`` and ``from_kwargs``).
-    """
-    if current_backend != "default":
-        return None
-    return default_engine_backend_for_model(model_class_name)
-
-
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
@@ -569,29 +538,14 @@ class OmniDiffusionConfig:
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
 
-    # Engine backend selection. Resolved by ``DiffusionEngine.make_engine``
-    # (mirrors ``distributed_executor_backend`` / ``DiffusionExecutor.get_class``):
-    #   "default" -> DiffusionEngine
-    #   "ar_diffusion"     -> ARDiffusionEngine (AR-diffusion engine with engine-level KV cache
-    #                management); also accepts a DiffusionEngine subclass or an
-    #                import path string.
+    # Engine backend selection, resolved generically by ``DiffusionEngine.make_engine``
+    # (mirrors ``DiffusionExecutor.get_class``): "default" -> DiffusionEngine, a
+    # DiffusionEngine subclass, or an import-path string (set e.g. by a deploy config).
     engine_backend: str = "default"
 
-    # Optional override for the diffusion model runner class (import path).
-    # The worker uses it instead of the platform default when set; the AR-Diffusion engine
-    # sets it to ARDiffusionModelRunner. Unset -> platform default (existing behavior).
+    # Optional override for the diffusion model runner class (import path). The worker
+    # uses it instead of the platform default when set; unset -> platform default.
     diffusion_model_runner_cls: str | None = None
-
-    # AR-Diffusion engine KV-cache parameters (command/deploy arg, e.g. in the
-    # deploy yaml). Dict of window_chunks / gpu_memory_fraction / sink_chunks /
-    # reset_at_boundary; None uses engine defaults. Selecting the AR-Diffusion
-    # engine enables KV (no env gate).
-    ar_diffusion_kv_config: dict | None = None
-    # DEFERRED (#4425 / RFC #4021 structured config): when rebasing onto the
-    # structured VllmOmniConfig, mirror engine_backend + diffusion_model_runner_cls
-    # into its DiffusionConfig (engine/runtime group) and parity test. enrich_config()
-    # there only copies fields present on DiffusionConfig, so without the mirror
-    # DreamZero's AR-Diffusion routing silently drops on the structured-config path. (PR #4534)
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -1119,12 +1073,6 @@ class OmniDiffusionConfig:
                         self.model_class_name = "DreamZeroPipeline"
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
-                        # DreamZero is an AR-diffusion world model: route it to the
-                        # AR-Diffusion engine (engine-level KV cache management) unless
-                        # the caller explicitly selected an engine backend.
-                        backend = resolve_default_engine_backend(self.model_class_name, self.engine_backend)
-                        if backend is not None:
-                            self.engine_backend = backend
                     else:
                         raise
                 elif architectures and len(architectures) == 1:
@@ -1196,13 +1144,6 @@ class OmniDiffusionConfig:
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
 
         instance = cls(**filtered_kwargs)
-        # Route per-model engines after model_class_name is finalized. This covers
-        # the explicit-model_class_name path (e.g. deploy configs) that the
-        # __post_init__ auto-detect branch does not reach. An explicit engine_backend
-        # command/deploy arg overrides the per-model default.
-        backend = resolve_default_engine_backend(instance.model_class_name, instance.engine_backend)
-        if backend is not None:
-            instance.engine_backend = backend
         return instance
 
 
