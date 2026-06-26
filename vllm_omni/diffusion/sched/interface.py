@@ -113,6 +113,8 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    # next request to background-prefetch KV
+    kv_prefetch_jobs: dict | None = None
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

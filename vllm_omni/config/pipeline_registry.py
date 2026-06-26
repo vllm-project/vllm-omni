@@ -63,7 +63,10 @@ from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
     MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
     MING_FLASH_OMNI_TTS_PIPELINE,
 )
-from vllm_omni.model_executor.models.ming_tts.pipeline import MING_TTS_PIPELINE
+from vllm_omni.model_executor.models.ming_tts.pipeline import (
+    MING_TTS_MOE_PIPELINE,
+    MING_TTS_PIPELINE,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_LOCAL_PIPELINE,
@@ -106,6 +109,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "cosyvoice3": COSYVOICE3_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,
     "ming_tts": MING_TTS_PIPELINE,
+    "ming_tts_moe": MING_TTS_MOE_PIPELINE,
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,

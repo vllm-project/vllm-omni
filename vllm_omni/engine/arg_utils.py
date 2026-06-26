@@ -40,7 +40,10 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
         )
-        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingDenseConfig
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+            MingDenseConfig,
+            MingMoeConfig,
+        )
         from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
             MossTTSLocalConfig,
             MossTTSRealtimeConfig,
@@ -66,6 +69,7 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("dense", MingDenseConfig),
+        ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
