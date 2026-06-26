@@ -2500,11 +2500,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             sample_rate = int(sr_raw)
 
+        _valid_audio_formats = {"wav", "mp3", "flac", "opus", "pcm16", "pcm"}
         audio_params = getattr(request, "audio", None)
         if isinstance(audio_params, dict):
             audio_format = audio_params.get("format", "wav")
         else:
             audio_format = "wav"
+        if audio_format not in _valid_audio_formats:
+            return self._create_error_response(
+                f"Invalid audio format '{audio_format}'. Supported formats: {sorted(_valid_audio_formats)}",
+            )
         if audio_format == "pcm16":
             audio_format = "pcm"
 
