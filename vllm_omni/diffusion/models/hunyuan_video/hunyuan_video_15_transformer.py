@@ -29,7 +29,7 @@ from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_modu
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
-from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context_geometry
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
 
@@ -703,13 +703,6 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
-
-        # Publish the patch grid so structure-aware sparse backends can recover
-        # (frame, patch) layout from the flat token sequence (see PerForwardState).
-        set_forward_context_geometry(
-            total_latent_frames=post_patch_num_frames,
-            patches_per_frame=post_patch_height * post_patch_width,
-        )
 
         image_rotary_emb = self.rope(hidden_states)
 

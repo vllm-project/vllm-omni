@@ -87,9 +87,15 @@ def _route_sparse_plugin_shorthand(spec: AttentionSpec) -> AttentionSpec:
     backend = spec.backend
     if backend.upper() in DiffusionAttentionBackendEnum.__members__:
         return spec
+    params = dict(spec.extra or {})
+    # Shorthand extras are flat kernel params, but tolerate a user who also
+    # nests them (extra={"params": {...}}) — hoist a lone "params" key instead
+    # of double-wrapping it into params={"params": {...}}.
+    if set(params) == {"params"} and isinstance(params["params"], dict):
+        params = dict(params["params"])
     return _AttentionSpec(
         backend=DiffusionAttentionBackendEnum.SPARSE_ATTN.name,
-        extra={"backend": backend, "params": dict(spec.extra or {})},
+        extra={"backend": backend, "params": params},
     )
 
 

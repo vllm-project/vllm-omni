@@ -10,6 +10,7 @@ Covers:
 """
 
 from dataclasses import FrozenInstanceError, replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,8 +26,8 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     override_forward_context,
     set_forward_context_denoise_step_idx,
-    set_forward_context_geometry,
     set_forward_context_total_denoise_steps,
+    set_forward_context_video_geometry,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -58,14 +59,14 @@ class TestForwardContextTotalDenoiseSteps:
         # ForwardContext is active (must not raise).
         with override_forward_context(None):
             set_forward_context_total_denoise_steps(40)
-            set_forward_context_geometry(total_latent_frames=21, patches_per_frame=1560)
+            set_forward_context_video_geometry(latent_shape=(21, 60, 104), patch_size=(1, 2, 2))
 
     def test_geometry_setter_updates_active_context(self):
         with override_forward_context(ForwardContext()):
-            set_forward_context_geometry(total_latent_frames=21, patches_per_frame=1560)
+            set_forward_context_video_geometry(latent_shape=(21, 60, 104), patch_size=(1, 2, 2))
             ctx = get_forward_context()
-            assert ctx.total_latent_frames == 21
-            assert ctx.patches_per_frame == 1560
+            assert ctx.latent_shape == (21, 60, 104)
+            assert ctx.patch_size == (1, 2, 2)
 
 
 class TestPerForwardState:
@@ -84,7 +85,14 @@ class TestPerForwardState:
     def test_to_dict_includes_none_by_default(self):
         st = PerForwardState(denoise_step_idx=torch.tensor([5, 5]))
         d = st.to_dict()
-        assert set(d) == {"denoise_step_idx", "total_denoise_steps", "total_latent_frames", "patches_per_frame"}
+        assert set(d) == {
+            "denoise_step_idx",
+            "total_denoise_steps",
+            "latent_shape",
+            "patch_size",
+            "total_latent_frames",
+            "patches_per_frame",
+        }
         assert d["total_denoise_steps"] is None
 
     def test_to_dict_exclude_none_drops_unset(self):
@@ -109,6 +117,53 @@ class TestAttentionMetadataPerForward:
         st = PerForwardState(denoise_step_idx=torch.tensor([7]))
         md = replace(AttentionMetadata(), per_forward=st)
         assert md.per_forward is st
+
+
+class TestRingSparseGuard:
+    """Attention._assert_ring_backend_supported fails fast on SPARSE_ATTN + ring.
+
+    A staticmethod, so it is exercised directly without constructing an Attention
+    layer (which would require a GPU platform).
+    """
+
+    def test_raises_for_sparse_under_ring(self):
+        with pytest.raises(ValueError, match="ring sequence parallelism"):
+            Attention._assert_ring_backend_supported("SPARSE_ATTN", use_ring=True, role="self")
+
+    def test_noop_for_sparse_without_ring(self):
+        Attention._assert_ring_backend_supported("SPARSE_ATTN", use_ring=False, role="self")
+
+    def test_noop_for_dense_backend_under_ring(self):
+        Attention._assert_ring_backend_supported("SDPA", use_ring=True, role="self")
+
+
+class TestFp32SparseGuard:
+    """The fp32 SDPA override must not silently bypass a configured sparse plugin.
+
+    ``_run_local_attention`` is exercised on a stand-in ``self`` (constructing an
+    Attention layer would require a GPU platform): fp32 raises for SPARSE_ATTN
+    instead of quietly rerouting to dense SDPA; dense backends keep the fallback.
+    """
+
+    def test_fp32_raises_for_sparse(self):
+        from vllm_omni.diffusion.attention.backends.sparse_attn import SparseAttentionBackend
+
+        fake_self = SimpleNamespace(attn_backend=SparseAttentionBackend, role="self")
+        q = torch.randn(1, 4, 2, 8, dtype=torch.float32)
+        with pytest.raises(ValueError, match="float32"):
+            Attention._run_local_attention(fake_self, q, q, q, None)
+
+    def test_fp32_falls_back_to_sdpa_for_dense(self):
+        sentinel = torch.zeros(1)
+        fake_self = SimpleNamespace(
+            attn_backend=SimpleNamespace(get_name=lambda: "FLASH_ATTN"),
+            role="self",
+            backend_pref="FLASH_ATTN",
+            attention=None,
+            sdpa_fallback=SimpleNamespace(forward=lambda q, k, v, md: sentinel),
+        )
+        q = torch.randn(1, 4, 2, 8, dtype=torch.float32)
+        assert Attention._run_local_attention(fake_self, q, q, q, None) is sentinel
 
 
 class TestPerForwardBridge:
@@ -164,11 +219,16 @@ class TestPerForwardBridge:
 
     def test_fills_geometry_per_sample(self):
         q = self.Q(2)
-        # Geometry alone (no step state) must still populate per_forward.
-        with override_forward_context(ForwardContext(total_latent_frames=21, patches_per_frame=1560)):
+        # Raw geometry primitives alone (no step state) must still populate
+        # per_forward, as per-sample [num_samples, 3] tensors.
+        with override_forward_context(ForwardContext(latent_shape=(21, 60, 104), patch_size=(1, 2, 2))):
             out = Attention._with_per_forward_state(AttentionMetadata(), q)
         pf = out.per_forward
         assert pf is not None
-        assert pf.total_latent_frames.tolist() == [21, 21]
-        assert pf.patches_per_frame.tolist() == [1560, 1560]
+        assert pf.latent_shape.tolist() == [[21, 60, 104], [21, 60, 104]]
+        assert pf.patch_size.tolist() == [[1, 2, 2], [1, 2, 2]]
+        # Derived fields are NOT produced by the bridge anymore (the dispatcher's
+        # resolver fills them); only raw primitives flow through here.
+        assert pf.total_latent_frames is None
+        assert pf.patches_per_frame is None
         assert pf.denoise_step_idx is None  # step fields stay None

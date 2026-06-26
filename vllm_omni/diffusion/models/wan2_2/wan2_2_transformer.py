@@ -40,11 +40,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import (
-    build_local_sp_padding_mask,
-    get_forward_context,
-    set_forward_context_geometry,
-)
+from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
@@ -973,13 +969,6 @@ class WanTransformer3DModel(nn.Module):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
-
-        # Publish the patch grid so structure-aware sparse backends can recover
-        # (frame, patch) layout from the flat token sequence (see PerForwardState).
-        set_forward_context_geometry(
-            total_latent_frames=post_patch_num_frames,
-            patches_per_frame=post_patch_height * post_patch_width,
-        )
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
         current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)

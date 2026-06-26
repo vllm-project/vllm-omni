@@ -36,6 +36,25 @@ callable::
 
     attn_fn.capabilities = {"supports_attention_mask": True}
 
+Video geometry reaches ``params`` as raw, model-agnostic primitives published
+generically by the framework (no per-model code): ``latent_shape`` ``(T, H, W)``
+and ``patch_size`` ``(p_t, p_h, p_w)``, both per-sample ``[num_samples, 3]``
+tensors. The dispatcher's default resolver derives ``total_latent_frames`` /
+``patches_per_frame`` from them for plugins that just want frame / patch counts.
+The default resolver writes Python ints; when a value instead arrives through
+:class:`PerForwardState` or ``extra`` it may be a per-sample tensor — plugins
+should accept either (``int(...)`` / ``_row0``-style reads). The resolver only
+fills the derived fields when their product equals the actual sequence length
+(``query.shape[1]``); under SP auto-padding or for models mixing non-video
+tokens into self-attention they are dropped and only the raw primitives remain.
+A plugin needing a bespoke layout may expose an optional ``geometry_fn``::
+
+    def geometry_fn(query_shape, params) -> dict: ...
+    attn_fn.geometry_fn = geometry_fn
+
+which runs after the default resolver and whose (non-``None``) returns are merged
+into ``params``.
+
 vllm-omni interprets no kernel-level parameter; the plugin reads what it needs.
 """
 
@@ -103,6 +122,66 @@ def merge_sparse_params(
     return {k: v for k, v in merged.items() if v is not None}
 
 
+def _row0(v: Any) -> tuple[int, int, int]:
+    """Read the first sample's ``(a, b, c)`` triple from a raw geometry value.
+
+    The bridge ships ``latent_shape`` / ``patch_size`` as ``[num_samples, 3]``
+    tensors (homogeneous batch -> equal rows), but also tolerates a plain
+    list/tuple so plugins and tests can pass either form.
+    """
+    if isinstance(v, torch.Tensor):
+        row = (v[0] if v.dim() == 2 else v).tolist()
+    elif v and isinstance(v[0], (list, tuple)):
+        row = list(v[0])
+    else:
+        row = list(v)
+    return int(row[0]), int(row[1]), int(row[2])
+
+
+def _apply_default_geometry(params: dict[str, Any], seq_len: int | None = None) -> None:
+    """Framework default resolver: derive frame / patch counts from raw primitives.
+
+    Fills ``total_latent_frames`` / ``patches_per_frame`` (as Python ints) from
+    ``latent_shape`` ``(T, H, W)`` and ``patch_size`` ``(p_t, p_h, p_w)`` using the
+    standard factorization ``(T // p_t, (H // p_h) * (W // p_w))``. A no-op when
+    the derived value is already present (so a plugin's ``geometry_fn`` or an
+    explicit ``extra`` override wins) or when the raw primitives are absent
+    (image/audio models, or a model that does not publish geometry).
+
+    When ``seq_len`` is given and the derived product does not equal it — e.g.
+    Ulysses SP auto-padding appended pad tokens, or the model's self-attention
+    sequence carries non-video tokens alongside the video patches — the derived
+    fields are DROPPED (with a one-time warning) instead of handing the kernel a
+    (frame, patch) mapping that does not describe the actual sequence. The raw
+    primitives stay in ``params`` so a ``geometry_fn`` can still resolve a bespoke
+    layout. Mutates ``params``.
+    """
+    if params.get("total_latent_frames") is not None:
+        return
+    ls, ps = params.get("latent_shape"), params.get("patch_size")
+    if ls is None or ps is None:
+        return
+    t, h, w = _row0(ls)
+    p_t, p_h, p_w = _row0(ps)
+    if not (p_t and p_h and p_w):
+        return
+    total_latent_frames = t // p_t
+    patches_per_frame = (h // p_h) * (w // p_w)
+    if seq_len is not None and total_latent_frames * patches_per_frame != seq_len:
+        logger.warning_once(
+            "Derived video geometry (total_latent_frames=%d * patches_per_frame=%d) "
+            "does not match the attention sequence length (%d); dropping the derived "
+            "fields. Likely causes: SP auto-padding, or non-video tokens in the "
+            "self-attention sequence. Raw latent_shape/patch_size are still passed.",
+            total_latent_frames,
+            patches_per_frame,
+            seq_len,
+        )
+        return
+    params["total_latent_frames"] = total_latent_frames
+    params["patches_per_frame"] = patches_per_frame
+
+
 class SparseAttentionBackend(AttentionBackend):
     """In-tree dispatcher backend; inherits the conservative ABC defaults.
 
@@ -128,6 +207,10 @@ class SparseAttentionBackend(AttentionBackend):
 
 
 class _SparseAttentionImpl(AttentionImpl):
+    # This dispatcher reads per_forward (step state + raw video geometry) and
+    # flattens it into the plugin ``params``, so the Attention layer must build it.
+    consumes_per_forward = True
+
     def __init__(
         self,
         num_heads: int,
@@ -140,6 +223,15 @@ class _SparseAttentionImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        # The plugin contract mandates BSND. Other impls transpose on the model's
+        # qkv_layout hint; an external kernel would silently get mislabeled axes,
+        # so refuse any non-BSND layout up front.
+        qkv_layout = extra_impl_args.get("qkv_layout")
+        if qkv_layout not in (None, "BSND"):
+            raise ValueError(
+                f"SPARSE_ATTN requires the BSND qkv layout; the model declared "
+                f"qkv_layout={qkv_layout!r}. Select a dense backend for this layer."
+            )
         # backend_kwargs == AttentionSpec.extra for this role. Accept both the
         # nested form {"backend": "dummy_sparse", "params": {"topk": 0.3}} and the
         # flat form {"backend": "dummy_sparse", "topk": 0.3} (unknown keys -> params).
@@ -160,6 +252,11 @@ class _SparseAttentionImpl(AttentionImpl):
         caps = raw_caps if isinstance(raw_caps, dict) else {}
         self._supports_attn_mask = bool(caps.get("supports_attention_mask", False))
         self._supports_full_attn_spans = bool(caps.get("supports_full_attn_spans", False))
+        # Optional per-plugin geometry resolver. When present, it runs after the
+        # framework default resolver and may override/extend the derived geometry
+        # with a bespoke representation (block layout, CSR, ...). Read once here.
+        geometry_fn = getattr(self._callable, "geometry_fn", None)
+        self._geometry_fn = geometry_fn if callable(geometry_fn) else None
 
     def forward(
         self,
@@ -175,12 +272,21 @@ class _SparseAttentionImpl(AttentionImpl):
         )
         extra = attn_metadata.extra if attn_metadata is not None else None
         params = merge_sparse_params(self._static_params, per_forward, extra)
+        # Geometry: framework default first, then optional per-plugin override.
+        # query is BSND, so shape[1] is the sequence length the kernel will see;
+        # the resolver drops derived fields that don't factorize it.
+        _apply_default_geometry(params, seq_len=query.shape[1])
+        if self._geometry_fn is not None:
+            geo = self._geometry_fn(query.shape, params) or {}
+            params.update({k: v for k, v in geo.items() if v is not None})
         if attn_metadata is not None:
             if attn_metadata.attn_mask is not None:
                 if not self._supports_attn_mask:
                     raise ValueError(
                         f"sparse attention plugin {self._kernel_name!r} received an "
-                        f"attn_mask but does not advertise 'supports_attention_mask'."
+                        f"attn_mask but does not advertise 'supports_attention_mask'. "
+                        f"Note: Ulysses SP auto-padding injects an attn_mask when the "
+                        f"sequence length is not divisible by the SP world size."
                     )
                 params["attn_mask"] = attn_metadata.attn_mask
             if attn_metadata.full_attn_spans is not None:

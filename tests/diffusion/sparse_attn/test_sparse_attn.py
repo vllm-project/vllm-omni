@@ -20,12 +20,15 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionImpl,
     AttentionMetadata,
     PerForwardState,
 )
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.backends.sparse_attn import (
     SparseAttentionBackend,
+    _apply_default_geometry,
+    _row0,
     _SparseAttentionImpl,
     merge_sparse_params,
     resolve_sparse_attn_plugin,
@@ -161,6 +164,155 @@ class TestSparseDispatch:
         assert captured["params"] == {"topk": 0.3}
 
 
+class TestDefaultGeometryResolver:
+    """The dispatcher derives frame/patch counts from raw geometry primitives,
+    so a plugin gets them for free with NO per-model edits."""
+
+    def _impl(self, fn, *, params=None):
+        cfg = {"backend": "dummy_sparse", "params": params or {}}
+        with patch("importlib.metadata.entry_points", return_value=[_fake_ep("dummy_sparse", fn)]):
+            return _SparseAttentionImpl(num_heads=4, head_size=16, softmax_scale=1.0, backend_kwargs=cfg)
+
+    @staticmethod
+    def _md_with_geometry():
+        # latent_shape (T,H,W)=(4,4,4), patch_size (1,2,2) -> 4 frames, 4 patches
+        # per frame -> seq_len 16 (the resolver checks the product against the
+        # actual query sequence length).
+        return AttentionMetadata(
+            per_forward=PerForwardState(
+                latent_shape=torch.tensor([[4, 4, 4], [4, 4, 4]]),
+                patch_size=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+            )
+        )
+
+    def test_row0_reads_first_sample(self):
+        assert _row0(torch.tensor([[21, 60, 104], [21, 60, 104]])) == (21, 60, 104)
+        assert _row0((1, 2, 2)) == (1, 2, 2)  # tolerate plain tuples
+        assert _row0([[1, 2, 2]]) == (1, 2, 2)  # and list-of-rows
+
+    def test_apply_default_geometry_pure(self):
+        params = {"latent_shape": (21, 60, 104), "patch_size": (1, 2, 2)}
+        _apply_default_geometry(params)
+        assert params["total_latent_frames"] == 21
+        assert params["patches_per_frame"] == 1560
+
+    def test_apply_default_geometry_noop_without_primitives(self):
+        params = {"topk": 0.3}
+        _apply_default_geometry(params)
+        assert "total_latent_frames" not in params
+
+    def test_apply_default_geometry_seq_len_match_fills(self):
+        params = {"latent_shape": (21, 60, 104), "patch_size": (1, 2, 2)}
+        _apply_default_geometry(params, seq_len=21 * 1560)
+        assert params["total_latent_frames"] == 21
+
+    def test_apply_default_geometry_seq_len_mismatch_drops_derived(self):
+        # SP auto-padding / non-video tokens make the derived (frame, patch)
+        # mapping wrong for the sequence the kernel sees -> derived fields are
+        # dropped, raw primitives remain for a plugin geometry_fn.
+        params = {"latent_shape": (21, 60, 104), "patch_size": (1, 2, 2)}
+        _apply_default_geometry(params, seq_len=21 * 1560 + 8)
+        assert "total_latent_frames" not in params
+        assert "patches_per_frame" not in params
+        assert params["latent_shape"] == (21, 60, 104)
+
+    def test_default_resolver_fills_derived_geometry(self):
+        fn, captured = _recording_plugin()
+        q = torch.randn(2, 16, 4, 16)  # seq_len 16 == 4 frames * 4 patches
+        self._impl(fn).forward(q, q, q, self._md_with_geometry())
+        params = captured["params"]
+        assert _row0(params["latent_shape"]) == (4, 4, 4)  # raw primitives forwarded
+        assert params["total_latent_frames"] == 4  # ... and derived counts resolved
+        assert params["patches_per_frame"] == 4
+
+    def test_mismatched_seq_len_drops_derived_via_forward(self):
+        fn, captured = _recording_plugin()
+        q = torch.randn(2, 8, 4, 16)  # seq_len 8 != 4 * 4 -> derived dropped
+        self._impl(fn).forward(q, q, q, self._md_with_geometry())
+        params = captured["params"]
+        assert "total_latent_frames" not in params
+        assert "patches_per_frame" not in params
+        assert _row0(params["latent_shape"]) == (4, 4, 4)  # raw still flows
+
+    def test_explicit_derived_value_wins_over_resolver(self):
+        # A dynamic `extra` override must beat the default resolver (later wins).
+        fn, captured = _recording_plugin()
+        q = torch.randn(2, 8, 4, 16)
+        md = self._md_with_geometry()
+        md.extra = {"total_latent_frames": 7}
+        self._impl(fn).forward(q, q, q, md)
+        assert captured["params"]["total_latent_frames"] == 7
+
+    def test_no_geometry_no_derived_fields(self):
+        fn, captured = _recording_plugin()
+        q = torch.randn(1, 8, 4, 16)
+        self._impl(fn).forward(q, q, q, AttentionMetadata())
+        assert "total_latent_frames" not in captured["params"]
+        assert "patches_per_frame" not in captured["params"]
+
+
+class TestGeometryFn:
+    """An optional plugin `geometry_fn` runs after the default resolver and may
+    override/extend the geometry with a bespoke representation."""
+
+    def _impl(self, fn):
+        with patch("importlib.metadata.entry_points", return_value=[_fake_ep("dummy_sparse", fn)]):
+            return _SparseAttentionImpl(
+                num_heads=4,
+                head_size=16,
+                softmax_scale=1.0,
+                backend_kwargs={"backend": "dummy_sparse", "params": {}},
+            )
+
+    def test_geometry_fn_overrides_and_extends(self):
+        fn, captured = _recording_plugin()
+        seen = {}
+
+        def geometry_fn(query_shape, params):
+            seen["query_shape"] = query_shape
+            seen["frames_in"] = params.get("total_latent_frames")  # sees default-resolved value
+            return {"total_latent_frames": 99, "block_layout": "csr", "ignored": None}
+
+        fn.geometry_fn = geometry_fn
+        q = torch.randn(2, 16, 4, 16)  # seq_len 16 == 4 frames * 4 patches
+        md = AttentionMetadata(
+            per_forward=PerForwardState(
+                latent_shape=torch.tensor([[4, 4, 4]] * 2),
+                patch_size=torch.tensor([[1, 2, 2]] * 2),
+            )
+        )
+        self._impl(fn).forward(q, q, q, md)
+        assert seen["frames_in"] == 4  # default resolver ran first
+        assert seen["query_shape"] == q.shape
+        assert captured["params"]["total_latent_frames"] == 99  # plugin override won
+        assert captured["params"]["block_layout"] == "csr"  # bespoke extension merged
+        assert "ignored" not in captured["params"]  # None returns dropped
+
+    def test_non_callable_geometry_fn_ignored(self):
+        fn, _ = _recording_plugin()
+        fn.geometry_fn = "not callable"  # malformed -> ignored, no crash
+        q = torch.randn(1, 8, 4, 16)
+        self._impl(fn).forward(q, q, q, AttentionMetadata())
+
+
+class TestConsumesPerForward:
+    """The Attention layer builds per_forward only for backends that read it.
+
+    Dense backends inherit ``consumes_per_forward = False`` so the layer skips
+    constructing step / geometry tensors per layer per step on the default path;
+    the sparse dispatcher opts in.
+    """
+
+    def test_base_dense_default_is_false(self):
+        # The ABC default: a backend is assumed NOT to consume per_forward.
+        assert AttentionImpl.consumes_per_forward is False
+
+    def test_sparse_dispatcher_opts_in(self):
+        # Class-level flag, readable without instantiating (gate is computed in
+        # Attention.__init__ from the impl class).
+        assert _SparseAttentionImpl.consumes_per_forward is True
+
+
 class TestGatedMetadata:
     """attn_mask / full_attn_spans reach the kernel only when the plugin
     advertises support; an unadvertised gated input fails loudly."""
@@ -259,12 +411,42 @@ class TestSparseDispatchCuda:
         assert captured["step_device"].type == "cuda"  # tensors stay on-device
 
 
+class TestQkvLayoutGuard:
+    """The plugin contract mandates BSND; a model-declared non-BSND layout would
+    hand the kernel mislabeled axes, so the impl refuses it at init."""
+
+    def _make(self, qkv_layout):
+        fn, _ = _recording_plugin()
+        with patch("importlib.metadata.entry_points", return_value=[_fake_ep("dummy_sparse", fn)]):
+            return _SparseAttentionImpl(
+                num_heads=4,
+                head_size=16,
+                softmax_scale=1.0,
+                qkv_layout=qkv_layout,
+                backend_kwargs={"backend": "dummy_sparse"},
+            )
+
+    def test_non_bsnd_layout_raises(self):
+        with pytest.raises(ValueError, match="BSND"):
+            self._make("BNSD")
+
+    def test_bsnd_and_unset_accepted(self):
+        self._make("BSND")
+        self._make(None)
+
+
 class TestPluginShorthandRouting:
     """backend=<plugin> routes to the SPARSE_ATTN dispatcher."""
 
     def test_shorthand_routed_to_dispatcher(self):
         out = _route_sparse_plugin_shorthand(AttentionSpec(backend="dummy_sparse", extra={"topk": 0.3}))
         assert out.backend == "SPARSE_ATTN"
+        assert out.extra == {"backend": "dummy_sparse", "params": {"topk": 0.3}}
+
+    def test_shorthand_lone_nested_params_hoisted(self):
+        # A user combining the shorthand with an explicit-form nested params dict
+        # must not get double-wrapped params={"params": {...}}.
+        out = _route_sparse_plugin_shorthand(AttentionSpec(backend="dummy_sparse", extra={"params": {"topk": 0.3}}))
         assert out.extra == {"backend": "dummy_sparse", "params": {"topk": 0.3}}
 
     def test_builtin_backend_unchanged(self):

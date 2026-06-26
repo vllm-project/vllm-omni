@@ -20,7 +20,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
 | `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
-| `SPARSE_ATTN` | In-tree dispatcher to **external** sparse-attention kernels registered via the `vllm_omni.sparse_attn` entry-point group (no kernels are vendored). Opt-in per role; maskless self-attention only. See [Sparse attention (plugin)](#sparse-attention-plugin). |
+| `SPARSE_ATTN` | In-tree dispatcher to **external** sparse-attention kernels registered via the `vllm_omni.sparse_attn` entry-point group (no kernels are vendored). Opt-in per role; self-attention, maskless unless the plugin advertises `supports_attention_mask`. See [Sparse attention (plugin)](#sparse-attention-plugin). |
 
 
 ## Configuration
@@ -136,21 +136,81 @@ vllm-omni serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
 Target `self` only — cross-attention keeps its dense default (sparsifying text
 cross-attention degrades quality).
 
+Shorthand `extra.*` keys are **flat kernel params** (a lone nested
+`extra.params` is also accepted and hoisted); use the explicit dispatcher form
+for anything more structured.
+
+Two runtime constraints:
+
+- **Run with `--enforce-eager` for now.** The dispatcher reads the per-step
+  state (a Python int that changes every denoise step) inside the
+  `torch.compile`'d transformer blocks, so each step triggers a Dynamo guard
+  miss and a recompile until the compile cache demotes those blocks to eager.
+  Correctness is unaffected, but compiled runs pay heavy recompile churn; a
+  startup warning is emitted. This will be lifted once step state is published
+  as tensors. Plugin authors: a kernel with data-dependent Python control flow
+  (per-frame loops, metadata caches, JIT'd sub-kernels) should decorate its
+  callable with `@torch.compiler.disable(recursive=True)` so compiled
+  transformers graph-break cleanly around it instead of Dynamo tracing into it.
+- **bf16/fp16 only.** For dense backends, float32 inputs silently reroute to
+  SDPA; for `SPARSE_ATTN` that would silently bypass the plugin, so fp32 raises
+  at the first forward instead (same fail-loud rationale as the ring-SP guard).
+
 ### The `params` dict
 
 The dispatcher hands the kernel one flat `params` dict, merged from three tiers
 (later wins, `None` dropped, so use `params.get(key, default)`):
 
 1. **static** — the kernel's configured params (`extra.params`, or flat `extra` keys).
-2. **per-forward** — canonical framework fields (`PerForwardState`), each a per-sample
-   `[num_samples]` tensor: `denoise_step_idx` / `total_denoise_steps` (e.g.
-   `progress = denoise_step_idx / total_denoise_steps`), plus video geometry
-   `total_latent_frames` / `patches_per_frame` when the model publishes its patch
-   grid (`seq_len == total_latent_frames * patches_per_frame`) — used by
-   structure-aware kernels to map the flat sequence to (frame, patch) coordinates.
+2. **per-forward** — canonical framework fields (`PerForwardState`): `denoise_step_idx`
+   / `total_denoise_steps` as per-sample `[num_samples]` tensors (e.g.
+   `progress = denoise_step_idx / total_denoise_steps`), plus **raw video-geometry
+   primitives** `latent_shape` `(T, H, W)` and `patch_size` `(p_t, p_h, p_w)` as
+   per-sample `[num_samples, 3]` tensors. The geometry primitives are published
+   **generically by the framework** (a forward pre-hook on the transformer) for any
+   `(B, C, T, H, W)` video model — **no per-model code**. All `PerForwardState`
+   fields are **optional by contract**; step fields are currently set by the
+   Wan2.2 t2v/i2v/vace pipelines only (e.g. HunyuanVideo-1.5 publishes geometry
+   but no step state), so plugins must handle their absence.
 3. **dynamic** — the opaque `AttentionMetadata.extra`.
 
 vLLM-Omni interprets no kernel-level parameter; the plugin reads what it needs.
+
+#### Video geometry: default resolver and `geometry_fn`
+
+For structure-aware kernels that map the flat sequence to (frame, patch)
+coordinates, the dispatcher derives the post-patch grid from the raw primitives
+and injects it into `params`:
+
+- **default resolver** — fills `total_latent_frames = T // p_t` and
+  `patches_per_frame = (H // p_h) * (W // p_w)` (as Python ints; the same fields
+  arriving via `PerForwardState`/`extra` may be per-sample tensors, so read them
+  type-tolerantly) whenever `latent_shape` and `patch_size` are present and the
+  value isn't already set. So a kernel that just wants frame / patch counts gets
+  them for free, on any video model, with no edits. The derived fields are only
+  injected when `total_latent_frames * patches_per_frame == seq_len` actually
+  holds for the sequence the kernel sees; when it doesn't — e.g. Ulysses SP
+  auto-padding appended pad tokens, or the model mixes non-video tokens into its
+  self-attention sequence — they are dropped with a one-time warning and only
+  the raw primitives are passed.
+- **plugin `geometry_fn`** (optional) — a callable advertised on the kernel
+  (`attn_fn.geometry_fn = fn`) that runs *after* the default resolver and whose
+  non-`None` returns are merged into `params`. Use it for a bespoke layout
+  (block masks, CSR, ring decomposition) computed straight from the raw primitives:
+
+```python
+def geometry_fn(query_shape, params):
+    ls, ps = params.get("latent_shape"), params.get("patch_size")
+    if ls is None or ps is None:
+        return {}                         # no geometry -> let the kernel fall back
+    ...                                   # compute a bespoke representation
+    return {"block_layout": ...}
+
+attn_fn.geometry_fn = geometry_fn
+```
+
+Models that aren't `(B, C, T, H, W)` videos (image / audio, or no `patch_size`)
+simply leave geometry unset; a kernel falls back to its own path — it never breaks.
 
 ### Well-known keys and capabilities
 

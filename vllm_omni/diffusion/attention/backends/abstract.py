@@ -74,9 +74,25 @@ class PerForwardState:
     # and (future) heterogeneous/continuous batching without a contract change.
     denoise_step_idx: torch.Tensor | None = None
     total_denoise_steps: torch.Tensor | None = None
-    # Video geometry (post-patch), written by the model from its patch grid so
-    # structure-aware kernels can split the flat sequence into (frame, patch):
-    # seq_len == total_latent_frames * patches_per_frame.
+    # Raw, model-agnostic video geometry primitives, published generically by the
+    # framework (a forward pre-hook on the transformer) — NOT by model code. Each
+    # is a per-sample tensor of shape ``[num_samples, 3]``:
+    #   latent_shape -> post-VAE, pre-patch grid ``(T, H, W)``
+    #   patch_size   -> patch dims ``(p_t, p_h, p_w)``
+    # They are enough for any kernel to derive its own layout; the default
+    # resolver in the SPARSE_ATTN dispatcher turns them into the derived fields
+    # below for plugins that just want frame / patch counts.
+    latent_shape: torch.Tensor | None = None
+    patch_size: torch.Tensor | None = None
+    # Derived video geometry (post-patch). No longer written by the bridge;
+    # produced on demand by the dispatcher's default resolver (or a plugin's
+    # ``geometry_fn``) from the raw primitives above, so structure-aware kernels
+    # can split the flat sequence into (frame, patch):
+    # seq_len == total_latent_frames * patches_per_frame (the resolver only
+    # fills them when that product matches the actual sequence length). Kept
+    # optional for back-compat with plugins that read them straight from
+    # ``params`` — note the resolver writes Python ints there, while values set
+    # here are per-sample tensors; plugins should accept either.
     total_latent_frames: torch.Tensor | None = None
     patches_per_frame: torch.Tensor | None = None
 
@@ -128,6 +144,14 @@ T = TypeVar("T", bound=AttentionMetadata)
 
 
 class AttentionImpl(ABC, Generic[T]):
+    # Whether this backend reads ``AttentionMetadata.per_forward`` (framework
+    # step state / video geometry). Default ``False``: dense backends ignore it,
+    # so the ``Attention`` layer skips building the per-forward tensors entirely
+    # for them — avoiding per-layer, per-step GPU allocations on the default
+    # (non-sparse) inference path. A backend that consumes per_forward (e.g. the
+    # SPARSE_ATTN dispatcher) overrides this to ``True``.
+    consumes_per_forward: bool = False
+
     # Per-platform kv_cache_dtype support. Maps OmniPlatformEnum value
     # (e.g. "cuda", "npu") to the set of quantized dtypes that platform
     # handles.
