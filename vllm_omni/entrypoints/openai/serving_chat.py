@@ -455,11 +455,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
+        if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
+            return self.create_error_response("'modalities' must be a list of strings.")
         unsupported = set(request.modalities) - set(engine_output_modalities)
         if unsupported:
             return self.create_error_response(
-                f"Unsupported output modalities {unsupported} for this model. "
-                f"Supported modalities: {engine_output_modalities}",
+                f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                f"Supported modalities: {', '.join(sorted(engine_output_modalities))}",
             )
 
         if request.modalities and "audio" in request.modalities:
