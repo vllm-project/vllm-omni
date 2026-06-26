@@ -442,6 +442,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         Paper D.2 uses ``mode=reduce-overhead``, ``fullgraph=True``, ``dynamic=False``
         on text/image/VAE and DiT. VAE decode uses a tensor feat_cache patch and
         compiles ``decoder.forward`` (not ``_decode``, which has a Python frame loop).
+        Incremental VAE encode (``_vae_encode_encoder_chunk``) stays eager because
+        Wan ``feat_cache`` mutation is incompatible with CUDAGraph capture.
         DiT blocks use per-block ``fullgraph=True``.
         """
         if not torch.cuda.is_available():
@@ -476,9 +478,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             logger.warning("DreamZero: image_encoder compile failed (%s); skipping.", exc)
 
         try:
-            self.vae.encode = torch.compile(self.vae.encode, **compile_ro)
+            self.vae._encode = torch.compile(self.vae._encode, **compile_ro)
         except Exception as exc:
-            logger.warning("DreamZero: vae.encode compile failed (%s); skipping.", exc)
+            logger.warning("DreamZero: vae._encode compile failed (%s); skipping.", exc)
 
         compiled_blocks = 0
         for block in self.transformer.blocks:
@@ -517,9 +519,23 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
             try:
                 image = torch.zeros(1, 1, 3, 180, 320, dtype=torch.bfloat16, device=device)
-                self._encode_image(image, self.num_frames, 180, 320)
+                self._encode_image(image, self.num_frames, 180, 320, state=self.state)
             except Exception as exc:
                 logger.warning("DreamZero compile warmup (image_encoder) skipped: %s", exc)
+
+            try:
+                self.state.reset_vae_encoder_stream()
+                dummy_video = torch.zeros(1, 3, 1, 180, 320, dtype=torch.bfloat16, device=device)
+                self._vae_stream_seed(self.state, dummy_video[:, :, :1])
+                for _ in range(4):
+                    self._vae_stream_append_frame(self.state, dummy_video[:, :, :1])
+                self._vae_stream_get_observation_latents(
+                    self.state,
+                    self.num_frame_per_block,
+                    dtype=torch.bfloat16,
+                )
+            except Exception as exc:
+                logger.warning("DreamZero compile warmup (vae encode stream) skipped: %s", exc)
 
             try:
                 latent_h, latent_w = 180 // 8, 320 // 8
@@ -624,6 +640,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         num_frames: int,
         height: int,
         width: int,
+        *,
+        state: DreamZeroState | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode first frame via CLIP + VAE.
         Returns: (clip_feas, ys, image_latent)
@@ -659,11 +677,140 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             new_image = y[:, :, 0:1]
             y = torch.concat([msk, y], dim=1)
 
+            if state is not None:
+                # Seed the AR streaming encoder after the compiled full encode above;
+                # ``cudagraph_mark_step_begin`` isolates eager feat_cache work from CUDAGraph.
+                self._vae_stream_seed(state, image_input[:, :, :1])
+
         return clip_context, y, new_image
+
+    def _vae_patchify(self, videos: torch.Tensor) -> torch.Tensor:
+        if self.vae.config.patch_size is not None:
+            from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+
+            return patchify(videos, patch_size=self.vae.config.patch_size)
+        return videos
+
+    @staticmethod
+    def _vae_clone_feat_map(feat_map: list[torch.Tensor | None]) -> list[torch.Tensor | None]:
+        return [entry.clone() if isinstance(entry, torch.Tensor) else entry for entry in feat_map]
+
+    def _vae_init_enc_feat_map(self) -> list[torch.Tensor | None]:
+        self.vae.clear_cache()
+        return self._vae_clone_feat_map(self.vae._enc_feat_map)
+
+    def _vae_encode_encoder_chunk(
+        self,
+        chunk: torch.Tensor,
+        feat_map: list[torch.Tensor | None],
+    ) -> tuple[torch.Tensor, list[torch.Tensor | None]]:
+        """Run one Wan encoder chunk while mutating ``feat_map`` in place.
+
+        Must stay eager (not ``torch.compile``): Wan causal ``feat_cache`` updates
+        conflict with ``reduce-overhead`` CUDAGraph capture.
+        """
+        self.vae._enc_feat_map = feat_map
+        self.vae._enc_conv_idx = [0]
+        out = self.vae.encoder(
+            chunk,
+            feat_cache=self.vae._enc_feat_map,
+            feat_idx=self.vae._enc_conv_idx,
+        )
+        return out, self._vae_clone_feat_map(self.vae._enc_feat_map)
+
+    def _vae_quantize_encoder_out(self, encoder_out: torch.Tensor) -> torch.Tensor:
+        enc = self.vae.quant_conv(encoder_out)
+        mu, _ = enc.chunk(2, dim=1)
+        mean = self.vae_latents_mean.to(device=mu.device, dtype=mu.dtype)
+        inv_std = self.vae_latents_inv_std.to(device=mu.device, dtype=mu.dtype)
+        return (mu - mean) * inv_std
+
+    def _vae_stream_seed(self, state: DreamZeroState, first_frame: torch.Tensor) -> None:
+        """Seed incremental VAE encode with the first observation frame."""
+        state.reset_vae_encoder_stream()
+        feat_map = self._vae_init_enc_feat_map()
+        chunk = self._vae_patchify(first_frame.to(dtype=self.vae.dtype))
+        self._cudagraph_mark_step_begin()
+        encoder_out, feat_map = self._vae_encode_encoder_chunk(chunk[:, :, :1], feat_map)
+        state.vae_enc_feat_map = feat_map
+        state.vae_encoder_out = encoder_out
+        state.vae_pending_body_frames = None
+        state.vae_stream_initialized = True
+
+    def _vae_stream_append_frame(self, state: DreamZeroState, new_frame: torch.Tensor) -> None:
+        """Append one pixel frame and encode a 4-frame body chunk when ready."""
+        if not state.vae_stream_initialized or state.vae_enc_feat_map is None or state.vae_encoder_out is None:
+            raise RuntimeError("VAE encoder stream is not initialized.")
+
+        frame = new_frame.to(dtype=self.vae.dtype)
+        if state.vae_pending_body_frames is None:
+            state.vae_pending_body_frames = frame
+        else:
+            state.vae_pending_body_frames = torch.cat([state.vae_pending_body_frames, frame], dim=2)
+
+        while state.vae_pending_body_frames is not None and state.vae_pending_body_frames.shape[2] >= 4:
+            body = state.vae_pending_body_frames[:, :, :4]
+            if state.vae_pending_body_frames.shape[2] > 4:
+                state.vae_pending_body_frames = state.vae_pending_body_frames[:, :, 4:]
+            else:
+                state.vae_pending_body_frames = None
+            chunk = self._vae_patchify(body)
+            encoder_chunk, feat_map = self._vae_encode_encoder_chunk(chunk, state.vae_enc_feat_map)
+            state.vae_encoder_out = torch.cat([state.vae_encoder_out, encoder_chunk], dim=2)
+            state.vae_enc_feat_map = feat_map
+
+    def _vae_stream_get_observation_latents(
+        self,
+        state: DreamZeroState,
+        num_latent_frames: int,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if state.vae_encoder_out is None:
+            raise RuntimeError("VAE encoder stream has no accumulated encoder output.")
+        latents = self._vae_quantize_encoder_out(state.vae_encoder_out).to(dtype=dtype)
+        if latents.shape[2] >= num_latent_frames:
+            return latents[:, :, -num_latent_frames:]
+        pad_count = num_latent_frames - latents.shape[2]
+        pad = latents[:, :, -1:].expand(-1, -1, pad_count, -1, -1)
+        return torch.cat([pad, latents], dim=2)
+
+    def _preprocess_vae_observation_window(self, videos: torch.Tensor) -> torch.Tensor:
+        _, _, num_frames_raw, _, _ = videos.shape
+        if (num_frames_raw - 1) // 4 == self.num_frame_per_block:
+            return videos
+        if num_frames_raw // 4 != self.num_frame_per_block:
+            repeat_factor = self.num_frame_per_block // (num_frames_raw // 4)
+            videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
+            first_frame = videos[:, :, 0:1]
+            return torch.cat([first_frame, videos], dim=2)
+        first_frame = videos[:, :, 0:1]
+        return torch.cat([first_frame, videos], dim=2)
+
+    def _encode_observation_latents(
+        self,
+        state: DreamZeroState,
+        videos: torch.Tensor,
+        *,
+        latent_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Encode current robot observation into normalized VAE latents."""
+        if state.vae_stream_initialized:
+            self._cudagraph_mark_step_begin()
+            self._vae_stream_append_frame(state, videos[:, :, -1:])
+            return self._vae_stream_get_observation_latents(
+                state,
+                self.num_frame_per_block,
+                dtype=latent_dtype,
+            )
+
+        videos = self._preprocess_vae_observation_window(videos)
+        return self._encode_vae_latents(videos).to(dtype=latent_dtype)
 
     def _encode_vae_latents(self, videos: torch.Tensor) -> torch.Tensor:
         """Encode videos into normalized VAE latents."""
         input_dtype = videos.dtype
+        self._cudagraph_mark_step_begin()
         hidden = self.vae._encode(videos.to(dtype=self.vae.dtype))
         mu, _ = hidden.chunk(2, dim=1)
         mean = self.vae_latents_mean.to(device=mu.device, dtype=mu.dtype)
@@ -1105,6 +1252,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 self.num_frames,
                 height,
                 width,
+                state=state,
             )
             state.clip_feas = clip_feas.to(dtype=image.dtype)
             state.ys = ys.to(dtype=image.dtype)
@@ -1118,22 +1266,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 self._kv_populate_cross(negative_prompt_embeds, state.clip_feas, is_negative=True)
 
         if state.current_start_frame != 0:
-            # Subsequent calls: encode current observation via VAE
-            if (num_frames_raw - 1) // 4 == self.num_frame_per_block:
-                pass
-            elif num_frames_raw // 4 != self.num_frame_per_block:
-                repeat_factor = self.num_frame_per_block // (num_frames_raw // 4)
-                videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
-                first_frame = videos[:, :, 0:1]
-                videos = torch.cat([first_frame, videos], dim=2)
-            else:
-                first_frame = videos[:, :, 0:1]
-                videos = torch.cat([first_frame, videos], dim=2)
-
             latent_dtype = videos.dtype
             with torch.no_grad():
-                image = self._encode_vae_latents(videos)
-            image = image.to(dtype=latent_dtype)
+                image = self._encode_observation_latents(state, videos, latent_dtype=latent_dtype)
 
         batch_size = image.shape[0]
         generator = torch.Generator(device=device).manual_seed(self.seed)

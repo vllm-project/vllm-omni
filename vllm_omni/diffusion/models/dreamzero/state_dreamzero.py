@@ -119,8 +119,16 @@ class DreamZeroState:
 
         self.clip_feas = None
         self.ys = None
+        self.reset_vae_encoder_stream()
         if clear_video_latents:
             self.language = None
+
+    def reset_vae_encoder_stream(self) -> None:
+        """Clear incremental Wan VAE encoder state used across AR steps."""
+        self.vae_stream_initialized = False
+        self.vae_enc_feat_map: list[torch.Tensor | None] | None = None
+        self.vae_encoder_out: torch.Tensor | None = None
+        self.vae_pending_body_frames: torch.Tensor | None = None
 
     def reset_inference_state(self) -> None:
         """Reset KV/frame state after local attention rolls without dropping video latents."""
