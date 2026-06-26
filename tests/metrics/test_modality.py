@@ -334,7 +334,7 @@ class TestObserveModalityAtFinalize:
         )
         assert not any(c[0].startswith("observe_diffusion") for c in stub.calls)
 
-    def test_diffusion_zero_values_skipped(self):
+    def test_diffusion_zero_values_observed(self):
         stub = _StubModMetrics()
         stage_metrics = _Bag(
             stage_gen_time_ms=500.0,
@@ -352,7 +352,9 @@ class TestObserveModalityAtFinalize:
             stage_metrics=stage_metrics,
             engine_outputs=_Bag(),
         )
-        assert not any(c[0].startswith("observe_diffusion") for c in stub.calls)
+        assert ("observe_diffusion_preprocess", "2", "0", 0.0) in stub.calls
+        assert ("observe_diffusion_exec", "2", "0", 0.0) in stub.calls
+        assert ("observe_diffusion_postprocess", "2", "0", 0.0) in stub.calls
 
     def test_non_audio_output_type_skips_audio_but_still_checks_diffusion(self):
         stub = _StubModMetrics()
