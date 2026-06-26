@@ -69,17 +69,18 @@ def _get_test_config() -> str:
     Reduces Stage 0 gpu_memory_utilization from 0.60 → 0.45 to leave headroom
     for Stage 1 (0.12) on a shared L4/A10G.  max_num_seqs=1 keeps per-test
     peak memory predictable.
+
+    Set MOSS_TTS_CODEC_CUDA_GRAPH=1 to enable CUDA Graph capture on Stage 1
+    (sets enforce_eager=False).  Default is eager (no CUDA Graph).
     """
+    stage_updates: dict[int, dict] = {
+        0: {"max_num_seqs": 1, "gpu_memory_utilization": 0.45},
+    }
+    if os.environ.get("MOSS_TTS_CODEC_CUDA_GRAPH") == "1":
+        stage_updates[1] = {"enforce_eager": False}
     return modify_stage_config(
         get_deploy_config_path("moss_voice_generator.yaml"),
-        updates={
-            "stages": {
-                0: {
-                    "max_num_seqs": 1,
-                    "gpu_memory_utilization": 0.45,
-                },
-            },
-        },
+        updates={"stages": stage_updates},
     )
 
 
