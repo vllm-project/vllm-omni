@@ -9,6 +9,8 @@ The loaded policy model owns dataset transforms inside its pipeline.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
@@ -114,7 +116,38 @@ class ServingRealtimeRobotOpenPI:
 
         if model_config is None:
             model_config = getattr(engine_client, "model_config", None)
-        return PolicyServerConfig.from_model_config(model_config)
+
+        # Framework-level fallback: if the model_config dict doesn't contain
+        # policy_server_config (e.g., the API server process's od_config
+        # model_config is a subset that omits it), try reading it from the
+        # model directory's config.json. This is safe for pure-diffusion
+        # policy models whose config.json already carries the field.
+        try:
+            return PolicyServerConfig.from_model_config(model_config)
+        except ValueError:
+            model_path = getattr(engine_client, "model", None)
+            if model_path is None:
+                for attr in ("od_config", "engine_args"):
+                    parent = getattr(engine_client, attr, None)
+                    model_path = getattr(parent, "model", None)
+                    if model_path is not None:
+                        break
+            if model_path is not None:
+                config_path = os.path.join(model_path, "config.json")
+                if os.path.isfile(config_path):
+                    with open(config_path) as f:
+                        config_json = json.load(f)
+                    psc = config_json.get("policy_server_config")
+                    if psc is not None:
+                        logger.info(
+                            "policy_server_config loaded from model config.json fallback: %s",
+                            config_path,
+                        )
+                        # psc is already the policy_server_config payload (not
+                        # the full model_config), so build PolicyServerConfig
+                        # directly instead of re-keying via from_model_config.
+                        return PolicyServerConfig(_to_builtin_container(psc))
+            raise
 
     def reset(self, obs: dict) -> None:
         """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
