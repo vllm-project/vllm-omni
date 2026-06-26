@@ -39,6 +39,7 @@ from vllm_omni.experimental.world_models.memory.objects import (
 logger = logging.getLogger(__name__)
 
 _FRAMES = "frames"
+_VIDEO_LATENTS = "video_latents"
 _META_DEFAULTS: dict[str, object] = {
     "call_count": 0,
     "current_start_frame": 0,
@@ -83,6 +84,15 @@ class DreamZeroStateAdapter:
         if not isinstance(buffer, LatentBuffer) or not buffer.resident:
             buffer = self._new_frame_buffer()
             self._session.put(_FRAMES, buffer)
+        return buffer
+
+    def _ensure_video_buffer(self) -> LatentBuffer:
+        """The accumulated AR video-latent chunks (unbounded, CPU)."""
+        buffer = self._session.get(_VIDEO_LATENTS)
+        if not isinstance(buffer, LatentBuffer) or not buffer.resident:
+            buffer = LatentBuffer()
+            buffer.allocate(maxlen=None)
+            self._session.put(_VIDEO_LATENTS, buffer)
         return buffer
 
     # Metadata getters read with a default so they never raise after a session
@@ -159,39 +169,108 @@ class DreamZeroStateAdapter:
         self.call_count += 1
         return np.stack(frames, axis=0)
 
+    # -- video-latent accumulation (logic mirrors DreamZeroState) -------
+
+    def append_video_latents(self, video_out: torch.Tensor) -> None:
+        """Append one AR chunk of normalized video latents for later decode."""
+        if video_out.dim() != 5:
+            raise ValueError(f"Expected 5D video_out, got shape {tuple(video_out.shape)}")
+        # Upstream ``torch.cat(..., dim=2)`` uses (B, C, T, H, W).
+        chunk = video_out.transpose(1, 2).detach().cpu()
+        buffer = self._ensure_video_buffer()
+        buffer.append(chunk)
+        logger.info(
+            "append_video_latents: chunk_shape=%s total_chunks=%d total_latent_t=%d",
+            tuple(chunk.shape),
+            len(buffer),
+            int(sum(c.shape[2] for c in buffer.view())),
+        )
+
+    def get_concatenated_video_latents(self) -> torch.Tensor | None:
+        """Return all accumulated chunks concatenated along the time dimension."""
+        buffer = self._session.get(_VIDEO_LATENTS)
+        if not isinstance(buffer, LatentBuffer) or not buffer.resident:
+            return None
+        chunks = buffer.view()
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return cast("torch.Tensor", chunks[0])
+        return torch.cat(chunks, dim=2)
+
+    def clear_video_latents(self) -> None:
+        """Drop accumulated video latents without resetting KV/frame state."""
+        buffer = LatentBuffer()
+        buffer.allocate(maxlen=None)
+        self._session.put(_VIDEO_LATENTS, buffer)
+
     # -- reset / should_reset (logic mirrors DreamZeroState) ------------
 
-    def reset(self) -> None:
-        """Clear all state for this session."""
+    def reset(self, *, clear_video_latents: bool = True) -> None:
+        """Clear session state.
+
+        When ``clear_video_latents`` is ``False`` the accumulated video latents
+        and the ``language`` token are preserved across the reset, matching
+        ``DreamZeroState.reset`` -- this is the ``reset_inference_state`` path
+        taken when local attention rolls over but the rollout continues.
+        """
+        saved_chunks: list[object] = []
+        saved_language: torch.Tensor | None = None
+        if not clear_video_latents:
+            buffer = self._session.get(_VIDEO_LATENTS)
+            if isinstance(buffer, LatentBuffer) and buffer.resident:
+                saved_chunks = list(buffer.view())
+            saved_language = self.language
+
         # Canonical reset: drop every typed object and clear session metadata.
         self._session.reset()
         # Leave an empty, allocated frame buffer ready for the next call.
         self._ensure_frame_buffer()
 
-    def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
-        """Determine if state should be reset before this forward()."""
+        if not clear_video_latents:
+            if saved_language is not None:
+                self.language = saved_language
+            restored = self._ensure_video_buffer()
+            if saved_chunks:
+                restored.extend(saved_chunks)
+
+    def reset_inference_state(self) -> None:
+        """Reset KV/frame state after local attention rolls without dropping video latents."""
+        self.reset(clear_video_latents=False)
+
+    def reset_reason(
+        self,
+        text_tokens: torch.Tensor | None,
+        num_video_frames: int,
+        local_attn_size: int,
+    ) -> str | None:
+        """Return why state should reset before the next forward(), if any."""
         language = self.language
         if language is None:
             logger.info("language is None, resetting")
-            return True
+            return "session"
 
         if text_tokens is not None and not torch.equal(language, text_tokens):
             logger.info("language changed, resetting")
-            return True
+            return "session"
 
         if num_video_frames == 1 and self.call_count > 1:
             logger.info("single frame input after first call, resetting")
-            return True
+            return "session"
 
         if local_attn_size != -1 and self.current_start_frame >= local_attn_size:
             logger.info(
-                "current_start_frame %d >= local_attn_size %d, resetting",
+                "current_start_frame %d >= local_attn_size %d, resetting inference state",
                 self.current_start_frame,
                 local_attn_size,
             )
-            return True
+            return "inference"
 
-        return False
+        return None
+
+    def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
+        """Determine if state should be reset before this forward()."""
+        return self.reset_reason(text_tokens, num_video_frames, local_attn_size) is not None
 
     # -- KV cache management --------------------------------------------
 
