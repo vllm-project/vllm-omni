@@ -60,6 +60,7 @@ class TestStreamingSpeechWebSocket:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
                 ws.send_json({"type": "session.config", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
 
                 start = ws.receive_json()
                 assert start["type"] == "audio.start"
@@ -73,7 +74,6 @@ class TestStreamingSpeechWebSocket:
                 done = ws.receive_json()
                 assert done == {"type": "audio.done", "sentence_index": 0, "total_bytes": len(audio), "error": False}
 
-                ws.send_json({"type": "input.done"})
                 session_done = ws.receive_json()
                 assert session_done == {"type": "session.done", "total_sentences": 1}
 
@@ -113,6 +113,7 @@ class TestStreamingSpeechWebSocket:
                     }
                 )
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
 
                 start = ws.receive_json()
                 assert start["type"] == "audio.start"
@@ -126,7 +127,6 @@ class TestStreamingSpeechWebSocket:
                 done = ws.receive_json()
                 assert done == {"type": "audio.done", "sentence_index": 0, "total_bytes": 6, "error": False}
 
-                ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
         assert len(captured_requests) == 1
@@ -150,6 +150,7 @@ class TestStreamingSpeechWebSocket:
                     }
                 )
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
 
                 error = ws.receive_json()
                 assert error["type"] == "error"
@@ -199,6 +200,7 @@ class TestStreamingSpeechWebSocket:
                     }
                 )
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
 
                 start = ws.receive_json()
                 assert start["type"] == "audio.start"
@@ -279,6 +281,7 @@ class TestStreamingSpeechWebSocket:
                     }
                 )
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
 
                 assert ws.receive_json()["type"] == "audio.start"
                 # Real-time audio chunk (timestamps null), then the timestamp frame.
@@ -342,16 +345,19 @@ class TestStreamingSpeechWebSocket:
 
         assert speech_service._generate_audio_bytes.await_count == 0
 
-    def test_multiple_sentences_increment_indices(self, mocker: MockerFixture):
+    def test_multiple_sentences_are_buffered_into_one_request(self, mocker: MockerFixture):
         app, _ = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
                 ws.send_json({"type": "session.config", "voice": "Vivian"})
-                ws.send_json({"type": "input.text", "text": "First sentence. Second sentence. "})
+                ws.send_json({"type": "input.text", "text": "First sentence. "})
+                ws.send_json({"type": "input.text", "text": "Second sentence. "})
+                ws.send_json({"type": "input.done"})
 
-                first_start = ws.receive_json()
-                assert first_start["sentence_index"] == 0
+                start = ws.receive_json()
+                assert start["sentence_index"] == 0
+                assert start["sentence_text"] == "First sentence. Second sentence."
                 ws.receive_bytes()
                 assert ws.receive_json() == {
                     "type": "audio.done",
@@ -359,19 +365,7 @@ class TestStreamingSpeechWebSocket:
                     "total_bytes": 36,
                     "error": False,
                 }
-
-                second_start = ws.receive_json()
-                assert second_start["sentence_index"] == 1
-                ws.receive_bytes()
-                assert ws.receive_json() == {
-                    "type": "audio.done",
-                    "sentence_index": 1,
-                    "total_bytes": 36,
-                    "error": False,
-                }
-
-                ws.send_json({"type": "input.done"})
-                assert ws.receive_json() == {"type": "session.done", "total_sentences": 2}
+                assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
     def test_unknown_message_type_keeps_session_open(self, mocker: MockerFixture):
         app, _ = _build_test_app(mocker=mocker)
@@ -385,6 +379,7 @@ class TestStreamingSpeechWebSocket:
                 assert error == {"type": "error", "message": "Unknown message type: unknown"}
 
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
                 assert ws.receive_json()["type"] == "audio.start"
                 ws.receive_bytes()
                 assert ws.receive_json() == {
@@ -394,7 +389,6 @@ class TestStreamingSpeechWebSocket:
                     "error": False,
                 }
 
-                ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
     def test_config_timeout_closes_session(self, mocker: MockerFixture):
@@ -419,12 +413,12 @@ class TestStreamingSpeechWebSocket:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
                 ws.send_json({"type": "session.config", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
 
                 assert ws.receive_json()["type"] == "audio.start"
                 assert ws.receive_json() == {"type": "error", "message": "Generation failed for sentence 0: boom"}
                 assert ws.receive_json() == {"type": "audio.done", "sentence_index": 0, "total_bytes": 0, "error": True}
 
-                ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
     def test_streaming_generation_error_marks_audio_done(self, mocker: MockerFixture):
@@ -453,6 +447,7 @@ class TestStreamingSpeechWebSocket:
                     }
                 )
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
+                ws.send_json({"type": "input.done"})
 
                 assert ws.receive_json()["type"] == "audio.start"
                 assert ws.receive_bytes() == b"\x01\x02"
@@ -467,7 +462,6 @@ class TestStreamingSpeechWebSocket:
                     "error": True,
                 }
 
-                ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
     def test_invalid_input_text_type_returns_validation_error(self, mocker: MockerFixture):

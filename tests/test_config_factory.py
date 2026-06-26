@@ -655,6 +655,16 @@ class TestPipelineRegistration:
         assert isinstance(pipeline_cfg, PipelineConfig)
         assert pipeline_cfg.model_type == resolved_type
 
+    def test_resolve_when_autodetect_resolves_none(self):
+        """Regression test for: https://github.com/vllm-project/vllm-omni/issues/4726"""
+        deploy_path = get_deploy_config_path("ming_tts.yaml")
+        resolved_config = StageConfigFactory.create_from_model(
+            model="inclusionAI/Ming-omni-tts-0.5B",
+            deploy_config_path=deploy_path,
+        )
+        assert resolved_config is not None
+        assert len(resolved_config) > 0
+
 
 class TestResolveScheduler:
     def test_all_execution_types_handled(self):

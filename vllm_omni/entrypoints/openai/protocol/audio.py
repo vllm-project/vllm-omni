@@ -476,13 +476,6 @@ class StreamingSpeechSessionConfig(BaseModel):
             "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
         ),
     )
-    split_granularity: Literal["sentence", "clause"] = Field(
-        default="sentence",
-        description=(
-            "Text splitting granularity: 'sentence' splits on .!?。！？, "
-            "'clause' also splits on CJK commas ， and semicolons ；."
-        ),
-    )
     word_timestamps: bool = Field(
         default=False,
         description=(
