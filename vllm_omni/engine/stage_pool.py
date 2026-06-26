@@ -1034,7 +1034,9 @@ class StagePool:
             return []
         client = cast(StagePoolLLMClient, raw_client)
         processor = self.output_processor
-        iteration_stats = IterationStats()
+        # Populate the caller's IterationStats (used by the stat logger) rather
+        # than a throwaway local; only allocate one if the caller passed None.
+        iteration_stats = iteration_stats or IterationStats()
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
