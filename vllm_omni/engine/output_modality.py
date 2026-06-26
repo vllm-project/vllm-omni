@@ -13,18 +13,6 @@ from typing import Literal, TypeAlias
 
 FinalOutputModalityType: TypeAlias = Literal["text", "image", "audio", "video"]
 
-_MODALITY_ALIASES: dict[str, str] = {
-    "speech": "audio",
-    "images": "image",
-    "latents": "latent",
-    "wav": "audio",
-    "waveform": "audio",
-    "pixel_values": "image",
-    "pixels": "image",
-    "token_ids": "text",
-    "tokens": "text",
-}
-
 
 class OutputModalityNames(StrEnum):
     """Keys for output modalities.
@@ -69,7 +57,7 @@ class OutputModality(Flag):
     def from_string(cls, s: str | None) -> OutputModality:
         """Parse a free-text modality string into an OutputModality flag.
 
-        Handles common aliases and compound strings separated by + or ,.
+        Handles compound strings separated by + or ,.
 
         Examples::
 
@@ -82,7 +70,6 @@ class OutputModality(Flag):
         parts = [p.strip().lower() for p in re.split(r"[+,]", s.strip())]
         result = cls(0)
         for p in parts:
-            p = _MODALITY_ALIASES.get(p, p)
             try:
                 result |= cls[p.upper()]
             except KeyError:

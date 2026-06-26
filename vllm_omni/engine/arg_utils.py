@@ -111,7 +111,7 @@ class OmniEngineArgs(EngineArgs):
             (default: "Qwen2_5OmniForConditionalGeneration")
         engine_output_type: Optional output type specification for the engine.
             Used to route outputs to appropriate processors (e.g., "image",
-            "audio", "latents"). If None, output type is inferred.
+            "audio", "latent"). If None, output type is inferred.
         hf_config_name: Optional key for HF config subkey to be extracted
             for this stage, e.g., talker_config; If None, the default
             HF config will be used.

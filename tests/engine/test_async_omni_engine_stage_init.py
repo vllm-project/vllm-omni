@@ -37,7 +37,7 @@ def _make_llm_metadata(
         default_sampling_params=types.SimpleNamespace(name=f"sp-{stage_id}-{replica_id}"),
         custom_process_input_func=None,
         engine_input_source=[] if stage_id == 0 else [stage_id - 1],
-        engine_output_type="token_ids",
+        engine_output_type="text",
         replica_id=replica_id,
         is_comprehension=is_comprehension,
     )
