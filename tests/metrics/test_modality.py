@@ -42,6 +42,9 @@ _EXPECTED_FAMILIES = [
     defs.AUDIO_UNDERRUN_S,
     defs.AUDIO_CONTINUITY_OK_METRIC,
     defs.AUDIO_SKIPPED_REQUESTS_METRIC,
+    defs.DIFFUSION_EXEC_S,
+    defs.DIFFUSION_PREPROCESS_S,
+    defs.DIFFUSION_POSTPROCESS_S,
 ]
 
 
@@ -55,6 +58,9 @@ class TestRegistration:
         mod.observe_audio_underrun("s", "r", 0.01)
         mod.inc_audio_continuity_ok("s", "r", 100)
         mod.inc_audio_skipped("s", "r", "malformed_codec")
+        mod.observe_diffusion_exec("s", "r", 0.5)
+        mod.observe_diffusion_preprocess("s", "r", 0.01)
+        mod.observe_diffusion_postprocess("s", "r", 0.2)
 
         out = generate_latest(REGISTRY).decode()
         for name in _EXPECTED_FAMILIES:
@@ -157,6 +163,49 @@ class TestAudio:
 
 
 # ---------------------------------------------------------------------------
+# Diffusion observe API
+# ---------------------------------------------------------------------------
+
+
+class TestDiffusion:
+    def test_diffusion_exec_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "dit_exec", "0"
+        mod.observe_diffusion_exec(stage, replica, 1.25)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DIFFUSION_EXEC_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 1.25
+
+    def test_diffusion_preprocess_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "dit_pre", "0"
+        mod.observe_diffusion_preprocess(stage, replica, 0.03)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DIFFUSION_PREPROCESS_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == pytest.approx(0.03)
+
+    def test_diffusion_postprocess_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "dit_post", "0"
+        mod.observe_diffusion_postprocess(stage, replica, 0.8)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DIFFUSION_POSTPROCESS_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 0.8
+
+    def test_diffusion_uses_seconds_fast_buckets(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "dit_buckets", "0"
+        mod.observe_diffusion_exec(stage, replica, 0.005)
+        out = generate_latest(REGISTRY).decode()
+        fast_marker = f'{defs.DIFFUSION_EXEC_S}_bucket{{le="0.001"'
+        assert fast_marker in out, "diffusion_exec_s should use SECONDS_FAST_BUCKETS containing le=0.001"
+
+    def test_log_stats_false_skips(self) -> None:
+        silent = OmniModalityMetrics(model_name="silent-model", log_stats=False)
+        silent.observe_diffusion_exec("s", "r", 1.0)
+        silent.observe_diffusion_preprocess("s", "r", 0.01)
+        silent.observe_diffusion_postprocess("s", "r", 0.5)
+        out = generate_latest(REGISTRY).decode()
+        assert f'model_name="silent-model"' not in out
+
+
+# ---------------------------------------------------------------------------
 # Stub-driven routing tests for the finalize / streaming helpers.
 # ---------------------------------------------------------------------------
 
@@ -182,6 +231,15 @@ class _StubModMetrics:
 
     def inc_audio_skipped(self, s, r, reason):
         self.calls.append(("inc_audio_skipped", s, r, reason))
+
+    def observe_diffusion_exec(self, s, r, v):
+        self.calls.append(("observe_diffusion_exec", s, r, v))
+
+    def observe_diffusion_preprocess(self, s, r, v):
+        self.calls.append(("observe_diffusion_preprocess", s, r, v))
+
+    def observe_diffusion_postprocess(self, s, r, v):
+        self.calls.append(("observe_diffusion_postprocess", s, r, v))
 
 
 class _Bag:
@@ -239,8 +297,64 @@ class TestObserveModalityAtFinalize:
         )
         assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
 
-    def test_non_audio_output_type_skipped(self):
-        # Image / video / text output types are out of scope for this module.
+    def test_diffusion_path_full(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            stage_gen_time_ms=1000.0,
+            diffusion_metrics={
+                "preprocess_time_s": 0.05,
+                "diffusion_engine_exec_time_s": 1.2,
+                "postprocess_time_s": 0.3,
+                "diffusion_engine_total_time_s": 1.55,
+                "image_num": 1,
+                "resolution": 1024,
+            },
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert ("observe_diffusion_preprocess", "2", "0", 0.05) in stub.calls
+        assert ("observe_diffusion_exec", "2", "0", 1.2) in stub.calls
+        assert ("observe_diffusion_postprocess", "2", "0", 0.3) in stub.calls
+
+    def test_diffusion_metrics_none_skipped(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=500.0, diffusion_metrics=None),
+            engine_outputs=_Bag(),
+        )
+        assert not any(c[0].startswith("observe_diffusion") for c in stub.calls)
+
+    def test_diffusion_zero_values_skipped(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            stage_gen_time_ms=500.0,
+            diffusion_metrics={
+                "preprocess_time_s": 0.0,
+                "diffusion_engine_exec_time_s": 0.0,
+                "postprocess_time_s": 0.0,
+            },
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert not any(c[0].startswith("observe_diffusion") for c in stub.calls)
+
+    def test_non_audio_output_type_skips_audio_but_still_checks_diffusion(self):
         stub = _StubModMetrics()
         for output_type in ("text", "image", "video"):
             observe_modality_at_finalize(
@@ -251,7 +365,7 @@ class TestObserveModalityAtFinalize:
                 stage_metrics=_Bag(stage_gen_time_ms=100.0),
                 engine_outputs=_Bag(),
             )
-        assert stub.calls == []
+        assert not any(c[0].startswith("observe_audio") or c[0].startswith("inc_audio") for c in stub.calls)
 
     def test_replica_id_none_skipped(self):
         stub = _StubModMetrics()

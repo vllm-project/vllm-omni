@@ -135,6 +135,14 @@ AUDIO_SKIPPED_REQUESTS_METRIC = METRIC_PREFIX + AUDIO_SKIPPED_REQUESTS
 
 
 # ============================================================================
+# Diffusion family (per-stage + per-replica diffusion timing breakdowns)
+# ============================================================================
+DIFFUSION_EXEC_S = METRIC_PREFIX + "diffusion_exec_s"
+DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
+DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
+
+
+# ============================================================================
 # Cross-stage Transfer family (per-physical-hop TX/RX/in-flight timings)
 # ============================================================================
 TRANSFER_SIZE_BYTES = METRIC_PREFIX + "transfer_size_bytes"

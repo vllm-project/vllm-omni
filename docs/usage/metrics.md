@@ -1,6 +1,6 @@
 # Production Metrics
 
-vLLM-Omni exposes Prometheus metrics via the `/metrics` endpoint on the OpenAI-compatible API server. This page covers the text and audio surface; diffusion / image / video metrics are tracked in a follow-up PR.
+vLLM-Omni exposes Prometheus metrics via the `/metrics` endpoint on the OpenAI-compatible API server.
 
 ```bash
 vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8000 --log-stats
@@ -50,6 +50,29 @@ Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the fi
 | `vllm:omni_audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
 
 The continuity math comes from `vllm_omni/benchmarks/audio_continuity.py::compute_continuity_stats` so the server-side observation aligns with the bench-side definition.
+
+## Diffusion Metrics (`vllm:omni_`)
+
+Per-request timing breakdowns for diffusion (image/video) stages. Emitted at request finalize when `stage_metrics.diffusion_metrics` is present. All carry `{model_name, stage, replica}`.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `vllm:omni_diffusion_exec_s` | Histogram | DiT forward pass execution time per request in seconds |
+| `vllm:omni_diffusion_preprocess_s` | Histogram | Diffusion input preprocessing time per request in seconds |
+| `vllm:omni_diffusion_postprocess_s` | Histogram | Diffusion output postprocessing (VAE decode) time per request in seconds |
+
+All three use `SECONDS_FAST_BUCKETS` (1 ms → 60 s).
+
+### Example PromQL
+
+```promql
+# P99 DiT exec time by stage
+histogram_quantile(0.99, rate(vllm_omni:diffusion_exec_s_bucket[5m]))
+
+# Ratio of preprocess to total exec wall time
+rate(vllm_omni:diffusion_preprocess_s_sum[5m])
+  / rate(vllm_omni:diffusion_exec_s_sum[5m])
+```
 
 ## Cross-Stage Transfer Metrics (`vllm:omni_`)
 

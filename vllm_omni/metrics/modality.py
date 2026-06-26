@@ -78,6 +78,29 @@ _audio_skipped_family = Counter(
 )
 
 
+# ----------------------------------------------------------------------------
+# Diffusion family
+# ----------------------------------------------------------------------------
+_diffusion_exec_family = Histogram(
+    defs.DIFFUSION_EXEC_S,
+    "DiT forward pass execution time per request in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_diffusion_preprocess_family = Histogram(
+    defs.DIFFUSION_PREPROCESS_S,
+    "Diffusion input preprocessing time per request in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_diffusion_postprocess_family = Histogram(
+    defs.DIFFUSION_POSTPROCESS_S,
+    "Diffusion output postprocessing (VAE decode) time per request in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+
+
 class OmniModalityMetrics:
     """Per-modality observe API. Stage/replica are passed at observe time
     because a single OmniModalityMetrics instance per pipeline serves all
@@ -139,6 +162,29 @@ class OmniModalityMetrics:
             reason=reason or "unknown",
         ).inc()
 
+    # ---- Diffusion --------------------------------------------------------
+
+    def observe_diffusion_exec(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_exec_family.labels(
+            model_name=self._model_name, stage=stage, replica=replica,
+        ).observe(seconds)
+
+    def observe_diffusion_preprocess(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_preprocess_family.labels(
+            model_name=self._model_name, stage=stage, replica=replica,
+        ).observe(seconds)
+
+    def observe_diffusion_postprocess(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_postprocess_family.labels(
+            model_name=self._model_name, stage=stage, replica=replica,
+        ).observe(seconds)
+
 
 def observe_modality_at_finalize(
     mod_metrics: OmniModalityMetrics,
@@ -160,8 +206,6 @@ def observe_modality_at_finalize(
     streaming hook at first-packet time, not at finalize.
     """
     if replica_id is None or stage_metrics is None or output_type is None:
-        return
-    if output_type != "audio":
         return
 
     stage_label = str(stage_id)
@@ -198,6 +242,27 @@ def observe_modality_at_finalize(
     # audio_underrun / continuity are emitted from the streaming path in
     # observe_audio_streaming_finalize; finalize is too late for the
     # per-chunk timeline they need.
+
+    dm = getattr(stage_metrics, "diffusion_metrics", None)
+    if dm:
+        _key_map = {
+            "diffusion_engine_exec_time_s": mod_metrics.observe_diffusion_exec,
+            "preprocess_time_s": mod_metrics.observe_diffusion_preprocess,
+            "postprocess_time_s": mod_metrics.observe_diffusion_postprocess,
+        }
+        for key, observe_fn in _key_map.items():
+            val = dm.get(key)
+            if val is not None:
+                observe_fn(stage_label, replica_label, float(val))
+
+        exec_time = dm.get("diffusion_engine_exec_time_s")
+        num_steps = dm.get("num_inference_steps")
+        if exec_time is not None and num_steps and num_steps > 0:
+            mod_metrics.observe_diffusion_exec_per_step(
+                stage_label,
+                replica_label,
+                float(exec_time) / int(num_steps),
+            )
 
 
 def observe_audio_first_packet(
