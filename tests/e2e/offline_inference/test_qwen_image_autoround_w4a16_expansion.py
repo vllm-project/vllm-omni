@@ -7,7 +7,6 @@ Verifies that the W4A16 quantized Qwen-Image checkpoint loads end-to-end
 """
 
 import os
-
 from pathlib import Path
 
 import numpy as np
