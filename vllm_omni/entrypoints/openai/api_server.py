@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import base64
 import dataclasses
 import io
 import json
@@ -19,6 +20,7 @@ from numbers import Integral
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
+import httpx
 import numpy as np
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
@@ -83,7 +85,6 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
-from vllm.multimodal.media import MediaConnector
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
@@ -2036,23 +2037,17 @@ async def edit_images(
         # Match the offline path: RGB normalize when the caller opts into
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
-        pil_images = await _load_input_images(
-            input_images_list,
-            engine_client.model_config,
-            normalize_rgb=normalize_edit_images_rgb,
-        )
+        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # Mask role is different (alpha channel matters); never normalize.
-            loaded = await _load_input_images([mask_image], engine_client.model_config, normalize_rgb=False)
+            loaded = await _load_input_images([mask_image], normalize_rgb=False)
             prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images(
-                [reference_image], engine_client.model_config, normalize_rgb=normalize_edit_images_rgb
-            )
+            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
@@ -2539,41 +2534,41 @@ def _extract_images_from_result(result: Any) -> list[Any]:
 
 async def _load_input_images(
     inputs: list[str],
-    model_config: Any,
     *,
     normalize_rgb: bool = True,
 ) -> list[Image.Image]:
-    """Load images from data URIs, http(s) URLs, file:// URIs, or UploadFiles.
-
-    http(s) and ``file:`` URLs are fetched through vLLM's ``MediaConnector`` which
-    respects ``--allowed-media-domains`` and ``--allowed-local-media-path``
-    to prevent SSRF.
     """
-
+    convert to PIL.Image.Image list
+    """
     if isinstance(inputs, str):
         inputs = [inputs]
-
-    connector = MediaConnector(
-        allowed_local_media_path=model_config.allowed_local_media_path,
-        allowed_media_domains=model_config.allowed_media_domains,
-    )
 
     images: list[Image.Image] = []
 
     for inp in inputs:
-        if isinstance(inp, str):
-            # http(s), data: and file: all handled by MediaConnector
+        # 1. URL + base64
+        if isinstance(inp, str) and inp.startswith("data:image"):
             try:
-                # Use RGBA to preserve alpha for transparent PNG.
-                result = await connector.fetch_image_async(
-                    inp,
-                    image_mode="RGBA",
-                )
-                images.append(result.media)
+                _, b64_data = inp.split(",", 1)
+                image_bytes = base64.b64decode(b64_data)
+                img = Image.open(io.BytesIO(image_bytes))
+                images.append(img)
             except Exception as e:
-                raise ValueError(f"Failed to load image: {e}") from e
+                raise ValueError(f"Invalid base64 image: {e}")
+
+        # 2. URL
+        elif isinstance(inp, str) and inp.startswith("http"):
+            async with httpx.AsyncClient(timeout=60) as client:
+                try:
+                    resp = await client.get(inp)
+                    resp.raise_for_status()
+                    img = Image.open(io.BytesIO(resp.content))
+                    images.append(img)
+                except Exception as e:
+                    raise ValueError(f"Failed to download image from URL {inp}: {e}")
+
+        # 3. UploadFile
         elif hasattr(inp, "file"):
-            # UploadFile
             try:
                 img_data = await inp.read()
                 img = Image.open(io.BytesIO(img_data))
@@ -3025,7 +3020,6 @@ async def _parse_video_form(
             request.image_reference,
             request.video_reference,
             input_reference_bytes,
-            model_config=handler._engine_client.model_config,
             max_video_frames=decode_spec.max_frames,
             video_keep=decode_spec.keep,
         )
@@ -3037,15 +3031,8 @@ async def _parse_video_form(
 
     reference_audio: ReferenceAudio | None = None
     if request.audio_reference is not None:
-        audio_connector = MediaConnector(
-            allowed_local_media_path=handler._engine_client.model_config.allowed_local_media_path,
-            allowed_media_domains=handler._engine_client.model_config.allowed_media_domains,
-        )
         try:
-            audio_path = await decode_audio_url(
-                request.audio_reference.audio_url,
-                audio_connector,
-            )
+            audio_path = await decode_audio_url(request.audio_reference.audio_url)
         except InvalidInputReferenceError as exc:
             raise HTTPException(400, detail=str(exc)) from exc
         reference_audio = ReferenceAudio(path=audio_path)
