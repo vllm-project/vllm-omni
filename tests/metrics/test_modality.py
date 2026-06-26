@@ -202,7 +202,7 @@ class TestDiffusion:
         silent.observe_diffusion_preprocess("s", "r", 0.01)
         silent.observe_diffusion_postprocess("s", "r", 0.5)
         out = generate_latest(REGISTRY).decode()
-        assert f'model_name="silent-model"' not in out
+        assert 'model_name="silent-model"' not in out
 
 
 # ---------------------------------------------------------------------------

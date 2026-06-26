@@ -168,21 +168,27 @@ class OmniModalityMetrics:
         if not self._log_stats:
             return
         _diffusion_exec_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica,
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
         ).observe(seconds)
 
     def observe_diffusion_preprocess(self, stage: str, replica: str, seconds: float) -> None:
         if not self._log_stats:
             return
         _diffusion_preprocess_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica,
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
         ).observe(seconds)
 
     def observe_diffusion_postprocess(self, stage: str, replica: str, seconds: float) -> None:
         if not self._log_stats:
             return
         _diffusion_postprocess_family.labels(
-            model_name=self._model_name, stage=stage, replica=replica,
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
         ).observe(seconds)
 
 
