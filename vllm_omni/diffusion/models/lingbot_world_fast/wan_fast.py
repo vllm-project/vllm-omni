@@ -20,6 +20,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
 
 from .state_lingbot_world_fast import CacheIndex
@@ -159,6 +160,10 @@ class CausalWanSelfAttention(nn.Module):
 
             for i in range(b):
                 slot_i = slot_idxs[i]
+                if slot_i == -1:
+                    # Inactive slot: self-attend over the row's own K/V; output discarded.
+                    outs.append(self.attn(roped_query[i : i + 1], roped_key[i : i + 1], v[i : i + 1]))
+                    continue
                 slot_kv = kv_cache[slot_i]
                 slot_local_end = local_end_index[slot_i]
                 slot_global_end = global_end_index[slot_i]
@@ -244,6 +249,9 @@ class CausalWanSelfAttention(nn.Module):
             max_end_per_slot: dict[int, int] = {}
             for i in range(b):
                 slot_i = slot_idxs[i]
+                if slot_i == -1:
+                    outs.append(self.attn(roped_query[i : i + 1], roped_key[i : i + 1], v[i : i + 1]))
+                    continue
                 slot_kv = kv_cache[slot_i]
 
                 cs_i = current_starts[i]
@@ -692,6 +700,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
             self.freqs = self.freqs.to(device)
 
         if first_stage:
+            stream_xt = torch.stack(x)
             if y is not None:
                 x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
             x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -705,6 +714,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
             x = intermediate_tensors["hidden_states"]
             grid_sizes = intermediate_tensors["grid_sizes"]
             seq_lens = intermediate_tensors["seq_lens"]
+            t = intermediate_tensors["t"]
+            stream_xt = intermediate_tensors["xt"]
 
         B = x.shape[0]
         s = x.shape[1]
@@ -789,10 +800,20 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 "hidden_states": x.to(model_dtype),
                 "grid_sizes": grid_sizes,
                 "seq_lens": seq_lens,
+                "t": t,
+                "xt": stream_xt,
             }
             if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
                 it["c2ws_plucker_emb"] = dit_cond_dict["c2ws_plucker_emb"].to(model_dtype)
             return IntermediateTensors(it)
+
+        # Last stage: expose t (and xt, when it arrived via the IT) on the forward
+        # context so the pipeline's step_scheduler / latent update can read them.
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            ctx.stream_t = t
+            if not first_stage:
+                ctx.stream_xt = stream_xt
 
         # head + unpatchify only on the last PP stage
         x = self.head(x, e)

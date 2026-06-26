@@ -26,11 +26,13 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     get_pp_group,
     is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
 from vllm_omni.diffusion.distributed.pipeline_parallel import (
     AsyncLatents,
     PipelineParallelMixin,
 )
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportCameraPosInput, SupportImageInput
@@ -44,10 +46,11 @@ from .cam_utils import (
     get_plucker_embeddings,
     interpolate_camera_poses,
 )
-from .flow_scheduler import LingbotFlowScheduler
 from .fm_solvers_unipc import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.causvid.flow_scheduler import CausVidFlowScheduler
+from vllm_omni.diffusion.models.causvid.stream_autoencoder_kl_wan import StreamAutoencoderKLWan
+
 from .state_lingbot_world_fast import LingbotWorldFastState
-from .stream_autoencoder_kl_wan import StreamAutoencoderKLWan
 from .wan_fast import WanModelFast
 
 logger = logging.getLogger(__name__)
@@ -108,6 +111,8 @@ class LingbotWorldFastPipeline(
 
         self.target_dtype = od_config.dtype
 
+        torch.backends.cudnn.benchmark = True
+
         self.control_type = "cam"
         self.num_train_timesteps = CONFIG["num_train_timesteps"]
 
@@ -131,7 +136,9 @@ class LingbotWorldFastPipeline(
         self.vae_stride = od_config.model_config.get("vae_stride", (4, 8, 8))
         self.patch_size = od_config.model_config.get("patch_size", (1, 2, 2))
 
-        needs_vae = od_config.stream_batch is False or is_pipeline_first_stage()
+        # Stream-batch needs the encoder on the first rank (conditioning) and the
+        # decoder on the last rank (deepest-slot decode), so load on both ends.
+        needs_vae = od_config.stream_batch is False or is_pipeline_first_stage() or is_pipeline_last_stage()
         if needs_vae:
             vae_path = os.path.join(model_path, CONFIG["vae_checkpoint"])
             vae_sd = torch.load(vae_path, map_location="cpu", weights_only=True)
@@ -658,7 +665,10 @@ class LingbotWorldFastPipeline(
         c2ws = camera.get("poses")
         max_area = self.od_config.model_config.get("max_area", 480 * 832)
 
-        new_lat_f = max(sampling.num_chunks * chunk_latent_frames, 1)
+        # Chunk 0 carries an extra I-frame (the anchor) on a fresh start, mirroring
+        # causvid; an extension continues a stream and has none.
+        iframe = 0 if extension else 1
+        new_lat_f = max(sampling.num_chunks * chunk_latent_frames + iframe, 1)
         if extension:
             num_frames = new_lat_f * 4
         else:
@@ -724,17 +734,37 @@ class LingbotWorldFastPipeline(
         c2ws_infer_full = c2ws_infer_full.to(self.device).to(torch.float32)
         Ks_t = Ks_t.to(self.device).to(torch.float32)
 
-        anchor_latent: torch.Tensor | None = None
-        if is_pipeline_first_stage():
+        # Reset stream encoder (first rank) + decoder (last rank) feat-maps per session.
+        chunk0_cond_lat: torch.Tensor | None = None
+        zero_cond_lat: torch.Tensor | None = None
+        dummy_cond: dict | None = None
+        # Fresh start resets both stream feat-maps; an extension keeps the decoder
+        # cache so its first chunk continues the stream (frame-by-frame) instead of
+        # re-priming via the I-frame split.
+        if (not extension) and (is_pipeline_first_stage() or is_pipeline_last_stage()):
             self.vae.reset()
+        if is_pipeline_first_stage():
+            # Precompute the two conditioning latents once: chunk 0 carries the
+            # anchor I-frame (base+1 frames); every other chunk uses the
+            # zero-frame conditioning (base frames).
+            zero_cond_lat = self._encode_cond(torch.zeros(3, 4 * chunk_latent_frames, h, w, device=self.device))
             if not extension:
                 anchor_pixels = torch.nn.functional.interpolate(
                     img[None], size=(h, w), mode="bicubic"
-                ).transpose(0, 1)
-                anchor_latent = self.vae.init(anchor_pixels)  # [16, 1, lat_h, lat_w]
-            else:
-                zero_frame = torch.zeros(3, 1, h, w, device=self.device)
-                self.vae.init(zero_frame)
+                ).transpose(0, 1)  # [3, 1, h, w]
+                tail = torch.zeros(3, 4 * chunk_latent_frames, h, w, device=self.device)
+                chunk0_cond_lat = self._encode_cond(torch.cat([anchor_pixels, tail], dim=1))  # [16, base+1, h, w]
+
+            # Base-frame dummy conditioning for None slots during PP fill/drain (a
+            # first-stage rank may hold only dummy slots); the output is discarded.
+            dpl = get_plucker_embeddings(
+                c2ws_infer_full[torch.arange(chunk_latent_frames, device=c2ws_infer_full.device)],
+                Ks_t.repeat(chunk_latent_frames, 1), h, w, only_rays_d=False,
+            )
+            dpl = rearrange(dpl, "f (h c1) (w c2) c -> f h w (c c1 c2)", c1=int(h // lat_h), c2=int(w // lat_w))
+            dpl = dpl.view(1, chunk_latent_frames, lat_h, lat_w, -1).permute(0, 4, 1, 2, 3).contiguous().to(self.target_dtype)
+            dmsk = torch.zeros(4, chunk_latent_frames, lat_h, lat_w, device=self.device)
+            dummy_cond = {"y": torch.cat([dmsk, zero_cond_lat], dim=0), "plucker": dpl}
 
         # Per-block self-attn config from sampling.extra_args. sink_size and
         # local_attn_size are in chunks (each chunk has chunk_latent_frames).
@@ -776,7 +806,7 @@ class LingbotWorldFastPipeline(
         model_args = self.model.config
         transformer_dtype = self.target_dtype
         frame_seqlen = int(lat_h * lat_w // 4)
-        extra_kv_size = (sink_size + local_attn_size) * chunk_latent_frames * frame_seqlen
+        extra_kv_size = ((sink_size + local_attn_size) * chunk_latent_frames + iframe) * frame_seqlen
         head_dim = model_args.dim // model_args.num_heads
         local_num_heads = model_args.num_heads // self.sp_size
         owned_num_layers = self.model.end_layer - self.model.start_layer
@@ -799,14 +829,15 @@ class LingbotWorldFastPipeline(
 
         # State population.
         state.prompt_embeds = None  # unused; lingbot keeps text as raw list[Tensor]
-        state.latents = None  # per-chunk latents are stacked by encode_chunk_inputs
+        state.latents = None  # the rolling [ns, 16, base, h, w] buffer is built per step by prepare_chunks
         state.timesteps = denoise_timesteps
         state.step_index = 0
-        state.scheduler = LingbotFlowScheduler(self.scheduler, denoise_timesteps)
+        state.scheduler = CausVidFlowScheduler(self.scheduler, denoise_timesteps)
         state.do_true_cfg = False
 
         state.extra["context"] = context_list
-        state.extra["anchor_latent"] = anchor_latent
+        state.extra["chunk0_cond_lat"] = chunk0_cond_lat
+        state.extra["zero_cond_lat"] = zero_cond_lat
         state.extra["start_token_offset"] = start_token_offset
         state.extra["max_attention_size"] = total_kv_size
         state.extra["frame_seqlen"] = frame_seqlen
@@ -818,6 +849,7 @@ class LingbotWorldFastPipeline(
         state.extra["w"] = w
         state.extra["new_lat_f"] = new_lat_f
         state.extra["extension"] = extension
+        state.extra["iframe"] = iframe
         state.extra["rolling_enabled"] = local_attn_size > 0
         state.extra["seed_g"] = seed_g
         state.extra["seed_g_addnoise"] = seed_g_addnoise
@@ -825,157 +857,168 @@ class LingbotWorldFastPipeline(
         state.extra["c2ws_infer_full"] = c2ws_infer_full
         state.extra["Ks_transformed"] = Ks_t
 
+        # Fixed-ladder / streaming state.
+        state.extra["slot_chunks"] = []
+        state.extra["chunk_cond"] = {}
+        state.extra["dummy_cond"] = dummy_cond
+        state.extra["decoded_chunks"] = []
+        state.extra["num_chunks_decoded"] = 0
+
         return state
 
-    def encode_chunk_inputs(
-        self,
-        state: DiffusionRequestState,
-        new_idxs: list[int],
-    ) -> torch.Tensor:
-        """Build per-chunk noise, plus VAE-encoded y and Plucker on first stage."""
-        seed_g = state.extra["seed_g"]
-        chunk_latent_frames = state.extra["chunk_latent_frames"]
+    def _encode_cond(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Raw-VAE-encode conditioning pixels ``[3, T, h, w]`` to a normalized
+        latent ``[16, F, lat_h, lat_w]`` (stateless; uses the inner VAE so the
+        stream encoder/decoder feat-maps are untouched). Mirrors ``encode_video``."""
+        mean, inv_std = self.latents_scale
+        mu = self.vae._vae.encode(pixels.unsqueeze(0)).latent_dist.mode()
+        return ((mu - mean) * inv_std).float().squeeze(0)
+
+    def encode_chunk(self, state: DiffusionRequestState, chunk_idx: int) -> torch.Tensor:
+        """Pure-noise latent for ``chunk_idx``; on the first stage also builds the
+        chunk's ``y`` (image conditioning) + Plucker (camera) and stashes them in
+        ``state.extra['chunk_cond']`` for the steady ladder to reuse."""
+        base = state.extra["chunk_latent_frames"]
         lat_h = state.extra["lat_h"]
         lat_w = state.extra["lat_w"]
-        h = state.extra["h"]
-        w = state.extra["w"]
-        chunks = state.extra["chunks"]
-        B = len(new_idxs)
+        seed_g = state.extra["seed_g"]
+        iframe = state.extra["iframe"]
+        extension = state.extra["extension"]
 
-        # noise
-        noise = torch.randn(
-            B,
-            16,
-            chunk_latent_frames,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device,
-        )
+        is_anchor = (not extension) and chunk_idx == 0
+        # Chunk 0 carries the I-frame (anchor): base + iframe latent frames; others base.
+        lat_f = base + iframe if chunk_idx == 0 else base
 
+        noise = torch.randn(16, lat_f, lat_h, lat_w, dtype=torch.float32, generator=seed_g, device=self.device)
         if not is_pipeline_first_stage():
             return noise
 
+        cond_lat = state.extra["chunk0_cond_lat"] if is_anchor else state.extra["zero_cond_lat"]
+        msk = torch.zeros(4, lat_f, lat_h, lat_w, device=self.device)
+        if is_anchor:
+            msk[:, 0] = 1
+        y = torch.cat([msk, cond_lat], dim=0)  # [20, lat_f, lat_h, lat_w]
+
+        h = state.extra["h"]
+        w = state.extra["w"]
         c2ws_infer_full = state.extra["c2ws_infer_full"]
         Ks_t = state.extra["Ks_transformed"]
-        anchor_latent: torch.Tensor | None = state.extra["anchor_latent"]
-        extension: bool = state.extra["extension"]
-
-        # per-chunk stream-encode y + per-chunk msk
-        for idx in new_idxs:
-            is_anchor_chunk = (not extension) and idx == 0
-            if is_anchor_chunk:
-                tail_frames = 4 * (chunk_latent_frames - 1)
-                if tail_frames > 0:
-                    zeros = torch.zeros(3, tail_frames, h, w, device=self.device)
-                    tail_lat = self.vae.encode(zeros)
-                    assert anchor_latent is not None
-                    vae_lat = torch.cat([anchor_latent, tail_lat], dim=1)
-                else:
-                    assert anchor_latent is not None
-                    vae_lat = anchor_latent
-            else:
-                zeros = torch.zeros(3, 4 * chunk_latent_frames, h, w, device=self.device)
-                vae_lat = self.vae.encode(zeros)
-
-            msk_chunk = torch.zeros(4, chunk_latent_frames, lat_h, lat_w, device=self.device)
-            if is_anchor_chunk:
-                msk_chunk[:, 0] = 1
-            chunks[idx].extra["y"] = torch.cat([msk_chunk, vae_lat], dim=0)
-
-        # plucker
+        start = 0 if chunk_idx == 0 else chunk_idx * base + iframe
         frame_indices = torch.tensor(
-            [ci * chunk_latent_frames + f for ci in new_idxs for f in range(chunk_latent_frames)],
-            device=c2ws_infer_full.device,
-            dtype=torch.long,
+            [start + f for f in range(lat_f)], device=c2ws_infer_full.device, dtype=torch.long
         )
-        batched_c2ws = c2ws_infer_full[frame_indices]  # [B*chunk_latent_frames, 3, 4]
-        batched_Ks = Ks_t.repeat(B * chunk_latent_frames, 1)  # [B*chunk_latent_frames, 4]
-        batched_plucker = get_plucker_embeddings(batched_c2ws, batched_Ks, h, w, only_rays_d=False)
-        batched_plucker = rearrange(
-            batched_plucker,
-            "f (h c1) (w c2) c -> f h w (c c1 c2)",
-            c1=int(h // lat_h),
-            c2=int(w // lat_w),
-        )
-        batched_plucker = batched_plucker.view(B, chunk_latent_frames, lat_h, lat_w, -1)
-        batched_plucker = batched_plucker.permute(0, 4, 1, 2, 3).contiguous().to(self.target_dtype)
+        plucker = get_plucker_embeddings(c2ws_infer_full[frame_indices], Ks_t.repeat(lat_f, 1), h, w, only_rays_d=False)
+        plucker = rearrange(plucker, "f (h c1) (w c2) c -> f h w (c c1 c2)", c1=int(h // lat_h), c2=int(w // lat_w))
+        plucker = plucker.view(1, lat_f, lat_h, lat_w, -1).permute(0, 4, 1, 2, 3).contiguous().to(self.target_dtype)
 
-        for i, idx in enumerate(new_idxs):
-            chunks[idx].extra["plucker"] = batched_plucker[i : i + 1]
-
+        state.extra["chunk_cond"][chunk_idx] = {"y": y, "plucker": plucker}
         return noise
 
-    def set_pp_recv_dict_buffers(self, state: DiffusionRequestState) -> None:
-        if get_pipeline_parallel_world_size() == 1:
-            return
+    def prepare_first_chunk(self, state: DiffusionRequestState) -> DiffusionOutput | None:
+        """Denoise chunk 0 alone (batch=1, clean KV) through every step, seed all
+        slots from it, then decode it. Mirrors causvid."""
+        ns = len(state.timesteps)
+        state.extra["slot_chunks"] = [0]
+        state.latents = self.encode_chunk(state, 0).unsqueeze(0)  # [1, 16, base, h, w]
 
-        pp_group = get_pp_group()
-        slo_fps = getattr(state.sampling, "slo_fps", None)
-        slo_max_batch = getattr(state.sampling, "slo_max_batch", 1)
-        slo_max_batch = max(1, slo_max_batch if slo_fps else 1)
+        for step in range(ns):
+            t = state.timesteps[step : step + 1]
+            noise_pred = self._denoise_forward(state, slot_chunks=[0], t=t, use_buffer=False)
+            state.latents = self.scheduler_step_maybe_with_cfg(
+                noise_pred,
+                state.timesteps[step : step + 1],
+                state.latents,
+                do_true_cfg=False,
+                per_request_scheduler=[state.scheduler],
+                generator=state.extra["seed_g_addnoise"],
+                batch_size=1,
+                receive_latents=True,
+                use_buffer=False,
+            )
+            state.step_index += 1
 
-        chunk_latent_frames = state.extra["chunk_latent_frames"]
+        self.state.seed_all_slots_from(0)
+        out = self.decode_chunks(state) if get_pp_group().is_last_rank else None
+        state.latents = None
+        return out
+
+    def prepare_chunks(self, state: DiffusionRequestState) -> None:
+        slot_chunks: list[int | None] = state.extra["slot_chunks"]
+        ns = len(slot_chunks)
+        base = state.extra["chunk_latent_frames"]
+        lat_h = state.extra["lat_h"]
+        lat_w = state.extra["lat_w"]
+
+        prev = state.latents
+        latents = torch.zeros(ns, 16, base, lat_h, lat_w, dtype=torch.float32, device=self.device)
+        if prev is not None:
+            latents[1:] = prev[: ns - 1]
+
+        new_idx = slot_chunks[0]
+        if new_idx is not None:
+            latents[0] = self.encode_chunk(state, new_idx)
+        state.latents = latents
+
+    def _dummy_intermediate(self, state: DiffusionRequestState, t: torch.Tensor, batch_size: int) -> IntermediateTensors:
+        base = state.extra["chunk_latent_frames"]
         lat_h = state.extra["lat_h"]
         lat_w = state.extra["lat_w"]
         max_seq_len = state.extra["max_seq_len"]
-        n_steps = int(state.timesteps.shape[0])
-
-        latents_dtype = torch.float32
-        it_dtype = self.target_dtype
-
-        for batch_size in range(1, slo_max_batch * n_steps + 1):
-            latents_template = {
-                "latents": torch.empty(
-                    batch_size, 16, chunk_latent_frames, lat_h, lat_w, dtype=latents_dtype, device="meta"
-                )
+        dim = self.model.dim
+        grid_row = [base // self.patch_size[0], lat_h // self.patch_size[1], lat_w // self.patch_size[2]]
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(batch_size, max_seq_len, dim, dtype=self.target_dtype, device=self.device),
+                "grid_sizes": torch.tensor([grid_row] * batch_size, dtype=torch.long, device=self.device),
+                "seq_lens": torch.full((batch_size,), max_seq_len, dtype=torch.long, device=self.device),
+                "t": t,
+                "xt": torch.zeros(batch_size, 16, base, lat_h, lat_w, dtype=torch.float32, device=self.device),
+                "c2ws_plucker_emb": torch.zeros(batch_size, max_seq_len, dim, dtype=self.target_dtype, device=self.device),
             }
-            it_template = {
-                "hidden_states": torch.empty(batch_size, max_seq_len, self.model.dim, dtype=it_dtype, device="meta"),
-                "grid_sizes": torch.empty(batch_size, 3, dtype=torch.long, device="meta"),
-                "seq_lens": torch.empty(batch_size, dtype=torch.long, device="meta"),
-                "c2ws_plucker_emb": torch.empty(batch_size, max_seq_len, self.model.dim, dtype=it_dtype, device="meta"),
-            }
-            pp_group.set_recv_dict_buffer("latents", -1, latents_template, batch_size=batch_size)
-            pp_group.set_recv_dict_buffer("intermediate", 0, it_template, batch_size=batch_size)
+        )
 
-    def denoise_step(
+    def _denoise_forward(
         self,
         state: DiffusionRequestState,
-        batch_size: int = 1,
-        **kwargs: Any,
+        *,
+        slot_chunks: list[int | None],
+        t: torch.Tensor,
+        use_buffer: bool,
+        preposted_its: list | None = None,
     ) -> torch.Tensor | None:
-        """Fused transformer forward for the batch of chunks.
-
-        Each row's per-chunk metadata (``current_starts``, ``y``, ``c2ws_plucker_emb``)
-        is read from state.extra keyed by chunk index. Rows whose timestep is 0
-        carry the KV-update payload (the chunk's saved x0) — their output is
-        ignored by ``step_scheduler``.
-        """
-        chunk_idxs: list[int] = state.extra["current_chunk_idxs"]
-        assert len(chunk_idxs) == batch_size
-
-        chunk_latent_frames = state.extra["chunk_latent_frames"]
+        """Transformer forward for a batch of (chunk, denoise-level) positions."""
+        batch_size = len(slot_chunks)
+        base = state.extra["chunk_latent_frames"]
         frame_seqlen = state.extra["frame_seqlen"]
         start_token_offset = state.extra["start_token_offset"]
-        chunks = state.extra["chunks"]
         context_list = state.extra["context"]
+
+        slot_idxs = [i if ci is not None else -1 for i, ci in enumerate(slot_chunks)]
+
+        iframe = state.extra["iframe"]
+
+        def chunk_start(ci: int | None) -> int:
+            if ci is None or ci == 0:
+                return start_token_offset
+            return start_token_offset + (ci * base + iframe) * frame_seqlen
+
+        current_starts = [chunk_start(ci) for ci in slot_chunks]
 
         x_list, y_list, plucker_list = None, None, None
         if is_pipeline_first_stage():
+            chunk_cond = state.extra["chunk_cond"]
+            dummy_cond = state.extra["dummy_cond"]
             x_list = [state.latents[i] for i in range(batch_size)]
-            y_list = [chunks[ci].extra["y"] for ci in chunk_idxs]
-            plucker_list = [chunks[ci].extra["plucker"] for ci in chunk_idxs]
-
-        current_starts = [start_token_offset + ci * chunk_latent_frames * frame_seqlen for ci in chunk_idxs]
-        slot_idxs = state.extra["chunk_step_idxs"]
+            y_list = [(chunk_cond[ci] if ci is not None else dummy_cond)["y"] for ci in slot_chunks]
+            plucker_list = [(chunk_cond[ci] if ci is not None else dummy_cond)["plucker"] for ci in slot_chunks]
 
         positive_kwargs = {
             "x": x_list,
-            "t": state.batched_timesteps,
+            "t": t,
+            # Bound covers chunk 0's extra I-frame ((base+1) frames); steady chunks
+            # are smaller. Used only for the model's sanity assert.
             "context": [context_list[0]] * batch_size,
-            "seq_len": state.extra["max_seq_len"],
+            "seq_len": (base + 1) * frame_seqlen,
             "y": y_list,
             "dit_cond_dict": {"c2ws_plucker_emb": plucker_list},
             "kv_cache": self.state.get_kv_cache(),
@@ -988,8 +1031,7 @@ class LingbotWorldFastPipeline(
             "max_attention_size": state.extra["max_attention_size"],
         }
 
-        preposted_its = state.extra.pop("preposted_its", None)
-        return self.predict_noise_maybe_with_cfg(
+        noise_pred = self.predict_noise_maybe_with_cfg(
             do_true_cfg=False,
             true_cfg_scale=1.0,
             positive_kwargs=positive_kwargs,
@@ -997,29 +1039,97 @@ class LingbotWorldFastPipeline(
             buf_idx=state.step_index % 2,
             batch_size=batch_size,
             preposted_its=preposted_its,
+            use_buffer=use_buffer,
         )
 
-    def step_scheduler(
-        self,
-        state: DiffusionRequestState,
-        noise_pred: torch.Tensor,
-        *,
-        per_request_scheduler: Any | list[Any] | None = None,
-        batch_size: int = 1,
-        **kwargs: Any,
-    ) -> None:
-        if per_request_scheduler is None:
-            per_request_scheduler = state.scheduler
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1 and pp_group.is_last_rank:
+            state.latents = get_forward_context().stream_xt
+        return noise_pred
+
+    def decode_chunks(self, state: DiffusionRequestState) -> DiffusionOutput | None:
+        """Decode the chunk at the deepest ladder slot (now x0); merge when done."""
+        if state.extra["slot_chunks"][-1] is None:
+            return None
+
+        lat = state.latents[-1:]  # [1, 16, base, lat_h, lat_w]
+        pred = lat.transpose(0, 1).reshape(lat.shape[1], lat.shape[0] * lat.shape[2], lat.shape[3], lat.shape[4])
+        video = self.vae.stream_decode(pred)  # [C, T_pix, lat_h*8, lat_w*8]
+
+        state.extra.setdefault("decoded_chunks", []).append(DiffusionOutput(output=video))
+        state.extra["num_chunks_decoded"] = state.extra.get("num_chunks_decoded", 0) + 1
+
+        if state.extra["num_chunks_decoded"] >= state.sampling.num_chunks:
+            self.state.advance(state.extra["new_lat_f"])
+            return self._merge_chunk_outputs(state.extra["decoded_chunks"])
+        return None
+
+    @staticmethod
+    def _merge_chunk_outputs(chunks: list[DiffusionOutput]) -> DiffusionOutput:
+        # Concatenate decoded chunks along the temporal axis (5D Wan: dim 2; 4D: dim 1).
+        try:
+            outputs = [c.output for c in chunks]
+            merged = torch.cat(outputs, dim=outputs[0].dim() - 3)
+        except Exception as e:
+            return DiffusionOutput(error=f"Failed to merge {len(chunks)} chunk outputs: {e}")
+        return DiffusionOutput(output=merged)
+
+    def set_pp_recv_dict_buffers(self, state: DiffusionRequestState) -> None:
+        if get_pipeline_parallel_world_size() == 1:
+            return
+
+        pp_group = get_pp_group()
+        chunk_latent_frames = state.extra["chunk_latent_frames"]
+        lat_h = state.extra["lat_h"]
+        lat_w = state.extra["lat_w"]
+        max_seq_len = state.extra["max_seq_len"]
+        batch_size = int(state.timesteps.shape[0])  # ns: one slot per denoise step
+
+        latents_dtype = torch.float32
+        it_dtype = self.target_dtype
+        dim = self.model.dim
+
+        latents_template = {
+            "latents": torch.empty(batch_size, 16, chunk_latent_frames, lat_h, lat_w, dtype=latents_dtype, device="meta")
+        }
+        it_template = {
+            "hidden_states": torch.empty(batch_size, max_seq_len, dim, dtype=it_dtype, device="meta"),
+            "grid_sizes": torch.empty(batch_size, 3, dtype=torch.long, device="meta"),
+            "seq_lens": torch.empty(batch_size, dtype=torch.long, device="meta"),
+            "t": torch.empty(batch_size, dtype=state.timesteps.dtype, device="meta"),
+            "xt": torch.empty(batch_size, 16, chunk_latent_frames, lat_h, lat_w, dtype=latents_dtype, device="meta"),
+            "c2ws_plucker_emb": torch.empty(batch_size, max_seq_len, dim, dtype=it_dtype, device="meta"),
+        }
+        pp_group.set_recv_dict_buffer("latents", -1, latents_template, batch_size=batch_size)
+        pp_group.set_recv_dict_buffer("intermediate", 0, it_template, batch_size=batch_size)
+
+    def denoise_step(self, state: DiffusionRequestState, **kwargs: Any) -> torch.Tensor | None:
+        """One steady ladder step: batch position j sits at denoise level j."""
+        slot_chunks: list[int | None] = state.extra["slot_chunks"]
+        ns = len(slot_chunks)
+        t = state.timesteps.clone()  # [ns]: one timestep per slot
+
+        preposted_its = state.extra.get("preposted_its")
+        if preposted_its is None and not is_pipeline_first_stage():
+            preposted_its = [self._dummy_intermediate(state, t, ns)]
+
+        return self._denoise_forward(state, slot_chunks=slot_chunks, t=t, use_buffer=True, preposted_its=preposted_its)
+
+    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        ns = len(state.extra["slot_chunks"])
+        stream_t = get_forward_context().stream_t  # [ns] on the last rank, else None
+        t = stream_t if stream_t is not None else state.timesteps
 
         state.latents = self.scheduler_step_maybe_with_cfg(
             noise_pred,
-            state.batched_timesteps,
+            t,
             state.latents,
             do_true_cfg=False,
-            per_request_scheduler=per_request_scheduler,
+            per_request_scheduler=[state.scheduler] * ns,
             generator=state.extra["seed_g_addnoise"],
-            batch_size=batch_size,
+            batch_size=ns,
             receive_latents=False,
+            use_buffer=True,
         )
         state.step_index += 1
 

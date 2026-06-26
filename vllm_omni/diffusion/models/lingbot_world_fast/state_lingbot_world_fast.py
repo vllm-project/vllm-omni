@@ -11,6 +11,8 @@ from enum import IntEnum
 
 import torch
 
+from vllm_omni.platforms import current_omni_platform
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,15 +39,10 @@ class LingbotWorldFastState:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Clear all state."""
+        """Clear all state and return the cached device memory to the allocator."""
 
-        if self.is_initialized:
-            for cache in self.kv_cache:
-                del cache
-            for cache in self.crossattn_cache:
-                if isinstance(cache["k"], torch.Tensor):
-                    del cache["k"]
-                    del cache["v"]
+        had_caches = self.is_initialized
+        cache_device = self.cache_device if had_caches else None
 
         self.kv_cache: list[torch.Tensor] | None = None
         self.crossattn_cache: list[dict[str, bool | torch.Tensor | None]] | None = None
@@ -62,6 +59,7 @@ class LingbotWorldFastState:
         self.num_layers: int | None = None
         self.num_heads: int | None = None
         self.head_dim: int | None = None
+        self.cache_device: torch.device | None = None
 
         # Shape constants captured on the first call of a session and reused
         # on extension calls, where multi_modal_data["image"] is absent.
@@ -84,6 +82,9 @@ class LingbotWorldFastState:
         self.session_chunk_latent_frames: int | None = None
         self.session_sink_size: int | None = None
         self.session_local_attn_size: int | None = None
+
+        if cache_device is not None and cache_device.type != "cpu":
+            current_omni_platform.empty_cache()
 
     # ------------------------------------------------------------------
     # KV cache management
@@ -113,6 +114,7 @@ class LingbotWorldFastState:
         self.num_slots = num_slots
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.cache_device = device
 
         # kv_cache[layer_idx][slot_idx] -> tensor [2, B, kv_size, H, D]
         self.kv_cache = [
@@ -176,6 +178,24 @@ class LingbotWorldFastState:
         """Get cross-attention caches for the specified branch."""
         assert self.crossattn_cache is not None, "Cross-attn caches not initialized"
         return self.crossattn_cache
+
+    def seed_all_slots_from(self, src_slot: int) -> None:
+        """Replicate one slot's self-attn KV state into every other slot."""
+        assert self.kv_cache is not None, "KV caches not initialized"
+        if self.num_slots <= 1:
+            return
+        for layer in range(self.num_layers):
+            src_kv = self.kv_cache[layer][src_slot]
+            src_local = self.local_end_index[layer][src_slot]
+            src_global = self.global_end_index[layer][src_slot]
+            src_evict = self.evict_queues[layer][src_slot]
+            for slot in range(self.num_slots):
+                if slot == src_slot:
+                    continue
+                self.kv_cache[layer][slot].copy_(src_kv)
+                self.local_end_index[layer][slot].copy_(src_local)
+                self.global_end_index[layer][slot].copy_(src_global)
+                self.evict_queues[layer][slot] = deque(src_evict)
 
     def advance(self, delta: int):
         self.current_lat_f += delta
