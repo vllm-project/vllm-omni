@@ -154,22 +154,6 @@ def test_component_config_with_default():
     assert config.resolve("vae.encoder") is None
 
 
-def test_gguf_config():
-    from vllm_gguf_plugin.quantization import DiffusionGGUFConfig
-
-    from vllm_omni.quantization import build_quant_config
-
-    config = build_quant_config(
-        {
-            "method": "gguf",
-            "gguf_model": "path/to/model.gguf",
-        }
-    )
-    assert isinstance(config, DiffusionGGUFConfig)
-    assert config.gguf_model == "path/to/model.gguf"
-    assert config.get_name() == "gguf"
-
-
 def test_integration_string():
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -237,7 +221,7 @@ def test_transformer_config_auto_detects_modelopt_fp8():
 def test_supported_methods_includes_vllm():
     from vllm_omni.quantization import SUPPORTED_QUANTIZATION_METHODS
 
-    for method in ["fp8", "gguf", "awq", "gptq", "bitsandbytes", "modelopt"]:
+    for method in ["fp8", "awq", "gptq", "bitsandbytes", "modelopt"]:
         assert method in SUPPORTED_QUANTIZATION_METHODS, f"{method} missing"
 
 

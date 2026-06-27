@@ -68,6 +68,10 @@ def load_omni_general_plugins() -> None:
         return
     omni_plugins_loaded = True
 
+    from vllm.plugins import load_general_plugins
+
+    load_general_plugins()
+
     plugins = load_omni_plugins_by_group(group=OMNI_DEFAULT_PLUGINS_GROUP)
     # General plugins: we only need to execute the loaded functions.
     for func in plugins.values():

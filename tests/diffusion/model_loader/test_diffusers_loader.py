@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from vllm.config.load import LoadConfig
-from vllm_gguf_plugin.weights_adapter.diffusion import get_diffusion_gguf_adapter
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -111,16 +110,6 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
         loader.load_weights(model)
 
 
-def test_qwen_model_class_selects_qwen_gguf_adapter():
-    adapter = get_diffusion_gguf_adapter(
-        "dummy.gguf",
-        model_class_name="QwenImagePipeline",
-        model_type="qwen_image",
-    )
-
-    assert adapter.__class__.__name__ == "QwenImageDiffusionGGUFAdapter"
-
-
 class _ConfigAwareModel(nn.Module):
     def __init__(self, *, od_config):
         super().__init__()
@@ -175,7 +164,6 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
     loader.load_weights = lambda model: None  # type: ignore[assignment]
     loader._process_weights_after_loading = lambda model, target_device: None  # type: ignore[assignment]
-    loader._is_gguf_quantization = lambda: False  # type: ignore[assignment]
 
     monkeypatch.setattr(loader_mod, "resolve_obj_by_qualname", lambda _name: _ConfigAwareModel)
     monkeypatch.setattr(loader_mod.torch, "device", lambda _name: _DeviceContext("cpu"))

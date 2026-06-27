@@ -416,7 +416,7 @@ class DiffusersPipelineLoader:
     def _is_expected_quantized_weight(name: str) -> bool:
         """Return True if *name* is a quantization-specific parameter.
 
-        Quantization methods (GPTQ, AWQ, FP8, GGUF, Autoround, etc.) create extra
+        Quantization methods (GPTQ, AWQ, FP8, Autoround, etc.) create extra
         parameters that have no counterpart in an unquantized checkpoint.
         These are expected to be absent and should not trigger a load error.
         """
@@ -429,8 +429,6 @@ class DiffusersPipelineLoader:
             ".weight_scale",
             ".weight_scale_inv",
             ".input_scale",
-            # GGUF
-            ".qweight_type",
             # INT8  (weight_scale already covered above)
         )
         return name.endswith(_QUANTIZED_WEIGHT_SUFFIXES)

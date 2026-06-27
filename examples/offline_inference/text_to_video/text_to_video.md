@@ -203,7 +203,7 @@ python text_to_video.py \
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
 - `--audio-sample-rate`: audio sample rate for embedded audio (when the pipeline returns audio).
-- `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
+- `--quantization`: quantization method, such as `fp8` for FP8.
 - `--flow-shift`: scheduler flow_shift parameter.
 - `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
 
