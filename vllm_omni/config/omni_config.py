@@ -353,6 +353,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
+    vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
@@ -362,6 +363,11 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
         self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
+        if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:
+            raise ValueError(
+                "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+                f"but got {self.vae_parallel_mode!r}."
+            )
 
         other_parallel_world_size = (
             self.pipeline_parallel_size

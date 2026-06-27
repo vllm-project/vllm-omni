@@ -43,6 +43,13 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateSpeechRequest,
     SpeechBatchItem,
     SpeechBatchItemResult,
+    SpeechInputTokenDetails,
+    SpeechTokenUsage,
+)
+from vllm_omni.entrypoints.openai.speech_usage import (
+    SpeechOutputTokenCounter,
+    build_speech_usage,
+    qwen3_tts_input_token_details,
 )
 from vllm_omni.entrypoints.openai.tts_adapters import (
     SpeechServingContext,
@@ -894,6 +901,69 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
+
+    def _get_usage_text_tokenizer(self):
+        """Return a text tokenizer for counting input-text usage tokens.
+
+        Prefer the per-model tokenizer already loaded for prompt-length
+        estimation (`_tts_tokenizer`, which is the *correct* tokenizer for the
+        active model). Fall back to a lazily-loaded, cached generic tokenizer
+        for models that never populate `_tts_tokenizer`. Returns None if no
+        tokenizer can be obtained (usage then reports text_tokens=0).
+        """
+        if self._tts_tokenizer is not None:
+            return self._tts_tokenizer
+        if getattr(self, "_usage_text_tokenizer", None) is None:
+            try:
+                from transformers import AutoTokenizer
+
+                self._usage_text_tokenizer = AutoTokenizer.from_pretrained(
+                    self.engine_client.model_config.model, trust_remote_code=True
+                )
+            except Exception as e:  # pragma: no cover - environment dependent
+                logger.warning("Usage: could not load a text tokenizer (%s); text_tokens will be 0", e)
+                self._usage_text_tokenizer = None
+        return self._usage_text_tokenizer
+
+    def _count_usage_text_tokens(self, text: str) -> int:
+        """Token count of `text` using the model's text tokenizer (0 on failure)."""
+        if not text:
+            return 0
+        tok = self._get_usage_text_tokenizer()
+        if tok is None:
+            return 0
+        try:
+            return len(tok(text, padding=False)["input_ids"])
+        except Exception:
+            return 0
+
+    def _compute_speech_input_details(
+        self, request: OpenAICreateSpeechRequest, tts_params: dict[str, Any]
+    ) -> SpeechInputTokenDetails:
+        """Input-token breakdown (text + reference-audio) for a speech request.
+
+        Counts `input` (+ `instructions`) as text tokens, and reference-audio
+        codec frames as audio tokens *only* when in-context voice cloning is
+        active (see `qwen3_tts_input_token_details` / `gate_audio_tokens`). The
+        audio gating reads Qwen3-TTS `tts_params` conventions; other TTS models
+        do not set those keys, so they degrade cleanly to text-only counts.
+        """
+        return qwen3_tts_input_token_details(
+            input_text=request.input,
+            instructions=request.instructions,
+            tts_params=tts_params or {},
+            count_text_tokens=self._count_usage_text_tokens,
+        )
+
+    def _build_speech_usage(
+        self,
+        request: OpenAICreateSpeechRequest,
+        tts_params: dict[str, Any],
+        output_tokens: int,
+    ) -> SpeechTokenUsage:
+        """Assemble the full usage object (input breakdown + generated tokens)."""
+        details = self._compute_speech_input_details(request, tts_params)
+        return build_speech_usage(details, output_tokens)
 
     def _estimate_fish_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate Fish Speech semantic token length from raw reference audio."""
@@ -2635,6 +2705,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         raw_request: Request | None = None,
         request_start_s: float | None = None,
         include_sample_rate: bool = False,
+        usage_acc: SpeechOutputTokenCounter | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2661,6 +2732,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         try:
             async for res in generator:
+                # Tally generated codec tokens for usage (reads per-stage metrics
+                # off the final output; a cheap early-return on every other res).
+                if usage_acc is not None:
+                    usage_acc.observe(res)
                 audio_output, audio_key = self._extract_audio_output(res)
                 if audio_key is None:
                     continue
@@ -2786,6 +2861,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         response_format: str = "pcm",
         raw_request: Request | None = None,
         request_start_s: float | None = None,
+        request: OpenAICreateSpeechRequest | None = None,
+        tts_params: dict[str, Any] | None = None,
     ):
         """Generate OpenAI-style SSE events with base64 audio deltas.
 
@@ -2793,7 +2870,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         carries the base64 chunk in ``audio`` (not ``delta`` — that is the
         Realtime API ``response.audio.delta`` convention, a different event).
         See https://platform.openai.com/docs/api-reference/audio-streaming.
+
+        The terminal ``speech.audio.done`` event carries a ``usage`` object
+        (``input_tokens``/``output_tokens``/``total_tokens`` + a per-modality
+        ``input_token_details`` breakdown), matching OpenAI's documented
+        ``speech.audio.done`` schema. ``output_tokens`` is accumulated from the
+        stage-0 deltas as they stream (see ``SpeechOutputTokenCounter``);
+        ``input_tokens`` is computed from the request text + reference audio.
         """
+        usage_acc = SpeechOutputTokenCounter()
         try:
             async for chunk in self._generate_audio_chunks(
                 generator,
@@ -2801,6 +2886,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 response_format,
                 raw_request=raw_request,
                 request_start_s=request_start_s,
+                usage_acc=usage_acc,
             ):
                 payload = {
                     "type": "speech.audio.delta",
@@ -2809,7 +2895,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 }
                 data = json.dumps(payload, separators=(",", ":"))
                 yield f"event: speech.audio.delta\ndata: {data}\n\n"
-            done = json.dumps({"type": "speech.audio.done"}, separators=(",", ":"))
+            done_payload: dict[str, Any] = {"type": "speech.audio.done"}
+            if request is not None:
+                # Streaming path: output_tokens = sum of stage-0 deltas.
+                usage = self._build_speech_usage(request, tts_params or {}, usage_acc.total())
+                done_payload["usage"] = usage.model_dump()
+            done = json.dumps(done_payload, separators=(",", ":"))
             yield f"event: speech.audio.done\ndata: {done}\n\n"
         except asyncio.CancelledError:
             raise
@@ -3650,8 +3741,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
         base64_encode: bool = False,
         request_id: str | None = None,
+        usage_out: list[SpeechTokenUsage] | None = None,
     ) -> tuple[bytes | str, str]:
-        request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+        # ``usage_out`` is an opt-in output channel: when a list is passed, the
+        # computed SpeechTokenUsage is appended to it. The return stays a
+        # 2-tuple so existing callers (and their test mocks) are unaffected;
+        # only the batch path, which surfaces per-item usage, opts in.
+        request_id, generator, bytes_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
         artifact_ready = False
 
         try:
@@ -3664,8 +3760,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             moss_sample_rate: int | None = None
 
             final_output: OmniRequestOutput | None = None
+            # Non-streaming is FINAL_ONLY, so the stage-0 output carries the full
+            # token sequence; the counter records its length for output_tokens.
+            usage_acc = SpeechOutputTokenCounter()
             async for res in generator:
                 final_output = res
+                usage_acc.observe(res)
                 if not is_moss:
                     continue
                 try:
@@ -3749,6 +3849,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_response: AudioResponse = self.create_audio(audio_obj)
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
+            if usage_out is not None:
+                usage_out.append(self._build_speech_usage(request, bytes_tts_params or {}, usage_acc.total()))
             return audio_response.audio_data, audio_response.media_type
         finally:
             if not artifact_ready:
@@ -3983,7 +4085,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if error is not None:
                     return error
 
-                _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                _, generator, sse_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
                 return StreamingResponse(
                     self._generate_audio_sse_events(
                         generator,
@@ -3991,6 +4093,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         response_format,
                         raw_request=raw_request,
                         request_start_s=request_start_s,
+                        request=request,
+                        tts_params=sse_tts_params,
                     ),
                     media_type="text/event-stream",
                 )
@@ -4108,8 +4212,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             validation_error = self._validate_tts_request(req)
             if validation_error is not None:
                 return SpeechBatchItemResult(index=idx, status="error", error=validation_error)
+            usage_box: list[SpeechTokenUsage] = []
             try:
-                audio_data, media_type = await self._generate_audio_bytes(req, base64_encode=True)
+                audio_data, media_type = await self._generate_audio_bytes(req, base64_encode=True, usage_out=usage_box)
             except Exception as e:
                 logger.exception("Batch item %d failed: %s", idx, e)
                 return SpeechBatchItemResult(index=idx, status="error", error=str(e))
@@ -4118,6 +4223,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 status="success",
                 audio_data=audio_data,
                 media_type=media_type,
+                usage=usage_box[0] if usage_box else None,
             )
 
         results = await asyncio.gather(

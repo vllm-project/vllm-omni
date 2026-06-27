@@ -14,9 +14,9 @@ from __future__ import annotations
 import base64
 import os
 import tempfile
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import av
 import numpy as np
@@ -26,8 +26,6 @@ import torch.nn.functional as F
 import torchaudio.functional as taF
 from einops import rearrange
 from torchvision.io import read_image
-from vllm.multimodal.media import MediaConnector
-from vllm.multimodal.media.base import MediaIO
 
 # AudioX task taxonomy. Tasks beginning with "v" require a video input; tasks containing
 # "t" carry a text prompt. tv2*/v2* share the same conditioning pathways.
@@ -53,51 +51,29 @@ def normalize_prompts(prompts: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
-class _TempFileMediaIO(MediaIO[str]):
-    """MediaIO that writes fetched bytes to a temp file, returns the path."""
-
-    def load_bytes(self, data: bytes) -> str:
-        return self._write_temp(data)
-
-    def load_base64(self, media_type: str, data: str) -> str:
-        return self._write_temp(base64.b64decode(data))
-
-    def load_file(self, filepath: Path) -> str:
-        return str(filepath)
-
-    @staticmethod
-    def _write_temp(data: bytes) -> str:
-        f = tempfile.NamedTemporaryFile(prefix="audiox_media_", suffix=".bin", delete=False)
-        f.write(data)
-        f.close()
-        return f.name
-
-
-def _get_media_connector() -> MediaConnector:
-    """Build a MediaConnector from the current forward context's model config."""
-    from vllm_omni.diffusion.forward_context import get_forward_context
-
-    ctx = get_forward_context()
-    model_config = ctx.vllm_config.model_config if ctx.vllm_config else None
-    return MediaConnector(
-        allowed_local_media_path=getattr(model_config, "allowed_local_media_path", ""),
-        allowed_media_domains=getattr(model_config, "allowed_media_domains", None),
-    )
-
-
 def materialize_media_source(source: str) -> str:
     """Return a local filesystem path for ``source``.
 
     Accepts a local path, a ``data:<mime>;base64,...`` URI, or an ``http(s)://`` URL.
-    All inputs are routed through vLLM's ``MediaConnector`` which respects
-    ``--allowed-media-domains`` and ``--allowed-local-media-path`` to prevent
-    SSRF.  Bare local paths are converted to ``file://`` URIs so that the
-    same path restriction applies.
+    Anything non-local is fetched into a NamedTemporaryFile and that path is returned;
+    callers don't need to clean the tempfile up (the OS does on exit).
     """
-    if not urlparse(source).scheme:
-        source = Path(source).resolve().as_uri()
-    connector = _get_media_connector()
-    return connector.load_from_url(source, _TempFileMediaIO())
+    if source.startswith("data:"):
+        _, _, payload = source.partition(",")
+        raw = base64.b64decode(payload)
+        f = tempfile.NamedTemporaryFile(prefix="audiox_media_", suffix=".bin", delete=False)
+        f.write(raw)
+        f.close()
+        return f.name
+    parsed = urlparse(source)
+    if parsed.scheme in ("http", "https"):
+        with urlopen(source) as resp:
+            data = resp.read()
+        f = tempfile.NamedTemporaryFile(prefix="audiox_media_", suffix=".bin", delete=False)
+        f.write(data)
+        f.close()
+        return f.name
+    return source
 
 
 def _load_video_path_pyav(
