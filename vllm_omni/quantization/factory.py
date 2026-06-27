@@ -83,7 +83,7 @@ logger = init_logger(__name__)
 
 def _build_gguf(**kw: Any) -> QuantizationConfig:
     """Lazy import to avoid pulling in CUDA/pynvml at module load time."""
-    from .gguf_config import DiffusionGGUFConfig
+    from vllm_gguf_plugin.quantization import DiffusionGGUFConfig
 
     return DiffusionGGUFConfig(**kw)
 

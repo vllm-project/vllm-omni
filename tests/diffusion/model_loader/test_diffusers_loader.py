@@ -12,11 +12,11 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from vllm.config.load import LoadConfig
+from vllm_gguf_plugin.weights_adapter.diffusion import get_diffusion_gguf_adapter
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.registry import initialize_model
 
@@ -112,24 +112,13 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
 
 
 def test_qwen_model_class_selects_qwen_gguf_adapter():
-    od_config = type(
-        "Config",
-        (),
-        {
-            "model_class_name": "QwenImagePipeline",
-            "tf_model_config": {"model_type": "qwen_image"},
-        },
-    )()
-    source = DiffusersPipelineLoader.ComponentSource(
-        model_or_path="dummy",
-        subfolder="transformer",
-        revision=None,
-        prefix="transformer.",
+    adapter = get_diffusion_gguf_adapter(
+        "dummy.gguf",
+        model_class_name="QwenImagePipeline",
+        model_type="qwen_image",
     )
 
-    adapter = get_gguf_adapter("dummy.gguf", object(), source, od_config)
-
-    assert adapter.__class__.__name__ == "QwenImageGGUFAdapter"
+    assert adapter.__class__.__name__ == "QwenImageDiffusionGGUFAdapter"
 
 
 class _ConfigAwareModel(nn.Module):

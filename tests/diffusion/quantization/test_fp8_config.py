@@ -155,8 +155,9 @@ def test_component_config_with_default():
 
 
 def test_gguf_config():
+    from vllm_gguf_plugin.quantization import DiffusionGGUFConfig
+
     from vllm_omni.quantization import build_quant_config
-    from vllm_omni.quantization.gguf_config import DiffusionGGUFConfig
 
     config = build_quant_config(
         {
