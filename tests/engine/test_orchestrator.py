@@ -90,6 +90,12 @@ class FakeStageClient:
         except queue.Empty:
             return SimpleNamespace(outputs=[])
 
+    def get_output_nowait(self):
+        try:
+            return self._engine_core_outputs.get_nowait()
+        except queue.Empty:
+            return None
+
     def get_diffusion_output_nowait(self):
         try:
             return self._diffusion_outputs.get_nowait()

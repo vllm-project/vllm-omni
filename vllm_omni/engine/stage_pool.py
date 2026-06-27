@@ -1015,13 +1015,6 @@ class StagePool:
 
     # ---- Stage-local polling ----
 
-    async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
-        """Pull raw EngineCoreOutputs from a stage replica without processing."""
-        outputs = await client.get_output_async()
-        if not outputs.outputs:
-            return None
-        return outputs
-
     async def process_llm_raw_outputs(
         self,
         replica_id: int,
@@ -1053,33 +1046,24 @@ class StagePool:
 
         return processed.request_outputs
 
-    async def poll_llm_raw_output(
-        self,
-        replica_id: int,
-        *,
-        timeout_s: float = 0.001,
-    ) -> EngineCoreOutputs | None:
-        """Poll raw EngineCore outputs from one LLM replica once."""
+    def poll_llm_raw_output_nowait(self, replica_id: int) -> EngineCoreOutputs | None:
+        """Non-blocking single-item poll of one LLM replica.
+
+        Returns a ready ``EngineCoreOutputs`` immediately, or ``None`` when the
+        replica currently has no output ready. Unlike :meth:`poll_llm_raw_output`,
+        this never blocks and never wraps a blocking get in ``asyncio.wait_for``
+        (which cancels the in-flight ``get`` and can drop a just-delivered item).
+        Callers loop this to drain already-ready outputs in a bounded pass
+        without head-of-line blocking. See vllm-project/vllm-omni#4561.
+
+        ``None`` means "queue empty"; an ``EngineCoreOutputs`` with an empty
+        ``outputs`` list is returned as-is so the caller can keep draining.
+        """
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None
         client = cast(StagePoolLLMClient, raw_client)
-        try:
-            return await asyncio.wait_for(
-                self._poll_stage_raw(client),
-                timeout=timeout_s,
-            )
-        except asyncio.TimeoutError:
-            return None
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "[StagePool] _poll_stage_raw failed for stage-%s replica-%s",
-                self.stage_id,
-                replica_id,
-            )
-            raise
+        return client.get_output_nowait()
 
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""

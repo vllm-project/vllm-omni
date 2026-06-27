@@ -49,6 +49,12 @@ class FakeStageClient:
         except queue.Empty:
             return SimpleNamespace(outputs=[])
 
+    def get_output_nowait(self):
+        try:
+            return self._engine_core_outputs.get_nowait()
+        except queue.Empty:
+            return None
+
     def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
         return list(self.next_inputs)
 
