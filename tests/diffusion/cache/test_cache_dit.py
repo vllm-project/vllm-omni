@@ -42,6 +42,10 @@ SEPARATE_CFG_TRANSFORMERS = [
 SAMPLE_CACHE_CONFIG = DiffusionCacheConfig()
 
 
+def test_wan22_vace_uses_wan22_custom_cache_dit_enabler():
+    assert cd_backend.CUSTOM_DIT_ENABLERS["Wan22VACEPipeline"] is cd_backend.enable_cache_for_wan22
+
+
 @pytest.mark.parametrize("transformer_model", SEPARATE_CFG_TRANSFORMERS)
 def test_cache_dit_configs_have_separate_cfg(transformer_model):
     """Check models with separate CFG set has_separate_cfg=True in their configs."""
@@ -60,6 +64,34 @@ def test_separate_wan22_custom_enabler_has_separate_cfg(mock_cache_dit, mock_blo
     mock_cache_dit.enable_cache.assert_called_once()
     adapter_kwargs = mock_block_adapter.call_args.kwargs
     assert adapter_kwargs["has_separate_cfg"] is True
+
+
+@pytest.mark.parametrize("has_transformer_2", [False, True])
+@patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
+@patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+def test_wan22_custom_enabler_passes_taylorseer_calibrator(
+    mock_cache_dit,
+    mock_block_adapter,
+    has_transformer_2,
+):
+    mock_pipeline = Mock()
+    mock_pipeline.transformer.blocks = [Mock()]
+    if has_transformer_2:
+        mock_pipeline.transformer_2.blocks = [Mock()]
+    else:
+        mock_pipeline.transformer_2 = None
+    cache_config = DiffusionCacheConfig(enable_taylorseer=True, taylorseer_order=1)
+
+    cd_backend.enable_cache_for_wan22(mock_pipeline, cache_config)
+
+    enable_cache_kwargs = mock_cache_dit.enable_cache.call_args.kwargs
+    calibrator_config = enable_cache_kwargs["calibrator_config"]
+    assert calibrator_config is not None
+    assert calibrator_config.taylorseer_order == 1
+
+    adapter_kwargs = mock_block_adapter.call_args.kwargs
+    for modifier in adapter_kwargs["params_modifiers"]:
+        assert modifier._context_kwargs["calibrator_config"] is calibrator_config
 
 
 @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
