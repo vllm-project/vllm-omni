@@ -59,10 +59,11 @@ logger = init_logger(__name__)
 def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) -> None:
     """Prevent out-of-range ``speech_embedding`` gathers on the non-multimodal talker path.
 
-    Runs on every non-multimodal step (including decode), so it uses a single ``.any()``
-    host<->device sync; ``.tolist()`` only runs on the error path. See issue #4721 for the
-    full failure mode (an out-of-range id triggers a CUDA device-side assert that poisons
-    the CUDA context and kills the EngineCore).
+    The caller gates this to prefill steps only (see ``_is_prefill_step``); decode ids on
+    this path are codec tokens the talker sampled from its own in-range vocab and cannot be
+    out of range. It uses a single ``.any()`` host<->device sync; ``.tolist()`` only runs on
+    the error path. See issue #4721 for the full failure mode (an out-of-range id triggers a
+    CUDA device-side assert that poisons the CUDA context and kills the EngineCore).
     """
     if input_ids.numel() == 0:
         return
@@ -74,6 +75,32 @@ def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) 
             f"got out-of-range ids {bad}. Non-multimodal text-only requests are not "
             "supported by the CosyVoice3 talker; provide the required audio prompt."
         )
+
+
+def _is_prefill_step() -> bool:
+    """Best-effort prefill detection for the talker's non-multimodal embed path.
+
+    Concurrent decode can have ``input_ids.numel() > 1`` while ``max_query_len == 1``; a
+    real prefill has ``max_query_len > 1``. Mirrors the idiom used by other omni talkers
+    (e.g. higgs_audio_v3). Fails safe to ``True`` (run the check) when the forward context
+    or attention metadata is unavailable.
+    """
+    if not is_forward_context_available():
+        return True
+    try:
+        attn_metadata = get_forward_context().attn_metadata
+        if not attn_metadata:
+            return True
+        if isinstance(attn_metadata, dict):
+            attn = next(iter(attn_metadata.values()))
+        else:
+            attn = attn_metadata
+        max_query_len = getattr(attn, "max_query_len", None)
+        if max_query_len is None:
+            return True
+        return int(max_query_len) > 1
+    except Exception:
+        return True
 
 
 # Process-wide cache of per-model mm-processor runtime components (tokenizer,
@@ -859,12 +886,19 @@ class CosyVoice3Model(
                     segments.append(multimodal_embeddings[i])
                 embed_tokens = torch.cat(segments, dim=0)
             else:
+                # This branch serves both the non-multimodal text-only prefill (the only
+                # case whose ids can be out of range) and the talker decode hot path, where
+                # ids are codec tokens the talker sampled from its own in-range vocab and so
+                # are always valid. Validate on prefill only, to avoid a per-decode-step
+                # host<->device sync.
+                #
                 # Bound is the embedding row count, not config ``speech_token_size``: the
-                # table also holds the special sos/task_id/eos rows beyond
-                # ``speech_token_size`` that legitimate decode ids may reference, so the row
-                # count is the correct upper bound for what can be safely indexed here.
-                num_speech_tokens = self.model.speech_embedding.weight.shape[0]
-                _validate_speech_token_ids(input_ids, num_speech_tokens)
+                # table also holds the special sos/task_id/eos rows in the trailing slots
+                # that legitimate ids may reference, so the row count is the correct upper
+                # bound for what can be safely indexed here.
+                if _is_prefill_step():
+                    num_speech_tokens = self.model.speech_embedding.weight.shape[0]
+                    _validate_speech_token_ids(input_ids, num_speech_tokens)
                 embed_tokens = self.model.speech_embedding.weight[input_ids]
             return embed_tokens
         elif self.model_stage == "cosyvoice3_code2wav":

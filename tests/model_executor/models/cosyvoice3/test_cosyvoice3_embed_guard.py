@@ -5,13 +5,16 @@
 See https://github.com/vllm-project/vllm-omni/issues/4721 — a non-multimodal request
 (e.g. text-only ``/v1/completions`` without an audio prompt) reaches the talker's ``else``
 branch in ``embed_input_ids`` and indexes ``speech_embedding`` with out-of-range text
-token ids, triggering a CUDA device-side assert that kills the EngineCore. The guard
-turns that into a clear ``ValueError`` before the gather.
+token ids, triggering a CUDA device-side assert that kills the EngineCore. The serving
+layer rejects unsupported generate routes before dispatch; this guard remains
+defense-in-depth for any path that reaches the talker prefill, turning OOB ids into a
+clear ``ValueError`` before the gather.
 """
 
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +27,58 @@ def _guard():
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _validate_speech_token_ids
 
     return _validate_speech_token_ids
+
+
+def _prefill_detector():
+    # Defer the heavy cosyvoice3 import until a test actually runs.
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _is_prefill_step
+
+    return _is_prefill_step
+
+
+def test_is_prefill_step_returns_false_for_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
+
+    # Decode must return False so embed_input_ids skips the OOB guard and avoids per-step sync.
+    ctx = SimpleNamespace(attn_metadata={"backend": SimpleNamespace(max_query_len=1)})
+    monkeypatch.setattr(cosyvoice3, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "get_forward_context", lambda: ctx)
+
+    assert _prefill_detector()() is False
+
+
+def test_is_prefill_step_returns_true_for_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
+
+    ctx = SimpleNamespace(attn_metadata={"backend": SimpleNamespace(max_query_len=8)})
+    monkeypatch.setattr(cosyvoice3, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "get_forward_context", lambda: ctx)
+
+    assert _prefill_detector()() is True
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        pytest.param(AttributeError("attn metadata unavailable"), id="attribute_error"),
+        pytest.param(KeyError("metadata"), id="key_error"),
+        pytest.param(RuntimeError("backend metadata unavailable"), id="runtime_error"),
+    ],
+)
+def test_is_prefill_step_fails_safe_when_metadata_unavailable(
+    monkeypatch: pytest.MonkeyPatch, exception: Exception
+) -> None:
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
+
+    class BrokenForwardContext:
+        @property
+        def attn_metadata(self):
+            raise exception
+
+    monkeypatch.setattr(cosyvoice3, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "get_forward_context", lambda: BrokenForwardContext())
+
+    assert _prefill_detector()() is True
 
 
 def test_inclusive_boundaries_pass() -> None:

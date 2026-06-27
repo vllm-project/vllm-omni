@@ -338,6 +338,140 @@ def client(test_app):
     return TestClient(test_app)
 
 
+def test_completion_route_forwards_supported_non_stream_request(mocker: MockerFixture):
+    class FakeCompletionHandler:
+        def __init__(self):
+            self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
+
+    app = FastAPI()
+    app.include_router(api_server_module.router)
+    app.state.openai_serving_completion = FakeCompletionHandler()
+    app.state.engine_client = mocker.MagicMock()
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/completions",
+        json={"model": "generate-model", "prompt": "hello"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"id": "cmpl", "choices": []}
+    app.state.openai_serving_completion.create_completion.assert_awaited_once()
+    app.state.engine_client.generate.assert_not_called()
+
+
+def test_completion_route_forwards_supported_stream_request(mocker: MockerFixture):
+    async def _stream():
+        yield b'data: {"id": "cmpl"}\n\n'
+
+    class FakeCompletionHandler:
+        def __init__(self):
+            self.create_completion = mocker.AsyncMock(return_value=_stream())
+
+    app = FastAPI()
+    app.include_router(api_server_module.router)
+    app.state.openai_serving_completion = FakeCompletionHandler()
+    app.state.engine_client = mocker.MagicMock()
+
+    client = TestClient(app)
+
+    with client.stream(
+        "POST",
+        "/v1/completions",
+        json={"model": "generate-model", "prompt": "hello", "stream": True},
+    ) as response:
+        body = response.read()
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert b"data:" in body
+    app.state.openai_serving_completion.create_completion.assert_awaited_once()
+    app.state.engine_client.generate.assert_not_called()
+
+
+def test_completion_route_preserves_handler_http_exception(mocker: MockerFixture):
+    class FakeCompletionHandler:
+        def __init__(self):
+            self.create_completion = mocker.AsyncMock(side_effect=HTTPException(status_code=400, detail="bad request"))
+
+    app = FastAPI()
+    app.include_router(api_server_module.router)
+    app.state.openai_serving_completion = FakeCompletionHandler()
+    app.state.engine_client = mocker.MagicMock()
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/completions",
+        json={"model": "generate-model", "prompt": "hello"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "bad request"
+    app.state.openai_serving_completion.create_completion.assert_awaited_once()
+    app.state.engine_client.generate.assert_not_called()
+
+
+def test_speech_only_model_rejects_generate_routes_before_engine(mocker: MockerFixture):
+    class FakeCompletionHandler:
+        def __init__(self):
+            self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
+
+    class FakeChatHandler:
+        def __init__(self):
+            self.create_chat_completion = mocker.AsyncMock(return_value={"id": "chatcmpl", "choices": []})
+
+    class FakeSpeechHandler:
+        def __init__(self):
+            self.create_speech = mocker.AsyncMock(return_value=JSONResponse({"ok": True}))
+
+    app = FastAPI()
+    app.include_router(api_server_module.router)
+    app.state.openai_serving_models = SimpleNamespace(
+        base_model_paths=[SimpleNamespace(name="cosyvoice3", model_path="/models/Fun-CosyVoice3-0.5B-2512")]
+    )
+    app.state.openai_serving_chat = FakeChatHandler()
+    app.state.openai_serving_completion = FakeCompletionHandler()
+    app.state.openai_serving_speech = FakeSpeechHandler()
+    app.state.engine_client = mocker.MagicMock()
+
+    client = TestClient(app)
+
+    terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
+    completion_response = client.post(
+        "/v1/completions",
+        json={"model": "cosyvoice3", "prompt": "hello"},
+    )
+    assert completion_response.status_code == 404
+    completion_body = completion_response.json()
+    assert completion_body["error"]["type"] == "NotFoundError"
+    assert completion_body["error"]["code"] == 404
+    assert "Completions API" in completion_body["error"]["message"]
+
+    chat_response = client.post(
+        "/v1/chat/completions",
+        json={"model": "cosyvoice3", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert chat_response.status_code == 404
+    chat_body = chat_response.json()
+    assert chat_body["error"]["type"] == "NotFoundError"
+    assert chat_body["error"]["code"] == 404
+    assert "Chat Completions API" in chat_body["error"]["message"]
+
+    terminate_mock.assert_not_called()
+    app.state.openai_serving_completion.create_completion.assert_not_called()
+    app.state.openai_serving_chat.create_chat_completion.assert_not_called()
+
+    speech_response = client.post(
+        "/v1/audio/speech",
+        json={"model": "cosyvoice3", "input": "hello", "voice": "alloy"},
+    )
+    assert speech_response.status_code == 200
+    app.state.openai_serving_speech.create_speech.assert_awaited_once()
+    app.state.engine_client.generate.assert_not_called()
+
+
 class TestSpeechAPI:
     @pytest.fixture(autouse=True)
     def _mock_upload_io(self, mocker: MockerFixture):
