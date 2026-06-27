@@ -82,6 +82,11 @@ _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
+# CosyVoice3 talker expects its reference transcript wrapped in the model
+# instruction template; without the delimiter the talker re-speaks the
+# reference (issue #4644). Matches the offline example/test and upstream demo.
+_COSYVOICE3_PROMPT_DELIMITER = "<|endofprompt|>"
+_COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DELIMITER}"
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
@@ -3208,8 +3213,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
         audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
 
+        # Wrap the reference transcript in the CosyVoice3 instruction template
+        # so the talker emits target-only speech (see _COSYVOICE3_PROMPT_PREFIX).
+        # Skip if the caller already supplied a formatted prompt_text.
+        ref_text = request.ref_text or ""
+        if _COSYVOICE3_PROMPT_DELIMITER not in ref_text:
+            ref_text = f"{_COSYVOICE3_PROMPT_PREFIX}{ref_text}"
         mm_kwargs: dict[str, Any] = {
-            "prompt_text": request.ref_text,
+            "prompt_text": ref_text,
             "sample_rate": sr,
         }
         # Pass voice metadata for caching in the processor
