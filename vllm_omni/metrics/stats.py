@@ -29,6 +29,15 @@ class StageStats:
 
 
 @dataclass
+class PipelineTimings:
+    """Orchestrator-level pipeline timing metrics (all in milliseconds)."""
+
+    queue_wait_ms: float = 0.0
+    preprocess_ms: float = 0.0
+    ar2diffusion_ms: float = 0.0
+
+
+@dataclass
 class StageRequestStats:
     batch_id: int
     batch_size: int
@@ -44,14 +53,14 @@ class StageRequestStats:
     final_output_type: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, int] = None
+    diffusion_metrics: dict[str, float] = None
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
     audio_rtf: float = 0.0
     image_pixels: int = 0
     denoise_step_latency_ms: float = 0.0
-    pipeline_timings: dict[str, float] | None = None
+    pipeline_timings: PipelineTimings | None = None
     output_unit_type: str | None = None
     output_unit_count: int = 0
     serving_time_to_first_output_ms: float = 0.0
@@ -572,7 +581,7 @@ class OrchestratorAggregator:
         if final_output_type is not None:
             stats.final_output_type = final_output_type
         stats.diffusion_metrics = (
-            {k: int(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
+            {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
             if req_id in self.diffusion_metrics
             else None
         )
@@ -738,8 +747,8 @@ class OrchestratorAggregator:
         preprocess_times = []
         for _rid, evts in self.stage_events.items():
             for evt in evts:
-                if evt.pipeline_timings and "preprocess_ms" in evt.pipeline_timings:
-                    preprocess_times.append(evt.pipeline_timings["preprocess_ms"])
+                if evt.pipeline_timings and evt.pipeline_timings.preprocess_ms > 0:
+                    preprocess_times.append(evt.pipeline_timings.preprocess_ms)
                     break  # only once per request
         if preprocess_times:
             overall_summary["input_preprocess_time_ms"] = sum(preprocess_times) / len(preprocess_times)
@@ -795,17 +804,17 @@ class OrchestratorAggregator:
                 self.stage_events.get(rid, []),
                 key=lambda e: e.stage_id if e.stage_id is not None else -1,
             )
-            pt = {}
+            pt = PipelineTimings()
             if stage_evts:
-                pt = stage_evts[-1].pipeline_timings or {}
-            if pt or e2e_evt:
+                pt = stage_evts[-1].pipeline_timings or PipelineTimings()
+            if e2e_evt or (stage_evts and stage_evts[-1].pipeline_timings):
                 parts = [f"req={rid}"]
                 if e2e_evt:
                     parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
-                if "preprocess_ms" in pt:
-                    parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
+                if pt.preprocess_ms > 0:
+                    parts.append(f"preprocess={pt.preprocess_ms / 1000.0:.2f}s")
                 if e2e_evt:
-                    engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
+                    engine_ms = e2e_evt.e2e_total_ms - pt.preprocess_ms
                     parts.append(f"engine={engine_ms / 1000.0:.2f}s")
                 stage_parts = []
                 for evt in stage_evts:
@@ -820,8 +829,8 @@ class OrchestratorAggregator:
                         transfer_parts.append(f"{te.from_stage}->{te.to_stage}={te.tx_time_ms:.2f}ms")
                 if transfer_parts:
                     parts.append(f"transfers=[{','.join(transfer_parts)}]")
-                if "ar2diffusion_ms" in pt:
-                    parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
+                if pt.ar2diffusion_ms > 0:
+                    parts.append(f"ar2diffusion={pt.ar2diffusion_ms:.2f}ms")
                 logger.info("[OmniTiming] %s", " ".join(parts))
 
             # === Stage table (columns = stage_id) ===

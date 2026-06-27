@@ -8,6 +8,12 @@ from typing import Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
+from vllm.tracing import (
+    SpanKind,
+    extract_trace_context,
+    instrument_manual,
+    is_tracing_available,
+)
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -27,6 +33,7 @@ from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import OmniSpanAttributes
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 logger = init_logger(__name__)
@@ -480,7 +487,9 @@ class OmniBase(PDDisaggregationMixin):
         # Merge pipeline timings from Orchestrator into stage_durations
         _m = result.metrics
         if _m is not None and hasattr(_m, "pipeline_timings") and _m.pipeline_timings:
-            for key, value in _m.pipeline_timings.items():
+            import dataclasses as _dc
+
+            for key, value in _dc.asdict(_m.pipeline_timings).items():
                 if key not in stage_durations:
                     stage_durations[key] = value
 
@@ -505,7 +514,10 @@ class OmniBase(PDDisaggregationMixin):
         stage_meta = self.engine.get_stage_metadata(stage_id)
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
+            metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
             metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
+            if is_tracing_available() and getattr(_m, "diffusion_metrics", None):
+                self._emit_diffusion_span(result, _m)
 
         if not stage_meta.final_output:
             return None
@@ -643,6 +655,52 @@ class OmniBase(PDDisaggregationMixin):
             List of results from each stage.
         """
         return self.engine.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
+
+    def _emit_diffusion_span(
+        self,
+        result: OutputMessage,
+        stage_metrics: Any,
+    ) -> None:
+        dm = stage_metrics.diffusion_metrics
+        if not dm:
+            return
+        trace_context = extract_trace_context(result.trace_headers)
+        total_ms = dm.get("diffusion_engine_total_time_ms") or dm.get("total_ms") or 0
+        if total_ms <= 0:
+            return
+        step_start = dm.get("step_start_ts", 0.0)
+        if step_start > 0:
+            start_ns = int(step_start * 1e9)
+            end_ns = int((step_start + total_ms / 1000) * 1e9)
+        else:
+            start_ns = int(time.time_ns() - total_ms * 1_000_000)
+            end_ns = time.time_ns()
+        _KEY_MAP = {
+            "preprocess_time_ms": OmniSpanAttributes.DIFFUSION_PREPROCESS_MS,
+            "preprocess_ms": OmniSpanAttributes.DIFFUSION_PREPROCESS_MS,
+            "diffusion_engine_exec_time_ms": OmniSpanAttributes.DIFFUSION_EXEC_MS,
+            "exec_ms": OmniSpanAttributes.DIFFUSION_EXEC_MS,
+            "postprocess_time_ms": OmniSpanAttributes.DIFFUSION_POSTPROCESS_MS,
+            "postprocess_ms": OmniSpanAttributes.DIFFUSION_POSTPROCESS_MS,
+            "diffusion_engine_total_time_ms": OmniSpanAttributes.DIFFUSION_TOTAL_MS,
+            "total_ms": OmniSpanAttributes.DIFFUSION_TOTAL_MS,
+        }
+        attributes: dict[str, Any] = {
+            OmniSpanAttributes.STAGE_ID: stage_metrics.stage_id,
+            OmniSpanAttributes.STAGE_NAME: "diffusion",
+            OmniSpanAttributes.STAGE_REPLICA_ID: stage_metrics.replica_id,
+        }
+        for key, attr in _KEY_MAP.items():
+            if key in dm and attr not in attributes:
+                attributes[attr] = float(dm[key])
+        instrument_manual(
+            span_name="diffusion_request",
+            start_time=start_ns,
+            end_time=end_ns,
+            attributes=attributes,
+            context=trace_context,
+            kind=SpanKind.INTERNAL,
+        )
 
     def _shutdown_base(self) -> None:
         if getattr(self, "_shutdown_called", False):

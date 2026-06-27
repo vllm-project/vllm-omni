@@ -578,6 +578,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        first_chunk_received_ts=getattr(request, "first_chunk_received_ts", None),
                     )
                 )
             else:
@@ -609,6 +610,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     events=request.take_events(),
                     kv_transfer_params=kv_transfer_params,
                     trace_headers=request.trace_headers,
+                    first_chunk_received_ts=getattr(request, "first_chunk_received_ts", None),
                 )
             )
             stopped_running_reqs.add(request)
@@ -634,6 +636,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
+                        first_chunk_received_ts=getattr(request, "first_chunk_received_ts", None),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:

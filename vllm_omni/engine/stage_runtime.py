@@ -126,6 +126,8 @@ class StageRuntime:
         diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
+        log_stats: bool = False,
+        tracing_enabled: bool = False,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -135,6 +137,8 @@ class StageRuntime:
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         self._num_stages = len(stage_configs)
+        self._log_stats = log_stats
+        self._tracing_enabled = tracing_enabled
 
         # Populated by initialize()
         self.stage_pools: list[StagePool] = []
@@ -691,7 +695,12 @@ class StageRuntime:
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+                output_processor = build_llm_stage_output_processor(
+                    plan,
+                    stage_vllm_config,
+                    log_stats=self._log_stats,
+                    tracing_enabled=self._tracing_enabled,
+                )
 
             stage_pools.append(
                 StagePool(
@@ -730,6 +739,8 @@ class DistStageRuntime(StageRuntime):
         diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
+        log_stats: bool = False,
+        tracing_enabled: bool = False,
         single_stage_id_filter: int | None,
         omni_master_address: str,
         omni_master_port: int,
@@ -746,6 +757,8 @@ class DistStageRuntime(StageRuntime):
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            log_stats=log_stats,
+            tracing_enabled=tracing_enabled,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -1066,6 +1079,8 @@ def create_stage_runtime(
     diffusion_batch_size: int,
     async_chunk: bool,
     tokenizer: str | None = None,
+    log_stats: bool = False,
+    tracing_enabled: bool = False,
     # Distributed-only params:
     single_stage_id_filter: int | None = None,
     omni_master_address: str | None = None,
@@ -1087,6 +1102,8 @@ def create_stage_runtime(
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            log_stats=log_stats,
+            tracing_enabled=tracing_enabled,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1103,4 +1120,6 @@ def create_stage_runtime(
         diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,
         tokenizer=tokenizer,
+        log_stats=log_stats,
+        tracing_enabled=tracing_enabled,
     )

@@ -27,6 +27,7 @@ from vllm import envs as vllm_envs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.tracing import init_tracer, instrument
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
@@ -202,6 +203,7 @@ class AsyncOmniEngine:
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when stage-init / forward paths touch these attrs.
     _log_stats: bool = False
+    _tracing_enabled: bool = False
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
 
@@ -233,6 +235,16 @@ class AsyncOmniEngine:
         # replica) vllm:* wrap stays registered but reads zero. Respects the
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
+
+        otlp_traces_endpoint = kwargs.get("otlp_traces_endpoint")
+        if otlp_traces_endpoint:
+            init_tracer("vllm_omni", otlp_traces_endpoint, extra_attributes={"service.name": "vllm-omni"})
+            self._tracing_enabled = True
+            self._log_stats = True
+            logger.info(
+                "[AsyncOmniEngine] OTel tracing enabled, endpoint=%s",
+                otlp_traces_endpoint,
+            )
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -339,6 +351,7 @@ class AsyncOmniEngine:
             self._diffusion_od_config_view = SimpleNamespace(model_class_name=resolve_model_class_name(self.model))
         return self._diffusion_od_config_view
 
+    @instrument(span_name="Initialize stages")
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
         self._runtime = create_stage_runtime(
@@ -350,6 +363,8 @@ class AsyncOmniEngine:
             diffusion_batch_size=self.diffusion_batch_size,
             async_chunk=self.async_chunk,
             tokenizer=self.tokenizer,
+            log_stats=self._log_stats,
+            tracing_enabled=self._tracing_enabled,
             single_stage_id_filter=self._single_stage_id_filter,
             omni_master_address=self._omni_master_address,
             omni_master_port=self._omni_master_port,
@@ -425,6 +440,7 @@ class AsyncOmniEngine:
                 running_counter=self._running_counter,
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
+                tracing_enabled=self._tracing_enabled,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

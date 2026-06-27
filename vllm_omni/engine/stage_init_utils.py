@@ -815,6 +815,7 @@ def build_llm_stage_output_processor(
     plan: LogicalStageInitPlan,
     stage_vllm_config: Any,
     log_stats: bool = False,
+    tracing_enabled: bool = False,
 ) -> Any | None:
     """Build one output processor per logical LLM stage.
 
@@ -823,6 +824,8 @@ def build_llm_stage_output_processor(
     the upstream MultimodalOutputProcessor default and respects the
     --log-stats CLI flag plumbed through AsyncOmniEngine.
     """
+    if tracing_enabled:
+        log_stats = True
 
     metadata = plan.replicas[0].metadata
     if stage_vllm_config.model_config.skip_tokenizer_init:
@@ -831,10 +834,24 @@ def build_llm_stage_output_processor(
         tokenizer = cached_tokenizer_from_config(
             model_config=stage_vllm_config.model_config,
         )
+    stage_name = (
+        getattr(
+            stage_vllm_config.model_config,
+            "model_stage",
+            None,
+        )
+        if hasattr(stage_vllm_config, "model_config")
+        else None
+    )
+    if stage_name is None:
+        stage_name = metadata.stage_type
     return MultimodalOutputProcessor(
         tokenizer=tokenizer,
         log_stats=log_stats,
+        tracing_enabled=tracing_enabled,
         engine_core_output_type=metadata.engine_output_type,
+        stage_id=plan.stage_idx,
+        stage_name=stage_name,
     )
 
 

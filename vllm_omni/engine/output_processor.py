@@ -6,6 +6,11 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
+from vllm.tracing import (
+    SpanKind,
+    extract_trace_context,
+    instrument_manual,
+)
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.engine.output_processor import (
@@ -25,6 +30,7 @@ from vllm_omni.engine.output_modality import (
     get_accumulation_strategy,
 )
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import OmniSpanAttributes
 
 logger = init_logger(__name__)
 
@@ -469,6 +475,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         tracing_enabled: bool = False,
         engine_core_output_type: str | None = None,
         output_modality: OutputModality = OutputModality.TEXT,
+        stage_id: int = -1,
+        stage_name: str | None = None,
+        replica_id: int = 0,
     ):
         """Initialize the multimodal output processor.
 
@@ -476,6 +485,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             tokenizer: Tokenizer for detokenizing text outputs
             log_stats: Whether to log statistics
             stream_interval: Stream interval for output generation
+            tracing_enabled: Whether OpenTelemetry tracing is active
             engine_core_output_type: Optional output type string (e.g.,
                 "image", "audio", "latent"). Converted to OutputModality
                 internally. Kept for backward compatibility with
@@ -483,6 +493,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             output_modality: Type-safe output modality flag. Used to tag
                 multimodal outputs with the correct modality key when
                 per-output type info is unavailable.
+            stage_id: Pipeline stage index for span attributes.
+            stage_name: Human-readable stage name for span attributes.
+            replica_id: Replica index for span attributes.
         """
         super().__init__(
             tokenizer=tokenizer,
@@ -497,6 +510,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self.output_modality = output_modality
         self.engine_core_output_type = engine_core_output_type
         self._native_text_metrics_by_request: dict[str, dict[str, Any]] = {}
+        self._stage_id = stage_id
+        self._stage_name = stage_name
+        self._replica_id = replica_id
 
     def _native_text_metric_record(self, request_id: str) -> dict[str, Any]:
         return self._native_text_metrics_by_request.setdefault(
@@ -620,7 +636,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 upstream_outputs.append(eco)
 
         # Handle multimodal-only outputs (generation stages) locally.
-        self._process_mm_only_outputs(mm_only_outputs)
+        self._process_mm_only_outputs(
+            mm_only_outputs,
+            engine_core_timestamp,
+            iteration_stats,
+        )
 
         # Delegate text/pooling outputs to upstream.
         return super().process_outputs(
@@ -632,6 +652,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def _process_mm_only_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
+        engine_core_timestamp: float | None = None,
+        iteration_stats: IterationStats | None = None,
     ) -> None:
         """Handle outputs from generation stages that have no detokenizer.
 
@@ -642,6 +664,14 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
+
+            if req_state.stats is not None:
+                self._update_stats_from_output(
+                    req_state,
+                    eco,
+                    engine_core_timestamp,
+                    iteration_stats,
+                )
 
             new_token_ids = eco.new_token_ids
             finish_reason = eco.finish_reason
@@ -663,6 +693,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     req_state.queue.put(request_output)
 
             if finish_reason is not None:
+                if self.tracing_enabled:
+                    self._emit_mm_only_tracing(eco, req_state)
                 self._finish_request(req_state)
 
     def _update_stats_from_output(
@@ -741,4 +773,80 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             return
         self._native_text_metric_record(req_state.external_req_id)["vllm_tpot_ms"] = (
             float(finished_request.mean_time_per_output_token) * 1000.0
+        )
+
+    def do_tracing(
+        self,
+        engine_core_output: EngineCoreOutput,
+        req_state: RequestState,
+        iteration_stats: IterationStats | None,
+    ) -> None:
+        super().do_tracing(engine_core_output, req_state, iteration_stats)
+        self._emit_llm_processing_span(engine_core_output, req_state)
+
+    def _emit_mm_only_tracing(
+        self,
+        engine_core_output: EngineCoreOutput,
+        req_state: RequestState,
+    ) -> None:
+        """Create llm_request + llm_processing spans for mm-only stages.
+
+        Cannot use upstream do_tracing because it asserts iteration_stats
+        is not None, which is unavailable for mm-only outputs.
+        """
+        stats = getattr(req_state, "native_text_stats", None) or req_state.stats
+        if stats is None:
+            return
+        trace_context = extract_trace_context(
+            engine_core_output.trace_headers,
+        )
+        arrival_time_ns = int(stats.arrival_time * 1e9)
+        instrument_manual(
+            span_name="llm_request",
+            start_time=arrival_time_ns,
+            attributes={
+                "gen_ai.request.id": req_state.external_req_id,
+            },
+            context=trace_context,
+            kind=SpanKind.INTERNAL,
+        )
+        self._emit_llm_processing_span(engine_core_output, req_state)
+
+    def _emit_llm_processing_span(
+        self,
+        engine_core_output: EngineCoreOutput,
+        req_state: RequestState,
+    ) -> None:
+        first_chunk_ts = getattr(engine_core_output, "first_chunk_received_ts", None)
+        if first_chunk_ts is None:
+            return
+        stats = getattr(req_state, "native_text_stats", None) or req_state.stats
+        if stats is None:
+            return
+        scheduled_ts = stats.scheduled_ts if stats.scheduled_ts > 0 else 0.0
+        last_token_ts = stats.last_token_ts if stats.last_token_ts > 0 else 0.0
+        if scheduled_ts > 0 and last_token_ts > 0:
+            duration = last_token_ts - scheduled_ts
+        elif stats.first_token_ts > 0 and last_token_ts > 0:
+            duration = last_token_ts - stats.first_token_ts
+        else:
+            return
+        start_ns = int(first_chunk_ts * 1e9)
+        end_ns = int((first_chunk_ts + duration) * 1e9)
+        trace_context = extract_trace_context(
+            engine_core_output.trace_headers,
+        )
+        attributes: dict[str, Any] = {
+            OmniSpanAttributes.STAGE_ID: self._stage_id,
+            OmniSpanAttributes.STAGE_REPLICA_ID: self._replica_id,
+        }
+        if self._stage_name:
+            attributes[OmniSpanAttributes.STAGE_NAME] = self._stage_name
+        instrument_manual(
+            span_name="llm_processing",
+            start_time=start_ns,
+            end_time=end_ns,
+            attributes=attributes,
+            context=trace_context,
+            kind=SpanKind.INTERNAL,
         )

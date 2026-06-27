@@ -89,6 +89,7 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     metrics: StageRequestMetrics | None = None
     finished: bool
     stage_submit_ts: float | None = None
+    trace_headers: dict[str, str] | None = None
 
 
 class StageMetricsMessage(EngineQueueMessage, kw_only=True):

@@ -19,6 +19,7 @@ class DiffusionStepTimings:
     exec_time_s: float
     postprocess_time_s: float
     total_time_ms: float
+    step_start_ts: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,7 @@ def format_diffusion_outputs(
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
         "resolution": int(request.sampling_params.resolution),
         "postprocess_time_ms": timings.postprocess_time_s * 1000,
+        "step_start_ts": timings.step_start_ts,
     }
 
     # Detect text output: when the pipeline returns a string (e.g.,

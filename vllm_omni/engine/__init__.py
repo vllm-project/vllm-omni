@@ -125,6 +125,8 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    # Wall-clock time when the first KV chunk arrived from upstream
+    first_chunk_received_ts: float | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

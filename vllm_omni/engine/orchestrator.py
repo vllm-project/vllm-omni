@@ -12,6 +12,8 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import time as _time
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,6 +25,12 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.tracing import (
+    SpanKind,
+    extract_trace_context,
+    is_tracing_available,
+)
+from vllm.tracing.utils import SpanAttributes
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -48,7 +56,9 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.metrics.stats import PipelineTimings
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.tracing import OmniSpanAttributes
 
 logger = init_logger(__name__)
 
@@ -123,6 +133,7 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
+    trace_headers: dict[str, str] | None = None,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -158,6 +169,7 @@ def build_engine_core_request_from_tokens(
         prompt_embeds=prompt_embeds,
         resumable=resumable,
         additional_information=additional_info_payload,
+        trace_headers=trace_headers,
     )
 
 
@@ -184,7 +196,12 @@ class OrchestratorRequestState:
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
     # Per-request pipeline timing accumulator (milliseconds)
-    pipeline_timings: dict[str, float] = field(default_factory=dict)
+    pipeline_timings: PipelineTimings = field(default_factory=PipelineTimings)
+
+    # Tracing: W3C trace context for downstream propagation
+    trace_headers: dict[str, str] | None = None
+    trace_start_ns: int = 0
+    _omni_span: Any = None
 
 
 @dataclass
@@ -207,6 +224,7 @@ class Orchestrator:
     _running_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    _tracing_enabled: bool = False
 
     def __init__(
         self,
@@ -221,6 +239,7 @@ class Orchestrator:
         running_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         log_stats: bool = False,
+        tracing_enabled: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -240,6 +259,7 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        self._tracing_enabled = tracing_enabled
         self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
 
         self._cfg_tracker = CfgCompanionTracker()
@@ -461,10 +481,12 @@ class Orchestrator:
         req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
-            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
+            req_state.pipeline_timings.queue_wait_ms = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
-            req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+            req_state.pipeline_timings.preprocess_ms = preprocess_ms
+        if self._tracing_enabled:
+            self._start_omni_request_span(req_state, prompt)
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -769,7 +791,7 @@ class Orchestrator:
                     replica_id=replica_id,
                     sampling_params=req_state.sampling_params_list[stage_id],
                 )
-                stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                stage_metrics.pipeline_timings = dataclasses.replace(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
@@ -807,6 +829,67 @@ class Orchestrator:
             self._pd_kv_params.pop(request_id, None)
             if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
                 self._running_counter.decrement()
+
+    def _start_omni_request_span(
+        self,
+        req_state: OrchestratorRequestState,
+        prompt: Any,
+    ) -> None:
+        if not is_tracing_available():
+            return
+        try:
+            from opentelemetry import trace
+            from opentelemetry.propagate import inject
+
+            parent_headers = getattr(prompt, "trace_headers", None)
+            parent_ctx = extract_trace_context(parent_headers)
+            req_state.trace_start_ns = int(req_state.request_timestamp * 1e9)
+            tracer = trace.get_tracer("vllm_omni")
+            span = tracer.start_span(
+                "omni_request",
+                context=parent_ctx,
+                kind=SpanKind.SERVER,
+                start_time=req_state.trace_start_ns,
+            )
+            req_state._omni_span = span
+            carrier: dict[str, str] = {}
+            ctx = trace.set_span_in_context(span)
+            inject(carrier, context=ctx)
+            req_state.trace_headers = carrier
+            if hasattr(prompt, "trace_headers"):
+                prompt.trace_headers = carrier
+        except Exception:
+            logger.debug(
+                "[Orchestrator] Failed to start omni_request span",
+                exc_info=True,
+            )
+
+    def _end_omni_request_span(
+        self,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        span = req_state._omni_span
+        if span is None:
+            return
+        try:
+            span.set_attribute(
+                SpanAttributes.GEN_AI_REQUEST_ID,
+                req_state.request_id,
+            )
+            pt_dict = dataclasses.asdict(req_state.pipeline_timings)
+            if pt_dict:
+                span.set_attribute(
+                    OmniSpanAttributes.PIPELINE_TIMINGS,
+                    json.dumps(pt_dict),
+                )
+            span.end()
+        except Exception:
+            logger.debug(
+                "[Orchestrator] Failed to end omni_request span",
+                exc_info=True,
+            )
+        finally:
+            req_state._omni_span = None
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -889,6 +972,7 @@ class Orchestrator:
                     metrics=stage_metrics,
                     finished=request_finished,
                     stage_submit_ts=submit_ts,
+                    trace_headers=req_state.trace_headers,
                 )
             )
         elif stage_metrics is not None:
@@ -943,6 +1027,8 @@ class Orchestrator:
                     )
 
         if request_finished:
+            if self._tracing_enabled:
+                self._end_omni_request_span(req_state)
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
@@ -992,6 +1078,7 @@ class Orchestrator:
         *,
         mm_features: list | None = None,
         resumable: bool = False,
+        trace_headers: dict[str, str] | None = None,
     ) -> Any:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -1002,6 +1089,7 @@ class Orchestrator:
                 model_config=next_pool.stage_vllm_config.model_config,
                 mm_features=mm_features,
                 resumable=resumable,
+                trace_headers=trace_headers,
             )
             request.external_req_id = request.request_id
             return request
@@ -1017,6 +1105,8 @@ class Orchestrator:
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
+        if trace_headers is not None and hasattr(request, "trace_headers"):
+            request.trace_headers = trace_headers
         return request
 
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
@@ -1208,7 +1298,7 @@ class Orchestrator:
                     **_extra_kwargs,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
-                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
+                req_state.pipeline_timings.ar2diffusion_ms = _dt_ar2d
                 logger.info(
                     "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
                     req_id,
@@ -1398,8 +1488,8 @@ class Orchestrator:
                 params=params,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
+                trace_headers=req_state.trace_headers,
             )
-
             if already_submitted:
                 await next_pool.submit_update(req_id, req_state, request)
             else:
@@ -1479,6 +1569,7 @@ class Orchestrator:
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
+                    trace_headers=req_state.trace_headers,
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(

@@ -332,6 +332,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                                 request_id=req_id,
                                 new_token_ids=[],
                                 kv_transfer_params={"kv_ready": True},
+                                first_chunk_received_ts=getattr(req, "first_chunk_received_ts", None),
                             )
                         )
                 except Exception:
@@ -485,6 +486,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                         is_segment_finished=is_segment_finished,
                         new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
+                        first_chunk_received_ts=getattr(request, "first_chunk_received_ts", None),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
@@ -513,6 +515,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
+                        first_chunk_received_ts=getattr(request, "first_chunk_received_ts", None),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:

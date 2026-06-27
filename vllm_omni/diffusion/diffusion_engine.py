@@ -193,6 +193,7 @@ class DiffusionEngine:
     async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         await self._check_and_start_background_loop()
 
+        step_start_ts = time.time()
         diffusion_engine_start_time = time.perf_counter()
 
         # Apply pre-processing if available
@@ -206,11 +207,14 @@ class DiffusionEngine:
         exec_start_time = time.perf_counter()
         output = await self.async_add_req_and_wait_for_response(request)
         exec_total_time = time.perf_counter() - exec_start_time
-        return self.postprocess_output(request, output, diffusion_engine_start_time, preprocess_time, exec_total_time)
+        return self.postprocess_output(
+            request, output, diffusion_engine_start_time, preprocess_time, exec_total_time, step_start_ts=step_start_ts
+        )
 
     async def step_streaming(self, request: OmniDiffusionRequest) -> AsyncGenerator[list[OmniRequestOutput], None]:
         await self._check_and_start_background_loop()
 
+        step_start_ts = time.time()
         diffusion_engine_start_time = time.perf_counter()
 
         preprocess_time = 0.0
@@ -225,7 +229,12 @@ class DiffusionEngine:
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
             yield self.postprocess_output(
-                request, output, diffusion_engine_start_time, preprocess_time, exec_total_time
+                request,
+                output,
+                diffusion_engine_start_time,
+                preprocess_time,
+                exec_total_time,
+                step_start_ts=step_start_ts,
             )
 
     def postprocess_output(
@@ -235,6 +244,8 @@ class DiffusionEngine:
         diffusion_engine_start_time: float,
         preprocess_time: float,
         exec_total_time: float,
+        *,
+        step_start_ts: float = 0.0,
     ) -> list[OmniRequestOutput]:
         """Convert a DiffusionOutput to a list of OmniRequestOutput, attaching profiling metrics."""
         if output.aborted:
@@ -324,6 +335,7 @@ class DiffusionEngine:
                 exec_time_s=exec_total_time,
                 postprocess_time_s=postprocess_time,
                 total_time_ms=step_total_ms,
+                step_start_ts=step_start_ts,
             ),
         )
 
