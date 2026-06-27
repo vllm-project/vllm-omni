@@ -121,7 +121,7 @@ def test_cli_overrides_strategy_with_warning():
         def emit(self, record: logging.LogRecord) -> None:
             messages.append(record.getMessage())
 
-    log = logging.getLogger("vllm_omni.config.stage_config")
+    log = logging.getLogger("vllm_omni.config.config_factory")
     handler = _Capture(level=logging.WARNING)
     log.addHandler(handler)
     try:
