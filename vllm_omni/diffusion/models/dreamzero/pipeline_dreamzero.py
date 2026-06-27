@@ -735,8 +735,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
         """Full inference step. Called by DiffusionEngine.step()."""
-        if req.num_reqs != 1:
-            raise ValueError("DreamZeroPipeline only supports single-request forward.")
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")
         if robot_obs is None:

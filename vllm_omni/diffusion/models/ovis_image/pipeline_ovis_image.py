@@ -144,7 +144,7 @@ def retrieve_timesteps(
 
 
 class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
-    supports_request_batch = True
+    supports_request_batch = False
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -572,7 +572,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
         callback_on_step_end: Callable[[int, int, dict], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 256,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         r"""
         Function invoked when calling the pipeline for generation.
 
@@ -763,16 +763,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
             image = self.vae.decode(latents, return_dict=False)[0]
 
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        n = req.sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [DiffusionOutput(output=image, stage_durations=stage_durations)]
-        return [
-            DiffusionOutput(
-                output=image[i * n : (i + 1) * n],
-                stage_durations=stage_durations,
-            )
-            for i in range(req.num_reqs)
-        ]
+        return DiffusionOutput(output=image, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

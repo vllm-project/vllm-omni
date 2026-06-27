@@ -46,7 +46,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     batching mode.
     """
 
-    supports_request_batch = True
+    supports_request_batch = False
     supports_step_execution: bool = False
 
     def __init__(self, *, od_config: OmniDiffusionConfig, device: torch.device | None = None):
@@ -152,26 +152,15 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # Forward pass
     # ------------------------------------------------------------------
 
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Full delegation to diffusers ``pipeline.__call__()``."""
-
         kwargs = self._build_call_kwargs(req)
         logger.debug(f"Calling diffusers pipeline with kwargs: {kwargs}")
 
         with torch.inference_mode():
             output = self._pipeline(**kwargs)  # pyright: ignore[reportCallIssue]
 
-        result = self._wrap_output(output)
-        images = result.output
-        n = req.sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [result]
-        return [
-            DiffusionOutput(
-                output=images[i * n : (i + 1) * n] if isinstance(images, list) else images,
-            )
-            for i in range(req.num_reqs)
-        ]
+        return self._wrap_output(output)
 
     # ------------------------------------------------------------------
     # Validation guards

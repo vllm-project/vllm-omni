@@ -90,12 +90,11 @@ class TestPipelineArgumentsHandling:
             "__call__",
             return_value=MockPipelineOutput(image=stub_image),
         )
-        outputs = adapter.forward(DiffusionRequestBatch(requests=[request]))
+        output = adapter.forward(DiffusionRequestBatch(requests=[request]))
 
-        assert isinstance(outputs, list) and len(outputs) == 1
-        assert isinstance(outputs[0], DiffusionOutput)
-        assert isinstance(outputs[0].output, MockPipelineOutput)
-        assert outputs[0].output.image is stub_image
+        assert isinstance(output, DiffusionOutput)
+        assert isinstance(output.output, MockPipelineOutput)
+        assert output.output.image is stub_image
 
     @pytest.mark.parametrize(
         "feature_id",
@@ -152,11 +151,10 @@ class TestPipelineArgumentsHandling:
             "__call__",
             return_value=raw_output,
         )
-        outputs = adapter.forward(_make_batch())
+        output = adapter.forward(_make_batch())
 
-        assert isinstance(outputs, list) and len(outputs) == 1
-        assert isinstance(outputs[0], DiffusionOutput)
-        assert outputs[0].output == raw_output
+        assert isinstance(output, DiffusionOutput)
+        assert output.output == raw_output
 
     def test_adapter_build_call_kwargs(self, mocker):
         class MockPipeline:

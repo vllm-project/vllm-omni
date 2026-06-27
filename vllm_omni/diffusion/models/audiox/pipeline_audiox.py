@@ -359,7 +359,7 @@ class _BrownianTreeNoiseSampler:
 
 
 class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
-    supports_request_batch = True
+    supports_request_batch = False
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 44100
     audio_channels: ClassVar[int] = 2
@@ -812,7 +812,7 @@ class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMix
                 )
         return batch
 
-    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if req.prompts is None or len(req.prompts) == 0:
             raise ValueError("AudioXPipeline requires at least one prompt.")
         normalized_prompts = _normalize_prompts(list(req.prompts))
@@ -916,20 +916,8 @@ class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMix
 
         stage_durations = self.stage_durations if getattr(self, "enable_diffusion_pipeline_profiler", False) else None
         custom_output = {"audiox_task": task_norm}
-        n = req.sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [
-                DiffusionOutput(
-                    output=audio,
-                    custom_output=custom_output,
-                    stage_durations=stage_durations,
-                )
-            ]
-        return [
-            DiffusionOutput(
-                output=audio[i * n : (i + 1) * n],
-                custom_output=custom_output,
-                stage_durations=stage_durations,
-            )
-            for i in range(req.num_reqs)
-        ]
+        return DiffusionOutput(
+            output=audio,
+            custom_output=custom_output,
+            stage_durations=stage_durations,
+        )

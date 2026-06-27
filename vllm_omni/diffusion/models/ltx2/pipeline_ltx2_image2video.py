@@ -74,7 +74,7 @@ class _I2VVideoAudioScheduler:
 
 
 class LTX2ImageToVideoPipeline(LTX2Pipeline):
-    supports_request_batch = True
+    supports_request_batch = False
     support_image_input = True
 
     def __init__(
@@ -314,7 +314,7 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         # Extract prompt/negative_prompt from request.
         # Input format: req.prompts is a list of str or dict with "prompt"/"negative_prompt" keys.
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
@@ -726,24 +726,13 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
             audio = self.vocoder(generated_mel_spectrograms)
 
-        n = req.sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [DiffusionOutput(output=(video, audio))]
-        return [
-            DiffusionOutput(
-                output=(
-                    video[i * n : (i + 1) * n] if isinstance(video, list) else video[i * n : (i + 1) * n],
-                    audio[i * n : (i + 1) * n] if isinstance(audio, (list, torch.Tensor)) else audio,
-                ),
-            )
-            for i in range(req.num_reqs)
-        ]
+        return DiffusionOutput(output=(video, audio))
 
 
 class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     """LTXImageToVideoTwoStagesPipeline is for two stages image to video generation"""
 
-    supports_request_batch = True
+    supports_request_batch = False
     support_image_input = True
     dummy_run_num_frames = 2
 
@@ -824,8 +813,8 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
-    ) -> list[DiffusionOutput]:
-        video_latent, audio_latent = self.pipe(
+    ) -> DiffusionOutput:
+        stage1_output = self.pipe(
             req=req,
             image=image,
             prompt=prompt,
@@ -854,7 +843,8 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             return_dict=return_dict,
             attention_kwargs=attention_kwargs,
             max_sequence_length=max_sequence_length,
-        )[0].output
+        )
+        video_latent, audio_latent = stage1_output.output
 
         upscaled_video_latent = self.upsample_pipe(
             latents=video_latent,
@@ -884,7 +874,7 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         stage_2_req.sampling_params = req.sampling_params.clone()
         stage_2_req.sampling_params.num_inference_steps = 3
 
-        stage2_outputs = self.pipe(
+        stage2_output = self.pipe(
             req=stage_2_req,
             latents=upscaled_video_latent,
             audio_latents=audio_latent,
@@ -897,20 +887,9 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             output_type="np",
             return_dict=False,
         )
-        video, audio = stage2_outputs[0].output
+        video, audio = stage2_output.output
 
-        n = req.sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [DiffusionOutput(output=(video, audio))]
-        return [
-            DiffusionOutput(
-                output=(
-                    video[i * n : (i + 1) * n] if isinstance(video, list) else video[i * n : (i + 1) * n],
-                    audio[i * n : (i + 1) * n] if isinstance(audio, (list, torch.Tensor)) else audio,
-                ),
-            )
-            for i in range(req.num_reqs)
-        ]
+        return DiffusionOutput(output=(video, audio))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

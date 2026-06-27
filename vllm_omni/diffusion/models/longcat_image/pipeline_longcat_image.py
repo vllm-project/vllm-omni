@@ -203,7 +203,7 @@ def get_prompt_language(prompt):
 
 
 class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
-    supports_request_batch = True
+    supports_request_batch = False
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -516,7 +516,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         enable_cfg_renorm: bool | None = True,
         cfg_renorm_min: float | None = 0.0,
         enable_prompt_rewrite: bool | None = True,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
@@ -696,16 +696,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
             image = self.vae.decode(latents, return_dict=False)[0]
 
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        n = req.sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [DiffusionOutput(output=image, stage_durations=stage_durations)]
-        return [
-            DiffusionOutput(
-                output=image[i * n : (i + 1) * n],
-                stage_durations=stage_durations,
-            )
-            for i in range(req.num_reqs)
-        ]
+        return DiffusionOutput(output=image, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

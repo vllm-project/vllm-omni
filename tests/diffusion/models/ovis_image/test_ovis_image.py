@@ -177,7 +177,7 @@ def test_basic_generation(ovis_pipeline):
         ),
     )
 
-    output = ovis_pipeline(DiffusionRequestBatch(requests=[req]))[0]
+    output = ovis_pipeline(DiffusionRequestBatch(requests=[req]))
 
     assert output is not None
     assert output.output is not None
@@ -236,7 +236,7 @@ def test_resolution_check(ovis_pipeline):
     # Should warn but proceed (as per code I read earlier) or resize?
     # The code had `logger.warning(...)`
 
-    output = ovis_pipeline(DiffusionRequestBatch(requests=[req]))[0]
+    output = ovis_pipeline(DiffusionRequestBatch(requests=[req]))
     assert output is not None
 
 

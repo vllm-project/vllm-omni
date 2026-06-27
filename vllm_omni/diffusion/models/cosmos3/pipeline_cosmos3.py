@@ -2179,8 +2179,6 @@ class Cosmos3OmniDiffusersPipeline(
         self,
         req: DiffusionRequestBatch,
     ) -> DiffusionOutput:
-        if req.num_reqs != 1:
-            raise ValueError("Cosmos3OmniDiffusersPipeline currently supports single-request forward.")
         pipeline_start = time.time()
 
         # --- Parse request ---

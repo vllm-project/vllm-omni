@@ -294,8 +294,6 @@ class MingImagePipeline(ZImagePipeline):
             image tensor in ``[-1, 1]``. The vllm-omni diffusion engine's
             output adapter converts this to PIL/base64 downstream.
         """
-        if req.num_reqs != 1:
-            raise ValueError("MingImagePipeline only supports single-request forward.")
         first_prompt = req.prompts[0] if req.prompts else None
         if isinstance(first_prompt, str):
             prompt_dict: dict[str, Any] = {}

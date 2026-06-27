@@ -77,7 +77,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
         prefix: Weight prefix for loading (default: "")
     """
 
-    supports_request_batch = True
+    supports_request_batch = False
 
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the
@@ -399,7 +399,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         output_type: str = "np",
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         """
         Generate audio from text prompt.
 
@@ -608,16 +608,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
         audio = audio[:, :, waveform_start:waveform_end]
 
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        n = req.sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [DiffusionOutput(output=audio, stage_durations=stage_durations)]
-        return [
-            DiffusionOutput(
-                output=audio[i * n : (i + 1) * n],
-                stage_durations=stage_durations,
-            )
-            for i in range(req.num_reqs)
-        ]
+        return DiffusionOutput(output=audio, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

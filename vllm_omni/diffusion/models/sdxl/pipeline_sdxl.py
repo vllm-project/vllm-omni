@@ -307,9 +307,6 @@ class StableDiffusionXLPipeline(
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
     ) -> DiffusionOutput:
-        if req.num_reqs != 1:
-            raise ValueError("StableDiffusionXLPipeline currently supports single-request forward.")
-
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         negative_prompt = [
             "" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts

@@ -55,6 +55,25 @@ def _return_annotation_is_diffusion_output_list(annotation: ast.expr | None) -> 
     }
 
 
+def _return_annotation_is_diffusion_output(annotation: ast.expr | None) -> bool:
+    return _annotation_text(annotation).replace(" ", "") == "DiffusionOutput"
+
+
+def _has_request_batch_size_guard(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Compare):
+            continue
+        if len(node.ops) != 1 or not isinstance(node.ops[0], ast.NotEq):
+            continue
+        if len(node.comparators) != 1:
+            continue
+        left = ast.unparse(node.left).replace(" ", "")
+        right = ast.unparse(node.comparators[0]).replace(" ", "")
+        if {left, right} == {"req.num_reqs", "1"}:
+            return True
+    return False
+
+
 def _class_inherits_explicit_request_batch_support(
     class_name: str,
     class_defs: dict[str, ast.ClassDef],
@@ -159,6 +178,19 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
 @pytest.mark.cpu
 def test_pipeline_forward_contract_uses_request_batch_static_contract():
     models_root = Path(__file__).resolve().parents[2] / "vllm_omni" / "diffusion" / "models"
+    flag_only_single_request_pipelines = {
+        "AudioXPipeline",
+        "DiffusersAdapterPipeline",
+        "FluxPipeline",
+        "LongCatImagePipeline",
+        "LTX2ImageToVideoPipeline",
+        "LTX2ImageToVideoTwoStagesPipeline",
+        "LTX2Pipeline",
+        "LTX2TwoStagesPipeline",
+        "OvisImagePipeline",
+        "StableAudioPipeline",
+        "ZImagePipeline",
+    }
     class_defs: dict[str, ast.ClassDef] = {}
     class_paths: dict[str, Path] = {}
     class_forwards: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
@@ -187,6 +219,25 @@ def test_pipeline_forward_contract_uses_request_batch_static_contract():
         req_annotation = _annotation_text(req_arg.annotation if req_arg is not None else None)
         supports_request_batch = _supports_request_batch_value(class_defs[class_name])
         inherits_request_batch_support = _class_inherits_explicit_request_batch_support(class_name, class_defs)
+
+        if _has_request_batch_size_guard(forward):
+            failures.append(
+                f"{class_paths[class_name]}:{class_name}.forward should not guard req.num_reqs; "
+                "the engine routes non-request-batch pipelines through execute_request"
+            )
+
+        if class_name in flag_only_single_request_pipelines:
+            if supports_request_batch is not False:
+                failures.append(
+                    f"{class_paths[class_name]}:{class_name} must declare supports_request_batch=False "
+                    "until it consumes sampling_params_list/request-local collate"
+                )
+            if not _return_annotation_is_diffusion_output(forward.returns):
+                failures.append(
+                    f"{class_paths[class_name]}:{class_name} is flag-only single-request pipeline "
+                    "but forward does not return DiffusionOutput"
+                )
+            continue
 
         if supports_request_batch is True and not _return_annotation_is_diffusion_output_list(forward.returns):
             failures.append(
