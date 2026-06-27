@@ -98,10 +98,12 @@ def test_device_check_survives_cli_override():
     # Strategy replicates the talker (1-GPU template -> valid at apply time),
     # but a CLI --stage_1_devices with 3 ids must NOT slip past the device
     # guard: effective world=1, replicas=2 admits only 1 or 2 device ids.
+    pipeline_cfg = OMNI_PIPELINES["qwen2_5_omni"]
     with pytest.raises(StrategyApplyError):
         StageConfigFactory._create_from_registry(
             "qwen2_5_omni",
-            {"stage_1_devices": "0,1,2"},
+            pipeline_cfg,
+            cli_overrides={"stage_1_devices": "0,1,2"},
             strategy_specs={"talker": [_stage_replica(2, "round_robin")]},
         )
 
@@ -123,9 +125,11 @@ def test_cli_overrides_strategy_with_warning():
     handler = _Capture(level=logging.WARNING)
     log.addHandler(handler)
     try:
+        pipeline_cfg = OMNI_PIPELINES["qwen2_5_omni"]
         stages, _ = StageConfigFactory._create_from_registry(
             "qwen2_5_omni",
-            {"stage_1_num_replicas": 3},
+            pipeline_cfg,
+            cli_overrides={"stage_1_num_replicas": 3},
             strategy_specs={"talker": [_stage_replica(2, "round_robin")]},
         )
     finally:
