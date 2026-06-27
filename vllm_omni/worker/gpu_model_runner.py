@@ -1933,18 +1933,27 @@ class OmniGPUModelRunner(GPUModelRunner):
         req_state = self.requests.get(req_id)
         if req_state is None:
             return
-        # Check if the model declares keys that should stay on GPU (tuples of (type_key, qualifier))
-        gpu_keys: set[tuple[str, str]] = set()
+        # Check if the model declares keys that should stay on GPU. Existing
+        # models use (type_key, qualifier) tuples for nested dict values; some
+        # lightweight TTS models also publish top-level tensor keys directly.
+        gpu_keys: set[tuple[str, str] | str] = set()
         if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
             gpu_keys = self.model.gpu_resident_buffer_keys
+        gpu_top_level_keys = {key for key in gpu_keys if isinstance(key, str)}
+        gpu_nested_keys = {key for key in gpu_keys if isinstance(key, tuple) and len(key) == 2}
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
         for k, v in upd.items():
             if isinstance(v, dict):
                 existing_sub = existing.setdefault(k, {})
                 for qual, val in v.items():
-                    self._store_value(existing_sub, qual, val, {q for tk, q in gpu_keys if tk == k})
+                    self._store_value(
+                        existing_sub,
+                        qual,
+                        val,
+                        {q for tk, q in gpu_nested_keys if tk == k},
+                    )
             else:
-                self._store_value(existing, k, v, set())
+                self._store_value(existing, k, v, gpu_top_level_keys)
         # Backward compatible: mirror to old setattr location
         setattr(req_state, "additional_information_cpu", existing)
 
