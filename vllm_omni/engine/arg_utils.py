@@ -477,6 +477,7 @@ class OrchestratorArgs:
     diffusion_kv_cache_skip_layers: str | None = None
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
+    vae_parallel_mode: str = "tile"
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None
