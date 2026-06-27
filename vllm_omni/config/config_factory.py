@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
@@ -123,6 +123,24 @@ class StageConfigFactory:
                             cli_overrides,
                             deploy_config_path,
                         )
+
+        # --- Explicit deploy-config pipeline ---
+        # When auto-detection above resolves nothing (generic/missing HF model_type
+        # and no matching architecture), honor an explicit pipeline key in the deploy config
+        if deploy_config_path is not None:
+            deploy_path = Path(deploy_config_path)
+            if deploy_path.exists():
+                deploy_cfg = load_deploy_config(deploy_path)
+                if deploy_cfg.pipeline:
+                    pipeline_cfg = cls.resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
+                    if pipeline_cfg is not None:
+                        return cls._create_from_registry(
+                            pipeline_cfg.model_type,
+                            pipeline_cfg,
+                            cli_overrides,
+                            deploy_config_path,
+                        )
+
         # Not in the pipeline registry — let the caller fall back to the
         # legacy ``stage_configs/*.yaml`` path (resolve_model_config_path).
         return None
@@ -329,7 +347,7 @@ class StageConfigFactory:
         return build_stage_runtime_overrides(stage.stage_id, cli_overrides)
 
     @staticmethod
-    def resolve_pipeline_config(model_type: str, hf_config: PreTrainedConfig | None = None) -> PipelineConfig | None:
+    def resolve_pipeline_config(model_type: str, hf_config: PretrainedConfig | None = None) -> PipelineConfig | None:
         """Given a model type, resolve to the pipeline to be used. If the pipeline
         maps to a callable we resolve based on the HF config."""
         if model_type not in OMNI_PIPELINES:

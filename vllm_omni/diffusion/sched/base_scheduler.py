@@ -52,6 +52,7 @@ class _BaseScheduler(SchedulerInterface):
         self._running_sampling_params_key: SamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
+        self._prefetch_enabled: bool = False
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
@@ -66,6 +67,8 @@ class _BaseScheduler(SchedulerInterface):
             self.max_num_running_reqs = max(1, int(max_num_seqs))
         except (TypeError, ValueError):
             self.max_num_running_reqs = 1
+        omni_kv = getattr(od_config, "omni_kv_config", None) or {}
+        self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -111,6 +114,22 @@ class _BaseScheduler(SchedulerInterface):
             else:
                 scheduled_cached_request_ids.append(request_id)
 
+        # Expose the next waiting request (serial mode) so the runner can
+        # prefetch its KV during this forward.  Skip a request without
+        # kv_sender_info (would target the wrong sender under multi-replica) or
+        # one already finished/aborted (would consume its sender buffer for
+        # nothing).
+        kv_prefetch_jobs: dict | None = None
+        if self._prefetch_enabled and self._waiting:
+            nxt = self._request_states.get(self._waiting[0])
+            if nxt is not None and not nxt.is_finished():
+                sender_info = getattr(nxt.req, "kv_sender_info", None)
+                if sender_info:
+                    kv_prefetch_jobs = {
+                        "request_id": nxt.request_id,
+                        "kv_sender_info": sender_info,
+                    }
+
         scheduler_output = DiffusionSchedulerOutput(
             step_id=self._step_id,
             scheduled_new_reqs=scheduled_new_reqs,
@@ -118,6 +137,7 @@ class _BaseScheduler(SchedulerInterface):
             finished_req_ids=set(self._finished_req_ids),
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
+            kv_prefetch_jobs=kv_prefetch_jobs,
         )
 
         # update after schedule
