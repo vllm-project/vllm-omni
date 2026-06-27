@@ -19,12 +19,9 @@ from vllm_omni.config.composable_parallel import (
     TakeRank,
     apply_strategy_specs,
 )
-from vllm_omni.config.stage_config import (
-    _PIPELINE_REGISTRY,
-    StageConfigFactory,
-    load_deploy_config,
-    merge_pipeline_deploy,
-)
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -40,7 +37,7 @@ def _stage_replica(size: int, policy: str = "round_robin") -> StrategySpec:
 
 
 def _qwen_stages():
-    pipeline = _PIPELINE_REGISTRY["qwen2_5_omni"]
+    pipeline = OMNI_PIPELINES["qwen2_5_omni"]
     deploy = load_deploy_config(_DEPLOY)
     return merge_pipeline_deploy(pipeline, deploy)
 
