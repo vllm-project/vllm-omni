@@ -341,7 +341,7 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
-    supports_request_batch = True
+    supports_request_batch = False
     support_image_input = True
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
@@ -2252,7 +2252,7 @@ class HunyuanImage3Pipeline(
         guidance_scale: float = 5.0,
         generator: torch.Generator | list[torch.Generator] | None = None,
         **kwargs,
-    ) -> list[DiffusionOutput]:
+    ) -> DiffusionOutput:
         extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
         (
             prompt_from_req,
@@ -2306,20 +2306,8 @@ class HunyuanImage3Pipeline(
         if any(t is not None for t in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        n = req.sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [
-                DiffusionOutput(
-                    output=image,
-                    custom_output=custom_output,
-                    stage_durations=stage_durations,
-                )
-            ]
-        return [
-            DiffusionOutput(
-                output=image[i * n : (i + 1) * n],
-                custom_output=custom_output,
-                stage_durations=stage_durations,
-            )
-            for i in range(req.num_reqs)
-        ]
+        return DiffusionOutput(
+            output=image,
+            custom_output=custom_output,
+            stage_durations=stage_durations,
+        )
