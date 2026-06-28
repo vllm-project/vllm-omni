@@ -143,6 +143,11 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         return free
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.cuda.mem_get_info(device)
+        return free, total
+
+    @classmethod
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 

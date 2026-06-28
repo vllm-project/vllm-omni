@@ -61,7 +61,7 @@ Memory optimization methods help reduce GPU memory usage, enabling inference on 
 |--------|-------------|----------|
 | **[CPU Offload](diffusion/cpu_offload_diffusion.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
 | **[Quantization](quantization/overview.md)** | Reduces transformer stages from BF16 to FP8/INT8/etc. | Limited VRAM, minimal accuracy loss    |
-| **[VAE Patch Parallelism](diffusion/parallelism/vae_patch_parallel.md)** | Distributes VAE decode tiling across GPUs | High-resolution generation with reduced VAE memory peak |
+| **[VAE Parallelism](diffusion/parallelism/vae_parallelism.md)** | Distributes VAE decode work across GPUs | High-resolution generation with reduced VAE memory peak |
 
 ### Extensions
 
@@ -146,7 +146,7 @@ The following tables show which models support each feature:
 | Model                        | ⚡TeaCache | ⚡Cache-DiT | 🔀SP (Ulysses & Ring) | 🔀CFG-Parallel | 🔀Tensor-Parallel | Pipeline-Parallel | 🔀HSDP | 💾CPU Offload (Layerwise) | 💾VAE-Patch-Parallel | 💾Quantization | 🔄Step Execution |
 |------------------------------|:---------:|:----------:|:---------------------:|:--------------:|:-----------------:|:-----------------:|:------:|:-------------------------:|:--------------------:|:--------------:|:----------------:|
 | **Wan2.2**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ✅         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
-| **Wan2.2-S2V**               |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |         ❌         |   ❌    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
+| **Wan2.2-S2V**               |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
 | **Wan2.1-VACE**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ❌    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
@@ -270,7 +270,7 @@ Measured on NVIDIA H800:
 **Memory Optimization:**
 
 - **[CPU Offload Guide](diffusion/cpu_offload_diffusion.md)** - Offload model components to CPU, reduce GPU memory usage
-- **[VAE Patch Parallelism Guide](diffusion/parallelism/vae_patch_parallel.md)** - Distribute VAE decode tiling across GPUs for high-resolution images
+- **[VAE Parallelism Guide](diffusion/parallelism/vae_parallelism.md)** - Distribute VAE decode work across GPUs for high-resolution images and videos
 - **[Quantization Overview](quantization/overview.md)** - Overview of quantization methods for diffusion, multi-stage omni/TTS, and multi-stage diffusion models
 
 **Extensions:**

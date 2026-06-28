@@ -24,12 +24,8 @@ class AudioMixin:
         audio_tensor = audio_obj.audio_tensor
         sample_rate = audio_obj.sample_rate
         response_format = audio_obj.response_format.lower()
-        stream_format = audio_obj.stream_format
         base64_encode = audio_obj.base64_encode
         speed = audio_obj.speed
-
-        if stream_format != "audio":
-            raise ValueError(f"Unsupported stream format: {stream_format}")
 
         if soundfile is None:
             raise ImportError(

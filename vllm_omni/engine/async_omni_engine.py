@@ -953,6 +953,7 @@ class AsyncOmniEngine:
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
+            vae_parallel_mode = normalized_kwargs.get("vae_parallel_mode") or "tile"
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
@@ -971,6 +972,7 @@ class AsyncOmniEngine:
                 ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
+                vae_parallel_mode=vae_parallel_mode,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
@@ -1027,6 +1029,7 @@ class AsyncOmniEngine:
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             "extras": {
                 "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),

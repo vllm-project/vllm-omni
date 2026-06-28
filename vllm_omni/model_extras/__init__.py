@@ -3,6 +3,7 @@
 
 from vllm_omni.model_extras.registry import (
     build_image_to_image_prompt,
+    build_image_to_video_prompt,
     build_text_to_image_prompt,
     get_extra_body_params,
     get_extra_output_params,
@@ -12,6 +13,7 @@ from vllm_omni.model_extras.registry import (
 
 __all__ = [
     "build_image_to_image_prompt",
+    "build_image_to_video_prompt",
     "build_text_to_image_prompt",
     "get_extra_body_params",
     "get_extra_output_params",

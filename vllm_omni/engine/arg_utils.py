@@ -20,6 +20,8 @@ logger = init_logger(__name__)
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
     "GLMTTSForConditionalGeneration": "glm_tts",
+    "IndexTTS2S2MelDecoder": "indextts2",
+    "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
@@ -35,7 +37,17 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
-        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingDenseConfig
+        from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
+            IndexTTS2Config,
+        )
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+            MingDenseConfig,
+            MingMoeConfig,
+        )
+        from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
+            MossTTSLocalConfig,
+            MossTTSRealtimeConfig,
+        )
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -57,6 +69,10 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("dense", MingDenseConfig),
+        ("bailingmm", MingMoeConfig),
+        ("indextts2", IndexTTS2Config),
+        ("moss_tts_local", MossTTSLocalConfig),
+        ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
@@ -461,6 +477,7 @@ class OrchestratorArgs:
     diffusion_kv_cache_skip_layers: str | None = None
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
+    vae_parallel_mode: str = "tile"
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

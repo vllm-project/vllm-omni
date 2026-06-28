@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from PIL import Image
@@ -19,19 +19,50 @@ from vllm_omni.model_extras.bagel import (
 from vllm_omni.model_extras.bagel import (
     build_text_to_image_prompt as build_bagel_text_to_image_prompt,
 )
+from vllm_omni.model_extras.cosmos3 import (
+    COSMOS3_EXTRA_BODY_PARAMS,
+    COSMOS3_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.cosmos3 import (
+    build_text_to_image_prompt as build_cosmos3_text_to_image_prompt,
+)
+from vllm_omni.model_extras.helios import (
+    HELIOS_EXTRA_BODY_PARAMS,
+    HELIOS_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.magi_human import (
+    MAGI_HUMAN_EXTRA_BODY_PARAMS,
+    MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.vace import (
+    VACE_EXTRA_BODY_PARAMS,
+    VACE_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.vace import (
+    build_image_to_video_prompt as build_vace_image_to_video_prompt,
+)
 
-# TODO: extend with TextToVideoPromptBuilder, ImageToVideoPromptBuilder
-# once a video model needs model-specific prompt construction (follow-up PR).
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
     dict[str, Any],
 ]
 ImageToImagePromptBuilder = Callable[
     [str, str | None, "Image.Image | list[Image.Image]", int | None, int | None],
+    dict[str, Any],
+]
+ImageToVideoPromptBuilder = Callable[
+    [
+        str,
+        str | None,
+        "Mapping[str, Any]",
+        int | None,
+        int | None,
+        int | None,
+    ],
     dict[str, Any],
 ]
 
@@ -64,6 +95,20 @@ def default_image_to_image_prompt(
     return result
 
 
+def default_image_to_video_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    media_inputs: Mapping[str, Any],
+    height: int | None = None,
+    width: int | None = None,
+    num_frames: int | None = None,
+) -> dict[str, Any]:
+    del height, width, num_frames
+    if set(media_inputs) != {"image"} or not isinstance(media_inputs["image"], Image.Image):
+        raise ValueError("This model only supports a single --image input in the shared image-to-video example.")
+    return default_image_to_image_prompt(prompt, negative_prompt, media_inputs["image"])
+
+
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
@@ -75,6 +120,28 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "SenseNovaU1Pipeline": {
         "extra_body_params": SENSENOVA_U1_EXTRA_BODY_PARAMS,
         "extra_output_params": SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
+    },
+    "Cosmos3OmniDiffusersPipeline": {
+        "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
+        "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+        "text_to_image_prompt_builder": build_cosmos3_text_to_image_prompt,
+    },
+    "MagiHumanPipeline": {
+        "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
+    },
+    "HeliosPipeline": {
+        "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
+        "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
+    },
+    "HeliosPyramidPipeline": {
+        "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
+        "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
+    },
+    "WanVACEPipeline": {
+        "extra_body_params": VACE_EXTRA_BODY_PARAMS,
+        "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
+        "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
     },
 }
 
@@ -145,3 +212,21 @@ def build_image_to_image_prompt(
         else default_image_to_image_prompt
     )
     return builder(prompt, negative_prompt, input_image, height, width)
+
+
+def build_image_to_video_prompt(
+    model_class_name: str | None,
+    prompt: str,
+    negative_prompt: str | None,
+    media_inputs: Mapping[str, Any],
+    height: int | None = None,
+    width: int | None = None,
+    num_frames: int | None = None,
+) -> dict[str, Any]:
+    spec = _get_spec(model_class_name)
+    builder: ImageToVideoPromptBuilder = (
+        spec.get("image_to_video_prompt_builder", default_image_to_video_prompt)
+        if spec is not None
+        else default_image_to_video_prompt
+    )
+    return builder(prompt, negative_prompt, media_inputs, height, width, num_frames)

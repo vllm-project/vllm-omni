@@ -606,13 +606,17 @@ class Wan22S2VPipeline(
 
         t5_checkpoint = os.path.join(model_path, "models_t5_umt5-xxl-enc-bf16.pth")
         self.text_encoder = UMT5EncoderModel(_WAN_UMT5_CONFIG)
-        self.text_encoder = _load_wan_t5_as_umt5(self.text_encoder, t5_checkpoint, dtype=dtype).to(self.device)
+        _cpu_offload = self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload
+        self.text_encoder = _load_wan_t5_as_umt5(self.text_encoder, t5_checkpoint, dtype=dtype)
+        if not _cpu_offload:
+            self.text_encoder = self.text_encoder.to(self.device)
 
         # -- VAE (original Wan2.1 VAE, loaded via diffusers from_single_file) --
         vae_pth = os.path.join(model_path, "Wan2.1_VAE.pth")
         self.vae = DistributedAutoencoderKLWan.from_single_file(vae_pth, torch_dtype=dtype)
         self.vae.init_distributed()
-        self.vae = self.vae.to(self.device)
+        if not _cpu_offload:
+            self.vae = self.vae.to(self.device)
 
         # -- Audio encoder (wav2vec2) --
         wav2vec_path = os.path.join(model_path, "wav2vec2-large-xlsr-53-english")
@@ -1284,7 +1288,7 @@ class Wan22S2VPipeline(
             )
 
             # ---- Decode this clip ----
-            if self.od_config.enable_cpu_offload:
+            if self.od_config.enable_cpu_offload and not getattr(self.od_config.parallel_config, "use_hsdp", False):
                 self.transformer.to("cpu")
                 current_omni_platform.empty_cache()
 

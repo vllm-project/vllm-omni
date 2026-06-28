@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
@@ -25,6 +26,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelL
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -601,6 +603,13 @@ class HeliosTransformer3DModel(nn.Module):
     Helios extends the Wan2.2 architecture with multi-term memory patches,
     guidance cross-attention, and chunked video generation support.
     """
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "blocks": ForwardPattern.Pattern_2,
+        },
+        has_separate_cfg=True,
+    )
 
     _repeated_blocks = ["HeliosTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["blocks"]

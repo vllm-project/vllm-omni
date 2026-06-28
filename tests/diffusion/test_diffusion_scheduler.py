@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import queue
 import threading
 from types import SimpleNamespace
@@ -238,6 +239,35 @@ class TestRequestScheduler:
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
 
+    def test_streaming_output_keeps_request_running_until_final_chunk(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace())
+        req_id = scheduler.add_request(_make_request("stream"))
+
+        sched_output = scheduler.schedule()
+        chunk = RunnerOutput(
+            request_id=req_id,
+            step_index=1,
+            finished=False,
+            result=DiffusionOutput(output="chunk-0", finished=False, chunk_index=0, total_chunks=2),
+        )
+        finished = scheduler.update_from_output(sched_output, chunk)
+
+        assert finished == set()
+        assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.RUNNING
+        assert scheduler.has_requests() is True
+
+        final_chunk = RunnerOutput(
+            request_id=req_id,
+            step_index=2,
+            finished=True,
+            result=DiffusionOutput(output="chunk-1", finished=True, chunk_index=1, total_chunks=2),
+        )
+        finished = scheduler.update_from_output(sched_output, final_chunk)
+
+        assert finished == {req_id}
+        assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+
     def test_fifo_single_request_scheduling(self) -> None:
         req_id_a = self.scheduler.add_request(_make_request("a"))
         req_id_b = self.scheduler.add_request(_make_request("b"))
@@ -369,6 +399,7 @@ class TestRequestScheduler:
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(streaming_output=False)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
         engine._rpc_lock = threading.RLock()
@@ -391,6 +422,7 @@ class TestDiffusionEngine:
         scheduler = _StubScheduler(request, runner_output)
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(streaming_output=False)
         engine.scheduler = scheduler
         engine._rpc_lock = threading.RLock()
         engine._cv = threading.Condition(engine._rpc_lock)
@@ -410,7 +442,7 @@ class TestDiffusionEngine:
     ) -> None:
         request = _make_request("init")
         scheduler = _StubScheduler(request, DiffusionOutput(output=None))
-        od_config = SimpleNamespace(model_class_name="mock_model")
+        od_config = SimpleNamespace(model_class_name="mock_model", streaming_output=False)
         fake_executor_cls = mocker.Mock(return_value=mocker.Mock())
 
         monkeypatch.setattr(
@@ -472,7 +504,7 @@ class TestDiffusionEngine:
 
     def test_finalize_finished_request_returns_aborted_output(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.scheduler = RequestScheduler()
+        engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
 
         req_id = engine.scheduler.add_request(_make_request("req-finalize"))
@@ -483,12 +515,77 @@ class TestDiffusionEngine:
         assert output.aborted is True
         assert output.abort_message == "Request req-finalize aborted."
 
+    @pytest.mark.asyncio
+    async def test_streaming_runner_output_notifies_each_chunk(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = StepScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._out_queue_streaming = {}
+        engine.main_loop = asyncio.get_running_loop()
+
+        req_id = engine.scheduler.add_request(_make_request("stream-engine"))
+        queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+        engine._out_queue_streaming[req_id] = queue
+        sched_output = engine.scheduler.schedule()
+
+        chunk = RunnerOutput(
+            request_id=req_id,
+            step_index=1,
+            finished=False,
+            result=DiffusionOutput(output="chunk-0", finished=False, chunk_index=0, total_chunks=2),
+        )
+        finished_req_ids = engine.scheduler.update_from_output(sched_output, chunk)
+        engine._handle_step_streaming_runner_output(finished_req_ids, sched_output.scheduled_request_ids, chunk)
+
+        notified_chunk = await asyncio.wait_for(queue.get(), timeout=1)
+        assert notified_chunk.output == "chunk-0"
+        assert notified_chunk.finished is False
+        assert engine.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.RUNNING
+
+        final_chunk = RunnerOutput(
+            request_id=req_id,
+            step_index=2,
+            finished=True,
+            result=DiffusionOutput(output="chunk-1", finished=True, chunk_index=1, total_chunks=2),
+        )
+        finished_req_ids = engine.scheduler.update_from_output(sched_output, final_chunk)
+        engine._handle_step_streaming_runner_output(finished_req_ids, sched_output.scheduled_request_ids, final_chunk)
+
+        notified_final = await asyncio.wait_for(queue.get(), timeout=1)
+        assert notified_final.output == "chunk-1"
+        assert notified_final.finished is True
+        assert engine.scheduler.get_request_state(req_id) is None
+
+    @pytest.mark.asyncio
+    async def test_finished_streaming_request_without_runner_output_notifies_waiter(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = RequestScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._out_queue_streaming = {}
+        engine.main_loop = asyncio.get_running_loop()
+
+        req_id = engine.scheduler.add_request(_make_request("stream-abort"))
+        queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+        engine._out_queue_streaming[req_id] = queue
+        engine.scheduler.finish_requests(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+        engine._handle_empty_streaming_requests({req_id})
+
+        output = await asyncio.wait_for(queue.get(), timeout=1)
+        assert output.aborted is True
+        assert output.finished is True
+        assert engine.scheduler.get_request_state(req_id) is None
+
     def test_initializes_step_scheduler_when_step_execution_enabled(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(model_class_name="mock_model")
+        od_config = SimpleNamespace(model_class_name="mock_model", streaming_output=False)
         od_config.step_execution = True
         fake_executor = mocker.Mock()
         fake_executor_cls = mocker.Mock(return_value=fake_executor)

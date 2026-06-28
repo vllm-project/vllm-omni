@@ -80,14 +80,29 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
 
-        # Initialize KV cache manager for connector management
+        # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+
+        # Prefetch covers TP / SP / CFG-Parallel / HSDP.  Disabled when a CFG
+        # companion KV collector is set (that KV is not backgrounded).
+        has_cfg_companion_kv = getattr(od_config, "cfg_kv_collect_func", None) is not None
+
+        self._kv_prefetch_enabled = (
+            bool(self.kv_transfer_manager.config.enable_kv_async_prefetch)
+            and not has_cfg_companion_kv
+            and self.kv_transfer_manager.config.need_recv_cache
+        )
+
+    @property
+    def target_device(self) -> torch.device | None:
+        return getattr(self.pipeline, "device", None)
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
         if model is None:
             return
+
         try:
             setattr(self.pipeline, attr_name, regionally_compile(model, dynamic=True))
             logger.info("Model runner: %s compiled with torch.compile.", attr_name)
@@ -152,10 +167,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         logger.info("Model runner: Model loaded successfully.")
 
+        if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
+            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+            self.od_config.step_execution = True
+
         if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                f"{self.od_config.model_class_name} does not support that contract."
+            )
+        if self.od_config.streaming_output and not self.supports_step_mode():
+            raise ValueError(
+                "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
@@ -259,7 +283,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
 
-    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
@@ -283,12 +307,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                req,
-                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                target_device=getattr(self.pipeline, "device", None),
-            )
+            # Receive AR KV (fetch → distribute → apply inside the entry). prefetch on:
+            # consume prior-forward payload, sync-fallback on miss; else sync receive.
+            kv_recv_t0 = time.perf_counter()
+            if self._kv_prefetch_enabled:
+                self.kv_transfer_manager.consume_and_distribute_kv_cache(
+                    req,
+                    target_device=self.target_device,
+                )
+            else:
+                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                    req,
+                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                    target_device=self.target_device,
+                )
+            kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
+            logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
+
+            # Kick off the next request's prefetch (+ H2D) to overlap this forward.
+            if self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
+                self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:
@@ -357,7 +395,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and self.od_config.enable_cache_dit_summary
             ):
                 cache_summary(self.pipeline, details=True)
-
             return output
 
     # ------------------------------------------------------------------
@@ -395,7 +432,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     state_req,
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=getattr(self.pipeline, "device", None),
+                    target_device=self.target_device,
                 )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
@@ -457,7 +494,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         scatter_latents(states, input_batch)
 
         for state in states:
-            if interrupted or state.denoise_completed:
+            if interrupted or state.request_denoise_completed:
                 self.state_cache.pop(state.request_id, None)
 
     def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
@@ -492,7 +529,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
-                noise_pred = self.pipeline.denoise_step(input_batch)
+                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
@@ -515,15 +552,24 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                         )
                         offset = offset + row_num
-                        if req.denoise_completed:
+                        if self.od_config.streaming_output:
+                            should_decode = req.chunk_denoise_completed
+                        else:
+                            should_decode = req.denoise_completed
+
+                        if should_decode:
                             result = self.pipeline.post_decode(req)
                         else:
                             result = None
+                        # finished should be computed after post_decode() advanced chunk_index
+                        finished = (
+                            req.request_denoise_completed if self.od_config.streaming_output else req.denoise_completed
+                        )
                         runner_output_list.append(
                             RunnerOutput(
                                 request_id=req.request_id,
                                 step_index=req.step_index,
-                                finished=req.denoise_completed,
+                                finished=finished,
                                 result=result,
                             )
                         )
