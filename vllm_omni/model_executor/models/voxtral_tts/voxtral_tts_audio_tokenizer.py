@@ -652,7 +652,7 @@ class TransformerBlock(nn.Module):
     def layer_id(self) -> int:
         return self._layer_id
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x))
         if self.post_attention_norm is not None:
             r = self.post_attention_norm(r)
@@ -757,7 +757,7 @@ class VoxtralTTSAudioTokenizer(nn.Module):
             # transformer
             layer_args = deepcopy(args)
             layer_args.attn_sliding_window_size = cur_window_size
-            assert layer_args.qk_norm, "qk_norm must be True for decoder"
+            assert layer_args.qk_norm, "qk_norm must be True for encoder"
             encoder_transformer = Transformer(
                 args=layer_args,
                 n_layers=n_layers,

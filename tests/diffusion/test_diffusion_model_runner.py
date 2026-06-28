@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import ast
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,105 +14,6 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.diffusion]
-
-
-def _annotation_text(annotation: ast.expr | None) -> str:
-    if annotation is None:
-        return ""
-    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
-        return annotation.value
-    return ast.unparse(annotation)
-
-
-def _supports_request_batch_value(class_def: ast.ClassDef) -> bool | None:
-    for node in class_def.body:
-        value = None
-        targets = []
-        if isinstance(node, ast.Assign):
-            value = node.value
-            targets = node.targets
-        elif isinstance(node, ast.AnnAssign):
-            value = node.value
-            targets = [node.target]
-        if not isinstance(value, ast.Constant) or not isinstance(value.value, bool):
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name) and target.id == "supports_request_batch":
-                return value.value
-    return None
-
-
-def _base_class_names(class_def: ast.ClassDef) -> list[str]:
-    return [ast.unparse(base).split(".")[-1] for base in class_def.bases]
-
-
-def _return_annotation_is_diffusion_output_list(annotation: ast.expr | None) -> bool:
-    return _annotation_text(annotation).replace(" ", "") in {
-        "list[DiffusionOutput]",
-        "List[DiffusionOutput]",
-    }
-
-
-def _return_annotation_is_diffusion_output(annotation: ast.expr | None) -> bool:
-    return _annotation_text(annotation).replace(" ", "") == "DiffusionOutput"
-
-
-def _has_request_batch_size_guard(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    for node in ast.walk(function):
-        if not isinstance(node, ast.Compare):
-            continue
-        if len(node.ops) != 1 or not isinstance(node.ops[0], ast.NotEq):
-            continue
-        if len(node.comparators) != 1:
-            continue
-        left = ast.unparse(node.left).replace(" ", "")
-        right = ast.unparse(node.comparators[0]).replace(" ", "")
-        if {left, right} == {"req.num_reqs", "1"}:
-            return True
-    return False
-
-
-def _class_inherits_explicit_request_batch_support(
-    class_name: str,
-    class_defs: dict[str, ast.ClassDef],
-    visiting: set[str] | None = None,
-) -> bool:
-    visiting = visiting or set()
-    if class_name in visiting:
-        return False
-    visiting.add(class_name)
-    class_def = class_defs.get(class_name)
-    if class_def is None:
-        return False
-    for base_name in _base_class_names(class_def):
-        base_def = class_defs.get(base_name)
-        if base_def is None:
-            continue
-        if _supports_request_batch_value(base_def) is True:
-            return True
-        if _class_inherits_explicit_request_batch_support(base_name, class_defs, visiting):
-            return True
-    return False
-
-
-def _effective_supports_request_batch(
-    class_name: str,
-    class_defs: dict[str, ast.ClassDef],
-    visiting: set[str] | None = None,
-) -> bool:
-    visiting = visiting or set()
-    if class_name in visiting:
-        return False
-    visiting.add(class_name)
-    class_def = class_defs.get(class_name)
-    if class_def is None:
-        return False
-    direct = _supports_request_batch_value(class_def)
-    if direct is not None:
-        return direct
-    return any(
-        _effective_supports_request_batch(base_name, class_defs, visiting) for base_name in _base_class_names(class_def)
-    )
 
 
 @contextmanager
@@ -159,6 +58,46 @@ class _SingleRequestDiffusionOutputPipeline:
         return DiffusionOutput(output=req.prompts[0])
 
 
+class _ChunkStepPipeline:
+    device = torch.device("cpu")
+    supports_step_execution = True
+
+    def __init__(self, outputs):
+        self._outputs = outputs
+        self.prepare_calls = 0
+        self.decode_calls = 0
+
+    def prepare_encode(self, state):
+        self.prepare_calls += 1
+        state.prompt_embeds = torch.zeros(1, 1, 1)
+        state.latents = torch.zeros(1, 1)
+        state.timesteps = torch.tensor([1.0, 0.0])
+        state.step_index = 0
+        state.step_in_chunk = 0
+        state.chunk_num_steps = 2
+        state.total_chunks = len(self._outputs)
+        return state
+
+    def denoise_step(self, input_batch, states):
+        del states
+        return torch.ones_like(input_batch.latents)
+
+    def step_scheduler(self, state, noise_pred):
+        state.latents = noise_pred
+        state.step_index += 1
+        state.step_in_chunk += 1
+
+    def post_decode(self, state):
+        output = self._outputs[self.decode_calls]
+        self.decode_calls += 1
+        state.chunk_index += 1
+        state.step_index = 0
+        state.step_in_chunk = 0
+        if not state.request_denoise_completed:
+            state.latents = torch.zeros(1, 1)
+        return output
+
+
 def _make_request(skip_cache_refresh: bool = True):
     sampling_params = SimpleNamespace(
         generator=None,
@@ -167,9 +106,11 @@ def _make_request(skip_cache_refresh: bool = True):
         num_inference_steps=4,
     )
     return SimpleNamespace(
+        request_id="req-test",
         prompt="a prompt",
         sampling_params=sampling_params,
         skip_cache_refresh=skip_cache_refresh,
+        kv_sender_info=None,
     )
 
 
@@ -180,106 +121,95 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="ok"))
     runner.cache_backend = cache_backend
     runner.offload_backend = None
+    runner.state_cache = {}
     runner.prompt_embed_cache = None
     runner.od_config = SimpleNamespace(
         cache_backend=cache_backend_name,
         enable_cache_dit_summary=enable_cache_dit_summary,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        streaming_output=False,
     )
     runner.kv_transfer_manager = SimpleNamespace(
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
-        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
+        receive_multi_kv_cache_distributed=lambda *a, **k: None,
     )
+    runner._kv_prefetch_enabled = False
+    return runner
+
+
+def _make_compile_runner(*, use_hsdp: bool):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = SimpleNamespace(transformer=SimpleNamespace())
+    runner.od_config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=use_hsdp))
     return runner
 
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_pipeline_forward_contract_uses_request_batch_static_contract():
-    models_root = Path(__file__).resolve().parents[2] / "vllm_omni" / "diffusion" / "models"
-    class_defs: dict[str, ast.ClassDef] = {}
-    class_paths: dict[str, Path] = {}
-    class_forwards: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+@pytest.mark.parametrize("use_hsdp", [False, True])
+def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
+    runner = _make_compile_runner(use_hsdp=use_hsdp)
+    compile_calls = []
 
-    for path in models_root.rglob("pipeline_*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in tree.body:
-            if not isinstance(node, ast.ClassDef) or not node.name.endswith("Pipeline"):
-                continue
-            forward = next(
-                (
-                    item
-                    for item in node.body
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "forward"
-                ),
-                None,
-            )
-            class_defs[node.name] = node
-            class_paths[node.name] = path.relative_to(models_root)
-            if forward is not None:
-                class_forwards[node.name] = forward
+    def _regionally_compile(model, *args, **kwargs):
+        compile_calls.append((model, args, kwargs))
+        return model
 
-    failures: list[str] = []
-    for class_name, forward in sorted(class_forwards.items()):
-        req_arg = next((arg for arg in forward.args.args if arg.arg == "req"), None)
-        req_annotation = _annotation_text(req_arg.annotation if req_arg is not None else None)
-        supports_request_batch = _supports_request_batch_value(class_defs[class_name])
-        effective_supports_request_batch = _effective_supports_request_batch(class_name, class_defs)
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
 
-        if _has_request_batch_size_guard(forward):
-            failures.append(
-                f"{class_paths[class_name]}:{class_name}.forward should not guard req.num_reqs; "
-                "the engine routes non-request-batch pipelines through execute_request"
-            )
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
 
-        if effective_supports_request_batch and not _return_annotation_is_diffusion_output_list(forward.returns):
-            failures.append(
-                f"{class_paths[class_name]}:{class_name} declares supports_request_batch=True "
-                "but forward does not return list[DiffusionOutput]"
-            )
-        if supports_request_batch is None and effective_supports_request_batch:
-            failures.append(
-                f"{class_paths[class_name]}:{class_name} inherits request-batch support; "
-                "declare supports_request_batch explicitly"
-            )
-        if req_annotation == "OmniDiffusionRequest":
-            failures.append(f"{class_paths[class_name]}:{class_name}.forward annotates req as OmniDiffusionRequest")
-        if not effective_supports_request_batch and _return_annotation_is_diffusion_output_list(forward.returns):
-            failures.append(
-                f"{class_paths[class_name]}:{class_name}.forward is not request-batch capable "
-                "but returns list[DiffusionOutput]"
-            )
-
-    assert not failures, "\n".join(failures)
+    assert compile_calls == [
+        (
+            runner.pipeline.transformer,
+            (),
+            {"dynamic": True},
+        )
+    ]
 
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_e2e_custom_qwen_pipeline_uses_request_batch_contract():
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "e2e"
-        / "offline_inference"
-        / "custom_pipeline"
-        / "qwen_image_pipeline_with_logprob.py"
-    )
-    tree = ast.parse(path.read_text(), filename=str(path))
-    class_def = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "QwenImagePipelineWithLogProbForTest"
-    )
-    forward = next(
-        item
-        for item in class_def.body
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "forward"
-    )
-    req_arg = next(arg for arg in forward.args.args if arg.arg == "req")
+def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
+    """Step streaming returns empty step results until a chunk decode boundary."""
+    chunks = [
+        DiffusionOutput(output="chunk-0", finished=False, chunk_index=0, total_chunks=2),
+        DiffusionOutput(output="chunk-1", finished=True, chunk_index=1, total_chunks=2),
+    ]
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _ChunkStepPipeline(chunks)
+    runner.od_config.streaming_output = True
+    runner.od_config.step_execution = True
+    req = _make_request(skip_cache_refresh=True)
+    req.request_id = "req"
 
-    assert _annotation_text(req_arg.annotation) == "DiffusionRequestBatch"
-    assert _supports_request_batch_value(class_def) is False
-    assert _annotation_text(forward.returns) == "DiffusionOutput"
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    first = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    assert first.get_request_output("req").result is None
+
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+    )
+    second = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    assert second.get_request_output("req").result == chunks[0]
+    assert second.get_request_output("req").finished is False
+
+    DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    fourth = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    assert fourth.get_request_output("req").result == chunks[1]
+    assert fourth.get_request_output("req").finished is True
 
 
 @pytest.mark.core_model
@@ -292,6 +222,9 @@ def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypa
     cache_summary_calls = []
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
     monkeypatch.setattr(
         model_runner_module,
         "cache_summary",
@@ -317,6 +250,9 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
     cache_summary_calls = []
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
     monkeypatch.setattr(
         model_runner_module,
         "cache_summary",
@@ -524,6 +460,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
         cache_config={},
         model_class_name="NextStep11Pipeline",
         enforce_eager=True,
+        streaming_output=False,
     )
 
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())

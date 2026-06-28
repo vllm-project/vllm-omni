@@ -70,7 +70,11 @@ def normalize_diffusion_postprocess_output(
     )
 
 
-def format_empty_diffusion_outputs(request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+def format_empty_diffusion_outputs(
+    request: OmniDiffusionRequest,
+    *,
+    finished: bool = True,
+) -> list[OmniRequestOutput]:
     return [
         OmniRequestOutput.from_diffusion(
             request_id=request.request_id,
@@ -78,6 +82,7 @@ def format_empty_diffusion_outputs(request: OmniDiffusionRequest) -> list[OmniRe
             prompt=request.prompt,
             metrics={},
             latents=None,
+            finished=finished,
         )
     ]
 
@@ -124,6 +129,7 @@ def format_diffusion_outputs(
         is_text_output=is_text_output,
         is_audio_output=is_audio_output,
         audio_sample_rate=audio_sample_rate,
+        finished=diffusion_output.finished,
     )
 
 
@@ -175,6 +181,7 @@ def _format_single_prompt_output(
     is_text_output: bool,
     is_audio_output: bool,
     audio_sample_rate: int | None,
+    finished: bool = True,
 ) -> list[OmniRequestOutput]:
     request_id = request.request_id
     mm_output = _build_multimodal_output(postprocess_output, audio_sample_rate)
@@ -191,6 +198,7 @@ def _format_single_prompt_output(
                 final_output_type="text",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
             ),
         ]
 
@@ -216,6 +224,7 @@ def _format_single_prompt_output(
                 final_output_type="audio",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
             ),
         ]
 
@@ -234,5 +243,6 @@ def _format_single_prompt_output(
             multimodal_output=mm_output,
             stage_durations=diffusion_output.stage_durations,
             peak_memory_mb=diffusion_output.peak_memory_mb,
+            finished=finished,
         ),
     ]

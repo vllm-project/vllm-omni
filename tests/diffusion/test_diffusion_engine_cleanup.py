@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
@@ -33,6 +34,7 @@ def _make_engine() -> DiffusionEngine:
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_queue = {}
+    engine._out_queue_streaming = {}
     engine._closed = False
     engine._shutdown_complete = False
     engine.abort_queue = queue.Queue()
@@ -53,6 +55,23 @@ def test_close_completes_pending_async_waiters() -> None:
 
         assert future.done()
         assert future.result().error == "DiffusionEngine is closed."
+    finally:
+        event_loop.close()
+
+
+def test_close_completes_pending_streaming_waiters() -> None:
+    engine = _make_engine()
+    event_loop = asyncio.new_event_loop()
+    try:
+        engine.main_loop = event_loop
+        queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+        engine._out_queue_streaming["pending-stream"] = queue
+
+        engine.close()
+
+        output = queue.get_nowait()
+        assert output.error == "DiffusionEngine is closed."
+        assert output.finished is True
     finally:
         event_loop.close()
 

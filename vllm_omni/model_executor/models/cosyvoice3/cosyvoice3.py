@@ -49,6 +49,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     unpad_prompt_conditioning,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -198,7 +199,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             ) from e
 
         model = _s3.load_model("speech_tokenizer_v3_25hz")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = current_omni_platform.get_torch_device()
         model = model.to(device).eval()
         cls._s3_model = (model, _s3, device)
         return cls._s3_model
@@ -479,14 +480,6 @@ class CosyVoice3Model(
             # Keep additional information synchronized for async_chunk updates.
             self.enable_update_additional_information = True
 
-            # Expose streaming parameters
-            self.token_overlap_len = self.code2wav.token_overlap_len
-            self.mel_overlap_len = self.code2wav.mel_overlap_len
-            self.mel_window = self.code2wav.mel_window
-            self.mel_cache_len = self.code2wav.mel_cache_len
-            self.source_cache_len = self.code2wav.source_cache_len
-            self.speech_window = self.code2wav.speech_window
-            self._stream_audio_cache_by_req: dict[str, torch.Tensor] = {}
             self._stream_audio_cache_lock = Lock()
             self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
         else:
@@ -511,27 +504,6 @@ class CosyVoice3Model(
         # Use parent's cache config - critical for PagedAttention to work correctly
         return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
 
-    @staticmethod
-    def _cross_fade_audio(audio: torch.Tensor, prev_tail: torch.Tensor) -> torch.Tensor:
-        """Blend previous chunk tail into current chunk head using a Hamming window.
-
-        This mirrors upstream CosyVoice's `fade_in_out(...)` semantics:
-        update the current head in-place using a 2*overlap window, then
-        concatenate the unchanged remainder.
-        """
-        if audio.numel() == 0 or prev_tail.numel() == 0:
-            return audio
-        overlap = min(int(audio.numel()), int(prev_tail.numel()))
-        if overlap <= 0:
-            return audio
-        window = torch.hamming_window(2 * overlap, periodic=False, dtype=audio.dtype, device=audio.device)
-        fade_in = window[:overlap]
-        fade_out = window[overlap:]
-        blended = audio[:overlap] * fade_in + prev_tail[-overlap:].to(device=audio.device, dtype=audio.dtype) * fade_out
-        if overlap == int(audio.numel()):
-            return blended
-        return torch.cat([blended, audio[overlap:]], dim=0)
-
     def _stitch_stream_audio(self, req_id: str | None, audio: torch.Tensor, stream_finished: bool) -> torch.Tensor:
         """Pass-through stitching for async_chunk.
 
@@ -539,11 +511,9 @@ class CosyVoice3Model(
         Applying an additional waveform-domain fade/cache step introduces either
         duplicated overlap (if no tail trim) or duration shrink (if tail trim).
         """
-        if req_id is not None and stream_finished and hasattr(self, "_stream_audio_cache_by_req"):
+        if req_id is not None and stream_finished and hasattr(self, "_stream_vocoder_cache_by_req"):
             with self._stream_audio_cache_lock:
-                self._stream_audio_cache_by_req.pop(req_id, None)
-                if hasattr(self, "_stream_vocoder_cache_by_req"):
-                    self._stream_vocoder_cache_by_req.pop(req_id, None)
+                self._stream_vocoder_cache_by_req.pop(req_id, None)
         return audio
 
     @staticmethod

@@ -72,6 +72,31 @@ pytest -s -v tests/e2e/offline_inference/test_sensenova_u1_text2img.py \
 - No deploy YAML needed — the engine auto-generates a single-stage diffusion config.
 - Think mode (`--think`) is recommended for higher image quality.
 
+#### Text-to-Image via the shared example
+
+SenseNova-U1 is also registered with the shared text-to-image example, so you
+can run it through `text_to_image.py` instead of `end2end.py`. Forward the
+SenseNova-specific generation parameters as a JSON object through `--extra-body`:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model SenseNova/SenseNova-U1-8B-MoT \
+    --prompt "A beautiful sunset over mountains" \
+    --width 2048 --height 2048 \
+    --num-inference-steps 50 \
+    --seed 42 \
+    --extra-body '{"think": true, "cfg_scale": 4.0, "cfg_norm": "none", "timestep_shift": 3.0, "t_eps": 0.02}' \
+    --output sensenova_text2img.png
+```
+
+The `--extra-body` keys are filtered against the model's declared
+`extra_body_params` (see
+[`vllm_omni/model_extras/sensenova_u1.py`](../../vllm_omni/model_extras/sensenova_u1.py)):
+`think`, `cfg_scale`, `cfg_norm`, `timestep_shift`, `t_eps`, `img_cfg_scale`,
+and `max_tokens`. No deploy YAML is needed — the engine auto-generates a
+single-stage diffusion config. For richer task modalities (img2text, text2text)
+and CPU offload, use the dedicated `end2end.py` script described above.
+
 #### Image-to-Image Editing (img2img)
 
 ```bash

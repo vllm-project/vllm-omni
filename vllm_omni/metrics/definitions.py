@@ -13,9 +13,9 @@ time-bearing metrics use the ``_s`` suffix (values in seconds), counters use
 
 from typing import Any
 
-# vllm:omni_ avoids upstream's unregister_vllm_metrics() stripping, which
-# removes every collector whose ``_name`` does not start with ``vllm``.
-METRIC_PREFIX = "vllm:omni_"
+# vllm_omni: namespace for omni-specific Prometheus families, distinct from
+# the upstream vllm:* families.
+METRIC_PREFIX = "vllm_omni:"
 
 
 # ============================================================================

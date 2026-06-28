@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import multiprocessing.connection
 import signal
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -170,6 +171,29 @@ class StageDiffusionProc:
             result.request_id = request_id
         return result
 
+    async def _process_streaming_request(
+        self,
+        request_id: str,
+        prompt: Any,
+        sampling_params_dict: dict,
+        kv_sender_info: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Process a streaming diffusion request and yield the results from DiffusionEngine.step_streaming()."""
+        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
+
+        request = OmniDiffusionRequest(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            kv_sender_info=kv_sender_info,
+        )
+
+        async for results in self._engine.step_streaming(request):  # pyright: ignore[reportOptionalMemberAccess]
+            result = results[0]
+            if not result.request_id:
+                result.request_id = request_id
+            yield result
+
     async def _process_batch_request(
         self,
         request_id: str,
@@ -326,13 +350,22 @@ class StageDiffusionProc:
         ) -> None:
             """Process a single diffusion request and send the response."""
             try:
-                result = await self._process_request(
-                    request_id,
-                    prompt,
-                    sampling_params_dict,
-                    kv_sender_info=kv_sender_info,
-                )
-                await response_socket.send(encoder.encode({"type": "result", "output": result}))
+                if not self._od_config.streaming_output:
+                    result = await self._process_request(
+                        request_id,
+                        prompt,
+                        sampling_params_dict,
+                        kv_sender_info=kv_sender_info,
+                    )
+                    await response_socket.send(encoder.encode({"type": "result", "output": result}))
+                else:
+                    async for result in self._process_streaming_request(
+                        request_id,
+                        prompt,
+                        sampling_params_dict,
+                        kv_sender_info=kv_sender_info,
+                    ):
+                        await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
                 logger.info(
                     "request_id: %s aborted: %s",

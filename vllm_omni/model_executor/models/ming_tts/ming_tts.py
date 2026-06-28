@@ -16,7 +16,6 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 
 from .audio_prep import (
-    _coerce_prompt_latents,
     _find_audio_placeholder_positions,
     _find_speaker_placeholder_positions,
     _initial_history,
@@ -32,7 +31,6 @@ from .config_ming_tts import (
     KEY_MAX_DECODE_STEPS,
     KEY_MIN_DECODE_STEPS,
     KEY_NEXT_EMBEDS,
-    KEY_PROMPT_LATENT_TAIL,
     KEY_REQUEST_ID,
     KEY_SIGMA,
     KEY_SPEAKER_EMBEDDING,
@@ -175,7 +173,6 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             dtype=torch.float32,
         )
         update[KEY_LATENT_HISTORY] = history.detach().to("cpu").contiguous()
-        update[KEY_PROMPT_LATENT_TAIL] = update[KEY_LATENT_HISTORY]
 
         speaker_embedding = info_dict.get(KEY_SPEAKER_EMBEDDING, info_dict.get("speaker_embedding"))
         speaker_embeddings = None
@@ -185,7 +182,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
                 use_zero_spk_emb=bool(info_dict.get("use_zero_spk_emb", False)),
             )
         if speaker_embeddings is not None and len(speaker_embeddings) > 0:
-            speaker_slots = _find_speaker_placeholder_positions(input_ids, self.vllm_config.model_config.hf_config)
+            speaker_slots = _find_speaker_placeholder_positions(input_ids, self.ming_config)
             if len(speaker_slots) < len(speaker_embeddings):
                 raise RuntimeError(
                     "Could not locate enough speaker placeholder slots: "
@@ -262,7 +259,6 @@ def _copy_runtime_controls(update: dict[str, Any], info_dict: dict[str, Any]) ->
 __all__ = [
     "MingTTSForConditionalGeneration",
     "_ModelSampleAdapter",
-    "_coerce_prompt_latents",
     "_find_audio_placeholder_positions",
     "_find_speaker_placeholder_positions",
     "_initial_history",

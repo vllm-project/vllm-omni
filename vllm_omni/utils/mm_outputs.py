@@ -20,6 +20,9 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     Args:
         multimodal_outputs: Multimodal dict mapping strings to objects.
     """
+    if not multimodal_outputs:
+        return {}
+
     # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
     # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
     mm_cpu: dict[str, object] = {}
@@ -28,11 +31,10 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     if not isinstance(multimodal_outputs, Mapping):
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
-    if multimodal_outputs:
-        for k, v in multimodal_outputs.items():
-            cpu_v = _to_cpu(v)
-            if cpu_v is not None:
-                mm_cpu[k] = cpu_v
+    for k, v in multimodal_outputs.items():
+        cpu_v = _to_cpu(v)
+        if cpu_v is not None:
+            mm_cpu[k] = cpu_v
     return mm_cpu
 
 

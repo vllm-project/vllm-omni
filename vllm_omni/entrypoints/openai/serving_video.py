@@ -128,6 +128,8 @@ class OmniOpenAIServingVideo:
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail="Provide either an image reference or a video reference, not both.",
             )
+        provided_fields = request.model_fields_set
+        fps_provided = self._request_fps_provided(request)
         vp = request.resolve_video_params()
         if input_image is not None and vp.width is not None and vp.height is not None:
             target_size = (vp.width, vp.height)
@@ -147,10 +149,10 @@ class OmniOpenAIServingVideo:
             gen_params.height = vp.height
         if vp.num_frames is not None:
             gen_params.num_frames = vp.num_frames
-        if vp.fps is not None:
+        # Leave fps/frame_rate as None when the user did not provide fps.
+        if fps_provided and vp.fps is not None:
             gen_params.fps = vp.fps
             gen_params.frame_rate = float(vp.fps)
-        provided_fields = request.model_fields_set
         if "enable_frame_interpolation" in provided_fields:
             gen_params.enable_frame_interpolation = request.enable_frame_interpolation
         if "frame_interpolation_exp" in provided_fields:
@@ -229,7 +231,9 @@ class OmniOpenAIServingVideo:
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         actions = self._extract_action_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
-        output_fps = (vp.fps or self._resolve_fps(result) or 24) * self._resolve_video_fps_multiplier(result)
+        model_fps = self._resolve_fps(result)
+        output_fps_base = (vp.fps if fps_provided else None) or model_fps or vp.fps or 24
+        output_fps = output_fps_base * self._resolve_video_fps_multiplier(result)
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -343,6 +347,15 @@ class OmniOpenAIServingVideo:
             if multiplier is not None:
                 return int(multiplier)
         return 1
+
+    @staticmethod
+    def _request_fps_provided(request: VideoGenerationRequest) -> bool:
+        if "fps" in request.model_fields_set and request.fps is not None:
+            return True
+        video_params = request.video_params
+        if video_params is None or "video_params" not in request.model_fields_set:
+            return False
+        return "fps" in video_params.model_fields_set and video_params.fps is not None
 
     def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
         default_sampling_params_list = getattr(self._engine_client, "default_sampling_params_list", None)

@@ -233,7 +233,12 @@ def _forward_with_fish_kvcache(
 
     if attn_metadata is not None and not attn_metadata.use_cascade:
         num_actual_tokens = attn_metadata.num_actual_tokens
-        key_cache, value_cache = kv_cache.unbind(0)
+        # vLLM >=0.23.0 lays out the KV cache as
+        # (num_blocks, 2, block_size, num_kv_heads, head_size), so key/value
+        # live on dim 1 (matches FlashAttentionImpl's kv_cache.unbind(1)).
+        # The pre-0.23 layout had them on dim 0; unbind(0) here would split
+        # along num_blocks and raise "too many values to unpack".
+        key_cache, value_cache = kv_cache.unbind(1)
         q = query[:num_actual_tokens]
         out = output[:num_actual_tokens]
         active_batch = int(q.shape[0])

@@ -20,6 +20,7 @@ RATIO_START = 200
 RATIO_END = 210
 RATIO_OTHER_START = 220
 RATIO_OTHER_END = 223
+TIMESTEP = 224
 
 
 class FakeSamplerModel:
@@ -58,6 +59,67 @@ class FakeSamplerModel:
 
     _get_forced_token = _Real._get_forced_token
     _apply_ratio_restriction = _Real._apply_ratio_restriction
+
+
+class FakeTokenEmbedding:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            [
+                input_ids.to(dtype=torch.float32),
+                input_ids.to(dtype=torch.float32) + 0.5,
+            ],
+            dim=-1,
+        )
+
+
+class FakeEmbeddingModel:
+    def __init__(self):
+        self.model = FakeTokenEmbedding()
+        self._timestep_token_id = TIMESTEP
+
+    from vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 import (
+        HunyuanImage3ForConditionalGeneration as _Real,
+    )
+
+    embed_input_ids = _Real.embed_input_ids
+
+    def _timestep_encode(self, timestep: torch.Tensor) -> torch.Tensor:
+        return torch.full(
+            (1, 2),
+            -7.0,
+            device=timestep.device,
+            dtype=timestep.dtype,
+        )
+
+
+class TestTimestepEmbedding:
+    def test_timestep_embedding_avoids_scalar_item_sync(self, monkeypatch):
+        model = FakeEmbeddingModel()
+        input_ids = torch.tensor([1, TIMESTEP, 2, TIMESTEP], dtype=torch.long)
+
+        def fail_item(_self):
+            raise AssertionError("embed_input_ids should not synchronize timestep count")
+
+        monkeypatch.setattr(torch.Tensor, "item", fail_item)
+
+        actual = model.embed_input_ids(input_ids)
+        expected = model.model.embed_input_ids(input_ids)
+        expected[input_ids == TIMESTEP] = -7.0
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_timestep_embedding_preserves_no_timestep_inputs(self, monkeypatch):
+        model = FakeEmbeddingModel()
+        input_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+
+        def fail_item(_self):
+            raise AssertionError("embed_input_ids should not synchronize timestep count")
+
+        monkeypatch.setattr(torch.Tensor, "item", fail_item)
+
+        actual = model.embed_input_ids(input_ids)
+
+        torch.testing.assert_close(actual, model.model.embed_input_ids(input_ids))
 
 
 class TestGetForcedToken:

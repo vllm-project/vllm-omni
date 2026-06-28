@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import torch
@@ -22,20 +22,56 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSDelayConfig,
+    MossTTSLocalConfig,
     MossTTSRealtimeConfig,
 )
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     MossTTSRealtimeLocalTransformer,
 )
+from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import (
+    MossTTSLocalDepthTransformer,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
-_AUDIO_PAD_ID = 0  # padding id used before delay slot fires
-
 
 def _maybe_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
+
+
+def _iter_state_row_spans(
+    states: Sequence[dict[str, Any]],
+    spans: Sequence[tuple[int, int]] | None,
+    num_rows: int,
+) -> Iterable[tuple[dict[str, Any], int, int]]:
+    """Yield state/logit-row ranges without assuming equal request row counts."""
+    if num_rows <= 0 or not states:
+        return
+
+    if spans is not None:
+        if len(spans) != len(states):
+            raise RuntimeError(f"request_token_spans has {len(spans)} entries for {len(states)} request states")
+        if all(row_end <= num_rows for _, row_end in spans):
+            for state, (row_start, row_end) in zip(states, spans, strict=False):
+                if row_start < row_end:
+                    yield state, int(row_start), int(row_end)
+            return
+        if num_rows != len(states):
+            raise RuntimeError(
+                "request_token_spans describe full hidden rows, but current logits "
+                f"have {num_rows} rows for {len(states)} states and are not one-row-per-request"
+            )
+
+    if num_rows == len(states):
+        for i, state in enumerate(states):
+            yield state, i, i + 1
+        return
+
+    raise RuntimeError(
+        "MOSS-TTS compute_logits requires request_token_spans or one-row-per-request logits; "
+        f"got {num_rows} rows for {len(states)} request states"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +189,12 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         # `make_omni_output`, which runs immediately before the sampler).
         self._batch_state: list[dict[str, Any]] | None = None
 
+        # Stacked weight caches built after load_weights(). Avoids a Python
+        # loop over n_vq heads/embeddings at every decode step.
+        # shapes: (n_vq, audio_vocab+1, hidden_size)
+        self._stacked_audio_head_w: torch.Tensor | None = None
+        self._stacked_audio_emb_w: torch.Tensor | None = None
+
     # ------------------------------------------------------------------
     # vLLM-Omni hooks
     # ------------------------------------------------------------------
@@ -205,14 +247,13 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         n_vq = self.n_vq
         device = logits.device
         vocab_size = logits.shape[-1]
-        rows_per_state = max(1, logits.shape[0] // max(1, len(states)))
 
-        for i, state in enumerate(states):
-            if not isinstance(state, dict):
-                continue
-            row_start = i * rows_per_state
-            row_end = min(row_start + rows_per_state, logits.shape[0])
-            if row_start >= row_end:
+        for state, row_start, row_end in _iter_state_row_spans(
+            states,
+            getattr(self, "_batch_state_spans", None),
+            logits.shape[0],
+        ):
+            if state is None:
                 continue
             row = logits[row_start:row_end]
 
@@ -394,9 +435,15 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                     chunk = ref_codes[ref_offset:end_off]
                     if chunk.numel() > 0 and chunk.shape[0] == span_len:
                         codes = chunk.to(device=device, dtype=torch.long).clamp_(0, self.audio_vocab_size)
-                        audio_embed = torch.zeros_like(embeds)
-                        for i, emb_layer in enumerate(self.audio_embeddings):
-                            audio_embed = audio_embed + emb_layer(codes[:, i])
+                        if self._stacked_audio_emb_w is not None:
+                            codes_nq = codes.t()  # (n_vq, L)
+                            audio_embed = self._stacked_audio_emb_w[
+                                torch.arange(self.n_vq, device=device)[:, None], codes_nq
+                            ].sum(0)
+                        else:
+                            audio_embed = torch.zeros_like(embeds)
+                            for i, emb_layer in enumerate(self.audio_embeddings):
+                                audio_embed = audio_embed + emb_layer(codes[:, i])
                         embeds = embeds + audio_embed
                         last_ref_row = codes[-1].detach()
 
@@ -436,10 +483,17 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         audio_codes_buf = (info_dict.get("audio_codes", {}) or {}).get("current")
         if isinstance(audio_codes_buf, torch.Tensor) and audio_codes_buf.numel() == self.n_vq:
             codes = audio_codes_buf.to(device=device, dtype=torch.long)
-            audio_embed = torch.zeros_like(text_embed)
-            for i, emb_layer in enumerate(self.audio_embeddings):
-                code_i = codes[i].clamp(0, self.audio_vocab_size).reshape(1)
-                audio_embed = audio_embed + emb_layer(code_i)
+            if self._stacked_audio_emb_w is not None:
+                # Single gather: stacked_emb[i, codes[i]] for each i → (n_vq, H) → sum → (1, H)
+                n_vq_idx = torch.arange(self.n_vq, device=device)
+                audio_embed = self._stacked_audio_emb_w[n_vq_idx, codes.clamp(0, self.audio_vocab_size)].sum(
+                    0, keepdim=True
+                )
+            else:
+                audio_embed = torch.zeros_like(text_embed)
+                for i, emb_layer in enumerate(self.audio_embeddings):
+                    code_i = codes[i].clamp(0, self.audio_vocab_size).reshape(1)
+                    audio_embed = audio_embed + emb_layer(code_i)
             combined = text_embed + audio_embed
         else:
             combined = text_embed
@@ -501,17 +555,38 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         if not bool(sampling_mask.any()):
             return codes
 
-        # Use deploy YAML defaults. The audio sampler isn't routed through
-        # vLLM's sampler so we apply the upstream's audio_top_k locally.
         audio_top_k = 25
         audio_temp = 1.7
 
+        if self._stacked_audio_head_w is not None:
+            # Single batched matmul: (n_vq, V+1, H) @ (H,) → (n_vq, V+1).
+            # Replaces n_vq serial nn.Linear calls.
+            all_logits = self._stacked_audio_head_w @ last_h.reshape(-1)  # (n_vq, V+1)
+            all_logits[:, -1] = float("-inf")  # invalid sentinel
+            all_logits[:, self.audio_pad_code] = float("-inf")
+
+            active_idx = sampling_mask.nonzero(as_tuple=True)[0]  # (n_active,)
+            active_logits = all_logits[active_idx]  # (n_active, V+1)
+            active_logits = active_logits / max(audio_temp, 1e-6)
+            if audio_top_k > 0 and audio_top_k < active_logits.shape[-1]:
+                top_vals, _ = torch.topk(active_logits, audio_top_k, dim=-1)
+                kth = top_vals[:, -1:].expand_as(active_logits)
+                active_logits = torch.where(
+                    active_logits < kth,
+                    torch.full_like(active_logits, float("-inf")),
+                    active_logits,
+                )
+            probs = torch.softmax(active_logits, dim=-1)
+            codes[active_idx] = torch.multinomial(probs, num_samples=1).squeeze(-1).long()
+            return codes
+
+        # Fallback: per-head loop (used before load_weights() completes).
         for i in range(n_vq):
             if not bool(sampling_mask[i]):
                 continue
             head = self.audio_heads[i]
             logits = head(last_h).reshape(-1)  # (V,)
-            logits[..., -1] = float("-inf")  # invalid sentinel
+            logits[..., -1] = float("-inf")
             logits[..., self.audio_pad_code] = float("-inf")
             sampled = self._sample_with_top_k(logits, audio_top_k, audio_temp)
             codes[i] = sampled.long()
@@ -531,6 +606,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         """
         if isinstance(model_outputs, OmniOutput):
             self._batch_state = None
+            self._batch_state_spans = None
             return model_outputs
 
         hidden = model_outputs  # (S, H)
@@ -552,19 +628,37 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         # Stash the per-row state for compute_logits to apply masks. logits
         # rows align with hidden rows, which align with info_dicts in order.
         self._batch_state = [(info["audio_state"] if isinstance(info, dict) else {}) for info in info_dicts]
+        self._batch_state_spans = kwargs.get("request_token_spans")
 
-        audio_codes_list: list[torch.Tensor] = []
+        # Per-request (start, end) hidden-row spans from the runner. In mixed
+        # prefill+decode steps the per-request token counts differ, so an equal
+        # rows-per-request split would sample codes from the wrong rows.
+        spans = kwargs.get("request_token_spans")
+
+        # One accumulated-codes tensor per request, in batch order. The generic
+        # splitter (``to_payload_element``) routes ``per_req_codes[idx]`` to
+        # request ``idx``, so Stage 1 decodes each request's own codes instead
+        # of request 0's. Skipped requests get an empty placeholder so indices
+        # stay aligned (a shorter list would silently fall back to entry 0).
+        per_req_codes: list[torch.Tensor] = []
+        have_codes = False
 
         if hidden.numel() > 0:
             num_rows = hidden.shape[0]
-            rows_per_req = max(1, num_rows // max(1, len(info_dicts) or 1))
+            if spans is None or len(spans) != len(info_dicts):
+                raise RuntimeError(
+                    "MOSS-TTS make_omni_output requires request_token_spans "
+                    f"for {len(info_dicts)} request infos, got {0 if spans is None else len(spans)}"
+                )
 
             for i, info in enumerate(info_dicts):
                 if not isinstance(info, dict):
+                    per_req_codes.append(hidden.new_empty((0, self.n_vq), dtype=torch.long))
                     continue
-                row_start = i * rows_per_req
-                row_end = min(row_start + rows_per_req, num_rows)
+                row_start, row_end = spans[i]
+                row_end = min(int(row_end), num_rows)
                 if row_start >= row_end:
+                    per_req_codes.append(hidden.new_empty((0, self.n_vq), dtype=torch.long))
                     continue
 
                 # Sample new audio codes from the last hidden state of this request.
@@ -582,21 +676,20 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                     "current": new_codes,
                     "accumulated": updated_acc,
                 }
-                audio_codes_list.append(updated_acc)
+                per_req_codes.append(updated_acc)
+                have_codes = True
 
-        if not audio_codes_list:
+        if not have_codes:
             return OmniOutput(
                 text_hidden_states=hidden,
                 multimodal_outputs={},
             )
 
-        # Forward the accumulated audio codes (T, NQ) of the first request to
-        # Stage 1.  Multi-request batching for the codec is not yet supported
-        # by this adapter; the existing code already takes the first stage
-        # output anyway.
+        # Emit one accumulated-codes tensor per request as a list; the splitter
+        # picks ``element[idx]`` per request on the way to Stage 1.
         return OmniOutput(
             text_hidden_states=hidden,
-            multimodal_outputs={"codes": {"audio": audio_codes_list[0]}},
+            multimodal_outputs={"codes": {"audio": per_req_codes}},
         )
 
     # ------------------------------------------------------------------
@@ -660,6 +753,14 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         backbone_loaded = self.model.load_weights(iter(backbone_weights))
         for n in backbone_loaded:
             loaded.add(f"model.{n}")
+
+        # Build stacked weight caches for vectorised decode ops.
+        self._stacked_audio_head_w = torch.stack(
+            [h.weight.detach() for h in self.audio_heads], dim=0
+        )  # (n_vq, audio_vocab+1, hidden_size)
+        self._stacked_audio_emb_w = torch.stack(
+            [e.weight.detach() for e in self.audio_embeddings], dim=0
+        )  # (n_vq, audio_vocab+1, hidden_size)
 
         return loaded
 
@@ -748,6 +849,10 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(self.text_vocab_size)
         self._batch_state: list[dict[str, Any]] | None = None
 
+        # Stacked weight cache built after load_weights().
+        # shape: (n_vq, audio_vocab_size, hidden_size)
+        self._stacked_audio_emb_w: torch.Tensor | None = None
+
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
             ("audio_codes", "accumulated"),
@@ -797,13 +902,12 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         logits = hidden_states.new_full((B, V), float("-inf"))
 
         states = self._batch_state or []
-        rows_per_state = max(1, B // max(1, len(states) or 1))
-        for i, state in enumerate(states):
-            r0 = i * rows_per_state
-            r1 = min(r0 + rows_per_state, B)
-            if r0 >= r1:
-                continue
-            if not isinstance(state, dict):
+        for state, r0, r1 in _iter_state_row_spans(
+            states,
+            getattr(self, "_batch_state_spans", None),
+            B,
+        ):
+            if state is None:
                 logits[r0:r1, self.text_pad_id] = 0.0
                 continue
             if state.get("is_stopping"):
@@ -837,6 +941,11 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         embeds = self.embed_tokens[0](text_ids)
         if audio_codes is None:
             return embeds
+        if self._stacked_audio_emb_w is not None:
+            # Single gather: (n_vq, vocab, H)[arange[:,None], codes.T] → (n_vq, T, H) → sum → (T, H)
+            n_vq_idx = torch.arange(self.n_vq, device=audio_codes.device)
+            codes_t = audio_codes.t().clamp(0, self.audio_vocab_size - 1)  # (n_vq, T)
+            return embeds + self._stacked_audio_emb_w[n_vq_idx.unsqueeze(1), codes_t].sum(0)
         for i in range(self.n_vq):
             col = audio_codes[:, i].clamp_(0, self.audio_vocab_size - 1)
             embeds = embeds + self.embed_tokens[i + 1](col)
@@ -919,6 +1028,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     ) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             self._batch_state = None
+            self._batch_state_spans = None
             return model_outputs
 
         hidden = model_outputs  # (S, H)
@@ -932,16 +1042,29 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 info["audio_state"] = {"is_stopping": False, "step": 0}
 
         self._batch_state = [(info["audio_state"] if isinstance(info, dict) else {}) for info in info_dicts]
+        self._batch_state_spans = kwargs.get("request_token_spans")
 
-        audio_codes_list: list[torch.Tensor] = []
+        # See delay talker: real per-request row spans from the runner are
+        # required because mixed prefill+decode steps have unequal row counts.
+        spans = kwargs.get("request_token_spans")
+        # Per-request accumulated codes in batch order, pre-filled with empty
+        # placeholders so every skip path (stopped / eos / bos / pad) keeps
+        # indices aligned for to_payload_element's per-request routing. A
+        # shorter list would silently fall back to request 0's codes.
+        per_req_codes: list[torch.Tensor] = [hidden.new_empty((0, self.n_vq), dtype=torch.long) for _ in info_dicts]
+        have_codes = False
         if hidden.numel() > 0 and info_dicts:
             num_rows = hidden.shape[0]
-            rows_per_req = max(1, num_rows // max(1, len(info_dicts) or 1))
+            if spans is None or len(spans) != len(info_dicts):
+                raise RuntimeError(
+                    "MOSS-TTS make_omni_output requires request_token_spans "
+                    f"for {len(info_dicts)} request infos, got {0 if spans is None else len(spans)}"
+                )
             for i, info in enumerate(info_dicts):
                 if not isinstance(info, dict):
                     continue
-                row_start = i * rows_per_req
-                row_end = min(row_start + rows_per_req, num_rows)
+                row_start, row_end = spans[i]
+                row_end = min(int(row_end), num_rows)
                 if row_start >= row_end:
                     continue
 
@@ -972,7 +1095,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     history_per_codebook=hist_per_cb,
                 ).squeeze(0)  # (n_vq,)
                 if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
-                    logger.info(
+                    logger.debug(
                         "[MossTTSRealtime make_omni] step=%d ch0=%d cursor=%d/%d",
                         int(state.get("step", 0)),
                         int(new_codes[0].item()),
@@ -1008,23 +1131,25 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
 
                 info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc}
                 state["step"] = int(state.get("step", 0)) + 1
-                audio_codes_list.append(updated_acc)
+                per_req_codes[i] = updated_acc
+                have_codes = True
 
-        if not audio_codes_list:
+        if not have_codes:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
-        # Forward the first request's accumulated codes (multi-request
-        # batching for the codec is not yet wired up — same as delay).
-        # The realtime variant emits raw codes (no delay pattern), so we
-        # signal that to the chunk processor via a 1-D bool tensor in
-        # ``meta.finished`` (already a tensor field on the schema). The
-        # processor reads its truth value as "skip de-delay" only for
-        # realtime; the delay path doesn't populate ``meta`` at all.
-        device = audio_codes_list[0].device
+        # Emit one accumulated-codes tensor per request as a list; the splitter
+        # routes ``element[idx]`` to request idx, so each Stage-1 request decodes
+        # its own codes instead of request 0's.
+        # The realtime variant emits raw codes (no delay pattern), so we signal
+        # that to the chunk processor via a 1-D bool tensor in ``meta.finished``
+        # (already a tensor field on the schema). The processor reads its truth
+        # value as "skip de-delay" only for realtime; the delay path doesn't
+        # populate ``meta`` at all.
+        device = hidden.device
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
-                "codes": {"audio": audio_codes_list[0]},
+                "codes": {"audio": per_req_codes},
                 "meta": {"finished": torch.tensor([True], dtype=torch.bool, device=device)},
             },
         )
@@ -1084,6 +1209,12 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         for n in backbone_loaded:
             loaded.add(f"model.{n}")
 
+        # Build stacked embedding cache for vectorised decode ops.
+        # embed_tokens[0] is the text embedding; [1..n_vq] are audio codebooks.
+        self._stacked_audio_emb_w = torch.stack(
+            [self.embed_tokens[i + 1].weight.detach() for i in range(self.n_vq)], dim=0
+        )  # (n_vq, audio_vocab_size, hidden_size)
+
         logger.info(
             "[MossTTSRealtime] loaded %d/%d params; skipped=%d (first 5: %s)",
             len(loaded),
@@ -1097,7 +1228,430 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         return loaded
 
 
+# ---------------------------------------------------------------------------
+# MossTTSLocalTalkerForGeneration
+# ---------------------------------------------------------------------------
+
+
+class MossTTSLocalTalkerForGeneration(nn.Module):
+    """Stage-0 talker for MossTTSLocalModel (MOSS-TTS-Local-Transformer-v1.5).
+
+    Architecture differs from both existing variants:
+
+    * Backbone (Qwen3; checkpoint prefix ``transformer.*``, unlike Delay/
+      Realtime's ``language_model.*``) consumes additive text+audio fusion
+      the same way Delay does (real text embeddings + masked per-codebook
+      audio embeddings from ``info["codes"]["ref"]`` / ``info["audio_codes"]
+      ["current"]``), but there is no delay-pattern countdown: the prompt
+      already ends right at the audio_start boundary, and every step from
+      the first decode onward drives exactly one audio frame.
+    * The checkpoint's own ``text_lm_head`` is loaded (trained for a
+      teacher-forced text loss) but never consulted at inference: the
+      official reference's own ``generate()`` hardcodes the next
+      text-channel input to ``audio_assistant_slot_token_id`` regardless of
+      what ``text_lm_head`` would predict, because
+      ``local_text_head_mode == "binary"`` for this checkpoint.
+      ``compute_logits`` therefore synthesises a one-hot logit row
+      (Realtime-style), forced to ``audio_assistant_slot_token_id`` while
+      continuing or ``im_end_token_id`` once the local transformer's binary
+      head decides to stop.
+    * Per-step audio generation runs ``MossTTSLocalDepthTransformer``
+      (1-layer GPT2-style local transformer, interleaved RoPE, ``n_vq=12``
+      codebooks -- structurally different from Realtime's Qwen3-style
+      ``CodePredictorBaseModel``) inside ``make_omni_output``. Stop
+      condition: the local transformer's binary head selects the
+      "audio_end" candidate (logits index 1).
+    """
+
+    have_multimodal_outputs: bool = True
+    has_preprocess: bool = True
+    has_postprocess: bool = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        self.vllm_config = vllm_config
+        self.config: MossTTSLocalConfig = vllm_config.model_config.hf_config
+
+        qwen3_cfg = self.config.qwen3_config
+        hidden_size = int(qwen3_cfg.hidden_size)
+        self.hidden_size = hidden_size
+        self.n_vq: int = int(self.config.n_vq)
+        self.audio_vocab_size: int = int(self.config.audio_vocab_size)
+        self.audio_pad_token_id: int = int(self.config.audio_pad_token_id)
+        self.text_vocab_size: int = int(qwen3_cfg.vocab_size)
+
+        self.audio_assistant_slot_token_id: int = int(self.config.audio_assistant_slot_token_id)
+        self.im_end_token_id: int = int(self.config.im_end_token_id)
+
+        # Qwen3 backbone. get_text_config() is sufficient for vLLM to size
+        # KV cache / heads correctly, as long as AutoConfig resolves to the
+        # local MossTTSLocalConfig rather than the HF remote-code class.
+        self.model = Qwen3Model(
+            vllm_config=vllm_config,
+            prefix=_maybe_prefix(prefix, "model"),
+        )
+
+        # Real text LM head -- loaded from the checkpoint but never consulted
+        # at inference (see class docstring); kept purely as a destination
+        # for ``text_lm_head.weight`` so load_weights() loads every tensor.
+        self.text_lm_head = ParallelLMHead(
+            self.text_vocab_size,
+            hidden_size,
+            bias=False,
+            prefix=_maybe_prefix(prefix, "text_lm_head"),
+        )
+        self.logits_processor = LogitsProcessor(self.text_vocab_size)
+
+        # Per-codebook audio embeddings/heads. audio_pad_token_id (==
+        # audio_vocab_size) is outside the embedding table -- masked to zero
+        # contribution rather than stored as a 1025th row (mirrors upstream
+        # ``_build_inputs_embeds``'s ``valid_mask`` masking).
+        self.audio_embeddings = nn.ModuleList(
+            [nn.Embedding(self.audio_vocab_size, hidden_size) for _ in range(self.n_vq)]
+        )
+        self.audio_lm_heads = nn.ModuleList(
+            [nn.Linear(hidden_size, self.audio_vocab_size, bias=False) for _ in range(self.n_vq)]
+        )
+        self.local_text_lm_head = nn.Linear(hidden_size, 2, bias=False)
+        self.local_transformer = MossTTSLocalDepthTransformer(self.config.gpt2_config, hidden_size=hidden_size)
+
+        self._batch_state: list[dict[str, Any]] | None = None
+        # Stacked embedding cache built after load_weights() for vectorised
+        # additive-fusion gathers (avoids an n_vq-iteration Python loop).
+        self._stacked_audio_emb_w: torch.Tensor | None = None
+
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
+            ("audio_codes", "current"),
+            ("audio_codes", "accumulated"),
+            ("hidden_states", "last"),
+        }
+
+    # ------------------------------------------------------------------
+    # vLLM hooks
+    # ------------------------------------------------------------------
+
+    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: Any,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor | OmniOutput,
+        sampling_metadata: SamplingMetadata | None = None,
+    ) -> torch.Tensor | None:
+        """Synthesise a one-hot text logit row per request.
+
+        The text channel is never freely generated here: the upstream
+        reference hardcodes it to ``audio_assistant_slot_token_id`` while
+        audio frames keep coming, and only emits ``im_end_token_id`` once the
+        local transformer's binary head decides to stop (see class
+        docstring for why the real ``text_lm_head`` is bypassed).
+        """
+        if isinstance(hidden_states, OmniOutput):
+            hidden_states = hidden_states.text_hidden_states
+        if hidden_states is None or hidden_states.numel() == 0:
+            return None
+
+        num_rows = hidden_states.shape[0]
+        logits = hidden_states.new_full((num_rows, self.text_vocab_size), float("-inf"))
+
+        states = self._batch_state or []
+        for state, row_start, row_end in _iter_state_row_spans(
+            states,
+            getattr(self, "_batch_state_spans", None),
+            num_rows,
+        ):
+            if state is not None and state.get("is_stopping"):
+                logits[row_start:row_end, self.im_end_token_id] = 0.0
+            else:
+                logits[row_start:row_end, self.audio_assistant_slot_token_id] = 0.0
+        if not states:
+            logits[:, self.audio_assistant_slot_token_id] = 0.0
+        return logits
+
+    # ------------------------------------------------------------------
+    # Embedding (text + audio codebooks, additive)
+    # ------------------------------------------------------------------
+
+    def _audio_embed(self, codes: torch.Tensor) -> torch.Tensor:
+        """``codes``: ``(T, n_vq)`` long, possibly containing ``audio_pad_token_id``
+        (outside the valid embedding range). Returns the ``(T, H)`` additive
+        audio embedding, masking out pad positions per codebook.
+        """
+        device = codes.device
+        valid_mask = codes.ne(self.audio_pad_token_id)  # (T, n_vq)
+        safe_codes = codes.masked_fill(~valid_mask, 0).clamp(0, self.audio_vocab_size - 1)
+        if self._stacked_audio_emb_w is not None:
+            n_vq_idx = torch.arange(self.n_vq, device=device)
+            codes_t = safe_codes.t()  # (n_vq, T)
+            gathered = self._stacked_audio_emb_w[n_vq_idx.unsqueeze(1), codes_t]  # (n_vq, T, H)
+            gathered = gathered * valid_mask.t().unsqueeze(-1)
+            return gathered.sum(0)
+        embeds: torch.Tensor | None = None
+        for i, emb_layer in enumerate(self.audio_embeddings):
+            col = emb_layer(safe_codes[:, i]) * valid_mask[:, i].unsqueeze(-1)
+            embeds = col if embeds is None else embeds + col
+        return embeds
+
+    def preprocess(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+        **info_dict: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Build per-step input embeddings (text + audio additive fusion).
+
+        Prefill: initialise the per-request ``{is_stopping, step}`` state.
+        Decode: combine the forced text token (from ``compute_logits``) with
+        the audio codes the local transformer produced last step.
+        """
+        device = input_ids.device
+        span_len = int(input_ids.shape[0])
+        audio_state = info_dict.get("audio_state")
+        is_first_call = not isinstance(audio_state, dict)
+
+        if span_len > 1 or is_first_call:
+            embeds = self.model.embed_tokens(input_ids)
+
+            ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
+            ref_offset = int(info_dict.get("ref_offset", 0))
+            last_ref_row = None
+            if isinstance(ref_codes, torch.Tensor) and ref_codes.numel() > 0:
+                if ref_codes.dim() == 1 and ref_codes.numel() % self.n_vq == 0:
+                    ref_codes = ref_codes.view(-1, self.n_vq)
+                if isinstance(ref_codes, torch.Tensor) and ref_codes.dim() == 2:
+                    end_off = ref_offset + span_len
+                    chunk = ref_codes[ref_offset:end_off]
+                    if chunk.numel() > 0 and chunk.shape[0] == span_len:
+                        codes = chunk.to(device=device, dtype=torch.long)
+                        embeds = embeds + self._audio_embed(codes)
+                        last_ref_row = codes[-1].detach()
+
+            current_codes = (
+                last_ref_row
+                if last_ref_row is not None
+                else torch.full((self.n_vq,), self.audio_pad_token_id, dtype=torch.long, device=device)
+            )
+
+            max_new_frames_req = info_dict.get("max_new_frames")
+            if isinstance(max_new_frames_req, (list, tuple)) and max_new_frames_req:
+                max_new_frames_req = max_new_frames_req[0]
+            try:
+                max_new_frames = int(max_new_frames_req) if max_new_frames_req is not None else -1
+            except (TypeError, ValueError):
+                max_new_frames = -1
+
+            info_update: dict[str, Any] = {
+                "audio_state": {"is_stopping": False, "step": 0, "max_new_frames": max_new_frames},
+                "audio_codes": {"current": current_codes},
+                "ref_offset": ref_offset + span_len,
+            }
+            return input_ids, embeds, info_update
+
+        # Decode step: input_ids is the forced text token from compute_logits.
+        text_embed = self.model.embed_tokens(input_ids.reshape(1))  # (1, H)
+        prev_codes = (info_dict.get("audio_codes", {}) or {}).get("current")
+        if isinstance(prev_codes, torch.Tensor) and prev_codes.numel() == self.n_vq:
+            codes = prev_codes.to(device=device, dtype=torch.long).unsqueeze(0)  # (1, n_vq)
+            combined = text_embed + self._audio_embed(codes)
+        else:
+            combined = text_embed
+        return input_ids, combined, {}
+
+    def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
+        if hidden_states.numel() == 0:
+            return {}
+        return {"hidden_states": {"last": hidden_states[-1].detach()}}
+
+    # ------------------------------------------------------------------
+    # Per-step audio generation via local transformer
+    # ------------------------------------------------------------------
+
+    def make_omni_output(
+        self,
+        model_outputs: torch.Tensor | OmniOutput,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        if isinstance(model_outputs, OmniOutput):
+            self._batch_state = None
+            self._batch_state_spans = None
+            return model_outputs
+
+        hidden = model_outputs  # (S, H)
+        info_dicts: list[dict[str, Any]] = (
+            kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
+        )
+
+        for info in info_dicts:
+            if isinstance(info, dict) and not isinstance(info.get("audio_state"), dict):
+                info["audio_state"] = {"is_stopping": False, "step": 0, "max_new_frames": -1}
+
+        self._batch_state = [(info["audio_state"] if isinstance(info, dict) else {}) for info in info_dicts]
+        self._batch_state_spans = kwargs.get("request_token_spans")
+
+        spans = kwargs.get("request_token_spans")
+        per_req_codes: list[torch.Tensor] = [hidden.new_empty((0, self.n_vq), dtype=torch.long) for _ in info_dicts]
+        have_codes = False
+
+        if hidden.numel() > 0 and info_dicts:
+            num_rows = hidden.shape[0]
+            if spans is None or len(spans) != len(info_dicts):
+                raise RuntimeError(
+                    "MOSS-TTS make_omni_output requires request_token_spans "
+                    f"for {len(info_dicts)} request infos, got {0 if spans is None else len(spans)}"
+                )
+            for i, info in enumerate(info_dicts):
+                if not isinstance(info, dict):
+                    continue
+                row_start, row_end = spans[i]
+                row_end = min(int(row_end), num_rows)
+                if row_start >= row_end:
+                    continue
+
+                state = info.get("audio_state", {}) or {}
+                if state.get("is_stopping"):
+                    continue  # already stopped -- no more audio frames
+
+                last_h = hidden[row_end - 1].unsqueeze(0)  # (1, H)
+
+                # Sampling parameters mirror Realtime's defaults; repetition
+                # penalty applies over a 50-frame rolling window per codebook.
+                rep_window = 50
+                acc_for_hist = (info.get("audio_codes", {}) or {}).get("accumulated")
+                if isinstance(acc_for_hist, torch.Tensor) and acc_for_hist.numel() > 0:
+                    tail = acc_for_hist[-rep_window:].long().cpu().tolist()
+                    hist_per_cb = [[row[cb] for row in tail] for cb in range(self.n_vq)]
+                else:
+                    hist_per_cb = [[] for _ in range(self.n_vq)]
+
+                should_continue_t, new_codes = self.local_transformer.generate_frame(
+                    last_h,
+                    self.audio_lm_heads,
+                    self.audio_embeddings,
+                    self.local_text_lm_head,
+                    n_vq=self.n_vq,
+                    do_sample=True,
+                    temperature=0.8,
+                    top_k=30,
+                    top_p=0.6,
+                    repetition_penalty=1.1,
+                    history_per_codebook=hist_per_cb,
+                )
+                should_continue = bool(should_continue_t[0].item())
+                new_codes = new_codes.squeeze(0)  # (n_vq,)
+
+                step = int(state.get("step", 0))
+                max_new_frames = int(state.get("max_new_frames", -1))
+                if not should_continue or (0 <= max_new_frames <= step):
+                    state["is_stopping"] = True
+                    state["step"] = step + 1
+                    info["audio_codes"] = {
+                        "current": new_codes,
+                        "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
+                    }
+                    continue  # don't append the stop frame to accumulated
+
+                acc = (info.get("audio_codes", {}) or {}).get("accumulated")
+                if isinstance(acc, torch.Tensor) and acc.numel() > 0:
+                    updated_acc = torch.cat([acc.to(new_codes.device), new_codes.unsqueeze(0)], dim=0)
+                else:
+                    updated_acc = new_codes.unsqueeze(0)
+
+                info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc}
+                state["step"] = step + 1
+                per_req_codes[i] = updated_acc
+                have_codes = True
+
+        if not have_codes:
+            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+
+        # Local-v1.5 emits raw codes (no delay pattern), so signal that to the
+        # chunk processor the same way Realtime does, via ``meta.finished``
+        # (read as "skip de-delay" by ``talker2codec_async_chunk``).
+        device = hidden.device
+        return OmniOutput(
+            text_hidden_states=hidden,
+            multimodal_outputs={
+                "codes": {"audio": per_req_codes},
+                "meta": {"finished": torch.tensor([True], dtype=torch.bool, device=device)},
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Weight loading
+    # ------------------------------------------------------------------
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Map checkpoint weight names to vLLM-Omni module names.
+
+        Checkpoint layout (prefix ``transformer.*`` for the backbone --
+        unlike Delay/Realtime's ``language_model.*``):
+          transformer.*               → model.*            (Qwen3 backbone)
+          text_lm_head.weight         → text_lm_head.weight
+          audio_embeddings.{i}.weight → audio_embeddings.{i}.weight
+          audio_lm_heads.{i}.weight   → audio_lm_heads.{i}.weight
+          local_text_lm_head.weight   → local_text_lm_head.weight
+          local_transformer.h.0.*     → local_transformer.h.0.*
+          local_transformer.ln_f.*    → local_transformer.ln_f.*
+
+        Every "tied" pair in the upstream config is stored as a full,
+        separate tensor in this checkpoint (confirmed via the raw
+        safetensors header: 438 keys, no dedup), so aside from the backbone
+        prefix this is pure 1:1 name-based loading.
+        """
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+
+        backbone_weights: list[tuple[str, torch.Tensor]] = []
+        skipped: list[str] = []
+
+        for name, tensor in weights:
+            if name.startswith("transformer."):
+                backbone_weights.append((name[len("transformer.") :], tensor))
+                continue
+            if name in params_dict:
+                default_weight_loader(params_dict[name], tensor)
+                loaded.add(name)
+            else:
+                skipped.append(name)
+
+        backbone_loaded = self.model.load_weights(iter(backbone_weights))
+        for n in backbone_loaded:
+            loaded.add(f"model.{n}")
+
+        self._stacked_audio_emb_w = torch.stack(
+            [e.weight.detach() for e in self.audio_embeddings], dim=0
+        )  # (n_vq, audio_vocab_size, hidden_size)
+
+        logger.info(
+            "[MossTTSLocal] loaded %d/%d params; skipped=%d (first 5: %s)",
+            len(loaded),
+            len(params_dict),
+            len(skipped),
+            skipped[:5],
+        )
+        not_loaded = [n for n in params_dict if n not in loaded]
+        if not_loaded:
+            logger.warning("[MossTTSLocal] %d params NOT loaded (first 5: %s)", len(not_loaded), not_loaded[:5])
+        return loaded
+
+
 __all__ = [
     "MossTTSDelayTalkerForGeneration",
     "MossTTSRealtimeTalkerForGeneration",
+    "MossTTSLocalTalkerForGeneration",
 ]
