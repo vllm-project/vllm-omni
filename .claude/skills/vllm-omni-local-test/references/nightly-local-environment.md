@@ -177,10 +177,10 @@ Apply confirmed env **before** **`cd "$REPO_ROOT"`**, optional **`git pull`** ([
 
 ## Default log location
 
-- **`$REPO_ROOT/logs/nightly_jobs`** is the default **`LOG_DIR`** for runs and for the report script.
-- Optional DFX perf JSON: **`$REPO_ROOT/tests/dfx/perf/results/`** — synced for kanban **`manual_*`** → **`docs/assets/charts/*_history.json`** (see [nightly-local-log-fetch.md](nightly-local-log-fetch.md) and [vllm-omni-test-report kanban prep](../../vllm-omni-test-report/references/kanban-pre-report-prep.md)).
-- **Before each laptop sync:** delete local **`$REPO_ROOT/logs`** and **`$REPO_ROOT/tests/dfx/perf/results`** so old artifacts are not merged with the new pull ([clear local trees](nightly-local-log-fetch.md#clear-local-trees)).
-- If `tools/nightly/run_nightly_jobs.sh` writes elsewhere, sync that directory or symlink into `logs/nightly_jobs`, then pass **`--log-dir`** when running **`vllm-omni-test-report`** `nightly_local_log_report.py`.
+- Each cluster run should write to a **timestamped/suffixed** **`LOG_DIR`**, e.g. **`$REPO_ROOT/logs/nightly_jobs_$(date -u +%Y%m%d-%H%M%S)`** via **`run_nightly_jobs.sh --log-dir …`**. DFX perf JSON for that run stays under the same **`LOG_DIR`** tree (e.g. **`results/`** subdir or alongside **`*.log`**).
+- **Laptop sync:** pull the **latest** **`logs/nightly_jobs_*`**, rename to **`$REPO_ROOT/logs/nightly_jobs`** — see [nightly-local-log-fetch.md](nightly-local-log-fetch.md). Job logs and perf JSON both live under that path for **`nightly_local_log_report.py`** and kanban **`manual_*`** → **`docs/assets/charts/*_history.json`** ([kanban prep](../../vllm-omni-test-report/references/kanban-pre-report-prep.md)).
+- **Before each laptop sync:** delete local **`$REPO_ROOT/logs`** so old artifacts are not merged with the new pull ([clear local trees](nightly-local-log-fetch.md#clear-local-trees)).
+- If the run used a custom **`LOG_DIR`** outside **`logs/nightly_jobs_*`**, sync that directory explicitly or symlink into **`logs/nightly_jobs`**, then pass **`--log-dir`** when running **`vllm-omni-test-report`** `nightly_local_log_report.py`.
 
 ## SSH connection name
 
@@ -235,14 +235,15 @@ When you cannot use tmux (e.g. automation-only **`ssh` `BatchMode`** one-shot), 
 
 ```bash
 # Inside docker exec bash -lc ' ... ', after source /rebase/.venv/bin/activate, HF / vLLM / CUDA exports and cd "$REPO_ROOT":
-mkdir -p "$REPO_ROOT/logs/nightly_jobs"
-LOG="$REPO_ROOT/logs/nightly_jobs/nightly_runner.nohup.log"
-nohup bash tools/nightly/run_nightly_jobs.sh >>"$LOG" 2>&1 &
-echo "nightly jobs PID=$! log=$LOG"
+LOG_DIR="$REPO_ROOT/logs/nightly_jobs_$(date -u +%Y%m%d-%H%M%S)"
+mkdir -p "$LOG_DIR"
+LOG="${LOG_DIR}/nightly_runner.nohup.log"
+nohup bash tools/nightly/run_nightly_jobs.sh --log-dir "$LOG_DIR" >>"$LOG" 2>&1 &
+echo "nightly jobs PID=$! LOG_DIR=$LOG_DIR log=$LOG"
 ```
 
 - **PID** and **`tail -f "$LOG"`** (from a new **`docker exec`** or after re-**`ssh`**) are how you monitor progress.
-- Ensure **`LOG_DIR`** for job artifacts still matches your reporting workflow (defaults under **`logs/nightly_jobs`**; see [Default log location](#default-log-location)).
+- Ensure **`LOG_DIR`** is under **`logs/nightly_jobs_*`** so laptop sync can pick the latest run (see [Default log location](#default-log-location)).
 
 ### Caveats
 

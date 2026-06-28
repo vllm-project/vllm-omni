@@ -1314,9 +1314,9 @@ def _grouped_rows_from_summary(summary: dict[str, Any]) -> dict[str, list[list[s
 def _filter_perf_summary_for_local(
     summary: dict[str, Any],
     *,
-    local_repo_root: Path,
+    log_dir: Path,
 ) -> dict[str, Any]:
-    result_root = (local_repo_root / "tests/dfx/perf/results").resolve()
+    result_root = log_dir.resolve()
     resolved_dir = resolve_local_perf_result_dir(result_root)
     perf_files = local_perf_result_files(resolved_dir) if resolved_dir else []
     local_keys = collect_local_perf_test_keys(resolved_dir)
@@ -1334,12 +1334,12 @@ def _filter_perf_summary_for_local(
         out["status"] = "empty"
         out["message"] = (
             f"No local perf JSON under {result_root}. "
-            "Sync tests/dfx/perf/results from the cluster before generating the report."
+            "Sync logs/nightly_jobs from the cluster before generating the report."
         )
         out["summary"] = {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
         scope["message"] = (
             f"No local perf JSON under {result_root}; Local performance baseline comparison "
-            f"shows only synced-result cases."
+            f"shows only synced log-dir cases."
         )
         out["local_perf_scope"] = scope
         return out
@@ -1378,7 +1378,7 @@ def _filter_perf_summary_for_local(
 def _buildkite_perf_rows(
     kanban_cfg: KanbanAssetsConfig,
     *,
-    local_repo_root: Path | None = None,
+    log_dir: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[list[str]]]]:
     summary = build_assets_perf_summary(
         assets_dir=kanban_cfg.assets_dir,
@@ -1392,8 +1392,8 @@ def _buildkite_perf_rows(
         summary.setdefault("warnings", []).append(warning)
     if summary.get("status") != "ok" or kanban_cfg.refresh_warnings:
         summary["raw_fallback"] = _kanban_raw_assets_diagnostic(kanban_cfg, summary)
-    if local_repo_root is not None:
-        summary = _filter_perf_summary_for_local(summary, local_repo_root=local_repo_root)
+    if log_dir is not None:
+        summary = _filter_perf_summary_for_local(summary, log_dir=log_dir)
     grouped_rows = _grouped_rows_from_summary(summary)
     return summary, grouped_rows
 
@@ -1404,7 +1404,7 @@ def _kanban_fallback_items(summary: dict[str, Any]) -> list[str]:
         return []
     items = [
         "Local nightly_jobs is for pass/fail analysis only; Local performance baseline comparison "
-        "shows tests/dfx/perf/results synced cases; Buildkite performance baseline comparison "
+        "shows logs/nightly_jobs synced cases; Buildkite performance baseline comparison "
         "reads all models from kanban docs/assets/charts/*_history.json.",
     ]
     raw_root = str(diag.get("raw_root") or "")
@@ -1457,11 +1457,11 @@ def _render_buildkite_perf_inner_html(
     kanban_cfg: KanbanAssetsConfig,
     *,
     model_subcard_class: str = "report-subcard--bk-perf-model",
-    local_repo_root: Path | None = None,
+    log_dir: Path | None = None,
 ) -> str:
     summary, grouped_rows = _buildkite_perf_rows(
         kanban_cfg,
-        local_repo_root=local_repo_root,
+        log_dir=log_dir,
     )
     parts: list[str] = [
         '<p class="meta"><strong>Data source:</strong> '
@@ -1504,8 +1504,8 @@ def _render_buildkite_perf_inner_html(
     parts.append(
         '<p class="hint">'
         + (
-            "Showing baseline comparison in kanban history only for cases synced to tests/dfx/perf/results."
-            if local_repo_root is not None
+            "Showing baseline comparison in kanban history only for cases with perf JSON under logs/nightly_jobs."
+            if log_dir is not None
             else (
                 f"Showing latest day ({html.escape(str(summary.get('latest_day') or 'N/A'))}) "
                 f"model records that include a baseline."
@@ -1540,11 +1540,11 @@ def _append_local_perf_baseline_markdown(
     lines: list[str],
     kanban_cfg: KanbanAssetsConfig,
     *,
-    repo_root: Path,
+    log_dir: Path,
 ) -> None:
     lines.append("## Local performance baseline comparison")
     lines.append("")
-    summary, grouped_rows = _buildkite_perf_rows(kanban_cfg, local_repo_root=repo_root)
+    summary, grouped_rows = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
     _append_buildkite_perf_markdown(lines, summary, grouped_rows)
 
 
@@ -1726,7 +1726,7 @@ def emit_report(
             "and match paths in references/nightly-local-log-layout.md.*"
         )
         lines.append("")
-        _append_local_perf_baseline_markdown(lines, kanban_cfg, repo_root=repo_root)
+        _append_local_perf_baseline_markdown(lines, kanban_cfg, log_dir=log_dir)
         print("\n".join(lines), file=out_fp)
         return
 
@@ -1739,7 +1739,7 @@ def emit_report(
         "*Failed and errored jobs only: detailed excerpts below. Passing jobs appear in the summary table only.*"
     )
     lines.append("")
-    _append_local_perf_baseline_markdown(lines, kanban_cfg, repo_root=repo_root)
+    _append_local_perf_baseline_markdown(lines, kanban_cfg, log_dir=log_dir)
 
     for job_name, paths, info in job_rows:
         if _job_is_clean(info):
@@ -2190,7 +2190,7 @@ def emit_report_html(
             _render_buildkite_perf_inner_html(
                 kanban_cfg,
                 model_subcard_class="report-subcard--local-perf-model",
-                local_repo_root=repo_root,
+                log_dir=log_dir,
             ),
             open_default=False,
             details_class="report-subcard--local-perf-baseline",

@@ -8,7 +8,7 @@ This is separate from [cluster run defaults](../../vllm-omni-local-test/referenc
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| **`REPO_ROOT`** | `~/vllm-omni` | Local vLLM-Omni checkout — sync target for **`logs/nightly_jobs`** and **`tests/dfx/perf/results/`** |
+| **`REPO_ROOT`** | `~/vllm-omni` | Local vLLM-Omni checkout — sync target for **`logs/nightly_jobs`** (job logs + perf JSON) |
 | **`KANBAN_REPO_ROOT`** | `~/vllm-omni-kanban` | Local [vllm-omni-kanban](https://github.com/hsliuustc0106/vllm-omni-kanban) clone — pull, **`manual_*`**, **`mkdocs build`**, **`--kanban-repo-root`** |
 
 Scripts resolve env overrides first; when unset they use the defaults above (`scripts/laptop_path_defaults.py`).
@@ -27,7 +27,7 @@ Skip re-prompting only if the user already said **use defaults** or gave explici
 ## Agent prompt template
 
 > Planned **local (laptop)** path defaults:
-> - **`REPO_ROOT`**: `~/vllm-omni` (local vLLM-Omni checkout — sync target for `logs/nightly_jobs` and `tests/dfx/perf/results/`)
+> - **`REPO_ROOT`**: `~/vllm-omni` (local vLLM-Omni checkout — sync target for `logs/nightly_jobs`)
 > - **`KANBAN_REPO_ROOT`**: `~/vllm-omni-kanban` (local kanban clone — pull, `manual_*`, performance baseline JSON)
 >
 > Use these defaults? To override, reply with custom paths. After you **confirm**, I will run sync, kanban prep, or report generation.

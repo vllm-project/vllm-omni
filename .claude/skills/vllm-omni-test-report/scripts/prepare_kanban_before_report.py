@@ -5,7 +5,7 @@ Prepare the vllm-omni-kanban checkout before generating a nightly/release HTML r
 Workflow (run from ``skills/vllm-omni-test-report/`` after log sync):
 
 1. ``git pull --rebase`` on the local https://github.com/hsliuustc0106/vllm-omni-kanban clone.
-2. When ``$REPO_ROOT/tests/dfx/perf/results`` contains perf JSON, create a new
+2. When ``$REPO_ROOT/logs/nightly_jobs`` contains perf JSON, create a new
    ``data/local_nightly_raw/manual_<suffix>/`` directory, copy result JSON, and copy
    ``logs/nightly_jobs/local_pytest_hunyuan_image.log`` as ``test_hunyuan_image3.log``.
 3. ``mkdocs build`` in the kanban repo (``mkdocs_hooks`` → sync + ``generate_charts``)
@@ -40,6 +40,7 @@ from laptop_path_defaults import (
 )
 from local_perf_results import (
     PERF_JSON_GLOBS,
+    default_nightly_log_dir,
     local_perf_result_files,
     resolve_local_perf_result_dir,
 )
@@ -115,17 +116,15 @@ def allocate_manual_dir(raw_root: Path, now: datetime | None = None) -> Path:
 def sync_local_nightly_raw(
     kanban_repo: Path,
     *,
-    perf_result_root: Path,
     log_dir: Path,
     now: datetime | None = None,
 ) -> tuple[Path | None, list[str], list[str], list[str]]:
-    """Copy perf JSON + job logs into a new ``manual_*`` directory under kanban."""
+    """Copy perf JSON + job logs from ``log_dir`` into a new ``manual_*`` directory under kanban."""
     notes: list[str] = []
-    resolved = resolve_local_perf_result_dir(perf_result_root.resolve())
+    log_dir = log_dir.resolve()
+    resolved = resolve_local_perf_result_dir(log_dir)
     if resolved is None:
-        notes.append(
-            f"No perf JSON under {perf_result_root} (patterns: {', '.join(PERF_JSON_GLOBS)}); skipped manual_* sync."
-        )
+        notes.append(f"No perf JSON under {log_dir} (patterns: {', '.join(PERF_JSON_GLOBS)}); skipped manual_* sync.")
         return None, [], [], notes
 
     perf_files = local_perf_result_files(resolved)
@@ -196,7 +195,6 @@ def prepare_kanban_before_report(
     kanban_repo: Path,
     *,
     repo_root: Path | None = None,
-    perf_result_root: Path | None = None,
     log_dir: Path | None = None,
     remote: str = "origin",
     branch: str | None = None,
@@ -222,12 +220,10 @@ def prepare_kanban_before_report(
     log_copied: list[str] = []
 
     if not skip_manual_sync and repo_root is not None:
-        perf_root = (perf_result_root or (repo_root / "tests/dfx/perf/results")).resolve()
-        job_log_dir = (log_dir or (repo_root / "logs/nightly_jobs")).resolve()
-        if perf_root.is_dir():
+        job_log_dir = (log_dir or default_nightly_log_dir(repo_root)).resolve()
+        if job_log_dir.is_dir():
             manual_dir, perf_copied, log_copied, sync_notes = sync_local_nightly_raw(
                 kanban_repo,
-                perf_result_root=perf_root,
                 log_dir=job_log_dir,
                 now=now,
             )
@@ -236,7 +232,7 @@ def prepare_kanban_before_report(
                 rel = manual_dir.relative_to(kanban_repo)
                 notes.append(f"Created {rel} with {len(perf_copied)} perf JSON and {len(log_copied)} log file(s).")
         else:
-            notes.append(f"Perf results root missing ({perf_root}); skipped manual_* sync.")
+            notes.append(f"Nightly log dir missing ({job_log_dir}); skipped manual_* sync.")
     elif skip_manual_sync:
         notes.append("Skipped manual_* sync (--skip-manual-sync).")
     else:
@@ -286,21 +282,15 @@ def main() -> int:
         type=Path,
         default=_default_repo_root(),
         help=(
-            "Local vLLM-Omni checkout with synced logs and perf JSON "
+            "Local vLLM-Omni checkout with synced logs (incl. perf JSON under logs/nightly_jobs) "
             f"(default: $REPO_ROOT or {DEFAULT_LAPTOP_REPO_ROOT_DISPLAY})."
         ),
-    )
-    parser.add_argument(
-        "--perf-result-root",
-        type=Path,
-        default=None,
-        help="Override perf JSON root (default: <repo-root>/tests/dfx/perf/results).",
     )
     parser.add_argument(
         "--log-dir",
         type=Path,
         default=None,
-        help="Override nightly job logs (default: <repo-root>/logs/nightly_jobs).",
+        help="Override nightly log dir for job logs + perf JSON (default: <repo-root>/logs/nightly_jobs).",
     )
     parser.add_argument("--git-remote", default="origin", help="Git remote for pull (default: origin).")
     parser.add_argument("--git-branch", default=None, help="Git branch for pull (default: current branch).")
@@ -315,7 +305,6 @@ def main() -> int:
         result = prepare_kanban_before_report(
             args.kanban_repo_root,
             repo_root=args.repo_root,
-            perf_result_root=args.perf_result_root,
             log_dir=args.log_dir,
             remote=args.git_remote,
             branch=args.git_branch,

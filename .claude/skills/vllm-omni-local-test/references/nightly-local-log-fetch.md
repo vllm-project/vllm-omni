@@ -1,65 +1,97 @@
 # Fetch nightly logs to your laptop
 
-Part of **vllm-omni-local-test**. Pull **`nightly_jobs`** and optional **`tests/dfx/perf/results/`** from the cluster/container **before** running **`vllm-omni-test-report`** `scripts/nightly_local_log_report.py` on your machine.
+Part of **vllm-omni-local-test**. Pull the **latest** **`logs/nightly_jobs_*`** run directory from the cluster/container **before** running **`vllm-omni-test-report`** `scripts/nightly_local_log_report.py` on your machine.
 
 **Before sync:** confirm laptop path defaults with the user — **`REPO_ROOT=~/vllm-omni`**, **`KANBAN_REPO_ROOT=~/vllm-omni-kanban`** — see [confirm-laptop-path-defaults.md](../../vllm-omni-test-report/references/confirm-laptop-path-defaults.md).
 
-**H200 and H800 use the same laptop-side workflow** (clear local **`logs/`** + **`results/`** → remote tarball → extract → report). Only the **remote pack command** differs: **H200** = direct **`ssh`** (already in container); **H800** = **`ssh` + `srun --overlap docker exec`**.
+**H200 and H800 use the same laptop-side workflow** (clear local **`logs/`** → resolve latest remote **`nightly_jobs_*`** → tarball → extract → rename to **`logs/nightly_jobs`** → report). Only the **remote pack command** differs: **H200** = direct **`ssh`** (already in container); **H800** = **`ssh` + `srun --overlap docker exec`**.
 
-**Default destination on your laptop:** mirror the cluster layout under your **local** vLLM-Omni checkout root (**`$REPO_ROOT`**):
+**Default destination on your laptop:** everything lands under **`$REPO_ROOT/logs/nightly_jobs/`** — job tee logs, optional perf JSON (`result_test_*.json`, …), and generated **`jobs/`** scripts. Report scripts and kanban prep read perf JSON recursively from that tree.
 
-- **`$REPO_ROOT/logs/nightly_jobs/`**
-- **`$REPO_ROOT/tests/dfx/perf/results/`** — DFX perf JSON; copied into kanban **`data/local_nightly_raw/manual_*`** via [prepare_kanban_before_report.py](../../vllm-omni-test-report/scripts/prepare_kanban_before_report.py) before **`mkdocs build`** updates **`docs/assets/charts/*_history.json`**
+## Remote source layout
 
-That matches **`nightly_local_log_report.py`** defaults: **`$REPO_ROOT/logs/nightly_jobs`** for job logs; **`$REPO_ROOT/tests/dfx/perf/results`** for baseline comparison (when **`REPO_ROOT`** is set).
+Cluster/container paths are relative to the **confirmed cluster repo root** (**`CLUSTER_REPO_ROOT`**, default **`/rebase/vllm-omni`**).
 
-## What to copy
+Each nightly run writes under a **timestamped or suffixed** directory:
 
-Cluster/container paths are relative to the **confirmed cluster repo root** (**`CLUSTER_REPO_ROOT`**, default **`/rebase/vllm-omni`**):
+```text
+$CLUSTER_REPO_ROOT/logs/
+  nightly_jobs_20250628-143022/     ← latest (example)
+    *.log                           job tee logs
+    jobs/                           generated wrapper scripts
+    results/                        optional DFX perf JSON (may also sit at run root)
+  nightly_jobs_20250627-091530/
+    …
+```
 
-| Path (under repo root) | Required | Local destination (under laptop **`$REPO_ROOT`**) |
-|------------------------|----------|---------------------------------------------------|
-| **`logs/nightly_jobs/`** | Yes | **`logs/nightly_jobs/`** — layout: [../../vllm-omni-test-report/references/nightly-local-log-layout.md](../../vllm-omni-test-report/references/nightly-local-log-layout.md) |
-| **`tests/dfx/perf/results/`** | Optional (if present) | **`tests/dfx/perf/results/`** — DFX perf JSON / artifacts from local nightly runs |
+**Do not** sync the legacy fixed path **`logs/nightly_jobs`** (no suffix) — it may contain stale mixed runs. Always pick the **newest** directory matching **`logs/nightly_jobs_*`**.
 
-- If your site bind-mounts the repo tree on the host, you may use **`scp` / `rsync`** against that host path instead of tarball (see [Optional: scp / rsync](#optional-scp--rsync)).
-- Missing optional paths must **not** fail the sync — tarball uses **`--ignore-failed-read`**; **`scp` / `rsync`** steps below are best-effort when the remote tree exists.
+### Pick latest `nightly_jobs_*` (remote)
 
-**Remote pack inner logic** (shared by H200/H800 tarball — runs with **`cd "$CLUSTER_REPO_ROOT"`**):
+Shared inner logic (runs with **`cd "$ROOT/logs"`** or equivalent):
 
 ```bash
 ROOT="${CLUSTER_REPO_ROOT:-/rebase/vllm-omni}"
-cd "$ROOT" || exit 1
-tar czf - --ignore-failed-read logs/nightly_jobs tests/dfx/perf/results
+LOGS_ROOT="${ROOT}/logs"
+shopt -s nullglob
+_candidates=( "${LOGS_ROOT}"/nightly_jobs_* )
+shopt -u nullglob
+if ((${#_candidates[@]} == 0)); then
+  echo "No nightly_jobs_* directory under ${LOGS_ROOT}" >&2
+  exit 1
+fi
+LATEST_RUN="$(ls -dt "${_candidates[@]}" | head -1)"
+LATEST_NAME="$(basename "${LATEST_RUN}")"
+echo "Using latest run dir: ${LATEST_RUN}" >&2
+```
+
+Optional: ask the user to confirm **`LATEST_NAME`** before tarball when multiple runs exist the same day.
+
+## What to copy
+
+| Source (latest **`logs/nightly_jobs_*`**) | Required | Local destination |
+|-------------------------------------------|----------|-------------------|
+| Entire run directory (logs, **`jobs/`**, perf JSON) | Yes | **`$REPO_ROOT/logs/nightly_jobs/`** — layout: [../../vllm-omni-test-report/references/nightly-local-log-layout.md](../../vllm-omni-test-report/references/nightly-local-log-layout.md) |
+
+**Remote pack inner logic** (shared by H200/H800 tarball — packs only the latest run dir):
+
+```bash
+ROOT="${CLUSTER_REPO_ROOT:-/rebase/vllm-omni}"
+LOGS_ROOT="${ROOT}/logs"
+shopt -s nullglob
+_candidates=( "${LOGS_ROOT}"/nightly_jobs_* )
+shopt -u nullglob
+LATEST_RUN="$(ls -dt "${_candidates[@]}" | head -1)"
+LATEST_NAME="$(basename "${LATEST_RUN}")"
+cd "${LOGS_ROOT}" || exit 1
+tar czf - --ignore-failed-read "${LATEST_NAME}"
 ```
 
 <a id="log-sync-workflow"></a>
 
 ## Log sync workflow (H200 and H800)
 
-Run these steps **in order** on your laptop **after the cluster run finishes** and **before** pulling logs or perf JSON. **H200** and **H800** share steps **1**, **3**, and **4**; step **2** picks the machine-specific remote command.
+Run these steps **in order** on your laptop **after the cluster run finishes** and **before** generating the report. **H200** and **H800** share steps **1**, **3**, **4**, and **5**; step **2** picks the machine-specific remote command.
 
 <a id="clear-local-trees"></a>
 
-### 1. Clear local `logs/` and `results/` (required)
+### 1. Clear local `logs/` (required)
 
-**Always delete the existing *local* `logs` directory and DFX `results` directory before each sync.** Otherwise old job folders or stale perf JSON can **merge with the new pull** and skew the nightly report.
+**Always delete the existing *local* `logs` directory before each sync.** Otherwise old job folders or stale perf JSON can **merge with the new pull** and skew the nightly report.
 
 ```bash
 REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
 rm -rf "$REPO_ROOT/logs"
-rm -rf "$REPO_ROOT/tests/dfx/perf/results"
 ```
 
 - **Scope:** your **laptop** checkout only; nothing on the cluster/container is removed.
-- **What is cleared:** the entire **`$REPO_ROOT/logs`** tree (including **`nightly_jobs`** and any other log artifacts) and **`$REPO_ROOT/tests/dfx/perf/results`** (perf JSON for kanban **`manual_*`** sync).
 - **Archive instead:** if you need a backup, rename before delete, e.g. `mv "$REPO_ROOT/logs" "$REPO_ROOT/logs.bak.$(date +%Y%m%d%H%M)"`.
 
 Run this **before** remote tarball download (step 2) and again **before** extract (step 3) if step 1 was skipped earlier.
 
 ### 2. Remote tarball (machine-specific)
 
-Pack **`logs/nightly_jobs`** and **`tests/dfx/perf/results`** in one archive. On **GNU tar**, missing optional paths do not abort the archive when **`--ignore-failed-read`** is set.
+Pack the **latest** **`logs/nightly_jobs_*`** directory in one archive.
 
 **H800** — **`ssh` + Slurm + `docker exec`** ([nightly-local-h800.md](nightly-local-h800.md)):
 
@@ -67,8 +99,15 @@ Pack **`logs/nightly_jobs`** and **`tests/dfx/perf/results`** in one archive. On
 ssh -o BatchMode=yes "<SSH_CONNECTION_NAME>" \
   "bash -lc 'type module >/dev/null 2>&1 && module load slurm 2>/dev/null; srun --jobid=\"<JOBID>\" --overlap docker exec \"<CONTAINER_NAME>\" bash -lc \"
     ROOT=\\\${CLUSTER_REPO_ROOT:-/rebase/vllm-omni}
-    cd \\\"\\\$ROOT\\\" || exit 1
-    tar czf - --ignore-failed-read logs/nightly_jobs tests/dfx/perf/results
+    LOGS_ROOT=\\\"\\\$ROOT/logs\\\"
+    shopt -s nullglob
+    _c=( \\\"\\\$LOGS_ROOT\\\"/nightly_jobs_* )
+    shopt -u nullglob
+    LATEST=\\\$(ls -dt \\\"\\\${_c[@]}\\\" | head -1)
+    NAME=\\\$(basename \\\"\\\$LATEST\\\")
+    echo Using latest: \\\"\\\$LATEST\\\" >&2
+    cd \\\"\\\$LOGS_ROOT\\\" || exit 1
+    tar czf - --ignore-failed-read \\\"\\\$NAME\\\"
   \"'" \
   > nightly_logs.tgz
 ```
@@ -79,29 +118,56 @@ ssh -o BatchMode=yes "<SSH_CONNECTION_NAME>" \
 ssh -o BatchMode=yes "<SSH_CONNECTION_NAME>" \
   "bash -lc '
     ROOT=\${CLUSTER_REPO_ROOT:-/rebase/vllm-omni}
-    cd \"\$ROOT\" || exit 1
-    tar czf - --ignore-failed-read logs/nightly_jobs tests/dfx/perf/results
+    LOGS_ROOT=\"\$ROOT/logs\"
+    shopt -s nullglob
+    _c=( \"\$LOGS_ROOT\"/nightly_jobs_* )
+    shopt -u nullglob
+    LATEST=\$(ls -dt \"\${_c[@]}\" | head -1)
+    NAME=\$(basename \"\$LATEST\")
+    echo Using latest: \"\$LATEST\" >&2
+    cd \"\$LOGS_ROOT\" || exit 1
+    tar czf - --ignore-failed-read \"\$NAME\"
   '" \
   > nightly_logs.tgz
 ```
 
-Use the **confirmed cluster repo root** in **`ROOT` / `-C`** when the user overrode the default **`/rebase/vllm-omni`**.
+Use the **confirmed cluster repo root** in **`ROOT`** when the user overrode the default **`/rebase/vllm-omni`**.
 
 ### 3. Extract on laptop (same for H200 and H800)
 
 ```bash
 REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
-# Required — same as step 1 if not already done:
-rm -rf "$REPO_ROOT/logs" "$REPO_ROOT/tests/dfx/perf/results"
-mkdir -p "$REPO_ROOT" && tar xzf nightly_logs.tgz -C "$REPO_ROOT"
+rm -rf "$REPO_ROOT/logs"
+mkdir -p "$REPO_ROOT/logs"
+tar xzf nightly_logs.tgz -C "$REPO_ROOT/logs"
 ```
 
-- Job logs land at **`$REPO_ROOT/logs/nightly_jobs`**.
-- DFX perf JSON (if present) lands at **`$REPO_ROOT/tests/dfx/perf/results/`** — feed into kanban via **`prepare_kanban_before_report.py`**, not read directly by the HTML report.
+The tarball contains a single top-level **`nightly_jobs_*`** folder under **`$REPO_ROOT/logs/`**.
 
-### 4. Verify, prepare kanban, and generate report (same for H200 and H800)
+### 4. Rename to `logs/nightly_jobs` (same for H200 and H800)
 
-1. Confirm **`logs/nightly_jobs`** and **`tests/dfx/perf/results/`** (if applicable) under your local checkout.
+```bash
+REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
+shopt -s nullglob
+_run_dirs=( "$REPO_ROOT/logs"/nightly_jobs_* )
+shopt -u nullglob
+if ((${#_run_dirs[@]} == 0)); then
+  echo "No nightly_jobs_* under $REPO_ROOT/logs after extract" >&2
+  exit 1
+fi
+LATEST_LOCAL="$(ls -dt "${_run_dirs[@]}" | head -1)"
+if [[ -d "$REPO_ROOT/logs/nightly_jobs" ]]; then
+  rm -rf "$REPO_ROOT/logs/nightly_jobs"
+fi
+mv "$LATEST_LOCAL" "$REPO_ROOT/logs/nightly_jobs"
+echo "Synced to: $REPO_ROOT/logs/nightly_jobs"
+```
+
+Job logs and perf JSON (wherever they sit under the run dir) remain under **`$REPO_ROOT/logs/nightly_jobs`**. Report scripts scan that tree recursively.
+
+### 5. Verify, prepare kanban, and generate report (same for H200 and H800)
+
+1. Confirm **`logs/nightly_jobs`** under your local checkout.
 2. **Kanban prep (before HTML report)** — [../../vllm-omni-test-report/references/kanban-pre-report-prep.md](../../vllm-omni-test-report/references/kanban-pre-report-prep.md):
 
 ```bash
@@ -111,17 +177,16 @@ cd ~/vllm-omni-skills/skills/vllm-omni-test-report   # or your skills checkout p
 python scripts/prepare_kanban_before_report.py
 ```
 
-This pulls latest kanban, copies perf JSON + job logs into **`data/local_nightly_raw/manual_*`** when results exist, and runs **`mkdocs build`** to refresh **`docs/assets/charts/*_history.json`**.
+This pulls latest kanban, copies perf JSON + job logs from **`logs/nightly_jobs`** into **`data/local_nightly_raw/manual_*`** when present, and runs **`mkdocs build`** to refresh **`docs/assets/charts/*_history.json`**.
 
 3. HTML nightly report — from **`skills/vllm-omni-test-report/`** ([../../vllm-omni-test-report/SKILL.md](../../vllm-omni-test-report/SKILL.md), report kind **nightly**):
 
 ```bash
-export REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"   # must match the tree you synced into
+export REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
 export KANBAN_REPO_ROOT="${KANBAN_REPO_ROOT:-~/vllm-omni-kanban}"
 python scripts/nightly_local_log_report.py --html-report ./nightly-report.html \
   --kanban-repo-root "$KANBAN_REPO_ROOT"
 # log-dir default: $REPO_ROOT/logs/nightly_jobs
-# performance baseline comparison: --kanban-repo-root → docs/assets/charts/*_history.json
 ```
 
 4. Release / combined report: **`--log-dir-h200`** or **`--log-dir-h800`** on **`compose_full_report.py`** as appropriate.
@@ -130,19 +195,20 @@ python scripts/nightly_local_log_report.py --html-report ./nightly-report.html \
 
 ## Optional: scp / rsync
 
-When the repo tree is visible on a **host bind-mount** (not only inside the container), you can sync without tarball. Apply **[step 1](#clear-local-trees)** first.
+When the repo tree is visible on a **host bind-mount** (not only inside the container), sync without tarball. Apply **[step 1](#clear-local-trees)** first, resolve **`LATEST_RUN`** on the host, then rename per **[step 4](#4-rename-to-logsnightly_jobs-same-for-h200-and-h800)**.
 
-**Remote repo root** on the host: **`REMOTE_REPO="user@remote_host:/path/on/host/vllm-omni"`** (adjust to your bind-mount).
+**Remote repo root** on the host: **`REMOTE_REPO="user@remote_host:/path/on/host/vllm-omni"`**.
 
 ### scp (recursive)
 
 ```bash
 REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
 REMOTE_REPO="user@remote_host:/path/on/host/vllm-omni"
-rm -rf "$REPO_ROOT/logs" "$REPO_ROOT/tests/dfx/perf/results"
-mkdir -p "$REPO_ROOT/logs" "$REPO_ROOT/tests/dfx/perf"
-scp -r "${REMOTE_REPO}/logs/nightly_jobs" "$REPO_ROOT/logs/"
-scp -r "${REMOTE_REPO}/tests/dfx/perf/results" "$REPO_ROOT/tests/dfx/perf/" 2>/dev/null || true
+REMOTE_LATEST="$(ssh "$REMOTE_REPO" 'ls -dt logs/nightly_jobs_* 2>/dev/null | head -1')"
+rm -rf "$REPO_ROOT/logs"
+mkdir -p "$REPO_ROOT/logs"
+scp -r "${REMOTE_REPO}/${REMOTE_LATEST}" "$REPO_ROOT/logs/"
+# Then run step 4 rename commands on laptop
 ```
 
 ### rsync
@@ -150,10 +216,12 @@ scp -r "${REMOTE_REPO}/tests/dfx/perf/results" "$REPO_ROOT/tests/dfx/perf/" 2>/d
 ```bash
 REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
 REMOTE_REPO="user@remote_host:/path/on/host/vllm-omni"
-rm -rf "$REPO_ROOT/logs" "$REPO_ROOT/tests/dfx/perf/results"
-mkdir -p "$REPO_ROOT/logs/nightly_jobs" "$REPO_ROOT/tests/dfx/perf"
-rsync -avz -e ssh "${REMOTE_REPO}/logs/nightly_jobs/" "$REPO_ROOT/logs/nightly_jobs/"
-rsync -avz -e ssh "${REMOTE_REPO}/tests/dfx/perf/results/" "$REPO_ROOT/tests/dfx/perf/results/" 2>/dev/null || true
+REMOTE_LATEST="$(ssh "${REMOTE_REPO%%:*}" "ls -dt ${REMOTE_REPO#*:}/logs/nightly_jobs_* 2>/dev/null | head -1")"
+REMOTE_NAME="$(basename "$REMOTE_LATEST")"
+rm -rf "$REPO_ROOT/logs"
+mkdir -p "$REPO_ROOT/logs"
+rsync -avz -e ssh "${REMOTE_REPO}/logs/${REMOTE_NAME}/" "$REPO_ROOT/logs/${REMOTE_NAME}/"
+# Then run step 4 rename commands on laptop
 ```
 
-Then continue with [Verify and generate report](#4-verify-and-generate-report-same-for-h200-and-h800) (step 4 above).
+Then continue with [Verify and generate report](#5-verify-prepare-kanban-and-generate-report-same-for-h200-and-h800) (step 5 above).

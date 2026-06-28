@@ -1,10 +1,15 @@
-"""Scan local DFX perf JSON under ``tests/dfx/perf/results``."""
+"""Scan local DFX perf JSON under ``logs/nightly_jobs`` (recursive)."""
 
 from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
+
+
+def default_nightly_log_dir(repo_root: Path) -> Path:
+    return repo_root / "logs" / "nightly_jobs"
+
 
 PERF_JSON_GLOBS = (
     "result_test_*.json",

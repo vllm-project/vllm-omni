@@ -9,7 +9,7 @@ Automated entry point: **`scripts/prepare_kanban_before_report.py`**.
 - Local clone: `git clone https://github.com/hsliuustc0106/vllm-omni-kanban` → default **`KANBAN_REPO_ROOT=~/vllm-omni-kanban`** ([confirm with user](confirm-laptop-path-defaults.md))
 - **`gh`** installed and authenticated (`gh auth login`) — used for `git pull --rebase`
 - Kanban Python env with **`mkdocs`** (and kanban deps) for step 3
-- After cluster sync: default **`REPO_ROOT=~/vllm-omni`** ([confirm with user](confirm-laptop-path-defaults.md)) with **`logs/nightly_jobs`** and optional **`tests/dfx/perf/results/`**
+- After cluster sync: default **`REPO_ROOT=~/vllm-omni`** ([confirm with user](confirm-laptop-path-defaults.md)) with **`logs/nightly_jobs`** (job logs + perf JSON in one tree)
 
 ## Steps (in order)
 
@@ -24,13 +24,13 @@ The script runs this via **`gh auth git-credential`** (same as report archive pu
 
 ### 2. Sync local perf + logs → `data/local_nightly_raw/manual_*`
 
-**When** `$REPO_ROOT/tests/dfx/perf/results` contains perf JSON (`result_test_*.json`, `diffusion_result_*.json`, `benchmark_results_*.json` — including under a latest timestamp subdirectory):
+**When** `$REPO_ROOT/logs/nightly_jobs` contains perf JSON (`result_test_*.json`, `diffusion_result_*.json`, `benchmark_results_*.json` — scanned recursively, including under **`results/`** if present):
 
 1. Create a **new** directory under **`$KANBAN_REPO_ROOT/data/local_nightly_raw/`**:
    - Name: **`manual_YYYYMMDD`**
    - If that name already exists: **`manual_YYYYMMDD_HHMMSS`** (or with numeric suffix)
 2. Copy into it:
-   - All matching perf JSON from **`$REPO_ROOT/tests/dfx/perf/results`** (flat copy, original basenames — unchanged)
+   - All matching perf JSON from **`$REPO_ROOT/logs/nightly_jobs`** (flat copy, original basenames — unchanged)
    - **Only** **`$REPO_ROOT/logs/nightly_jobs/local_pytest_hunyuan_image.log`** → **`test_hunyuan_image3.log`** (other logs under `nightly_jobs` are not copied)
 
 Example kanban layout (committed over time):
@@ -41,7 +41,7 @@ data/local_nightly_raw/manual_20260622/
   test_hunyuan_image3.log
 ```
 
-If the results directory is **empty or missing**, skip this step (still run step 3 to refresh charts from existing raw data).
+If **`logs/nightly_jobs`** has **no perf JSON**, skip this step (still run step 3 to refresh charts from existing raw data).
 
 ### 3. MkDocs build (regenerate chart history)
 
@@ -80,8 +80,7 @@ python scripts/nightly_local_log_report.py \
 | `--skip-pull` | Do not `git pull --rebase` |
 | `--skip-manual-sync` | Do not create `manual_*` or copy perf/logs |
 | `--skip-mkdocs` | Do not run `mkdocs build` |
-| `--perf-result-root` | Override `$REPO_ROOT/tests/dfx/perf/results` |
-| `--log-dir` | Override `$REPO_ROOT/logs/nightly_jobs` |
+| `--log-dir` | Override `$REPO_ROOT/logs/nightly_jobs` (job logs + perf JSON scan root) |
 
 ## Notes
 
