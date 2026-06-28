@@ -202,6 +202,41 @@ class TestGetSamplingParamsKey:
         assert a == b
 
 
+class TestGetRequestBatchSamplingParamsKey:
+    """Pure-function tests for the request-batch compatibility key builder."""
+
+    @staticmethod
+    def _make(
+        *,
+        num_inference_steps: int = 2,
+        seed: int | None = 123,
+        generator: torch.Generator | None = None,
+    ) -> OmniDiffusionRequest:
+        sp = OmniDiffusionSamplingParams(
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+            generator=generator,
+        )
+        return OmniDiffusionRequest(prompt="prompt", sampling_params=sp, request_id=f"req-{num_inference_steps}")
+
+    def test_distinguishes_num_inference_steps(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_request_batch_sampling_params_key
+
+        assert get_request_batch_sampling_params_key(
+            self._make(num_inference_steps=2)
+        ) != get_request_batch_sampling_params_key(self._make(num_inference_steps=4))
+
+    def test_ignores_seed_and_generator(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_request_batch_sampling_params_key
+
+        gen_a = torch.Generator(device="cpu").manual_seed(1)
+        gen_b = torch.Generator(device="cpu").manual_seed(2)
+
+        assert get_request_batch_sampling_params_key(
+            self._make(seed=1, generator=gen_a)
+        ) == get_request_batch_sampling_params_key(self._make(seed=2, generator=gen_b))
+
+
 class TestRequestScheduler:
     def setup_method(self) -> None:
         self.scheduler: RequestScheduler = RequestScheduler()
@@ -303,14 +338,68 @@ class TestRequestScheduler:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
 
-        req_id_a = scheduler.add_request(_make_request("a"))
-        req_id_b = scheduler.add_request(_make_request("b"))
+        req_id_a = scheduler.add_request(
+            _make_step_request(
+                "a",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, seed=123),
+            )
+        )
+        req_id_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, seed=123),
+            )
+        )
 
         sched_output = scheduler.schedule()
 
         assert _new_ids(sched_output) == [req_id_a, req_id_b]
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
+
+    def test_batches_incompatible_request_sampling_params_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(
+            _make_step_request(
+                "a", num_inference_steps=2, sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123)
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "b", num_inference_steps=4, sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4, seed=123)
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [req_id_a]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+    def test_batches_different_request_local_seed_together(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(
+            _make_step_request(
+                "a",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123),
+            )
+        )
+        req_id_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=456),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [req_id_a, req_id_b]
+        assert first.num_running_reqs == 2
+        assert first.num_waiting_reqs == 0
 
     def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
         scheduler = RequestScheduler()

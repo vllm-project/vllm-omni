@@ -4,7 +4,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
+
+import torch
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -31,8 +35,9 @@ class DiffusionRequestBatch:
         num_reqs: Number of requests in the batch.
         request_ids: Request IDs in the same order as ``requests``.
         prompts: Prompt list assembled from each request's single ``prompt``.
-        sampling_params: Sampling parameters shared by the batch. Scheduler
-            compatibility checks ensure batched requests can use this value.
+        sampling_params_list: Per-request sampling parameters in scheduler
+            order. Request-batch pipelines read request-local values here.
+        sampling_params: Sampling parameters for single-request legacy paths.
         request_id: First request ID, kept as a compatibility convenience for
             code paths that handle a single-request batch.
         kv_sender_info: KV-transfer metadata from the first request.
@@ -53,7 +58,15 @@ class DiffusionRequestBatch:
         return [req.prompt for req in self.requests]
 
     @property
+    def sampling_params_list(self) -> list[OmniDiffusionSamplingParams]:
+        return [req.sampling_params for req in self.requests]
+
+    @property
     def sampling_params(self) -> OmniDiffusionSamplingParams:
+        # Legacy pipelines do not accept RequestBatch, so they are invoked with
+        # one request at a time. In that path, this batch is expected to contain
+        # a single request, and we expose its sampling params for compatibility.
+        assert len(self.requests) == 1, "RequestBatch with multiple requests does not have a single sampling_params"
         return self.requests[0].sampling_params
 
     @property
@@ -72,3 +85,143 @@ class DiffusionRequestBatch:
             if req.request_id == request_id:
                 return req
         return None
+
+    def collate_request_generators(
+        self,
+        num_outputs_per_prompt: int,
+        default_generator: torch.Generator | list[torch.Generator] | None,
+    ) -> torch.Generator | list[torch.Generator] | None:
+        return self.collate_sampling_param_generators(
+            self.sampling_params_list,
+            num_outputs_per_prompt,
+            default_generator,
+        )
+
+    def collate_request_tensors(
+        self,
+        attr: str,
+        default_tensor: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        return self.collate_tensors(
+            [getattr(sampling, attr) for sampling in self.sampling_params_list],
+            attr,
+            default_tensor,
+        )
+
+    @staticmethod
+    def collate_tensors(
+        tensors: list[torch.Tensor | None],
+        name: str,
+        default_tensor: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        validated_tensors = DiffusionRequestBatch._validate_tensor_sequence(tensors, name)
+        if validated_tensors is None:
+            return default_tensor
+        return torch.cat(validated_tensors, dim=0)
+
+    @staticmethod
+    def collate_prompt_tensors(
+        tensors: list[torch.Tensor | None],
+        name: str,
+        default_tensor: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        validated_tensors = DiffusionRequestBatch._validate_tensor_sequence(tensors, name)
+        if validated_tensors is None:
+            return default_tensor
+        return torch.stack(validated_tensors, dim=0)
+
+    @staticmethod
+    def get_prompt_field(prompt: OmniPromptType, name: str) -> Any:
+        if isinstance(prompt, str):
+            return None
+        value = prompt.get(name)
+        if value is None:
+            additional = prompt.get("additional_information")
+            if isinstance(additional, dict):
+                value = additional.get(name)
+        if isinstance(value, list):
+            return value[0] if value else None
+        return value
+
+    @staticmethod
+    def collate_prompt_fields(
+        prompts: list[OmniPromptType],
+        name: str,
+        default_tensor: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        return DiffusionRequestBatch.collate_prompt_tensors(
+            [DiffusionRequestBatch.get_prompt_field(prompt, name) for prompt in prompts],
+            name,
+            default_tensor,
+        )
+
+    @staticmethod
+    def get_prompt_field_with_aliases(prompt: OmniPromptType, names: Sequence[str]) -> Any:
+        for name in names:
+            value = DiffusionRequestBatch.get_prompt_field(prompt, name)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def collate_prompt_field_map(
+        prompts: list[OmniPromptType],
+        field_defaults: Mapping[str, torch.Tensor | None],
+        field_aliases: Mapping[str, Sequence[str]] | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        collated_fields: dict[str, torch.Tensor | None] = {}
+        for name, default_tensor in field_defaults.items():
+            aliases = field_aliases.get(name, (name,)) if field_aliases is not None else (name,)
+            collated_fields[name] = DiffusionRequestBatch.collate_prompt_tensors(
+                [DiffusionRequestBatch.get_prompt_field_with_aliases(prompt, aliases) for prompt in prompts],
+                name,
+                default_tensor,
+            )
+        return collated_fields
+
+    @staticmethod
+    def _validate_tensor_sequence(
+        tensors: list[torch.Tensor | None],
+        name: str,
+    ) -> list[torch.Tensor] | None:
+        if not any(tensor is not None for tensor in tensors):
+            return None
+        if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+            raise ValueError(f"Cannot batch requests with a mix of provided and missing {name}.")
+
+        first = tensors[0]
+        assert isinstance(first, torch.Tensor)
+        for tensor in tensors[1:]:
+            assert isinstance(tensor, torch.Tensor)
+            if tensor.shape != first.shape or tensor.dtype != first.dtype or tensor.device != first.device:
+                raise ValueError(
+                    f"Batched request {name} must have matching shape, dtype, and device; "
+                    f"got {tensor.shape}/{tensor.dtype}/{tensor.device} and "
+                    f"{first.shape}/{first.dtype}/{first.device}."
+                )
+        return tensors
+
+    @staticmethod
+    def collate_sampling_param_generators(
+        sampling_params_list: list[Any],
+        num_outputs_per_prompt: int,
+        default_generator: torch.Generator | list[torch.Generator] | None,
+    ) -> torch.Generator | list[torch.Generator] | None:
+        request_generators = [sampling.generator for sampling in sampling_params_list]
+        if not any(generator is not None for generator in request_generators):
+            return default_generator
+        if not all(generator is not None for generator in request_generators):
+            raise ValueError("Cannot batch requests with a mix of provided and missing generators.")
+
+        generators: list[torch.Generator] = []
+        for generator in request_generators:
+            if isinstance(generator, list):
+                if len(generator) != num_outputs_per_prompt:
+                    raise ValueError(
+                        "Per-request generator lists must match num_outputs_per_prompt, "
+                        f"got {len(generator)} and {num_outputs_per_prompt}."
+                    )
+                generators.extend(generator)
+            else:
+                generators.extend([generator] * num_outputs_per_prompt)
+        return generators

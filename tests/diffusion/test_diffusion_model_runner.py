@@ -114,6 +114,26 @@ def _make_request(skip_cache_refresh: bool = True):
     )
 
 
+def _make_request_with_params(req_id: str, sampling_params):
+    return SimpleNamespace(
+        request_id=req_id,
+        prompt=f"prompt-{req_id}",
+        prompts=[f"prompt-{req_id}"],
+        sampling_params=sampling_params,
+        skip_cache_refresh=True,
+    )
+
+
+def _make_request_with_params(req_id: str, sampling_params):
+    return SimpleNamespace(
+        request_id=req_id,
+        prompt=f"prompt-{req_id}",
+        prompts=[f"prompt-{req_id}"],
+        sampling_params=sampling_params,
+        skip_cache_refresh=True,
+    )
+
+
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -306,9 +326,10 @@ class _BatchPipeline:
 
     def __init__(self, outputs):
         self._outputs = outputs
+        self.last_batch = None
 
     def forward(self, batch):
-        del batch
+        self.last_batch = batch
         return list(self._outputs)
 
 
@@ -386,6 +407,29 @@ def test_execute_model_batch_routes_one_output_per_request(monkeypatch):
     assert result.runner_outputs[0].result.output == "a"
     assert result.runner_outputs[1].request_id == "req-1"
     assert result.runner_outputs[1].result.output == "b"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_batch_preserves_per_request_sampling_and_seeds_generators(monkeypatch):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(
+        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
+    )
+    outputs = [SimpleNamespace(output="a"), SimpleNamespace(output="b")]
+    pipeline = _BatchPipeline(outputs=outputs)
+    runner = _make_batch_runner(pipeline)
+    sched = _make_scheduler_output(num_reqs=2)
+    sched.scheduled_new_reqs[0].req.sampling_params.seed = 111
+    sched.scheduled_new_reqs[1].req.sampling_params.seed = 222
+
+    DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+    assert pipeline.last_batch is not None
+    assert [sp.seed for sp in pipeline.last_batch.sampling_params_list] == [111, 222]
+    assert [sp.generator.initial_seed() for sp in pipeline.last_batch.sampling_params_list] == [111, 222]
+    with pytest.raises(AssertionError, match="multiple requests"):
+        _ = pipeline.last_batch.sampling_params
 
 
 @pytest.mark.core_model

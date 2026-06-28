@@ -531,26 +531,50 @@ class FluxPipeline(
         """Forward pass for flux."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        sigmas = req.sampling_params.sigmas or sigmas
+        height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = common_sampling_params.num_inference_steps or num_inference_steps
+        sigmas = common_sampling_params.sigmas or sigmas
         guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+            common_sampling_params.guidance_scale
+            if common_sampling_params.guidance_scale is not None
+            else guidance_scale
         )
-        generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        true_cfg_scale = common_sampling_params.true_cfg_scale or true_cfg_scale
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
+            common_sampling_params.num_outputs_per_prompt
+            if common_sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
         )
+        generator = req.collate_request_generators(num_images_per_prompt, generator)
+        latents = req.collate_request_tensors("latents", latents)
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "pooled_prompt_embeds": pooled_prompt_embeds,
+                "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
+        pooled_prompt_embeds = prompt_fields["pooled_prompt_embeds"]
+        negative_pooled_prompt_embeds = prompt_fields["negative_pooled_prompt_embeds"]
+        if prompt_embeds is not None:
+            prompt = None
+            prompt_2 = None
+        if negative_prompt_embeds is not None:
+            negative_prompt = None
+            negative_prompt_2 = None
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -669,7 +693,16 @@ class FluxPipeline(
             image = self.vae.decode(latents, return_dict=False)[0]
 
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        return DiffusionOutput(output=image, stage_durations=stage_durations)
+        n = num_images_per_prompt
+        if req.num_reqs == 1:
+            return [DiffusionOutput(output=image, stage_durations=stage_durations)]
+        return [
+            DiffusionOutput(
+                output=image[i * n : (i + 1) * n] if isinstance(image, list) else image[i * n : (i + 1) * n],
+                stage_durations=stage_durations,
+            )
+            for i in range(req.num_reqs)
+        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
