@@ -1288,7 +1288,7 @@ class Wan22S2VPipeline(
             )
 
             # ---- Decode this clip ----
-            if self.od_config.enable_cpu_offload:
+            if self.od_config.enable_cpu_offload and not getattr(self.od_config.parallel_config, "use_hsdp", False):
                 self.transformer.to("cpu")
                 current_omni_platform.empty_cache()
 
