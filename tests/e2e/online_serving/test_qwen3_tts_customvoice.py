@@ -21,7 +21,7 @@ MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
 _STAGE_CONFIG = modify_stage_config(
     get_deploy_config_path("qwen3_tts.yaml"),
-    updates={"stages": {0: {"default_sampling_params.max_tokens": 300}}},
+    updates={"stages": {0: {"default_sampling_params.max_tokens": 500}}},
 )
 
 

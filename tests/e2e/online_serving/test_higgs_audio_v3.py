@@ -75,7 +75,7 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
-    @pytest.mark.advanced_model
+    @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_plain_text_with_max_new_tokens(self, omni_server, openai_client) -> None:
@@ -183,7 +183,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
     They do not assert audio quality (out of scope for CI).
     """
 
-    @pytest.mark.advanced_model
+    @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_emotion_and_expressive(self, omni_server, openai_client) -> None:
@@ -199,7 +199,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.advanced_model
+    @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_style_whispering(self, omni_server, openai_client) -> None:
@@ -215,7 +215,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.advanced_model
+    @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_prosody_speed_and_pitch(self, omni_server, openai_client) -> None:
@@ -233,7 +233,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.advanced_model
+    @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_pause_mid_text(self, omni_server, openai_client) -> None:
@@ -249,7 +249,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.advanced_model
+    @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_sfx_with_onomatopoeia(self, omni_server, openai_client) -> None:
@@ -291,7 +291,7 @@ class TestHiggsAudioV3OnlineVoiceClone:
             }
         )
 
-    @pytest.mark.advanced_model
+    @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_references_alias(self, omni_server, openai_client) -> None:
