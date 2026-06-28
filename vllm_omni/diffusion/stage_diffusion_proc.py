@@ -419,61 +419,6 @@ class StageDiffusionProc:
                     )
                     tasks[request_id] = task
 
-                elif msg_type == "add_batch_request":
-                    request_id = msg["request_id"]
-
-                    async def _dispatch_batch(
-                        rid: str,
-                        prompts: list,
-                        sp_dict: dict,
-                        kv_sender_info: dict[str, Any] | None = None,
-                    ) -> None:
-                        try:
-                            result = await self._process_batch_request(
-                                rid,
-                                prompts,
-                                sp_dict,
-                                kv_sender_info=kv_sender_info,
-                            )
-                            await response_socket.send(encoder.encode({"type": "result", "output": result}))
-                        except DiffusionRequestAbortedError as e:
-                            logger.info(
-                                "request_id: %s aborted: %s",
-                                rid,
-                                str(e),
-                            )
-                        except Exception as e:
-                            logger.exception("Batch diffusion request %s failed: %s", rid, e)
-                            status_code, error_type = client_error_metadata(e)
-                            await response_socket.send(
-                                encoder.encode(
-                                    {
-                                        "type": "error",
-                                        "request_id": rid,
-                                        "error": str(e),
-                                        "status_code": status_code,
-                                        "error_type": error_type,
-                                    }
-                                )
-                            )
-                            # Same rationale as the single-request path: a
-                            # closed executor turns every subsequent batch
-                            # into a 500, so escalate now.
-                            if self._is_executor_dead():
-                                self._signal_fatal_engine_failure(f"add_batch_request {rid}: {e!s}")
-                        finally:
-                            tasks.pop(rid, None)
-
-                    task = asyncio.create_task(
-                        _dispatch_batch(
-                            request_id,
-                            msg["prompts"],
-                            msg["sampling_params"],
-                            msg.get("kv_sender_info"),
-                        )
-                    )
-                    tasks[request_id] = task
-
                 elif msg_type == "abort":
                     for rid in msg.get("request_ids", []):
                         task = tasks.pop(rid, None)
