@@ -89,17 +89,30 @@ class ManagedBuffer:
     Must be kept alive while the data view is being used.
     """
 
-    def __init__(self, allocator: BufferAllocator, offset: int, size: int, pool_tensor: torch.Tensor):
+    def __init__(
+        self,
+        allocator: BufferAllocator,
+        offset: int,
+        size: int,
+        pool_tensor: torch.Tensor,
+        release_callback=None,
+        allocation_size: int | None = None,
+    ):
         self.allocator = allocator
         self.offset = offset
         self.size = size
+        self.allocation_size = size if allocation_size is None else allocation_size
         self.pool_tensor = pool_tensor
+        self._release_callback = release_callback
         self._released = False
 
     def release(self) -> None:
         """Explicitly release the buffer back to the pool."""
         if not self._released:
-            self.allocator.free(self.offset, self.size)
+            if self._release_callback is not None and self._release_callback(self):
+                self._released = True
+                return
+            self.allocator.free(self.offset, self.allocation_size)
             self._released = True
 
     def __del__(self):

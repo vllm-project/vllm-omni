@@ -8,7 +8,7 @@ import threading
 import time as _time_mod
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
@@ -31,6 +31,7 @@ except ImportError:
 # Stale buffer TTL: buffers older than this are automatically reclaimed
 # to prevent memory leaks when receiver crashes or gives up.
 _BUFFER_TTL_SECONDS = 300  # 5 minutes
+_PROFILE: bool = os.getenv("VLLM_OMNI_CONNECTOR_PROFILE", "0") == "1"
 
 # ZMQ Message constants
 TRANS_DONE = b"trans_done"
@@ -40,6 +41,38 @@ INFO_NOT_FOUND = b"info_not_found"
 PAYLOAD_KIND_RAW = "raw"
 PAYLOAD_KIND_MSGPACK = "msgpack"
 PAYLOAD_KIND_TENSOR_DICT = "tensor_dict"
+
+
+if _PROFILE:
+
+    class _Span:
+        __slots__ = ("name", "start", "store")
+
+        def __init__(self, name: str, store: dict[str, float]):
+            self.name = name
+            self.store = store
+
+        def __enter__(self):
+            self.start = _time_mod.perf_counter()
+            return self
+
+        def __exit__(self, *_):
+            self.store[self.name] = self.store.get(self.name, 0.0) + (_time_mod.perf_counter() - self.start)
+
+
+@dataclass
+class _CachedSocket:
+    socket: zmq.Socket
+    created_at: float
+    last_used_at: float
+    had_error: bool = False
+
+
+@dataclass
+class _WarmPool:
+    buffers: list["ManagedBuffer"] = field(default_factory=list)
+    hits: int = 0
+    misses: int = 0
 
 
 @dataclass
@@ -124,6 +157,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
         self._sender_endpoints: dict[int, tuple[str, int]] = {}
+        self._warm_pool = _WarmPool()
+        self._warm_pool_lock = threading.Lock()
+        self._profile_records: list[dict[str, float | str | int]] = []
+        self._profile_lock = threading.Lock()
 
         self._metrics = {
             "puts": 0,
@@ -131,6 +168,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             "bytes_transferred": 0,
             "errors": 0,
             "timeouts": 0,
+            "warm_pool_hits": 0,
+            "warm_pool_misses": 0,
+            "socket_recreates": 0,
         }
 
         self.config = config
@@ -160,6 +200,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # --- Memory Pool Configuration ---
         self.pool_size = config.get("memory_pool_size", 1024**3)  # Default 1GB
         self.pool_device = config.get("memory_pool_device", "cpu")
+        self.enable_tensor_dict_fast_path = bool(config.get("enable_tensor_dict_fast_path", True))
+        self.enable_pipelined_zmq_write = bool(config.get("enable_pipelined_zmq_write", False))
+        self.pool_prewarm_slots = int(config.get("pool_prewarm_slots", 0) or 0)
+        self.pool_prewarm_size = int(config.get("pool_prewarm_size", 0) or 0)
+        self.socket_health_interval_s = float(config.get("socket_health_interval_s", 30.0))
 
         # --- Sender Configuration (for receiver to query without metadata) ---
         # When receiver doesn't have metadata, it uses these to connect to sender
@@ -211,6 +256,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             raise
 
         self.allocator = BufferAllocator(self.pool_size, alignment=4096)  # 4KB alignment for safety
+        self._prewarm_pool()
+
+        if self.enable_pipelined_zmq_write:
+            logger.warning(
+                "enable_pipelined_zmq_write=True requested, but this connector uses sender-side "
+                "batch_transfer_sync_write() into receiver-provided addresses. Early TRANS_DONE would "
+                "let callers read before the write is visible, so Opt A remains disabled for correctness."
+            )
+            self.enable_pipelined_zmq_write = False
 
         # --- State Management & Background Threads ---
         # Most fields already initialized at the top of __init__ for teardown
@@ -264,6 +318,81 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             "rpc_port": self.rpc_port,
             "can_put": self.can_put,
         }
+
+    def _record_profile(self, operation: str, key: str, spans: dict[str, float], size: int = 0) -> None:
+        if not _PROFILE:
+            return
+        record: dict[str, float | str | int] = {
+            "operation": operation,
+            "key": key,
+            "size": size,
+        }
+        record.update({name: seconds * 1000.0 for name, seconds in spans.items()})
+        with self._profile_lock:
+            self._profile_records.append(record)
+        logger.debug("Mooncake TE profile span: %s", record)
+
+    def pop_profile_records(self) -> list[dict[str, float | str | int]]:
+        """Return and clear collected profiling records.
+
+        Records are populated only when ``VLLM_OMNI_CONNECTOR_PROFILE=1``.
+        This keeps profiling data out of ``health()``, which remains an
+        operational API rather than a benchmark transport.
+        """
+        if not _PROFILE:
+            return []
+        with self._profile_lock:
+            records = list(self._profile_records)
+            self._profile_records.clear()
+        return records
+
+    def _return_warm_buffer(self, buf: ManagedBuffer) -> bool:
+        if self._closed:
+            return False
+        buf.size = buf.allocation_size
+        with self._warm_pool_lock:
+            self._warm_pool.buffers.append(buf)
+        return True
+
+    def _prewarm_pool(self) -> None:
+        if self.pool_prewarm_slots <= 0:
+            return
+        if self.pool_prewarm_size <= 0:
+            raise ValueError("pool_prewarm_size must be > 0 when pool_prewarm_slots is enabled")
+
+        for _ in range(self.pool_prewarm_slots):
+            offset = self.allocator.alloc(self.pool_prewarm_size)
+            buf = ManagedBuffer(
+                self.allocator,
+                offset,
+                self.pool_prewarm_size,
+                self.pool,
+                release_callback=self._return_warm_buffer,
+                allocation_size=self.pool_prewarm_size,
+            )
+            buf._released = True
+            self._warm_pool.buffers.append(buf)
+        logger.info(
+            "Pre-warmed Mooncake memory pool with %s slots of %s bytes",
+            self.pool_prewarm_slots,
+            self.pool_prewarm_size,
+        )
+
+    def _alloc_managed_buffer(self, size: int) -> ManagedBuffer:
+        with self._warm_pool_lock:
+            for i, buf in enumerate(self._warm_pool.buffers):
+                if buf.allocation_size >= size:
+                    self._warm_pool.hits += 1
+                    self._metrics["warm_pool_hits"] += 1
+                    leased = self._warm_pool.buffers.pop(i)
+                    leased.size = size
+                    leased._released = False
+                    return leased
+            self._warm_pool.misses += 1
+            self._metrics["warm_pool_misses"] += 1
+
+        offset = self.allocator.alloc(size)
+        return ManagedBuffer(self.allocator, offset, size, self.pool)
 
     def update_sender_info(
         self,
@@ -335,16 +464,35 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         If a call fails, use ``_invalidate_req_socket()`` to discard the
         broken socket; the next call will transparently create a fresh one.
         """
-        cache: dict[str, zmq.Socket] = getattr(self._req_local, "cache", None)  # type: ignore[assignment]
+        cache: dict[str, _CachedSocket] = getattr(self._req_local, "cache", None)  # type: ignore[assignment]
         if cache is None:
             cache = {}
             self._req_local.cache = cache
 
-        sock = cache.get(zmq_addr)
-        if sock is None:
+        now = _time_mod.monotonic()
+        cached = cache.get(zmq_addr)
+        idle_too_long = (
+            cached is not None
+            and self.socket_health_interval_s > 0
+            and now - cached.last_used_at >= self.socket_health_interval_s
+        )
+        if cached is not None and (cached.had_error or idle_too_long):
+            try:
+                cached.socket.close(linger=0)
+            except Exception:
+                pass
+            cache.pop(zmq_addr, None)
+            cached = None
+
+        if cached is None:
             sock = self.zmq_ctx.socket(zmq.REQ)
             sock.connect(zmq_addr)
-            cache[zmq_addr] = sock
+            cached = _CachedSocket(socket=sock, created_at=now, last_used_at=now)
+            cache[zmq_addr] = cached
+            self._metrics["socket_recreates"] += 1
+
+        cached.last_used_at = now
+        sock = cached.socket
         # Set timeouts per-call (safe to change between send/recv cycles).
         # SNDTIMEO guards against send() blocking when the peer is unreachable
         # or its receive buffer is full.
@@ -354,13 +502,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
     def _invalidate_req_socket(self, zmq_addr: str) -> None:
         """Close and remove a thread-local cached REQ socket (e.g., after recv timeout)."""
-        cache: dict[str, zmq.Socket] = getattr(self._req_local, "cache", None)  # type: ignore[assignment]
+        cache: dict[str, _CachedSocket] = getattr(self._req_local, "cache", None)  # type: ignore[assignment]
         if cache is None:
             return
-        sock = cache.pop(zmq_addr, None)
-        if sock is not None:
+        cached = cache.pop(zmq_addr, None)
+        if cached is not None:
+            cached.had_error = True
             try:
-                sock.close(linger=0)
+                cached.socket.close(linger=0)
             except Exception:
                 pass  # Best-effort; zmq_ctx.term() will reclaim if needed
 
@@ -388,6 +537,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return False, 0, None
 
         put_key = self._make_key(put_key, from_stage, to_stage)
+        spans: dict[str, float] = {}
 
         # Serialize concurrent put() calls on the same connector to prevent
         # races in the alloc -> copy -> store-metadata flow at the Mooncake
@@ -418,12 +568,20 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Pre-process: serialize non-raw types before entering the copy path.
             # This avoids the previous recursive put() pattern and keeps
             # _local_buffers writes atomic (single write, no override needed).
-            if is_tensor_dict(data):
-                data = serialize_tensor_dict(data)
+            if self.enable_tensor_dict_fast_path and is_tensor_dict(data):
+                if _PROFILE:
+                    with _Span("serialize", spans):
+                        data = serialize_tensor_dict(data)
+                else:
+                    data = serialize_tensor_dict(data)
                 is_fast_path = False
                 payload_kind = PAYLOAD_KIND_TENSOR_DICT
             elif not isinstance(data, ManagedBuffer | torch.Tensor | bytes):
-                data = OmniSerializer.serialize(data)
+                if _PROFILE:
+                    with _Span("serialize", spans):
+                        data = OmniSerializer.serialize(data)
+                else:
+                    data = OmniSerializer.serialize(data)
                 is_fast_path = False  # Receiver must deserialize
                 payload_kind = PAYLOAD_KIND_MSGPACK
 
@@ -457,8 +615,12 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
                 # 2. Alloc from pool
                 try:
-                    offset = self.allocator.alloc(size)
-                    holder = ManagedBuffer(self.allocator, offset, size, self.pool)
+                    if _PROFILE:
+                        with _Span("pool_alloc", spans):
+                            holder = self._alloc_managed_buffer(size)
+                    else:
+                        holder = self._alloc_managed_buffer(size)
+                    offset = holder.offset
                     should_release_holder = True  # We created it, we release it
                 except MemoryError:
                     logger.error(f"Pool exhausted, cannot put data size {size}")
@@ -545,6 +707,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
+            self._record_profile("put", put_key, spans, size)
 
             return True, size, metadata
 
@@ -623,6 +786,30 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return None
         return self._query_metadata_at(get_key, *endpoint)
 
+    def _resolve_get_metadata(self, get_key: str, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not metadata:
+            if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
+                raise RuntimeError(
+                    f"get(metadata=None) requires sender info to be resolved, "
+                    f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
+                    f"Call update_sender_info(host, port) before using get() without metadata."
+                )
+            return self._query_metadata_from_sender(get_key)
+
+        if "data_size" in metadata:
+            return metadata
+
+        partial_host = metadata.get("source_host")
+        partial_port = metadata.get("source_port")
+        if not partial_host or not partial_port:
+            logger.warning(
+                "get(%s): partial metadata missing source_host/source_port, cannot resolve data_size. metadata=%s",
+                get_key,
+                metadata,
+            )
+            return None
+        return self._query_metadata_at(get_key, str(partial_host), int(partial_port))
+
     def get(
         self,
         from_stage: str,
@@ -659,33 +846,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         get_key = self._make_key(get_key, from_stage, to_stage)
 
         _t0 = _time_mod.perf_counter()
+        spans: dict[str, float] = {}
 
+        if _PROFILE:
+            with _Span("zmq_query", spans):
+                metadata = self._resolve_get_metadata(get_key, metadata)
+        else:
+            metadata = self._resolve_get_metadata(get_key, metadata)
         if not metadata:
-            # Path 3: no metadata at all — query default sender
-            if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
-                raise RuntimeError(
-                    f"get(metadata=None) requires sender info to be resolved, "
-                    f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
-                    f"Call update_sender_info(host, port) before using get() without metadata."
-                )
-            metadata = self._query_metadata_from_sender(get_key)
-            if not metadata:
-                return None
-        elif "data_size" not in metadata:
-            # Path 2: partial metadata (host/port only) — query that sender
-            partial_host = metadata.get("source_host")
-            partial_port = metadata.get("source_port")
-            if not partial_host or not partial_port:
-                logger.warning(
-                    "get(%s): partial metadata missing source_host/source_port, cannot resolve data_size. metadata=%s",
-                    get_key,
-                    metadata,
-                )
-                return None
-            queried = self._query_metadata_at(get_key, str(partial_host), int(partial_port))
-            if not queried:
-                return None
-            metadata = queried
+            return None
 
         _t1 = _time_mod.perf_counter()
         _query_ms = (_t1 - _t0) * 1000
@@ -709,8 +878,12 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         # 1. Allocate Destination Buffer from Pool
         try:
-            offset = self.allocator.alloc(data_size)
-            recv_buffer = ManagedBuffer(self.allocator, offset, data_size, self.pool)
+            if _PROFILE:
+                with _Span("dest_alloc", spans):
+                    recv_buffer = self._alloc_managed_buffer(data_size)
+            else:
+                recv_buffer = self._alloc_managed_buffer(data_size)
+            offset = recv_buffer.offset
             dst_ptr = self.base_ptr + offset
         except MemoryError:
             logger.error(f"Failed to allocate {data_size} bytes in receive pool")
@@ -741,7 +914,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         try:
             req_socket.send(msgspec.msgpack.encode(agent_meta))
-            resp = req_socket.recv()
+            if _PROFILE:
+                with _Span("te_read", spans):
+                    resp = req_socket.recv()
+            else:
+                resp = req_socket.recv()
 
             _t3 = _time_mod.perf_counter()
             _rdma_ms = (_t3 - _t2) * 1000
@@ -780,6 +957,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     )
                     self._metrics["gets"] += 1
                     self._metrics["bytes_transferred"] += data_size
+                    self._record_profile("get", get_key, spans, data_size)
                     return recv_buffer, data_size
                 else:
                     # If it was a serialized object or generic bytes, we assume standard Omni behavior:
@@ -792,7 +970,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                         _copy_ms = (_t_copy_end - _t_copy_start) * 1000
 
                         _t_deser_start = _time_mod.perf_counter()
-                        if payload_kind == PAYLOAD_KIND_TENSOR_DICT:
+                        if _PROFILE:
+                            with _Span("deserialize", spans):
+                                if payload_kind == PAYLOAD_KIND_TENSOR_DICT:
+                                    val = deserialize_tensor_dict(raw_bytes)
+                                else:
+                                    val = OmniSerializer.deserialize(raw_bytes)
+                        elif payload_kind == PAYLOAD_KIND_TENSOR_DICT:
                             val = deserialize_tensor_dict(raw_bytes)
                         else:
                             val = OmniSerializer.deserialize(raw_bytes)
@@ -808,6 +992,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                         )
                         self._metrics["gets"] += 1
                         self._metrics["bytes_transferred"] += data_size
+                        self._record_profile("get", get_key, spans, data_size)
                         return val, data_size
                     finally:
                         recv_buffer.release()
@@ -905,16 +1090,23 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     holder.release()
             self._local_buffers.clear()
 
+        with self._warm_pool_lock:
+            for buf in self._warm_pool.buffers:
+                buf._release_callback = None
+                buf._released = False
+                buf.release()
+            self._warm_pool.buffers.clear()
+
         # 5. Close thread-local cached REQ sockets (for the calling thread).
         #    Sockets cached in *other* threads are not directly accessible here
         #    because they live in per-thread ``threading.local()`` storage.
         #    They will be forcefully closed when ``zmq_ctx.term()`` is called
         #    in step 7 below, which is the intended cleanup path.
-        cache: dict[str, zmq.Socket] = getattr(self._req_local, "cache", None)  # type: ignore[assignment]
+        cache: dict[str, _CachedSocket] = getattr(self._req_local, "cache", None)  # type: ignore[assignment]
         if cache:
-            for addr, sock in cache.items():
+            for addr, cached in cache.items():
                 try:
-                    sock.close(linger=0)
+                    cached.socket.close(linger=0)
                 except Exception:
                     pass  # Best-effort; zmq_ctx.term() below will reclaim
             cache.clear()
@@ -1066,13 +1258,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             src_addrs, src_lengths, _, _, _, _, _ = item
             remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+            spans: dict[str, float] = {}
 
             # RDMA Write
-            ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
+            if _PROFILE:
+                with _Span("te_write", spans):
+                    ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
+            else:
+                ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
 
             if ret == 0:
                 self.cleanup(meta.request_id)
                 response_queue.put((identity, TRANS_DONE))
+                self._record_profile("write", meta.request_id, spans, sum(src_lengths))
             else:
                 # Keep buffer in _local_buffers so receiver can retry on transient failures.
                 # Buffer will be cleaned up when: (a) a retry succeeds, (b) close() is called,

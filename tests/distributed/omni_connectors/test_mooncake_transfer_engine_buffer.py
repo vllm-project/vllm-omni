@@ -11,9 +11,12 @@ import threading
 import pytest
 import torch
 
+import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
     BufferAllocator,
     ManagedBuffer,
+    MooncakeTransferEngineConnector,
+    _WarmPool,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData
 
@@ -293,3 +296,136 @@ class TestMooncakePackedPayloadSmoke:
         assert decoded["layer_blocks"]["value_cache"][0].is_cuda
         assert torch.equal(decoded["layer_blocks"]["key_cache"][0].cpu(), key_tensor.cpu())
         assert torch.equal(decoded["layer_blocks"]["value_cache"][0].cpu(), value_tensor.cpu())
+
+
+@pytest.mark.core_model
+class TestManagedBufferReleaseCallback:
+    """Unit tests for ManagedBuffer release callbacks."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        self.allocator = BufferAllocator(total_size=4096, alignment=64)
+        self.pool = torch.zeros(4096, dtype=torch.uint8)
+
+    def test_release_callback_can_retain_allocation(self):
+        """Verify warm-pool style release callbacks can retain an allocation."""
+        retained = []
+        offset = self.allocator.alloc(128)
+
+        def retain(buf):
+            retained.append(buf)
+            return True
+
+        buf = ManagedBuffer(
+            self.allocator,
+            offset,
+            64,
+            self.pool,
+            release_callback=retain,
+            allocation_size=128,
+        )
+
+        buf.release()
+
+        assert buf._released
+        assert retained == [buf]
+        with pytest.raises(MemoryError):
+            self.allocator.alloc(4096)
+
+        buf._release_callback = None
+        buf._released = False
+        buf.release()
+        assert self.allocator.alloc(4096) == 0
+
+
+class TestWarmPool:
+    """Unit tests for pre-warmed ManagedBuffer leasing."""
+
+    def _connector(self, slots=2, slot_size=128):
+        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
+        connector._closed = False
+        connector.allocator = BufferAllocator(total_size=1024, alignment=64)
+        connector.pool = torch.zeros(1024, dtype=torch.uint8)
+        connector.pool_prewarm_slots = slots
+        connector.pool_prewarm_size = slot_size
+        connector._warm_pool = _WarmPool()
+        connector._warm_pool_lock = threading.Lock()
+        connector._metrics = {"warm_pool_hits": 0, "warm_pool_misses": 0}
+        return connector
+
+    def test_warm_pool_no_stall_for_prewarmed_slots(self):
+        connector = self._connector(slots=2, slot_size=128)
+
+        MooncakeTransferEngineConnector._prewarm_pool(connector)
+        buffers = [MooncakeTransferEngineConnector._alloc_managed_buffer(connector, 64) for _ in range(2)]
+
+        assert connector._metrics["warm_pool_hits"] == 2
+        assert connector._metrics["warm_pool_misses"] == 0
+        assert len(connector._warm_pool.buffers) == 0
+
+        for buf in buffers:
+            buf.release()
+        assert len(connector._warm_pool.buffers) == 2
+
+
+class TestCachedSocket:
+    """Unit tests for idle/error-triggered socket recreation."""
+
+    class _FakeSocket:
+        def __init__(self):
+            self.closed = False
+            self.connected_to = None
+            self.options = {}
+
+        def connect(self, addr):
+            self.connected_to = addr
+
+        def setsockopt(self, key, value):
+            self.options[key] = value
+
+        def close(self, linger=0):
+            del linger
+            self.closed = True
+
+    class _FakeContext:
+        def __init__(self):
+            self.sockets = []
+
+        def socket(self, socket_type):
+            del socket_type
+            sock = TestCachedSocket._FakeSocket()
+            self.sockets.append(sock)
+            return sock
+
+    def _connector(self):
+        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
+        connector._req_local = threading.local()
+        connector.zmq_ctx = self._FakeContext()
+        connector.socket_health_interval_s = 30.0
+        connector._metrics = {"socket_recreates": 0}
+        return connector
+
+    def test_socket_recovery_recreates_failed_cached_socket(self):
+        connector = self._connector()
+        addr = "tcp://127.0.0.1:5555"
+
+        first = MooncakeTransferEngineConnector._get_req_socket(connector, addr, timeout_ms=100)
+        connector._req_local.cache[addr].had_error = True
+        second = MooncakeTransferEngineConnector._get_req_socket(connector, addr, timeout_ms=100)
+
+        assert first is not second
+        assert first.closed
+        assert second.connected_to == addr
+        assert connector._metrics["socket_recreates"] == 2
+
+
+def test_profile_disabled_does_not_define_span():
+    """Use _Span non-existence as the CI-safe proxy for zero profiling overhead.
+
+    Full put/get profiling overhead needs Mooncake, but when profiling is off
+    this verifies the module does not even define the span context manager that
+    would allocate and enter/exit on hot paths.
+    """
+    if mooncake_module._PROFILE:
+        pytest.skip("VLLM_OMNI_CONNECTOR_PROFILE is enabled for this test process")
+    assert not hasattr(mooncake_module, "_Span")

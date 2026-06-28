@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 from pytest_mock import MockerFixture
 
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
@@ -24,8 +25,6 @@ def test_basic_serialization():
 
 def test_tensor_serialization():
     """Test torch.Tensor serialization."""
-    import torch
-
     tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     serialized = OmniSerializer.serialize(tensor)
     deserialized = OmniSerializer.deserialize(serialized)
@@ -193,5 +192,78 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         assert connector.host == "10.20.30.40"
         assert connector.engine.host == "10.20.30.40"
         assert connector.get_connection_info()["host"] == "10.20.30.40"
+    finally:
+        connector.close()
+
+
+def test_mooncake_tensor_dict_put_bypasses_omni_serializer(monkeypatch: pytest.MonkeyPatch):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    class _FakePool:
+        is_cuda = False
+
+        def __init__(self, size):
+            self.tensor = torch.zeros(size, dtype=torch.uint8)
+
+        def pin_memory(self):
+            return self
+
+        def data_ptr(self):
+            return self.tensor.data_ptr()
+
+        def __getitem__(self, item):
+            return self.tensor[item]
+
+        def __setitem__(self, item, value):
+            self.tensor[item] = value
+
+    class _FakeTransferEngine:
+        def initialize(self, host, mode, protocol, device_name):
+            del host, mode, protocol, device_name
+            return 0
+
+        def get_rpc_port(self):
+            return 23456
+
+        def register_memory(self, base_ptr, pool_size):
+            del base_ptr, pool_size
+            return 0
+
+        def unregister_memory(self, base_ptr):
+            del base_ptr
+            return 0
+
+    monkeypatch.setattr(mooncake_module, "TransferEngine", _FakeTransferEngine)
+    monkeypatch.setattr(mooncake_module.torch, "empty", lambda size, *args, **kwargs: _FakePool(size))
+    monkeypatch.setattr(
+        mooncake_module.MooncakeTransferEngineConnector,
+        "_zmq_listener_loop",
+        lambda self: self._listener_ready.set(),
+    )
+    monkeypatch.setattr(
+        mooncake_module.OmniSerializer,
+        "serialize",
+        lambda obj: (_ for _ in ()).throw(AssertionError("OmniSerializer should not handle tensor_dict")),
+    )
+
+    connector = mooncake_module.MooncakeTransferEngineConnector(
+        {
+            "host": "127.0.0.1",
+            "zmq_port": 50052,
+            "memory_pool_size": 4096,
+        }
+    )
+    try:
+        ok, size, metadata = connector.put(
+            "stage_0",
+            "stage_1",
+            "req_tensor_dict",
+            {"tokens": torch.arange(4, dtype=torch.int64)},
+        )
+
+        assert ok is True
+        assert size > 0
+        assert metadata["payload_kind"] == mooncake_module.PAYLOAD_KIND_TENSOR_DICT
+        assert metadata["is_fast_path"] is False
     finally:
         connector.close()
