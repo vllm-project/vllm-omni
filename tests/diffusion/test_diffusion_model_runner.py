@@ -452,6 +452,31 @@ def test_execute_model_batch_rejects_single_diffusion_output(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_execute_model_batch_uses_runner_output_helper(monkeypatch):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(
+        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
+    )
+    outs = [DiffusionOutput(output="a"), DiffusionOutput(output="b")]
+    runner = _make_batch_runner(_BatchPipeline(outputs=outs))
+    sched = _make_scheduler_output(num_reqs=2)
+    helper_calls = []
+    original_from_outputs = DiffusionModelRunner._runner_output_from_outputs
+
+    def _recording_from_outputs(self, reqs, outputs):
+        helper_calls.append(([req.request_id for req in reqs], [output.output for output in outputs]))
+        return original_from_outputs(self, reqs, outputs)
+
+    monkeypatch.setattr(DiffusionModelRunner, "_runner_output_from_outputs", _recording_from_outputs)
+
+    result = DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+    assert [runner_output.result.output for runner_output in result.runner_outputs] == ["a", "b"]
+    assert helper_calls == [(["req-0", "req-1"], ["a", "b"])]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_diffusion_output_by_request_slices_single_and_multi_request_outputs():
     reqs = [_make_request(), _make_request()]
     reqs[0].request_id = "req-0"
