@@ -44,7 +44,7 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -1086,18 +1086,11 @@ class QwenImagePipeline(
 
         self._current_timestep = None
         result = self._decode_latents(latents, height, width, output_type)
-        image = result.output
-        stage_durations = result.stage_durations
-        n = common_sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [result]
-        return [
-            DiffusionOutput(
-                output=image[i * n : (i + 1) * n],
-                stage_durations=stage_durations,
-            )
-            for i in range(req.num_reqs)
-        ]
+        return split_diffusion_output_by_request(
+            result,
+            req,
+            num_outputs_per_prompt=num_images_per_prompt,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

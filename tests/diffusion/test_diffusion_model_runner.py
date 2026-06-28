@@ -11,7 +11,7 @@ import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 pytestmark = [pytest.mark.diffusion]
 
@@ -111,16 +111,6 @@ def _make_request(skip_cache_refresh: bool = True):
         sampling_params=sampling_params,
         skip_cache_refresh=skip_cache_refresh,
         kv_sender_info=None,
-    )
-
-
-def _make_request_with_params(req_id: str, sampling_params):
-    return SimpleNamespace(
-        request_id=req_id,
-        prompt=f"prompt-{req_id}",
-        prompts=[f"prompt-{req_id}"],
-        sampling_params=sampling_params,
-        skip_cache_refresh=True,
     )
 
 
@@ -458,6 +448,47 @@ def test_execute_model_batch_rejects_single_diffusion_output(monkeypatch):
 
     with pytest.raises(RuntimeError, match="request-batch forward must return list\\[DiffusionOutput\\]"):
         DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_split_diffusion_output_by_request_slices_single_and_multi_request_outputs():
+    reqs = [_make_request(), _make_request()]
+    reqs[0].request_id = "req-0"
+    reqs[1].request_id = "req-1"
+    batch = DiffusionRequestBatch(requests=reqs)
+    result = DiffusionOutput(output=["img-0a", "img-0b", "img-1a", "img-1b"], stage_durations={"decode": 1.0})
+
+    outputs = split_diffusion_output_by_request(result, batch, num_outputs_per_prompt=2)
+
+    assert [output.output for output in outputs] == [["img-0a", "img-0b"], ["img-1a", "img-1b"]]
+    assert [output.stage_durations for output in outputs] == [{"decode": 1.0}, {"decode": 1.0}]
+
+    single = split_diffusion_output_by_request(
+        result, DiffusionRequestBatch(requests=reqs[:1]), num_outputs_per_prompt=2
+    )
+
+    assert single[0].output == ["img-0a", "img-0b"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_split_diffusion_output_by_request_slices_tuple_outputs():
+    reqs = [_make_request(), _make_request()]
+    batch = DiffusionRequestBatch(requests=reqs)
+    result = DiffusionOutput(
+        output=(
+            ["video-0", "video-1"],
+            torch.tensor([10, 20]),
+        )
+    )
+
+    outputs = split_diffusion_output_by_request(result, batch, num_outputs_per_prompt=1)
+
+    assert outputs[0].output[0] == ["video-0"]
+    assert torch.equal(outputs[0].output[1], torch.tensor([10]))
+    assert outputs[1].output[0] == ["video-1"]
+    assert torch.equal(outputs[1].output[1], torch.tensor([20]))
 
 
 @pytest.mark.core_model

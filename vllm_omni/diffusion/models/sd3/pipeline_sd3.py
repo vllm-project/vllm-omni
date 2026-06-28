@@ -26,7 +26,7 @@ from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -780,17 +780,14 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        n = num_images_per_prompt
-        if req.num_reqs == 1:
-            return [DiffusionOutput(output=image, stage_durations=stage_durations)]
-        return [
+        return split_diffusion_output_by_request(
             DiffusionOutput(
-                output=image[i * n : (i + 1) * n],
-                stage_durations=stage_durations,
-            )
-            for i in range(req.num_reqs)
-        ]
+                output=image,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            ),
+            req,
+            num_outputs_per_prompt=num_images_per_prompt,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

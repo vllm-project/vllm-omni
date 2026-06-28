@@ -10,8 +10,47 @@ from typing import Any
 
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
+
+
+def _slice_request_output(value: Any, start: int, stop: int) -> Any:
+    if isinstance(value, tuple):
+        return tuple(_slice_request_output(item, start, stop) for item in value)
+    if isinstance(value, list):
+        return value[start:stop]
+    if isinstance(value, torch.Tensor):
+        return value[start:stop]
+    return value
+
+
+def split_diffusion_output_by_request(
+    result: DiffusionOutput,
+    req: DiffusionRequestBatch,
+    *,
+    num_outputs_per_prompt: int,
+) -> list[DiffusionOutput]:
+    """Split a batched DiffusionOutput into one output per request."""
+    if num_outputs_per_prompt <= 0:
+        raise ValueError(f"num_outputs_per_prompt must be positive, got {num_outputs_per_prompt}.")
+
+    return [
+        DiffusionOutput(
+            output=_slice_request_output(
+                result.output,
+                idx * num_outputs_per_prompt,
+                (idx + 1) * num_outputs_per_prompt,
+            ),
+            error=result.error,
+            finished=result.finished,
+            stage_durations=result.stage_durations,
+            peak_memory_mb=result.peak_memory_mb,
+            chunk_index=result.chunk_index,
+            total_chunks=result.total_chunks,
+        )
+        for idx in range(req.num_reqs)
+    ]
 
 
 @dataclass

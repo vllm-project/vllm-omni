@@ -50,7 +50,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 from .pipeline_ltx2 import (
     _VideoAudioScheduler,
@@ -1284,20 +1284,14 @@ class LTX23Pipeline(
 
             audio = self.vocoder(generated_mel_spectrograms)
 
-        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        n = common_sampling_params.num_outputs_per_prompt
-        if req.num_reqs == 1:
-            return [DiffusionOutput(output=(video, audio), stage_durations=stage_durations)]
-        return [
+        return split_diffusion_output_by_request(
             DiffusionOutput(
-                output=(
-                    video[i * n : (i + 1) * n] if isinstance(video, list) else video[i * n : (i + 1) * n],
-                    audio[i * n : (i + 1) * n] if isinstance(audio, (list, torch.Tensor)) else audio,
-                ),
-                stage_durations=stage_durations,
-            )
-            for i in range(req.num_reqs)
-        ]
+                output=(video, audio),
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            ),
+            req,
+            num_outputs_per_prompt=num_videos_per_prompt,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
