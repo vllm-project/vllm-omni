@@ -537,7 +537,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return False, 0, None
 
         put_key = self._make_key(put_key, from_stage, to_stage)
-        spans: dict[str, float] = {}
 
         # Serialize concurrent put() calls on the same connector to prevent
         # races in the alloc -> copy -> store-metadata flow at the Mooncake
@@ -548,6 +547,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     def _put_impl(self, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Internal put implementation, called under _put_lock."""
         try:
+            spans: dict[str, float] = {}
             src_addr = 0
             size = 0
             holder = None
