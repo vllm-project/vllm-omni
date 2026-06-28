@@ -784,14 +784,22 @@ def merge_pipeline_deploy(
     if len(pipeline.stages) <= 1:
         deploy.async_chunk = False
 
-    # A pipeline supports async_chunk only when at least one stage declares a
-    # dedicated per-step async producer (``async_chunk_process_next_stage_input_func``).
+    # async_chunk only applies to multi-stage pipelines: a pipeline with no
+    # consumer stages (every stage has empty input_sources) has no inter-stage
+    # edges, so async_chunk is a no-op and we skip the check entirely.
+    # For pipelines that DO have inter-stage edges, require a dedicated per-step
+    # async producer (``async_chunk_process_next_stage_input_func``).
     # ``custom_process_next_stage_input_func`` is the full-payload / connector-path
     # producer and does NOT imply async_chunk support — pipelines like qwen2_5_omni
     # and covo_audio have it but removed their consumer-side ``custom_process_input_func``
     # because they don't support async_chunk, so accepting them here would silently
     # miswire the consumer stage instead of raising a clear error.
-    if deploy.async_chunk and not any(ps.async_chunk_process_next_stage_input_func for ps in pipeline.stages):
+    _has_inter_stage_edges = any(ps.input_sources for ps in pipeline.stages)
+    if (
+        deploy.async_chunk
+        and _has_inter_stage_edges
+        and not any(ps.async_chunk_process_next_stage_input_func for ps in pipeline.stages)
+    ):
         raise ValueError(
             f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
             "declares a dedicated async-chunk next-stage processor "
