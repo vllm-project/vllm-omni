@@ -416,7 +416,7 @@ def test_execute_model_batch_preserves_per_request_sampling_and_seeds_generators
     monkeypatch.setattr(
         model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
     )
-    outputs = [SimpleNamespace(output="a"), SimpleNamespace(output="b")]
+    outputs = [DiffusionOutput(output="a"), DiffusionOutput(output="b")]
     pipeline = _BatchPipeline(outputs=outputs)
     runner = _make_batch_runner(pipeline)
     sched = _make_scheduler_output(num_reqs=2)
