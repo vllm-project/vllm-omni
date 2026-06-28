@@ -448,6 +448,42 @@ Complete examples in the codebase:
 
 ---
 
+## Spatially-Sharded Decode (Wan)
+
+The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan VAE additionally supports a **spatially-sharded decode** backend, selected through `DiffusionParallelConfig.vae_parallel_mode` (`"spatial_shard_height"` or `"spatial_shard_width"`; default is `"tile"`).
+
+### How it differs from tile parallel
+
+| Aspect | Tile parallel (`"tile"`) | Spatially-sharded (`"spatial_shard_height"`/`"spatial_shard_width"`) |
+|--------|--------------------------|-----------------------------------------------|
+| Unit of work | Independent overlapping tiles | A single global feature map sharded along H or W |
+| Cross-rank communication | Gather tiles to rank 0, stitch + blend | Per-conv **halo exchange** of boundary rows/cols (P2P) |
+| Output assembly | Blend overlapping tiles | All-gather shards on rank 0, trim padding (matches `broadcast_result=False`) |
+| Scope | Decode + encode | Decode only |
+
+Spatial-shard decode swaps the decoder's spatial convolutions/padding for halo-exchanging variants (`WanDistConv2d`, `WanDistCausalConv3d`, `WanDistZeroPad2d`) so each rank only holds a shard of the activations but still sees the correct receptive field at shard boundaries. Implementation lives in `vllm_omni/diffusion/distributed/autoencoders/wan_spatial_shard.py`.
+
+### Wiring
+
+`vae_parallel_mode` flows through the same path as `vae_patch_parallel_size`:
+
+```text
+serve.py (--vae-parallel-mode) / OmniEngineArgs
+  -> DiffusionParallelConfig.vae_parallel_mode
+  -> registry.py: model.vae.set_parallel_size(vae_pp_size, mode=...)
+  -> DistributedVaeExecutor.parallel_mode
+  -> DistributedAutoencoderKLWan.tiled_decode dispatch
+```
+
+`DistributedAutoencoderKLWan._spatial_shard_decode_enabled()` gates the path: it requires distributed decode to be enabled, a 5D latent, and `vae_patch_parallel_size == DiT group size`. Otherwise it logs a warning and falls back to tile-parallel decode.
+
+### Notes
+
+- The decoder is patched **in place** the first time spatial-shard decode runs and is bound to a single split dimension for the lifetime of the VAE instance.
+- Numerical correctness vs. single-GPU decode is covered by `tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference` (multi-GPU, nightly `full_model` + `distributed_cuda`).
+
+---
+
 ## Summary
 
 Adding VAE Patch Parallel support to diffusion model:

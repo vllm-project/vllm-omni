@@ -162,6 +162,10 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        raise NotImplementedError
+
+    @classmethod
     def create_autocast_context(
         cls,
         *,

@@ -80,6 +80,7 @@ def _make_request(skip_cache_refresh: bool = True):
         num_inference_steps=4,
     )
     return SimpleNamespace(
+        request_id="req-test",
         prompts=["a prompt"],
         sampling_params=sampling_params,
         skip_cache_refresh=skip_cache_refresh,
@@ -104,8 +105,9 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     runner.kv_transfer_manager = SimpleNamespace(
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
-        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
+        receive_multi_kv_cache_distributed=lambda *a, **k: None,
     )
+    runner._kv_prefetch_enabled = False
     return runner
 
 

@@ -122,7 +122,8 @@ Content-Type: application/json
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
-| `stream` | bool | false | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
+| `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. Omit (null) for a single non-streaming binary response. See [Response Format](#response-format). |
+| `stream` | bool | false | Legacy streaming switch, equivalent to `stream_format="audio"`. Requires `response_format="pcm"` or `"wav"`. Speed adjustment is not supported when streaming. |
 
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
@@ -136,7 +137,60 @@ Content-Type: application/json
 
 ### Response Format
 
-Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/wav`).
+The response shape depends on the streaming parameters:
+
+**Non-streaming (default).** With `stream=false` and no `stream_format`, returns the
+complete clip as binary audio data with an appropriate `Content-Type` header (e.g.
+`audio/wav`). The raw-bytes body has no JSON carrier, so no `usage` is reported.
+
+**Raw audio stream** (`stream=true` or `stream_format="audio"`). Streams raw
+audio bytes (PCM or WAV) as they are decoded.
+
+Both streaming modes (`stream_format="audio"` and `"sse"`) require
+`response_format="pcm"` or `"wav"`, and `speed` must be `1.0` (or omitted).
+
+**SSE stream** (`stream_format="sse"`). Streams [OpenAI `speech.audio.*` Server-Sent
+Events](https://platform.openai.com/docs/api-reference/audio-streaming). Set
+`stream_format="sse"` and leave the legacy `stream` unset: `stream=true` takes
+precedence and forces the raw-audio path, so the response would be audio bytes with
+no `speech.audio.*` events (and no terminal `usage`). Each event has an `event:`
+line and a JSON `data:` line:
+
+- `speech.audio.delta` — a base64 audio chunk:
+
+    ```json
+    { "type": "speech.audio.delta", "audio": "<base64>", "response_format": "pcm" }
+    ```
+
+- `speech.audio.done` — terminal event, carrying token `usage`:
+
+    ```json
+    {
+        "type": "speech.audio.done",
+        "usage": {
+            "input_tokens": 119,
+            "output_tokens": 77,
+            "total_tokens": 196,
+            "input_token_details": { "text_tokens": 18, "audio_tokens": 101 }
+        }
+    }
+    ```
+
+- `speech.audio.error` — emitted instead of `speech.audio.done` if generation fails:
+
+    ```json
+    { "type": "speech.audio.error", "error": { "message": "...", "type": "server_error", "param": null, "code": 500 } }
+    ```
+
+The `usage` object on `speech.audio.done` is the same shape returned per item by the
+[batch endpoint](#batch-speech-generation):
+
+- `input_tokens` = `text_tokens` + `audio_tokens`
+    - `text_tokens`: tokens of the synthesized text (`input` plus `instructions`)
+    - `audio_tokens`: reference-audio codec frames, non-zero only for in-context
+      voice cloning (Base task); `0` for CustomVoice/VoiceDesign or x-vector-only
+- `output_tokens`: generated codec tokens
+- `total_tokens` = `input_tokens` + `output_tokens`
 
 ### Voices Endpoint
 
@@ -233,9 +287,9 @@ Server -> Client:
 
 | Message | Description |
 |---------|-------------|
-| `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for a sentence |
+| `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
-| `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for a sentence |
+| `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
 | `{"type": "session.done", "total_sentences": N}` | Session complete |
 | `{"type": "error", "message": "..."}` | Non-fatal error |
 
@@ -245,8 +299,7 @@ All REST API parameters are supported, plus:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `stream_audio` | bool | false | Stream one or more PCM chunks per sentence over WebSocket |
-| `split_granularity` | string | "sentence" | Text splitting granularity |
+| `stream_audio` | bool | false | Stream one or more PCM chunks for the buffered input over WebSocket |
 
 
 ```bash
@@ -491,7 +544,13 @@ Each item in the `items` array requires only `input` (the text). All other field
             "index": 0,
             "status": "success",
             "audio_data": "<base64-encoded audio>",
-            "media_type": "audio/wav"
+            "media_type": "audio/wav",
+            "usage": {
+                "input_tokens": 119,
+                "output_tokens": 77,
+                "total_tokens": 196,
+                "input_token_details": { "text_tokens": 18, "audio_tokens": 101 }
+            }
         },
         {
             "index": 1,
@@ -504,6 +563,18 @@ Each item in the `items` array requires only `input` (the text). All other field
     "failed": 1
 }
 ```
+
+Each successful item carries a `usage` object (errored items omit it):
+
+- `input_tokens` = `text_tokens` + `audio_tokens`
+    - `text_tokens`: tokens of the synthesized text (`input` plus `instructions`)
+    - `audio_tokens`: reference-audio codec frames, non-zero only for in-context
+      voice cloning (Base task); `0` for CustomVoice/VoiceDesign or x-vector-only
+- `output_tokens`: generated codec tokens
+- `total_tokens` = `input_tokens` + `output_tokens`
+
+This is the same `usage` object emitted on the terminal `speech.audio.done` event
+of the single endpoint's [SSE stream](#response-format) (`stream_format="sse"`).
 
 ### Examples
 

@@ -54,5 +54,5 @@ class MossTTSNanoAdapter(_MossTTSAdapterBase):
 
 @register_tts_adapter
 class MossTTSAdapter(_MossTTSAdapterBase):
-    stage_keys = frozenset({"moss_tts", "moss_tts_codec"})
+    stage_keys = frozenset({"moss_tts", "moss_tts_codec", "moss_tts_local", "moss_tts_local_codec"})
     name = "moss_tts"

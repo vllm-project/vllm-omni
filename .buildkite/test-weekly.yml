@@ -85,6 +85,66 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
+  - label: "Reliability Test - hunyuan-image"
+    timeout_in_minutes: 180
+    depends_on: upload-weekly-pipeline
+    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    commands:
+      - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 4
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  - label: "Reliability Test - voxcpm2"
+    timeout_in_minutes: 180
+    depends_on: upload-weekly-pipeline
+    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    commands:
+      - pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m "slow"
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   # Invalid HTTP / WS payloads vs live Omni servers (Issue #3649 tracks known skips).
   - group: "Reliability Test - Invalid parameters Test"
     depends_on: upload-weekly-pipeline
