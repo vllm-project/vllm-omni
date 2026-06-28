@@ -88,7 +88,6 @@ class TestSpeechBatchE2E:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4757")
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_basic_two_items(self, omni_server) -> None:
@@ -116,7 +115,10 @@ class TestSpeechBatchE2E:
             assert result["index"] == i
             assert result["status"] == "success"
             assert result["audio_data"] is not None
-            assert result["error"] is None
+            # Successful items omit `error` entirely (the batch response is
+            # serialized with exclude_none), so probe with .get rather than
+            # indexing a key that is only present on errored items.
+            assert result.get("error") is None
             audio_bytes = base64.b64decode(result["audio_data"])
             assert verify_wav_bytes(audio_bytes), f"Item {i}: invalid WAV"
             assert len(audio_bytes) > MIN_AUDIO_BYTES, f"Item {i}: audio too small ({len(audio_bytes)} bytes)"
