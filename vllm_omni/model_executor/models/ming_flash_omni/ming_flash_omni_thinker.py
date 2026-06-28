@@ -768,6 +768,16 @@ class MingFlashOmniThinkerForConditionalGeneration(
         if self.vision is None:
             raise ValueError("Vision encoder not initialized")
 
+        from vllm_omni.embedding_cache.cache import get_embedding_cache
+        from vllm_omni.embedding_cache.hasher import hash_image_pixels
+
+        _cache = get_embedding_cache()
+        if _cache is not None:
+            _key = hash_image_pixels(pixel_values)
+            _cached = _cache.get(_key)
+            if _cached is not None:
+                return _cached
+
         with torch.amp.autocast(pixel_values.device.type, dtype=torch.bfloat16):
             image_embeds = self.vision(pixel_values, grid_thw=grid_thw)
 
@@ -776,6 +786,10 @@ class MingFlashOmniThinkerForConditionalGeneration(
 
         image_embeds = self.linear_proj(image_embeds)
         image_embeds = F.normalize(image_embeds, dim=-1)
+
+        if _cache is not None:
+            _cache.put(_key, image_embeds, image_embeds.nbytes)
+
         return image_embeds
 
     def extract_audio_feature(

@@ -255,11 +255,27 @@ class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixi
         assert grid_thw.ndim == 2
 
         pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+
+        from vllm_omni.embedding_cache.cache import get_embedding_cache
+        from vllm_omni.embedding_cache.hasher import hash_image_pixels
+
+        _cache = get_embedding_cache()
+        if _cache is not None:
+            _key = hash_image_pixels(pixel_values)
+            _cached = _cache.get(_key)
+            if _cached is not None:
+                merge_size = self.visual.spatial_merge_size
+                sizes = grid_thw.prod(-1) // merge_size // merge_size
+                return tuple(_cached.split(sizes.tolist()))
+
         with set_forward_context(None, self.vllm_config):
             image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
         # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
         sizes = grid_thw.prod(-1) // merge_size // merge_size
+
+        if _cache is not None:
+            _cache.put(_key, image_embeds, image_embeds.nbytes)
 
         return image_embeds.split(sizes.tolist())
 
@@ -274,11 +290,27 @@ class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixi
         assert grid_thw.ndim == 2
 
         pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
+
+        from vllm_omni.embedding_cache.cache import get_embedding_cache
+        from vllm_omni.embedding_cache.hasher import hash_video_pixels
+
+        _cache = get_embedding_cache()
+        if _cache is not None:
+            _key = hash_video_pixels(pixel_values_videos)
+            _cached = _cache.get(_key)
+            if _cached is not None:
+                merge_size = self.visual.spatial_merge_size
+                sizes = grid_thw.prod(-1) // merge_size // merge_size
+                return _cached.split(sizes.tolist())
+
         with set_forward_context(None, self.vllm_config):
             video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
         # Split concatenated embeddings for each video item.
         merge_size = self.visual.spatial_merge_size
         sizes = grid_thw.prod(-1) // merge_size // merge_size
+
+        if _cache is not None:
+            _cache.put(_key, video_embeds, video_embeds.nbytes)
 
         return video_embeds.split(sizes.tolist())
 
