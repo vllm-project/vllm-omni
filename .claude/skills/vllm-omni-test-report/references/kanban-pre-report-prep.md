@@ -31,7 +31,8 @@ The script runs this via **`gh auth git-credential`** (same as report archive pu
    - If that name already exists: **`manual_YYYYMMDD_HHMMSS`** (or with numeric suffix)
 2. Copy into it:
    - All matching perf JSON from **`$REPO_ROOT/logs/nightly_jobs`** (flat copy, original basenames — unchanged)
-   - **Only** **`$REPO_ROOT/logs/nightly_jobs/local_pytest_hunyuan_image.log`** → **`test_hunyuan_image3.log`** (other logs under `nightly_jobs` are not copied)
+   - **Only** one Hunyuan Image job log from **`$REPO_ROOT/logs/nightly_jobs`** → **`test_hunyuan_image3.log`**:
+     **`local_pytest_hunyuan_image.log`** (preferred) or **`test_hunyuan_image3.log`** if already renamed locally
 
 Example kanban layout (committed over time):
 

@@ -41,7 +41,7 @@ from shutil import copy2
 
 from kanban_local_nightly_raw import (
     HUNYUAN_MANUAL_DEST_LOG,
-    HUNYUAN_NIGHTLY_SOURCE_LOG,
+    HUNYUAN_NIGHTLY_SOURCE_LOG_CANDIDATES,
     LOCAL_NIGHTLY_RAW,
     manual_dir_rel,
     resolve_manual_dir_for_archive,
@@ -343,8 +343,8 @@ def _manual_staging_warnings(
             )
     else:
         warnings.append(
-            f"Warning: {log_rel} missing — prep should copy "
-            f"logs/nightly_jobs/{HUNYUAN_NIGHTLY_SOURCE_LOG} "
+            f"Warning: {log_rel} missing — prep should copy one of "
+            f"logs/nightly_jobs/{{{', '.join(HUNYUAN_NIGHTLY_SOURCE_LOG_CANDIDATES)}}} "
             f"→ {HUNYUAN_MANUAL_DEST_LOG}."
         )
 

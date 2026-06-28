@@ -9,6 +9,21 @@ LAST_MANUAL_MARKER = LOCAL_NIGHTLY_RAW / ".last_manual_dir"
 MANUAL_DIR_PREFIX = "manual_"
 HUNYUAN_NIGHTLY_SOURCE_LOG = "local_pytest_hunyuan_image.log"
 HUNYUAN_MANUAL_DEST_LOG = "test_hunyuan_image3.log"
+# Cluster/local sync may use either pytest-style or kanban dest basename.
+HUNYUAN_NIGHTLY_SOURCE_LOG_CANDIDATES = (
+    HUNYUAN_NIGHTLY_SOURCE_LOG,
+    HUNYUAN_MANUAL_DEST_LOG,
+)
+
+
+def resolve_hunyuan_nightly_source_log(log_dir: Path) -> Path | None:
+    """Return the first existing Hunyuan Image nightly job log under ``log_dir``."""
+    root = log_dir.resolve()
+    for name in HUNYUAN_NIGHTLY_SOURCE_LOG_CANDIDATES:
+        path = root / name
+        if path.is_file():
+            return path
+    return None
 
 
 def local_nightly_raw_root(kanban_repo: Path) -> Path:

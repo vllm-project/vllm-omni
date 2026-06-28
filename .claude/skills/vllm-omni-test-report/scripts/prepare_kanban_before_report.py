@@ -7,7 +7,8 @@ Workflow (run from ``skills/vllm-omni-test-report/`` after log sync):
 1. ``git pull --rebase`` on the local https://github.com/hsliuustc0106/vllm-omni-kanban clone.
 2. When ``$REPO_ROOT/logs/nightly_jobs`` contains perf JSON, create a new
    ``data/local_nightly_raw/manual_<suffix>/`` directory, copy result JSON, and copy
-   ``logs/nightly_jobs/local_pytest_hunyuan_image.log`` as ``test_hunyuan_image3.log``.
+   ``logs/nightly_jobs/local_pytest_hunyuan_image.log`` (or ``test_hunyuan_image3.log``) as
+   ``test_hunyuan_image3.log``.
 3. ``mkdocs build`` in the kanban repo (``mkdocs_hooks`` → sync + ``generate_charts``)
    to refresh ``docs/assets/charts/*_history.json``.
 
@@ -26,9 +27,10 @@ from pathlib import Path
 
 from kanban_local_nightly_raw import (
     HUNYUAN_MANUAL_DEST_LOG,
-    HUNYUAN_NIGHTLY_SOURCE_LOG,
+    HUNYUAN_NIGHTLY_SOURCE_LOG_CANDIDATES,
     LOCAL_NIGHTLY_RAW,
     clear_last_manual_marker,
+    resolve_hunyuan_nightly_source_log,
     write_last_manual_marker,
 )
 from kanban_repo_config import KANBAN_REPO_URL
@@ -155,17 +157,20 @@ def sync_local_nightly_raw(
         perf_copied.append(dest_name)
 
     log_copied: list[str] = []
-    src_log = log_dir.resolve() / HUNYUAN_NIGHTLY_SOURCE_LOG
-    if src_log.is_file():
+    src_log = resolve_hunyuan_nightly_source_log(log_dir)
+    if src_log is not None:
         dest_log = HUNYUAN_MANUAL_DEST_LOG
         if dest_log in used_names:
-            notes.append(f"Skipped {HUNYUAN_NIGHTLY_SOURCE_LOG}: {dest_log} already taken by a perf JSON basename.")
+            notes.append(f"Skipped {src_log.name}: {dest_log} already taken by a perf JSON basename.")
         else:
             shutil.copy2(src_log, manual_dir / dest_log)
             used_names.add(dest_log)
             log_copied.append(dest_log)
     else:
-        notes.append(f"Missing {src_log} (expected under nightly_jobs); manual dir contains perf JSON only.")
+        tried = ", ".join(HUNYUAN_NIGHTLY_SOURCE_LOG_CANDIDATES)
+        notes.append(
+            f"Missing Hunyuan job log under {log_dir.resolve()} (tried: {tried}); manual dir contains perf JSON only."
+        )
 
     write_last_manual_marker(kanban_repo, manual_dir)
     notes.append(f"Marked {manual_dir.name} for archive push (.last_manual_dir).")
