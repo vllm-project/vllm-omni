@@ -355,22 +355,6 @@ class StageDiffusionClient(StageClientBase):
             )
         )
 
-    async def add_batch_request_async(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None:
-        """List-prompt batch requests are no longer supported.
-
-        Submit multiple independent requests to use scheduler batching.
-        """
-        raise ValueError(
-            "Diffusion list-prompt batch requests are no longer supported. "
-            "Submit multiple independent requests to use scheduler batching."
-        )
-
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
         self._drain_responses()
         try:

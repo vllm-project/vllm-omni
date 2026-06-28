@@ -4,7 +4,6 @@
 import asyncio
 import time
 from dataclasses import asdict, dataclass
-from types import SimpleNamespace
 
 import pytest
 
@@ -13,22 +12,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
-
-
-def test_process_batch_request_raises_value_error():
-    async def run_test():
-        proc = object.__new__(StageDiffusionProc)
-        proc._engine = SimpleNamespace(step=lambda request: None)
-
-        with pytest.raises(ValueError, match="no longer supported"):
-            await proc._process_batch_request(
-                request_id="req-parent",
-                prompts=["hello", "world"],
-                sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
-                kv_sender_info={0: {"host": "10.0.0.2", "zmq_port": 50151}},
-            )
-
-    asyncio.run(run_test())
 
 
 @dataclass

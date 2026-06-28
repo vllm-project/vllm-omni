@@ -194,22 +194,6 @@ class StageDiffusionProc:
                 result.request_id = request_id
             yield result
 
-    async def _process_batch_request(
-        self,
-        request_id: str,
-        prompts: list[Any],
-        sampling_params_dict: dict,
-        kv_sender_info: dict[str, Any] | None = None,
-    ) -> OmniRequestOutput:
-        """List-prompt batch requests are no longer supported.
-
-        Submit multiple independent requests to use scheduler batching.
-        """
-        raise ValueError(
-            "Diffusion list-prompt batch requests are no longer supported. "
-            "Submit multiple independent requests to use scheduler batching."
-        )
-
     # ------------------------------------------------------------------
     # Collective RPC dispatch
     # ------------------------------------------------------------------
