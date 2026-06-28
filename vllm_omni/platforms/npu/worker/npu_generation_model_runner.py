@@ -41,6 +41,10 @@ from vllm_omni.utils.mm_outputs import partition_payload_list
 class NPUGenerationModelRunner(OmniNPUModelRunner):
     """Generation model runner for vLLM-omni on NPU (non-autoregressive)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._async_chunk = getattr(self.model_config, "async_chunk", False)
+
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
         for req_id in scheduler_output.finished_req_ids:
@@ -472,7 +476,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         else:
             raise RuntimeError("Unsupported diffusion output type")
 
-        inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
+        if self._async_chunk:
+            inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
+        else:
+            inter_stage_outputs, multimodal_outputs = None, per_req_payloads
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()

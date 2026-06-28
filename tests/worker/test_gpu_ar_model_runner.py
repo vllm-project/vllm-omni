@@ -115,6 +115,7 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     )
     runner.vllm_config = SimpleNamespace(model_config=model_config)
     runner.model_config = model_config
+    runner._async_chunk = True
     runner.omni_prefix_cache = None
     runner.requests = {"r1": object(), "r2": object()}
     runner.supports_mm_inputs = False
@@ -399,6 +400,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(engine_output_type="audio"),
     )
+    runner._async_chunk = False
 
     monkeypatch.setattr(
         GPUARModelRunner, "_sample", lambda self, logits, spec_decode_metadata: SimpleNamespace(sampled_token_ids=[])
@@ -432,13 +434,13 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
 
     output = GPUARModelRunner.sample_tokens(runner, grammar_output=None)
 
-    assert output.inter_stage_outputs is not None
-    assert torch.equal(output.inter_stage_outputs[0]["hidden"], torch.tensor([[1.0, 10.0]]))
+    assert output.inter_stage_outputs is None
+    assert output.multimodal_outputs is not None
+    assert torch.equal(output.multimodal_outputs[0]["hidden"], torch.tensor([[1.0, 10.0]]))
     assert torch.equal(
-        output.inter_stage_outputs[1]["hidden"],
+        output.multimodal_outputs[1]["hidden"],
         torch.tensor([[2.0, 20.0], [3.0, 30.0]]),
     )
-    assert output.multimodal_outputs is None
 
 
 def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch):

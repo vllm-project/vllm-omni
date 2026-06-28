@@ -110,6 +110,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        self._async_chunk = getattr(self.model_config, "async_chunk", False)
         self._downstream_payload_cache: dict[str, bool] = {}
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -1141,7 +1142,10 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
-        pooler_inter, pooler_client = partition_payload_list(pooler_output)
+        if self._async_chunk:
+            pooler_inter, pooler_client = partition_payload_list(pooler_output)
+        else:
+            pooler_inter, pooler_client = None, pooler_output
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
         multimodal_outputs = self._build_multimodal_outputs(pooler_client)
         model_runner_output = OmniModelRunnerOutput(

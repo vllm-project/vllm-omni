@@ -288,6 +288,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        self._async_chunk = getattr(self.model_config, "async_chunk", False)
         # Worker-connector init is gated by a per-`model_arch` allowlist
         # (covers both producer-side and consumer-side runners for the
         # arches below).  Consumer-wait stages must be registered
@@ -1650,7 +1651,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
-        pooler_inter, pooler_client = partition_payload_list(pooler_output)
+        if self._async_chunk:
+            pooler_inter, pooler_client = partition_payload_list(pooler_output)
+        else:
+            pooler_inter, pooler_client = None, pooler_output
 
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
