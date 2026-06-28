@@ -1,4 +1,5 @@
 """Tests for embedding_cache.hasher."""
+
 import torch
 
 from vllm_omni.embedding_cache.hasher import (

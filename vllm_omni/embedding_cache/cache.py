@@ -39,7 +39,7 @@ _EVICTION_INTERVAL_SECONDS = 5
 
 @dataclass
 class _Entry:
-    embedding: "torch.Tensor"
+    embedding: torch.Tensor
     size_bytes: int
     inserted_at: float = field(default_factory=time.monotonic)
     last_hit: float = field(default_factory=time.monotonic)
@@ -91,7 +91,7 @@ class EmbeddingCache:
     # Public API                                                           #
     # ------------------------------------------------------------------ #
 
-    def get(self, key: str) -> "torch.Tensor | None":
+    def get(self, key: str) -> torch.Tensor | None:
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
@@ -110,7 +110,7 @@ class EmbeddingCache:
             self._stats["hits"] += 1
             return entry.embedding
 
-    def put(self, key: str, embedding: "torch.Tensor", size_bytes: int) -> None:
+    def put(self, key: str, embedding: torch.Tensor, size_bytes: int) -> None:
         with self._lock:
             if key in self._store:
                 return  # Another thread inserted while we were encoding.

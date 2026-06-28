@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     import torch
 
 
-def _sha256_tensor(t: "torch.Tensor") -> str:
+def _sha256_tensor(t: torch.Tensor) -> str:
     """Return 16-char hex digest of a tensor's raw bytes (CPU, contiguous)."""
     arr = t.detach().cpu().contiguous()
     # view as uint8 to get raw bytes without interpreter overhead
@@ -31,7 +31,7 @@ def _sha256_tensor(t: "torch.Tensor") -> str:
     return digest[:16]
 
 
-def hash_audio_features(input_features: "torch.Tensor") -> str:
+def hash_audio_features(input_features: torch.Tensor) -> str:
     """Hash audio mel-spectrogram features.
 
     `input_features` is the tensor passed directly to audio_tower —
@@ -42,7 +42,7 @@ def hash_audio_features(input_features: "torch.Tensor") -> str:
     return "a:" + _sha256_tensor(input_features)
 
 
-def hash_image_pixels(pixel_values: "torch.Tensor") -> str:
+def hash_image_pixels(pixel_values: torch.Tensor) -> str:
     """Hash image pixel values.
 
     `pixel_values` is the input to the vision tower before patching —
@@ -51,7 +51,7 @@ def hash_image_pixels(pixel_values: "torch.Tensor") -> str:
     return "i:" + _sha256_tensor(pixel_values)
 
 
-def hash_video_pixels(pixel_values_videos: "torch.Tensor") -> str:
+def hash_video_pixels(pixel_values_videos: torch.Tensor) -> str:
     """Hash video pixel values (all frames concatenated).
 
     `pixel_values_videos` — shape (total_frames * n_patches, C, H, W).

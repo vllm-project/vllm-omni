@@ -1,15 +1,15 @@
 """Tests for embedding_cache.cache."""
-import os
-import time
-import threading
 
-import pytest
+import os
+import threading
+import time
+
 import torch
 
-from vllm_omni.embedding_cache.cache import EmbeddingCache, get_embedding_cache
-
+from vllm_omni.embedding_cache.cache import EmbeddingCache
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
 
 def _t(*shape) -> torch.Tensor:
     return torch.randn(*shape)
@@ -20,6 +20,7 @@ def _nbytes(t: torch.Tensor) -> int:
 
 
 # ── basic get/put ───────────────────────────────────────────────────────────
+
 
 def test_put_then_get():
     c = EmbeddingCache(ttl_seconds=60, max_bytes=1 << 30)
@@ -39,6 +40,7 @@ def test_get_missing_returns_none():
 
 # ── TTL eviction ────────────────────────────────────────────────────────────
 
+
 def test_ttl_eviction():
     c = EmbeddingCache(ttl_seconds=1, max_bytes=1 << 30)
     t = _t(4, 64)
@@ -50,6 +52,7 @@ def test_ttl_eviction():
 
 
 # ── LRU eviction ────────────────────────────────────────────────────────────
+
 
 def test_lru_eviction():
     elem_bytes = _nbytes(_t(1, 64))
@@ -69,11 +72,12 @@ def test_lru_eviction():
 
 # ── stats ───────────────────────────────────────────────────────────────────
 
+
 def test_stats():
     c = EmbeddingCache(ttl_seconds=60, max_bytes=1 << 30)
     t = _t(4, 64)
     c.put("k1", t, _nbytes(t))
-    c.get("k1")       # hit
+    c.get("k1")  # hit
     c.get("missing")  # miss
     s = c.stats()
     assert s["hits"] == 1
@@ -83,6 +87,7 @@ def test_stats():
 
 
 # ── clear ───────────────────────────────────────────────────────────────────
+
 
 def test_clear():
     c = EmbeddingCache(ttl_seconds=60, max_bytes=1 << 30)
@@ -95,6 +100,7 @@ def test_clear():
 
 
 # ── thread safety ───────────────────────────────────────────────────────────
+
 
 def test_concurrent_put_get():
     c = EmbeddingCache(ttl_seconds=60, max_bytes=1 << 30)
@@ -122,12 +128,15 @@ def test_concurrent_put_get():
 
 # ── singleton ───────────────────────────────────────────────────────────────
 
+
 def test_get_embedding_cache_disabled():
     # Without env var the singleton is None
     os.environ.pop("VLLM_OMNI_EMBEDDING_CACHE", None)
     # Reload to reset singleton state
     import importlib
+
     import vllm_omni.embedding_cache.cache as cache_mod
+
     importlib.reload(cache_mod)
     assert cache_mod.get_embedding_cache() is None
 
@@ -135,7 +144,9 @@ def test_get_embedding_cache_disabled():
 def test_get_embedding_cache_enabled(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_EMBEDDING_CACHE", "1")
     import importlib
+
     import vllm_omni.embedding_cache.cache as cache_mod
+
     importlib.reload(cache_mod)
     inst = cache_mod.get_embedding_cache()
     assert inst is not None
