@@ -100,11 +100,10 @@ Admission is conservative:
 request-batch capability during initialization from the configured pipeline
 class, including custom pipeline classes.
 
-The capability check requires:
-
-- `supports_request_batch = True`
-- a `forward()` contract compatible with request batching
-- a return annotation compatible with `list[DiffusionOutput]`
+The capability check uses the pipeline class attribute
+`supports_request_batch = True`. Pipelines that set this attribute must implement
+a request-batch-compatible `forward()` contract and return one
+`DiffusionOutput` per request; the runner validates that return shape at runtime.
 
 When the selected pipeline is batch-capable and `step_execution=False`, request
 mode routes scheduler waves through the batch executor path. Otherwise it keeps

@@ -32,11 +32,6 @@ class OmniDiffusionRequest:
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
-        if isinstance(self.prompt, list):
-            raise ValueError(
-                "OmniDiffusionRequest.prompt must be a single prompt (str or dict), not a list. "
-                "Submit multiple independent requests to use scheduler batching."
-            )
         if not isinstance(self.request_id, str) or not self.request_id:
             raise ValueError("OmniDiffusionRequest.request_id must be a non-empty string.")
 

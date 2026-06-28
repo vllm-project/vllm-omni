@@ -98,57 +98,13 @@ def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) ->
     )
 
 
-def _is_diffusion_output_list_annotation(annotation: object) -> bool:
-    if annotation is inspect.Parameter.empty:
-        return False
-    if getattr(annotation, "__origin__", None) is list:
-        args = getattr(annotation, "__args__", ())
-        if args and getattr(args[0], "__name__", "") == "DiffusionOutput":
-            return True
-    ann_text = str(annotation).replace(" ", "")
-    return "list[" in ann_text and "DiffusionOutput" in ann_text
-
-
-def _pipeline_forward_is_request_batch_capable(pipeline_cls: type) -> bool:
-    """Validate that the effective forward() implements the request-batch contract.
-
-    Custom pipeline subclasses may inherit ``supports_request_batch = True`` from
-    a batch-capable parent while overriding ``forward`` with the legacy
-    single-request API. Those pipelines must not route through execute_batch.
-    """
-    if not getattr(pipeline_cls, "supports_request_batch", False):
-        return False
-
-    forward = pipeline_cls.__dict__.get("forward")
-    if forward is None:
-        return True
-
-    try:
-        signature = inspect.signature(forward)
-    except (TypeError, ValueError):
-        return False
-
-    parameters = list(signature.parameters.values())
-    if len(parameters) >= 2:
-        req_annotation = parameters[1].annotation
-        if req_annotation is not inspect.Parameter.empty:
-            req_name = getattr(req_annotation, "__name__", str(req_annotation))
-            if req_name == "OmniDiffusionRequest":
-                return False
-
-    return_annotation = signature.return_annotation
-    if return_annotation is DiffusionOutput:
-        return False
-    return _is_diffusion_output_list_annotation(return_annotation)
-
-
 def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
     model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
     if model_cls is None:
         model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
     if model_cls is None:
         return False
-    return _pipeline_forward_is_request_batch_capable(model_cls)
+    return bool(getattr(model_cls, "supports_request_batch", False))
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -484,8 +440,8 @@ class DiffusionEngine:
         if self.step_execution or not self.supports_request_batch:
             return
 
-        max_wait_s = float(getattr(self.od_config, "request_batch_max_wait_ms", 0.0) or 0.0) / 1000.0
-        if max_wait_s <= 0:
+        max_wait_s = self.od_config.request_batch_max_wait_ms / 1000.0
+        if max_wait_s == 0:
             return
 
         max_batch = self.scheduler.max_num_running_reqs

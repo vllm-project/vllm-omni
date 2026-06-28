@@ -14,7 +14,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, _move_tensor_tree_to_cpu
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -160,12 +160,33 @@ class TestRequestBatchCapability:
 
         assert diffusion_engine_module.supports_request_batch(od_config) is True
 
-    def test_supports_request_batch_rejects_custom_single_request_forward_override(
+    def test_supports_request_batch_uses_only_explicit_pipeline_attribute_for_custom_override(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         od_config = SimpleNamespace(
             model_class_name="BatchPipeline",
             custom_pipeline_args={"pipeline_class": _SingleRequestOverridePipeline},
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: None,
+        )
+
+        assert diffusion_engine_module.supports_request_batch(od_config) is True
+
+    def test_supports_request_batch_honors_explicit_false_on_custom_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _ExplicitlyUnsupportedOverride(_BatchCapablePipeline):
+            supports_request_batch = False
+
+            def forward(self, req, prompt_ids=None):
+                return DiffusionOutput(output=None)
+
+        od_config = SimpleNamespace(
+            model_class_name="BatchPipeline",
+            custom_pipeline_args={"pipeline_class": _ExplicitlyUnsupportedOverride},
         )
         monkeypatch.setattr(
             diffusion_engine_module.DiffusionModelRegistry,
@@ -205,7 +226,11 @@ class TestRequestBatchCapability:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(model_class_name="SinglePipeline", custom_pipeline_args=None)
+        od_config = SimpleNamespace(
+            model_class_name="SinglePipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+        )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(return_value="per-request"),
             execute_batch=mocker.Mock(return_value="batch"),
@@ -247,7 +272,11 @@ class TestRequestBatchCapability:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(model_class_name="BatchPipeline", custom_pipeline_args=None)
+        od_config = SimpleNamespace(
+            model_class_name="BatchPipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+        )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(return_value="per-request"),
             execute_batch=mocker.Mock(return_value="batch"),
@@ -285,6 +314,16 @@ class TestRequestBatchCapability:
 
 class TestRequestBatchAdmission:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    def test_config_rejects_negative_request_batch_max_wait_ms(self) -> None:
+        with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
+            OmniDiffusionConfig(model="test", request_batch_max_wait_ms=-1.0)
+
+    def test_config_normalizes_request_batch_max_wait_ms_to_float(self) -> None:
+        config = OmniDiffusionConfig(model="test", request_batch_max_wait_ms=5)
+
+        assert config.request_batch_max_wait_ms == 5.0
+        assert isinstance(config.request_batch_max_wait_ms, float)
 
     def test_scheduler_exposes_waiting_and_running_counts(self) -> None:
         from vllm_omni.diffusion.sched import RequestScheduler
@@ -442,6 +481,7 @@ async def test_async_add_req_and_wait_for_response():
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._init_lock = asyncio.Lock()
     engine._closed = False
+    engine.od_config = SimpleNamespace(streaming_output=False)
     engine._loop_started = False
     engine.main_loop = None
     engine.supports_request_batch = False

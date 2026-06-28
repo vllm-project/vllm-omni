@@ -10,6 +10,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
 
 
@@ -173,7 +174,7 @@ def _build_multimodal_output(
 def _format_single_prompt_output(
     *,
     request: OmniDiffusionRequest,
-    prompt: Any,
+    prompt: OmniPromptType,
     diffusion_output: DiffusionOutput,
     outputs: list[Any],
     metrics: dict[str, Any],
