@@ -17,7 +17,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.slow, pytest.mark.omni]
 
 MIMO_AUDIO_TOKENIZER_REPO = "XiaomiMiMo/MiMo-Audio-Tokenizer"
 CHAT_TEMPLATE_PATH = str(

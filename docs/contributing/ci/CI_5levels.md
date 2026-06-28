@@ -67,7 +67,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L2</strong><br>(E2E across models & GPU-required UT)</td>
       <td>Online (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
-      <td>High-priority models + online basic scenarios + request success validation</td>
+      <td>High-priority models + online basic scenarios; request success, non-empty output, format match (no Whisper/accuracy)</td>
       <td>High-priority features (using random lightweight models)</td>
       <td>High-priority interfaces (using random lightweight models)</td>
       <td><code>core_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
@@ -89,7 +89,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L3</strong><br>(Important Perf & Integration & Accuracy)</td>
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
-      <td>High/medium-priority models with real weights + online/offline key scenarios + basic accuracy validation</td>
+      <td>High/medium-priority models + key online/offline scenarios; real weights, Whisper/similarity, preset voice gender, basic accuracy</td>
       <td>Medium-priority features (using random lightweight models)</td>
       <td>Medium-priority interfaces (using random lightweight models)</td>
       <td><code>advanced_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
@@ -113,9 +113,9 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L4</strong><br>(Perf & Integration & Accuracy)</td>
       <td>Online: full functional scenarios + performance test + doc test + accuracy test</td>
-      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium/low-priority models: function and doc testing</td>
-      <td>Low-priority features (using random lightweight models)</td>
-      <td>Low-priority interfaces (using random lightweight models)</td>
+      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium-priority models: function and doc testing</td>
+      <td>Low-priority features (using real weights)</td>
+      <td>Low-priority interfaces (using real weights)</td>
       <td><code>full_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;3 hour</td>
       <td>
@@ -144,7 +144,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L5</strong><br>(Stability & Reliability)</td>
       <td>Online: long-term stability test + reliability test</td>
-      <td>Long-term stability and reliability testing for high-priority models</td>
+      <td>Long-term stability and reliability testing for high-priority models<br>Low-priority models: function and doc testing</td>
       <td>/</td>
       <td>Invalid-parameter validation for high-priority interfaces</td>
       <td><code>slow and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
@@ -446,7 +446,11 @@ L2 level testing builds upon L1 by introducing GPU resources and verifying that 
     -   ***Time Cost***: Execution time is controlled within ***15 minutes*** to ensure fast feedback.
 -   ***L2 (Basic End-to-End Testing)***:
 -   -   ***Scope***: Covers two basic deployment scenarios: `online` (serving) and `offline` (inference).
-    -   ***Focus***: Uses `dummy` models or lightweight real models to verify that the entire chain from request input to result output works normally, including output data structure, streaming (stream) support, etc. Also includes some unit tests that require launching independent service instances.
+    -   ***Focus***: Uses `dummy` weights (via deploy YAML patching at `core_model`) or lightweight real models to verify that the entire chain from request input to result output works normally, including output data structure, streaming (stream) support, and **cheap payload checks** at `--run-level core_model` (see below). Also includes some unit tests that require launching independent service instances.
+    -   ***L2 response validation (`core_model`)***: Implemented in `tests/helpers/assertions.py` and invoked by `OpenAIClientHandler` based on `--run-level`. At L2 we require **request success** plus minimal output sanity—not full accuracy:
+        -   **Speech / TTS** (`assert_audio_speech_response`): decoded audio must be present and non-empty (or exceed `min_audio_bytes` when set in `request_config`); `response_format` must match the returned content-type (e.g. `wav`, `pcm`). Whisper transcript similarity, PCM HNR, and preset-voice gender checks run only at L3+.
+        -   **Diffusion** (`assert_diffusion_response`): at least one non-empty image, video, or audio artifact. Resolution/frame-count parity and other deep checks run only at L3+.
+        -   **Omni multimodal** (`assert_omni_response`): L2 asserts successful completion; keyword, transcript, and cross-modal similarity checks run only at L3+.
     -   ***Characteristic***: Requires ***GPU*** resources to perform model computations.
 
 ### 1.3 Test Directory and Execution Files
@@ -555,6 +559,11 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 -   1.  ***Inference Functionality***: Ensures real models can perform forward computation normally and return results.
     2.  ***Accuracy Compliance***: Verifies that the model's evaluation metrics (e.g., accuracy) meet the expected baseline, preventing code changes from introducing accuracy issues.
     3.  ***Important Performance***: Verifies whether performance (e.g., P99 latency, throughput) in core scenarios meets preset thresholds.
+-   ***L3 response validation (`advanced_model`)***: At `--run-level advanced_model`, `tests/helpers/assertions.py` adds semantic checks on top of L2 payload gates (see Chapter 1):
+    -   **Speech / TTS** (`assert_audio_speech_response`): Whisper transcript of returned audio vs `request_config["input"]` (cosine similarity &gt; 0.9 when input text is set); optional `min_audio_bytes` floor; PCM harmonic-to-noise ratio when `response_format` is `pcm`; **preset voice gender** via `_assert_preset_voice_gender_from_audio` when `voice` matches a known preset in `_PRESET_VOICE_GENDER_MAP` (pitch/F0-based classifier; skipped for unknown voices or `pcm` output).
+    -   **Omni multimodal** (`assert_omni_response`): non-empty text/audio outputs; `key_words` in transcript or text; text–audio similarity / containment; preset **`speaker`** gender check (same helper as TTS).
+    -   **Diffusion** (`assert_*_diffusion_response`): image/video dimension and frame-count parity with request parameters where configured.
+    -   **Accuracy suites**: pixel/video similarity and metric baselines under `/tests/e2e/accuracy/` (separate from inline helper assertions).
 
 ### 2.3 Test Directory and Execution Files
 
@@ -582,9 +591,9 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Explanation**:
 
-    @pytest.mark.advanced_model: Marks the test as L3 merge level, indicating deep validation with real models. @pytest.mark.full_model: Marks L4 nightly-only suites (e.g. `test_*_expansion.py`, doc examples).
+    @pytest.mark.advanced_model: Marks the test as L3 merge level (`--run-level advanced_model`): real weights, Whisper/similarity/keyword checks, diffusion deep checks, and **preset voice/speaker gender** validation where applicable. @pytest.mark.full_model: Marks L4 nightly-only suites (e.g. `test_*_expansion.py`, doc examples).
 
-    @pytest.mark.core_model: Marks the test as L1 or L2 level, indicating that this test case validates the basic functionality of the core model. It uses mock weights and only checks if the relevant interface functions correctly.
+    @pytest.mark.core_model: Marks the test as L1 or L2 level. At `--run-level core_model`, validation is limited to request success plus cheap payload checks (e.g. non-empty audio bytes, response format/content-type, non-empty diffusion outputs)—not Whisper, keyword, or accuracy gates. Deploy YAML may use `load_format: dummy` for fast PR feedback.
 
     @pytest.mark.parametrize: A parameterization decorator that allows abstracting test data into parameters, enabling reuse of the same test logic across different data configurations. indirect=True indicates that parameters will be passed to the fixture for processing.
 
@@ -680,7 +689,7 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
-    **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model and full_model perform deep validation.
+    **Implicit Validation**: `send_omni_request`, `send_audio_speech_request`, and `send_diffusion_request` call `assert_*_response` helpers with the session `--run-level`. At `core_model`, checks are limited to success plus cheap payload sanity (non-empty audio/media, format/content-type, optional `min_audio_bytes`). At `advanced_model` and `full_model`, deep validation adds Whisper transcripts, keyword/similarity, diffusion dimension checks, PCM HNR, etc.
 
     **Audio output debugging**: Deep validation may transcribe returned audio via `convert_audio_bytes_to_text` (Whisper). If an audio keyword or text–audio similarity assertion fails, set `VLLM_OMNI_KEEP_REQUEST_MEDIA=1` before running pytest to keep the intermediate WAV files for inspection (see [Test helper environment variables](#test-helper-environment-variables)).
 

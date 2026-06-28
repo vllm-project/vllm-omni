@@ -627,6 +627,16 @@ def get_deploy_config_path(rel_path: str) -> str:
     return str(_DEPLOY_DIR / rel_path)
 
 
+def _get_config_value_by_path(config_dict: dict, path: str) -> Any:
+    """Read a dot-separated path from a nested dict (e.g. ``engine_args.load_format``)."""
+    current: Any = config_dict
+    for key in path.split("."):
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
 def _stage_load_format_paths(stage_config_path: str) -> tuple[str, str, list[int]]:
     """Return ``(stage_key, load_format_field_path, stage_ids)`` for a deploy YAML."""
     with open(stage_config_path, encoding="utf-8") as f:
@@ -660,10 +670,25 @@ def _delete_dummy_load_format(
     """For ``advanced_model`` / ``full_model``, strip ``load_format: dummy`` so real weights load."""
     if run_level not in {"advanced_model", "full_model"} or stage_config_path is None:
         return stage_config_path
-    stage_key, load_format_path, stage_ids = _stage_load_format_paths(stage_config_path)
+    stage_key, load_format_path, _stage_ids = _stage_load_format_paths(stage_config_path)
+    with open(stage_config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    stage_entries = cfg.get(stage_key, [])
+
+    deletes: dict[int, list[str]] = {}
+    for stage in stage_entries:
+        stage_id = stage.get("stage_id")
+        if stage_id is None:
+            continue
+        if _get_config_value_by_path(stage, load_format_path) == "dummy":
+            deletes[stage_id] = [load_format_path]
+
+    if not deletes:
+        return stage_config_path
+
     return modify_stage_config(
         stage_config_path,
-        deletes={stage_key: {stage_id: [load_format_path] for stage_id in stage_ids}},
+        deletes={stage_key: deletes},
     )
 
 
