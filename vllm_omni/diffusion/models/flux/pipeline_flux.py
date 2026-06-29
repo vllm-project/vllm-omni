@@ -70,7 +70,7 @@ def get_flux_post_process_func(
 class FluxPipeline(
     nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
 ):
-    supports_request_batch = False
+    supports_request_batch = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
@@ -527,7 +527,7 @@ class FluxPipeline(
         joint_attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         """Forward pass for flux."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
@@ -716,5 +716,5 @@ class FluxDMD2Pipeline(DMD2PipelineMixin, FluxPipeline):
         super().__init__(od_config=od_config, prefix=prefix)
         self.__init_dmd2__()
 
-    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
         return super().forward(req, **kwargs)
