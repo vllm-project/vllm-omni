@@ -76,6 +76,10 @@ from vllm_omni.utils.speaker_cache import (
 
 logger = init_logger(__name__)
 
+_SPEECH_USAGE_INPUT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TOKENS"
+_SPEECH_USAGE_OUTPUT_TOKENS_HEADER = "X-VLLM-OMNI-OUTPUT-TOKENS"
+_SPEECH_USAGE_TOTAL_TOKENS_HEADER = "X-VLLM-OMNI-TOTAL-TOKENS"
+
 # TTS Configuration
 _MING_TTS_MODEL_ARCHS = {"MingTTSForConditionalGeneration"}
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
@@ -969,6 +973,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Assemble the full usage object (input breakdown + generated tokens)."""
         details = self._compute_speech_input_details(request, tts_params)
         return build_speech_usage(details, output_tokens)
+
+    @staticmethod
+    def _build_speech_usage_headers(usage: SpeechTokenUsage | None) -> dict[str, str]:
+        if usage is None:
+            return {}
+
+        return {
+            _SPEECH_USAGE_INPUT_TOKENS_HEADER: str(usage.input_tokens),
+            _SPEECH_USAGE_OUTPUT_TOKENS_HEADER: str(usage.output_tokens),
+            _SPEECH_USAGE_TOTAL_TOKENS_HEADER: str(usage.total_tokens),
+        }
 
     def _estimate_fish_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate Fish Speech semantic token length from raw reference audio."""
@@ -4110,7 +4125,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     media_type="text/event-stream",
                 )
 
-            audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
+            usage_box: list[SpeechTokenUsage] = []
+            audio_bytes, media_type = await self._generate_audio_bytes(
+                request, request_id=request_id, usage_out=usage_box
+            )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
@@ -4118,7 +4136,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
             )
-            return Response(content=audio_bytes, media_type=media_type)
+            return Response(
+                content=audio_bytes,
+                media_type=media_type,
+                headers=self._build_speech_usage_headers(usage_box[0] if usage_box else None),
+            )
 
         except asyncio.CancelledError:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0

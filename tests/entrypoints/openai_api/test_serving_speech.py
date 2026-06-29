@@ -32,6 +32,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     OpenAICreateAudioGenerateRequest,
     OpenAICreateSpeechRequest,
     SpeechBatchItem,
+    SpeechInputTokenDetails,
+    SpeechTokenUsage,
     StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import (
@@ -144,6 +146,7 @@ class TestAudioMixin:
 # Helper to create mock model output for endpoint tests
 def create_mock_audio_output_for_test(
     request_id: str = "speech-mock-123",
+    metrics: dict | None = None,
 ) -> OmniRequestOutput:
     class MockCompletionOutput:
         def __init__(self, index: int = 0):
@@ -170,10 +173,14 @@ def create_mock_audio_output_for_test(
     audio_tensor = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, num_samples))
     mock_request_output = MockRequestOutput(request_id=request_id, audio_tensor=audio_tensor)
 
+    if metrics is None:
+        metrics = {"stage_metrics": {"0": {"num_tokens_in": 0, "num_tokens_out": 5}}}
+
     return OmniRequestOutput(
         stage_id=0,
         final_output_type="audio",
         request_output=mock_request_output,
+        metrics=metrics,
     )
 
 
@@ -222,6 +229,7 @@ def test_app(mocker: MockerFixture):
         models=mock_models,
         request_logger=mock_request_logger,
     )
+    speech_server._tts_tokenizer = lambda text, padding=False: {"input_ids": text.split()}
 
     # Skip TTS validation in tests (mock doesn't set up supported_speakers)
     speech_server._validate_tts_request = mocker.MagicMock(return_value=None)
@@ -358,6 +366,33 @@ class TestSpeechAPI:
         assert response.status_code == 200
         assert response.headers["content-type"] == "audio/wav"
         assert len(response.content) > 0
+
+    def test_create_speech_includes_token_usage_headers(self, client):
+        payload = {
+            "input": "Hello world",
+            "model": "tts-model",
+            "voice": "alloy",
+            "response_format": "wav",
+        }
+        response = client.post("/v1/audio/speech", json=payload)
+        assert response.status_code == 200
+        assert response.headers["x-vllm-omni-input-tokens"] == "2"
+        assert response.headers["x-vllm-omni-output-tokens"] == "5"
+        assert response.headers["x-vllm-omni-total-tokens"] == "7"
+
+    def test_build_speech_usage_headers_uses_usage_field_names(self):
+        usage = SpeechTokenUsage(
+            input_tokens=7,
+            output_tokens=11,
+            total_tokens=18,
+            input_token_details=SpeechInputTokenDetails(text_tokens=3, audio_tokens=4),
+        )
+        headers = OmniOpenAIServingSpeech._build_speech_usage_headers(usage)
+        assert headers == {
+            "X-VLLM-OMNI-INPUT-TOKENS": "7",
+            "X-VLLM-OMNI-OUTPUT-TOKENS": "11",
+            "X-VLLM-OMNI-TOTAL-TOKENS": "18",
+        }
 
     def test_create_speech_mp3_format(self, client):
         payload = {
