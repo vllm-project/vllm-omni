@@ -1187,6 +1187,114 @@ def extract_flux_context(
     )
 
 
+def extract_ernie_image_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_bth: torch.Tensor,
+    text_lens: torch.Tensor,
+    return_dict: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for ErnieImageTransformer2DModel.
+
+    ERNIE-Image uses a single-stream architecture where image and text tokens
+    are concatenated and processed together through shared transformer layers.
+
+    Args:
+        module: ErnieImageTransformer2DModel instance
+        hidden_states: Input image latents [B, C, H, W]
+        timestep: Current diffusion timestep
+        text_bth: Text embeddings [B, Tmax, text_in_dim]
+        text_lens: Text sequence lengths [B]
+        return_dict: Whether to return a Transformer2DModelOutput
+        **kwargs: Additional keyword arguments
+
+    Returns:
+        CacheContext with all information needed for generic caching
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    if not hasattr(module, "layers") or len(module.layers) == 0:
+        raise ValueError("Module must have layers attribute with at least one block")
+
+    # ============================================================================
+    # PREPROCESSING (ERNIE-Image specific)
+    # ============================================================================
+    dtype = hidden_states.dtype
+    B, C, H, W = hidden_states.shape
+    p = module.patch_size
+    Hp, Wp = H // p, W // p
+    N_img = Hp * Wp
+
+    # Prepare hidden_states, RoPE embeddings, and attention mask
+    hidden_states, freqs_cos, freqs_sin, attention_mask = module.unified_prepare(hidden_states, text_bth, text_lens)
+    attention_mask = module._slice_attention_mask_for_ring(attention_mask)
+    rotary_pos_emb = (freqs_cos, freqs_sin)
+    S = hidden_states.shape[0]
+
+    # Timestep embedding
+    sample = module.time_proj(timestep)
+    sample = sample.to(dtype=dtype)
+    c = module.time_embedding(sample)
+
+    # AdaLN modulation parameters (6 params per block)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
+        t.unsqueeze(0).expand(S, -1, -1).contiguous() for t in module.adaLN_modulation(c).chunk(6, dim=-1)
+    ]
+
+    # ============================================================================
+    # EXTRACT MODULATED INPUT (for cache decision)
+    # ============================================================================
+    # Use the first transformer block to extract modulated input
+    # The block applies RMSNorm + AdaLN modulation before attention
+    first_block = module.layers[0]
+    modulated_input = first_block.adaLN_sa_ln(hidden_states)
+    modulated_input = (modulated_input.float() * (1 + scale_msa.float()) + shift_msa.float()).to(modulated_input.dtype)
+
+    # ============================================================================
+    # DEFINE TRANSFORMER EXECUTION (ERNIE-Image specific)
+    # ============================================================================
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        """Execute all ERNIE-Image transformer blocks."""
+        h = hidden_states
+        temb = [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
+
+        for layer in module.layers:
+            h = layer(h, rotary_pos_emb, temb, attention_mask)
+        return (h,)
+
+    # ============================================================================
+    # DEFINE POSTPROCESSING (ERNIE-Image specific)
+    # ============================================================================
+    def postprocess(h: torch.Tensor) -> Any:
+        """Apply ERNIE-Image specific output postprocessing."""
+        h = module.final_norm(h, c).type_as(h)
+        patches = module.final_linear(h)[:N_img].transpose(0, 1).contiguous()
+        output = (
+            patches.view(B, Hp, Wp, p, p, module.out_channels)
+            .permute(0, 5, 1, 3, 2, 4)
+            .contiguous()
+            .view(B, module.out_channels, H, W)
+        )
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    # ============================================================================
+    # RETURN CONTEXT
+    # ============================================================================
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=None,  # Single-stream: no separate encoder states
+        temb=c,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1202,6 +1310,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "Flux2Transformer2DModel": extract_flux2_context,
     "LongCatImageTransformer2DModel": extract_longcat_context,
     "FluxTransformer2DModel": extract_flux_context,
+    "ErnieImageTransformer2DModel": extract_ernie_image_context,
     # Future models:
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,
 }

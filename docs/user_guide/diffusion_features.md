@@ -133,7 +133,7 @@ The following tables show which models support each feature:
 | **Stable-Diffusion-XL**  |     ❌     |     ❌      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Stable-Diffusion3.5**  |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Z-Image**              |     ✅     |     ✅      |           ✅           |       ❓        |   ✅ (TP=2 only)   |          ❌          |   ✅    |             ❌             |      ✅ (decode)      |       ✅        |        ❌         |
-| **ERNIE-Image**          |     ❌     |     ✅      |           ✅           |       ❓        |         ✅         |          ❌          |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **ERNIE-Image**          |     ✅     |     ✅      |           ✅           |       ❓        |         ✅         |          ❌          |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ✅        |        ❌         |
 
 > Notes:

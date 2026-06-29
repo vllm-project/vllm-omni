@@ -15,6 +15,7 @@ Currently implemented:
 - TestFlux2KleinExtractor: Flux2Klein model extractor
 - TestFlux2Extractor: Flux2 model extractor
 - TestFluxExtractor: Flux model extractor
+- TestErnieImageExtractor: ERNIE-Image model extractor
 """
 
 from abc import ABC, abstractmethod
@@ -25,9 +26,13 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.cache.teacache.extractors import (
+    extract_ernie_image_context,
     extract_flux2_context,
     extract_flux2_klein_context,
     extract_flux_context,
+)
+from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import (
+    ErnieImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
@@ -423,3 +428,172 @@ class TestFluxExtractor(BaseExtractorTest):
                 img_ids=torch.randint(0, 64, (1, 16, 3)),
                 txt_ids=torch.randint(0, 64, (1, 8, 3)),
             )
+
+
+@pytest.mark.cpu
+class TestErnieImageExtractor(BaseExtractorTest):
+    """Test extract_ernie_image_context function."""
+
+    @pytest.fixture(autouse=True)
+    def cpu_vllm_config(self):
+        """Force CPU custom-op dispatch for this test class."""
+        from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+
+        with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def mock_ernie_image_attention_backend(self):
+        """Use the SDPA backend so ERNIE-Image can be instantiated in CPU tests."""
+        from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+
+        with patch(
+            "vllm_omni.diffusion.attention.layer.get_attn_backend_for_role",
+            return_value=(SDPABackend, None),
+        ):
+            yield
+
+    def get_extractor(self):
+        return extract_ernie_image_context
+
+    @pytest.fixture
+    def ernie_image_module(self):
+        """Create a minimal ErnieImageTransformer2DModel for testing."""
+        return ErnieImageTransformer2DModel(
+            patch_size=1,
+            in_channels=64,
+            out_channels=64,
+            num_layers=2,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            hidden_size=128,
+            text_in_dim=128,  # Same as hidden_size to skip text_proj
+            rope_theta=256,
+            rope_axes_dim=(16, 16, 16),
+        )
+
+    def get_module(self, ernie_image_module):
+        return ernie_image_module
+
+    @pytest.fixture
+    def sample_inputs(self):
+        """Create sample input tensors for ERNIE-Image.
+
+        ERNIE-Image expects:
+        - hidden_states: [B, C, H, W] - image latents
+        - timestep: scalar or [B] tensor
+        - text_bth: [B, Tmax, text_in_dim] - text embeddings
+        - text_lens: [B] - text sequence lengths
+        """
+        batch_size = 1
+        height, width = 8, 8
+        in_channels = 64
+        text_seq_len = 16
+        text_in_dim = 128
+
+        return {
+            "hidden_states": torch.randn(batch_size, in_channels, height, width),
+            "timestep": torch.tensor([500]),
+            "text_bth": torch.randn(batch_size, text_seq_len, text_in_dim),
+            "text_lens": torch.tensor([text_seq_len]),
+        }
+
+    def get_sample_inputs(self, sample_inputs):
+        return sample_inputs
+
+    def test_modulated_input_shape(self, ernie_image_module, sample_inputs):
+        """Test that modulated_input has correct shape.
+
+        ERNIE-Image uses single-stream architecture where image and text tokens
+        are concatenated. Shape is [S, B, hidden_size] where S = N_img + Tmax.
+        """
+        context = extract_ernie_image_context(ernie_image_module, **sample_inputs)
+
+        B, C, H, W = sample_inputs["hidden_states"].shape
+        N_img = H * W  # patch_size = 1
+        Tmax = sample_inputs["text_bth"].shape[1]
+        hidden_size = ernie_image_module.hidden_size
+
+        # ERNIE-Image uses [S, B, dim] format (sequence first)
+        assert context.modulated_input.shape == (N_img + Tmax, B, hidden_size)
+
+    def test_hidden_states_shape(self, ernie_image_module, sample_inputs):
+        """Test that hidden_states has correct shape after preprocessing."""
+        context = extract_ernie_image_context(ernie_image_module, **sample_inputs)
+
+        B, C, H, W = sample_inputs["hidden_states"].shape
+        N_img = H * W
+        Tmax = sample_inputs["text_bth"].shape[1]
+        hidden_size = ernie_image_module.hidden_size
+
+        assert context.hidden_states.shape == (N_img + Tmax, B, hidden_size)
+
+    def test_encoder_hidden_states_is_none(self, ernie_image_module, sample_inputs):
+        """Test that encoder_hidden_states is None for single-stream model."""
+        context = extract_ernie_image_context(ernie_image_module, **sample_inputs)
+
+        # ERNIE-Image is single-stream, so no separate encoder states
+        assert context.encoder_hidden_states is None
+
+    def test_run_transformer_blocks_callable(self, ernie_image_module, sample_inputs):
+        """Test that run_transformer_blocks is callable."""
+        context = extract_ernie_image_context(ernie_image_module, **sample_inputs)
+        assert callable(context.run_transformer_blocks)
+
+    def test_postprocess_callable(self, ernie_image_module, sample_inputs):
+        """Test that postprocess is callable."""
+        context = extract_ernie_image_context(ernie_image_module, **sample_inputs)
+        assert callable(context.postprocess)
+
+    def test_postprocess_output_shape(self, ernie_image_module, sample_inputs):
+        """Test that postprocess produces correct output shape."""
+        context = extract_ernie_image_context(ernie_image_module, **sample_inputs)
+        output = context.postprocess(context.hidden_states)
+
+        # Output should match input image latent shape [B, C, H, W]
+        assert output.sample.shape == sample_inputs["hidden_states"].shape
+
+    def test_postprocess_return_tuple_when_return_dict_false(self, ernie_image_module, sample_inputs):
+        """Test that postprocess honors return_dict=False."""
+        context = extract_ernie_image_context(ernie_image_module, **sample_inputs, return_dict=False)
+        output = context.postprocess(context.hidden_states)
+
+        assert isinstance(output, tuple)
+        assert len(output) == 1
+        assert output[0].shape == sample_inputs["hidden_states"].shape
+
+    def test_temb_shape(self, ernie_image_module, sample_inputs):
+        """Test that temb has correct shape."""
+        context = extract_ernie_image_context(ernie_image_module, **sample_inputs)
+
+        # temb (c) should be [B, hidden_size]
+        assert context.temb.shape == (1, ernie_image_module.hidden_size)
+
+    def test_invalid_module_raises_error(self):
+        """Test that invalid module without layers raises ValueError."""
+        invalid_module = Mock()
+        invalid_module.layers = []
+
+        with pytest.raises(ValueError, match="Module must have layers"):
+            extract_ernie_image_context(
+                invalid_module,
+                hidden_states=torch.randn(1, 64, 8, 8),
+                timestep=torch.tensor([500]),
+                text_bth=torch.randn(1, 16, 128),
+                text_lens=torch.tensor([16]),
+            )
+
+    def test_different_text_lengths(self, ernie_image_module, sample_inputs):
+        """Test context extraction with varying text lengths."""
+        # Test with shorter text
+        inputs = sample_inputs.copy()
+        inputs["text_bth"] = torch.randn(1, 8, 128)
+        inputs["text_lens"] = torch.tensor([8])
+
+        context = extract_ernie_image_context(ernie_image_module, **inputs)
+
+        B, C, H, W = inputs["hidden_states"].shape
+        N_img = H * W
+        hidden_size = ernie_image_module.hidden_size
+
+        assert context.modulated_input.shape == (N_img + 8, B, hidden_size)
