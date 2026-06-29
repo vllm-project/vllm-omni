@@ -23,7 +23,9 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan_video_1
     DistributedAutoencoderKLHunyuanVideo15,
 )
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.metrics.perf import HunyuanVideoDiTForwardStats
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
@@ -202,6 +204,7 @@ class HunyuanVideo15Pipeline(
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+        self._last_dit_forward_stats: HunyuanVideoDiTForwardStats | None = None
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -218,6 +221,75 @@ class HunyuanVideo15Pipeline(
     @property
     def current_timestep(self):
         return self._current_timestep
+
+    def _clear_dit_forward_stats(self) -> None:
+        self._last_dit_forward_stats = None
+
+    @staticmethod
+    def _max_valid_tokens(mask: torch.Tensor | None, fallback_len: int) -> int:
+        if mask is None:
+            return int(fallback_len)
+        return int(mask.to(dtype=torch.bool).sum(dim=1).max().item())
+
+    def _record_dit_forward_stats(
+        self,
+        *,
+        latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor | None,
+        prompt_embeds_2: torch.Tensor,
+        prompt_embeds_mask_2: torch.Tensor | None,
+        image_embeds: torch.Tensor,
+        image_embeds_mask: torch.Tensor | None,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+    ) -> None:
+        """Record HunyuanVideo estimated/theoretical denoiser FLOPs inputs."""
+
+        try:
+            transformer = self.transformer
+            parallel_config = getattr(self.od_config, "parallel_config", None)
+            cfg_world_size = get_classifier_free_guidance_world_size() if do_true_cfg else 1
+            forwards_per_step_per_gpu = 2 if do_true_cfg and cfg_world_size == 1 else 1
+
+            text_context_len = self._max_valid_tokens(prompt_embeds_mask, int(prompt_embeds.shape[1]))
+            text_context_len_2 = self._max_valid_tokens(prompt_embeds_mask_2, int(prompt_embeds_2.shape[1]))
+            image_context_len = 0
+            if image_embeds_mask is not None:
+                image_context_len = self._max_valid_tokens(image_embeds_mask, int(image_embeds.shape[1]))
+
+            hidden_dim = int(getattr(transformer, "inner_dim"))
+            ffn_dim = int(getattr(transformer, "ffn_dim", 4 * hidden_dim))
+            self._last_dit_forward_stats = HunyuanVideoDiTForwardStats(
+                batch_size=int(latents.shape[0]),
+                latent_num_frames=int(latents.shape[2]),
+                latent_height=int(latents.shape[3]),
+                latent_width=int(latents.shape[4]),
+                patch_size_t=int(getattr(transformer, "patch_size_t")),
+                patch_size=int(getattr(transformer, "patch_size")),
+                context_len=image_context_len + text_context_len_2 + text_context_len,
+                hidden_dim=hidden_dim,
+                ffn_dim=ffn_dim,
+                num_layers=len(transformer.transformer_blocks),
+                num_steps=int(len(timesteps)),
+                forwards_per_step_per_gpu=forwards_per_step_per_gpu,
+                tensor_parallel_size=int(getattr(parallel_config, "tensor_parallel_size", 1)),
+                sequence_parallel_size=int(getattr(parallel_config, "sequence_parallel_size", 1) or 1),
+                pipeline_parallel_size=int(getattr(parallel_config, "pipeline_parallel_size", 1)),
+            )
+        except Exception:
+            self._last_dit_forward_stats = None
+            logger.warning("Failed to collect HunyuanVideo estimated DiT FLOPs inputs.", exc_info=True)
+
+    def get_dit_forward_stats(
+        self,
+        req: OmniDiffusionRequest,
+        output: DiffusionOutput,
+    ) -> HunyuanVideoDiTForwardStats | None:
+        """Return HunyuanVideo estimated/theoretical DiT FLOPs inputs."""
+
+        del req, output
+        return getattr(self, "_last_dit_forward_stats", None)
 
     def _get_mllm_prompt_embeds(
         self,
@@ -404,6 +476,8 @@ class HunyuanVideo15Pipeline(
         generator: torch.Generator | list[torch.Generator] | None = None,
         **kwargs,
     ) -> DiffusionOutput:
+        self._clear_dit_forward_stats()
+
         if len(req.prompts) > 1:
             raise ValueError("This model only supports a single prompt per request.")
         if len(req.prompts) == 1:
@@ -478,6 +552,19 @@ class HunyuanVideo15Pipeline(
         self.scheduler.set_timesteps(sigmas=sigmas, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
+
+        if getattr(self, "collect_dit_mfu_stats", False):
+            self._record_dit_forward_stats(
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                prompt_embeds_mask=prompt_embeds_mask,
+                prompt_embeds_2=prompt_embeds_2,
+                prompt_embeds_mask_2=prompt_embeds_mask_2,
+                image_embeds=image_embeds,
+                image_embeds_mask=None,
+                timesteps=timesteps,
+                do_true_cfg=do_cfg and negative_prompt_embeds is not None,
+            )
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):

@@ -5,6 +5,7 @@ import contextlib
 
 import pytest
 import torch
+from vllm.v1.metrics.perf import PerfStats
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.ipc import (
@@ -105,6 +106,31 @@ def test_rpc_result_envelope_diffusion_output_round_trips_through_shm() -> None:
     assert isinstance(result, DiffusionOutput)
     torch.testing.assert_close(result.output, tensor)
     assert unpacked["rank_statuses"] == [{"rank": 0, "ok": True}]
+
+
+def test_diffusion_output_defaults_perf_stats_to_none() -> None:
+    output = DiffusionOutput(output=torch.tensor([1]))
+
+    assert output.perf_stats is None
+
+
+def test_diffusion_output_to_cpu_preserves_perf_stats() -> None:
+    perf_stats = PerfStats(num_flops_per_gpu=123)
+    output = DiffusionOutput(output=torch.tensor([1]), perf_stats=perf_stats, to_cpu=True)
+
+    assert output.perf_stats is perf_stats
+
+
+def test_diffusion_output_shm_round_trip_preserves_perf_stats() -> None:
+    perf_stats = PerfStats(num_flops_per_gpu=123)
+    tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    output = DiffusionOutput(output=tensor, perf_stats=perf_stats)
+
+    pack_diffusion_output_shm(output)
+    unpack_diffusion_output_shm(output)
+
+    torch.testing.assert_close(output.output, tensor)
+    assert output.perf_stats is perf_stats
 
 
 def test_pack_value_keeps_tensor_at_threshold_inline() -> None:

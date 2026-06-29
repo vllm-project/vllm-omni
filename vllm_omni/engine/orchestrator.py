@@ -652,6 +652,7 @@ class Orchestrator:
                         if output is None:
                             continue
 
+                        self._record_diffusion_perf_stats(stage_id, replica_id, output)
                         pool.record_output_timestamps([output])
                         await self._handle_processed_outputs(stage_id, replica_id, [output])
                         idle = False
@@ -741,6 +742,32 @@ class Orchestrator:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
+
+    def _record_diffusion_perf_stats(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: OmniRequestOutput,
+    ) -> None:
+        if self._stat_logger is None or output.perf_stats is None:
+            return
+        engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
+        if engine_idx is None:
+            logger.warning(
+                "Skipping diffusion perf stats for stage %d replica %d: engine index is missing",
+                stage_id,
+                replica_id,
+            )
+            return
+        try:
+            self._stat_logger.record_perf_stats(output.perf_stats, engine_idx=engine_idx)
+        except Exception:
+            logger.warning(
+                "Failed to record diffusion perf stats for stage %d replica %d",
+                stage_id,
+                replica_id,
+                exc_info=True,
+            )
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""

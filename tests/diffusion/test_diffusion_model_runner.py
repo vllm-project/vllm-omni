@@ -6,10 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.metrics.perf import PerfStats
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.metrics.perf import DiTForwardStats
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
 pytestmark = [pytest.mark.diffusion]
@@ -118,6 +120,80 @@ def _make_compile_runner(*, use_hsdp: bool):
     return runner
 
 
+def _make_mfu_runner(pipeline, *, enable_mfu_metrics: bool):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        observability_config=SimpleNamespace(enable_mfu_metrics=enable_mfu_metrics),
+    )
+    runner.device = torch.device("cpu")
+    runner.pipeline = pipeline
+    runner.cache_backend = None
+    runner.offload_backend = None
+    runner.prompt_embed_cache = None
+    runner.od_config = SimpleNamespace(
+        cache_backend="none",
+        enable_cache_dit_summary=False,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+    )
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
+    )
+    runner._kv_prefetch_enabled = False
+    return runner
+
+
+def _patch_peak_memory_stats(monkeypatch) -> None:
+    monkeypatch.setattr(
+        model_runner_module,
+        "current_omni_platform",
+        SimpleNamespace(
+            reset_peak_memory_stats=lambda: None,
+            max_memory_reserved=lambda: 0,
+            max_memory_allocated=lambda: 0,
+        ),
+    )
+
+
+class _MfuStatsPipeline:
+    device = torch.device("cpu")
+
+    def __init__(self, output: DiffusionOutput, stats: DiTForwardStats | None):
+        self.output = output
+        self.stats = stats
+        self.collect_flags: list[bool] = []
+        self.get_stats_calls = 0
+
+    def forward(self, req):
+        del req
+        self.collect_flags.append(bool(getattr(self, "collect_dit_mfu_stats", False)))
+        return self.output
+
+    def get_dit_forward_stats(self, req, output):
+        del req, output
+        self.get_stats_calls += 1
+        return self.stats
+
+
+class _NoDitStatsMethodPipeline:
+    device = torch.device("cpu")
+
+    def __init__(self, output: DiffusionOutput):
+        self.output = output
+        self.collect_flags: list[bool] = []
+
+    def forward(self, req):
+        del req
+        self.collect_flags.append(bool(getattr(self, "collect_dit_mfu_stats", False)))
+        return self.output
+
+
+class _FailingDitStatsPipeline(_MfuStatsPipeline):
+    def get_dit_forward_stats(self, req, output):
+        del req, output
+        self.get_stats_calls += 1
+        raise RuntimeError("stats failed")
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 @pytest.mark.parametrize("use_hsdp", [False, True])
@@ -158,9 +234,7 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     req.request_id = "req"
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    _patch_peak_memory_stats(monkeypatch)
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
         scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
@@ -195,9 +269,7 @@ def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypa
     cache_summary_calls = []
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    _patch_peak_memory_stats(monkeypatch)
     monkeypatch.setattr(
         model_runner_module,
         "cache_summary",
@@ -223,9 +295,7 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
     cache_summary_calls = []
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
-    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    _patch_peak_memory_stats(monkeypatch)
     monkeypatch.setattr(
         model_runner_module,
         "cache_summary",
@@ -236,6 +306,167 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
     assert output.output == "ok"
     assert cache_summary_calls == [(runner.pipeline, True)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_attaches_dit_perf_stats_when_mfu_metrics_enabled(monkeypatch):
+    stats = DiTForwardStats(
+        batch_size=1,
+        seq_len=2,
+        context_len=3,
+        hidden_dim=4,
+        ffn_dim=16,
+        num_layers=5,
+        num_steps=6,
+        forwards_per_step_per_gpu=1,
+    )
+    pipeline = _MfuStatsPipeline(DiffusionOutput(output=torch.tensor([1])), stats)
+    runner = _make_mfu_runner(pipeline, enable_mfu_metrics=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    _patch_peak_memory_stats(monkeypatch)
+
+    output = DiffusionModelRunner.execute_model(runner, _make_request())
+
+    assert pipeline.collect_flags == [True]
+    assert pipeline.get_stats_calls == 1
+    assert output.perf_stats is not None
+    assert output.perf_stats.num_flops_per_gpu > 0
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_does_not_collect_dit_stats_when_mfu_metrics_disabled(monkeypatch):
+    stats = DiTForwardStats(
+        batch_size=1,
+        seq_len=2,
+        context_len=3,
+        hidden_dim=4,
+        ffn_dim=16,
+        num_layers=5,
+        num_steps=6,
+        forwards_per_step_per_gpu=1,
+    )
+    pipeline = _MfuStatsPipeline(DiffusionOutput(output=torch.tensor([1])), stats)
+    runner = _make_mfu_runner(pipeline, enable_mfu_metrics=False)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    _patch_peak_memory_stats(monkeypatch)
+
+    output = DiffusionModelRunner.execute_model(runner, _make_request())
+
+    assert pipeline.collect_flags == [False]
+    assert pipeline.get_stats_calls == 0
+    assert output.perf_stats is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_leaves_output_unchanged_when_dit_stats_missing(monkeypatch):
+    pipeline = _NoDitStatsMethodPipeline(DiffusionOutput(output=torch.tensor([1])))
+    runner = _make_mfu_runner(pipeline, enable_mfu_metrics=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    _patch_peak_memory_stats(monkeypatch)
+
+    output = DiffusionModelRunner.execute_model(runner, _make_request())
+
+    assert pipeline.collect_flags == [True]
+    assert output.perf_stats is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_leaves_output_unchanged_when_dit_stats_are_none(monkeypatch):
+    pipeline = _MfuStatsPipeline(DiffusionOutput(output=torch.tensor([1])), None)
+    runner = _make_mfu_runner(pipeline, enable_mfu_metrics=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    _patch_peak_memory_stats(monkeypatch)
+
+    output = DiffusionModelRunner.execute_model(runner, _make_request())
+
+    assert pipeline.collect_flags == [True]
+    assert pipeline.get_stats_calls == 1
+    assert output.perf_stats is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_leaves_output_unchanged_when_dit_stats_producer_fails(monkeypatch):
+    stats = DiTForwardStats(
+        batch_size=1,
+        seq_len=2,
+        context_len=3,
+        hidden_dim=4,
+        ffn_dim=16,
+        num_layers=5,
+        num_steps=6,
+        forwards_per_step_per_gpu=1,
+    )
+    pipeline = _FailingDitStatsPipeline(DiffusionOutput(output=torch.tensor([1])), stats)
+    runner = _make_mfu_runner(pipeline, enable_mfu_metrics=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    _patch_peak_memory_stats(monkeypatch)
+
+    output = DiffusionModelRunner.execute_model(runner, _make_request())
+
+    assert pipeline.collect_flags == [True]
+    assert pipeline.get_stats_calls == 1
+    assert output.perf_stats is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_does_not_overwrite_existing_perf_stats(monkeypatch):
+    existing = PerfStats(num_flops_per_gpu=123)
+    stats = DiTForwardStats(
+        batch_size=1,
+        seq_len=2,
+        context_len=3,
+        hidden_dim=4,
+        ffn_dim=16,
+        num_layers=5,
+        num_steps=6,
+        forwards_per_step_per_gpu=1,
+    )
+    pipeline = _MfuStatsPipeline(DiffusionOutput(output=torch.tensor([1]), perf_stats=existing), stats)
+    runner = _make_mfu_runner(pipeline, enable_mfu_metrics=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    _patch_peak_memory_stats(monkeypatch)
+
+    output = DiffusionModelRunner.execute_model(runner, _make_request())
+
+    assert output.perf_stats is existing
+    assert pipeline.get_stats_calls == 0
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_skips_dit_perf_stats_for_error_output(monkeypatch):
+    stats = DiTForwardStats(
+        batch_size=1,
+        seq_len=2,
+        context_len=3,
+        hidden_dim=4,
+        ffn_dim=16,
+        num_layers=5,
+        num_steps=6,
+        forwards_per_step_per_gpu=1,
+    )
+    pipeline = _MfuStatsPipeline(DiffusionOutput(error="boom"), stats)
+    runner = _make_mfu_runner(pipeline, enable_mfu_metrics=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    _patch_peak_memory_stats(monkeypatch)
+
+    output = DiffusionModelRunner.execute_model(runner, _make_request())
+
+    assert output.perf_stats is None
+    assert pipeline.get_stats_calls == 0
 
 
 @pytest.mark.core_model

@@ -4,6 +4,7 @@ from typing import Any
 import torch
 from PIL import Image
 from vllm.outputs import RequestOutput
+from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
@@ -102,6 +103,9 @@ class OmniRequestOutput:
     # memory usage info
     peak_memory_mb: float = 0.0
 
+    # Optional upstream vLLM MFU stats produced by diffusion stages.
+    perf_stats: PerfStats | None = None
+
     # error handling
     error: str | None = None
     error_status_code: int | None = None
@@ -176,6 +180,7 @@ class OmniRequestOutput:
         stage_durations: dict[str, float] | None = None,
         peak_memory_mb: float = 0.0,
         finished: bool = True,
+        perf_stats: PerfStats | None = None,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -212,6 +217,7 @@ class OmniRequestOutput:
             _custom_output=custom_output or {},
             stage_durations=stage_durations or {},
             peak_memory_mb=peak_memory_mb,
+            perf_stats=perf_stats,
             finished=finished,
         )
 
