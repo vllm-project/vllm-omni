@@ -100,9 +100,9 @@ def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
     )
     batch = DiffusionRequestBatch(requests=[mock_req])
 
-    outputs = pipeline.forward(batch, prompt_embeds=prompt_embeds, output_type="latent", guidance_scale=1.0)
+    output = pipeline.forward(batch, prompt_embeds=prompt_embeds, output_type="latent", guidance_scale=1.0)
 
-    assert torch.equal(outputs[0].output, torch.ones((1, 4, 1, 8, 8)))
+    assert torch.equal(output.output, torch.ones((1, 4, 1, 8, 8)))
     assert torch.equal(captured["timesteps"], pipeline.scheduler.timesteps)
     assert captured["guidance_low"] == 1.0
     assert captured["guidance_high"] == 1.0

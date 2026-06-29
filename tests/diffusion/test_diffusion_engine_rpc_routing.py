@@ -32,12 +32,12 @@ import pytest
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, _RpcTask
 from vllm_omni.diffusion.sched import RequestScheduler
-from vllm_omni.diffusion.sched.interface import SamplingParamsKey
+from vllm_omni.diffusion.sched.interface import RequestBatchSamplingParamsKey
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 # Default values for every batch-key field, so SimpleNamespace-based
 # sampling_params satisfy ``get_sampling_params_key``'s attribute lookups.
-_SAMPLING_KEY_DEFAULTS = {f.name: f.default for f in _dc_fields(SamplingParamsKey)}
+_SAMPLING_KEY_DEFAULTS = {f.name: f.default for f in _dc_fields(RequestBatchSamplingParamsKey)}
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -121,10 +121,12 @@ class _ConcurrencyTrackingExecutor:
 
 
 def _make_request(tag: str):
+    sampling_params = dict(_SAMPLING_KEY_DEFAULTS)
+    sampling_params["num_inference_steps"] = 1
     return SimpleNamespace(
         request_id=tag,
         prompt=f"prompt_{tag}",
-        sampling_params=SimpleNamespace(num_inference_steps=1, **_SAMPLING_KEY_DEFAULTS),
+        sampling_params=SimpleNamespace(**sampling_params),
     )
 
 
@@ -139,6 +141,7 @@ def _make_engine_with_loop(
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine._closed = False
+    engine.od_config = SimpleNamespace(streaming_output=False)
     engine.executor = _ConcurrencyTrackingExecutor(rpc_delay=rpc_delay)
 
     sched = RequestScheduler()
@@ -151,6 +154,7 @@ def _make_engine_with_loop(
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_queue = {}
+    engine._out_queue_streaming = {}
     engine._closed = False
     engine.abort_queue = queue.Queue()
     engine._rpc_queue = queue.Queue()

@@ -285,7 +285,7 @@ class HeliosPipeline(
         """Initialize Helios request state for chunk-wise step execution."""
         del kwargs
         req = OmniDiffusionRequest(
-            prompts=state.prompts or [],
+            prompt=state.prompt,
             sampling_params=state.sampling,
             request_id=state.request_id,
         )
