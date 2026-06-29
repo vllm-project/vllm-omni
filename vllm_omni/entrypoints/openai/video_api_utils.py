@@ -10,14 +10,12 @@ import base64
 import binascii
 from collections import deque
 from io import BytesIO
-from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
-from vllm.multimodal.media import MediaConnector
-from vllm.multimodal.media.base import MediaIO
 
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -147,12 +145,22 @@ def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
     raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
 
 
-async def decode_image_url(image_url: str, connector: MediaConnector) -> Image.Image:
-    """Fetch and decode an image URL using MediaConnector for SSRF protection."""
-    try:
-        return (await connector.fetch_image_async(image_url)).media
-    except Exception as exc:
-        raise InvalidInputReferenceError(f"Invalid image_reference.image_url: {exc}") from exc
+async def decode_image_url(image_url: str) -> Image.Image:
+    if image_url.startswith("data:image"):
+        return _decode_base64_image(image_url, source="image_reference.image_url")
+
+    if image_url.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(image_url)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise InvalidInputReferenceError(
+                    "Invalid image_reference.image_url: failed to download image."
+                ) from exc
+        return _decode_image_bytes(response.content, source="image_reference.image_url")
+
+    raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
 
 
 def _decode_base64_video(
@@ -176,117 +184,96 @@ def _decode_base64_video(
     raise InvalidInputReferenceError(f"Invalid {source}: video data is empty.")
 
 
-class _VideoFramesMediaIO(MediaIO[VideoFrames]):
-    """MediaIO that decodes video bytes into VideoFrames with frame extraction."""
-
-    def __init__(
-        self,
-        *,
-        source: str = "video_reference.video_url",
-        max_frames: int | None = None,
-        keep: Literal["first", "last"] = "first",
-    ) -> None:
-        self._source = source
-        self._max_frames = max_frames
-        self._keep = keep
-
-    def load_bytes(self, data: bytes) -> VideoFrames:
-        return _decode_video_bytes(
-            data,
-            source=self._source,
-            max_frames=self._max_frames,
-            keep=self._keep,
+async def decode_video_url(
+    video_url: str,
+    *,
+    max_frames: int | None = None,
+    keep: Literal["first", "last"] = "first",
+) -> VideoFrames:
+    if video_url.startswith("data:video"):
+        return _decode_base64_video(
+            video_url,
+            source="video_reference.video_url",
+            max_frames=max_frames,
+            keep=keep,
         )
 
-    def load_base64(self, media_type: str, data: str) -> VideoFrames:
-        return self.load_bytes(base64.b64decode(data))
+    if video_url.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(video_url)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise InvalidInputReferenceError(
+                    "Invalid video_reference.video_url: failed to download video."
+                ) from exc
+        return _decode_video_bytes(
+            response.content,
+            source="video_reference.video_url",
+            max_frames=max_frames,
+            keep=keep,
+        )
 
-    def load_file(self, filepath: Path) -> VideoFrames:
-        return self.load_bytes(filepath.read_bytes())
+    raise InvalidInputReferenceError("Invalid video_reference.video_url: must be an http(s) URL or data URL.")
 
 
-class _AudioFileMediaIO(MediaIO[str]):
-    """MediaIO that writes audio bytes to a temp file, returns the path."""
+async def decode_audio_url(audio_url: str) -> str:
+    """Decode an audio URL or data-URL to a temporary file path."""
+    import tempfile
 
-    def load_bytes(self, data: bytes) -> str:
-        return self._write_temp(data, suffix=".wav")
+    audio_bytes: bytes | None = None
 
-    def load_base64(self, media_type: str, data: str) -> str:
-        suffix = ".wav"
-        ext = media_type.split("/")[-1] if media_type else ""
+    if audio_url.startswith("data:audio"):
+        _, b64_data = audio_url.split(",", 1)
+        try:
+            audio_bytes = base64.b64decode(b64_data)
+        except (binascii.Error, ValueError) as exc:
+            raise InvalidInputReferenceError(
+                "Invalid audio_reference.audio_url: audio data is not valid base64."
+            ) from exc
+    elif audio_url.startswith(("http://", "https://")):
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(audio_url)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise InvalidInputReferenceError(
+                    "Invalid audio_reference.audio_url: failed to download audio."
+                ) from exc
+        audio_bytes = response.content
+    else:
+        raise InvalidInputReferenceError("Invalid audio_reference.audio_url: must be an http(s) URL or data URL.")
+
+    if not audio_bytes:
+        raise InvalidInputReferenceError("Invalid audio_reference: audio data is empty.")
+
+    suffix = ".wav"
+    if audio_url.startswith("data:audio/"):
+        mime = audio_url.split(";")[0].removeprefix("data:")
+        ext = mime.split("/")[-1]
         if ext in ("mpeg", "mp3"):
             suffix = ".mp3"
         elif ext == "wav":
             suffix = ".wav"
         elif ext.isalnum() and len(ext) <= 8:
             suffix = f".{ext}"
-        return self._write_temp(base64.b64decode(data), suffix=suffix)
 
-    def load_file(self, filepath: Path) -> str:
-        return str(filepath)
-
-    @staticmethod
-    def _write_temp(data: bytes, *, suffix: str) -> str:
-        import tempfile
-
-        if not data:
-            raise InvalidInputReferenceError("Invalid audio_reference: audio data is empty.")
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tmp.write(data)
-        tmp.close()
-        return tmp.name
-
-
-async def decode_video_url(
-    video_url: str,
-    connector: MediaConnector,
-    *,
-    max_frames: int | None = None,
-    keep: Literal["first", "last"] = "first",
-) -> VideoFrames:
-    """Fetch and decode a video URL using MediaConnector for SSRF protection."""
-    try:
-        return await connector.load_from_url_async(
-            video_url,
-            _VideoFramesMediaIO(max_frames=max_frames, keep=keep),
-        )
-    except InvalidInputReferenceError:
-        raise
-    except Exception as exc:
-        raise InvalidInputReferenceError(f"Invalid video_reference.video_url: {exc}") from exc
-
-
-async def decode_audio_url(
-    audio_url: str,
-    connector: MediaConnector,
-) -> str:
-    """Fetch and decode an audio URL using MediaConnector for SSRF protection."""
-    try:
-        return await connector.load_from_url_async(
-            audio_url,
-            _AudioFileMediaIO(),
-        )
-    except InvalidInputReferenceError:
-        raise
-    except Exception as exc:
-        raise InvalidInputReferenceError(f"Invalid audio_reference.audio_url: {exc}") from exc
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(audio_bytes)
+    tmp.close()
+    return tmp.name
 
 
 async def decode_input_reference(
     image_reference: ImageReference | None,
     video_reference: VideoReference | None,
     input_reference_bytes: bytes | None,
-    model_config: Any,
     *,
     max_video_frames: int | None = None,
     video_keep: Literal["first", "last"] = "first",
 ) -> Image.Image | VideoFrames | None:
-    """Decode media input from multipart bytes, data URLs, or typed references.
+    """Decode media input from multipart bytes, data URLs, or typed references."""
 
-    http(s) image and video URLs are fetched through vLLM's
-    ``MediaConnector`` which respects ``--allowed-media-domains`` and
-    ``--allowed-local-media-path`` to prevent SSRF.
-    """
     provided = sum(item is not None for item in (input_reference_bytes, image_reference, video_reference))
     if provided > 1:
         raise InvalidInputReferenceError("Provide only one of input_reference, image_reference, or video_reference.")
@@ -300,22 +287,13 @@ async def decode_input_reference(
         )
 
     if isinstance(image_reference, UrlImageReference):
-        connector = MediaConnector(
-            allowed_local_media_path=model_config.allowed_local_media_path,
-            allowed_media_domains=model_config.allowed_media_domains,
-        )
-        return await decode_image_url(image_reference.image_url, connector)
+        return await decode_image_url(image_reference.image_url)
     elif isinstance(image_reference, FileImageReference):
         raise InvalidInputReferenceError("Invalid image_reference: file_id is not supported yet.")
 
     if isinstance(video_reference, UrlVideoReference):
-        connector = MediaConnector(
-            allowed_local_media_path=model_config.allowed_local_media_path,
-            allowed_media_domains=model_config.allowed_media_domains,
-        )
         return await decode_video_url(
             video_reference.video_url,
-            connector,
             max_frames=max_video_frames,
             keep=video_keep,
         )
