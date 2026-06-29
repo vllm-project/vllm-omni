@@ -1,21 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E online serving tests for Ming-omni-tts (dense) model.
+E2E expansion tests for Ming-omni-tts online serving (nightly CI).
+
 Tests text-to-audio via /v1/audio/speech endpoint.
 """
 
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.omni]
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.tts,
+    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4704"),
+]
 
 MODEL = "inclusionAI/Ming-omni-tts-0.5B"
 DEPLOY_CONFIG = get_deploy_config_path("ming_tts.yaml")

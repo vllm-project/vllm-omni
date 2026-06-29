@@ -24,9 +24,9 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-# ``omni`` for all tests; 001/002 also get ``full_model`` via ``TestMossTtsNanoFull`` (003 is core+advanced only, no full_model).
+# ``omni`` for all tests; 001/002 also get ``slow`` via ``TestMossTtsNanoFull`` (003 is core+advanced only, no slow).
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.tts,
 ]
 
