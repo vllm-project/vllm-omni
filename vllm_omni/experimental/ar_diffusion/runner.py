@@ -14,9 +14,11 @@ parameters come from the deploy yaml's ``model_config["ar_diffusion_kv_config"]`
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from collections import OrderedDict
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 
@@ -126,6 +128,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         super().load_model(*args, **kwargs)
         if self.ar_diffusion_kv_config.enable and self.pipeline is not None:
             self._preallocate_kv_cache()
+            # Pre-capture the CUDA graphs for every window-fill shape at load time
+            # (only when compiling/cuda-graph is on) so serving is fast from chunk 0.
+            if not self.od_config.enforce_eager and self.ar_diffusion_kv_config.warmup_cudagraph:
+                self._warmup_ar_rollout()
 
     def _infer_frame_seqlen(self) -> int:
         """frame_seqlen = (H//8)*(W//8)//4 from the configured image_resolution."""
@@ -242,3 +248,116 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             torch.cuda.synchronize(self.device)
         self._perf_e2e_times.append(time.perf_counter() - _e2e_t0)
         return out
+
+    # -- cuda-graph warm-up ----------------------------------------------------
+
+    #: Dedicated session id for the warm-up rollout; cleaned from both state maps.
+    _WARMUP_SID = "__ardiffusion_warmup__"
+
+    def _synth_robot_obs(self, h: int, w: int, n_frames: int) -> dict:
+        """Zero-filled roboarena observation matching the client's obs layout.
+
+        Mirrors ``examples/.../client_schedule.make_obs_from_video`` (2 ext + wrist
+        cameras, 7/6/1 state vectors) so it survives ``_transform_robot_obs`` exactly
+        like a real request. One frame -> ``(H,W,3)``; chunk -> ``(n_frames,H,W,3)``.
+        """
+        img = (
+            np.zeros((h, w, 3), dtype=np.uint8)
+            if n_frames == 1
+            else np.zeros((n_frames, h, w, 3), dtype=np.uint8)
+        )
+        return {
+            "observation/exterior_image_0_left": img,
+            "observation/exterior_image_1_left": img,
+            "observation/wrist_image_left": img,
+            "observation/joint_position": np.zeros(7, dtype=np.float32),
+            "observation/cartesian_position": np.zeros(6, dtype=np.float32),
+            "observation/gripper_position": np.zeros(1, dtype=np.float32),
+            "prompt": "warmup",
+            "session_id": self._WARMUP_SID,
+        }
+
+    def _warmup_ar_rollout(self) -> None:
+        """Drive a synthetic rollout through one window-fill so every DiT graph is
+        captured at load (off the serving hot path). Frees the synthetic session and
+        leaves the KV pool exactly as found. Never raises — falls back to lazy capture.
+        """
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        kv = self.kv_cache
+        if kv is None:
+            return
+        sid = self._WARMUP_SID
+        t = self.pipeline.transformer
+        nfpb = int(t.num_frame_per_block)
+        window_chunks = int(kv.config.window_chunks or 0)
+        if window_chunks <= 0:
+            return
+        # Distinct DiT window shapes are walked by one fill: prefill + ceil((W-1)/nfpb)
+        # chunk forwards. +1 optionally to also capture the reset-cycle forward.
+        n_forwards = 1 + math.ceil(max(0, window_chunks - 1) / nfpb)
+        if self.ar_diffusion_kv_config.warmup_capture_reset:
+            n_forwards += 1
+        res = self._image_resolution()
+        h, w = int(res[0]), int(res[1])
+
+        free_before = kv.manager.block_pool.get_num_free_blocks()
+        # The step cache is left active: the DiT input shape is per-chunk (the resident
+        # window length), and the first denoise step of every chunk always computes, so
+        # every window shape is captured regardless of how many later steps are skipped.
+        logger.info(
+            "AR-Diffusion cudagraph warm-up: up to %d synthetic forwards (window_chunks=%d, nfpb=%d)",
+            n_forwards, window_chunks, nfpb,
+        )
+        try:
+            for i in range(n_forwards):
+                n_frames = 1 if i == 0 else 4  # client convention: 1-frame prefill, 4-frame chunks
+                obs = self._synth_robot_obs(h, w, n_frames)
+                sp = OmniDiffusionSamplingParams(
+                    extra_args={"reset": i == 0, "session_id": sid, "robot_obs": obs}
+                )
+                req = OmniDiffusionRequest(
+                    prompts=["warmup"], sampling_params=sp, request_id=f"ardiffusion-warmup-{i}"
+                )
+                self.execute_model(req)
+                # Stop once the resident window is full — the remaining shapes are
+                # already captured (the window caps/resets through the same set).
+                ar_state = self._ar_diffusion_states.get(sid)
+                if (
+                    not self.ar_diffusion_kv_config.warmup_capture_reset
+                    and ar_state is not None
+                    and len(kv.window_block_ids(ar_state.pos)) >= window_chunks
+                ):
+                    break
+        except Exception as e:  # noqa: BLE001 — warm-up must never break model load
+            logger.warning("AR-Diffusion cudagraph warm-up failed (%s); using lazy capture.", e)
+        finally:
+            # Free the synthetic session from BOTH maps (KV pool + pipeline state).
+            ar_state = self._ar_diffusion_states.pop(sid, None)
+            if ar_state is not None:
+                try:
+                    ar_state.close()  # return KV blocks to the BlockPool
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("AR-Diffusion warm-up: state.close() failed (%s)", e)
+            try:
+                self.pipeline._states.pop(sid, None)
+            except Exception:  # noqa: BLE001
+                pass
+            # Drop any per-forward timings the warm-up recorded so serving stats start clean.
+            self._perf_e2e_times.clear()
+            free_after = kv.manager.block_pool.get_num_free_blocks()
+            if free_after != free_before:
+                logger.warning(
+                    "AR-Diffusion warm-up: KV pool not restored (free %d -> %d) — possible leak",
+                    free_before, free_after,
+                )
+            else:
+                logger.info(
+                    "AR-Diffusion cudagraph warm-up complete; KV pool restored (%d free blocks)",
+                    free_after,
+                )
+
+    def _image_resolution(self) -> list[int]:
+        mc = getattr(self.od_config, "model_config", None) or {}
+        psc = (mc.get("policy_server_config") if isinstance(mc, dict) else None) or {}
+        return psc.get("image_resolution", [180, 320])

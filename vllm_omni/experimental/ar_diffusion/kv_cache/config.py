@@ -26,6 +26,12 @@ class ARDiffusionKVConfig:
     reset_at_boundary: bool = False
     # Fraction of free device memory budgeted for the AR-Diffusion KV pool.
     gpu_memory_fraction: float = 0.1
+    # When CUDA graph / torch.compile is on (not enforce_eager), pre-capture the
+    # DiT graphs for every window-fill shape at load time via a synthetic rollout,
+    # so the serving run is fast from the first chunk. No effect when eager.
+    warmup_cudagraph: bool = True
+    # Also capture the post-window-boundary (reset-cycle) forward during warm-up.
+    warmup_capture_reset: bool = False
 
     @property
     def sliding_window(self) -> int | None:
