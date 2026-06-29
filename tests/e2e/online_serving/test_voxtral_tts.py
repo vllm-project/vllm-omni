@@ -7,11 +7,13 @@ These tests verify the /v1/audio/speech endpoint works correctly with
 actual model inference, not mocks.
 """
 
+import io
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+import soundfile as sf
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
@@ -96,20 +98,52 @@ class TestVoxtralTTSFixedVoice:
     @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_speech_speed(self, omni_server, openai_client) -> None:
-        """Request with speed parameters"""
-        speeds = [0.5, 1, 1.5, 2, 2.5]
+        """``speed`` time-stretches the output: duration scales ~1/speed.
+
+        ``speed`` is an output-side post-process (phase-vocoder time-stretch),
+        not a model capability, so this asserts the parameter is honored - audio
+        gets shorter as speed rises - rather than ASR intelligibility at extreme
+        rates, where the vocoder (not the model) would dominate the transcript.
+        """
+        text = "The boy was there when the sun rose."
+        speeds = [0.5, 1.0, 1.5, 2.0, 2.5]
+        durations: dict[float, float] = {}
         for speed in speeds:
-            openai_client.send_audio_speech_request(
+            responses = openai_client.send_audio_speech_request(
                 {
                     "model": omni_server.model,
-                    "input": "The boy was there when the sun rose.",
+                    "input": text,
                     "voice": "casual_female",
                     "language": "English",
                     "response_format": "wav",
                     "timeout": 120.0,
                     "speed": speed,
+                    "seed": 1234,
                 }
             )
+            info = sf.info(io.BytesIO(responses[0].audio_bytes))
+            durations[speed] = info.frames / info.samplerate
+            print(f"speed={speed}: duration={durations[speed]:.3f}s ({info.frames} frames @ {info.samplerate} Hz)")
+
+        # ``speed`` sets output samples = round(generated_samples / speed), so
+        # ``duration * speed`` recovers the underlying generation length, which
+        # should be ~constant across requests. Comparing each request's implied
+        # length to the median is robust to the per-request generation-length
+        # jitter that the TTS sampling retains even with a fixed seed; if speed
+        # were ignored the implied lengths would instead spread by ~5x.
+        implied = {speed: durations[speed] * speed for speed in speeds}
+        median_len = sorted(implied.values())[len(implied) // 2]
+        assert median_len > 0, "Generation produced empty audio"
+        for speed in speeds:
+            assert implied[speed] == pytest.approx(median_len, rel=0.4), (
+                f"speed={speed}: duration {durations[speed]:.3f}s implies generation length "
+                f"{implied[speed]:.3f}s, far from median {median_len:.3f}s; speed not applied "
+                f"as ~1/speed: durations={durations}"
+            )
+        # Endpoints are 5x apart in speed; their durations must clearly separate.
+        assert durations[speeds[0]] > durations[speeds[-1]], (
+            f"slowest speed should yield clearly longer audio than fastest: {durations}"
+        )
 
     @pytest.mark.advanced_model
     @pytest.mark.tts

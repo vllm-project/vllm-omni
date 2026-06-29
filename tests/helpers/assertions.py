@@ -24,6 +24,10 @@ _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
 _PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
 _MIN_PCM_SPEECH_HNR_DB = 1.0
+# Speed band within which the time-stretch post-process keeps audio intelligible
+# enough for an ASR transcript to be a meaningful model-correctness signal.
+_ASR_RELIABLE_SPEED_MIN = 0.5
+_ASR_RELIABLE_SPEED_MAX = 1.5
 _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
     "serena": "female",
     "uncle_fu": "male",
@@ -568,7 +572,12 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
     if run_level in {"advanced_model", "full_model"} and req_fmt != "pcm":
         expected_text = request_config.get("input")
-        if expected_text:
+        # ``speed`` is an optional output-side time-stretch (phase vocoder), not a
+        # model capability. Beyond a moderate band the vocoder degrades
+        # intelligibility enough that an ASR transcript no longer reflects model
+        # correctness, so only gate transcript fidelity where it stays meaningful.
+        speed = request_config.get("speed") or 1.0
+        if expected_text and _ASR_RELIABLE_SPEED_MIN <= speed <= _ASR_RELIABLE_SPEED_MAX:
             transcript = (response.audio_content or "").strip()
             print(f"audio content is: {transcript}")
             print(f"input text is: {expected_text}")
@@ -577,6 +586,8 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             assert similarity > 0.9, (
                 f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
             )
+        # The gender check below still runs at any speed (pitch is preserved),
+        # so non-silent real-audio output stays covered outside the ASR band.
         _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
 
 
