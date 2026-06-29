@@ -50,6 +50,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         stage_id: int = 1,
         model_mode: str = "ar",
         max_num_seqs: int = 2,
+        max_num_batched_tokens: int = 32768,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
     ):
@@ -82,7 +83,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             max_num_seqs=max_num_seqs,
             active_stream_window=active_stream_window,
         )
-        scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
+        scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens)
         adapter = OmniChunkTransferAdapter(
             SimpleNamespace(model_config=model_config, scheduler_config=scheduler_config)
         )

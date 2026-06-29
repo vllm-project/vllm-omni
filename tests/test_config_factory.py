@@ -1625,6 +1625,11 @@ class TestSentinelDefaultPrecedence:
         for stage in stages:
             assert stage.yaml_engine_args.get("async_chunk") is not True
 
+    def test_async_chunk_false_disables_chunked_prefill_between_stage(self):
+        stages = self._stages({"async_chunk": False})
+        for stage in stages:
+            assert stage.yaml_engine_args.get("enable_chunked_prefill_between_stage") is False
+
     def test_async_chunk_none_keeps_yaml_true(self):
         stages = self._stages({"async_chunk": None})
         for stage in stages:
@@ -1718,6 +1723,15 @@ class TestSentinelDefaultPrecedence:
             .yaml_engine_args["custom_process_next_stage_input_func"]
             .endswith("talker2code2wav_full_payload")
         )
+        for stage in sync_stages:
+            assert stage.yaml_engine_args.get("enable_chunked_prefill_between_stage") is False
+
+        chunked_stages = merge_pipeline_deploy(
+            pipeline,
+            DeployConfig(async_chunk=True, enable_chunked_prefill_between_stage=True),
+        )
+        for stage in chunked_stages:
+            assert stage.yaml_engine_args.get("enable_chunked_prefill_between_stage") is True
 
     def test_ming_flash_omni_topology(self):
         """Guard ming_flash_omni's PR3 cleanup: stage 0 has no full-payload

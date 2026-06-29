@@ -91,6 +91,8 @@ class OmniModelConfig(ModelConfig):
          hf_text_config: The sub text_config of the model's hf_config (default: None)
          stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
          async_chunk: If set to True, perform async chunk
+         enable_chunked_prefill_between_stage: If set to True, enable
+             inter-stage chunked-prefill handoff for supported models.
          model_stage: Stage type identifier, e.g., "thinker" or "talker"
              (default: "thinker")
          model_arch: Model architecture name
@@ -119,6 +121,7 @@ class OmniModelConfig(ModelConfig):
 
     stage_id: int = 0
     async_chunk: bool = False
+    enable_chunked_prefill_between_stage: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
     model_stage: str = "thinker"

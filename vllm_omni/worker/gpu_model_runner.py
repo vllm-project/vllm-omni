@@ -600,12 +600,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
                     info_dict = deserialize_additional_information(new_req_data.additional_information)
                     if info_dict:
-                        self.model_intermediate_buffer[req_id] = info_dict
-                        setattr(
-                            self.requests[req_id],
-                            "additional_information_cpu",
-                            info_dict,
-                        )
+                        self._update_intermediate_buffer(req_id, info_dict)
             except Exception as e:
                 logger.error(f"Error decoding additional information: {e}")
 

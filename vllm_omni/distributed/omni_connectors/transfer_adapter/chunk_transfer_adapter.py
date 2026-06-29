@@ -41,6 +41,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self.scheduler_max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:
@@ -60,11 +61,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
+        self.async_chunk_handle_ar_payload_func: Callable[..., bool | None] | None = None
+        self.async_chunk_cleanup_state_func: Callable[..., None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
+        custom_process_input_func = getattr(model_config, "custom_process_input_func", None)
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_next_stage_input_func = getattr(module, func_name)
+        hook_func_path = custom_process_input_func or custom_process_next_stage_input_func
+        async_chunk_enabled = bool(getattr(model_config, "async_chunk", False))
+        between_stage_chunked_prefill_enabled = bool(
+            getattr(model_config, "enable_chunked_prefill_between_stage", False)
+        )
+        if hook_func_path and async_chunk_enabled and between_stage_chunked_prefill_enabled:
+            hook_module_path, _ = hook_func_path.rsplit(".", 1)
+            hook_module = importlib.import_module(hook_module_path)
+            self._load_chunked_prefill_hooks(hook_module)
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
@@ -88,6 +101,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+
+    def _load_chunked_prefill_hooks(self, hook_module: Any) -> None:
+        hook_factory = getattr(hook_module, "hook_for_chunked_prefill", None)
+        if callable(hook_factory):
+            hook_bundle = hook_factory()
+            if isinstance(hook_bundle, dict):
+                for attr_name, hook in hook_bundle.items():
+                    setattr(self, attr_name, hook)
+                return
+
+        self.async_chunk_handle_ar_payload_func = getattr(hook_module, "async_chunk_handle_ar_payload", None)
+        self.async_chunk_cleanup_state_func = getattr(hook_module, "async_chunk_cleanup_state", None)
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -200,7 +225,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         external_req_id = self.request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
-        # Use timeout=0 for non-blocking poll
         try:
             result = self.connector.get(
                 str(target_stage_id),
@@ -223,7 +247,24 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
             if self.model_mode == "ar":
-                request.additional_information = payload_data
+                if self.async_chunk_handle_ar_payload_func is not None:
+                    early = self.async_chunk_handle_ar_payload_func(
+                        self,
+                        request,
+                        req_id,
+                        external_req_id,
+                        payload_data,
+                        meta,
+                        payload_finished,
+                    )
+                    if early is True:
+                        if payload_finished:
+                            self.finished_requests.add(req_id)
+                            request.resumable = False
+                        return True
+                else:
+                    request.additional_information = payload_data
+
                 if chunk_id > 0 and request.resumable:
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
@@ -411,6 +452,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        if self.async_chunk_cleanup_state_func is not None:
+            self.async_chunk_cleanup_state_func(self, external_req_id)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
@@ -686,8 +729,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     req_ids.add(req_id)
         return req_ids
 
-    @staticmethod
-    def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:
+    def attach_cached_additional_information(self, scheduler_output: Any, requests: dict[str, Request]) -> None:
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if not cached_reqs:
             return

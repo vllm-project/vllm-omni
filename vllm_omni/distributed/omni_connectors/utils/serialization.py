@@ -20,6 +20,11 @@ _PIL_IMAGE_MARKER = "__pil_image__"
 # Keys that identify a RequestOutput dict (for reconstruction)
 _REQUEST_OUTPUT_KEYS = frozenset({"request_id", "prompt", "prompt_token_ids", "outputs", "finished"})
 
+# Primitive types that never need recursive _post_process handling.
+# Used to short-circuit the recursive walk for plain data collections
+# (e.g. lists of token IDs) and avoid O(N²) Python-call overhead.
+_PRIMITIVE_TYPES = (int, float, bool, str, bytes, type(None))
+
 # Keys that identify a CompletionOutput dict (for reconstruction)
 _COMPLETION_OUTPUT_KEYS = frozenset({"index", "text", "token_ids", "finish_reason"})
 
@@ -202,6 +207,14 @@ class OmniMsgpackDecoder:
             if obj.get(_PIL_IMAGE_MARKER):
                 return self._decode_pil_image(obj)
 
+            # Fast path: if every value is a primitive, no recursive processing
+            # is needed and no type-marker reconstruction can apply. This avoids
+            # O(N) Python-call overhead for plain metadata dicts.
+            if not (_REQUEST_OUTPUT_KEYS.issubset(obj) or _COMPLETION_OUTPUT_KEYS.issubset(obj)) and all(
+                isinstance(v, _PRIMITIVE_TYPES) for v in obj.values()
+            ):
+                return obj
+
             # Process values recursively first
             processed = {k: self._post_process(v) for k, v in obj.items()}
 
@@ -221,9 +234,17 @@ class OmniMsgpackDecoder:
             return processed
 
         if isinstance(obj, list):
+            # Fast path: if no element is a dict/list/tuple there is nothing to
+            # transform – return the list as-is.  This turns the O(N) per-step
+            # cost of walking token-ID lists (which grow with every decode step)
+            # from N Python function calls into a single C-level scan.
+            if not obj or not any(isinstance(item, (dict, list, tuple)) for item in obj):
+                return obj
             return [self._post_process(item) for item in obj]
 
         if isinstance(obj, tuple):
+            if not obj or not any(isinstance(item, (dict, list, tuple)) for item in obj):
+                return obj
             return tuple(self._post_process(item) for item in obj)
 
         return obj

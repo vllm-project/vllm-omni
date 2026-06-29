@@ -61,6 +61,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
     stream_finished: torch.Tensor
+    thinker_finished: bool
+    is_final_prefill_chunk: bool
     req_id: list[str]
     left_context_size: int
     right_holdback_size: int
@@ -150,6 +152,8 @@ class MetaStruct(_StructBase):
     finished: torch.Tensor | None = None
     is_segment_finished: torch.Tensor | None = None
     stream_finished: torch.Tensor | None = None
+    thinker_finished: bool | None = None
+    is_final_prefill_chunk: bool | None = None
     req_id: list[str] | None = None
     left_context_size: int | None = None
     right_holdback_size: int | None = None

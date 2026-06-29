@@ -934,7 +934,11 @@ def _build_common_stage_config_kwargs(
     engine: _StageEngineValues,
     parallel_config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
 ) -> tuple[dict[str, Any], str | None, str | None]:
-    input_proc, next_stage_proc = _select_processor_funcs(topology, bool(deploy.async_chunk))
+    input_proc, next_stage_proc = _select_processor_funcs(
+        topology,
+        bool(deploy.async_chunk),
+        bool(deploy.enable_chunked_prefill_between_stage),
+    )
     quantization_config = _build_quantization_config(deploy, engine.quantization)
     parallel_config = _build_parallel_config(deploy, engine.parallel, parallel_config_cls)
 

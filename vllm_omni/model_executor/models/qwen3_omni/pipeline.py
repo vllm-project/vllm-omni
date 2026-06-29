@@ -35,6 +35,7 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             custom_process_next_stage_input_func=(f"{_PROC}.thinker2talker_full_payload"),
             async_chunk_process_next_stage_input_func=(f"{_PROC}.thinker2talker_async_chunk"),
+            async_chunk_prefill_next_stage_input_func=(f"{_PROC}.thinker2talker_async_chunk_chunked_prefill"),
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
