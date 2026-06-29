@@ -84,7 +84,7 @@ def test_pipeline_initializes_local_policy():
 def test_forward_returns_dict_actions_in_output():
     pipeline = _pipeline()
     req = OmniDiffusionRequest(
-        prompts=["pick"],
+        prompt="pick",
         request_id="req",
         sampling_params=OmniDiffusionSamplingParams(
             extra_args={
@@ -118,7 +118,7 @@ def test_forward_returns_dict_actions_in_output():
 def test_dummy_warmup_returns_shape_correct_zero_actions():
     pipeline = _pipeline()
     req = OmniDiffusionRequest(
-        prompts=["dummy run"],
+        prompt="dummy run",
         request_id="dummy_req_id",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
     )

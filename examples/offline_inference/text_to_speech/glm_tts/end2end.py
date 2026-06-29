@@ -101,7 +101,7 @@ def _extract_sample_rate(audio_mm: dict) -> int:
 def _modify_deploy_config(base_path: str, async_chunk: bool) -> str:
     """Build deploy config with explicit sync/async mode and eager execution.
 
-    Mirrors the logic in ``tests/e2e/offline_inference/test_glm_tts.py``
+    Mirrors the logic in ``tests/e2e/offline_inference/test_glm_tts_expansion.py``
     (``_get_deploy_config``) so that example runs match CI behavior.
     """
     with open(base_path) as f:

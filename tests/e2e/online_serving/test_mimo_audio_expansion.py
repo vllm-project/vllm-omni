@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E Online tests for MiMo-Audio model with audio/text input and audio output.
+E2E expansion tests for MiMo-Audio online serving (nightly Omni · Function Test with H100).
 """
 
 import os
@@ -16,6 +16,8 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+
+pytestmark = [pytest.mark.slow, pytest.mark.omni]
 
 MIMO_AUDIO_TOKENIZER_REPO = "XiaomiMiMo/MiMo-Audio-Tokenizer"
 CHAT_TEMPLATE_PATH = str(
@@ -39,16 +41,11 @@ def download_tokenizer():
     return local_path
 
 
-# Guard module-level setup so test collection doesn't fail in environments
-# where the model cache is read-only or models aren't available.
 try:
     stage_configs = [get_deploy_config_path("mimo_audio.yaml")]
     tokenizer_path = download_tokenizer()
     os.environ["MIMO_AUDIO_TOKENIZER_PATH"] = tokenizer_path
 
-    # --load-format dummy applies to every stage pipeline-wide, avoiding a
-    # per-stage yaml rewrite (the old approach wrote a tempfile + atexit-unlink
-    # which raced with CI's process lifecycle).
     test_params = [
         OmniServerParams(
             model=model,
@@ -60,7 +57,7 @@ try:
     ]
 except Exception as exc:
     pytest.skip(
-        f"MiMo-Audio online serving tests skipped: module setup failed ({type(exc).__name__}: {exc})",
+        f"MiMo-Audio expansion tests skipped: module setup failed ({type(exc).__name__}: {exc})",
         allow_module_level=True,
     )
 
@@ -78,45 +75,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.skip(reason="CI failed 8571")
-def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
-    """
-    Test audio and text input processing and text/audio output generation via OpenAI API.
-    Deploy Setting: default yaml
-    Input Modal: text + audio
-    Output Modal: text + audio
-    Input Setting: stream=True
-    Datasets: single request
-    """
-
-    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1, sample_rate=24000)['base64']}"
-    messages = dummy_messages_from_mix_data(
-        audio_data_url=audio_data_url,
-        content_text=get_prompt("audio"),
-    )
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "sampling_params_list": [{"max_tokens": 64}, {"max_tokens": 64}],
-        "key_words": {
-            "audio": ["test"],
-        },
-    }
-
-    # Test single completion
-    openai_client.send_omni_request(request_config)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
@@ -137,3 +96,34 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.skip(reason="CI failed 8571")
+def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
+    """
+    Test audio and text input processing and text/audio output generation via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text + audio
+    Output Modal: text + audio
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1, sample_rate=24000)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        audio_data_url=audio_data_url,
+        content_text=get_prompt("audio"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "sampling_params_list": [{"max_tokens": 64}, {"max_tokens": 64}],
+        "key_words": {
+            "audio": ["test"],
+        },
+    }
+
+    openai_client.send_omni_request(request_config)

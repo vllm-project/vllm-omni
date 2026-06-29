@@ -31,7 +31,6 @@ uv pip install -e .
 
 For additional installation methods — please see the [installation guide](installation/README.md).
 
-
 !!! note
     It is important to install the same major & minor version of vLLM and vLLM Omni, otherwise things may not work as expected. If the versions are misaligned, you will see a warning when you import vLLM Omni.
 
@@ -52,14 +51,14 @@ if __name__ == "__main__":
     images[0].save("coffee.png")
 ```
 
-You can pass a list of prompts and wait for them to process altogether, shown below.
+You can pass a list of prompts and wait for the independent requests to finish,
+as shown below.
 
 !!! info
 
-    However, it is not currently recommended to do so
-    because not all models support batch inference,
-    and batch requesting mostly does not provide significant performance improvement (despite the impression that it does).
-    This feature is primarily for the sake of interface compatibility with vLLM and to allow for future improvements.
+    For diffusion pipelines, each prompt becomes a separate logical request.
+    The runtime may automatically batch compatible in-flight requests through
+    the scheduler and runner.
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -88,9 +87,9 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].engine_args.max_num_seqs` is 1 by default, and the input
-    list is sliced into single-item requests before feeding into the diffusion pipeline. For models that do internally support
-    batched inputs, you can [modify this configuration](../configuration/stage_configs.md) to let the model accept a longer batch of prompts.
+    For diffusion request-level batching controls such as `max_num_seqs` and
+    `request_batch_max_wait_ms`, see
+    [Request-Level Batching](../user_guide/diffusion/request_batching.md).
 
 For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 

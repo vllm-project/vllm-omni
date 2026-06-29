@@ -17,6 +17,7 @@ import soundfile as sf
 from PIL import Image
 
 from tests.helpers.media import (
+    convert_audio_bytes_to_text,
     cosine_similarity_text,
 )
 
@@ -374,8 +375,15 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         return "unknown"
 
 
-def _assert_preset_voice_gender_from_audio(audio_bytes: bytes | None, voice_name: str | None) -> None:
+def _assert_preset_voice_gender_from_audio(
+    audio_bytes: bytes | None,
+    voice_name: str | None,
+    *,
+    response_format: str | None = None,
+) -> None:
     """If ``voice_name`` matches a known preset, assert classifier gender matches (skip when unknown)."""
+    if response_format == "pcm":
+        return
     if not voice_name or not audio_bytes:
         return
     key = str(voice_name).lower()
@@ -432,6 +440,61 @@ def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PC
     )
 
 
+def _response_has_audio_output(response: Any) -> bool:
+    if response.audio_bytes:
+        return len(response.audio_bytes) > 0
+    if isinstance(getattr(response, "audio_content", None), str) and response.audio_content.strip():
+        return True
+    audio_data = getattr(response, "audio_data", None)
+    return bool(audio_data)
+
+
+def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str) -> bool:
+    if run_level not in {"advanced_model", "full_model"}:
+        return False
+    modalities = request_config.get("modalities", ["text", "audio"])
+    if "audio" not in modalities:
+        return False
+    keywords_dict = request_config.get("key_words", {}) or {}
+    if keywords_dict.get("audio") and "text" not in modalities:
+        return True
+    if request_config.get("audio_ref_text"):
+        return True
+    return "text" in modalities
+
+
+def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str) -> bool:
+    if run_level not in {"advanced_model", "full_model"}:
+        return False
+    if request_config.get("response_format") == "pcm":
+        return False
+    return bool(request_config.get("input"))
+
+
+def _resolve_audio_transcript(
+    response: Any,
+    request_config: dict[str, Any],
+    run_level: str,
+    *,
+    speech_api: bool,
+) -> str | None:
+    """Run Whisper only when this run_level / request_config needs a transcript for assertions."""
+    needs = (
+        _speech_assertion_needs_audio_transcript(request_config, run_level)
+        if speech_api
+        else _omni_assertion_needs_audio_transcript(request_config, run_level)
+    )
+    if not needs:
+        return None
+    existing = getattr(response, "audio_content", None)
+    if isinstance(existing, str) and existing.strip():
+        return existing
+    audio_bytes = getattr(response, "audio_bytes", None)
+    if not audio_bytes:
+        return None
+    return convert_audio_bytes_to_text(audio_bytes)
+
+
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
     """
     Validate response results.
@@ -447,15 +510,18 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
     modalities = request_config.get("modalities", ["text", "audio"])
 
     if run_level in {"advanced_model", "full_model"}:
+        transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=False)
         # Verify output success
         if "audio" in modalities:
-            assert response.audio_content is not None, "No audio output is generated"
-            print(f"audio content is: {response.audio_content}")
+            assert _response_has_audio_output(response), "No audio output is generated"
+            if transcript is not None:
+                print(f"audio content is: {transcript}")
             speaker = request_config.get("speaker")
             if speaker:
                 _assert_preset_voice_gender_from_audio(
                     response.audio_bytes,
                     speaker,
+                    response_format=request_config.get("response_format"),
                 )
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
@@ -474,7 +540,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     )
             else:
                 if keywords:
-                    audio_lower = response.audio_content.lower()
+                    assert transcript is not None, "No audio transcript for keyword validation"
+                    audio_lower = transcript.lower()
                     assert any(str(kw).lower() in audio_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
@@ -484,7 +551,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
             audio_ref_text = request_config.get("audio_ref_text")
             similarity_threshold = request_config.get("similarity_threshold", 0.8)
             if "text" in modalities:
-                transcript = (response.audio_content or "").strip()
+                assert transcript is not None, "No audio transcript for similarity validation"
                 text_output = (response.text_content or "").strip()
                 # For very short outputs (e.g. one-word answers), n-gram cosine
                 # similarity with length penalty is unreliable because Whisper
@@ -513,8 +580,9 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     print(f"similarity is: {similarity}")
                     assert similarity > similarity_threshold, "The audio content is not same as the text"
             if audio_ref_text:
+                assert transcript is not None, "No audio transcript for reference-text validation"
                 audio_similarity = cosine_similarity_text(
-                    response.audio_content.lower(),
+                    transcript.strip().lower(),
                     str(audio_ref_text).lower(),
                 )
                 assert audio_similarity > similarity_threshold, (
@@ -557,8 +625,6 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
     req_fmt = request_config.get("response_format")
     if req_fmt == "pcm" and response.audio_bytes:
-        min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
-        _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
         if response.audio_format:
             assert "pcm" in response.audio_format.lower(), (
                 f"Expected audio/pcm content-type, got {response.audio_format!r}"
@@ -566,18 +632,27 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
 
-    if run_level in {"advanced_model", "full_model"} and req_fmt != "pcm":
-        expected_text = request_config.get("input")
-        if expected_text:
-            transcript = (response.audio_content or "").strip()
-            print(f"audio content is: {transcript}")
-            print(f"input text is: {expected_text}")
-            similarity = cosine_similarity_text(transcript.lower(), expected_text.lower())
-            print(f"Cosine similarity: {similarity:.3f}")
-            assert similarity > 0.9, (
-                f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
-            )
-        _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
+    if run_level in {"advanced_model", "full_model"}:
+        if req_fmt == "pcm" and response.audio_bytes:
+            min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
+            _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
+
+        transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
+        if transcript is not None:
+            expected_text = request_config.get("input")
+            if expected_text:
+                print(f"audio content is: {transcript}")
+                print(f"input text is: {expected_text}")
+                similarity = cosine_similarity_text(transcript.strip().lower(), str(expected_text).lower())
+                print(f"Cosine similarity: {similarity:.3f}")
+                assert similarity > 0.9, (
+                    f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
+                )
+        _assert_preset_voice_gender_from_audio(
+            response.audio_bytes,
+            request_config.get("voice"),
+            response_format=request_config.get("response_format"),
+        )
 
 
 def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):

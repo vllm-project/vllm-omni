@@ -500,25 +500,6 @@ def _build_talker_inputs(
     return talker_inputs
 
 
-def thinker2talker(
-    source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    _requires_multimodal_data: bool = False,
-    _streaming_context: Any | None = None,
-) -> list[OmniTokensPrompt]:
-    """Build talker stage inputs from thinker stage outputs."""
-    return _build_talker_inputs(source_outputs, prompt)
-
-
-# ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` or
-# ``_FULL_PAYLOAD_INPUT_STAGES``, so the worker connector is not
-# initialised for this arch and the consumer never waits on a connector
-# payload.  Data flows through ``additional_information`` written by
-# ``thinker2talker_token_only`` (wired as ``sync_process_input_func``
-# in the pipeline) or ``thinker2talker`` (wired as
-# ``custom_process_input_func``).
-
-
 def thinker2talker_token_only(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
@@ -531,29 +512,9 @@ def thinker2talker_token_only(
 thinker2talker_token_only._is_sync_input = True
 
 
-def thinker2talker_full_payload(
-    transfer_manager,
-    pooling_output,
-    request,
-):
-    """Producer-side payload builder — no-op.
-
-    ming_flash_omni's thinker emits no heavy tensor to ship via the
-    worker connector (the bridge passes text only, and speaker metadata
-    arrives through the USER request's additional_information).
-    ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` so this
-    function is never invoked at runtime; it is retained for forward
-    compatibility with the connector path.
-    """
-    del transfer_manager, pooling_output, request
-    return None
-
-
 __all__ = [
     "CFG_TEXT_SUFFIX",
     "expand_cfg_prompts",
     "thinker2imagegen",
-    "thinker2talker",
-    "thinker2talker_full_payload",
     "thinker2talker_token_only",
 ]

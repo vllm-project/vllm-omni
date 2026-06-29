@@ -37,7 +37,7 @@ steps:
         if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--e2e"
         fi
-        python3 .buildkite/scripts/upload_pipeline.py --upload $EXTRA .buildkite/test-ready.yml
+        python3 .buildkite/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/test-ready.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -52,7 +52,7 @@ steps:
         if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--e2e"
         fi
-        python3 .buildkite/scripts/upload_pipeline.py --upload $EXTRA .buildkite/test-merge.yml
+        python3 .buildkite/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
