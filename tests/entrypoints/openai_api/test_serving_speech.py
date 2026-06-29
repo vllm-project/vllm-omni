@@ -2535,6 +2535,61 @@ def test_api_server_create_speech_batch_without_handler_returns_404(mocker: Mock
     )
 
 
+def test_api_server_create_speech_batch_omits_null_fields(mocker: MockerFixture):
+    # The batch response must omit optional null fields rather than serialize them
+    # as null (issue #4646 follow-up): errored items drop usage/audio_data/media_type,
+    # successful items drop error. This is the shape documented in speech_api.md.
+    from vllm_omni.entrypoints.openai.protocol.audio import (
+        BatchSpeechResponse,
+        SpeechBatchItemResult,
+        SpeechInputTokenDetails,
+        SpeechTokenUsage,
+    )
+
+    handler = mocker.MagicMock()
+    handler.create_speech_batch = mocker.AsyncMock(
+        return_value=BatchSpeechResponse(
+            id="speech-batch-test",
+            results=[
+                SpeechBatchItemResult(
+                    index=0,
+                    status="success",
+                    audio_data="YWJj",
+                    media_type="audio/wav",
+                    usage=SpeechTokenUsage(
+                        input_tokens=119,
+                        output_tokens=77,
+                        total_tokens=196,
+                        input_token_details=SpeechInputTokenDetails(text_tokens=18, audio_tokens=101),
+                    ),
+                ),
+                SpeechBatchItemResult(index=1, status="error", error="Input text cannot be empty"),
+            ],
+            total=2,
+            succeeded=1,
+            failed=1,
+        )
+    )
+    raw_request = _make_api_server_request(handler, path="/v1/audio/speech/batch")
+    request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi"), SpeechBatchItem(input="")])
+
+    response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    success, errored = body["results"][0], body["results"][1]
+    # Successful item carries usage and drops the null `error`.
+    assert success["usage"]["total_tokens"] == 196
+    assert success["usage"]["input_token_details"] == {"text_tokens": 18, "audio_tokens": 101}
+    assert "error" not in success
+    # Errored item drops usage/audio_data/media_type instead of serializing null.
+    assert "usage" not in errored
+    assert "audio_data" not in errored
+    assert "media_type" not in errored
+    assert errored["error"] == "Input text cannot be empty"
+
+
 def test_api_server_create_audio_generate_without_handler_returns_404(mocker: MockerFixture):
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/generate")

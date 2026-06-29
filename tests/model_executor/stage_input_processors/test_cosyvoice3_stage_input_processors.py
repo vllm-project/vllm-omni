@@ -91,7 +91,11 @@ def test_text2flow_token_only_strips_reference_speech_prefix_from_cumulative_ids
     assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
 
 
-def test_text2flow_token_only_marks_prompt_trim_for_stop_token_completion():
+def test_text2flow_token_only_does_not_mark_prompt_trim():
+    # The talker prompt is wrapped with the CosyVoice3 instruction template in
+    # _build_cosyvoice3_prompt, so the talker emits target-only speech and no
+    # prompt-trim offset is required; the flow stage trims prompt_feat itself
+    # (issue #4644). Confirm no talker_prefill_offset is set.
     source_outputs = [
         _source_output(
             "req-stop",
@@ -104,7 +108,8 @@ def test_text2flow_token_only_marks_prompt_trim_for_stop_token_completion():
     outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
 
     assert outputs[0]["prompt_token_ids"] == [1, 2, 6562]
-    assert outputs[0]["additional_information"]["meta"]["talker_prefill_offset"] == 2
+    meta = outputs[0]["additional_information"].get("meta") or {}
+    assert "talker_prefill_offset" not in meta
 
 
 def test_text2flow_full_payload_does_not_send_codec_ids():
