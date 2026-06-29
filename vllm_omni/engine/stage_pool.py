@@ -949,15 +949,17 @@ class StagePool:
             params = OmniDiffusionSamplingParams()
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
+            if isinstance(request, list):
+                raise ValueError(
+                    "Diffusion list-prompt batch requests are no longer supported. "
+                    "Submit multiple independent requests to use scheduler batching."
+                )
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
             client = self._diffusion_client(replica_id)
-            if isinstance(request, list):
-                await client.add_batch_request_async(request_id, request, params, **submit_kwargs)
-            else:
-                await client.add_request_async(request_id, request, params, **submit_kwargs)
+            await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
         replica_id = await self._pick_or_select(
@@ -1018,6 +1020,11 @@ class StagePool:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
+            if isinstance(request, list):
+                raise ValueError(
+                    "Diffusion list-prompt batch requests are no longer supported. "
+                    "Submit multiple independent requests to use scheduler batching."
+                )
             await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
         else:
             # Refresh the shared output-processor state before yielding to the

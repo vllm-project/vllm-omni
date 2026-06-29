@@ -272,6 +272,7 @@ markers = [
     "skipif_npu: Skip if the num of NPU cards is less than the required",
     "skipif_musa: Skip if the num of MUSA cards is less than the required",
     # more detailed markers
+    "sp: Sequence parallelism tests (multi-GPU)",
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
 ]

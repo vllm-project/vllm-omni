@@ -1236,6 +1236,31 @@ class Orchestrator:
                     src_stage_id,
                     next_logical,
                 )
+                if diffusion_prompt is None:
+                    error_output = OmniRequestOutput.from_error(
+                        req_id,
+                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
+                    )
+                    logger.warning(
+                        "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                        "routing terminal error output",
+                        req_id,
+                        src_stage_id,
+                        next_logical,
+                    )
+                    await self.output_async_queue.put(
+                        OutputMessage(
+                            request_id=req_id,
+                            stage_id=next_logical,
+                            engine_outputs=error_output,
+                            metrics=None,
+                            finished=True,
+                        )
+                    )
+                    await self._cleanup_request_ids(
+                        [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                    )
+                    return
                 if isinstance(diffusion_prompt, list):
                     if not diffusion_prompt:
                         error_output = OmniRequestOutput.from_error(
