@@ -24,7 +24,6 @@ from vllm_omni.engine.output_modality import (
     TensorAccumulationStrategy,
     get_accumulation_strategy,
 )
-from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
@@ -251,7 +250,7 @@ class OmniRequestState(RequestState):
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: Any = None,
-    ) -> OmniRequestOutput | PoolingRequestOutput | None:
+    ) -> RequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
         Creates a RequestOutput or PoolingRequestOutput from the generated
@@ -268,7 +267,7 @@ class OmniRequestState(RequestState):
                 attached to the completion output for generation stages
 
         Returns:
-            OmniRequestOutput or PoolingRequestOutput if output should be
+            RequestOutput or PoolingRequestOutput if output should be
             emitted (based on finish status and output kind), None otherwise
         """
         # Pooling-only requests should follow base behavior.

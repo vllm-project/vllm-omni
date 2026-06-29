@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from typing import Any
 
 import msgspec
@@ -11,6 +11,8 @@ import torch
 from msgspec import msgpack
 from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
+
+from vllm_omni.engine.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"
@@ -161,15 +163,20 @@ class OmniMsgpackEncoder:
         return result
 
     def _encode_completion_output(self, obj: CompletionOutput) -> dict[str, Any]:
-        """Encode CompletionOutput to dict, preserving multimodal payloads."""
-        result = asdict(obj)
+        """Encode CompletionOutput to dict, preserving multimodal payloads.
+
+        Build from CompletionOutput's base fields explicitly (avoid asdict()
+        deep-copying tensors). MultimodalPayload is written in its native
+        ``{tensors, metadata}`` shape so this matches what msgspec produces
+        when encoding a MultimodalCompletionOutput dataclass directly.
+        """
+        result = {f.name: getattr(obj, f.name) for f in fields(CompletionOutput)}
         mm_output = getattr(obj, "multimodal_output", None)
         if mm_output is not None:
-            # Convert MultimodalPayload to plain dict for wire format
-            if isinstance(mm_output, Mapping):
-                result["multimodal_output"] = dict(mm_output)
-            else:
-                result["multimodal_output"] = mm_output
+            if not isinstance(mm_output, MultimodalPayload):
+                # Legacy plain dict: normalize through MultimodalPayload.
+                mm_output = MultimodalPayload.from_dict(mm_output) or MultimodalPayload()
+            result["multimodal_output"] = {"tensors": mm_output.tensors, "metadata": mm_output.metadata}
         return result
 
 
@@ -300,12 +307,27 @@ class OmniMsgpackDecoder:
         return Image.fromarray(arr, mode=mode)
 
     def _decode_completion_output(self, obj: dict[str, Any]) -> CompletionOutput:
-        """Decode dict to CompletionOutput using msgspec.convert."""
+        """Decode dict to CompletionOutput, promoting to MultimodalCompletionOutput
+        when a multimodal payload is present."""
         mm_output = obj.pop("multimodal_output", None)
-        co = msgspec.convert(obj, CompletionOutput)
-        if mm_output is not None:
-            setattr(co, "multimodal_output", mm_output)
-        return co
+        if mm_output is None:
+            return msgspec.convert(obj, CompletionOutput)
+        if not isinstance(mm_output, MultimodalPayload):
+            # Wire format is the native MultimodalPayload shape
+            # ``{tensors, metadata}``; fall back to flat dict reconstruction
+            # for any legacy producer that wrote a plain dict.
+            if isinstance(mm_output, dict) and set(mm_output.keys()) <= {"tensors", "metadata"}:
+                mm_output = MultimodalPayload(
+                    tensors=mm_output.get("tensors") or {},
+                    metadata=mm_output.get("metadata") or {},
+                )
+            else:
+                mm_output = MultimodalPayload.from_dict(mm_output) or MultimodalPayload()
+        base = msgspec.convert(obj, CompletionOutput)
+        return MultimodalCompletionOutput(
+            **{f.name: getattr(base, f.name) for f in fields(CompletionOutput)},
+            multimodal_output=mm_output,
+        )
 
     def _decode_request_output(self, obj: dict[str, Any]) -> RequestOutput:
         """Decode dict to RequestOutput.
