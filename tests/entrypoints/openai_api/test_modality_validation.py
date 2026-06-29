@@ -12,7 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
