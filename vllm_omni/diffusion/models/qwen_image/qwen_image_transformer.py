@@ -26,6 +26,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.quantization.component_config import safe_quant_config
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
@@ -47,15 +49,6 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
-
-
-def _resolve_txt_mod_quant_config(
-    quant_config: QuantizationConfig | None,
-) -> QuantizationConfig | None:
-    get_name = getattr(quant_config, "get_name", None)
-    if callable(get_name) and get_name() == "inc":
-        return quant_config
-    return None
 
 
 def _normalize_qwen_image_weight_name(name: str) -> str:
@@ -738,7 +731,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
-        txt_mod_quant_config = _resolve_txt_mod_quant_config(quant_config)
+        txt_mod_quant_config = safe_quant_config(quant_config)
 
         # Image processing modules.
         # The re-quantized W4A16 checkpoint keeps img_mod.1 in full precision.
