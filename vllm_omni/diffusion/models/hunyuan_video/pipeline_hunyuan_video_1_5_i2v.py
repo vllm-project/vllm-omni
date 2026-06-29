@@ -63,10 +63,10 @@ def get_hunyuan_video_15_i2v_pre_process_func(od_config: OmniDiffusionConfig):
     divisor = 16  # Must be divisible by VAE spatial compression
 
     def pre_process_func(req: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        if not req.prompts:
+        if not req.prompt:
             return req
 
-        prompt_data = req.prompts[0]
+        prompt_data = req.prompt
         if isinstance(prompt_data, str):
             return req
 

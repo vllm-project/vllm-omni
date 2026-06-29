@@ -372,15 +372,13 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         action_mode = _request_action_mode(request)
+        prompt = request.prompt
         if is_guardrails_enabled(od_config, request.sampling_params):
-            prompt = request.prompt
             text = prompt if isinstance(prompt, str) else prompt.get("prompt", "")
             check_text_safety(text)
 
-        prompt = request.prompt
         if isinstance(prompt, str):
             return request
-
         multi_modal_data = prompt.get("multi_modal_data", {}) or {}
         raw_image = multi_modal_data.get("image")
         raw_video = multi_modal_data.get("video")
@@ -481,6 +479,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                 int(target_h),
                 int(target_w),
             )
+        request.prompt = prompt
 
         return request
 
@@ -2835,7 +2834,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         # --- Parse request ---
         prompt_data = req.prompts[0] if req.prompts else ""
-        if isinstance(prompt_data, list):
+        if len(req.prompts) > 1:
             raise ValueError("Cosmos3OmniDiffusersPipeline currently supports a single prompt per request.")
 
         sp = req.sampling_params

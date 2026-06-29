@@ -90,48 +90,47 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
         if "additional_information" not in prompt:
             prompt["additional_information"] = {}
 
-        if raw_image is not None:
-            if not isinstance(raw_image, list):
-                raw_image = [raw_image]
-            images = [
-                PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
-                for im in raw_image
-            ]
+        if raw_image is None:
+            # Text-to-image mode, no preprocessing needed
+            return request
 
-            preprocessed = []
-            height, width = None, None
+        if not isinstance(raw_image, list):
+            raw_image = [raw_image]
+        images = [
+            PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
+            for im in raw_image
+        ]
 
-            for img in images:
-                if isinstance(img, PIL.Image.Image):
-                    img_h, img_w = img.size[::-1]  # PIL is (width, height)
-                else:
-                    img_h, img_w = img.shape[:2]
+        preprocessed = []
+        height, width = None, None
 
-                # Align to multiple of vae_scale_factor * patch_size
-                multiple_of = vae_scale_factor * patch_size
-                img_h = (img_h // multiple_of) * multiple_of
-                img_w = (img_w // multiple_of) * multiple_of
+        for img in images:
+            if isinstance(img, PIL.Image.Image):
+                img_h, img_w = img.size[::-1]  # PIL is (width, height)
+            else:
+                img_h, img_w = img.shape[:2]
 
-                processed = image_processor.preprocess(img, height=img_h, width=img_w)
-                preprocessed.append(processed)
+            # Align to multiple of vae_scale_factor * patch_size
+            multiple_of = vae_scale_factor * patch_size
+            img_h = (img_h // multiple_of) * multiple_of
+            img_w = (img_w // multiple_of) * multiple_of
 
-                # Use first image dimensions as default
-                if height is None:
-                    height, width = img_h, img_w
+            processed = image_processor.preprocess(img, height=img_h, width=img_w)
+            preprocessed.append(processed)
 
-            # Store in request
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt, additional_information={})
-            elif "additional_information" not in prompt:
-                prompt["additional_information"] = {}
-            prompt["additional_information"]["preprocessed_image"] = processed  # type: ignore
-            prompt["additional_information"]["prompt_image"] = images  # type: ignore
-            if request.sampling_params.height is None:
-                request.sampling_params.height = height
-            if request.sampling_params.width is None:
-                request.sampling_params.width = width
+            # Use first image dimensions as default
+            if height is None:
+                height, width = img_h, img_w
 
+        # Store in request
+        prompt["additional_information"]["preprocessed_image"] = processed  # type: ignore
+        prompt["additional_information"]["prompt_image"] = images  # type: ignore
         request.prompt = prompt
+        if request.sampling_params.height is None:
+            request.sampling_params.height = height
+        if request.sampling_params.width is None:
+            request.sampling_params.width = width
+
         return request
 
     return pre_process_func

@@ -246,6 +246,18 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
 
 
 def make_request_batch(prompt: Any, sampling_params: SimpleNamespace) -> DiffusionRequestBatch:
+    if isinstance(prompt, list):
+        return DiffusionRequestBatch(
+            requests=[
+                SimpleNamespace(
+                    prompt=item,
+                    request_id=f"cosmos3-test-{idx}",
+                    sampling_params=sampling_params,
+                    kv_sender_info=None,
+                )
+                for idx, item in enumerate(prompt)
+            ]
+        )
     return DiffusionRequestBatch(
         requests=[
             SimpleNamespace(
