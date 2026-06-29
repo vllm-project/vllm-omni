@@ -710,6 +710,11 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable AR stage profiler to include AR stage timing in stage_durations.",
         )
+        omni_config_group.add_argument(
+            "--enable-orch-monitor",
+            action="store_true",
+            help="Enable orchestrator window monitor and write a JSON log at shutdown.",
+        )
 
         # Supplementary auxiliary text encoder parameters
         # (e.g., the meta llama/meta llama-3.1-8b-instrument used by hidream)
