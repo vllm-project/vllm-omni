@@ -90,7 +90,7 @@ Returns binary audio data with the appropriate `Content-Type` header:
 | `mp3` | `audio/mpeg` |
 | `flac` | `audio/flac` |
 | `pcm` | `audio/pcm` |
-| `opus` | `audio/ogg` |
+| `opus` | `audio/opus` |
 
 ## Examples
 
