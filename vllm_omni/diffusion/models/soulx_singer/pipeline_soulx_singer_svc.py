@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.soulx_singer.utils import (
     validate_soulx_extra_args,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -58,7 +59,7 @@ def get_soulxsinger_svc_pre_process_func(od_config: OmniDiffusionConfig):
         # Inline build: when no warmup/no precomputed paths/no IPC payload,
         # build the preprocess payload directly from audio file paths.
         if not (is_warmup_request(request) or has_precomputed(extra_args, "svc")):
-            prompt = request.prompts[0]
+            prompt = request.prompt
             if not isinstance(prompt, str) and not get_soulx_preprocessed_payload(prompt):  # type: ignore[arg-type]
                 prompt_audio, target_audio = resolve_preprocess_audio(prompt, extra_args)  # type: ignore[arg-type]
                 if prompt_audio is not None and target_audio is not None:
@@ -395,7 +396,7 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
         return generated_audio.unsqueeze(0), pitch_shift
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         return self._forward_batch_from_request(
             req,
             kind="svc",

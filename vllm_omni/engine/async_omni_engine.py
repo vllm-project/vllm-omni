@@ -1003,6 +1003,7 @@ class AsyncOmniEngine:
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
+            "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
             "cache_backend": cache_backend,

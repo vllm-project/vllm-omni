@@ -270,15 +270,16 @@ class AsyncOmni(EngineClient, OmniBase):
         through all stages in the pipeline and yields outputs as they become
         available.
 
-        **Batch mode (diffusion only):**
-        When *prompt* is a ``list``, all prompts are dispatched in a single
-        ``DiffusionEngine.step()`` call at the diffusion stage.  The combined
-        result is yielded as one ``OmniRequestOutput`` with all generated
-        images.  Only a single *request_id* is used for the whole batch.
+        **Diffusion batching:**
+        Diffusion stages accept only a single prompt per request.  Passing a
+        ``list`` of prompts to a diffusion stage will raise ``ValueError``.
+        To batch multiple diffusion prompts, submit each as an independent
+        request; the scheduler will automatically co-batch compatible requests.
 
         Args:
-            prompt: A single prompt **or** a list of prompts.  A list
-                triggers batch mode when the diffusion stage is reached.
+            prompt: A single prompt **or** a list of prompts.  For diffusion
+                stages, only a single prompt is accepted; a list will be
+                rejected with an error.
             request_id: Unique identifier for this request. If one is not provided,
                 a random one will be generated.
             sampling_params_list: List of SamplingParams, one per stage.
@@ -288,11 +289,10 @@ class AsyncOmni(EngineClient, OmniBase):
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
-            In batch mode the diffusion stage yields one output containing
-            all generated images.
 
         Raises:
-            ValueError: If sampling_params_list has incorrect length.
+            ValueError: If sampling_params_list has incorrect length, or
+                if a list prompt is submitted to a diffusion stage.
         """
         # Append a random UUID suffix to the request_id to ensure it is unique
         # and non-empty, similar to vLLM's input processor. The suffix is used
@@ -305,6 +305,15 @@ class AsyncOmni(EngineClient, OmniBase):
             await self._pause_cond.wait_for(lambda: not self._paused)
 
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
+
+        # Reject diffusion list-prompt early with a clear API error.
+        if isinstance(prompt, list) and any(
+            getattr(client, "stage_type", "") == "diffusion" for client in getattr(self.engine, "stage_clients", [])
+        ):
+            raise ValueError(
+                "Diffusion stages accept only a single prompt per request. "
+                "Submit multiple independent requests to use scheduler batching."
+            )
 
         input_stream_task: asyncio.Task | None = None
         try:
