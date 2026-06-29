@@ -23,6 +23,7 @@ from PIL import Image
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.distributed.utils import build_local_sp_padding_mask
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -412,3 +413,85 @@ def test_sp_correctness_advanced(model_name: str):
             f"{baseline_str:<12} {r['sp_ms']:.0f}ms{'':<7} {speedup_str:<10} {status}"
         )
     print("=" * 70)
+
+
+@pytest.mark.skipif(
+    not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
+    reason="Only tested on CUDA and XPU",
+)
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.core_model
+def test_local_sp_padding_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A partially padded SP shard must receive a local-length mask."""
+    mask = build_local_sp_padding_mask(
+        batch_size=2,
+        local_seq_len=4,
+        sp_original_seq_len=5,
+        sp_padding_size=3,
+        sequence_parallel_rank=1,
+        device=torch.device(current_omni_platform.device_type),
+    )
+
+    expected = torch.tensor(
+        [
+            [True, False, False, False],
+            [True, False, False, False],
+        ],
+        dtype=torch.bool,
+        device=mask.device,
+    )
+    assert mask is not None
+    assert mask.shape == (2, 4)
+    assert torch.equal(mask, expected)
+
+
+@pytest.mark.skipif(
+    not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
+    reason="Only tested on CUDA and XPU",
+)
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.core_model
+def test_local_sp_padding_mask_no_padding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rank whose local shard contains no padding should not get a mask."""
+    mask = build_local_sp_padding_mask(
+        batch_size=2,
+        local_seq_len=4,
+        sp_original_seq_len=5,
+        sp_padding_size=3,
+        sequence_parallel_rank=0,
+        device=torch.device(current_omni_platform.device_type),
+    )
+
+    assert mask is None
+
+
+@pytest.mark.skipif(
+    not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
+    reason="Only tested on CUDA and XPU",
+)
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.core_model
+def test_wan_sp_plan() -> None:
+    """Wan2.2 must shard hidden states before CacheDiT-wrapped transformer blocks."""
+    try:
+        from vllm_omni.diffusion.distributed.sp_plan import validate_sp_plan
+        from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+    except ImportError as exc:
+        pytest.skip(f"WanTransformer3DModel not available: {exc}")
+
+    plan = getattr(WanTransformer3DModel, "_sp_plan", None)
+
+    assert plan is not None
+    assert "_sp_shard_point" in plan
+    assert "blocks.0" not in plan
+
+    shard_plan = plan["_sp_shard_point"]
+    assert 0 in shard_plan
+    assert shard_plan[0].split_dim == 1
+    assert shard_plan[0].expected_dims == 3
+    assert shard_plan[0].split_output is True
+
+    validate_sp_plan(plan)

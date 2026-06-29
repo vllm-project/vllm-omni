@@ -655,6 +655,16 @@ class TestPipelineRegistration:
         assert isinstance(pipeline_cfg, PipelineConfig)
         assert pipeline_cfg.model_type == resolved_type
 
+    def test_resolve_when_autodetect_resolves_none(self):
+        """Regression test for: https://github.com/vllm-project/vllm-omni/issues/4726"""
+        deploy_path = get_deploy_config_path("ming_tts.yaml")
+        resolved_config = StageConfigFactory.create_from_model(
+            model="inclusionAI/Ming-omni-tts-0.5B",
+            deploy_config_path=deploy_path,
+        )
+        assert resolved_config is not None
+        assert len(resolved_config) > 0
+
 
 class TestResolveScheduler:
     def test_all_execution_types_handled(self):
@@ -1050,7 +1060,11 @@ class TestQwen2_5OmniPipeline:
         assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
         assert s.sampling_constraints["stop_token_ids"] == [8294]
-        assert s.custom_process_input_func is not None
+        # thinker2talker was removed: qwen2_5_omni has no async_chunk support,
+        # so sync_process_input_func always wins and custom_process_input_func
+        # was dead code.
+        assert s.custom_process_input_func is None
+        assert s.sync_process_input_func is not None
 
     def test_code2wav(self):
         p = StageConfigFactory.resolve_pipeline_config("qwen2_5_omni")
@@ -1181,10 +1195,14 @@ class TestMingFlashOmniPipeline:
         # Per-stage model_arch override (Ming talker has its own self-contained LLM)
         assert s.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
         assert s.tokenizer_subdir == "talker/llm"
-        assert s.custom_process_input_func is not None
+        # thinker2talker was removed: ming_flash_omni has no async_chunk support
+        # and both thinker2talker / thinker2talker_token_only called _build_talker_inputs
+        # identically, so custom_process_input_func was dead code.
+        assert s.custom_process_input_func is None
+        assert s.sync_process_input_func is not None
 
     def test_talker_stage_processor_wiring_resolves(self):
-        """The custom_process_input_func string must point to a real callable.
+        """The sync_process_input_func string must point to a real callable.
 
         Lazy string references only fail at first inference otherwise — this
         catches typos in the pipeline declaration at import / registration time.
@@ -1194,7 +1212,7 @@ class TestMingFlashOmniPipeline:
 
         s = p.get_stage(1)
         assert isinstance(s, StagePipelineConfig)
-        module_path, _, attr = s.custom_process_input_func.rpartition(".")
+        module_path, _, attr = s.sync_process_input_func.rpartition(".")
         module = importlib.import_module(module_path)
         assert callable(getattr(module, attr))
 
@@ -1710,11 +1728,12 @@ class TestSentinelDefaultPrecedence:
         )
 
     def test_ming_flash_omni_topology(self):
-        """Guard ming_flash_omni's PR3 cleanup: stage 0 has no full-payload
-        producer hook (the connector path was removed as fake -- arch is not
-        in ``_FULL_PAYLOAD_INPUT_STAGES``), and stage 1 still wires the
-        legacy ``thinker2talker`` (custom_process_input_func) plus the
-        ``thinker2talker_token_only`` placeholder (sync_process_input_func).
+        """Guard ming_flash_omni's SIP cleanup: stage 0 has no full-payload
+        producer hook (arch is not in ``_FULL_PAYLOAD_INPUT_STAGES``), and
+        stage 1 uses only ``thinker2talker_token_only`` (sync_process_input_func).
+        The dead ``thinker2talker`` (custom_process_input_func) was removed
+        because ming_flash_omni has no async_chunk support and both functions
+        called ``_build_talker_inputs`` identically.
         Merge under either async_chunk mode must not re-introduce a
         stage-0 full-payload hook."""
         pipeline = StageConfigFactory.resolve_pipeline_config("ming_flash_omni")
@@ -1725,8 +1744,7 @@ class TestSentinelDefaultPrecedence:
             "ming_flash_omni stage 0 must not declare a full-payload producer "
             "(connector path is not active for this arch)."
         )
-        assert stage1.custom_process_input_func is not None
-        assert stage1.custom_process_input_func.endswith("thinker2talker")
+        assert stage1.custom_process_input_func is None
         assert stage1.sync_process_input_func is not None
         assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
 

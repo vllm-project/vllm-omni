@@ -956,7 +956,8 @@ class Cosmos3VFMTransformer(nn.Module):
     """Cosmos3 VFM Transformer: UND language model + GEN denoising layers.
 
     The UND pathway runs once per generation (K/V cached). The GEN pathway
-    runs at each denoising step.
+    runs at each denoising step over the target video/image latent stream and
+    optional transfer-control, action, and sound latent streams.
 
     Layerwise offloading uses ``gen_layers`` as the block container.
 
@@ -1408,14 +1409,16 @@ class Cosmos3VFMTransformer(nn.Module):
             sound_latents: Optional [B, C_sound, T_sound] noisy sound latents.
             noisy_frame_mask: Optional [B, 1, t, 1, 1] mask where 1=noisy (add
                 timestep embedding, predict velocity) and 0=conditioned (clean
-                context, skip timestep embedding).  None means all frames noisy
-                (T2V mode).
+                context, skip timestep embedding). None means all target vision
+                frames are noisy, as in T2I/T2V.
             control_latents: Optional transfer-control latents. Controls are
                 clean vision context and are packed before the noisy target.
 
         Returns:
             [B, C, t, h, w] velocity prediction, or
-            tuple outputs in video, action, sound order when extra modalities are provided.
+            tuple outputs in video, action, sound order when action/sound streams
+            are provided. Transfer-control streams condition the video prediction
+            and are not returned.
         """
         if kwargs:
             raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")

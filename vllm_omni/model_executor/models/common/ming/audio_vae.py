@@ -346,11 +346,8 @@ class AudioVAE(PreTrainedModel):
         h, _ = self.encoder(waveform)
         h = h.transpose(1, 2)
 
-        mean, logvar = torch.chunk(h, 2, dim=1)
-        logvar = torch.clamp(logvar, -30.0, 20.0)
-        std = torch.exp(0.5 * logvar)
-        latent = mean + std * torch.randn_like(mean)
-        latent = latent.transpose(1, 2)
+        mean = torch.chunk(h, 2, dim=1)[0]
+        latent = mean.transpose(1, 2)
         return latent, frame_num
 
     @torch.inference_mode()

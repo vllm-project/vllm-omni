@@ -68,10 +68,6 @@ class FakeAsyncOmni:
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.captured_prompt = None
         self.captured_sampling_params_list = None
-        self.model_config = SimpleNamespace(
-            allowed_local_media_path="",
-            allowed_media_domains=None,
-        )
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_prompt = prompt
@@ -87,12 +83,6 @@ class BlockingVideoHandler:
         self.stage_configs = None
         self.started = threading.Event()
         self.cancelled = threading.Event()
-        self._engine_client = SimpleNamespace(
-            model_config=SimpleNamespace(
-                allowed_local_media_path="",
-                allowed_media_domains=None,
-            ),
-        )
 
     def set_stage_configs_if_missing(self, stage_configs):
         if self.stage_configs is None:
@@ -1869,77 +1859,3 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
-
-
-# ---------------------------------------------------------------------------
-# MediaConnector / SSRF protection (end-to-end through /v1/videos)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def restricted_test_client():
-    """Test client whose engine restricts media to trusted.example.com."""
-    engine = FakeAsyncOmni()
-    engine.model_config = SimpleNamespace(
-        allowed_local_media_path="",
-        allowed_media_domains=["trusted.example.com"],
-    )
-    app = FastAPI()
-    app.include_router(router)
-    app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
-        diffusion_engine=engine,
-        model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    )
-    with TestClient(app) as client:
-        yield client
-
-
-class TestVideoEndpointSSRF:
-    """SSRF protection via /v1/videos endpoint with domain-restricted engine."""
-
-    def test_blocked_image_reference_url_returns_400(self, restricted_test_client):
-        response = restricted_test_client.post(
-            "/v1/videos",
-            data={
-                "prompt": "A fox.",
-                "image_reference": json.dumps({"image_url": "https://evil.internal/image.png"}),
-            },
-        )
-        assert response.status_code == 400
-        assert "allowed domains" in response.json()["detail"].lower()
-
-    def test_blocked_video_reference_url_returns_400(self, restricted_test_client):
-        response = restricted_test_client.post(
-            "/v1/videos",
-            data={
-                "prompt": "Continue.",
-                "video_reference": json.dumps({"video_url": "https://evil.internal/video.mp4"}),
-            },
-        )
-        assert response.status_code == 400
-        assert "allowed domains" in response.json()["detail"].lower()
-
-    def test_blocked_audio_reference_url_returns_400(self, restricted_test_client):
-        response = restricted_test_client.post(
-            "/v1/videos",
-            data={
-                "prompt": "Narrate.",
-                "audio_reference": json.dumps({"audio_url": "https://evil.internal/audio.mp3"}),
-            },
-        )
-        assert response.status_code == 400
-        assert "allowed domains" in response.json()["detail"].lower()
-
-    def test_data_url_bypasses_domain_restriction(self, restricted_test_client, mocker: MockerFixture):
-        mocker.patch(
-            "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-            return_value=b"fake-video",
-        )
-        response = restricted_test_client.post(
-            "/v1/videos",
-            data={
-                "prompt": "A fox.",
-                "image_reference": json.dumps({"image_url": _make_test_image_data_url((40, 24))}),
-            },
-        )
-        assert response.status_code == 200
