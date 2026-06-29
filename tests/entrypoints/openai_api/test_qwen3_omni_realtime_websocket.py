@@ -214,27 +214,6 @@ def _assert_realtime_accuracy(result: dict) -> None:
 
 
 class TestQwen3OmniRealtimeWebSocket:
-    @pytest.mark.core_model
-    @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
-    def test_streaming_audio_input_pcm_output_async_chunk_smoke(self, omni_server) -> None:
-        """Ready CI: async_chunk on, no send delay, smoke only."""
-        pcm16 = _synthetic_pcm16_input()
-
-        result = asyncio.run(
-            _run_realtime_audio_roundtrip(
-                omni_server.host,
-                omni_server.port,
-                omni_server.model,
-                pcm16,
-                chunk_ms=100,
-                send_delay_ms=0,
-            )
-        )
-
-        _assert_realtime_smoke(result)
-
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)

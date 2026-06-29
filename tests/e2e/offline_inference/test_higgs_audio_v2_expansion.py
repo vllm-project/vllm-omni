@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-End-to-end offline inference tests for higgs-audio v2.
+E2E Offline expansion tests for higgs-audio v2.
 
 Mirrors examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py:
 build Stage-0 prompt_token_ids with the model's own processor + plain-text
@@ -33,6 +33,8 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
+
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = "bosonai/higgs-audio-v2-generation-3B-base"
 STAGE_CONFIG = get_deploy_config_path("higgs_audio_v2.yaml")
@@ -89,9 +91,7 @@ def _extract_pcm(outputs) -> torch.Tensor:
     raise AssertionError(f"no audio payload in any stage output (got {len(outputs)} stages)")
 
 
-@pytest.mark.core_model
-@pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_plain_text(omni_runner_function: OmniRunner) -> None:
     """
@@ -131,9 +131,7 @@ def test_higgs_audio_v2_offline_plain_text(omni_runner_function: OmniRunner) -> 
     assert np.isfinite(arr).all(), "audio contains non-finite samples (nan/inf)"
 
 
-@pytest.mark.core_model
-@pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_batch_two_prompts(omni_runner_function: OmniRunner) -> None:
     """
@@ -199,9 +197,7 @@ def _compose_voice_clone_request(model_name: str, text: str, ref_text: str, ref_
     }
 
 
-@pytest.mark.advanced_model
-@pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_voice_clone(omni_runner_function: OmniRunner) -> None:
     """
