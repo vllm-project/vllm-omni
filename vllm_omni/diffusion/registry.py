@@ -306,6 +306,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sdxl",
         "StableDiffusionXLPipeline",
     ),
+    "Ideogram4Pipeline": (
+        "ideogram4",
+        "pipeline_ideogram4",
+        "Ideogram4Pipeline",
+    ),
 }
 
 
@@ -533,6 +538,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
+    "Ideogram4Pipeline": "get_ideogram4_post_process_func",
 }
 
 _DIFFUSION_ACTION_POST_PROCESS_FUNCS = {
