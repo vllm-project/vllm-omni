@@ -290,7 +290,6 @@ stage_args:
       enable_prefix_caching: false
       engine_output_type: latent
     engine_input_source: [0]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
     default_sampling_params:
       temperature: 0.9
       top_p: 0.8
