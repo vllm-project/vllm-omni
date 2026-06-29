@@ -335,11 +335,12 @@ class Qwen2Model(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        get_cache_scale = getattr(self.quant_config, "get_cache_scale", None)
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
+            if get_cache_scale is not None and (scale_name := get_cache_scale(name)):
                 # Loading kv cache quantization scales
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
