@@ -281,6 +281,17 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Thinking --omni --port 8091 \
   --max-num-batched-tokens 32768
 ```
 
+### Tensor parallelism
+
+The Thinking audio encoder has 20 attention heads, thus **TP must divide 20**
+(e.g. TP=2/4 on stock `vllm/vllm-omni-rocm:v0.20.0`; TP=8 requires additional
+patches). We have created the following PRs to fix this:
+
+- [vllm-project/vllm#45900](https://github.com/vllm-project/vllm/pull/45900) —
+  Fix Qwen3-vLLM audio encoder TP when heads are not divisible by TP size
+- [vllm-project/vllm-omni#4322](https://github.com/vllm-project/vllm-omni/pull/4322) —
+  Fix Qwen3-Omni audio encoder TP when heads are not divisible by TP size
+
 ### Verification
 
 After server startup, run a multimodal example client. Request text-only output:

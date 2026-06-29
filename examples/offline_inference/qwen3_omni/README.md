@@ -128,7 +128,12 @@ pip install -U qwen-omni-utils librosa soundfile
 pip install --no-cache-dir "uvloop>=0.21"
 ```
 
-**Tensor parallelism:** the Thinking audio encoder has 20 attention heads, thus **TP must divide 20** (e.g. TP=2/4 on stock vllm/vllm-omni-rocm:v0.20.0; TP=8 require additional patches).
+**Tensor parallelism:** the Thinking audio encoder has 20 attention heads, thus **TP must divide 20** (e.g. TP=2/4 on stock vllm/vllm-omni-rocm:v0.20.0; TP=8 require additional patches). We have created the following PRs to fix this:
+
+- [vllm-project/vllm#45900](https://github.com/vllm-project/vllm/pull/45900) — Fix Qwen3-vLLM audio encoder TP when heads are not divisible by TP size
+- [vllm-project/vllm-omni#4322](https://github.com/vllm-project/vllm-omni/pull/4322) — Fix Qwen3-Omni audio encoder TP when heads are not divisible by TP size
+
+
 
 ### Run
 
