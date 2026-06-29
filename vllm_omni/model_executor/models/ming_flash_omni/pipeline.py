@@ -6,8 +6,8 @@ Stage 0: Thinker — multimodal understanding + text generation.
 Stage 1: Talker  — text -> audio waveform via CFM + AudioVAE.
 
 The thinker -> talker bridge passes the detokenized text rather than
-hidden states through `ming_flash_omni.thinker2talker`; the talker has a
-self-contained Qwen2 LLM that retokenizes the string itself.
+hidden states; the talker has a self-contained Qwen2 LLM that retokenizes
+the string itself.
 """
 
 from vllm_omni.config.stage_config import (
@@ -57,7 +57,6 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             hf_config_name="talker_config",
             engine_output_type="audio",
             tokenizer_subdir="talker/llm",
-            custom_process_input_func=f"{_PROC}.thinker2talker",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
         ),
     ),
@@ -102,6 +101,40 @@ MING_FLASH_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
             hf_config_name="llm_config",
             engine_output_type="text",
             sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
+
+# Thinker + image-generation (diffusion) variant: text-to-image / img2img.
+MING_FLASH_OMNI_IMAGE_PIPELINE = PipelineConfig(
+    model_type="ming_flash_omni_image",
+    model_arch="MingFlashOmniForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=False,
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            hf_config_name="thinker_config",
+            engine_output_type="latent",
+            prompt_expand_func=f"{_PROC}.expand_cfg_prompts",
+            sampling_constraints={"detokenize": False},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="dit",
+            # Resolved in vllm_omni/diffusion/registry.py.
+            model_arch="MingImagePipeline",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="image",
+            hf_config_name="image_gen_config",
+            custom_process_input_func=f"{_PROC}.thinker2imagegen",
         ),
     ),
 )

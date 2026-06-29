@@ -4,6 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -190,7 +191,7 @@ def _get_prefill_multimodal_output(
     if not isinstance(by_req, dict):
         return None
     prefill_mm = by_req.get(request_id)
-    return prefill_mm if isinstance(prefill_mm, dict) else None
+    return prefill_mm if isinstance(prefill_mm, Mapping) else None
 
 
 def _merge_pd_embeddings(
@@ -215,7 +216,7 @@ def _merge_pd_embeddings(
         p_emb = p_layers[int(_EMBED_LAYER_KEY)].detach().to(device=device, dtype=torch.float)
         p_hid = p_layers[int(_HIDDEN_LAYER_KEY)].detach().to(device=device, dtype=torch.float)
     except (KeyError, AttributeError, TypeError) as exc:
-        available_keys = list(prefill_mm.keys()) if isinstance(prefill_mm, dict) else type(prefill_mm).__name__
+        available_keys = list(prefill_mm.keys()) if isinstance(prefill_mm, Mapping) else type(prefill_mm).__name__
         logger.error(
             "_merge_pd_embeddings: failed to extract prefill embeddings (%s). "
             "Expected keys %r and %r, got: %s. "
@@ -261,6 +262,89 @@ def _resolve_tts_token_embedding(
 # =========================
 
 
+def _construct_thinker2talker_streaming_input_async_chunk(
+    is_finished: bool,
+    request,
+    thinker_emb,
+    thinker_hid,
+    transfer_manager,
+) -> OmniPayloadStruct | None:
+    """Build Thinker -> Talker payloads for realtime streaming input chunks.
+
+    A resumable realtime request reuses the same logical request id across
+    audio segments. The first streaming prefill chunk is cached and returns ``None`` so the
+    connector does not emit an incomplete downstream chunk. The following
+    decode chunk flushes that cached prefill together with the current Thinker
+    output, keeping Talker ids and tensor rows aligned.
+    """
+    request_id = request.external_req_id
+    output_token_ids = request.output_token_ids
+    # Convert ConstantList to regular list for OmniSerializer serialization
+    output_token_ids = _ensure_list(output_token_ids)
+    speaker = extract_speaker_from_request(request)
+    language = extract_language_from_request(request)
+    finished = torch.tensor(is_finished, dtype=torch.bool)
+    emb_cpu = thinker_emb.detach().cpu()
+    hid_cpu = thinker_hid.detach().cpu()
+
+    if output_token_ids:
+        if thinker_emb.shape[0] > 1:
+            # if thinker_emb.shape[0] > 1, new streaming input segment is added
+            # and will transfer prefill embeddings and hidden states to talker.
+            new_prompt_len = thinker_emb.shape[0]
+            payload = OmniPayloadStruct(
+                meta=MetaStruct(finished=finished),
+                embed=EmbeddingsStruct(prefill=emb_cpu),
+                hidden_states=HiddenStatesStruct(output=hid_cpu),
+                ids=IdsStruct(
+                    all=_ensure_list(request.all_token_ids[-new_prompt_len - 1 :]),
+                    prompt=_ensure_list(request.prompt_token_ids[-new_prompt_len:]),
+                ),
+                speaker=speaker,
+                language=language,
+            )
+            transfer_manager._pending_streaming_prefills[request_id] = to_dict(payload)
+            return None
+        else:
+            save_payload = transfer_manager._pending_streaming_prefills.pop(request_id, None)
+            if save_payload is not None:
+                saved_prefill = save_payload.get("embed", {}).get("prefill")
+                saved_output = save_payload.get("hidden_states", {}).get("output")
+                if isinstance(saved_prefill, torch.Tensor) and isinstance(saved_output, torch.Tensor):
+                    return OmniPayloadStruct(
+                        meta=MetaStruct(finished=finished),
+                        embed=EmbeddingsStruct(prefill=torch.cat((saved_prefill, emb_cpu), dim=0)),
+                        hidden_states=HiddenStatesStruct(output=torch.cat((saved_output, hid_cpu), dim=0)),
+                        ids=IdsStruct(
+                            all=save_payload.get("ids", {}).get("all"),
+                            prompt=save_payload.get("ids", {}).get("prompt"),
+                        ),
+                        speaker=speaker,
+                        language=language,
+                    )
+            return OmniPayloadStruct(
+                meta=MetaStruct(
+                    finished=finished,
+                ),
+                embed=EmbeddingsStruct(decode=emb_cpu),
+                hidden_states=HiddenStatesStruct(output=hid_cpu),
+                ids=IdsStruct(output=output_token_ids),
+                speaker=speaker,
+                language=language,
+            )
+    else:
+        if not is_finished:
+            # do not send async chunk mode placeholder token or embedding/hidden of the stop token
+            return None
+        return OmniPayloadStruct(
+            meta=MetaStruct(finished=finished),
+            embed=EmbeddingsStruct(decode=emb_cpu),
+            hidden_states=HiddenStatesStruct(output=hid_cpu),
+            speaker=speaker,
+            language=language,
+        )
+
+
 @dataclass
 class _Thinker2TalkerStreamingState:
     last_prompt_len: int = 0
@@ -295,16 +379,16 @@ def _get_streaming_talker_tokens(
     streaming_context: Any | None = None,
     *,
     clear_state: bool = False,
-) -> tuple[list[int], list[int], list[int], list[int]]:
-    """Return streaming token slices and merged token views for thinker->talker.
-       e.g. For the second streaming input request:
-       merged_sequences: [input_prompt 1, output_tokens 1[:-1], input_prompt 2, output_tokens 2]
-      thinker_input_ids: [input_prompt 1, output_tokens 1[:-1], input_prompt 2]
+) -> tuple[list[int], list[int]]:
+    """Return prompt/output token deltas for the current streaming segment.
+
+    In non-async-chunk streaming, Thinker's prompt may already include the
+    next input segment. Remove that new prompt tail before building the Talker
+    delta for the previous segment.
+
     Returns:
         inc_prompt: prompt token delta for this segment.
         inc_output: output token delta for this segment.
-        merged_sequences: full thinker_sequences to send downstream.
-        thinker_input_ids: full thinker_input_ids paired with merged_sequences.
     """
     state = _get_qwen3_streaming_state(request_id, streaming_context).thinker2talker
     if new_prompt_len_snapshot:
@@ -314,15 +398,6 @@ def _get_streaming_talker_tokens(
 
     inc_prompt = prompt_token_ids[state.last_prompt_len :]
     inc_output = output_token_ids[state.last_output_len :]
-    delta_sequences = inc_prompt + inc_output
-    cached_sequences = state.merged_sequences
-
-    merged_sequences = cached_sequences + delta_sequences
-    thinker_input_ids = cached_sequences + inc_prompt
-
-    # Persist history for next segment. Drop the latest sampled token to keep
-    # thinker_input_ids / thinker_sequences alignment with next-step append.
-    cached_sequences.extend(delta_sequences[:-1])
 
     state.last_prompt_len = cur_prompt_len
     state.last_output_len = cur_output_len
@@ -332,7 +407,7 @@ def _get_streaming_talker_tokens(
         state.last_output_len = 0
         state.merged_sequences.clear()
 
-    return inc_prompt, inc_output, merged_sequences, thinker_input_ids
+    return inc_prompt, inc_output
 
 
 def _get_streaming_codec_delta_len(
@@ -359,7 +434,7 @@ def _get_streaming_codec_delta_len(
 
 def thinker2talker_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload,
+    multimodal_output: OmniPayload | dict[str, Any],
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -372,13 +447,13 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
-    if not isinstance(pooling_output, dict):
-        logger.debug("thinker2talker_async_chunk: skip non-dict pooling_output for req=%s", request_id)
+    if not isinstance(multimodal_output, Mapping):
+        logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None
 
-    thinker_hs = pooling_output.get("hidden_states", {})
+    thinker_hs = multimodal_output.get("hidden_states", {})
     thinker_layers = thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {}
-    thinker_embed_raw = pooling_output.get("embed", {})
+    thinker_embed_raw = multimodal_output.get("embed", {})
     thinker_embed = thinker_embed_raw if isinstance(thinker_embed_raw, dict) else {}
     thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
     thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
@@ -429,6 +504,10 @@ def thinker2talker_async_chunk(
                 transfer_manager.request_payload[request_id] = to_dict(payload)
                 return None
     else:
+        if request.resumable:
+            return _construct_thinker2talker_streaming_input_async_chunk(
+                is_finished, request, thinker_emb, thinker_hid, transfer_manager
+            )
         if thinker_emb.shape[0] > 1:
             logger.warning(
                 "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
@@ -456,7 +535,7 @@ def thinker2talker_full_payload(
 ) -> dict[str, Any] | None:
     """Pack complete thinker output for the non-async connector path."""
     rid = getattr(request, "request_id", None)
-    if not isinstance(pooling_output, dict):
+    if not isinstance(pooling_output, Mapping):
         logger.warning(
             "thinker2talker_full_payload: pooling_output not a dict (type=%s) for req=%s; consumer wait gate may hang.",
             type(pooling_output).__name__,
@@ -567,7 +646,7 @@ def thinker2talker(
         output_ids = _ensure_list(output.cumulative_token_ids)
         is_streaming_session = bool(getattr(streaming_context, "enabled", False))
         if is_streaming_session:
-            prompt_token_ids, output_ids, thinker_sequences, thinker_input_ids = _get_streaming_talker_tokens(
+            prompt_token_ids, output_ids = _get_streaming_talker_tokens(
                 req_id,
                 prompt_token_ids,
                 output_ids,
@@ -575,17 +654,16 @@ def thinker2talker(
                 streaming_context,
                 clear_state=bool(getattr(thinker_output, "finished", False)),
             )
-        else:
-            thinker_sequences = prompt_token_ids + output_ids
-            thinker_input_ids = prompt_token_ids
+        thinker_sequences = prompt_token_ids + output_ids
+        thinker_input_ids = prompt_token_ids
         new_seq_length = len(prompt_token_ids + output_ids) - 1
         thinker_mm_raw = getattr(output, "multimodal_output", None)
-        if not isinstance(thinker_mm_raw, dict):
+        if not isinstance(thinker_mm_raw, Mapping):
             logger.debug("thinker2talker: skip req=%s due to empty multimodal_output", req_id)
             continue
         thinker_mm: OmniPayload = thinker_mm_raw
         mm_hs = thinker_mm.get("hidden_states", {})
-        mm_layers = mm_hs.get("layers", {}) if isinstance(mm_hs, dict) else {}
+        mm_layers = mm_hs.get("layers", {}) if isinstance(mm_hs, Mapping) else {}
         emb_layer = _layer_tensor(mm_layers, _EMBED_LAYER_KEY)
         hid_layer = _layer_tensor(mm_layers, _HIDDEN_LAYER_KEY)
         if emb_layer is None or hid_layer is None:
@@ -671,11 +749,11 @@ def thinker2talker_token_only(
         # hidden-state layers), do the same here so the worker buffer
         # presence agrees with the orchestrator's scheduling decision.
         thinker_mm_raw = getattr(output, "multimodal_output", None)
-        if not isinstance(thinker_mm_raw, dict):
+        if not isinstance(thinker_mm_raw, Mapping):
             logger.debug("thinker2talker_token_only: skip req=%s due to empty multimodal_output", req_id)
             continue
         mm_hs = thinker_mm_raw.get("hidden_states", {})
-        mm_layers = mm_hs.get("layers", {}) if isinstance(mm_hs, dict) else {}
+        mm_layers = mm_hs.get("layers", {}) if isinstance(mm_hs, Mapping) else {}
         if _layer_tensor(mm_layers, _EMBED_LAYER_KEY) is None or _layer_tensor(mm_layers, _HIDDEN_LAYER_KEY) is None:
             logger.debug("thinker2talker_token_only: skip req=%s due to missing hidden-state layers", req_id)
             continue
@@ -683,7 +761,7 @@ def thinker2talker_token_only(
         output_ids = _ensure_list(output.cumulative_token_ids)
         is_streaming_session = bool(getattr(streaming_context, "enabled", False))
         if is_streaming_session:
-            prompt_token_ids, output_ids, thinker_sequences, thinker_input_ids = _get_streaming_talker_tokens(
+            prompt_token_ids, output_ids = _get_streaming_talker_tokens(
                 req_id,
                 prompt_token_ids,
                 output_ids,
@@ -691,9 +769,8 @@ def thinker2talker_token_only(
                 streaming_context,
                 clear_state=bool(getattr(thinker_output, "finished", False)),
             )
-        else:
-            thinker_sequences = prompt_token_ids + output_ids
-            thinker_input_ids = prompt_token_ids
+        thinker_sequences = prompt_token_ids + output_ids
+        thinker_input_ids = prompt_token_ids
         info_for_len = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
         prompt_len = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
 
@@ -725,20 +802,26 @@ def thinker2talker_token_only(
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload,
+    multimodal_output: OmniPayload | dict[str, Any],
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """
-    Pooling version.
+    Multimodal output version.
     """
-    if not isinstance(pooling_output, dict):
+    if not isinstance(multimodal_output, Mapping):
         return None
-    talker_codes = pooling_output.get("codes", {})
+    talker_codes = multimodal_output.get("codes", {})
     if not isinstance(talker_codes, dict):
         return None
     code_predictor_codes = talker_codes.get("audio")
     if code_predictor_codes is None:
+        return None
+
+    if code_predictor_codes.numel() == 0:
+        return None
+
+    if not code_predictor_codes.any():
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -746,31 +829,28 @@ def talker2code2wav_async_chunk(
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
-    if code_predictor_codes is None:
-        return None
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if code_predictor_codes.numel() == 0:
-            return None
-    elif hasattr(code_predictor_codes, "__len__"):
-        if len(code_predictor_codes) == 0:
-            return None
-
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if not code_predictor_codes.any():
-            return None
-    else:
-        code_tensor = torch.tensor(code_predictor_codes, dtype=torch.long)
-        if not code_tensor.any():
-            return None
-
-    codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
-    if sum(codec_codes) == 0:
+    sampling_params = getattr(request, "sampling_params", None)
+    stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
+    stop_token_id = getattr(sampling_params, "stop_token_id", None)
+    if stop_token_id is not None:
+        stop_token_ids.add(stop_token_id)
+    first_codebook = int(code_predictor_codes[0, 0].item())
+    if first_codebook in stop_token_ids:
+        logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
         return None
 
     request_id = request.external_req_id
-    transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+    chunk_id = transfer_manager.put_req_chunk[request_id]
+    transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+
+    if configured_initial_chunk_size > 0:
+        if chunk_id == 0:
+            chunk_size_config = configured_initial_chunk_size
+        else:
+            length -= configured_initial_chunk_size
 
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not is_finished:
@@ -778,10 +858,16 @@ def talker2code2wav_async_chunk(
 
     context_length = chunk_length if chunk_length != 0 else chunk_size_config
     # ensure left context does not exceed available length
-    left_context_size = max(0, min(length - context_length, left_context_size_config))
-    end_index = min(length, left_context_size + context_length)
+    if configured_initial_chunk_size > 0 and chunk_id == 1:
+        left_context_size = configured_initial_chunk_size
+        end_index = length + configured_initial_chunk_size
+    else:
+        left_context_size = max(0, min(length - context_length, left_context_size_config))
+        end_index = min(length, left_context_size + context_length)
 
-    codes = torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:]).transpose(0, 1).reshape(-1)
+    codes = (
+        torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0).transpose(0, 1).reshape(-1)
+    )
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codes),
@@ -799,7 +885,7 @@ def talker2code2wav_full_payload(
 ) -> dict[str, Any] | None:
     """Pack complete talker codec output for the non-async connector path."""
     rid = getattr(request, "request_id", None)
-    if not isinstance(pooling_output, dict):
+    if not isinstance(pooling_output, Mapping):
         logger.warning(
             "talker2code2wav_full_payload: pooling_output not a dict "
             "(type=%s) for req=%s; consumer wait gate may hang.",
@@ -898,7 +984,7 @@ def talker2code2wav(
         if is_streaming_session:
             seq_len = _get_streaming_codec_delta_len(cur_seq_len, req_id, talker_output, streaming_context)
         mm_raw = getattr(output, "multimodal_output", None)
-        if not isinstance(mm_raw, dict):
+        if not isinstance(mm_raw, Mapping):
             logger.debug("talker2code2wav: skip req=%s due to empty multimodal_output", req_id)
             continue
         mm: OmniPayload = mm_raw

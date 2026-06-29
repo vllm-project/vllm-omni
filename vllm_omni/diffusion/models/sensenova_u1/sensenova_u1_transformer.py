@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from transformers.cache_utils import DynamicCache
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig, SensenovaCachedAdapter
 
 
 @dataclass
@@ -587,6 +589,12 @@ class SenseNovaU1DecoderLayer(nn.Module):
         past_key_values=None,
         **kwargs,
     ):
+        if isinstance(attention_mask, dict):
+            attention_mask = attention_mask.get(
+                self.attention_type,
+                attention_mask.get("full_attention"),
+            )
+
         if exist_und and not exist_gen:
             return self._forward_und(hidden_states, indexes, attention_mask, past_key_values, **kwargs)
         if not exist_und and exist_gen:
@@ -600,6 +608,14 @@ class SenseNovaU1DecoderLayer(nn.Module):
 
 
 class SenseNovaU1Model(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_3,
+        },
+        has_separate_cfg=True,
+        cached_adapter_cls=SensenovaCachedAdapter,
+    )
+
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
         self.config = config
@@ -663,7 +679,7 @@ class SenseNovaU1Model(nn.Module):
                 exist_und=exist_und,
                 exist_gen=exist_gen,
                 indexes=indexes,
-                attention_mask=causal_mask_mapping.get(layer.attention_type, causal_mask_mapping.get("full_attention")),
+                attention_mask=causal_mask_mapping,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 **kwargs,

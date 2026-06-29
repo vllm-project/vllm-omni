@@ -64,6 +64,47 @@ def resolve_model_name(*, model_name: str | None, model: str | None = None, outp
     raise ValueError("model-name is required when it cannot be inferred from model or output-root")
 
 
+def _coerce_score_int(value: Any) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"Expected numeric score, got bool: {value!r}")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.lstrip("-").isdigit():
+            return int(stripped)
+    raise TypeError(f"Expected numeric score, got {type(value).__name__}: {value!r}")
+
+
+def _expand_score_entry(entry: Any) -> list[int]:
+    if isinstance(entry, dict):
+        if "score" in entry:
+            return [_coerce_score_int(entry["score"])]
+        if "value" in entry:
+            return [_coerce_score_int(entry["value"])]
+        numeric_values = [_coerce_score_int(value) for value in entry.values()]
+        if numeric_values:
+            return numeric_values
+        raise TypeError(f"Score dict has no numeric values: {entry!r}")
+    return [_coerce_score_int(entry)]
+
+
+def _normalize_score_list(score: Any) -> list[int]:
+    if isinstance(score, dict):
+        entries: list[Any] = [score]
+    elif isinstance(score, list):
+        entries = score
+    else:
+        entries = [score]
+
+    normalized: list[int] = []
+    for entry in entries:
+        normalized.extend(_expand_score_entry(entry))
+    if not normalized:
+        raise ValueError(f"Empty score list after normalization: {score!r}")
+    return normalized
+
+
 def parse_score_payload(raw_text: str) -> dict[str, Any]:
     try:
         parsed = extract_json_object(raw_text)
@@ -73,10 +114,7 @@ def parse_score_payload(raw_text: str) -> dict[str, Any]:
             parsed = {"score": json.loads(stripped), "reasoning": ""}
         else:
             raise
-    score = parsed.get("score", [])
-    if not isinstance(score, list):
-        score = [score]
-    parsed["score"] = [int(value) for value in score]
+    parsed["score"] = _normalize_score_list(parsed.get("score", []))
     return parsed
 
 
@@ -391,6 +429,9 @@ class GEditBenchRunner:
         num_inference_steps: int = 20,
         guidance_scale: float | None = None,
         seed: int | None = 42,
+        bot_task: str | None = None,
+        sys_type: str | None = None,
+        system_prompt: str | None = None,
     ):
         self.dataset_ref = dataset_ref
         self.output_root = output_root
@@ -400,6 +441,9 @@ class GEditBenchRunner:
         self.num_inference_steps = num_inference_steps
         self.guidance_scale = guidance_scale
         self.seed = seed
+        self.bot_task = bot_task
+        self.sys_type = sys_type
+        self.system_prompt = system_prompt
         self.client = VllmOmniImageClient(base_url=base_url, api_key=api_key)
 
     def generate(
@@ -478,6 +522,9 @@ class GEditBenchRunner:
             num_inference_steps=self.num_inference_steps,
             guidance_scale=self.guidance_scale,
             seed=self.seed,
+            bot_task=self.bot_task,
+            sys_type=self.sys_type,
+            system_prompt=self.system_prompt,
         )
         edited_image.save(output_path)
         return {
@@ -633,6 +680,25 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--num-inference-steps", type=int, default=20)
     generate.add_argument("--guidance-scale", type=float, default=None)
     generate.add_argument("--seed", type=int, default=42)
+    generate.add_argument(
+        "--bot-task",
+        type=str,
+        default=None,
+        choices=["think", "recaption", "think_recaption", "vanilla"],
+        help="HunyuanImage-3 prompting mode for /v1/images/edits (optional).",
+    )
+    generate.add_argument(
+        "--sys-type",
+        type=str,
+        default=None,
+        help="Hunyuan system-prompt type (e.g. en_unified). Defaults from --bot-task when omitted.",
+    )
+    generate.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help="Custom Hunyuan system prompt body (sys_type=custom).",
+    )
     generate.add_argument("--workers", type=int, default=1)
     generate.add_argument("--max-samples", type=int, default=None)
     generate.add_argument("--samples-per-group", type=int, default=None)
@@ -675,6 +741,9 @@ def main(argv: list[str] | None = None) -> int:
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
             seed=args.seed,
+            bot_task=args.bot_task,
+            sys_type=args.sys_type,
+            system_prompt=args.system_prompt,
         )
         records = runner.generate(
             model_name=model_name,

@@ -214,6 +214,11 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return free
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.cuda.mem_get_info(device)
+        return free, total
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.cuda.get_device_name(device_id)
 
@@ -229,4 +234,4 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         if envs.VLLM_USE_OINK_OPS:
             rms_norm = ["oink"] + default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)

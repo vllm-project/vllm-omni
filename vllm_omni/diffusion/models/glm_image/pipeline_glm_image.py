@@ -17,7 +17,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageKVCache,
     GlmImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
@@ -238,7 +239,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     """
     GLM-Image Pipeline for text-to-image and image-to-image generation.
 
@@ -254,6 +255,10 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     3. DiT performs iterative denoising conditioned on prior tokens
     4. VAE decodes final latents to image
     """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,
@@ -555,6 +560,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     # Scheduler step
                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    # Re-cast to transformer_dtype before cfg_group.broadcast to avoid dtype mismatches across ranks
+                    latents = latents.to(transformer_dtype)
 
                 # Broadcast updated latents to all ranks
                 cfg_group.broadcast(latents, src=0)

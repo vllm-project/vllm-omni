@@ -40,6 +40,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
+    "websockets>=15.0.1",
     "datasets>=2.14.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
@@ -64,16 +65,43 @@ dev = [
     "lpips>=0.1.4", # for quantization fp8
     "orjson>=3.11.7", # to make v1/embeddings API fast
     "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
-    "torchdiffeq>=0.2.5" # for covo_audio Test
+    "torchdiffeq>=0.2.5", # for covo_audio Test
+    "FlagEmbedding", # for hunyuan_image3 tests
+    "kernels<0.15.0", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
+    "s3tokenizer>=0.3.0" # for tts test
 ]
 
 demo = [
-    "gradio>=6.7.0",
+    "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
+    "requests>=2.28.0",  # cli/stream_client HTTP
+    "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
+]
+
+forced-aligner = [
+    "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
 ]
 
 # Local-test-only extras
 local = [
     "FlagEmbedding",
+]
+
+# Optional runtime dependencies for the MiniCPM-o 4.5 talker pipeline.
+# The talker loads MiniCPMTTS via `trust_remote_code` from the model repo,
+# and that module performs `from stepaudio2 import Token2wav` against the
+# MiniCPM-o-flavored Token2wav vocoder (PyPI: `stepaudio2-minicpmo`, NOT
+# upstream `stepfun-ai/Step-Audio2` — the upstream signature rejects
+# `n_timesteps` and crashes at construction). A clean `vllm-omni` install
+# does not pull this in by default to avoid forcing the dep onto users
+# who only need other models; opt in with `pip install vllm-omni[minicpmo]`.
+minicpmo = [
+    "stepaudio2-minicpmo",
+]
+
+# Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
+# as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
+quack = [
+    "quack-kernels>=0.3.11",
 ]
 
 docs = [
@@ -91,6 +119,12 @@ docs = [
     "pydantic",
 ]
 
+soulx-svs = [
+    "funasr>=1.0.0",
+    "g2pM>=0.1.2.5",
+    "g2p-en>=2.1.0",
+    "ToJyutping>=3.2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-omni"
@@ -100,6 +134,13 @@ Documentation = "https://vllm-omni.readthedocs.io"
 
 [project.scripts]
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
+
+# Register vllm-omni's model registrations on every vllm subprocess. vllm
+# auto-loads anything advertised under `vllm.general_plugins` in its own
+# `load_general_plugins()`, so worker subprocesses spawned by vllm (which
+# only import vllm, not vllm_omni) will still pick up the omni archs.
+[project.entry-points."vllm.general_plugins"]
+vllm_omni_register_models = "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
 
 
 [tool.setuptools.packages.find]
@@ -149,6 +190,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
+# MiniCPM-o reference modeling code vendored from upstream HF/transformers/MiniCPM-o.
+# These files keep upstream conventions (star imports, long lines, math-symbol
+# argument names) so they stay easy to diff against upstream releases.
+"vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
+"vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
@@ -196,6 +242,7 @@ markers = [
     "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
+    "sp: Sequence parallelism tests",
     "example: Doc example code tests",
     # platform markers
     "cpu: Tests that run on CPU",
@@ -249,6 +296,7 @@ extend-ignore-identifiers-re = [
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
     ".*[Nn][Dd]3.*",
+    ".*updator.*",
     "byt5.*",
 ]
 extend-ignore-re = [
@@ -261,5 +309,12 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+# Step-Audio reasoning parser streams `</think>` tokens split across chunks
+# (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
+# parser logic and tests and is not a typo of "the"/"this".
+thi = "thi"
 ND = "ND"
 byt5 = "byt5"
+# "seeked" is the standard HTML media element DOM event name (fires when a
+# seek completes), used by the word-timestamps Gradio demo. Not a typo.
+seeked = "seeked"

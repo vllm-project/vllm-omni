@@ -24,6 +24,20 @@ NEGATIVE_PROMPT = "blurry, low quality, distorted"
 # that provide good performance improvements.
 def _get_diffusion_feature_cases(model: str):
     return [
+        # CFG Parallel + Tensor Parallel + CPU offload
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--cfg-parallel-size",
+                    "2",
+                    "--tensor-parallel-size",
+                    "2",
+                    "--enable-cpu-offload",
+                ],
+            ),
+            marks=FOUR_CARD_FEATURE_MARKS,
+        ),
         # Cache-DiT + CFG Parallel + Tensor Parallel
         pytest.param(
             OmniServerParams(

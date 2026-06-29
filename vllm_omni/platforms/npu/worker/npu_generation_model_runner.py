@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import time
+from collections.abc import Mapping
 from copy import copy, deepcopy
 
 import numpy as np
@@ -15,11 +16,6 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    extract_routed_experts_for_current_batch,
-    get_global_experts_capturer,
-    issue_routing_d2h_copy,
-)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -37,7 +33,7 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState
+from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 
 
@@ -78,7 +74,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
         if self.vllm_config.model_config.enable_return_routed_experts:
-            capturer = get_global_experts_capturer()
+            capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
                 capturer.finalize_pending_copy()
         if self.ascend_config.profiling_chunk_config.enabled:
@@ -163,6 +159,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                     logits_indices,
                     spec_decode_metadata,
                     total_num_scheduled_tokens,
+                    num_scheduled_tokens_compressed_list,
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
@@ -387,12 +384,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             deferred_state_corrections_fn()
 
         if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
-            issue_routing_d2h_copy(
-                input_batch_req_ids=self.input_batch.req_ids,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                positions=self.positions,
-                positions_cpu=self._positions_cpu,
-            )
+            self._omni_routed_experts_d2h(scheduler_output)
 
         return None
 
@@ -435,33 +427,35 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             _batch_desc,
-            multimodal_outputs,  # Omni-Specific
+            multimodal_outputs_raw,  # Omni-Specific
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
 
         #  -------------------------------------- Omni-new -------------------------------------------------
-        pooler_output: list[object] = []
-        if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
+        # Build per-request multimodal_outputs list (dedicated channel).
+        # pooler_output is no longer used for multimodal data.
+        multimodal_outputs: list[dict[str, object]] = []
+        if isinstance(multimodal_outputs_raw, torch.Tensor):
+            assert multimodal_outputs_raw.shape[0] == 1, (
                 "model should return a single tensor, to return multiple tensors, use a dict"
             )
-            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
+            assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
-        elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
+                multimodal_outputs.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
+        elif isinstance(multimodal_outputs_raw, list):
+            assert len(multimodal_outputs_raw) == 1, (
                 "model should return a single list, to return multiple lists, use a dict"
             )
-            for out in multimodal_outputs:
-                pooler_output.append(
+            for out in multimodal_outputs_raw:
+                multimodal_outputs.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
-        elif isinstance(multimodal_outputs, dict):
+        elif isinstance(multimodal_outputs_raw, Mapping):
             num_reqs = self.input_batch.num_reqs
             for i in range(num_reqs):
                 mm_payload = {}
-                for key, out in multimodal_outputs.items():
+                for key, out in multimodal_outputs_raw.items():
                     if isinstance(out, list):
                         if len(out) != num_reqs:
                             raise ValueError(
@@ -473,35 +467,31 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:
                         logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                pooler_output.append(mm_payload)
+                multimodal_outputs.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
-        routed_experts_dict = None
+        routed_experts_lists = None
         if self.vllm_config.model_config.enable_return_routed_experts and hasattr(
             self.input_batch, "num_tokens_no_spec"
         ):
-            routed_experts_dict = extract_routed_experts_for_current_batch(
-                req_ids=req_ids_output_copy,
-                requests=self.requests,
-                req_id_to_index=self.input_batch.req_id_to_index,
-                num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
-                max_model_len=self.max_model_len,
-            )
+            routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
-            pooler_output=pooler_output,
+            pooler_output=None,
+            multimodal_outputs=multimodal_outputs,
             kv_connector_output=kv_connector_output,
-            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
-            routed_experts_dict=routed_experts_dict,
+            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
+        output.routed_experts = routed_experts_lists
         #  -------------------------------------- Omni-new -------------------------------------------------
 
         if self.speculative_config is not None:

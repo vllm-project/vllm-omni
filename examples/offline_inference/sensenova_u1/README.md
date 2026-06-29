@@ -37,6 +37,10 @@ python end2end.py --modality text2text \
 # Custom resolution (image generation)
 python end2end.py --prompt "A futuristic cityscape at sunset" \
                   --width 2048 --height 1024 --think
+
+# Text-to-image with Cache-DiT acceleration
+python end2end.py --prompt "A cute cat" \
+                  --cache-backend cache_dit \
 ```
 
 > **Note**: Default configuration works on a single **NVIDIA A100 (80GB)** or **H100** GPU.
@@ -135,11 +139,13 @@ python end2end.py \
 | `--tensor-parallel-size` | 1 | Number of GPUs for tensor parallelism |
 | `--enforce-eager` | False | Disable torch.compile |
 | `--enable-cpu-offload` | False | Enable module-wise (sequential) CPU offload to reduce peak VRAM |
+| `--cache-backend` | None | Set to `cache_dit` for Cache-DiT acceleration |
+| `--enable-cache-dit-summary` | False | Print Cache-DiT cache statistics after generation |
 
 ## Reducing GPU Memory Usage
 
 For hardware with limited VRAM, enable **module-wise CPU offload** with
-`--enable-cpu-offload`. The pipeline implements `SupportsModuleOffload`, so the
+`--enable-cpu-offload`. The pipeline implements `SupportsComponentDiscovery`, so the
 vision encoder (`vision_model`) and the Qwen3 LLM (`language_model`) are
 swapped between CPU and GPU on demand:
 

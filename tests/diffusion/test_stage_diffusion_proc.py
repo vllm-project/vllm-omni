@@ -11,6 +11,7 @@ import pytest
 
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -54,6 +55,7 @@ def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
 
         proc = object.__new__(StageDiffusionProc)
         proc._engine = SimpleNamespace(step=step)
+        proc._od_config = SimpleNamespace(streaming_output=False)
         proc._executor = ThreadPoolExecutor(max_workers=1)
 
         try:
@@ -85,7 +87,7 @@ class MockOmniRequestOutput:
 BASE_HEIGHT = 512
 BASE_WIDTH = 512
 BASE_INFER_STEPS = 10
-DELAY_BASE = 2
+DELAY_BASE = 0.01
 
 
 class MockDiffusionEngine:
@@ -93,13 +95,47 @@ class MockDiffusionEngine:
         def simulate_step_delay(height, width, num_inference_steps) -> float:
             return (height / BASE_HEIGHT) * (width / BASE_WIDTH) * (num_inference_steps / BASE_INFER_STEPS)
 
-        DELAY_BASE = 2
+        DELAY_BASE = 0.01
         delay_scale = simulate_step_delay(
             request.sampling_params.height, request.sampling_params.width, request.sampling_params.num_inference_steps
         )
         delay = DELAY_BASE + delay_scale * DELAY_BASE
         await asyncio.sleep(delay)
         return [MockOmniRequestOutput(request_id=request.request_id)]
+
+
+@pytest.mark.asyncio
+async def test_proc_streaming_request_yields_each_engine_chunk():
+    """Ensure that the streaming output chunks from DiffusionEngine reaches StageDiffusionProc"""
+    captured = {}
+    chunks = [
+        OmniRequestOutput.from_diffusion(request_id="", images=[], finished=False),
+        OmniRequestOutput.from_diffusion(request_id="", images=[], finished=True),
+    ]
+
+    class _StreamingEngine:
+        async def step_streaming(self, request):
+            captured["request"] = request
+            for chunk in chunks:
+                yield [chunk]
+
+    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc._engine = _StreamingEngine()
+
+    outputs = [
+        output
+        async for output in stage_proc._process_streaming_request(
+            request_id="req-stream",
+            prompt="prompt",
+            sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+            kv_sender_info={0: {"host": "127.0.0.1"}},
+        )
+    ]
+
+    assert outputs == chunks
+    assert [output.request_id for output in outputs] == ["req-stream", "req-stream"]
+    assert [output.finished for output in outputs] == [False, True]
+    assert captured["request"].kv_sender_info == {0: {"host": "127.0.0.1"}}
 
 
 @pytest.mark.asyncio
@@ -139,7 +175,7 @@ async def test_proc_process_request_with_batching_async_output():
     assert len(results) == len(test_requests)
     base_time = DELAY_BASE
     time_gap_std = DELAY_BASE * 2 * 2 * 1  # height/width/steps infer time scale
-    eps = 0.5
+    eps = 0.1
     for i, (res, elapsed_time) in enumerate(results):
         assert res.request_id == test_requests[i]["request_id"]
         assert isinstance(res, MockOmniRequestOutput)

@@ -36,6 +36,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -156,9 +157,13 @@ class _VideoAudioScheduler:
         return ((video_out, audio_out),)
 
 
-class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsComponentDiscovery):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+
     # Audio is diffused jointly with video; warmup must size audio tokens.
-    support_audio_output = True
+    dummy_run_num_frames = 2
 
     def __init__(
         self,
@@ -185,6 +190,19 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             ),
         ]
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        ltx2_subfolders = [
+            "tokenizer",
+            "text_encoder",
+            "connectors",
+            "vae",
+            "audio_vae",
+            "vocoder",
+            "scheduler",
+        ]
+        prefetch_subfolders(model, ltx2_subfolders, local_files_only=local_files_only)
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
             subfolder="tokenizer",
@@ -193,36 +211,46 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         # prefer mmap loading as default device is cuda, and the output of text encoder
         # could be deterministic.
         with torch.device("cpu"):
-            self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+            self.text_encoder = from_pretrained_with_prefetch(
+                Gemma3ForConditionalGeneration.from_pretrained,
                 model,
                 subfolder="text_encoder",
-                torch_dtype=dtype,
+                prefetch_list=ltx2_subfolders,
                 local_files_only=local_files_only,
+                torch_dtype=dtype,
             ).to(self.device)
-        self.connectors = LTX2TextConnectors.from_pretrained(
+        self.connectors = from_pretrained_with_prefetch(
+            LTX2TextConnectors.from_pretrained,
             model,
             subfolder="connectors",
-            torch_dtype=dtype,
+            prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
-        self.vae = AutoencoderKLLTX2Video.from_pretrained(
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLLTX2Video.from_pretrained,
             model,
             subfolder="vae",
-            torch_dtype=dtype,
+            prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
-        self.audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
+        self.audio_vae = from_pretrained_with_prefetch(
+            AutoencoderKLLTX2Audio.from_pretrained,
             model,
             subfolder="audio_vae",
-            torch_dtype=dtype,
+            prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
-        self.vocoder = LTX2Vocoder.from_pretrained(
+        self.vocoder = from_pretrained_with_prefetch(
+            LTX2Vocoder.from_pretrained,
             model,
             subfolder="vocoder",
-            torch_dtype=dtype,
+            prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
@@ -1120,6 +1148,8 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
 class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     """LTX2TwoStagesPipeline is for two stages image to video generation"""
+
+    dummy_run_num_frames = 2
 
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]

@@ -55,6 +55,12 @@ class DiffusionRequestState:
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
 
+    # ── Optional chunked streaming progress ──
+    chunk_index: int = 0
+    step_in_chunk: int = 0
+    total_chunks: int = 1
+    chunk_num_steps: int | None = None
+
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
 
@@ -102,6 +108,18 @@ class DiffusionRequestState:
         if total_steps == 0:
             return False
         return self.step_index >= total_steps
+
+    @property
+    def chunk_denoise_completed(self) -> bool:
+        if self.chunk_num_steps is None:
+            return False
+        return self.step_in_chunk >= self.chunk_num_steps
+
+    @property
+    def request_denoise_completed(self) -> bool:
+        if self.chunk_num_steps is None:
+            return self.denoise_completed
+        return self.chunk_index >= self.total_chunks
 
     @property
     def new_request(self) -> bool:

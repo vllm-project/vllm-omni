@@ -1,5 +1,6 @@
 """Stage input processor for MammothModa2 (AR -> DiT)."""
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -10,11 +11,15 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 
 def ar2dit(
     source_outputs: list[Any],
-    prompts: OmniTokensPrompt | TextPrompt | None = None,
+    prompts: OmniTokensPrompt | TextPrompt | list[OmniTokensPrompt | TextPrompt] | None = None,
     _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """Convert AR stage outputs to DiT stage inputs."""
     ar_outputs = source_outputs
+
+    # Normalize prompts to list
+    if not isinstance(prompts, list):
+        prompts = [prompts] if prompts is not None else [{}]
 
     dit_inputs: list[OmniTokensPrompt] = []
     for ar_output, prompt in zip(ar_outputs, prompts):
@@ -35,7 +40,7 @@ def ar2dit(
         full_token_ids = prompt_token_ids + gen_token_ids
 
         mm_output = getattr(completion_output, "multimodal_output", None)
-        if not isinstance(mm_output, dict) or "latent" not in mm_output:
+        if not isinstance(mm_output, Mapping) or "latent" not in mm_output:
             raise ValueError(
                 "AR stage output missing latent multimodal output. "
                 f"request_id={getattr(ar_output, 'request_id', None)}, "
