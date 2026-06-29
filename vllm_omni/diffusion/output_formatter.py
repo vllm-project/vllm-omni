@@ -25,6 +25,7 @@ class DiffusionStepTimings:
 class DiffusionPostprocessOutput:
     outputs: Any
     custom_output: dict[str, Any]
+    images_payload: Any | None = None
     audio_payload: Any | None = None
     action_payload: Any | None = None
     audio_sample_rate: int | None = None
@@ -54,6 +55,7 @@ def normalize_diffusion_postprocess_output(
         has_video_payload = "video" in outputs
         audio_payload = outputs.get("audio")
         action_payload = outputs.get("actions")
+        images_payload = outputs.get("images")
         merged_custom_output.update(outputs.get("custom_output") or {})
         audio_sample_rate = outputs.get("audio_sample_rate")
         fps = outputs.get("fps")
@@ -64,6 +66,7 @@ def normalize_diffusion_postprocess_output(
         custom_output=merged_custom_output,
         audio_payload=audio_payload,
         action_payload=action_payload,
+        images_payload=images_payload,
         audio_sample_rate=audio_sample_rate,
         fps=fps,
         has_video_payload=has_video_payload,
@@ -78,10 +81,9 @@ def format_empty_diffusion_outputs(
     return [
         OmniRequestOutput.from_diffusion(
             request_id=request.request_id,
-            images=[],
             prompt=prompt,
             metrics={},
-            latents=None,
+            multimodal_output=None,
             finished=finished,
         )
         for prompt in request.prompts
@@ -99,7 +101,7 @@ def format_diffusion_outputs(
 ) -> list[OmniRequestOutput]:
     """Convert a finished diffusion model output into API-facing outputs."""
 
-    outputs = _ensure_list(postprocess_output.outputs)
+    # outputs = _ensure_list(postprocess_output.outputs)
     metrics = {
         "preprocess_time_ms": timings.preprocess_time_s * 1000,
         "diffusion_engine_exec_time_ms": timings.exec_time_s * 1000,
@@ -114,6 +116,7 @@ def format_diffusion_outputs(
     # as a text-type response instead of an image.
     is_text_output = isinstance(output_data, str) and postprocess_output.custom_output.get("text_output") is not None
 
+    is_images_output = postprocess_output.images_payload is not None
     is_audio_output = supports_audio_output(od_config.model_class_name)
     audio_sample_rate = postprocess_output.audio_sample_rate
     if is_audio_output and audio_sample_rate is None:
@@ -124,9 +127,10 @@ def format_diffusion_outputs(
         return _format_single_prompt_output(
             request=request,
             diffusion_output=diffusion_output,
-            outputs=outputs,
+            # outputs=outputs,
             metrics=metrics,
             postprocess_output=postprocess_output,
+            is_images_output=is_images_output,
             is_text_output=is_text_output,
             is_audio_output=is_audio_output,
             audio_sample_rate=audio_sample_rate,
@@ -136,7 +140,7 @@ def format_diffusion_outputs(
     return _format_multi_prompt_outputs(
         request=request,
         diffusion_output=diffusion_output,
-        outputs=outputs,
+        # outputs=outputs,
         metrics=metrics,
         postprocess_output=postprocess_output,
         is_audio_output=is_audio_output,
@@ -179,6 +183,8 @@ def _build_multimodal_output(
         mm_output["fps"] = postprocess_output.fps
     if postprocess_output.action_payload is not None:
         mm_output["actions"] = postprocess_output.action_payload
+    if postprocess_output.images_payload is not None:
+        mm_output["images"] = postprocess_output.images_payload
     return mm_output
 
 
@@ -186,9 +192,9 @@ def _format_single_prompt_output(
     *,
     request: OmniDiffusionRequest,
     diffusion_output: DiffusionOutput,
-    outputs: list[Any],
     metrics: dict[str, Any],
     postprocess_output: DiffusionPostprocessOutput,
+    is_images_output: bool,
     is_text_output: bool,
     is_audio_output: bool,
     audio_sample_rate: int | None,
@@ -196,13 +202,27 @@ def _format_single_prompt_output(
 ) -> list[OmniRequestOutput]:
     prompt = request.prompts[0]
     request_id = request.request_id
+
     mm_output = _build_multimodal_output(postprocess_output, audio_sample_rate)
+
+    if is_images_output:
+        return [
+            OmniRequestOutput.from_diffusion(
+                request_id=request_id,
+                prompt=prompt,
+                metrics=metrics,
+                multimodal_output=mm_output,
+                final_output_type="image",
+                stage_durations=diffusion_output.stage_durations,
+                peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
+            ),
+        ]
 
     if is_text_output:
         return [
             OmniRequestOutput.from_diffusion(
                 request_id=request_id,
-                images=[],
                 prompt=prompt,
                 metrics=metrics,
                 custom_output=postprocess_output.custom_output,
@@ -214,25 +234,13 @@ def _format_single_prompt_output(
             ),
         ]
 
-    if is_audio_output and not _has_non_audio_postprocess_payload(postprocess_output):
-        request_audio_payload = postprocess_output.audio_payload
-        if request_audio_payload is None:
-            request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
+    if is_audio_output:
         return [
             OmniRequestOutput.from_diffusion(
                 request_id=request_id,
-                images=[],
                 prompt=prompt,
                 metrics=metrics,
-                latents=diffusion_output.trajectory_latents,
-                trajectory_latents=diffusion_output.trajectory_latents,
-                trajectory_timesteps=diffusion_output.trajectory_timesteps,
-                trajectory_log_probs=diffusion_output.trajectory_log_probs,
-                trajectory_decoded=diffusion_output.trajectory_decoded,
-                multimodal_output=_format_audio_multimodal_output(
-                    request_audio_payload,
-                    audio_sample_rate,
-                ),
+                multimodal_output=mm_output,
                 final_output_type="audio",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
@@ -243,14 +251,8 @@ def _format_single_prompt_output(
     return [
         OmniRequestOutput.from_diffusion(
             request_id=request_id,
-            images=outputs,
             prompt=prompt,
             metrics=metrics,
-            latents=diffusion_output.trajectory_latents,
-            trajectory_latents=diffusion_output.trajectory_latents,
-            trajectory_timesteps=diffusion_output.trajectory_timesteps,
-            trajectory_log_probs=diffusion_output.trajectory_log_probs,
-            trajectory_decoded=diffusion_output.trajectory_decoded,
             custom_output=postprocess_output.custom_output,
             multimodal_output=mm_output,
             stage_durations=diffusion_output.stage_durations,
@@ -295,7 +297,6 @@ def _format_multi_prompt_outputs(
             results.append(
                 OmniRequestOutput.from_diffusion(
                     request_id=request_id,
-                    images=[],
                     prompt=prompt,
                     metrics=metrics,
                     latents=diffusion_output.trajectory_latents,

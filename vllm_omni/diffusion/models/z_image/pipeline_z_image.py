@@ -66,9 +66,11 @@ def get_post_process_func(
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_convert_rgb=True)
 
     def post_process_func(
-        images: torch.Tensor,
+        multimodal_output: dict[str, Any],
     ):
-        return image_processor.postprocess(images)
+        processed_images = image_processor.postprocess(multimodal_output["images"])
+        multimodal_output["images"] = processed_images
+        return multimodal_output
 
     return post_process_func
 
@@ -829,7 +831,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             # image = self.image_processor.postprocess(image, output_type=output_type)
 
         return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            multimodal_output={"images": image},
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

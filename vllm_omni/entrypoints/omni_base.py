@@ -564,7 +564,6 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
-        images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
         rid_key = str(req_id)
@@ -589,21 +588,41 @@ class OmniBase(PDDisaggregationMixin):
                 response_metrics["final_output_type"] = current_stage_metrics["final_output_type"]
                 response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
                 response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
+        # Diffusion stages emit an OmniRequestOutput directly. Unwrap it so the
+        # outer `request_output` field holds a vLLM RequestOutput (or None) per
+        # its annotation, instead of nesting OmniRequestOutput inside itself.
+        # Inner-only fields (prompt, error, diffusion perf metrics) are merged
+        # into the outer so no data is lost in the unwrap.
+        if isinstance(engine_outputs, OmniRequestOutput):
+            inner_request_output = engine_outputs.request_output
+            prompt = engine_outputs.prompt
+            error = engine_outputs.error
+            error_status_code = engine_outputs.error_status_code
+            error_type = engine_outputs.error_type
+            for k, v in (engine_outputs.metrics or {}).items():
+                response_metrics.setdefault(k, v)
+        else:
+            inner_request_output = engine_outputs
+            prompt = None
+            error = None
+            error_status_code = None
+            error_type = None
+
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,
             final_output_type=output_type,
-            request_output=engine_outputs,
-            images=images,
-            trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),
-            trajectory_timesteps=getattr(engine_outputs, "trajectory_timesteps", None),
-            trajectory_log_probs=getattr(engine_outputs, "trajectory_log_probs", None),
-            trajectory_decoded=getattr(engine_outputs, "trajectory_decoded", None),
+            request_output=inner_request_output,
+            prompt=prompt,
+            _multimodal_output=getattr(engine_outputs, "_multimodal_output", {}),
             _custom_output=getattr(engine_outputs, "_custom_output", {}),
             metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
             finished=finished,
+            error=error,
+            error_status_code=error_status_code,
+            error_type=error_type,
         )
 
     def shutdown(self, timeout: float | None = None) -> None:

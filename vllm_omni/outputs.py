@@ -1,8 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
-from PIL import Image
 from vllm.outputs import RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
@@ -70,9 +68,10 @@ class OmniRequestOutput:
         stage_id: Identifier of the stage that produced this output (pipeline mode)
         final_output_type: Type of output ("text", "image", "audio", "latents")
         request_output: The underlying RequestOutput from the stage (pipeline mode)
-        images: List of generated PIL images (diffusion mode)
         prompt: The prompt used for generation (diffusion mode)
         latents: Optional tensor of latent representations (diffusion mode)
+        _multimodal_output: Optional multimodal output dict (diffusion mode)
+        _custom_output: Optional custom output dict (diffusion mode)
         metrics: Optional dictionary of generation metrics
     """
 
@@ -85,13 +84,7 @@ class OmniRequestOutput:
     request_output: RequestOutput | None = None
 
     # Diffusion model fields
-    images: list[Image.Image] = field(default_factory=list)
     prompt: OmniPromptType | None = None
-    latents: torch.Tensor | None = None
-    trajectory_latents: torch.Tensor | None = None
-    trajectory_timesteps: torch.Tensor | None = None
-    trajectory_log_probs: torch.Tensor | None = None
-    trajectory_decoded: list | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
     _custom_output: dict[str, Any] = field(default_factory=dict)
@@ -162,14 +155,8 @@ class OmniRequestOutput:
     def from_diffusion(
         cls,
         request_id: str,
-        images: list[Image.Image],
         prompt: OmniPromptType | None = None,
         metrics: dict[str, Any] | None = None,
-        latents: torch.Tensor | None = None,
-        trajectory_latents: torch.Tensor | None = None,
-        trajectory_timesteps: torch.Tensor | None = None,
-        trajectory_log_probs: torch.Tensor | None = None,
-        trajectory_decoded: list | None = None,
         multimodal_output: dict[str, Any] | None = None,
         custom_output: dict[str, Any] | None = None,
         final_output_type: str = "image",
@@ -181,14 +168,8 @@ class OmniRequestOutput:
 
         Args:
             request_id: Request identifier
-            images: Generated images
             prompt: The prompt used
             metrics: Generation metrics
-            latents: Optional latent tensors
-            trajectory_latents: Optional stacked trajectory latent tensors
-            trajectory_timesteps: Optional stacked trajectory timestep tensors
-            trajectory_log_probs: Optional stacked trajectory log-probability tensors
-            trajectory_decoded: Optional list of decoded trajectory images
             multimodal_output: Optional multimodal output dict
             custom_output: Optional custom output dict (e.g. prompt embeds)
             stage_durations: Optional stage durations (execution time of each stage) dict
@@ -200,13 +181,7 @@ class OmniRequestOutput:
         return cls(
             request_id=request_id,
             final_output_type=final_output_type,
-            images=images,
             prompt=prompt,
-            latents=latents,
-            trajectory_latents=trajectory_latents,
-            trajectory_timesteps=trajectory_timesteps,
-            trajectory_log_probs=trajectory_log_probs,
-            trajectory_decoded=trajectory_decoded,
             metrics=metrics or {},
             _multimodal_output=multimodal_output or {},
             _custom_output=custom_output or {},
@@ -255,7 +230,10 @@ class OmniRequestOutput:
     @property
     def num_images(self) -> int:
         """Return the number of generated images."""
-        return len(self.images)
+        assert self.final_output_type == "image", "num_images is only valid for image outputs"
+        assert "images" in self.multimodal_output, "multimodal_output must contain 'images' key for image outputs"
+        assert isinstance(self.multimodal_output["images"], list), "multimodal_output['images'] must be a list"
+        return len(self.multimodal_output["images"])
 
     # Pass-through properties keep vLLM serving codepaths compatible with
     # OmniRequestOutput for pipeline outputs (Issue #345).
@@ -312,7 +290,8 @@ class OmniRequestOutput:
     @property
     def is_diffusion_output(self) -> bool:
         """Check if this is a diffusion model output."""
-        return len(self.images) > 0 or self.final_output_type == "image"
+        raise NotImplementedError("is_diffusion_output is not implemented yet")
+        # return len(self.images) > 0 or self.final_output_type == "image"
 
     @property
     def is_pipeline_output(self) -> bool:
@@ -413,8 +392,6 @@ class OmniRequestOutput:
 
     def __repr__(self) -> str:
         """Custom repr to properly show image count instead of image objects."""
-        # For images, show count instead of full list
-        images_repr = f"[{len(self.images)} PIL Images]" if self.images else "[]"
 
         # Build repr string
         parts = [
@@ -423,9 +400,7 @@ class OmniRequestOutput:
             f"stage_id={self.stage_id}",
             f"final_output_type={self.final_output_type!r}",
             f"request_output={self.request_output}",
-            f"images={images_repr}",
             f"prompt={self.prompt!r}",
-            f"latents={self.latents}",
             f"metrics={self.metrics}",
             f"multimodal_output={self._multimodal_output}",
             f"custom_output={self._custom_output}",

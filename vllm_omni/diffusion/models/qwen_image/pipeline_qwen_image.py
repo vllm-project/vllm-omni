@@ -73,9 +73,11 @@ def get_qwen_image_post_process_func(
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
     def post_process_func(
-        images: torch.Tensor,
+        multimodal_output: dict[str, Any],
     ):
-        return image_processor.postprocess(images)
+        processed_images = image_processor.postprocess(multimodal_output["images"])
+        multimodal_output["images"] = processed_images
+        return multimodal_output
 
     return post_process_func
 

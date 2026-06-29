@@ -27,6 +27,7 @@ from vllm.v1.executor import Executor
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.output_modality import EngineOutputType
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -329,7 +330,7 @@ class StageMetadata:
 
     stage_id: int
     stage_type: Literal["llm", "diffusion"]
-    engine_output_type: str | None
+    engine_output_type: EngineOutputType | None
     is_comprehension: bool
     requires_multimodal_data: bool
     engine_input_source: list[int]

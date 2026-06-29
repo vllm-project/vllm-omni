@@ -27,7 +27,7 @@ GLM_IMAGE_PIPELINE = PipelineConfig(
             final_output=False,
             owns_tokenizer=True,
             model_arch="GlmImageForConditionalGeneration",
-            engine_output_type="token_ids",
+            engine_output_type="text",
             model_subdir="vision_language_encoder",
             tokenizer_subdir="processor",
         ),

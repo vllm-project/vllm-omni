@@ -42,7 +42,7 @@ MultimodalCompletionOutput = _mm_mod.MultimodalCompletionOutput
 
 
 def test_output_modality_parsing_and_flags():
-    """Test OutputModality enum: from_string, aliases, compounds, properties, and accumulation strategy."""
+    """Test OutputModality enum: from_string, compounds, properties, and accumulation strategy."""
     # Defaults
     assert OutputModality.from_string(None) == OutputModality.TEXT
     assert OutputModality.from_string("") == OutputModality.TEXT
@@ -50,11 +50,6 @@ def test_output_modality_parsing_and_flags():
     # Direct names and case insensitivity
     assert OutputModality.from_string("image") == OutputModality.IMAGE
     assert OutputModality.from_string("Audio") == OutputModality.AUDIO
-
-    # Aliases
-    assert OutputModality.from_string("speech") == OutputModality.AUDIO
-    assert OutputModality.from_string("latents") == OutputModality.LATENT
-    assert OutputModality.from_string("pixel_values") == OutputModality.IMAGE
 
     # Compound
     compound = OutputModality.from_string("text+image")
@@ -102,7 +97,7 @@ def test_multimodal_payload_and_completion_output():
 def test_output_modality_printed_examples(capsys):
     """Printed examples for output modality types."""
     print("\n=== OutputModality Parsing ===")
-    for s in [None, "", "image", "Audio", "speech", "latents", "pixel_values", "text+image"]:
+    for s in [None, "", "image", "latent", "Audio", "text+image"]:
         print(f"  from_string({s!r:20s}) -> {OutputModality.from_string(s)}")
 
     print("\n=== Flag Properties ===")

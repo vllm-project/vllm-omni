@@ -61,7 +61,7 @@ def _make_llm_plan(
         default_sampling_params=SimpleNamespace(),
         custom_process_input_func=None,
         engine_input_source=[],
-        engine_output_type="token_ids",
+        engine_output_type="text",
         replica_id=0,
     )
     return LogicalStageInitPlan(

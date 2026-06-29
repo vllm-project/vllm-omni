@@ -14,6 +14,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 
 import vllm_omni.model_executor.models as me_models
+from vllm_omni.engine.output_modality import EngineOutputType
 
 logger = init_logger(__name__)
 
@@ -124,7 +125,7 @@ class OmniModelConfig(ModelConfig):
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None
-    engine_output_type: str | None = None
+    engine_output_type: EngineOutputType | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(

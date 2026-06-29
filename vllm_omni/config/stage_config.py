@@ -21,6 +21,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.engine.output_modality import EngineOutputType
 
 logger = init_logger(__name__)
 
@@ -212,7 +213,7 @@ class StagePipelineConfig:
     owns_tokenizer: bool = False
     requires_multimodal_data: bool = False
     hf_config_name: str | None = None
-    engine_output_type: str | None = None
+    engine_output_type: EngineOutputType | None = None
     model_arch: str | None = None
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None

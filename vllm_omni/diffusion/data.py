@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any
 
 import diffusers
 import torch
-from PIL import Image
 from pydantic import Field, model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
@@ -1174,11 +1173,7 @@ class DiffusionOutput:
     """
 
     # Fields may be replaced with SHM handle dicts by ipc.pack_diffusion_output_shm
-    output: torch.Tensor | tuple[Any, ...] | dict[str, Any] | None = None
-    trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None
-    trajectory_latents: torch.Tensor | dict[str, Any] | None = None
-    trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
-    trajectory_decoded: list[Image.Image] | None = None
+    multimodal_output: dict[str, Any] | None = None
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
@@ -1220,10 +1215,9 @@ class DiffusionOutput:
                 return value.detach().cpu()
             return value
 
-        self.output = _maybe_to_cpu(self.output)
-        self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
-        self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
-        self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        for k in self.multimodal_output.keys() if self.multimodal_output else []:
+            self.multimodal_output[k] = _maybe_to_cpu(self.multimodal_output[k])
+
         if self.custom_output:
             self.custom_output = {k: _maybe_to_cpu(v) for k, v in self.custom_output.items()}
 
