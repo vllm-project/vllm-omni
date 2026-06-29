@@ -14,6 +14,7 @@ parameters come from the deploy yaml's ``model_config["ar_diffusion_kv_config"]`
 from __future__ import annotations
 
 import dataclasses
+import time
 from collections import OrderedDict
 
 import torch
@@ -66,6 +67,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # until the KV pool is exhausted. Evicting frees those blocks (state.close()).
         self._ar_diffusion_states: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._max_ar_diffusion_states = MAX_DREAMZERO_SESSIONS
+        # Per-request server-side forward E2E times (seconds), recorded in
+        # execute_model. This is the worker-side compute time — the analog of the
+        # upstream server's per-request E2E — and excludes the engine<->worker IPC
+        # that the client's omni.generate wall time includes. Read (and cleared)
+        # by the ar_diffusion_perf_stats worker RPC for the perf-compare summary.
+        self._perf_e2e_times: list[float] = []
 
     def build_kv_cache(
         self,
@@ -224,7 +231,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             kv.num_blocks,
         )
         self.pipeline._ar_diffusion_kv_state = state
+        # Time the worker-side forward (true per-request compute E2E). The CUDA
+        # sync below makes the stop reflect completed GPU work, not just dispatch.
+        _e2e_t0 = time.perf_counter()
         try:
-            return super().execute_model(req)
+            out = super().execute_model(req)
         finally:
             self.pipeline._ar_diffusion_kv_state = None
+        if self.device is not None and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        self._perf_e2e_times.append(time.perf_counter() - _e2e_t0)
+        return out
