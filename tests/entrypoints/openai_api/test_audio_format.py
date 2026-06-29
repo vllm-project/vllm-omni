@@ -133,7 +133,7 @@ class TestResolveAudioFormat:
         return object.__new__(OmniOpenAIServingChat)
 
     def _make_request(self, audio_params=None):
-        from vllm.entrypoints.openai.protocol import ChatCompletionRequest
+        from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 
         req = ChatCompletionRequest(
             model="test-model",
@@ -159,7 +159,7 @@ class TestResolveAudioFormat:
         assert result == "pcm"
 
     def test_invalid_format_returns_error(self, serving_chat):
-        from vllm.entrypoints.openai.protocol import ErrorResponse
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 
         request = self._make_request({"format": "aac", "voice": "alloy"})
         result = serving_chat._resolve_audio_format(request)
@@ -167,7 +167,7 @@ class TestResolveAudioFormat:
         assert "aac" in result.error.message
 
     def test_all_supported_formats_accepted(self, serving_chat):
-        from vllm.entrypoints.openai.protocol import ErrorResponse
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 
         for fmt in SUPPORTED_CHAT_AUDIO_FORMATS:
             request = self._make_request({"format": fmt, "voice": "alloy"})
