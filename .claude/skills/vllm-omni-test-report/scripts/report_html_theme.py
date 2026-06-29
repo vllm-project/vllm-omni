@@ -906,6 +906,203 @@ section.job-fail-bk h2 {
 }
 .btn-gh-open:hover { background: var(--accent-hover); filter: none; }
 /* Nightly report: Buildkite Test / Local Test outer cards + collapsible subcards */
+.nightly-focus {
+  border-top: 4px solid var(--accent);
+  background: linear-gradient(
+    180deg,
+    var(--dashboard-panel-bg) 0%,
+    color-mix(in srgb, var(--accent-tint) 65%, var(--dashboard-panel-bg)) 100%
+  );
+}
+.nightly-focus--fail {
+  border-top-color: var(--dashboard-alert);
+  background: linear-gradient(
+    180deg,
+    var(--dashboard-panel-bg) 0%,
+    color-mix(in srgb, var(--dashboard-alert-bg) 62%, var(--dashboard-panel-bg)) 100%
+  );
+}
+.nightly-focus--normal {
+  border-top-color: var(--dashboard-warning);
+  background: linear-gradient(
+    180deg,
+    var(--dashboard-panel-bg) 0%,
+    color-mix(in srgb, var(--dashboard-warning-bg) 58%, var(--dashboard-panel-bg)) 100%
+  );
+}
+.nightly-focus--ok {
+  border-top-color: var(--dashboard-healthy);
+  background: linear-gradient(
+    180deg,
+    var(--dashboard-panel-bg) 0%,
+    color-mix(in srgb, var(--dashboard-healthy-bg) 62%, var(--dashboard-panel-bg)) 100%
+  );
+}
+.nightly-focus--unknown {
+  border-top-color: var(--unknown-edge);
+}
+.nightly-focus .heading-ico {
+  color: var(--accent);
+}
+.nightly-focus--fail .heading-ico {
+  color: var(--dashboard-alert);
+}
+.nightly-focus--normal .heading-ico {
+  color: var(--dashboard-warning);
+}
+.nightly-focus--ok .heading-ico {
+  color: var(--dashboard-healthy);
+}
+.focus-conclusion {
+  margin: 0 0 0.9rem;
+  font-size: 1rem;
+  font-weight: 720;
+  color: var(--dashboard-text);
+}
+.focus-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 0.85rem;
+  margin: 0.85rem 0 1rem;
+}
+.focus-card {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  padding: 0.85rem 0.95rem;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--dashboard-panel-bg) 65%, transparent);
+}
+.focus-card--fail {
+  border-left: 4px solid var(--dashboard-alert);
+  background: color-mix(in srgb, var(--dashboard-alert-bg) 76%, var(--dashboard-panel-bg));
+}
+.focus-card--ok {
+  border-left: 4px solid var(--dashboard-healthy);
+  background: color-mix(in srgb, var(--dashboard-healthy-bg) 72%, var(--dashboard-panel-bg));
+}
+.focus-card-title {
+  color: var(--dashboard-muted);
+  font-size: 0.78rem;
+  font-weight: 760;
+  text-transform: uppercase;
+  letter-spacing: 0.035em;
+}
+.focus-card-value {
+  margin-top: 0.2rem;
+  font-size: 1.18rem;
+  font-weight: 820;
+  color: var(--dashboard-text);
+}
+.focus-card-detail {
+  margin-top: 0.15rem;
+  color: var(--dashboard-muted);
+  font-size: 0.84rem;
+}
+.focus-table-title {
+  margin: 1rem 0 0.45rem;
+  color: var(--dashboard-soft-text);
+  font-size: 1rem;
+}
+table.focus-table {
+  table-layout: fixed;
+  font-size: 0.86rem;
+  min-width: 980px;
+}
+table.focus-table th,
+table.focus-table td {
+  padding: 0.48rem 0.55rem;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  line-height: 1.35;
+}
+table.focus-table th:nth-child(1),
+table.focus-table td:nth-child(1) {
+  width: 5.8rem;
+}
+table.focus-table th:nth-child(2),
+table.focus-table td:nth-child(2) {
+  width: 13rem;
+}
+table.focus-table th:nth-child(3),
+table.focus-table td:nth-child(3) {
+  width: 6.8rem;
+}
+table.focus-table th:nth-child(4),
+table.focus-table td:nth-child(4) {
+  width: 12rem;
+}
+table.focus-table th:nth-child(5),
+table.focus-table td:nth-child(5) {
+  width: 12rem;
+}
+table.focus-table th:nth-child(6),
+table.focus-table td:nth-child(6) {
+  width: 8rem;
+}
+table.focus-table th:nth-child(7),
+table.focus-table td:nth-child(7),
+table.focus-table th:nth-child(8),
+table.focus-table td:nth-child(8),
+table.focus-table th:nth-child(9),
+table.focus-table td:nth-child(9) {
+  width: 6.4rem;
+  text-align: right;
+  white-space: nowrap;
+}
+table.focus-table th:nth-child(10),
+table.focus-table td:nth-child(10) {
+  width: 5rem;
+  white-space: nowrap;
+}
+.focus-filter-scope .table-scroll {
+  max-height: 13rem;
+  overflow: auto;
+}
+.focus-filter-scope--expanded .table-scroll {
+  max-height: none;
+}
+.focus-filter-scope table.focus-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.focus-model-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.7rem;
+  max-width: min(58rem, 100%);
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid color-mix(in srgb, var(--dashboard-border) 82%, var(--ci) 18%);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--dashboard-panel-bg) 86%, var(--ci-soft) 14%);
+}
+.focus-model-filter legend {
+  padding: 0 0.25rem;
+  color: var(--dashboard-muted);
+  font-size: 0.78rem;
+  font-weight: 760;
+}
+.focus-model-filter legend span {
+  font-weight: 520;
+}
+.focus-model-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-width: 18rem;
+  color: var(--dashboard-text);
+  font-size: 0.82rem;
+  font-weight: 640;
+}
+.focus-model-check input {
+  margin: 0;
+  flex-shrink: 0;
+}
+.focus-model-check span {
+  overflow-wrap: anywhere;
+}
 .nightly-root.panel {
   margin-bottom: 1.35rem;
 }
@@ -1120,7 +1317,8 @@ details.local-summary-dim[open] > summary.local-summary-dim-summary::before {
   font-weight: 720;
   color: var(--dashboard-muted);
 }
-.perf-filter-select {
+.perf-filter-select,
+.perf-filter-input {
   min-height: 2rem;
   max-width: min(22rem, 70vw);
   padding: 0.35rem 2rem 0.35rem 0.55rem;
@@ -1130,9 +1328,25 @@ details.local-summary-dim[open] > summary.local-summary-dim-summary::before {
   color: var(--dashboard-text);
   font: inherit;
 }
-.perf-filter-select:focus {
+.perf-filter-select:focus,
+.perf-filter-input:focus {
   outline: 2px solid color-mix(in srgb, var(--ci) 45%, transparent);
   outline-offset: 2px;
+}
+.focus-expand-btn {
+  min-height: 2rem;
+  padding: 0.35rem 0.85rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--dashboard-border));
+  border-radius: 0.55rem;
+  background: color-mix(in srgb, var(--accent-tint) 72%, var(--dashboard-panel-bg));
+  color: var(--accent-hover);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 720;
+}
+.focus-expand-btn:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-tint) 45%, var(--dashboard-panel-bg));
 }
 .perf-filter-table td,
 .perf-filter-table th {

@@ -25,7 +25,10 @@ from typing import Any
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
-from kanban_assets_perf_summary import build_assets_perf_summary  # noqa: E402
+from kanban_assets_perf_summary import (  # noqa: E402
+    _empty_perf_status_counts,
+    build_assets_perf_summary,
+)
 from kanban_repo_config import KANBAN_REPO_URL  # noqa: E402
 from laptop_path_defaults import (  # noqa: E402
     DEFAULT_KANBAN_REPO_ROOT_DISPLAY,
@@ -476,22 +479,46 @@ def _github_issue_submit_script() -> str:
   }});
 
   function applyPerfFilters(scope) {{
-    var testSel = scope.querySelector('select[data-filter-key="test"]');
-    var metricSel = scope.querySelector('select[data-filter-key="metric"]');
-    var statusSel = scope.querySelector('select[data-filter-key="status"]');
+    var controls = Array.prototype.slice.call(
+      scope.querySelectorAll("select[data-filter-key], input[data-filter-key]")
+    );
     var rows = scope.querySelectorAll('tr[data-perf-row="1"]');
     var empty = scope.querySelector("[data-perf-empty]");
-    if (!testSel || !metricSel || !statusSel || !rows.length) return;
+    if (!controls.length || !rows.length) return;
 
-    var testVal = testSel.value || "";
-    var metricVal = metricSel.value || "";
-    var statusVal = statusSel.value || "";
+    var scalarControls = [];
+    var checkboxGroups = {{}};
+    controls.forEach(function (control) {{
+      var key = control.getAttribute("data-filter-key") || "";
+      if (!key) return;
+      if (control.type === "checkbox") {{
+        if (!checkboxGroups[key]) checkboxGroups[key] = [];
+        if (control.checked) checkboxGroups[key].push(control.value || "");
+      }} else {{
+        scalarControls.push(control);
+      }}
+    }});
+
     var visibleCount = 0;
     rows.forEach(function (row) {{
       var ok = true;
-      if (testVal && row.getAttribute("data-test") !== testVal) ok = false;
-      if (metricVal && row.getAttribute("data-metric") !== metricVal) ok = false;
-      if (statusVal && row.getAttribute("data-status") !== statusVal) ok = false;
+      scalarControls.forEach(function (control) {{
+        var key = control.getAttribute("data-filter-key") || "";
+        var val = (control.value || "").trim();
+        var rowVal = row.getAttribute("data-" + key) || "";
+        if (!val) return;
+        if (control.tagName.toLowerCase() === "input") {{
+          if (rowVal.toLowerCase().indexOf(val.toLowerCase()) === -1) ok = false;
+        }} else if (rowVal !== val) {{
+          ok = false;
+        }}
+      }});
+      Object.keys(checkboxGroups).forEach(function (key) {{
+        var vals = checkboxGroups[key] || [];
+        if (vals.length && vals.indexOf(row.getAttribute("data-" + key) || "") === -1) {{
+          ok = false;
+        }}
+      }});
       row.hidden = !ok;
       if (ok) visibleCount += 1;
     }});
@@ -501,9 +528,17 @@ def _github_issue_submit_script() -> str:
   }}
 
   document.querySelectorAll("[data-perf-filter-scope]").forEach(function (scope) {{
-    scope.querySelectorAll("select[data-filter-key]").forEach(function (sel) {{
-      sel.addEventListener("change", function () {{
+    scope.querySelectorAll("select[data-filter-key], input[data-filter-key]").forEach(function (control) {{
+      var eventName = control.tagName.toLowerCase() === "input" && control.type !== "checkbox" ? "input" : "change";
+      control.addEventListener(eventName, function () {{
         applyPerfFilters(scope);
+      }});
+    }});
+    scope.querySelectorAll("[data-focus-expand]").forEach(function (btn) {{
+      btn.addEventListener("click", function () {{
+        var expanded = scope.classList.toggle("focus-filter-scope--expanded");
+        btn.setAttribute("aria-expanded", expanded ? "true" : "false");
+        btn.textContent = expanded ? "收起表格" : "展开表格";
       }});
     }});
     applyPerfFilters(scope);
@@ -1244,6 +1279,325 @@ _PERF_TABLE_HEADERS = [
 ]
 
 
+@dataclass
+class NightlyFocusItem:
+    """One baseline-backed performance row promoted to the top-level nightly focus."""
+
+    source: str
+    model: str
+    model_type: str
+    config: str
+    test: str
+    metric: str
+    latest: Any
+    baseline: Any
+    vs_baseline_pct: Any
+    status: str
+
+
+def _job_kind_counts(kinds: list[str]) -> dict[str, int]:
+    out = {"total": len(kinds), "ok": 0, "fail": 0, "unknown": 0}
+    for kind in kinds:
+        key = kind if kind in ("ok", "fail", "unknown") else "unknown"
+        out[key] += 1
+    return out
+
+
+def _buildkite_job_counts(bk_jobs: list[dict[str, Any]] | None) -> dict[str, int]:
+    if bk_jobs is None:
+        return {"total": 0, "ok": 0, "fail": 0, "unknown": 0}
+    return _job_kind_counts([_summary_row_kind_bk(rec) for rec in bk_jobs])
+
+
+def _local_job_counts(
+    job_rows: list[tuple[str, list[Path], dict[str, Any]]],
+) -> dict[str, int]:
+    return _job_kind_counts([_summary_row_kind(info) for _, _, info in job_rows])
+
+
+def _perf_counts(summary: dict[str, Any]) -> dict[str, int]:
+    counts = _empty_perf_status_counts()
+    for key, value in (summary.get("summary") or {}).items():
+        if key in counts:
+            counts[key] = int(value or 0)
+    return counts
+
+
+def _focus_item_from_perf_row(source: str, row: Any) -> NightlyFocusItem:
+    if isinstance(row, dict):
+        get_value = row.get
+    else:
+
+        def get_value(key, default=None):
+            return getattr(row, key, default)
+
+    return NightlyFocusItem(
+        source=source,
+        model=str(get_value("model", "") or "unknown"),
+        model_type=str(get_value("model_type", "") or ""),
+        config=str(get_value("config_view", "") or ""),
+        test=str(get_value("test_name", "") or ""),
+        metric=str(get_value("metric", "") or ""),
+        latest=get_value("latest"),
+        baseline=get_value("baseline"),
+        vs_baseline_pct=get_value("vs_baseline_pct"),
+        status=str(get_value("status", "") or "n/a"),
+    )
+
+
+def _focus_item_sort_key(item: NightlyFocusItem) -> tuple[int, float, str, str]:
+    status_rank = {"fail": 0, "normal": 1, "n/a": 2, "pass": 3}
+    pct = _as_num(item.vs_baseline_pct)
+    if pct is None:
+        pct = 999999.0
+    return (status_rank.get(item.status, 4), pct, item.source, item.model)
+
+
+def _focus_perf_items(
+    bk_perf_summary: dict[str, Any],
+    local_perf_summary: dict[str, Any],
+) -> list[NightlyFocusItem]:
+    items: list[NightlyFocusItem] = []
+    for row in bk_perf_summary.get("rows", []) or []:
+        items.append(_focus_item_from_perf_row("Buildkite", row))
+    for row in local_perf_summary.get("rows", []) or []:
+        items.append(_focus_item_from_perf_row("Local", row))
+    return items
+
+
+def _select_focus_perf_items(items: list[NightlyFocusItem]) -> tuple[str, list[NightlyFocusItem]]:
+    failed = sorted(
+        [item for item in items if item.status == "fail"],
+        key=_focus_item_sort_key,
+    )
+    if failed:
+        return "fail", failed
+    normal = sorted(
+        [item for item in items if item.status == "normal"],
+        key=_focus_item_sort_key,
+    )
+    if normal:
+        return "normal", normal[:3]
+    return "empty", []
+
+
+def _focus_perf_table_rows(items: list[NightlyFocusItem]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for item in items:
+        rows.append(
+            [
+                _md_cell(item.source),
+                _md_cell(item.model),
+                _md_cell(item.model_type),
+                _md_cell(item.config),
+                _md_cell(item.test),
+                _md_cell(item.metric),
+                _perf_num(item.latest),
+                _perf_num(item.baseline),
+                _perf_pct(item.vs_baseline_pct),
+                _md_cell(item.status),
+            ]
+        )
+    return rows
+
+
+def _render_focus_perf_table_html(items: list[NightlyFocusItem]) -> str:
+    models = sorted({item.model for item in items if item.model})
+    model_checks = []
+    for model in models:
+        val = html.escape(model, quote=True)
+        model_checks.append(
+            '<label class="focus-model-check">'
+            f'<input type="checkbox" data-filter-key="model" value="{val}">'
+            f"<span>{html.escape(model)}</span></label>"
+        )
+    parts: list[str] = [
+        '<div class="perf-filter-scope focus-filter-scope" data-perf-filter-scope="daily-focus-regressions">',
+        '<div class="perf-filter-bar focus-filter-bar">',
+        '<fieldset class="focus-model-filter"><legend>Model <span>不勾选 = All</span></legend>',
+        "".join(model_checks),
+        "</fieldset>",
+        '<button type="button" class="focus-expand-btn" data-focus-expand="0" aria-expanded="false">展开表格</button>',
+        "</div>",
+        '<div class="table-scroll">',
+        '<table class="summary focus-table">',
+        "<thead><tr>",
+    ]
+    headers = ["Source", "Model", "Type", "Config", "Test", "Metric", "latest", "baseline", "vs baseline", "Status"]
+    for header in headers:
+        parts.append(f"<th>{html.escape(header)}</th>")
+    parts.append("</tr></thead><tbody>")
+    for item, row in zip(items, _focus_perf_table_rows(items)):
+        model = html.escape(item.model, quote=True)
+        row_class = "summary-row--fail" if item.status == "fail" else "summary-row--unknown"
+        parts.append(f'<tr class="{row_class}" data-perf-row="1" data-model="{model}">')
+        for cell in row:
+            parts.append(f"<td>{html.escape(cell)}</td>")
+        parts.append("</tr>")
+    parts.extend(
+        [
+            "</tbody></table></div>",
+            '<p class="note perf-filter-empty" data-perf-empty hidden>No rows match filters.</p>',
+            "</div>",
+        ]
+    )
+    return "\n".join(parts)
+
+
+def _daily_focus_data(
+    *,
+    bk_jobs: list[dict[str, Any]] | None,
+    local_job_rows: list[tuple[str, list[Path], dict[str, Any]]],
+    kanban_cfg: KanbanAssetsConfig,
+    log_dir: Path,
+) -> dict[str, Any]:
+    bk_perf_summary, _ = _buildkite_perf_rows(kanban_cfg)
+    local_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
+    focus_items = _focus_perf_items(bk_perf_summary, local_perf_summary)
+    focus_kind, top_items = _select_focus_perf_items(focus_items)
+    bk_job_counts = _buildkite_job_counts(bk_jobs)
+    local_job_counts = _local_job_counts(local_job_rows)
+    bk_perf_counts = _perf_counts(bk_perf_summary)
+    local_perf_counts = _perf_counts(local_perf_summary)
+    job_fail_count = int(bk_job_counts["fail"]) + int(local_job_counts["fail"])
+    perf_fail_count = int(bk_perf_counts["fail"]) + int(local_perf_counts["fail"])
+    if job_fail_count or perf_fail_count:
+        conclusion = f"需要关注：发现 {job_fail_count} 个测试失败/异常，{perf_fail_count} 条大型性能下降。"
+        severity = "fail"
+    elif focus_kind == "normal":
+        conclusion = "未发现大型性能下降；下方列出轻微波动观察项。"
+        severity = "normal"
+    elif focus_items:
+        conclusion = "未发现大型性能下降。"
+        severity = "ok"
+    else:
+        conclusion = "未发现可判定的大型性能下降；baseline 数据缺失或为空。"
+        severity = "unknown"
+    return {
+        "conclusion": conclusion,
+        "severity": severity,
+        "focus_kind": focus_kind,
+        "top_items": top_items,
+        "bk_job_counts": bk_job_counts,
+        "local_job_counts": local_job_counts,
+        "bk_perf_counts": bk_perf_counts,
+        "local_perf_counts": local_perf_counts,
+        "bk_perf_status": bk_perf_summary.get("status", ""),
+        "local_perf_status": local_perf_summary.get("status", ""),
+        "bk_perf_message": bk_perf_summary.get("message", ""),
+        "local_perf_message": local_perf_summary.get("message", ""),
+    }
+
+
+def _render_focus_metric_card(title: str, value: str, detail: str, severity: str) -> str:
+    return (
+        f'<div class="focus-card focus-card--{html.escape(severity)}">'
+        f'<div class="focus-card-title">{html.escape(title)}</div>'
+        f'<div class="focus-card-value">{html.escape(value)}</div>'
+        f'<div class="focus-card-detail">{html.escape(detail)}</div>'
+        "</div>"
+    )
+
+
+def _render_daily_focus_html(data: dict[str, Any]) -> str:
+    bk_jobs = data["bk_job_counts"]
+    local_jobs = data["local_job_counts"]
+    bk_perf = data["bk_perf_counts"]
+    local_perf = data["local_perf_counts"]
+    cards = [
+        _render_focus_metric_card(
+            "Buildkite jobs",
+            f"{int(bk_jobs['fail'])}/{int(bk_jobs['total'])} failed",
+            f"ok={int(bk_jobs['ok'])}, unknown={int(bk_jobs['unknown'])}",
+            "fail" if bk_jobs["fail"] else "ok",
+        ),
+        _render_focus_metric_card(
+            "Local jobs",
+            f"{int(local_jobs['fail'])}/{int(local_jobs['total'])} failed",
+            f"ok={int(local_jobs['ok'])}, unknown={int(local_jobs['unknown'])}",
+            "fail" if local_jobs["fail"] else "ok",
+        ),
+        _render_focus_metric_card(
+            "Buildkite perf",
+            f"{int(bk_perf['fail'])} fail",
+            f"pass={int(bk_perf['pass'])}, normal={int(bk_perf['normal'])}, n/a={int(bk_perf['n/a'])}",
+            "fail" if bk_perf["fail"] else "ok",
+        ),
+        _render_focus_metric_card(
+            "Local perf",
+            f"{int(local_perf['fail'])} fail",
+            f"pass={int(local_perf['pass'])}, normal={int(local_perf['normal'])}, n/a={int(local_perf['n/a'])}",
+            "fail" if local_perf["fail"] else "ok",
+        ),
+    ]
+    parts: list[str] = [
+        f'<section class="panel nightly-focus nightly-focus--{html.escape(str(data["severity"]))}">',
+        _heading_html(
+            "h2",
+            _SVG_SPARK,
+            html.escape("今日重点"),
+            sub=html.escape("Performance regressions and test failures"),
+        ),
+        f'<p class="focus-conclusion">{html.escape(str(data["conclusion"]))}</p>',
+        '<div class="focus-card-grid">',
+        "\n".join(cards),
+        "</div>",
+    ]
+    top_items: list[NightlyFocusItem] = data.get("top_items") or []
+    if top_items:
+        label = "全部重点性能下降" if data.get("focus_kind") == "fail" else "轻微波动观察项"
+        parts.extend(
+            [
+                f'<h3 class="focus-table-title">{html.escape(label)}</h3>',
+                _render_focus_perf_table_html(top_items),
+            ]
+        )
+    else:
+        notes = []
+        if data.get("bk_perf_status") != "ok" and data.get("bk_perf_message"):
+            notes.append(f"Buildkite perf: {data['bk_perf_message']}")
+        if data.get("local_perf_status") != "ok" and data.get("local_perf_message"):
+            notes.append(f"Local perf: {data['local_perf_message']}")
+        if notes:
+            parts.append(
+                '<div class="note"><strong>数据提示:</strong><ul>'
+                + "".join(f"<li>{html.escape(str(note))}</li>" for note in notes)
+                + "</ul></div>"
+            )
+        else:
+            parts.append('<p class="note">没有需要置顶展示的性能下降项。</p>')
+    parts.append("</section>")
+    return "\n".join(parts)
+
+
+def _append_daily_focus_markdown(lines: list[str], data: dict[str, Any]) -> None:
+    lines.append("## 今日重点")
+    lines.append("")
+    lines.append(f"- **结论:** {_md_cell(str(data['conclusion']))}")
+    bk_jobs = data["bk_job_counts"]
+    local_jobs = data["local_job_counts"]
+    bk_perf = data["bk_perf_counts"]
+    local_perf = data["local_perf_counts"]
+    lines.append(
+        f"- **测试失败:** Buildkite `{int(bk_jobs['fail'])}/{int(bk_jobs['total'])}`，"
+        f"Local `{int(local_jobs['fail'])}/{int(local_jobs['total'])}`"
+    )
+    lines.append(f"- **性能 fail:** Buildkite `{int(bk_perf['fail'])}`，Local `{int(local_perf['fail'])}`")
+    lines.append("")
+    top_items: list[NightlyFocusItem] = data.get("top_items") or []
+    if top_items:
+        title = "### 全部重点性能下降" if data.get("focus_kind") == "fail" else "### 轻微波动观察项"
+        lines.append(title)
+        lines.append("")
+        lines.append(
+            render_markdown_table(
+                ["Source", "Model", "Type", "Config", "Test", "Metric", "latest", "baseline", "vs baseline", "Status"],
+                _focus_perf_table_rows(top_items),
+            )
+        )
+        lines.append("")
+
+
 def _render_perf_model_table_html(table_id: str, rows: list[list[str]]) -> str:
     """Render one model performance table with per-table dropdown filters."""
     tests = sorted({r[2] for r in rows if len(r) > 2 and r[2]})
@@ -1713,6 +2067,17 @@ def emit_report(
         "",
     ]
 
+    job_rows = _local_job_rows_with_info(groups) if groups else []
+    _append_daily_focus_markdown(
+        lines,
+        _daily_focus_data(
+            bk_jobs=bk_jobs,
+            local_job_rows=job_rows,
+            kanban_cfg=kanban_cfg,
+            log_dir=log_dir,
+        ),
+    )
+
     _append_buildkite_markdown(lines, bk_build, bk_jobs, bk_note, kanban_cfg)
 
     lines.append("## Local cluster (nightly_jobs)")
@@ -1729,8 +2094,6 @@ def emit_report(
         _append_local_perf_baseline_markdown(lines, kanban_cfg, log_dir=log_dir)
         print("\n".join(lines), file=out_fp)
         return
-
-    job_rows = _local_job_rows_with_info(groups)
 
     lines.append("### Summary")
     lines.append("")
@@ -2148,6 +2511,20 @@ def emit_report_html(
         '<div class="shell">',
     ]
 
+    job_rows: list[tuple[str, list[Path], dict[str, Any]]] = []
+    if groups:
+        job_rows = _local_job_rows_with_info(groups)
+    body_parts.append(
+        _render_daily_focus_html(
+            _daily_focus_data(
+                bk_jobs=bk_jobs,
+                local_job_rows=job_rows,
+                kanban_cfg=kanban_cfg,
+                log_dir=log_dir,
+            )
+        )
+    )
+
     body_parts.append(
         _render_buildkite_section_html(
             bk_build,
@@ -2173,7 +2550,6 @@ def emit_report_html(
             "and match references/nightly-local-log-layout.md.</p>"
         )
     else:
-        job_rows = _local_job_rows_with_info(groups)
         summary_body = _render_local_summary_grouped_html(job_rows)
     local_chunks.append(
         _details_subcard(
