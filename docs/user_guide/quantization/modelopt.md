@@ -34,13 +34,24 @@ and the quantization algorithm must be one of the validated algorithms below.
 |------------------|-----------------|
 | `method` / `quant_method` | `modelopt`, `modelopt_fp4`, `modelopt_mixed` |
 | `producer.name` | `modelopt` |
-| `quant_algo` | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `NVFP4`, `MIXED_PRECISION` |
+| `quant_algo` | One of the runtime algorithms listed below |
 
 | `quant_algo` | Runtime method | Typical use |
 |--------------|----------------|-------------|
-| `FP8`, `FP8_PER_CHANNEL_PER_TOKEN` | `modelopt` | FP8 diffusion transformer checkpoints |
-| `NVFP4` | `modelopt_fp4` | NVFP4 diffusion transformer checkpoints |
-| `MIXED_PRECISION` | `modelopt_mixed` | Mixed FP8/NVFP4 checkpoints with a ModelOpt per-layer policy |
+| `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_PB_WO` | `modelopt` | FP8 diffusion transformer checkpoints |
+| `NVFP4`, `NVFP4_LOCAL_HESSIAN`, `NVFP4_MSE_FP8_SWEEP` | `modelopt_fp4` | Standard-runtime NVFP4 checkpoints |
+| `NVFP4_AWQ`, `NVFP4_AWQ_LITE`, `NVFP4_AWQ_CLIP`, `NVFP4_AWQ_FULL` | `modelopt_fp4` | NVFP4 with a ModelOpt pre-quantization scale |
+| `NVFP4_SVD`, `NVFP4_SVDQUANT` | `modelopt_fp4` | TP=1 NVFP4 with a ModelOpt low-rank residual |
+| `W4A16_NVFP4` | `modelopt_fp4` | Weight-only NVFP4 checkpoints |
+| `MIXED_PRECISION` | `modelopt_mixed` | ModelOpt AutoQuant or manually selected mixed checkpoints |
+
+ModelOpt AutoQuant exports its selected per-layer policy as
+`quant_algo: MIXED_PRECISION` with a `quantized_layers` mapping. vLLM-Omni
+uses that mapping at model construction time: FP8 layers use the ModelOpt FP8
+runtime, NVFP4-family layers use their matching ModelOpt NVFP4 runtime, and
+omitted or explicitly BF16 layers remain unquantized. Candidate selection and
+checkpoint export happen in ModelOpt before the checkpoint is loaded by
+vLLM-Omni.
 
 For multi-component diffusion or omni models, only the checkpoint component
 that contains ModelOpt quantized weights should use the ModelOpt quantization

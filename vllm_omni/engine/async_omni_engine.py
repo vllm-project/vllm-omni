@@ -1028,6 +1028,7 @@ class AsyncOmniEngine:
             "diffusion_kv_cache_skip_layers": kwargs.get("diffusion_kv_cache_skip_layers", None),
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
+            "linear_backend": kwargs.get("linear_backend", None),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
             "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
@@ -1209,6 +1210,13 @@ class AsyncOmniEngine:
                 if quantization is not None:
                     if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
                         cfg.engine_args.quantization = quantization
+                linear_backend = kwargs.get("linear_backend")
+                if linear_backend is not None:
+                    if not hasattr(cfg.engine_args, "linear_backend") or cfg.engine_args.linear_backend in (
+                        None,
+                        "auto",
+                    ):
+                        cfg.engine_args.linear_backend = linear_backend
                 diffusion_kv_cache_dtype = kwargs.get("diffusion_kv_cache_dtype")
                 if diffusion_kv_cache_dtype is not None:
                     if (

@@ -136,6 +136,16 @@ def _is_unexpected_additional_config_type_error(exc: TypeError) -> bool:
     return "unexpected keyword argument" in message and "additional_config" in message
 
 
+def _apply_diffusion_kernel_overrides(
+    vllm_config: VllmConfig,
+    od_config: OmniDiffusionConfig,
+) -> None:
+    linear_backend = getattr(od_config, "linear_backend", None)
+    if linear_backend and linear_backend != "auto":
+        vllm_config.kernel_config.linear_backend = linear_backend
+        logger.info("Using diffusion linear backend override: %s", linear_backend)
+
+
 def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDiffusionConfig) -> VllmConfig:
     """Create a worker-local VllmConfig while preserving additional_config when supported."""
     config_kwargs: dict[str, Any] = {
@@ -146,7 +156,9 @@ def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDi
         config_kwargs["additional_config"] = od_config.additional_config
 
     try:
-        return VllmConfig(**config_kwargs)
+        vllm_config = VllmConfig(**config_kwargs)
+        _apply_diffusion_kernel_overrides(vllm_config, od_config)
+        return vllm_config
     except TypeError as exc:
         if not _is_unexpected_additional_config_type_error(exc):
             raise
@@ -158,6 +170,7 @@ def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDi
             setattr(vllm_config, "additional_config", dict(od_config.additional_config))
         except Exception as set_exc:  # pragma: no cover - defensive for older vLLM builds
             logger.warning("Failed to attach additional_config to worker VllmConfig: %s", set_exc)
+        _apply_diffusion_kernel_overrides(vllm_config, od_config)
         return vllm_config
 
 

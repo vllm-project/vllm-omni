@@ -2,10 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the unified quantization framework."""
 
+from types import SimpleNamespace
+
 import pytest
 from torch import nn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+class _FakeQuantConfig:
+    def __init__(self, name: str, **attrs: object) -> None:
+        self._name = name
+        for attr_name, value in attrs.items():
+            setattr(self, attr_name, value)
+
+    def get_name(self) -> str:
+        return self._name
 
 
 def test_build_quant_config_fp8():
@@ -71,6 +83,115 @@ def test_build_quant_config_modelopt_fp8_config_json():
     assert isinstance(config, ModelOptFp8Config)
     assert config.get_name() == "modelopt"
     assert config.is_checkpoint_fp8_serialized
+
+
+@pytest.mark.parametrize(
+    ("quant_algo", "expected_name", "serialized_attr"),
+    [
+        ("FP8_PB_WO", "modelopt", "is_checkpoint_fp8_serialized"),
+        ("NVFP4_AWQ", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+        ("NVFP4_AWQ_LITE", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+        ("NVFP4_AWQ_CLIP", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+        ("NVFP4_AWQ_FULL", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+        ("NVFP4_LOCAL_HESSIAN", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+        ("NVFP4_MSE_FP8_SWEEP", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+        ("NVFP4_SVD", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+        ("NVFP4_SVDQUANT", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+        ("W4A16_NVFP4", "modelopt_fp4", "is_checkpoint_nvfp4_serialized"),
+    ],
+)
+def test_build_quant_config_modelopt_new_quant_algos(
+    quant_algo: str,
+    expected_name: str,
+    serialized_attr: str,
+):
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": quant_algo,
+            "producer": {"name": "modelopt"},
+        }
+    )
+
+    assert config.get_name() == expected_name
+    assert getattr(config, serialized_attr)
+
+
+def test_build_quant_config_modelopt_mixed_precision_config_json():
+    from vllm_omni.quantization import build_quant_config
+
+    quantized_layers = {
+        "transformer.block.to_q": {"quant_algo": "NVFP4_AWQ"},
+        "transformer.block.to_out": {"quant_algo": "FP8_PB_WO"},
+    }
+
+    config = build_quant_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "producer": {"name": "modelopt"},
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": quantized_layers,
+            },
+        }
+    )
+
+    assert config.get_name() == "modelopt_mixed"
+    assert config.is_checkpoint_mixed_precision_serialized
+    assert config.quantized_layers == quantized_layers
+
+
+@pytest.mark.parametrize(
+    "generic_config",
+    [
+        "modelopt_mixed",
+        {"method": "modelopt_mixed"},
+        _FakeQuantConfig("modelopt_mixed"),
+    ],
+    ids=["string", "dict", "object"],
+)
+def test_omni_diffusion_config_propagates_modelopt_mixed_checkpoint_config(
+    generic_config: object,
+):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    checkpoint_config = _FakeQuantConfig(
+        "modelopt_mixed",
+        is_checkpoint_mixed_precision_serialized=True,
+    )
+    config = OmniDiffusionConfig(model="test")
+    config.quantization_config = generic_config
+    config.set_tf_model_config(
+        SimpleNamespace(
+            quant_config=checkpoint_config,
+            quant_method="modelopt_mixed",
+        )
+    )
+
+    assert config.quantization_config is checkpoint_config
+
+
+def test_omni_diffusion_config_keeps_generic_mixed_when_checkpoint_is_online():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    generic_config = _FakeQuantConfig("modelopt_mixed")
+    online_config = _FakeQuantConfig(
+        "modelopt_mixed",
+        is_checkpoint_mixed_precision_serialized=False,
+    )
+    config = OmniDiffusionConfig(model="test")
+    config.quantization_config = generic_config
+    config.set_tf_model_config(
+        SimpleNamespace(
+            quant_config=online_config,
+            quant_method="modelopt_mixed",
+        )
+    )
+
+    assert config.quantization_config is generic_config
 
 
 def test_build_quant_config_per_component():

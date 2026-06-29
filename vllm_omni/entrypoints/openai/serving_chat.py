@@ -67,8 +67,12 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.engine.serving import ChatLikeRequest, clamp_prompt_logprobs
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
-    parse_chat_output,
 )
+
+try:
+    from vllm.entrypoints.openai.parser.harmony_utils import parse_chat_output
+except ImportError:
+    parse_chat_output = None
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
@@ -2256,7 +2260,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning, content, _ = parse_chat_output(token_ids)
+                if parse_chat_output is None:
+                    reasoning = None
+                    content = tokenizer.decode(token_ids)
+                else:
+                    reasoning, content, _ = parse_chat_output(token_ids)
                 if not request.include_reasoning:
                     reasoning = None
 

@@ -7,7 +7,19 @@ from itertools import chain
 from typing import TYPE_CHECKING
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.utils.torch_utils import supports_xccl
+
+try:
+    from vllm.utils.torch_utils import supports_xccl
+except ImportError:
+    import torch
+
+    def supports_xccl() -> bool:
+        return (
+            torch.distributed.is_available()
+            and hasattr(torch.distributed, "is_xccl_available")
+            and torch.distributed.is_xccl_available()
+        )
+
 
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_omni.plugins import (
