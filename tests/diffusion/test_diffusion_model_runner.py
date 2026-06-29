@@ -124,6 +124,14 @@ def _make_request_with_params(req_id: str, sampling_params):
     )
 
 
+def _fake_platform_for_peak_memory():
+    return SimpleNamespace(
+        reset_peak_memory_stats=lambda: None,
+        max_memory_reserved=lambda: 0,
+        max_memory_allocated=lambda: 0,
+    )
+
+
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -280,7 +288,6 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 def test_execute_model_passes_single_request_batch_to_non_admission_pipeline(monkeypatch):
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.pipeline = _SingleRequestBatchPipeline()
-    runner._record_peak_memory = lambda output: None
     req = _make_request(skip_cache_refresh=True)
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
@@ -297,7 +304,6 @@ def test_execute_model_passes_single_request_batch_to_non_admission_pipeline(mon
 def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipeline(monkeypatch):
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.pipeline = _SingleRequestDiffusionOutputPipeline()
-    runner._record_peak_memory = lambda output: None
     req = _make_request(skip_cache_refresh=True)
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
@@ -351,7 +357,6 @@ def _make_batch_runner(pipeline):
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
     )
-    runner._record_peak_memory = lambda output: None
     return runner
 
 
@@ -368,9 +373,7 @@ def test_execute_model_batch_rejects_output_count_mismatch(monkeypatch):
     """A pipeline returning the wrong number of outputs must fail loudly,
     not silently drop requests or IndexError on the per-request mapping."""
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(
-        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
-    )
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
     # forward returns 1 output for 2 scheduled requests
     runner = _make_batch_runner(_BatchPipeline(outputs=[DiffusionOutput(output="only-one")]))
     sched = _make_scheduler_output(num_reqs=2)
@@ -383,9 +386,7 @@ def test_execute_model_batch_rejects_output_count_mismatch(monkeypatch):
 @pytest.mark.cpu
 def test_execute_model_batch_routes_one_output_per_request(monkeypatch):
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(
-        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
-    )
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
     outs = [DiffusionOutput(output="a"), DiffusionOutput(output="b")]
     runner = _make_batch_runner(_BatchPipeline(outputs=outs))
     sched = _make_scheduler_output(num_reqs=2)
@@ -403,9 +404,7 @@ def test_execute_model_batch_routes_one_output_per_request(monkeypatch):
 @pytest.mark.cpu
 def test_execute_model_batch_preserves_per_request_sampling_and_seeds_generators(monkeypatch):
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(
-        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
-    )
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
     outputs = [DiffusionOutput(output="a"), DiffusionOutput(output="b")]
     pipeline = _BatchPipeline(outputs=outputs)
     runner = _make_batch_runner(pipeline)
@@ -426,9 +425,7 @@ def test_execute_model_batch_preserves_per_request_sampling_and_seeds_generators
 @pytest.mark.cpu
 def test_execute_model_batch_rejects_pipeline_without_request_batch_support(monkeypatch):
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(
-        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
-    )
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
     runner = _make_batch_runner(_SingleRequestPipeline())
     sched = _make_scheduler_output(num_reqs=2)
 
@@ -440,9 +437,7 @@ def test_execute_model_batch_rejects_pipeline_without_request_batch_support(monk
 @pytest.mark.cpu
 def test_execute_model_batch_rejects_single_diffusion_output(monkeypatch):
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(
-        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
-    )
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
     runner = _make_batch_runner(_BatchSingleOutputPipeline())
     sched = _make_scheduler_output(num_reqs=1)
 
@@ -454,9 +449,7 @@ def test_execute_model_batch_rejects_single_diffusion_output(monkeypatch):
 @pytest.mark.cpu
 def test_execute_model_batch_uses_runner_output_helper(monkeypatch):
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-    monkeypatch.setattr(
-        model_runner_module, "current_omni_platform", SimpleNamespace(reset_peak_memory_stats=lambda: None)
-    )
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
     outs = [DiffusionOutput(output="a"), DiffusionOutput(output="b")]
     runner = _make_batch_runner(_BatchPipeline(outputs=outs))
     sched = _make_scheduler_output(num_reqs=2)

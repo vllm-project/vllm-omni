@@ -323,10 +323,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         return peak_memory_mb
 
-    def _record_peak_memory(self, output: DiffusionOutput) -> None:
-        """Record peak GPU memory for the current forward pass into output."""
-        output.peak_memory_mb = self._sample_peak_memory_mb()
-
     def _prepare_request_for_forward(
         self,
         req: OmniDiffusionRequest,
@@ -472,7 +468,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     )
 
             if is_primary and outputs:
-                self._record_peak_memory(outputs[0])
+                batch_peak_memory_mb = self._sample_peak_memory_mb()
+                for output in outputs:
+                    output.peak_memory_mb = max(output.peak_memory_mb, batch_peak_memory_mb)
 
             # Log prompt-embed cache activity; hits/misses accumulate across requests.
             prompt_embed_cache = getattr(self, "prompt_embed_cache", None)
