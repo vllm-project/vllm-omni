@@ -96,7 +96,12 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import encode_image_base64_with_compression, validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
-from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    DEFAULT_AUDIO_FORMAT,
+    SUPPORTED_CHAT_AUDIO_FORMATS,
+    AudioResponse,
+    CreateAudio,
+)
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageEditARDeltaChunk,
@@ -2500,18 +2505,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             sample_rate = int(sr_raw)
 
-        _valid_audio_formats = {"wav", "mp3", "flac", "opus", "pcm16", "pcm"}
-        audio_params = getattr(request, "audio", None)
-        if isinstance(audio_params, dict):
-            audio_format = audio_params.get("format", "wav")
-        else:
-            audio_format = "wav"
-        if audio_format not in _valid_audio_formats:
-            return self._create_error_response(
-                f"Invalid audio format '{audio_format}'. Supported formats: {sorted(_valid_audio_formats)}",
-            )
-        if audio_format == "pcm16":
-            audio_format = "pcm"
+        audio_format = self._resolve_audio_format(request)
+        if isinstance(audio_format, ErrorResponse):
+            return audio_format
 
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
@@ -3467,10 +3463,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     raise ValueError(f"Unexpected audio tensor rank {audio_tensor.ndim}; expected 1-3 dims.")
                 audio_array = audio_tensor.numpy()
 
+                audio_format = self._resolve_audio_format(request)
+                if isinstance(audio_format, ErrorResponse):
+                    return audio_format
+
                 audio_obj = CreateAudio(
                     audio_tensor=audio_array,
                     sample_rate=sample_rate,
-                    response_format="wav",
+                    response_format=audio_format,
                     speed=1.0,
                     base64_encode=True,
                 )
@@ -3685,6 +3685,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Invalid size format: %s", extra_body.get("size"))
 
         return height, width
+
+    def _resolve_audio_format(self, request: ChatCompletionRequest) -> str | ErrorResponse:
+        """Extract and validate the audio output format from a chat completion request."""
+        audio_params = getattr(request, "audio", None)
+        if isinstance(audio_params, dict):
+            audio_format = audio_params.get("format", DEFAULT_AUDIO_FORMAT)
+        else:
+            audio_format = DEFAULT_AUDIO_FORMAT
+        if audio_format not in SUPPORTED_CHAT_AUDIO_FORMATS:
+            return self._create_error_response(
+                f"Invalid audio format '{audio_format}'. Supported formats: {sorted(SUPPORTED_CHAT_AUDIO_FORMATS)}",
+            )
+        if audio_format == "pcm16":
+            audio_format = "pcm"
+        return audio_format
 
     def _create_error_response(
         self,

@@ -139,7 +139,7 @@ Content-Type: application/json
 |-----------|------|---------|-------------|
 | `input` | string | **required** | Text prompt describing the audio to generate |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
-| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
+| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, opus |
 | `speed` | float | 1.0 | Playback speed (0.25 - 4.0) |
 | `audio_length` | float | null | Audio duration in seconds (max ~47s for `stable-audio-open-1.0`) |
 | `audio_start` | float | 0.0 | Audio start time in seconds |

@@ -5,7 +5,7 @@ import torch
 import torchaudio
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.protocol.audio import DEFAULT_AUDIO_FORMAT, AudioResponse, CreateAudio
 
 try:
     import soundfile
@@ -53,8 +53,8 @@ class AudioMixin:
         }
 
         if response_format not in supported_formats:
-            logger.warning(f"Unsupported response format '{response_format}', defaulting to 'wav'.")
-            response_format = "wav"
+            logger.warning(f"Unsupported response format '{response_format}', defaulting to '{DEFAULT_AUDIO_FORMAT}'.")
+            response_format = DEFAULT_AUDIO_FORMAT
 
         soundfile_format, media_type, kwargs = supported_formats[response_format]
 
