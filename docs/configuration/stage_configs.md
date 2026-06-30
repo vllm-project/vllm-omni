@@ -378,6 +378,20 @@ The maximum number of sequences for concurrent processing in this stage. For LLM
 
 Default: `1`
 
+#### `engine_args.request_batch_max_wait_ms`
+
+The maximum time, in milliseconds, that a diffusion request-mode stage may wait
+before the first `schedule()` of a new scheduler wave so compatible requests can
+accumulate for request-level batching. This only applies to diffusion pipelines
+that support request-level batching with `step_execution` disabled.
+
+Use this together with `max_num_seqs > 1` for bursty serving traffic. `0`
+disables admission waiting and preserves the lowest first-request latency.
+For diffusion request-level batching tuning, see
+[Request-Level Batching](../user_guide/diffusion/request_batching.md).
+
+Default: `0.0`
+
 ### `engine_args`
 
 Engine arguments for configuring the LLM engine, diffusion engine, or other engine types used by this stage.

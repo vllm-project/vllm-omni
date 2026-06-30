@@ -16,6 +16,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     NewRequestData,
+    RequestBatchSamplingParamsKey,
     SamplingParamsKey,
     SchedulerInterface,
 )
@@ -24,20 +25,29 @@ logger = init_logger(__name__)
 
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
-_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
+_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
+_REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(RequestBatchSamplingParamsKey)) - {
+    "lora_int_id"
+}
 
 
-def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
+def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey:
     """Build a batch-compatibility key from the request's sampling params."""
-    if len(request.prompts) != 1:
-        return None
-
     sampling = request.sampling_params
     lora_request = getattr(sampling, "lora_request", None)
     return SamplingParamsKey(
         lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-        **{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES},
+        **{name: getattr(sampling, name) for name in _SAMPLING_PARAMS_KEY_FIELD_NAMES},
     )
+
+
+def get_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+    """Build a request-batch compatibility key from the request's sampling params."""
+    sampling = request.sampling_params
+    lora_request = getattr(sampling, "lora_request", None)
+    key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    return RequestBatchSamplingParamsKey(**key_kwargs)
 
 
 class _BaseScheduler(SchedulerInterface):
@@ -49,7 +59,7 @@ class _BaseScheduler(SchedulerInterface):
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
-        self._running_sampling_params_key: SamplingParamsKey | None = None
+        self._running_sampling_params_key: SamplingParamsKey | RequestBatchSamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
@@ -147,6 +157,12 @@ class _BaseScheduler(SchedulerInterface):
 
     def has_requests(self) -> bool:
         return bool(self._waiting or self._running)
+
+    def num_waiting_requests(self) -> int:
+        return len(self._waiting)
+
+    def num_running_requests(self) -> int:
+        return len(self._running)
 
     def get_request_state(self, request_id: str) -> DiffusionRequestState | None:
         return self._request_states.get(request_id)
@@ -250,7 +266,7 @@ class _BaseScheduler(SchedulerInterface):
         return DiffusionRequestState(
             request_id=request_id,
             req=request,
-            sampling_params_key=get_sampling_params_key(request),
+            sampling_params_key=self._build_sampling_params_key(request),
         )
 
     def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:
@@ -260,9 +276,14 @@ class _BaseScheduler(SchedulerInterface):
         current_key = self._current_sampling_params_key()
         return current_key is not None and current_key == state.sampling_params_key
 
-    def _current_sampling_params_key(self) -> SamplingParamsKey | None:
+    def _current_sampling_params_key(self) -> SamplingParamsKey | RequestBatchSamplingParamsKey | None:
         if self._running_sampling_params_key is not None or not self._running:
             return self._running_sampling_params_key
         state = self._request_states.get(self._running[0])
         self._running_sampling_params_key = None if state is None else state.sampling_params_key
         return self._running_sampling_params_key
+
+    def _build_sampling_params_key(
+        self, request: OmniDiffusionRequest
+    ) -> SamplingParamsKey | RequestBatchSamplingParamsKey | None:
+        return get_sampling_params_key(request)
