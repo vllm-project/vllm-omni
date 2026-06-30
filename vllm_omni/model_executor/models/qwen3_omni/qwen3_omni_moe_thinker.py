@@ -1061,12 +1061,26 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
 
         audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
 
+        from vllm_omni.embedding_cache.cache import get_embedding_cache
+        from vllm_omni.embedding_cache.hasher import hash_audio_features
+
+        _cache = get_embedding_cache()
+        if _cache is not None:
+            _key = hash_audio_features(input_features)
+            _cached = _cache.get(_key)
+            if _cached is not None:
+                return tuple(_cached.split(audio_output_lengths.tolist()))
+
         audio_outputs = self.audio_tower(
             input_features.to(self.audio_tower.dtype),
             feature_lens=audio_feature_lengths,
             aftercnn_lens=audio_output_lengths,
         )
         audio_features = audio_outputs if isinstance(audio_outputs, torch.Tensor) else audio_outputs.last_hidden_state
+
+        if _cache is not None:
+            _cache.put(_key, audio_features, audio_features.nbytes)
+
         return audio_features.split(audio_output_lengths.tolist())
 
 

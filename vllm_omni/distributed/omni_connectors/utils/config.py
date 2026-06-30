@@ -25,6 +25,20 @@ class ConnectorSpec:
     extra: dict[str, Any] = field(default_factory=dict)  # backend-specific config
 
 
+@dataclass(frozen=True)
+class MooncakeTransferEngineExtraKeys:
+    """Recognized ``ConnectorSpec.extra`` keys for MooncakeTransferEngineConnector."""
+
+    enable_tensor_dict_fast_path: str = "enable_tensor_dict_fast_path"
+    enable_pipelined_zmq_write: str = "enable_pipelined_zmq_write"
+    pool_prewarm_slots: str = "pool_prewarm_slots"
+    pool_prewarm_size: str = "pool_prewarm_size"
+    socket_health_interval_s: str = "socket_health_interval_s"
+
+
+MOONCAKE_TRANSFER_ENGINE_EXTRA_KEYS = MooncakeTransferEngineExtraKeys()
+
+
 @dataclass
 class OmniTransferConfig:
     """

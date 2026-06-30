@@ -118,10 +118,84 @@ receiver_connect  = remote_side_channel_port + tp_rank
 
 ## Environment Variables
 
-| Variable | Description |
+| Variable | Default | Description |
+|---|---|---|
+| `RDMA_DEVICE_NAME` | *(auto)* | Override RDMA device name (e.g., `mlx5_0`). |
+| `MC_IB_PCI_RELAXED_ORDERING` | `0` | Set to `1` to enable PCIe relaxed ordering for GPUDirect. |
+| `VLLM_OMNI_CONNECTOR_PROFILE` | `0` | Set to `1` to enable per-operation latency profiling. Records `serialize`, `pool_alloc`, and `zmq_notify` span durations (ms) for each `put()` and `get()` call. Retrieve records via `connector.pop_profile_records()`. Disabled by default — enabling adds a small overhead on every operation. |
+
+## Warm Pool (Pre-Allocation)
+
+By default the memory pool allocates on first use. You can pre-allocate slots at
+startup to eliminate pool-miss latency on the first batch of transfers.
+
+| Config key | Type | Default | Description |
+|---|---|---|---|
+| `pool_prewarm_slots` | `int` | `0` | Number of pool slots to allocate at connector init. |
+| `pool_prewarm_size` | `int` | `0` | Size (bytes) of each pre-warmed slot. Set to the expected payload size for best results. |
+
+Example:
+```yaml
+connector:
+  type: mooncake_transfer_engine
+  pool_prewarm_slots: 4
+  pool_prewarm_size: 209715200   # 200 MB per slot
+```
+
+Pre-warming is useful when your workload has a predictable, uniform KV cache
+size (e.g., fixed sequence length). For variable-size workloads, leave at `0`.
+
+## Tensor-Dict Wire Format
+
+When `data` is a `dict[str, torch.Tensor]`, the connector bypasses generic
+serialization and uses a compact binary wire format for lower CPU overhead and
+faster deserialization on the receiver side.
+
+### Frame layout
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Header (64-byte aligned)                                 │
+│  [4] magic = "OMDI"  (0x4F4D4449)                       │
+│  [2] version = 1                                        │
+│  [2] header_len (bytes, multiple of 64)                 │
+│  [4] n_tensors                                          │
+│  [4] CRC-32 of header (computed with checksum field=0)  │
+│  per-tensor entries:                                    │
+│    [2]       key_len                                    │
+│    [key_len] key  (UTF-8)                               │
+│    [2]       dtype_id  (see table below)                │
+│    [1]       ndim                                       │
+│    [1]       layout = 0 (contiguous)                    │
+│    [ndim×8]  shape  (int64, little-endian)              │
+│    [8]       data_offset (from body start, 64-byte aligned) │
+│    [8]       nbytes                                     │
+│  padding to next 64-byte boundary                       │
+├─────────────────────────────────────────────────────────┤
+│ Body (tensor payloads, each 64-byte aligned)            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### dtype_id mapping
+
+| dtype_id | torch dtype |
 |---|---|
-| `RDMA_DEVICE_NAME` | Override RDMA device name (e.g., `mlx5_0`). |
-| `MC_IB_PCI_RELAXED_ORDERING` | Set to `1` to enable PCIe relaxed ordering for GPUDirect. |
+| 1 | `torch.bool` |
+| 2 | `torch.uint8` |
+| 3 | `torch.int8` |
+| 4 | `torch.int16` |
+| 5 | `torch.int32` |
+| 6 | `torch.int64` |
+| 7 | `torch.float16` |
+| 8 | `torch.bfloat16` |
+| 9 | `torch.float32` |
+| 10 | `torch.float64` |
+| 11 | `torch.complex64` |
+| 12 | `torch.complex128` |
+
+Tensors are always serialized to CPU, contiguous, and 64-byte-aligned in the
+body. The receiver reconstructs them as CPU tensors; device placement is the
+caller's responsibility.
 
 ## Docker / Container Setup
 
