@@ -23,7 +23,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 _MODEL_REPO = "stabilityai/stable-audio-open-1.0"
 

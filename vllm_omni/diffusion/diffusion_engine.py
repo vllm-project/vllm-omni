@@ -17,6 +17,7 @@ import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
@@ -38,6 +39,7 @@ from vllm_omni.diffusion.output_formatter import (
     normalize_diffusion_postprocess_output,
 )
 from vllm_omni.diffusion.registry import (
+    DiffusionModelRegistry,
     get_diffusion_action_post_process_func,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
@@ -72,6 +74,37 @@ def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
     return parameter_name in parameters or any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     )
+
+
+def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
+    if custom_pipeline_args is None:
+        return None
+
+    try:
+        pipeline_cls = custom_pipeline_args["pipeline_class"]
+    except KeyError as exc:
+        raise ValueError("custom_pipeline_args must include 'pipeline_class'.") from exc
+
+    if isinstance(pipeline_cls, type):
+        return pipeline_cls
+    if isinstance(pipeline_cls, str):
+        try:
+            return resolve_obj_by_qualname(pipeline_cls)
+        except (AttributeError, ImportError, ValueError) as exc:
+            raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+    raise TypeError(
+        f"custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
+        f"got {type(pipeline_cls).__name__}"
+    )
+
+
+def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    if model_cls is None:
+        model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "supports_request_batch", False))
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -138,10 +171,7 @@ class DiffusionEngine:
             StepScheduler() if self.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
-        if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
-            max_num_seqs = self.scheduler.max_num_running_reqs
-            self.scheduler.max_num_running_reqs = 1
-            logger.warning(f"Non-stepwise-execution does not support max-num-seqs={max_num_seqs}, set it to 1.")
+        self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -161,8 +191,17 @@ class DiffusionEngine:
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         if self.step_execution:
             self.execute_fn = self.executor.execute_step
+        elif self.supports_request_batch:
+            self.execute_fn = self.executor.execute_batch
         else:
             self.execute_fn = self.executor.execute_request
+
+        if self.supports_request_batch:
+            logger.info(
+                "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s",
+                getattr(od_config, "max_num_seqs", None),
+                getattr(od_config, "request_batch_max_wait_ms", None),
+            )
 
         try:
             self._dummy_run()
@@ -348,6 +387,9 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
+                if self.supports_request_batch:
+                    self._wait_for_request_batch_admission_locked()
+
                 sched_output = self.scheduler.schedule()
 
             if sched_output.is_empty:
@@ -389,6 +431,61 @@ class DiffusionEngine:
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _wait_for_request_batch_admission_locked(self) -> None:
+        """Wait for compatible requests to accumulate before scheduling a wave.
+
+        Caller must hold ``self._cv``.
+        """
+        if self.step_execution or not self.supports_request_batch:
+            return
+
+        max_wait_s = self.od_config.request_batch_max_wait_ms / 1000.0
+        if max_wait_s == 0:
+            return
+
+        max_batch = self.scheduler.max_num_running_reqs
+        waiting = self.scheduler.num_waiting_requests()
+        running = self.scheduler.num_running_requests()
+
+        if running > 0:
+            return
+
+        start = time.monotonic()
+        deadline = start + max_wait_s
+        last_waiting = -1
+        stable_since = start
+        # Require a short idle period with no queue growth so bursty HTTP
+        # ingress can land before the first schedule() of a wave.
+        stable_window_s = min(0.05, max_wait_s / 5.0)
+
+        while not self.stop_event.is_set():
+            waiting = self.scheduler.num_waiting_requests()
+            now = time.monotonic()
+
+            if waiting >= max_batch:
+                break
+            if waiting > 0 and (now - stable_since) >= stable_window_s:
+                break
+            if now >= deadline:
+                break
+
+            if waiting > last_waiting:
+                stable_since = now
+                last_waiting = waiting
+
+            remaining = deadline - now
+            self._cv.wait(timeout=min(remaining, 0.002))
+
+        waited_ms = (time.monotonic() - start) * 1000.0
+        final_waiting = self.scheduler.num_waiting_requests()
+        if final_waiting > 0:
+            logger.info(
+                "[RequestBatch] admission wait done waiting=%d max_batch=%d waited_ms=%.1f",
+                final_waiting,
+                max_batch,
+                waited_ms,
+            )
 
     def _process_rpc_queue(self) -> None:
         """Execute pending collective_rpc tasks from the busy-loop thread.
@@ -680,7 +777,7 @@ class DiffusionEngine:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
         req = OmniDiffusionRequest(
-            prompts=[prompt],
+            prompt=prompt,
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
@@ -930,9 +1027,12 @@ class DiffusionEngine:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+            # Preserve runner-provided abort details when available.
+            if runner_output is not None and runner_output.result is not None and runner_output.result.aborted:
+                return runner_output.result
             return DiffusionOutput(
                 aborted=True,
-                abort_message=f"Request {state.req.request_id} aborted.",
+                abort_message=f"Request {request_id} aborted.",
             )
 
         if runner_output is not None and runner_output.result is not None:

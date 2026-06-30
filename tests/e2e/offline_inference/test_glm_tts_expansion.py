@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""E2E Offline inference tests for GLM-TTS voice cloning.
-
-GLM-TTS is a zero-shot voice cloning model that always requires ref_audio.
-There is no text-only / non-clone inference path in the official implementation.
-"""
+"""E2E expansion tests for GLM-TTS voice cloning offline inference (nightly CI)."""
 
 import os
 import tempfile
@@ -23,11 +19,12 @@ from tests.helpers.runtime import OmniResponse
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.model_executor.models.glm_tts.glm_tts import build_glm_tts_prefill_metadata
 
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
+
 MODEL = os.environ.get("GLM_TTS_MODEL_PATH", "zai-org/GLM-TTS")
 REF_TEXT = "他当时还跟线下其他的站姐吵架，然后，打架进局子了。"
 
 DEPLOY_CONFIG = get_deploy_config_path("glm_tts.yaml")
-
 REFERENCE_PROMPT_WAV_PATH = get_asset_path("glm_tts/jiayan_zh.wav")
 
 ASYNC_CHUNK_MODES = [
@@ -84,9 +81,7 @@ def _get_deploy_config(*, async_chunk: bool) -> str:
     )
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)
 def test_offline_voice_clone_zh(async_chunk: bool) -> None:
     """
@@ -94,9 +89,6 @@ def test_offline_voice_clone_zh(async_chunk: bool) -> None:
     Deploy Setting: glm_tts.yaml with explicit sync/async mode, enforce_eager
     Input Modal: text + ref_audio + ref_text
     Output Modal: audio
-
-    Uses the official jiayan_zh.wav reference audio from the upstream
-    GLM-TTS repository (real human speech matching REF_TEXT).
     """
     synth_text = "今天天气真不错，适合出去散散步。"
     prompt_audio = _load_ref_audio()
@@ -144,5 +136,5 @@ def test_offline_voice_clone_zh(async_chunk: bool) -> None:
                 audio_format="audio/wav",
             ),
             {"input": synth_text, "response_format": "wav"},
-            run_level="advanced_model",
+            run_level="full_model",
         )
