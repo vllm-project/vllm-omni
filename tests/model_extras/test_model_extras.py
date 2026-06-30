@@ -149,6 +149,47 @@ def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_audiox_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("AudioXPipeline") == frozenset(
+        {
+            "audiox_task",
+            "seconds_start",
+            "seconds_total",
+            "sigma_min",
+            "sigma_max",
+            "cfg_rescale",
+            "video_path",
+            "audio_path",
+        }
+    )
+    assert get_extra_output_params("AudioXPipeline") == frozenset({"audiox_task"})
+    assert should_init_extra_args_for_non_diffusion_stages("AudioXPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_audiox_declared_extra_args_route_into_sampling_params() -> None:
+    params = OmniDiffusionSamplingParams()
+    declared = get_extra_body_params("AudioXPipeline")
+    apply_declared_extra_args(
+        params,
+        declared,
+        {
+            "audiox_task": "t2a",
+            "seconds_total": 10.0,
+            "sigma_min": 0.03,
+            "unknown": "ignored",
+        },
+    )
+    assert params.extra_args == {
+        "audiox_task": "t2a",
+        "seconds_total": 10.0,
+        "sigma_min": 0.03,
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_helios_extra_registry_declares_request_and_response_params() -> None:
     expected_body = frozenset(
         {
