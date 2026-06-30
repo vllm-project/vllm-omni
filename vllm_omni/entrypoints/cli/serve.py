@@ -556,6 +556,14 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
+        omni_config_group.add_argument(
+            "--request-batch-max-wait-ms",
+            type=float,
+            default=0.0,
+            help="Request-mode batch admission: max milliseconds to wait for compatible "
+            "requests to accumulate before scheduling a fused forward wave. "
+            "0 disables admission (default).",
+        )
 
         # VAE memory optimization parameters
         omni_config_group.add_argument(
@@ -709,6 +717,11 @@ class OmniServeCommand(CLISubcommand):
             "--enable-ar-profiler",
             action="store_true",
             help="Enable AR stage profiler to include AR stage timing in stage_durations.",
+        )
+        omni_config_group.add_argument(
+            "--enable-orch-monitor",
+            action="store_true",
+            help="Enable orchestrator window monitor and write a JSON log at shutdown.",
         )
 
         # Supplementary auxiliary text encoder parameters

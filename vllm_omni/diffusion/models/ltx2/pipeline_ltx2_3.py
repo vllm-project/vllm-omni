@@ -50,10 +50,9 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 from .pipeline_ltx2 import (
-    _get_prompt_field,
     _VideoAudioScheduler,
     calculate_shift,
     create_transformer_from_config,
@@ -61,6 +60,13 @@ from .pipeline_ltx2 import (
 )
 
 logger = init_logger(__name__)
+
+
+def _get_audio_latents_from_sampling(sampling: Any) -> torch.Tensor | None:
+    if sampling.audio_latents is not None:
+        return sampling.audio_latents
+    return sampling.extra_args.get("audio_latents")
+
 
 # Try to import LTX2VocoderWithBWE (diffusers >= 0.38.0)
 try:
@@ -131,6 +137,7 @@ class LTX23Pipeline(
     - Transformer: passes sigma for prompt_adaln
     """
 
+    supports_request_batch = True
     # Audio is diffused jointly with video; warmup must size audio tokens.
     dummy_run_num_frames = 2
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -830,7 +837,7 @@ class LTX23Pipeline(
     @torch.no_grad()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -856,76 +863,80 @@ class LTX23Pipeline(
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         # ---- Extract from request ----
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        height = req.sampling_params.height or height or 512
-        width = req.sampling_params.width or width or 768
-        num_frames = req.sampling_params.num_frames or num_frames or 121
-        frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or 24.0
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps or 40
+        height = common_sampling_params.height or height or 512
+        width = common_sampling_params.width or width or 768
+        num_frames = common_sampling_params.num_frames or num_frames or 121
+        frame_rate = common_sampling_params.resolved_frame_rate or frame_rate or 24.0
+        num_inference_steps = common_sampling_params.num_inference_steps or num_inference_steps or 40
         # Enforce minimum of 2 timesteps for flow matching scheduler
         if timesteps is None:
             num_inference_steps = max(int(num_inference_steps), 2)
         elif len(timesteps) < 2:
             raise ValueError("`timesteps` must contain at least 2 values for FlowMatchEulerDiscreteScheduler.")
         num_videos_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
+            common_sampling_params.num_outputs_per_prompt
+            if common_sampling_params.num_outputs_per_prompt > 0
             else num_videos_per_prompt or 1
         )
         max_sequence_length = (
-            req.sampling_params.max_sequence_length or max_sequence_length or self.tokenizer_max_length
+            common_sampling_params.max_sequence_length or max_sequence_length or self.tokenizer_max_length
         )
 
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        if common_sampling_params.guidance_scale_provided:
+            guidance_scale = common_sampling_params.guidance_scale
 
         if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            generator = req.collate_request_generators(num_videos_per_prompt, generator)
 
-        latents = req.sampling_params.latents if req.sampling_params.latents is not None else latents
-        audio_latents = (
-            req.sampling_params.audio_latents
-            if req.sampling_params.audio_latents is not None
-            else req.sampling_params.extra_args.get("audio_latents", audio_latents)
+        latents = req.collate_request_tensors("latents", latents)
+        audio_latents = DiffusionRequestBatch.collate_tensors(
+            [_get_audio_latents_from_sampling(sampling) for sampling in sampling_params_list],
+            "audio_latents",
+            audio_latents,
         )
 
         # Override with pre-computed embeddings if provided in request
-        req_prompt_embeds = [_get_prompt_field(p, "prompt_embeds") for p in req.prompts]
-        if any(p is not None for p in req_prompt_embeds):
-            prompt_embeds = torch.stack(req_prompt_embeds)
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "prompt_attention_mask": prompt_attention_mask,
+                "negative_prompt_attention_mask": negative_prompt_attention_mask,
+            },
+            field_aliases={
+                "prompt_attention_mask": ("prompt_attention_mask", "attention_mask"),
+                "negative_prompt_attention_mask": (
+                    "negative_prompt_attention_mask",
+                    "negative_attention_mask",
+                ),
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
+        prompt_attention_mask = prompt_fields["prompt_attention_mask"]
+        negative_prompt_attention_mask = prompt_fields["negative_prompt_attention_mask"]
+        if prompt_embeds is not None:
+            prompt = None
+        if negative_prompt_embeds is not None:
+            negative_prompt = None
 
-        req_negative_prompt_embeds = [_get_prompt_field(p, "negative_prompt_embeds") for p in req.prompts]
-        if any(p is not None for p in req_negative_prompt_embeds):
-            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)
-
-        req_prompt_attention_masks = [
-            _get_prompt_field(p, "prompt_attention_mask") or _get_prompt_field(p, "attention_mask") for p in req.prompts
-        ]
-        if any(m is not None for m in req_prompt_attention_masks):
-            prompt_attention_mask = torch.stack(req_prompt_attention_masks)
-
-        req_negative_attention_masks = [
-            _get_prompt_field(p, "negative_prompt_attention_mask") or _get_prompt_field(p, "negative_attention_mask")
-            for p in req.prompts
-        ]
-        if any(m is not None for m in req_negative_attention_masks):
-            negative_prompt_attention_mask = torch.stack(req_negative_attention_masks)
-
-        if req.sampling_params.decode_timestep is not None:
-            decode_timestep = req.sampling_params.decode_timestep
-        if req.sampling_params.decode_noise_scale is not None:
-            decode_noise_scale = req.sampling_params.decode_noise_scale
-        if req.sampling_params.output_type is not None:
-            output_type = req.sampling_params.output_type
+        if common_sampling_params.decode_timestep is not None:
+            decode_timestep = common_sampling_params.decode_timestep
+        if common_sampling_params.decode_noise_scale is not None:
+            decode_noise_scale = common_sampling_params.decode_noise_scale
+        if common_sampling_params.output_type is not None:
+            output_type = common_sampling_params.output_type
 
         self.check_inputs(
             prompt=prompt,
@@ -1273,9 +1284,13 @@ class LTX23Pipeline(
 
             audio = self.vocoder(generated_mel_spectrograms)
 
-        return DiffusionOutput(
-            output=(video, audio),
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        return split_diffusion_output_by_request(
+            DiffusionOutput(
+                output=(video, audio),
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            ),
+            req,
+            num_outputs_per_prompt=num_videos_per_prompt,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

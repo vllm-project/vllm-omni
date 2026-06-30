@@ -770,6 +770,12 @@ class OmniDiffusionConfig:
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
+    # Request-mode batch admission: wait briefly for compatible requests to
+    # accumulate in the scheduler waiting queue before the first schedule() of
+    # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
+    # 0 disables admission (default; no added latency).
+    request_batch_max_wait_ms: float = 0.0
+
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
 
@@ -842,6 +848,9 @@ class OmniDiffusionConfig:
 
     def __post_init__(self):
         self.master_port = self._resolve_master_port()
+        self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
+        if self.request_batch_max_wait_ms < 0:
+            raise ValueError(f"request_batch_max_wait_ms must be non-negative, got {self.request_batch_max_wait_ms}.")
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig

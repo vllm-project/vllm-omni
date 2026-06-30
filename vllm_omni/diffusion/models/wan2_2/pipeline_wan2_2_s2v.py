@@ -42,6 +42,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -282,61 +283,60 @@ def get_wan22_s2v_pre_process_func(
     """
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            # -- Reference image --
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if raw_image is None:
-                raise ValueError(
-                    "No reference image provided. S2V requires a reference image. "
-                    'Set `"multi_modal_data": {"image": <path or PIL.Image>, ...}`'
-                )
-            if isinstance(raw_image, str):
-                image = PIL.Image.open(raw_image).convert("RGB")
-            elif isinstance(raw_image, PIL.Image.Image):
-                image = raw_image
-            else:
-                raise TypeError(f"Unsupported image type {type(raw_image)}")
-
-            # -- Audio --
-            raw_audio = multi_modal_data.get("audio", None) if multi_modal_data is not None else None
-            if raw_audio is None:
-                raise ValueError(
-                    "No audio provided. S2V requires an audio file path. "
-                    'Set `"multi_modal_data": {"audio": "<path>", ...}`'
-                )
-
-            # -- Compute target size --
-            max_area = 720 * 1280
-            if request.sampling_params.height is not None and request.sampling_params.width is not None:
-                height, width = request.sampling_params.height, request.sampling_params.width
-            else:
-                ref_h, ref_w = image.height, image.width
-                height, width = _get_size_less_than_area(ref_h, ref_w, target_area=max_area)
-                if request.sampling_params.height is None:
-                    request.sampling_params.height = height
-                if request.sampling_params.width is None:
-                    request.sampling_params.width = width
-
-            # Resize + center-crop reference image to target size
-            resize_op = transforms.Resize(min(height, width))
-            crop_op = transforms.CenterCrop((height, width))
-            ref_pil = crop_op(resize_op(image))
-
-            prompt["multi_modal_data"]["image"] = ref_pil
-            prompt["additional_information"]["audio_path"] = raw_audio
-            prompt["additional_information"]["pose_video"] = (
-                multi_modal_data.get("pose_video", None) if multi_modal_data is not None else None
+        # -- Reference image --
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if raw_image is None:
+            raise ValueError(
+                "No reference image provided. S2V requires a reference image. "
+                'Set `"multi_modal_data": {"image": <path or PIL.Image>, ...}`'
             )
-            prompt["additional_information"]["init_first_frame"] = (
-                multi_modal_data.get("init_first_frame", False) if multi_modal_data is not None else False
+        if isinstance(raw_image, str):
+            image = PIL.Image.open(raw_image).convert("RGB")
+        elif isinstance(raw_image, PIL.Image.Image):
+            image = raw_image
+        else:
+            raise TypeError(f"Unsupported image type {type(raw_image)}")
+
+        # -- Audio --
+        raw_audio = multi_modal_data.get("audio", None) if multi_modal_data is not None else None
+        if raw_audio is None:
+            raise ValueError(
+                'No audio provided. S2V requires an audio file path. Set `"multi_modal_data": {"audio": "<path>", ...}`'
             )
-            request.prompts[i] = prompt
+
+        # -- Compute target size --
+        max_area = 720 * 1280
+        if request.sampling_params.height is not None and request.sampling_params.width is not None:
+            height, width = request.sampling_params.height, request.sampling_params.width
+        else:
+            ref_h, ref_w = image.height, image.width
+            height, width = _get_size_less_than_area(ref_h, ref_w, target_area=max_area)
+            if request.sampling_params.height is None:
+                request.sampling_params.height = height
+            if request.sampling_params.width is None:
+                request.sampling_params.width = width
+
+        # Resize + center-crop reference image to target size
+        resize_op = transforms.Resize(min(height, width))
+        crop_op = transforms.CenterCrop((height, width))
+        ref_pil = crop_op(resize_op(image))
+
+        prompt["multi_modal_data"]["image"] = ref_pil
+        prompt["additional_information"]["audio_path"] = raw_audio
+        prompt["additional_information"]["pose_video"] = (
+            multi_modal_data.get("pose_video", None) if multi_modal_data is not None else None
+        )
+        prompt["additional_information"]["init_first_frame"] = (
+            multi_modal_data.get("init_first_frame", False) if multi_modal_data is not None else False
+        )
+        request.prompt = prompt
 
         return request
 
@@ -1054,7 +1054,7 @@ class Wan22S2VPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         image: PIL.Image.Image | None = None,
