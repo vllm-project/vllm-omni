@@ -1422,7 +1422,7 @@ class TestForwardRouting:
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
         sound_latents = torch.zeros(1, 3, 4)
         pipeline._resolve_sound_target_samples = lambda *args: (20, 2.0, 10)
-        pipeline._prepare_sound_latents = lambda *args: (sound_latents, 4)
+        pipeline._prepare_sound_latents = lambda *args, **kwargs: (sound_latents, 4)
         pipeline._decode_sound_latents = lambda *args: torch.ones(1, 2, 20)
         output = pipeline.forward(
             make_request_batch(

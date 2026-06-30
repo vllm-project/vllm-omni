@@ -81,6 +81,10 @@ class _DiffusionVllmModelConfig:
     def is_nvfp4_quantized(self) -> bool:
         return self.quantization == "modelopt_fp4"
 
+    @property
+    def is_diffusion(self) -> bool:
+        return False
+
 
 def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
     quant_config = getattr(od_config, "quantization_config", None)

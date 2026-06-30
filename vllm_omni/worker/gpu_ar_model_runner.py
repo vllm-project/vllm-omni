@@ -1654,7 +1654,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self._async_chunk:
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            pooler_inter, pooler_client = None, pooler_output
+            # Non-async-chunk still ships the full payload to the next stage (via
+            # accumulate_full_payload_output and the inter_stage_outputs field); only
+            # client mm keys are split out when async_chunk is enabled. #4527 set this
+            # to (None, pooler_output), which skipped accumulation and starved the
+            # downstream stage (300s connector-input timeout / empty audio). (PR #4792)
+            pooler_inter, pooler_client = pooler_output, pooler_output
 
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):

@@ -1282,10 +1282,14 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             self.pipe.scheduler = new_scheduler
 
         # We only want to change num_inference_steps here, so no need
-        # to deep copy the whole request
+        # to deep copy the whole request. `req` is a DiffusionRequestBatch
+        # whose `sampling_params` is a read-only property, so clone the
+        # underlying request(s) and override their sampling params instead.
         stage_2_req = copy.copy(req)
-        stage_2_req.sampling_params = req.sampling_params.clone()
-        stage_2_req.sampling_params.num_inference_steps = 3
+        stage_2_req.requests = [copy.copy(r) for r in req.requests]
+        for stage_2_request in stage_2_req.requests:
+            stage_2_request.sampling_params = stage_2_request.sampling_params.clone()
+            stage_2_request.sampling_params.num_inference_steps = 3
 
         stage2_output = self.pipe(
             req=stage_2_req,

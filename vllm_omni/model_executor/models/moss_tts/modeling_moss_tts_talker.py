@@ -140,9 +140,17 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         self.pad_token_id: int = getattr(self.config, "pad_token_id", 151643)
         self.im_end_token_id: int = getattr(self.config, "im_end_token_id", 151645)
 
-        # Qwen3 backbone — weights live under ``language_model.*``
+        # Qwen3 backbone — weights live under ``language_model.*``. vLLM's
+        # Qwen3Model reads num_hidden_layers/hidden_size/etc. from
+        # vllm_config.model_config.hf_config, but MOSS nests the LLM config under
+        # ``language_config`` (a Qwen3Config). Rebind the backbone's hf_config to
+        # it — same pattern as the Qwen3-Omni talker — so the inner model sees a
+        # real Qwen3Config instead of MossTTSDelayConfig (which lacks
+        # num_hidden_layers).
+        lm_vllm_config = vllm_config.with_hf_config(lm_cfg, architectures=["Qwen3ForCausalLM"])
+        lm_vllm_config.model_config.hf_text_config = lm_vllm_config.model_config.hf_config
         self.model = Qwen3Model(
-            vllm_config=vllm_config,
+            vllm_config=lm_vllm_config,
             prefix=_maybe_prefix(prefix, "model"),
         )
 

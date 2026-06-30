@@ -330,6 +330,27 @@ def test_forward_with_sound_ulysses_error_mentions_combined_sequence(monkeypatch
         )
 
 
+def test_sound_latent_frames_padded_for_sequence_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = object.__new__(transformer_cosmos3.Cosmos3VFMTransformer)
+    model.latent_patch_size = 2
+    vs = (3, 16, 16)
+
+    monkeypatch.setattr(parallel_state, "get_ulysses_parallel_world_size", lambda: 1)
+    assert model.sound_latent_frames_for_sequence_parallel(video_shape=vs, sound_frames=97) == 97
+
+    monkeypatch.setattr(parallel_state, "get_ulysses_parallel_world_size", lambda: 2)
+    assert model.sound_latent_frames_for_sequence_parallel(video_shape=vs, sound_frames=97) == 98
+    assert model.sound_latent_frames_for_sequence_parallel(video_shape=vs, sound_frames=98) == 98
+
+    # ulysses=4, with a transfer control folded into the vision base.
+    monkeypatch.setattr(parallel_state, "get_ulysses_parallel_world_size", lambda: 4)
+    padded = model.sound_latent_frames_for_sequence_parallel(video_shape=vs, sound_frames=97, num_vision_items=2)
+    assert (2 * 192 + padded) % 4 == 0
+
+
 def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 

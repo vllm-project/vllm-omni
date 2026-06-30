@@ -224,8 +224,16 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
-        """Copied from vllm/platforms/cuda/platform.py v0.20.0 with force using vllm_c kernels"""
-        default = ["vllm_c", "native"]  # Originally using "native" here when compiling
+        """Copied from upstream CudaPlatformBase with inductor-aware logic.
+
+        When inductor is active (compiling) use native as the default;
+        otherwise prefer vllm_c kernels where available.
+        """
+        from vllm.config.compilation import CompilationMode
+
+        cc = vllm_config.compilation_config
+        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        default = ["native"] if using_inductor else ["vllm_c", "native"]
 
         # Use oink if enabled for rms_norm
         # TODO(Laurawly/luka): remove this env var,
