@@ -87,6 +87,12 @@ _diffusion_exec_family = Histogram(
     labelnames=_stage_labels,
     buckets=defs.SECONDS_FAST_BUCKETS,
 )
+_diffusion_exec_per_step_family = Histogram(
+    defs.DIFFUSION_EXEC_PER_STEP_S,
+    "DiT forward pass execution time per denoising step in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
 _diffusion_preprocess_family = Histogram(
     defs.DIFFUSION_PREPROCESS_S,
     "Diffusion input preprocessing time per request in seconds.",
@@ -168,6 +174,15 @@ class OmniModalityMetrics:
         if not self._log_stats:
             return
         _diffusion_exec_family.labels(
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
+        ).observe(seconds)
+
+    def observe_diffusion_exec_per_step(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_exec_per_step_family.labels(
             model_name=self._model_name,
             stage=stage,
             replica=replica,

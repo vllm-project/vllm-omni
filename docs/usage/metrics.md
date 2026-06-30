@@ -58,10 +58,11 @@ Per-request timing breakdowns for diffusion (image/video) stages. Emitted at req
 | Metric | Type | Description |
 |--------|------|-------------|
 | `vllm_omni:diffusion_exec_s` | Histogram | DiT forward pass execution time per request in seconds |
+| `vllm_omni:diffusion_exec_per_step_s` | Histogram | DiT forward pass execution time per denoising step in seconds (`exec_s / num_inference_steps`) |
 | `vllm_omni:diffusion_preprocess_s` | Histogram | Diffusion input preprocessing time per request in seconds |
 | `vllm_omni:diffusion_postprocess_s` | Histogram | Diffusion output postprocessing (VAE decode) time per request in seconds |
 
-All three use `SECONDS_FAST_BUCKETS` (1 ms → 60 s).
+All four use `SECONDS_FAST_BUCKETS` (1 ms → 60 s). `diffusion_exec_per_step_s` is skipped when `num_inference_steps` is not set.
 
 ### Example PromQL
 

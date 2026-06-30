@@ -95,6 +95,7 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
         "resolution": 512,
         "width": None,
         "height": None,
+        "num_inference_steps": 1,
     }
 
 
