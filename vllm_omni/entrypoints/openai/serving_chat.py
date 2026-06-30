@@ -2670,6 +2670,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         reference_images: list[Image.Image],
         gen_params: OmniDiffusionSamplingParams,
         tokenizer: Any = None,
+        request_id: str | None = None,
     ) -> tuple[OmniTextPrompt, list[Any]]:
         """Build the shared multistage generation prompt and stage params."""
         stage_configs = getattr(engine, "stage_configs", None) or []
@@ -2780,8 +2781,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Provide multi_modal_uuids so that newer vLLM versions can
             # validate multi_modal_data / multi_modal_uuids consistency.
             # Generate one uuid per image when the value is a list (multi-image inputs).
+            #
+            # IMPORTANT: key the uuids by request_id. vLLM's multimodal processor
+            # cache uses these uuids as its cache key, so a CONSTANT uuid (the old
+            # "img-{k}-0") made every image-edit request reuse the first cached
+            # image. With one mm cache per engine, each replica then stuck on the
+            # first reference image it processed -> wrong subject in multi-replica
+            # output. A request-unique key (matching the other request paths) keeps
+            # each request's reference image isolated.
+            rid = request_id or f"req-{uuid.uuid4().hex[:16]}"
             engine_prompt["multi_modal_uuids"] = {
-                k: [f"img-{k}-{i}" for i in range(len(v))] if isinstance(v, list) else [f"img-{k}-0"]
+                k: [f"{rid}-img-{k}-{i}" for i in range(len(v))] if isinstance(v, list) else [f"{rid}-img-{k}-0"]
                 for k, v in engine_prompt_data.items()
             }
 
@@ -2998,6 +3008,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     reference_images=pil_images,
                     gen_params=gen_params,
                     tokenizer=tokenizer,
+                    request_id=request_id,
                 )
             else:
                 engine_prompt = gen_prompt

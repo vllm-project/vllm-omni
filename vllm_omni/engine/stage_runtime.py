@@ -17,6 +17,7 @@ from typing import Any
 import janus
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
+from vllm.utils.network_utils import get_open_ports_list
 
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
@@ -140,6 +141,11 @@ class StageRuntime:
         self.stage_pools: list[StagePool] = []
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
+        # Serializes local LLM engine-core spawn+startup across replicas. vLLM's
+        # multiproc executor picks its worker TCPStore init port via get_open_port()
+        # (not config-driven), so concurrently-spawned inner-DP replicas race on
+        # that port and collide (EADDRINUSE). See _initialize_local_llm_replica.
+        self._local_llm_spawn_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
 
     @staticmethod
@@ -390,6 +396,31 @@ class StageRuntime:
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
 
+                # Per-replica inner-DP port reseed. ``stage_vllm_config`` is built
+                # once above and shared across replicas, so every local inner-DP
+                # replica would draw replica 0's ``data_parallel_master_port`` and
+                # collide binding the DP/worker TCPStore init port
+                # (EADDRINUSE on tcp://127.0.0.1:<port>), never forming its group.
+                # Give each replica 1+ its own vllm_config copy with a freshly
+                # seeded master-port list; DP ranks *within* a replica still share
+                # that copy, so they agree on the rendezvous port. replica 0 keeps
+                # the original (its ports are already assigned).
+                replica_vllm_config = stage_vllm_config
+                pc = getattr(stage_vllm_config, "parallel_config", None)
+                if (
+                    replica_id > 0
+                    and launch_mode == "local"
+                    and stage_vllm_config is not None
+                    and pc is not None
+                    and getattr(pc, "data_parallel_size", 1) > 1
+                ):
+                    replica_vllm_config = copy.deepcopy(stage_vllm_config)
+                    replica_parallel_config = replica_vllm_config.parallel_config
+                    replica_parallel_config._data_parallel_master_port_list = get_open_ports_list(5)
+                    replica_parallel_config.data_parallel_master_port = (
+                        replica_parallel_config._data_parallel_master_port_list[-1]
+                    )
+
                 replicas.append(
                     ReplicaInitPlan(
                         replica_id=replica_id,
@@ -399,7 +430,7 @@ class StageRuntime:
                         metadata=replica_metadata,
                         stage_connector_spec=stage_connector_spec,
                         omni_kv_connector=omni_kv_connector,
-                        stage_vllm_config=stage_vllm_config,
+                        stage_vllm_config=replica_vllm_config,
                         executor_class=executor_class,
                         engine_args_dict=copy.deepcopy(engine_args_dict) if engine_args_dict is not None else None,
                     )
@@ -559,19 +590,25 @@ class StageRuntime:
                     plan.engine_args_dict,
                     stage_init_timeout,
                 )
-            with launch_stage_replica(
-                vllm_config=vllm_config,
-                executor_class=executor_class,
-                log_stats=False,
-                stage_id=plan.metadata.stage_id,
-                replica_id=plan.replica_id,
-                stage_config=plan.stage_cfg,
-                omni_master_server=self._get_omni_master_server(),
-                omni_coordinator_address=self._get_coordinator_address(),
-                stage_visible_devices=physical_devices,
-                spawn_device_lock=self._spawn_device_lock,
-            ) as resources:
-                pass
+            # Serialize spawn+startup across local LLM replicas so each replica's
+            # engine cores bind their (get_open_port-derived) worker init ports
+            # before the next replica begins — otherwise concurrent inner-DP
+            # replicas race and collide (EADDRINUSE). Diffusion replicas use a
+            # separate inline path and are unaffected.
+            with self._local_llm_spawn_lock:
+                with launch_stage_replica(
+                    vllm_config=vllm_config,
+                    executor_class=executor_class,
+                    log_stats=False,
+                    stage_id=plan.metadata.stage_id,
+                    replica_id=plan.replica_id,
+                    stage_config=plan.stage_cfg,
+                    omni_master_server=self._get_omni_master_server(),
+                    omni_coordinator_address=self._get_coordinator_address(),
+                    stage_visible_devices=physical_devices,
+                    spawn_device_lock=self._spawn_device_lock,
+                ) as resources:
+                    pass
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
             if resources is None:
@@ -733,7 +770,7 @@ class DistStageRuntime(StageRuntime):
         single_stage_id_filter: int | None,
         omni_master_address: str,
         omni_master_port: int,
-        omni_dp_size_local: int = 1,
+        omni_num_replica: int = 1,
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
         request_queue: janus.Queue[EngineQueueMessage] | None = None,
@@ -756,7 +793,7 @@ class DistStageRuntime(StageRuntime):
 
         self._omni_master_server: OmniMasterServer | None = None
         self._coordinator_runtime: Any | None = None
-        self._omni_dp_size_local = omni_dp_size_local
+        self._omni_num_replica = omni_num_replica
         self._stage_remote_factory_contexts: dict[int, StageRemoteFactoryContext] = {}
 
     def create_membership_controller(self) -> Any | None:
@@ -777,7 +814,7 @@ class DistStageRuntime(StageRuntime):
         return super()._prepare_stage_plans()
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
-        """Apply --omni-dp-size-local to the local stage's runtime.num_replicas."""
+        """Apply omni_num_replica to the local stage's runtime.num_replicas."""
         target_stage_id = self._single_stage_id_filter
         if target_stage_id is None:
             return
@@ -789,14 +826,14 @@ class DistStageRuntime(StageRuntime):
                 continue
             if stage_id == target_stage_id:
                 try:
-                    runtime_cfg.num_replicas = self._omni_dp_size_local
+                    runtime_cfg.num_replicas = self._omni_num_replica
                 except (AttributeError, TypeError):
                     if hasattr(runtime_cfg, "__setitem__"):
-                        runtime_cfg["num_replicas"] = self._omni_dp_size_local
+                        runtime_cfg["num_replicas"] = self._omni_num_replica
                         continue
                     logger.warning(
-                        "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
-                        self._omni_dp_size_local,
+                        "[DistStageRuntime] Failed to apply omni_num_replica=%s to stage %s runtime config",
+                        self._omni_num_replica,
                         stage_id,
                     )
 
@@ -1070,7 +1107,7 @@ def create_stage_runtime(
     single_stage_id_filter: int | None = None,
     omni_master_address: str | None = None,
     omni_master_port: int | None = None,
-    omni_dp_size_local: int = 1,
+    omni_num_replica: int = 1,
     omni_heartbeat_timeout: float = 30.0,
     omni_lb_policy: str = "random",
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
@@ -1090,11 +1127,16 @@ def create_stage_runtime(
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
-            omni_dp_size_local=omni_dp_size_local,
+            omni_num_replica=omni_num_replica,
             omni_heartbeat_timeout=omni_heartbeat_timeout,
             omni_lb_policy=omni_lb_policy,
             request_queue=request_queue,
         )
+    # Single-process: --omni-num-replica fans the comprehension (AR) stage into
+    # that many replicas. The distributed path applies it to its --stage-id
+    # stage instead (see DistStageRuntime).
+    if omni_num_replica > 1:
+        _apply_num_replicas_to_comprehension_stage(stage_configs, omni_num_replica)
     return StageRuntime(
         stage_configs=stage_configs,
         model=model,
@@ -1104,3 +1146,22 @@ def create_stage_runtime(
         async_chunk=async_chunk,
         tokenizer=tokenizer,
     )
+
+
+def _apply_num_replicas_to_comprehension_stage(stage_configs: Sequence[Any], num_replicas: int) -> None:
+    """Set the comprehension (AR) stage's ``runtime.num_replicas`` for single-process
+    ``--omni-num-replica``. Targets the ``is_comprehension`` stage, falling back to the
+    first non-diffusion (LLM) stage."""
+    target = next((c for c in stage_configs if getattr(c, "is_comprehension", False)), None)
+    if target is None:
+        target = next((c for c in stage_configs if getattr(c, "stage_type", "llm") != "diffusion"), None)
+    if target is None:
+        return
+    runtime_cfg = getattr(target, "runtime", None)
+    if runtime_cfg is None:
+        return
+    try:
+        runtime_cfg.num_replicas = num_replicas
+    except (AttributeError, TypeError):
+        if hasattr(runtime_cfg, "__setitem__"):
+            runtime_cfg["num_replicas"] = num_replicas

@@ -23,6 +23,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    KV_DP_PORT_STRIDE,
     KV_TRANSFER_PORT_OFFSET,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
@@ -353,21 +354,33 @@ class StageEngineCoreClientBase(StageClientBase):
         *,
         base_port: int = 50051,
         kv_transfer_port_offset: int = KV_TRANSFER_PORT_OFFSET,
+        dp_rank: int = 0,
     ) -> dict[str, Any] | None:
         """Build sender bootstrap info for diffusion KV transfer receivers.
 
         ``base_port`` and ``kv_transfer_port_offset`` are only used by the
         legacy fallback path when no connector-level sender endpoint is
         configured in ``omni_kv_config``.
+
+        ``dp_rank`` is the inner data-parallel rank of the engine that actually
+        served the request (the KV producer). The advertised endpoint is the
+        rank-0 base port of *that* DP group, so receiver workers can add their
+        own ``local_rank * KV_RANK_PORT_STRIDE``. Defaults to 0 for
+        single-DP stages.
         """
+        dp_offset = max(int(dp_rank), 0) * KV_DP_PORT_STRIDE
         if self._kv_sender_info is not None:
-            return dict(self._kv_sender_info)
+            info = dict(self._kv_sender_info)
+            if dp_offset and info.get("zmq_port") is not None:
+                info["zmq_port"] = int(info["zmq_port"]) + dp_offset
+            return info
 
         if self._kv_sender_host is None:
             self._kv_sender_host = self._resolve_contact_host()
         if self._kv_sender_host is None:
             return None
-        # rank-0 base port; receiver workers adjust per KV_RANK_PORT_STRIDE.
+        # rank-0 base port for the serving DP group; receiver workers add their
+        # own local_rank * KV_RANK_PORT_STRIDE.
         return {
             "host": self._kv_sender_host,
             "zmq_port": kv_zmq_port(
@@ -375,6 +388,7 @@ class StageEngineCoreClientBase(StageClientBase):
                 int(self.stage_id),
                 local_rank=0,
                 replica_id=self.replica_id,
+                dp_rank=dp_rank,
             ),
         }
 

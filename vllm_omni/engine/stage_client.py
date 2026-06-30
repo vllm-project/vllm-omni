@@ -86,6 +86,7 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
         *,
         base_port: int = ...,
         kv_transfer_port_offset: int = ...,
+        dp_rank: int = ...,
     ) -> dict[str, Any] | None: ...
 
 

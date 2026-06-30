@@ -39,7 +39,7 @@ def _make_headless_args(**kwargs) -> TrackingNamespace:
         "omni_master_address": "127.0.0.1",
         "omni_master_port": 26000,
         "omni_replica_address": None,
-        "omni_dp_size_local": 1,
+        "omni_num_replica": 1,
         "worker_backend": "multi_process",
         "stage_configs_path": None,
         "deploy_config": None,
@@ -192,8 +192,8 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     engine_manager.shutdown.assert_called_once_with()
 
 
-def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: MockerFixture) -> None:
-    """``--omni-dp-size-local=N`` must spawn N managers, each with its own
+def test_run_headless_llm_launches_one_manager_per_omni_num_replica(mocker: MockerFixture) -> None:
+    """``--omni-num-replica=N`` must spawn N managers, each with its own
     master-assigned replica_id, and join all of them before returning."""
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
@@ -243,7 +243,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
     )
     mocker.patch("signal.signal")
 
-    run_headless(_make_headless_args(stage_id=0, omni_dp_size_local=2))
+    run_headless(_make_headless_args(stage_id=0, omni_num_replica=2))
 
     assert mock_manager_cls.call_count == 2
     assigned_ids = [call.kwargs["omni_replica_base_id"] for call in mock_manager_cls.call_args_list]

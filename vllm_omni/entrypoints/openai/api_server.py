@@ -684,6 +684,17 @@ async def build_async_omni_from_stage_config(
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
         kwargs.setdefault("log_stats", not args.disable_log_stats)
+        # CLI boundary: --omni-num-replica is canonical; --omni-dp-size-local is
+        # the deprecated alias. Fold whichever the user passed (carried in the
+        # explicit kwargs) into the canonical omni_num_replica that AsyncOmni reads.
+        from vllm_omni.engine.arg_utils import resolve_omni_num_replica
+
+        kwargs["omni_num_replica"] = resolve_omni_num_replica(
+            kwargs.pop("omni_num_replica", None),
+            kwargs.pop("omni_dp_size_local", None),
+            label_omni_num_replica="--omni-num-replica",
+            label_omni_dp_size_local="--omni-dp-size-local",
+        )
         async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory

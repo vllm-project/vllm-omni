@@ -31,12 +31,21 @@ KV_TRANSFER_PORT_OFFSET = 100
 # Formula:
 #   zmq_port = base + KV_TRANSFER_PORT_OFFSET
 #            + replica * KV_REPLICA_PORT_STRIDE
+#            + dp_rank * KV_DP_PORT_STRIDE
 #            + rank * KV_RANK_PORT_STRIDE
 #            + stage
 KV_RANK_PORT_STRIDE = 16
 
+# Port stride between inner vLLM data-parallel ranks of the same stage
+# replica.  Without this term, a KV-sending stage with data_parallel_size > 1
+# binds the same port for every DP group's TP-rank-0 worker -> EADDRINUSE.
+# Sized to hold up to KV_DP_PORT_STRIDE / KV_RANK_PORT_STRIDE = 8 TP ranks per
+# DP group, and KV_REPLICA_PORT_STRIDE / KV_DP_PORT_STRIDE = 8 DP groups per
+# replica block.
+KV_DP_PORT_STRIDE = 128
+
 # Port stride between Omni replicas of the same stage.  This reserves a
-# comfortably sized block per replica for TP-rank and stage offsets.
+# comfortably sized block per replica for DP-group, TP-rank and stage offsets.
 KV_REPLICA_PORT_STRIDE = 1024
 
 

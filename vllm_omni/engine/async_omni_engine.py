@@ -255,11 +255,11 @@ class AsyncOmniEngine:
         self._omni_master_port: int | None = kwargs.get("omni_master_port")
 
         # New omni-coordinator flags. Consumed only in single_stage_mode.
-        # ``omni_dp_size_local`` is process-local: each invocation (head and
+        # ``omni_num_replica`` is process-local: each invocation (head and
         # every headless) launches that many replicas for its own stage.
-        self._omni_dp_size_local: int = int(kwargs.get("omni_dp_size_local") or 1)
-        if self._omni_dp_size_local < 1:
-            raise ValueError(f"--omni-dp-size-local must be >= 1, got {self._omni_dp_size_local}")
+        self._omni_num_replica: int = int(kwargs.get("omni_num_replica") or 1)
+        if self._omni_num_replica < 1:
+            raise ValueError(f"--omni-num-replica must be >= 1, got {self._omni_num_replica}")
         self._omni_lb_policy: str = str(kwargs.get("omni_lb_policy") or "random")
         self._omni_heartbeat_timeout: float = float(kwargs.get("omni_heartbeat_timeout") or 30.0)
         if self._omni_heartbeat_timeout <= 0:
@@ -355,7 +355,7 @@ class AsyncOmniEngine:
             single_stage_id_filter=self._single_stage_id_filter,
             omni_master_address=self._omni_master_address,
             omni_master_port=self._omni_master_port,
-            omni_dp_size_local=self._omni_dp_size_local,
+            omni_num_replica=self._omni_num_replica,
             omni_heartbeat_timeout=self._omni_heartbeat_timeout,
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,

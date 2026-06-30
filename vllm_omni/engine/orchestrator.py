@@ -1287,8 +1287,25 @@ class Orchestrator:
                             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
                         )
                         return
-                    if already_submitted and len(diffusion_prompt) == 1:
+                    # The AR→DiT input processor wraps a single diffusion prompt
+                    # in a list. Unwrap a length-1 list for BOTH the initial and the
+                    # streaming-update submit: upstream #4079 removed diffusion
+                    # list-prompt batch support (``stage_pool.submit_initial`` /
+                    # ``submit_update`` now reject lists), so each diffusion request
+                    # must be submitted independently.
+                    if len(diffusion_prompt) == 1:
                         diffusion_prompt = diffusion_prompt[0]
+                    elif not already_submitted:
+                        # A genuine multi-prompt diffusion batch previously rode the
+                        # list-prompt path that #4079 removed. Fanning it into N
+                        # independent diffusion requests under one orchestrator
+                        # req_id needs sub-request tracking that is not wired up yet,
+                        # so fail loudly instead of handing a list to submit_initial.
+                        raise ValueError(
+                            f"req={req_id}: AR→DiT produced {len(diffusion_prompt)} diffusion "
+                            "prompts; multi-prompt batches are no longer supported as a single "
+                            "submit (upstream #4079). Emit independent diffusion requests instead."
+                        )
             else:
                 diffusion_prompt = req_state.prompt
 
@@ -1303,6 +1320,9 @@ class Orchestrator:
                         "kv_sender_info": self._build_kv_sender_info(
                             list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
                             request_id=req_id,
+                            sender_dp_rank=int(
+                                (getattr(output, "kv_transfer_params", None) or {}).get("kv_sender_dp_rank", 0) or 0
+                            ),
                         )
                     },
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
@@ -1552,8 +1572,15 @@ class Orchestrator:
         sender_stage_ids: list[int],
         *,
         request_id: str | None = None,
+        sender_dp_rank: int = 0,
     ) -> dict[int, dict[str, Any]] | None:
-        """Build per-request sender info for diffusion KV-transfer receivers."""
+        """Build per-request sender info for diffusion KV-transfer receivers.
+
+        ``sender_dp_rank`` is the inner data-parallel rank of the engine that
+        produced this request's KV (carried on the ``kv_ready`` signal). It is
+        threaded into the advertised endpoint so the receiver pulls from the
+        correct per-DP-group ZMQ port.
+        """
         sender_infos: dict[int, dict[str, Any]] = {}
         for sender_stage_id in dict.fromkeys(sender_stage_ids):
             if sender_stage_id < 0 or sender_stage_id >= len(self.stage_pools):
@@ -1567,7 +1594,10 @@ class Orchestrator:
             if not callable(get_sender_info):
                 continue
 
-            sender_info = get_sender_info()
+            try:
+                sender_info = get_sender_info(dp_rank=sender_dp_rank)
+            except TypeError:
+                sender_info = get_sender_info()
             if not sender_info:
                 logger.warning(
                     "[Orchestrator] Stage-%s has no KV sender info available",

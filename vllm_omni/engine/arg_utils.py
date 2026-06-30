@@ -104,6 +104,56 @@ def register_omni_models_to_vllm():
     import vllm_omni.reasoning  # noqa: F401
 
 
+# Module-level guard so the deprecation warning fires at most once per
+# process even when validate() / __init__ / run_headless all touch the
+# alias path during the same launch.
+_OMNI_DP_SIZE_LOCAL_WARNED = False
+
+
+def resolve_omni_num_replica(
+    omni_num_replica: int | None,
+    omni_dp_size_local: int | None,
+    *,
+    label_omni_num_replica: str,
+    label_omni_dp_size_local: str,
+) -> int:
+    """Resolve ``omni_num_replica`` from the new flag + deprecated CLI alias.
+
+    Called once, from CLI argument parsing (``OmniServeCommand.validate``),
+    to fold the deprecated ``--omni-dp-size-local`` alias into the canonical
+    ``omni_num_replica``. The alias is confined to that parse step; all
+    downstream engine/launch logic reads only ``omni_num_replica``.
+
+    Args:
+        omni_num_replica: Value from ``--omni-num-replica``.
+        omni_dp_size_local: Value from the deprecated ``--omni-dp-size-local``
+            alias.
+        label_omni_num_replica: Human-readable name of the new flag for
+            error messages.
+        label_omni_dp_size_local: Human-readable name of the deprecated alias.
+
+    Returns:
+        Resolved replica count. Defaults to 1 when neither is set.
+
+    Raises:
+        ValueError: when both ``omni_num_replica`` and ``omni_dp_size_local``
+            are set.
+    """
+    if omni_num_replica is not None and omni_dp_size_local is not None:
+        raise ValueError(f"Specify only one of {label_omni_num_replica} / {label_omni_dp_size_local}")
+    if omni_dp_size_local is not None and omni_num_replica is None:
+        global _OMNI_DP_SIZE_LOCAL_WARNED
+        if not _OMNI_DP_SIZE_LOCAL_WARNED:
+            logger.warning(
+                "%s is deprecated; use %s. The old name will be removed in the next release.",
+                label_omni_dp_size_local,
+                label_omni_num_replica,
+            )
+            _OMNI_DP_SIZE_LOCAL_WARNED = True
+        return int(omni_dp_size_local)
+    return int(omni_num_replica) if omni_num_replica is not None else 1
+
+
 @dataclass
 class OmniEngineArgs(EngineArgs):
     """Engine arguments for omni models, extending base EngineArgs.
@@ -192,7 +242,7 @@ class OmniEngineArgs(EngineArgs):
     omni_master_address: str | None = None
     omni_master_port: int | None = None
     # OmniCoordinator integration knobs (process-local).
-    omni_dp_size_local: int = 1
+    omni_num_replica: int = 1
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = 30.0
     stage_configs_path: str | None = None

@@ -1284,7 +1284,7 @@ class TestLaunchOmniCoreEngines:
             omni_master_port=26000,
             omni_stage_id=7,
             omni_stage_config=stage_config,
-            coordinator=None,
+            dp_coordinator=None,
             replica_id=2,
         )
         omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
@@ -1362,7 +1362,7 @@ class TestLaunchOmniCoreEngines:
             omni_master_port=26000,
             omni_stage_id=7,
             omni_stage_config={"stage_id": 7},
-            coordinator=coordinator,
+            dp_coordinator=coordinator,
             replica_id=3,
         )
         mock_wait.assert_called_once()

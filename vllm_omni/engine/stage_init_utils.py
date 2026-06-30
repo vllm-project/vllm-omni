@@ -459,7 +459,7 @@ def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
 def split_devices_for_replicas(
     devices_str: str | None,
     num_replicas: int,
-    tp_size: int,
+    devices_per_replica: int,
     stage_id: int,
 ) -> list[str]:
     """Split a devices string into per-replica subsets.
@@ -467,19 +467,19 @@ def split_devices_for_replicas(
     When ``num_replicas`` is 1, returns ``[devices_str]`` unchanged.
     Otherwise, two YAML shapes are accepted:
 
-    1. **Legacy / pool mode** — ``len(devices) == num_replicas * tp_size``:
+    1. **Legacy / pool mode** — ``len(devices) == num_replicas * devices_per_replica``:
        the string enumerates the full per-stage pool. Each replica gets
-       ``tp_size`` consecutive entries. The values are logical indices
-       into the launcher's ``CUDA_VISIBLE_DEVICES``.
+       ``devices_per_replica`` consecutive entries. The values are logical
+       indices into the launcher's ``CUDA_VISIBLE_DEVICES``.
 
        ``split_devices_for_replicas("1,2,3,4", 2, 2, 1) → ["1,2", "3,4"]``
 
-    2. **Template mode** — ``len(devices) == tp_size``: the YAML declares
-       a single per-replica template (the same shape one replica would
-       use), and is **dp-independent**. Each replica r gets the offsets
-       ``[r*tp_size + a for a in template]`` of the launcher's
+    2. **Template mode** — ``len(devices) == devices_per_replica``: the YAML
+       declares a single per-replica template (the same shape one replica
+       would use), and is **dp-independent**. Each replica r gets the offsets
+       ``[r*devices_per_replica + a for a in template]`` of the launcher's
        ``CUDA_VISIBLE_DEVICES``. The template's entries must lie in
-       ``[0, tp_size)``.
+       ``[0, devices_per_replica)``.
 
        ``split_devices_for_replicas("0,1", 2, 2, 1) → ["0,1", "2,3"]``
        ``split_devices_for_replicas("0,1", 4, 2, 1) → ["0,1", "2,3", "4,5", "6,7"]``
@@ -496,40 +496,62 @@ def split_devices_for_replicas(
 
     device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
 
-    if len(device_list) == num_replicas * tp_size:
-        return [",".join(device_list[r * tp_size : (r + 1) * tp_size]) for r in range(num_replicas)]
+    if len(device_list) == num_replicas * devices_per_replica:
+        return [
+            ",".join(device_list[r * devices_per_replica : (r + 1) * devices_per_replica]) for r in range(num_replicas)
+        ]
 
-    if len(device_list) == tp_size:
+    if len(device_list) == devices_per_replica:
         try:
             offsets = [int(a) for a in device_list]
         except ValueError as e:
             raise ValueError(f"Stage {stage_id}: template-mode devices must be ints, got {devices_str!r}") from e
-        bad = [a for a in offsets if not (0 <= a < tp_size)]
+        bad = [a for a in offsets if not (0 <= a < devices_per_replica)]
         if bad:
             raise ValueError(
                 f"Stage {stage_id}: template-mode device offset(s) {bad} "
-                f"out of range [0, {tp_size}); devices={devices_str!r}"
+                f"out of range [0, {devices_per_replica}); devices={devices_str!r}"
             )
-        return [",".join(str(r * tp_size + a) for a in offsets) for r in range(num_replicas)]
+        return [",".join(str(r * devices_per_replica + a) for a in offsets) for r in range(num_replicas)]
 
     raise ValueError(
         f"Stage {stage_id}: devices={devices_str!r} has {len(device_list)} id(s); "
-        f"need either {tp_size} (template, dp-independent) or "
-        f"{num_replicas * tp_size} (pool / legacy). "
-        f"num_replicas={num_replicas}, tensor_parallel_size={tp_size}."
+        f"need either {devices_per_replica} (template, dp-independent) or "
+        f"{num_replicas * devices_per_replica} (pool / legacy). "
+        f"num_replicas={num_replicas}, devices_per_replica={devices_per_replica}."
     )
+
+
+def _stage_engine_arg_int(stage_cfg: Any, key: str, default: int = 1) -> int:
+    """Read an int field from a stage's ``engine_args`` (dict or object).
+
+    A ``None`` value (field present but unset, e.g. ``pipeline_parallel_size:``
+    left blank) collapses to ``default``.
+    """
+    engine_args = getattr(stage_cfg, "engine_args", {})
+    if hasattr(engine_args, "get"):
+        return int(engine_args.get(key, default) or default)
+    return int(getattr(engine_args, key, default) or default)
 
 
 def get_stage_tp_size(stage_cfg: Any) -> int:
     """Extract tensor_parallel_size from a stage config object."""
-    engine_args = getattr(stage_cfg, "engine_args", {})
-    if hasattr(engine_args, "get"):
-        return int(engine_args.get("tensor_parallel_size", 1) or 1)
-    return int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
+    return _stage_engine_arg_int(stage_cfg, "tensor_parallel_size", 1)
 
 
 def get_stage_devices_per_replica(stage_cfg: Any) -> int:
-    """Return the number of devices consumed by one replica of *stage_cfg*."""
+    """Return the number of devices consumed by one replica of *stage_cfg*.
+
+    Diffusion stages derive their device count from the diffusion
+    ``parallel_config`` world size. LLM stages use the full intra-replica GPU
+    count ``tp x pp x pcp x dp``: every inner vLLM-DP rank needs its own
+    ``tp x pp`` GPUs, so a replica running ``data_parallel_size`` ranks
+    consumes ``dp`` times the TP world (matches PR1 design 3.2 rule 9 and how
+    single-replica ``devices:`` are written -- e.g. ``"0,1,2,3"`` for
+    ``tp=2, dp=2``). Returning ``tp`` alone under-provisioned every replica by
+    ``dp`` and made ``num_replicas > 1`` with ``data_parallel_size > 1``
+    unrunnable.
+    """
     engine_args = getattr(stage_cfg, "engine_args", {})
     if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
         parallel_config = _get_attr_or_item(engine_args, "parallel_config")
@@ -547,7 +569,11 @@ def get_stage_devices_per_replica(stage_cfg: Any) -> int:
         except Exception:
             return 1
 
-    return get_stage_tp_size(stage_cfg)
+    tp = _stage_engine_arg_int(stage_cfg, "tensor_parallel_size", 1)
+    pp = _stage_engine_arg_int(stage_cfg, "pipeline_parallel_size", 1)
+    pcp = _stage_engine_arg_int(stage_cfg, "prefill_context_parallel_size", 1)
+    dp = _stage_engine_arg_int(stage_cfg, "data_parallel_size", 1)
+    return max(1, tp * pp * pcp * dp)
 
 
 def compute_replica_layout(
@@ -745,14 +771,132 @@ def build_engine_args_dict(
     return engine_args_dict
 
 
+_LLM_MASTER_OWNED_FIELDS: tuple[str, ...] = (
+    "data_parallel_address",
+    "data_parallel_rpc_port",
+    "data_parallel_master_port",
+    "data_parallel_rank",
+    "data_parallel_rank_local",
+    "data_parallel_size_local",
+)
+
+
+def _enforce_omni_parallel_config(
+    stage_cfg: Any,
+    engine_args_dict: dict[str, Any],
+    *,
+    num_replicas_for_devices: int,
+) -> None:
+    """Validate and normalize an LLM stage's parallel config in-place.
+
+    DiT stages early-return; the DiT runtime handles its own validation
+    in ``DiffusionParallelConfig``.
+
+    Must run in ``build_vllm_config`` BEFORE ``filter_dataclass_kwargs``
+    so that disallowed keys like a nested ``parallel_config:`` block on
+    an LLM stage are caught instead of being silently stripped.
+
+    ``num_replicas_for_devices`` is the per-runtime replica count used
+    by the devices-divisibility check. Resolved by the caller because
+    only the caller knows which launch mode is active (headless reads
+    ``args.omni_num_replica``; head-owned reads
+    ``stage_cfg.runtime.num_replicas``).
+    """
+    stage_type = getattr(stage_cfg, "stage_type", "llm")
+    sid = getattr(stage_cfg, "stage_id", "?")
+
+    if int(num_replicas_for_devices) < 1:
+        raise ValueError(f"stage {sid}: num_replicas_for_devices must be >= 1, got {num_replicas_for_devices}")
+
+    # 1) DiT early-return.
+    if stage_type == "diffusion":
+        return
+
+    # 2) Reject nested ``parallel_config:`` on LLM stages.
+    nested = engine_args_dict.get("parallel_config")
+    if nested is not None:
+        raise ValueError(f"stage {sid}: nested parallel_config: block is for DiT; use flat fields on LLM stages")
+
+    # 3) Reject master-owned fields.
+    for f in _LLM_MASTER_OWNED_FIELDS:
+        if engine_args_dict.get(f) is not None:
+            raise ValueError(f"stage {sid}: engine_args.{f} is owned by vLLM/omni and must not be set in YAML or CLI")
+
+    # 4) Reject incompatible LB / EP flags.
+    for f in ("data_parallel_external_lb", "data_parallel_hybrid_lb", "enable_elastic_ep"):
+        if bool(engine_args_dict.get(f)):
+            raise ValueError(
+                f"stage {sid}: engine_args.{f}=True is incompatible with omni "
+                f"(would short-circuit one of the two LB layers or require Ray)"
+            )
+
+    # 5) Reject Ray DP backend (out of scope for PR 1; see RFC leftover).
+    dp_backend = engine_args_dict.get("data_parallel_backend")
+    if dp_backend is not None and dp_backend != "mp":
+        raise ValueError(f"stage {sid}: data_parallel_backend must be 'mp' under omni, got {dp_backend!r}")
+
+    # 6) Reject api_server_count > 1 under omni.
+    api_server_count = engine_args_dict.get("api_server_count")
+    if api_server_count is not None and int(api_server_count) > 1:
+        raise ValueError(
+            f"stage {sid}: api_server_count > 1 is incompatible with omni "
+            f"(separate API-server pool breaks the outer LB)"
+        )
+
+    # 7) Normalize / positive-int check parallelism axes.
+    for f in ("tensor_parallel_size", "pipeline_parallel_size", "prefill_context_parallel_size", "data_parallel_size"):
+        v = engine_args_dict.get(f)
+        if v is not None and int(v) < 1:
+            raise ValueError(f"stage {sid}: {f} must be >= 1, got {v}")
+    if engine_args_dict.get("data_parallel_size") is None:
+        engine_args_dict["data_parallel_size"] = 1
+
+    # 8) EPLB world-size check.
+    if bool(engine_args_dict.get("enable_eplb")):
+        tp = int(engine_args_dict.get("tensor_parallel_size") or 1)
+        pcp = int(engine_args_dict.get("prefill_context_parallel_size") or 1)
+        dp = int(engine_args_dict.get("data_parallel_size") or 1)
+        if tp * pcp * dp <= 1:
+            raise ValueError(f"stage {sid}: enable_eplb requires tp * pcp * dp > 1, got tp={tp}, pcp={pcp}, dp={dp}")
+
+    # 9) Device-count divisibility via split_devices_for_replicas. The
+    # function already enforces the template-or-pool contract and
+    # produces a stage-id-prefixed error with the accepted lengths
+    # spelled out; calling it here just runs the same check earlier.
+    runtime = getattr(stage_cfg, "runtime", None)
+    if runtime is not None:
+        devices_str = runtime.get("devices") if hasattr(runtime, "get") else getattr(runtime, "devices", None)
+        if devices_str:
+            tp = int(engine_args_dict.get("tensor_parallel_size") or 1)
+            pp = int(engine_args_dict.get("pipeline_parallel_size") or 1)
+            pcp = int(engine_args_dict.get("prefill_context_parallel_size") or 1)
+            dp = int(engine_args_dict.get("data_parallel_size") or 1)
+            per_replica = tp * pp * pcp * dp
+            # ``split_devices_for_replicas`` raises ValueError with a
+            # stage-id-prefixed message on any mismatch; propagate as-is.
+            split_devices_for_replicas(
+                devices_str=devices_str,
+                num_replicas=int(num_replicas_for_devices),
+                devices_per_replica=per_replica,
+                stage_id=int(sid) if isinstance(sid, int) else sid,
+            )
+
+
 def build_vllm_config(
     stage_config: Any,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
+    *,
+    num_replicas_for_devices: int = 1,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
+
+    ``num_replicas_for_devices`` is forwarded to
+    ``_enforce_omni_parallel_config`` for the devices-divisibility
+    check. The caller is responsible for resolving the correct value
+    (CLI vs YAML — see ``_enforce_omni_parallel_config``).
 
     Returns:
         (vllm_config, executor_class)
@@ -763,6 +907,15 @@ def build_vllm_config(
             model,
             stage_connector_spec=stage_connector_spec,
         )
+
+    # Validate / normalize parallel config BEFORE filter_dataclass_kwargs
+    # so disallowed keys (e.g. nested ``parallel_config:`` on an LLM
+    # stage) are caught instead of silently stripped.
+    _enforce_omni_parallel_config(
+        stage_config,
+        engine_args_dict,
+        num_replicas_for_devices=num_replicas_for_devices,
+    )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
 

@@ -301,47 +301,63 @@ class StageDeployConfig:
     (``trust_remote_code``, ``distributed_executor_backend``, ``dtype``,
     ``quantization``, prefix/chunked prefill, DP/PP sizes) are declared at
     the top level of ``DeployConfig`` and propagated to every stage.
+
+    Fields are organized into three groups by which stage runtime consumes
+    them:
+
+    * **Shared** — honored by both LLM and DiT stages (identity, placement,
+      connector wiring, the TP/DP/EP parallelism trio, and common
+      capacity/execution knobs).
+    * **LLM-only** — vLLM ``EngineArgs`` that DiT stages ignore (sampling,
+      scheduler/KV capacity, inner-DP context-parallel + EP/EPLB, model
+      loading/compilation).
+    * **DiT-only** — diffusion ``parallel_config`` overrides (sequence/CFG/VAE/
+      HSDP parallelism) folded into the nested ``parallel_config:`` block for
+      DiT stages; unused by LLM stages.
     """
 
-    # === Omni fields ===
-    # Stage identity and Omni runtime placement.
+    # ============================ Shared (LLM + DiT) ============================
+    # Stage identity, Omni runtime placement, and inter-stage connector wiring.
     stage_id: int
     devices: str | None = None
     num_replicas: int = 1
     env: dict[str, Any] | None = None
-
-    # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
+
+    # Parallelism honored by both runtimes: vLLM ``ParallelConfig`` for LLM
+    # stages, folded into the diffusion ``parallel_config`` for DiT stages.
+    tensor_parallel_size: int | None = None
+    data_parallel_size: int | None = None
+    enable_expert_parallel: bool | None = None
+
+    # Capacity / execution knobs both stage types honor.
+    gpu_memory_utilization: float | None = None
+    max_num_seqs: int | None = None
+    enforce_eager: bool | None = None
+
+    # Pass-through vLLM EngineArgs fields that are not represented elsewhere.
+    engine_extras: dict[str, Any] = field(default_factory=dict)
+
+    # ================================ LLM-only =================================
+    # Request/sampling defaults.
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
 
-    # === vLLM EngineArgs fields ===
-    # Parallelism and scheduler/memory capacity.
-    tensor_parallel_size: int | None = None
-    gpu_memory_utilization: float | None = None
-    max_num_seqs: int | None = None
+    # Scheduler, KV/cache behavior, and model-length capacity.
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
-
-    # Execution, scheduling, and KV/cache behavior.
-    enforce_eager: bool | None = None
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
 
-    # Diffusion parallel_config deploy override fields.
-    enable_expert_parallel: bool | None = None
-    ulysses_degree: int | None = None
-    ulysses_mode: str | None = None
-    ring_degree: int | None = None
-    sequence_parallel_size: int | None = None
-    cfg_parallel_size: int | None = None
-    vae_patch_parallel_size: int | None = None
-    vae_parallel_mode: str | None = None
-    use_hsdp: bool | None = None
-    hsdp_shard_size: int | None = None
-    hsdp_replicate_size: int | None = None
+    # Inner vLLM DP context-parallel + EP/EPLB. Unused on DiT stages, which
+    # consume the nested ``parallel_config:`` block instead.
+    prefill_context_parallel_size: int | None = None
+    enable_eplb: bool | None = None
+    eplb_config: dict[str, Any] | None = None
+    expert_placement_strategy: str | None = None
+    all2all_backend: str | None = None
 
     # Compilation, profiling, tokenizer/config parsing, and model loading.
     compilation_config: dict[str, Any] | None = None
@@ -352,8 +368,20 @@ class StageDeployConfig:
     load_format: str | None = None
     tokenizer_mode: str | None = None
 
-    # Pass-through vLLM EngineArgs fields that are not represented above.
-    engine_extras: dict[str, Any] = field(default_factory=dict)
+    # ================================ DiT-only =================================
+    # Diffusion ``parallel_config`` deploy overrides (sequence/CFG/VAE/HSDP
+    # parallelism). Moved into the nested ``parallel_config`` for DiT stages;
+    # unused by LLM stages.
+    sequence_parallel_size: int | None = None
+    ulysses_degree: int | None = None
+    ulysses_mode: str | None = None
+    ring_degree: int | None = None
+    cfg_parallel_size: int | None = None
+    vae_patch_parallel_size: int | None = None
+    vae_parallel_mode: str | None = None
+    use_hsdp: bool | None = None
+    hsdp_shard_size: int | None = None
+    hsdp_replicate_size: int | None = None
 
 
 @dataclass

@@ -111,10 +111,11 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         for index in range(local_engine_count):
             local_index = local_start_index + index
             global_index = start_index + index
-            # Each spawned subprocess is one omni replica. The replica id
-            # is contiguous within this manager; the master server may have
-            # pre-allocated a contiguous block starting at ``omni_replica_base_id``.
-            omni_replica_id = omni_replica_base_id + index
+            # All DP ranks of one omni replica share omni_replica_id —
+            # the KV connector keys peers by it (via VLLM_OMNI_REPLICA_ID,
+            # see kv_utils.py:97). Diverging ids → cross-stage rank
+            # mismatch. See docs/design/pr1-yaml-only.md §4.
+            omni_replica_id = omni_replica_base_id
 
             local_dp_ranks.append(local_index)
             self.processes.append(

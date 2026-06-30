@@ -94,6 +94,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
 
+        # Inner-DP rank of the engine this scheduler belongs to.  Stamped onto
+        # the ``kv_ready`` signal so the orchestrator can advertise the correct
+        # per-DP-group KV sender endpoint to the receiving stage (the sender
+        # ZMQ port carries a dp_rank term to avoid same-host EADDRINUSE).
+        _pc = getattr(self.vllm_config, "parallel_config", None)
+        _dp_local = getattr(_pc, "data_parallel_rank_local", None)
+        if _dp_local is None:
+            _dp_local = getattr(_pc, "data_parallel_rank", 0)
+        self._kv_sender_dp_rank: int = max(int(_dp_local or 0), 0)
+
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
         # Output placeholders are zero when async scheduling isn't used
@@ -332,7 +342,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             OmniEngineCoreOutput(
                                 request_id=req_id,
                                 new_token_ids=[],
-                                kv_transfer_params={"kv_ready": True},
+                                kv_transfer_params={
+                                    "kv_ready": True,
+                                    "kv_sender_dp_rank": self._kv_sender_dp_rank,
+                                },
                             )
                         )
                 except Exception:

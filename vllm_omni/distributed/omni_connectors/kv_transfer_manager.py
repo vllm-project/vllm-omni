@@ -26,6 +26,7 @@ from .utils.kv_utils import (
     build_rank_aware_recv_keys,
     build_rank_aware_send_keys,
     get_kv_target_ranks,
+    get_local_dp_rank,
     get_local_tp_rank,
     get_omni_replica_id,
     get_tp_world_size,
@@ -536,6 +537,7 @@ class OmniKVTransferManager:
                             stage_int,
                             self._tp_topo.local_rank,
                             replica_id=replica_id,
+                            dp_rank=get_local_dp_rank(),
                         )
 
                         if self.config.need_send_cache:

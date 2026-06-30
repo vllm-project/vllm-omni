@@ -16,7 +16,12 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from .initialization import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
+from .initialization import (
+    KV_DP_PORT_STRIDE,
+    KV_RANK_PORT_STRIDE,
+    KV_REPLICA_PORT_STRIDE,
+    KV_TRANSFER_PORT_OFFSET,
+)
 
 logger = init_logger(__name__)
 
@@ -103,6 +108,30 @@ def get_omni_replica_id() -> int:
     return max(replica_id, 0)
 
 
+def get_local_dp_rank() -> int:
+    """Return this worker's data-parallel rank within its replica's DP group.
+
+    With inner ``data_parallel_size > 1`` each DP group's TP-rank-0 worker
+    would otherwise compute the same KV-transfer ZMQ port and collide on bind.
+    Prefers vLLM's DP parallel-state group (the rank within this replica's DP
+    group), falling back to the engine-set env vars, then 0.
+    """
+    try:
+        from vllm.distributed.parallel_state import get_dp_group
+
+        return max(int(get_dp_group().rank_in_group), 0)
+    except Exception:
+        logger.debug("DP parallel state not initialized, falling back to env", exc_info=True)
+    for var in ("VLLM_DP_RANK_LOCAL", "VLLM_DP_RANK"):
+        val = os.environ.get(var)
+        if val is not None:
+            try:
+                return max(int(val), 0)
+            except (ValueError, TypeError):
+                pass
+    return 0
+
+
 # ------------------------------------------------------------------ #
 #  ZMQ port computation
 # ------------------------------------------------------------------ #
@@ -113,13 +142,15 @@ def kv_zmq_port(
     from_stage: int,
     local_rank: int = 0,
     replica_id: int | None = None,
+    dp_rank: int = 0,
 ) -> int:
     """Compute the ZMQ port for a KV-transfer connector.
 
-    Each Omni replica and TP rank gets its own port so multi-replica or
-    TP > 1 deployments do not cause ``EADDRINUSE`` when multiple sender
-    workers bind on the same host. The formula is backward-compatible:
-    replica 0 / rank 0 produces the previous ``base + OFFSET + stage`` port.
+    Each Omni replica, inner DP group, and TP rank gets its own port so
+    multi-replica, ``data_parallel_size > 1``, or TP > 1 deployments do not
+    cause ``EADDRINUSE`` when multiple sender workers bind on the same host.
+    The formula is backward-compatible: replica 0 / dp 0 / rank 0 produces the
+    previous ``base + OFFSET + stage`` port.
 
     """
     replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
@@ -127,6 +158,7 @@ def kv_zmq_port(
         base_port
         + KV_TRANSFER_PORT_OFFSET
         + replica * KV_REPLICA_PORT_STRIDE
+        + max(int(dp_rank), 0) * KV_DP_PORT_STRIDE
         + local_rank * KV_RANK_PORT_STRIDE
         + from_stage
     )
