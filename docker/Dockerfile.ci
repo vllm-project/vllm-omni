@@ -1,9 +1,8 @@
-# Target vllm: the upstream commit pinned in VLLM_PRECOMPILED_WHEEL_COMMIT below
-# (the precompiled wheel force-reinstalled over the base image's vLLM).
+# Target vllm version: v0.24.0 (releases/v0.24.0 branch).
 # The pinned VLLM_PRECOMPILED_WHEEL_COMMIT and VLLM_BASE_TAG below must
 # be updated on every rebase to match the new upstream vllm commit/tag.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.23.0
+ARG VLLM_BASE_TAG=v0.24.0
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
@@ -15,56 +14,8 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-
-# Install vLLM (CUDA 13.0 build) from precompiled wheel at the selected commit.
-# Must use direct URL because the wheel has a PEP 440 local version identifier
-# (e.g. +gaeee7ef93.cu130) which pip/uv refuse to install from a PEP 503 package index.
-# The cu130 wheel index lives at /<commit>/cu130/vllm/ but the actual wheel files
-# are stored at the top level /<commit>/<wheel>.
-ENV VLLM_PRECOMPILED_WHEEL_COMMIT=217c64a976869883fcf0c52a8cf8bc3c954d285b
-# Ensure CUDA library path is in LD_LIBRARY_PATH so bitsandbytes' precompiled
-# C extension can find libnvJitLink.so.13 (CUDA 13.x JIT linker) at import time.
-# The base vLLM image has bitsandbytes pre-installed; without this env var,
-# worker subprocesses fail to load bitsandbytes' C extension, producing
-# OSError tracebacks that pollute CI logs.
-ENV LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}
-RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
-    from urllib.parse import urljoin, quote; \
-    index_url='https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/cu130/vllm/'; \
-    html=urllib.request.urlopen(index_url).read().decode(); \
-    m=re.search(r'href=\"([^\"]*x86_64\.whl)\"',html); \
-    assert m, f'No x86_64 vLLM wheel found at {index_url}'; \
-    print(quote(urljoin(index_url,m.group(1)), safe=':/+%'))") && \
-    echo "Installing vLLM from: ${VLLM_WHEEL_URL}" && \
-    uv pip install --system --force-reinstall "${VLLM_WHEEL_URL}"
-
-
-
 RUN uv pip install --system ".[dev]"
 
-RUN uv pip install --system --upgrade \
-        "flashinfer-python==0.6.12" \
-        "flashinfer-cubin==0.6.12" \
-        "numpy==2.2.6"
-
-RUN uv pip install --system --upgrade \
-    "flashinfer-jit-cache==0.6.12" \
-    --index-url https://flashinfer.ai/whl/cu130
-
-# Force-reinstall torch AFTER flashinfer, because flashinfer --upgrade pulls in
-# a newer torch (2.12.x) whose libtorch_cuda.so lacks
-# at::cuda::getCurrentCUDABlasHandle, causing "undefined symbol" at import time.
-RUN uv pip install --system --force-reinstall \
-    "torch==2.11.0" "torchaudio==2.11.0" "torchvision==0.26.0" \
-    --torch-backend cu130
-
-# Re-pin numpy LAST. The flashinfer-jit-cache and torch reinstalls above
-# resolve their own dependencies and pull numpy 2.5, which clobbers the
-# numpy==2.2.6 from the flashinfer step and breaks numba at runtime
-# ("Numba needs NumPy 2.4 or less. Got NumPy 2.5." — TTS audio post-processing,
-# build 2349). Assert the numba-compatible version as the final install step so
-# nothing downstream can bump it.
-RUN uv pip install --system --force-reinstall "numpy==2.2.6"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
