@@ -4038,11 +4038,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
 
-        Streaming is supported via ``stream_format='audio'`` or the legacy
-        ``stream=True`` switch, with ``response_format='pcm'`` or ``'wav'``.
-        ``stream_format='sse'`` returns OpenAI ``speech.audio.*`` SSE events instead.
-        Each Code2Wav chunk is yielded as raw audio bytes as soon as it is decoded.
-        For WAV format, a header with placeholder size values is emitted first.
+        Streaming is supported via the ``stream=True`` switch or ``stream_format='sse'``,
+        which return OpenAI ``speech.audio.*`` SSE events. ``stream_format='audio'``
+        opts into raw audio streaming with ``response_format='pcm'`` or ``'wav'``.
+        Raw audio streaming yields each Code2Wav chunk as raw bytes as soon as it is
+        decoded. Raw WAV streaming emits a header with placeholder size values first.
         """
         if self._diffusion_mode:
             return await self._create_diffusion_speech(request)
@@ -4060,14 +4060,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         try:
-            if request.is_raw_audio_stream():
-                if request.word_timestamps:
-                    return self.create_error_response(
-                        "word_timestamps=true is currently supported by the WebSocket "
-                        "/v1/audio/speech/stream path. Use session.config with "
-                        "stream_audio=true and response_format='pcm'."
-                    )
+            if request.is_streaming() and request.word_timestamps:
+                return self.create_error_response(
+                    "word_timestamps=true is currently supported by the WebSocket "
+                    "/v1/audio/speech/stream path. Use session.config with "
+                    "stream_audio=true and response_format='pcm'."
+                )
 
+            if request.is_raw_audio_stream():
                 response_format, error = self._validate_speech_streaming_request(
                     request,
                     mode_label="Streaming",

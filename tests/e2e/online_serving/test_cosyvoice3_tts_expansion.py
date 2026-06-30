@@ -104,6 +104,7 @@ def test_voice_clone_zh_002(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt("zh"),
         "stream": True,
+        "stream_format": "audio",
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,

@@ -75,6 +75,7 @@ def test_streaming(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": "Hello, this is a voice cloning demo.",
         "stream": True,
+        "stream_format": "audio",
         "response_format": "pcm",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": 1024,
