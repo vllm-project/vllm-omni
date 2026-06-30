@@ -459,7 +459,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self._async_chunk:
             inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
         else:
-            inter_stage_outputs, multimodal_outputs = None, per_req_payloads
+            # See gpu_ar_model_runner: non-async-chunk ships the full payload to the next
+            # stage; #4527's (None, per_req_payloads) starved the downstream stage. (PR #4792)
+            inter_stage_outputs, multimodal_outputs = per_req_payloads, per_req_payloads
 
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
@@ -467,16 +469,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         routed_experts_lists = None
         if self.routed_experts_initialized:
             routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
-        # Full-payload mode (always no-async-chunk: should_accumulate_full_payload_output
-        # is False when async_chunk is set) sends the COMPLETE per-request payload to the
-        # next stage. Use per_req_payloads, not inter_stage_outputs -- the latter is None
-        # in the no-async-chunk path, which previously skipped accumulation entirely and
-        # starved the downstream stage (300s connector-input timeout / empty output).
-        if per_req_payloads and self._should_accumulate_full_payload_output():
+        if inter_stage_outputs and self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
-                if req_state is not None and per_req_payloads[i]:
-                    self.accumulate_full_payload_output(rid, per_req_payloads[i], req_state)
+                if req_state is not None and inter_stage_outputs[i]:
+                    self.accumulate_full_payload_output(rid, inter_stage_outputs[i], req_state)
 
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,

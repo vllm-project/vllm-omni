@@ -434,8 +434,12 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
 
     output = GPUARModelRunner.sample_tokens(runner, grammar_output=None)
 
-    assert output.inter_stage_outputs is None
+    # Non-async-chunk now ships the full payload to the next stage, so
+    # inter_stage_outputs mirrors multimodal_outputs (PR #4792).
+    assert output.inter_stage_outputs is not None
     assert output.multimodal_outputs is not None
+    assert torch.equal(output.inter_stage_outputs[0]["hidden"], output.multimodal_outputs[0]["hidden"])
+    assert torch.equal(output.inter_stage_outputs[1]["hidden"], output.multimodal_outputs[1]["hidden"])
     assert torch.equal(output.multimodal_outputs[0]["hidden"], torch.tensor([[1.0, 10.0]]))
     assert torch.equal(
         output.multimodal_outputs[1]["hidden"],

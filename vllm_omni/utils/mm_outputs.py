@@ -9,13 +9,9 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Client-facing multimodal output roots. At worker output, these roots are
-# copied into the client payload (what is returned to the user). The inter-stage
-# connector payload is NON-LOSSY and keeps every key regardless of this set, so a
-# downstream stage can never starve on a value (e.g. ``model_outputs``/
-# ``latents``) that merely shares a root with a final client output. This list is
-# therefore only an *allowlist for the client copy*, not an exclusion list for
-# stage-to-stage transport.
+# Flat payload keys partitioned at worker output into inter-stage connector
+# payloads vs client-facing multimodal outputs.  Only final output roots are
+# listed here; everything else remains available for stage-to-stage transport.
 _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
     {
         "model_outputs",
@@ -34,22 +30,17 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
 def partition_flat_payload(
     payload: Mapping[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Split a flattened per-request payload into inter-stage vs client mm dicts.
-
-    Non-lossy split: the inter-stage connector payload keeps **every** key so a
-    downstream stage always receives the values it needs (the thinker->talker /
-    talker->token2wav handoffs live under roots such as ``model_outputs`` that
-    are also client-facing). The client payload is trimmed to the roots in
-    ``_CLIENT_MM_ROOT_KEYS`` to keep what is returned to the user small (the
-    performance goal of #4527). A value that is both consumed downstream and
-    returned to the client appears in both dicts.
-    """
+    """Split a flattened per-request payload into inter-stage vs client mm dicts."""
     if not payload:
         return {}, {}
-    inter_stage: dict[str, object] = dict(payload)
-    client_mm: dict[str, object] = {
-        key: value for key, value in payload.items() if key.split(".", 1)[0] in _CLIENT_MM_ROOT_KEYS
-    }
+    inter_stage: dict[str, object] = {}
+    client_mm: dict[str, object] = {}
+    for key, value in payload.items():
+        root = key.split(".", 1)[0]
+        if root in _CLIENT_MM_ROOT_KEYS:
+            client_mm[key] = value
+        else:
+            inter_stage[key] = value
     return inter_stage, client_mm
 
 
