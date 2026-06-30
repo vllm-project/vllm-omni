@@ -97,6 +97,7 @@ def test_voice_clone_zh_async_chunk(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": "今天天气真不错，适合出去散散步。",
         "stream": True,
+        "stream_format": "audio",
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,

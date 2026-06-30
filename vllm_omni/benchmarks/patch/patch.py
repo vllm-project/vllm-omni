@@ -1133,9 +1133,9 @@ async def async_request_openai_audio_speech(
 ) -> MixRequestFuncOutput:
     """Streaming request to /v1/audio/speech endpoint.
 
-    Sends ``stream=true`` with ``response_format=pcm`` so the server returns
-    raw PCM chunks as they are decoded. This allows measuring TTFP (time to
-    first audio packet) separately from E2EL.
+    Sends ``stream=true`` with ``stream_format=audio`` and ``response_format=pcm``
+    so the server returns raw PCM chunks as they are decoded. This allows measuring
+    TTFP (time to first audio packet) separately from E2EL.
     """
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
@@ -1144,12 +1144,14 @@ async def async_request_openai_audio_speech(
         "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
         "input": request_func_input.prompt,
         "stream": True,
+        "stream_format": "audio",
         "response_format": "pcm",
     }
     _update_payload_common(payload, request_func_input)
     # Seed-TTS + WER: ``--extra-body`` may set stream=false / other formats; speech must stream PCM.
     if getattr(request_func_input, "seed_tts_row", False) and _seed_tts_capture_pcm_for_wer():
         payload["stream"] = True
+        payload["stream_format"] = "audio"
         payload["response_format"] = "pcm"
 
     headers = {
@@ -1219,7 +1221,7 @@ async def async_request_openai_audio_speech(
                     ct = response.headers.get("Content-Type", "")
                     logger.warning(
                         "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
-                        "Check stream=true and response_format=pcm on the server.",
+                        "Check stream=true, stream_format=audio, and response_format=pcm on the server.",
                         ct,
                         api_url,
                     )

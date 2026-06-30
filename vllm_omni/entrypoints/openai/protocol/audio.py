@@ -69,13 +69,15 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description=(
             "Streaming output format. 'audio' streams raw pcm/wav bytes; "
-            "'sse' streams OpenAI speech.audio.* SSE events. Omit for non-streaming."
+            "'sse' streams OpenAI speech.audio.* SSE events. If omitted, stream=true "
+            "selects SSE and stream=false remains non-streaming."
         ),
     )
     stream: bool = Field(
         default=False,
         description=(
-            "Legacy streaming switch; equivalent to stream_format='audio'. "
+            "Streaming switch; defaults to OpenAI speech.audio.* SSE events. "
+            "Set stream_format='audio' to opt into raw pcm/wav byte streaming. "
             "Requires response_format='pcm' or 'wav'. Speed adjustment is not supported when streaming."
         ),
     )
@@ -292,13 +294,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         return self
 
     def is_raw_audio_stream(self) -> bool:
-        return self.stream or self.stream_format == "audio"
+        return self.stream_format == "audio"
 
     def is_sse_stream(self) -> bool:
-        return self.stream_format == "sse" and not self.is_raw_audio_stream()
+        return (self.stream or self.stream_format == "sse") and not self.is_raw_audio_stream()
 
     def is_streaming(self) -> bool:
-        return self.is_raw_audio_stream() or self.stream_format == "sse"
+        return self.is_raw_audio_stream() or self.is_sse_stream()
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
