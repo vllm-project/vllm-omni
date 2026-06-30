@@ -110,6 +110,7 @@ class TeaCacheHook(ModelHook):
         Returns:
             Model output (format depends on model)
         """
+
         # Get model-specific context from extractor
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
@@ -157,12 +158,24 @@ class TeaCacheHook(ModelHook):
                 ctx.encoder_hidden_states.clone() if ctx.encoder_hidden_states is not None else None
             )
 
-            # Handle models with additional blocks (e.g., Flux2 single_transformer_blocks)
-            if getattr(ctx, "extra_states", None) and "run_flux2_full_transformer_with_single" in ctx.extra_states:
-                run_full = ctx.extra_states["run_flux2_full_transformer_with_single"]
-                ctx.hidden_states, ctx.encoder_hidden_states = run_full(ori_hidden_states, ori_encoder_hidden_states)
-                output = ctx.hidden_states
-                state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
+            # Handle models with additional blocks (e.g., Flux single_transformer_blocks)
+            extra_states = getattr(ctx, "extra_states", None) or {}
+            for key in (
+                "run_flux_full_transformer_with_single",
+                "run_flux2_full_transformer_with_single",
+            ):
+                if key in extra_states:
+                    run_full = extra_states[key]
+                    ctx.hidden_states, ctx.encoder_hidden_states = run_full(
+                        ori_hidden_states, ori_encoder_hidden_states
+                    )
+                    output = ctx.hidden_states
+                    state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
+                    if ori_encoder_hidden_states is not None:
+                        state.previous_residual_encoder = (
+                            ctx.encoder_hidden_states - ori_encoder_hidden_states
+                        ).detach()
+                    break
             else:
                 # Run transformer blocks using model-specific callable
                 outputs = ctx.run_transformer_blocks()

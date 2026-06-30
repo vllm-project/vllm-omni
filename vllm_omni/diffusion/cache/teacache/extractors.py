@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from diffusers.utils import is_torch_npu_available
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -573,6 +574,146 @@ def extract_zimage_context(
             "x_item_seqlens": x_item_seqlens,
             "patch_size": patch_size,
             "f_patch_size": f_patch_size,
+        },
+    )
+
+
+def extract_flux_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor = None,
+    pooled_projections: torch.Tensor = None,
+    timestep: torch.LongTensor = None,
+    img_ids: torch.Tensor = None,
+    txt_ids: torch.Tensor = None,
+    guidance: torch.Tensor | None = None,
+    joint_attention_kwargs: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for Flux1-dev model.
+
+    Args:
+        module: FluxTransformer2DModel instance
+        hidden_states: Input image hidden states tensor
+        encoder_hidden_states: Input text hidden states tensor
+        pooled_projections: Pooled text embeddings
+        timestep: Current diffusion timestep
+        img_ids: Image position IDs for RoPE
+        txt_ids: Text position IDs for RoPE
+        guidance: Optional guidance scale for CFG
+        joint_attention_kwargs: Additional attention kwargs
+
+    Returns:
+        CacheContext with all information needed for generic caching
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must have transformer_blocks")
+
+    # ============================================================================
+    # PREPROCESSING (Flux-specific)
+    # ============================================================================
+    dtype = hidden_states.dtype
+    device = hidden_states.device
+    timestep = timestep.to(device=device, dtype=dtype) * 1000
+    if guidance is not None:
+        guidance = guidance.to(device=device, dtype=dtype) * 1000
+
+    temb = (
+        module.time_text_embed(timestep, pooled_projections)
+        if guidance is None
+        else module.time_text_embed(timestep, guidance, pooled_projections)
+    )
+
+    hidden_states = module.x_embedder(hidden_states)
+    encoder_hidden_states = module.context_embedder(encoder_hidden_states)
+
+    if txt_ids.ndim == 3:
+        txt_ids = txt_ids[0]
+    if img_ids.ndim == 3:
+        img_ids = img_ids[0]
+
+    ids = torch.cat((txt_ids, img_ids), dim=0)
+    if is_torch_npu_available():
+        freqs_cos, freqs_sin = module.pos_embed(ids.cpu())
+        image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
+    else:
+        image_rotary_emb = module.pos_embed(ids)
+
+    # ============================================================================
+    # EXTRACT MODULATED INPUT (for cache decision)
+    # ============================================================================
+    block = module.transformer_blocks[0]
+    norm_output = block.norm1(hidden_states, emb=temb)
+    if isinstance(norm_output, tuple):
+        norm_hidden_states = norm_output[0]
+    else:
+        norm_hidden_states = norm_output
+    modulated_input = norm_hidden_states
+
+    # ============================================================================
+    # DEFINE TRANSFORMER EXECUTION (Flux-specific)
+    # ============================================================================
+    def run_flux_transformer_blocks():
+        h = hidden_states
+        c = encoder_hidden_states
+        for block in module.transformer_blocks:
+            c, h = block(
+                hidden_states=h,
+                encoder_hidden_states=c,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        return (h, c)
+
+    def run_flux_full_transformer_with_single(ori_h, ori_c):
+        h = ori_h
+        c = ori_c
+        for block in module.transformer_blocks:
+            c, h = block(
+                hidden_states=h,
+                encoder_hidden_states=c,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        for block in module.single_transformer_blocks:
+            c, h = block(
+                hidden_states=h,
+                encoder_hidden_states=c,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        return h, c
+
+    # ============================================================================
+    # DEFINE POSTPROCESSING (Flux-specific)
+    # ============================================================================
+    return_dict = kwargs.get("return_dict", True)
+
+    def postprocess(h):
+        h = module.norm_out(h, temb)
+        output = module.proj_out(h)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    # ============================================================================
+    # RETURN CONTEXT
+    # ============================================================================
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+        run_transformer_blocks=run_flux_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "run_flux_full_transformer_with_single": run_flux_full_transformer_with_single,
         },
     )
 
@@ -1197,6 +1338,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
     "ZImageTransformer2DModel": extract_zimage_context,
+    "FluxTransformer2DModel": extract_flux_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
     "Flux2Transformer2DModel": extract_flux2_context,
