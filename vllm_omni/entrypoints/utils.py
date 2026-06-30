@@ -542,9 +542,7 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
         try:
             return json.loads(value)
         except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}"
-            ) from exc
+            raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
     return value
 
 
