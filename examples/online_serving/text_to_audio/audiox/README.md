@@ -6,7 +6,7 @@ minimal Python client that covers all six tasks (`t2a`, `t2m`, `v2a`, `v2m`, `tv
 ## Start the server
 
 ```bash
-cd examples/online_serving/audiox
+cd examples/online_serving/text_to_audio/audiox
 bash run_server.sh                 # defaults: MODEL=zhangj1an/AudioX, PORT=8099
 ```
 

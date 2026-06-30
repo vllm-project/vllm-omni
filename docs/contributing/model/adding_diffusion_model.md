@@ -608,7 +608,7 @@ If your model is one of Text-to-Image, Text-to-Audio, Text-to-Video, Image-to-Im
 | Image-to-Image | `examples/offline_inference/image_to_image/image_edit.py` |
 | Image-to-Video | `examples/offline_inference/image_to_video/image_to_video.py` |
 | Text-to-Image | `examples/offline_inference/text_to_image/text_to_image.py` |
-| Text-to-Audio | `examples/offline_inference/text_to_audio/text_to_audio.py` |
+| Text-to-Audio | `examples/offline_inference/text_to_audio/stable_audio/end2end.py` |
 | Text-to-Video | `examples/offline_inference/text_to_video/text_to_video.py` |
 
 

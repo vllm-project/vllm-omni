@@ -41,6 +41,7 @@ nav:
       - Online serving Example of vLLM-Omni for MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
+      - Text-To-Audio: user_guide/examples/online_serving/text_to_audio.md
       - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md

@@ -229,6 +229,6 @@ python stable_audio_client.py \
 
 ## See Also
 
-- [Offline Inference Example](../../offline_inference/text_to_audio/README.md)
+- [Offline Inference Example](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_audio/stable_audio/README.md)
 - [Stable Audio Model Card](https://huggingface.co/stabilityai/stable-audio-open-1.0)
 - [vLLM-Omni Documentation](https://github.com/vllm-project/vllm-omni)

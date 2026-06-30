@@ -22,8 +22,8 @@ that produces stereo 44.1 kHz audio up to ~10 s per call.
 - vLLM-Omni weight bundle: <https://huggingface.co/zhangj1an/AudioX>
 - Pipeline: `vllm_omni.diffusion.models.audiox.pipeline_audiox.AudioXPipeline`
 - Input transforms: `vllm_omni.transformers_utils.processors.audiox`
-- Offline example: [`examples/offline_inference/audiox/`](../../examples/offline_inference/audiox/)
-- Online example: [`examples/online_serving/audiox/`](../../examples/online_serving/audiox/)
+- Offline example: [`examples/offline_inference/text_to_audio/audiox/`](../../examples/offline_inference/text_to_audio/audiox/)
+- Online example: [`examples/online_serving/text_to_audio/audiox/`](../../examples/online_serving/text_to_audio/audiox/)
 
 ## Hardware Support
 
@@ -45,7 +45,7 @@ Offline (text-to-audio):
 
 ```bash
 huggingface-cli download zhangj1an/AudioX --local-dir ./audiox_weights
-python examples/offline_inference/audiox/end2end.py \
+python examples/offline_inference/text_to_audio/audiox/end2end.py \
   --model ./audiox_weights \
   --tasks t2a \
   --num-inference-steps 250 \
@@ -55,8 +55,8 @@ python examples/offline_inference/audiox/end2end.py \
 Online:
 
 ```bash
-bash examples/online_serving/audiox/run_server.sh
-python examples/online_serving/audiox/openai_chat_client.py \
+bash examples/online_serving/text_to_audio/audiox/run_server.sh
+python examples/online_serving/text_to_audio/audiox/openai_chat_client.py \
   --task t2a \
   --prompt "Fireworks burst twice, followed by a clock ticking." \
   --output t2a.wav

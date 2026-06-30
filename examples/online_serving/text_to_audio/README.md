@@ -1,12 +1,9 @@
 # Text-To-Audio (Online Serving)
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_audio>.
-
-
 vLLM-Omni serves diffusion-based audio generation models through two
 endpoints, depending on the pipeline:
 
-- **Stable Audio** — OpenAI-compatible [`POST /v1/audio/generate`](https://github.com/vllm-project/vllm-omni/tree/main/docs/serving/audio_generate_api.md).
+- **Stable Audio** — OpenAI-compatible [`POST /v1/audio/generate`](../../../docs/serving/audio_generate_api.md).
 - **AudioX** — OpenAI-compatible `POST /v1/chat/completions` with task and
   generation knobs passed under `extra_args`.
 
@@ -14,11 +11,11 @@ Each model has its own subdirectory containing client snippets and helper
 scripts; this README is the single doc entry point for online serving of
 all of them.
 
-For offline inference, see [`examples/offline_inference/text_to_audio/`](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_audio/README.md).
+For offline inference, see [`examples/offline_inference/text_to_audio/`](../../offline_inference/text_to_audio/README.md).
 For the full list of supported architectures across all modalities, see
-[Supported Models](https://github.com/vllm-project/vllm-omni/tree/main/docs/models/supported_models.md).
+[Supported Models](../../../docs/models/supported_models.md).
 
-For text-to-speech (autoregressive TTS) online serving, see [`examples/online_serving/text_to_speech/`](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_speech/README.md).
+For text-to-speech (autoregressive TTS) online serving, see [`examples/online_serving/text_to_speech/`](../text_to_speech/README.md).
 
 ## Supported Models
 
@@ -124,8 +121,8 @@ Response: audio data in the requested format (default: WAV).
 ### See also
 
 - [Stable Audio model card](https://huggingface.co/stabilityai/stable-audio-open-1.0)
-- [Audio generation API reference](https://github.com/vllm-project/vllm-omni/tree/main/docs/serving/audio_generate_api.md)
-- [Offline Stable Audio example](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_audio/stable_audio/README.md)
+- [Audio generation API reference](../../../docs/serving/audio_generate_api.md)
+- [Offline Stable Audio example](../../offline_inference/text_to_audio/stable_audio/README.md)
 
 ---
 
@@ -198,26 +195,3 @@ curl -sS -X POST http://localhost:8099/v1/chat/completions \
     }
   }' > t2m.json
 ```
-
-## Example materials
-
-??? abstract "audiox/README.md"
-    --8<-- "examples/online_serving/text_to_audio/audiox/README.md"
-??? abstract "audiox/openai_chat_client.py"
-    ``````py
-    --8<-- "examples/online_serving/text_to_audio/audiox/openai_chat_client.py"
-    ``````
-??? abstract "audiox/run_server.sh"
-    ``````sh
-    --8<-- "examples/online_serving/text_to_audio/audiox/run_server.sh"
-    ``````
-??? abstract "stable_audio/README.md"
-    --8<-- "examples/online_serving/text_to_audio/stable_audio/README.md"
-??? abstract "stable_audio/curl_examples.sh"
-    ``````sh
-    --8<-- "examples/online_serving/text_to_audio/stable_audio/curl_examples.sh"
-    ``````
-??? abstract "stable_audio/stable_audio_client.py"
-    ``````py
-    --8<-- "examples/online_serving/text_to_audio/stable_audio/stable_audio_client.py"
-    ``````

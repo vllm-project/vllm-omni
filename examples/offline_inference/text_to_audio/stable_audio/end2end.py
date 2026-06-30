@@ -8,10 +8,10 @@ This script demonstrates how to generate audio from text prompts using
 the Stable Audio Open model with vLLM-Omni.
 
 Usage:
-    python text_to_audio.py --prompt "The sound of a dog barking"
-    python text_to_audio.py --prompt "A piano playing a gentle melody" --audio-length 10.0
-    python text_to_audio.py --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
-    python text_to_audio.py --prompt "A soft synth pad" --cache-backend tea_cache
+    python end2end.py --prompt "The sound of a dog barking"
+    python end2end.py --prompt "A piano playing a gentle melody" --audio-length 10.0
+    python end2end.py --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
+    python end2end.py --prompt "A soft synth pad" --cache-backend tea_cache
 """
 
 import argparse
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         help="Stable Audio model name or local path.",
     )
     parser.add_argument(
-        "--prompt",
+        "--prompt ",
         default="The sound of a hammer hitting a wooden surface.",
         help="Text prompt for audio generation.",
     )
