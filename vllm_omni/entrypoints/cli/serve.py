@@ -261,6 +261,13 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--forced-aligner-device",
+            type=str,
+            default=None,
+            help="Device(s) for the forced-aligner stage (e.g. '2'). Defaults to "
+            "sharing an existing stage's GPU when unset.",
+        )
+        omni_config_group.add_argument(
             "--deploy-config",
             type=str,
             default=None,

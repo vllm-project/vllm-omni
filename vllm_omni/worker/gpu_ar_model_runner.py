@@ -1360,7 +1360,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+            # A pooling stage skips mm extraction + the omni prefix cache (both assume an AR
+            # [n_tok, hidden] output) and exits through the shared _pool() branch below.
+            if self.is_pooling_model:
+                multimodal_outputs = None
+            else:
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
 
             # Async-write pipeline (replaces the per-step blocking
@@ -1369,7 +1374,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # the actual CPU scatter into ``hidden_states_cache`` /
             # ``mm_outputs_cache`` happens in ``drain_ready_async_writes``
             # at the top of subsequent execute_model() calls.
-            if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+            if not self.is_pooling_model and self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
                 hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
                 # Some models (e.g. qwen3-tts-talker) opt out of full-hidden-state
                 # prefix caching but the downstream pooler payload path still

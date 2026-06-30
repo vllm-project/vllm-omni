@@ -27,6 +27,7 @@ _MIXIN_UPDATE_HELPERS = (
     "_attach_finished_request_sets",
     "_attach_scheduler_stats",
     "_capture_omni_connector_output",
+    "_maybe_decode_pooling_output",
 )
 
 
@@ -138,6 +139,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         pending_stop_after_extraction=set(),
         waiting_for_transfer_free=set(),
         _new_prompt_len_snapshot={},
+        _pooling_output_decoder=None,
         finished_req_ids=set(),
         finished_req_ids_dict=defaultdict(set),
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),

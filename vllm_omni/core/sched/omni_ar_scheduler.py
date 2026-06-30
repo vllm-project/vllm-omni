@@ -513,6 +513,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            # Emit condition below tests the UNdecoded pooler_output so a failed decode still terminates the request.
+            pooling_output_payload = self._maybe_decode_pooling_output(request, pooler_output)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 OmniSchedulerMixin._append_request_output(
                     self,
@@ -522,7 +524,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     finish_reason=finish_reason,
                     new_logprobs=new_logprobs,
                     new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                    pooling_output=pooler_output,
+                    pooling_output=pooling_output_payload,
                     multimodal_output=mm_output,
                     stop_reason=request.stop_reason,
                     prefill_stats=request.take_prefill_stats(),
