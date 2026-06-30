@@ -482,6 +482,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             {
                 "stage_id": 1,
                 "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.5,
             },
         ],
     },
@@ -577,10 +578,15 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             {
                 "stage_id": 0,
                 "max_num_seqs": 1,
-                "gpu_memory_utilization": 0.9,
+                # Tuned for the heavier rebased stack (vLLM v0.23.1rc1 + torch 2.11 + CUDA 13
+                # + flashinfer) on a 24 GiB L4: the 16.78 GiB model weights + non-KV overhead
+                # + a 16384-token activation peak left 0 KV cache at util 0.85 (build 2354
+                # OOM). The abort test only needs the engine to init, so a smaller batched-
+                # token budget is fine; outputs are unaffected (chunked prefill is on).
+                "gpu_memory_utilization": 0.90,
                 "enforce_eager": True,
                 "enable_prefix_caching": False,
-                "max_num_batched_tokens": 16384,
+                "max_num_batched_tokens": 2048,
                 "max_model_len": 16384,
                 "skip_mm_profiling": True,
                 "mm_processor_cache_gb": 0,

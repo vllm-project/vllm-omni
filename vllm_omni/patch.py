@@ -324,11 +324,13 @@ def _patch_chat_template_registry():
     try:
         from vllm.transformers_utils.chat_templates.registry import (
             _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK,
-            _get_qwen_chat_template_fallback,
+            CHAT_TEMPLATES_DIR,
         )
 
         if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
-            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = _get_qwen_chat_template_fallback
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = (
+                lambda _: CHAT_TEMPLATES_DIR / "template_chatml.jinja"
+            )
     except ImportError:
         pass
 
