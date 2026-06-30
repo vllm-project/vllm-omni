@@ -201,15 +201,17 @@ class TeaCacheCoefficientEstimator:
     def collect_from_prompt(self, prompt: str, **generate_kwargs):
         self.hook.start_collection()
         req = OmniDiffusionRequest(
-            prompts=[prompt],
+            prompt=prompt,
             request_id="teacache-coefficient-estimator",
             sampling_params=OmniDiffusionSamplingParams(
                 num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
                 seed=generate_kwargs.get("seed", 42),
             ),
         )
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
         with torch.no_grad():
-            self.pipeline.forward(req)
+            self.pipeline.forward(DiffusionRequestBatch(requests=[req]))
         trajectory = self.hook.stop_collection()
         if trajectory:
             self.collected_data.append(trajectory)

@@ -80,6 +80,7 @@ curl -X POST http://127.0.0.1:8091/v1/audio/speech \
     "voice": "casual_female",
     "language": "English",
     "stream": true,
+    "stream_format": "audio",
     "response_format": "pcm"
   }' \
   --output voxtral_stream.pcm

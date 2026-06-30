@@ -68,7 +68,8 @@ dev = [
     "torchdiffeq>=0.2.5", # for covo_audio Test
     "FlagEmbedding", # for hunyuan_image3 tests
     "kernels<0.15.0", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
-    "s3tokenizer>=0.3.0" # for tts test
+    "s3tokenizer>=0.3.0", # for tts test
+    "step-audio2>=1.0.0", # Step-Audio2 Token2Wav (flashcosyvoice / hyperpyyaml)
 ]
 
 demo = [
@@ -271,6 +272,7 @@ markers = [
     "skipif_npu: Skip if the num of NPU cards is less than the required",
     "skipif_musa: Skip if the num of MUSA cards is less than the required",
     # more detailed markers
+    "sp: Sequence parallelism tests (multi-GPU)",
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
 ]

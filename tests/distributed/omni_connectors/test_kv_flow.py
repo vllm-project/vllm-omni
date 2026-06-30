@@ -370,7 +370,7 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     mock_connector.store[store_key] = data_to_receive
 
     req = OmniDiffusionRequest(
-        prompts=["test_recv"],
+        prompt="test_recv",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=req_id,
     )
@@ -414,7 +414,7 @@ def test_manager_reception_prefers_parent_request_id_for_batched_request(kv_conf
     mock_connector.store[store_key] = data_to_receive
 
     req = OmniDiffusionRequest(
-        prompts=["prompt-a", "prompt-b"],
+        prompt="prompt-a",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=parent_req_id,
     )
@@ -439,7 +439,7 @@ def test_receive_multi_kv_cache_uses_parent_request_id_for_cfg_collection(kv_con
         return {"cfg_text_kv_metadata": {"ok": True}}
 
     req = OmniDiffusionRequest(
-        prompts=["prompt-a", "prompt-b"],
+        prompt="prompt-a",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id="req-parent",
     )
@@ -500,7 +500,7 @@ def test_integration_flow(common_constants):
     receiver_manager._connector = connector
 
     req = OmniDiffusionRequest(
-        prompts=["test_integ"],
+        prompt="test_integ",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=req_id,
     )
