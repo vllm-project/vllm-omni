@@ -92,5 +92,6 @@ def test_response_format_001(omni_server, openai_client) -> None:
         "voice": "default",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        "min_hnr_db": -2.0,
     }
     openai_client.send_audio_speech_request(request_config)
