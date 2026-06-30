@@ -1,3 +1,4 @@
+import json
 import os
 import types
 from collections import Counter
@@ -524,6 +525,27 @@ def filter_stages(
     except Exception as e:
         logger.warning("Failed to apply mode-based stage filtering: %s", e)
         return stage_configs
+
+
+def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
+    """Parse the ``--stage-overrides`` value into a per-stage override dict.
+
+    ``value`` may be a raw JSON string (as supplied on the CLI) or an
+    already-parsed mapping. Returns ``None`` when no overrides are given.
+
+    Raises:
+        ValueError: when ``value`` is a string that is not valid JSON.
+    """
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}"
+            ) from exc
+    return value
 
 
 def load_and_resolve_stage_configs(

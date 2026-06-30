@@ -775,7 +775,10 @@ def run_headless(args: TrackingNamespace) -> None:
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
     )
-    from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
+    from vllm_omni.entrypoints.utils import (
+        load_and_resolve_stage_configs,
+        parse_stage_overrides,
+    )
 
     model = args.model
     stage_id: int | None = args.stage_id
@@ -811,11 +814,17 @@ def run_headless(args: TrackingNamespace) -> None:
             args.replica_id,
         )
 
+    # Parse --stage-overrides (raw JSON string) exactly like the standard
+    # engine path (AsyncOmniEngine._resolve_stage_configs) so headless and
+    # standard launches resolve to the same per-stage device layout.
+    stage_overrides = parse_stage_overrides(args_dict.get("stage_overrides"))
+
     config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
         stage_configs_path,
         args_dict,
         deploy_config_path=args_dict.get("deploy_config"),
+        stage_overrides=stage_overrides,
         strategy_config_path=args_dict.get("strategy_config"),
     )
 

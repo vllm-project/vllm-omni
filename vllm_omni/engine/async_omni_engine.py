@@ -58,7 +58,10 @@ from vllm_omni.engine.stage_runtime import (
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
+from vllm_omni.entrypoints.utils import (
+    load_and_resolve_stage_configs,
+    parse_stage_overrides,
+)
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -1172,17 +1175,7 @@ class AsyncOmniEngine:
             base_kwargs = kwargs
 
         # Parse --stage-overrides JSON string if provided
-        stage_overrides = None
-        if stage_overrides_json:
-            if isinstance(stage_overrides_json, str):
-                try:
-                    stage_overrides = json.loads(stage_overrides_json)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"--stage-overrides is not valid JSON: {exc}. Got: {stage_overrides_json!r}"
-                    ) from exc
-            else:
-                stage_overrides = stage_overrides_json
+        stage_overrides = parse_stage_overrides(stage_overrides_json)
 
         config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
