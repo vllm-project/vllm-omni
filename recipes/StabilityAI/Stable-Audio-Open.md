@@ -24,7 +24,7 @@ offline validation sample with TeaCache and online serving through the
 - Offline example:
   [`examples/offline_inference/text_to_audio`](../../examples/offline_inference/text_to_audio)
 - Online example:
-  [`examples/online_serving/stable_audio`](../../examples/online_serving/stable_audio)
+  [`examples/online_serving/text_to_audio`](../../examples/online_serving/text_to_audio)
 - Audio generation API:
   [`docs/serving/audio_generate_api.md`](../../docs/serving/audio_generate_api.md)
 - Related issue:
@@ -103,7 +103,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
     "seed": 42,
     "response_format": "wav"
   }' \
-  --output examples/online_serving/stable_audio/piano_10s.wav
+  --output examples/online_serving/text_to_audio/piano_10s.wav
 ```
 
 ##### Verification
@@ -137,12 +137,12 @@ PY
 Validate the online output:
 
 ```bash
-ls -lh examples/online_serving/stable_audio/piano_10s.wav
+ls -lh examples/online_serving/text_to_audio/piano_10s.wav
 
 python - <<'PY'
 import soundfile as sf
 
-path = "examples/online_serving/stable_audio/piano_10s.wav"
+path = "examples/online_serving/text_to_audio/piano_10s.wav"
 audio, sample_rate = sf.read(path)
 print("sample_rate:", sample_rate)
 print("shape:", audio.shape)
