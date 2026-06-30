@@ -146,16 +146,13 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
-        """Get the free memory on the MUSA device.
-
-        Args:
-            device: Optional device to query. If None, uses current device.
-
-        Returns:
-            Free memory in bytes.
-        """
         free, _ = torch.musa.mem_get_info(device)
         return free
+
+    @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.musa.mem_get_info(device)
+        return free, total
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:

@@ -4,8 +4,8 @@
 AudioX supports 6 tasks (t2a, t2m, v2a, v2m, tv2a, tv2m). Text-only tasks send the prompt as the
 chat message; video-conditioned tasks additionally attach the video via a ``video_url`` content
 item (data URI for local files). Task + generation knobs (steps, cfg, sigma range, seconds, seed)
-are sent via the OpenAI SDK's ``extra_body`` as ``extra_args`` — the same pipeline-agnostic escape
-hatch used by the /v1/videos endpoint's ``extra_params`` field.
+are sent as flattened keys under ``extra_body``; the server routes the declared knobs into
+``sampling_params.extra_args`` (see ``vllm_omni/model_extras/audiox.py``).
 
 Usage:
   python openai_chat_client.py --task t2a --prompt "Fireworks burst twice..." --output t2a.wav
@@ -88,10 +88,10 @@ def main() -> int:
     payload = {
         "model": args.model,
         "messages": [{"role": "user", "content": content}],
-        "num_inference_steps": args.steps,
-        "guidance_scale": args.guidance_scale,
-        "seed": args.seed,
-        "extra_args": {
+        "extra_body": {
+            "num_inference_steps": args.steps,
+            "guidance_scale": args.guidance_scale,
+            "seed": args.seed,
             "audiox_task": args.task,
             "seconds_start": args.seconds_start,
             "seconds_total": args.seconds_total,

@@ -49,7 +49,7 @@ test_params_thinker = [(m, c) for m in models for c in [get_eager_config_thinker
 test_params = [(m, c) for m in models for c in [get_eager_config()]]
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
@@ -65,7 +65,7 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
@@ -82,7 +82,7 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
@@ -101,7 +101,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
@@ -118,7 +118,7 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
@@ -138,7 +138,7 @@ def test_mixed_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
@@ -154,7 +154,7 @@ def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)

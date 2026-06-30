@@ -524,6 +524,67 @@ async def test_run_single_stage_diffusion(orchestrator_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_single_stage_diffusion_streaming_forwards_intermediate_chunks(orchestrator_factory) -> None:
+    """Intermediate diffusion chunks (finished=False) reach the frontend before the final chunk."""
+    stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    orchestrator_fixture = orchestrator_factory([stage0])
+    params = OmniDiffusionSamplingParams()
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-stream",
+            prompt={"prompt": "draw a cat"},
+            original_prompt={"prompt": "draw a cat"},
+            sampling_params_list=[params],
+            final_stage_id=0,
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.push_diffusion_output(
+            OmniRequestOutput.from_diffusion(
+                request_id="req-stream",
+                images=[],
+                final_output_type="image",
+                custom_output={"chunk": 0},
+                finished=False,
+            )
+        )
+        stage0.push_diffusion_output(
+            OmniRequestOutput.from_diffusion(
+                request_id="req-stream",
+                images=[],
+                final_output_type="image",
+                custom_output={"chunk": 1},
+                finished=True,
+            )
+        )
+
+        output_msgs: list[OutputMessage] = []
+        deadline = time.monotonic() + 2.0
+        while not output_msgs or not output_msgs[-1].finished:
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"Timed out waiting for finished orchestrator output, got {len(output_msgs)} message(s)"
+                )
+            try:
+                msg = orchestrator_fixture.output_sync_q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+            if isinstance(msg, OutputMessage):
+                output_msgs.append(msg)
+
+        assert [msg.request_id for msg in output_msgs] == ["req-stream", "req-stream"]
+        assert [msg.finished for msg in output_msgs] == [False, True]
+        assert [msg.engine_outputs.finished for msg in output_msgs] == [False, True]
+        assert [msg.engine_outputs.custom_output["chunk"] for msg in output_msgs] == [0, 1]
+        await _wait_for(lambda: "req-stream" not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_run_llm_to_diffusion(orchestrator_factory) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")

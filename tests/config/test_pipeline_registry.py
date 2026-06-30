@@ -1,146 +1,68 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the central pipeline registry (2.5/N)."""
-
-from __future__ import annotations
-
-import logging
+"""Tests for out of tree registration to OMNI_PIPELINES."""
 
 import pytest
+from transformers import PretrainedConfig
 
-from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
-from vllm_omni.config.stage_config import (
-    _PIPELINE_REGISTRY,
-    PipelineConfig,
-    StageExecutionType,
-    StagePipelineConfig,
-    register_pipeline,
-)
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
+from vllm_omni.config.stage_config import PipelineConfig, pipeline_cfg_resolver
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-class TestCentralRegistryDeclarations:
-    """Every in-tree pipeline must be declared exactly once in the central registry."""
+@pytest.fixture
+def custom_resolver():
+    """Build a reusable custom resolver for PipelineConfigs."""
 
-    def test_omni_entries_visible_in_registry(self):
-        for key in _OMNI_PIPELINES:
-            assert key in _PIPELINE_REGISTRY
+    class CustomConfigType(PretrainedConfig):
+        pass
 
-    def test_expected_omni_pipelines_present(self):
-        # Guard against accidental removal during future refactors.
-        assert "qwen2_5_omni" in _OMNI_PIPELINES
-        assert "qwen2_5_omni_thinker_only" in _OMNI_PIPELINES
-        assert "qwen3_omni_moe" in _OMNI_PIPELINES
-        assert "aura_omni" in _OMNI_PIPELINES
-        assert "qwen3_tts" in _OMNI_PIPELINES
+    @pipeline_cfg_resolver(config_type=CustomConfigType)
+    def custom_resolver(
+        hf_config: CustomConfigType,
+    ) -> PipelineConfig:
+        return PipelineConfig(model_type="resolved_type")
 
-
-class TestLazyLoading:
-    """Pipelines are imported only on first access."""
-
-    def test_contains_without_import(self):
-        # ``in`` hits the lazy map, not the loaded cache.
-        assert "qwen3_omni_moe" in _PIPELINE_REGISTRY
-
-    def test_getitem_loads_correct_pipeline(self):
-        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
-        assert pipeline.model_type == "qwen3_omni_moe"
-        assert pipeline.model_arch == "Qwen3OmniMoeForConditionalGeneration"
-
-    def test_getitem_loads_aura_omni_pipeline(self):
-        pipeline = _PIPELINE_REGISTRY["aura_omni"]
-        assert pipeline.model_type == "aura_omni"
-        assert [stage.model_stage for stage in pipeline.stages] == [
-            "asr",
-            "aura",
-            "qwen3_tts",
-            "code2wav",
-        ]
-        assert pipeline.stages[0].model_arch == "Qwen3ASRForConditionalGeneration"
-        assert pipeline.stages[1].model_arch == "AuraQwen3VLForConditionalGeneration"
-        assert pipeline.stages[2].model_arch == "Qwen3TTSTalkerForConditionalGeneration"
-        assert pipeline.stages[3].model_arch == "Qwen3TTSCode2Wav"
-
-    def test_unknown_model_type_returns_none_via_get(self):
-        assert _PIPELINE_REGISTRY.get("not_a_real_pipeline") is None
-
-    def test_unknown_model_type_raises_keyerror_via_getitem(self):
-        with pytest.raises(KeyError):
-            _PIPELINE_REGISTRY["not_a_real_pipeline"]
-
-    def test_iteration_yields_registered_pipelines(self):
-        keys = set(_PIPELINE_REGISTRY)
-        assert "qwen2_5_omni" in keys
-        assert "qwen3_omni_moe" in keys
-
-    def test_iteration_resilience(self, monkeypatch, caplog):
-        # Synthetic failure to verify iteration robustness against load errors.
-        target_logger = logging.getLogger("vllm_omni.config.stage_config")
-        target_logger.addHandler(caplog.handler)
-        prev_level = target_logger.level
-        target_logger.setLevel(logging.ERROR)
-        try:
-            monkeypatch.setattr(
-                _PIPELINE_REGISTRY,
-                "_lazy_map",
-                {
-                    "healthy": ("vllm_omni.model_executor.models.qwen2_5_omni.pipeline", "QWEN2_5_OMNI_PIPELINE"),
-                    "broken": ("vllm_omni.non_existent_module", "SomeConfig"),
-                    "attr_fail": ("vllm_omni.config.stage_config", "NON_EXISTENT_VAR"),
-                },
-            )
-            monkeypatch.setattr(_PIPELINE_REGISTRY, "_loaded", {})
-
-            # Assert that list(_PIPELINE_REGISTRY.values()) and dict(_PIPELINE_REGISTRY.items())
-            # both yield only healthy entries.
-            healthy_instance = _PIPELINE_REGISTRY["healthy"]
-            assert list(_PIPELINE_REGISTRY.values()) == [healthy_instance]
-            assert dict(_PIPELINE_REGISTRY.items()) == {"healthy": healthy_instance}
-            assert "Failed to import pipeline module" in caplog.text
-            assert "Pipeline variable 'NON_EXISTENT_VAR' not found" in caplog.text
-
-        finally:
-            target_logger.removeHandler(caplog.handler)
-            target_logger.setLevel(prev_level)
+    return custom_resolver
 
 
-class TestDynamicRegistration:
-    """``register_pipeline()`` still works for plugins and tests."""
+def test_register_pipeline_config(clean_pipeline_registry):
+    """Ensure that we can register a custom pipeline config to OMNI_PIPELINES."""
+    new_model_type = "new_model_type"
+    pipe_cfg = PipelineConfig(model_type=new_model_type)
+    assert new_model_type not in OMNI_PIPELINES
+    register_pipeline(pipe_cfg)
+    assert new_model_type in OMNI_PIPELINES
+    assert OMNI_PIPELINES[new_model_type] is pipe_cfg
 
-    def test_register_adds_to_registry(self):
-        custom = PipelineConfig(
-            model_type="_test_dynamic_registration",
-            model_arch="DynamicTestModel",
-            stages=(
-                StagePipelineConfig(
-                    stage_id=0,
-                    model_stage="test",
-                    execution_type=StageExecutionType.LLM_AR,
-                    input_sources=(),
-                    final_output=True,
-                ),
-            ),
-        )
-        register_pipeline(custom)
-        try:
-            assert "_test_dynamic_registration" in _PIPELINE_REGISTRY
-            assert _PIPELINE_REGISTRY["_test_dynamic_registration"] is custom
-        finally:
-            # Don't leak the test registration into other tests.
-            if "_test_dynamic_registration" in _PIPELINE_REGISTRY:
-                del _PIPELINE_REGISTRY["_test_dynamic_registration"]
 
-    def test_dynamic_registration_overrides_lazy_entry(self):
-        # Build a substitute for qwen3_omni_moe that we can distinguish.
-        original = _PIPELINE_REGISTRY["qwen3_omni_moe"]
-        override = PipelineConfig(
-            model_type="qwen3_omni_moe",
-            model_arch="OverriddenArch",
-            stages=original.stages,
-        )
-        register_pipeline(override)
-        try:
-            assert _PIPELINE_REGISTRY["qwen3_omni_moe"].model_arch == "OverriddenArch"
-        finally:
-            # Remove the dynamic override so later tests see the original.
-            if "qwen3_omni_moe" in _PIPELINE_REGISTRY._loaded:
-                del _PIPELINE_REGISTRY["qwen3_omni_moe"]
+def test_register_pipeline_config_with_model_type(clean_pipeline_registry):
+    """Ensure that we can register a custom pipeline config with an explicit model_type to OMNI_PIPELINES."""
+    new_model_type = "new_model_type"
+    unused_model_type = "foo"
+    pipe_cfg = PipelineConfig(model_type=unused_model_type)
+    assert new_model_type not in OMNI_PIPELINES
+    assert unused_model_type not in OMNI_PIPELINES
+
+    # Registering with an explicitly provided model_type uses
+    # the passed value instead of the pipeline_cfg.model_type
+    register_pipeline(pipe_cfg, new_model_type)
+    assert new_model_type in OMNI_PIPELINES
+    assert unused_model_type not in OMNI_PIPELINES
+    assert OMNI_PIPELINES[new_model_type] is pipe_cfg
+
+
+def test_register_resolver(custom_resolver, clean_pipeline_registry):
+    """Ensure that we can register a custom resolver to OMNI_PIPELINES."""
+    new_model_type = "new_model_type"
+    assert new_model_type not in OMNI_PIPELINES
+    register_pipeline(custom_resolver, new_model_type)
+    assert new_model_type in OMNI_PIPELINES
+    assert OMNI_PIPELINES[new_model_type] is custom_resolver
+
+
+def test_register_resolver_requires_model_type(custom_resolver, clean_pipeline_registry):
+    """Ensure that registering a custom resolver to OMNI_PIPELINES requires an explicit model_type."""
+    with pytest.raises(ValueError):
+        register_pipeline(custom_resolver)

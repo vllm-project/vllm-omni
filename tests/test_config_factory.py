@@ -12,14 +12,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
 from vllm_omni.config.stage_config import (
-    _PIPELINE_REGISTRY,
     DeployConfig,
     PipelineConfig,
     StageConfig,
-    StageConfigFactory,
     StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
@@ -30,14 +31,16 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
-    register_pipeline,
+    pipeline_cfg_resolver,
     strip_parent_engine_args,
 )
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
+Q3_OMNI_THINKER_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=False)
 
 
 class TestStageType:
@@ -511,26 +514,39 @@ class TestStageResolutionHelpers:
 
 
 class TestPipelineDiscovery:
-    """Tests for the central pipeline registry (``pipeline_registry._OMNI_PIPELINES``)."""
+    """Tests for the central pipeline registry (``OMNI_PIPELINES``)."""
 
     def test_registry_has_known_models(self):
-        """Built-in pipelines are lazy-loaded from the central declaration
-        on first access; no eager import or discovery walk needed."""
-        # ``in`` triggers the lazy-map lookup without forcing a load.
-        assert "qwen2_5_omni" in _PIPELINE_REGISTRY
-        assert "qwen3_omni_moe" in _PIPELINE_REGISTRY
-        assert "qwen3_tts" in _PIPELINE_REGISTRY
+        """Check that specific models are in OMNI_PIPELINES."""
+        assert "qwen2_5_omni" in OMNI_PIPELINES
+        assert "qwen3_omni_moe" in OMNI_PIPELINES
+        assert "qwen3_tts" in OMNI_PIPELINES
 
-    def test_registry_loads_pipeline_on_getitem(self):
-        """Looking up a registered model_type returns the matching PipelineConfig."""
-        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
+    def test_registry_resolver_qwen3_omni_all_stages(self):
+        """Test that providing the HF config for qwen3 omni with audio enabled uses all stages."""
+        pipeline = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
         assert pipeline.model_type == "qwen3_omni_moe"
         assert len(pipeline.stages) == 3  # thinker + talker + code2wav
 
+    def test_registry_resolver_qwen3_omni_thinker_only(self):
+        """Test that providing the HF config for qwen3 omni without audio is thinker only."""
+        pipeline = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_THINKER_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+        assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
+        assert len(pipeline.stages) == 1  # thinker only
+
     def test_registry_returns_none_for_unknown(self):
-        """Unknown model_types aren't found; ``get()`` returns None."""
-        assert "definitely_not_a_real_model" not in _PIPELINE_REGISTRY
-        assert _PIPELINE_REGISTRY.get("definitely_not_a_real_model") is None
+        """Unknown model_types aren't found and resolve to `None`."""
+        assert "definitely_not_a_real_model" not in OMNI_PIPELINES
+        assert OMNI_PIPELINES.get("definitely_not_a_real_model") is None
+        assert StageConfigFactory.resolve_pipeline_config("definitely_not_a_real_model") is None
 
     def test_pipeline_config_supports_hf_architectures(self):
         """PipelineConfig accepts hf_architectures for HF-arch fallback
@@ -579,6 +595,77 @@ class TestPipelineConfigNew:
         assert any("no stages" in e.lower() for e in p.validate())
 
 
+class TestPipelineRegistration:
+    def test_pipeline_registration(self, clean_pipeline_registry):
+        """Ensure that we can register and create a custom pipeline config."""
+        new_model_type = "new_model_type"
+        pipe_cfg = PipelineConfig(model_type=new_model_type)
+
+        # Register the new PipelineConfig
+        assert new_model_type not in OMNI_PIPELINES
+        register_pipeline(pipe_cfg)
+        assert new_model_type in OMNI_PIPELINES
+        assert OMNI_PIPELINES[new_model_type] is pipe_cfg
+
+        class FakeConfig(PretrainedConfig):
+            model_type = new_model_type
+
+        # Create the model
+        with (
+            patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()),
+            patch.object(StageConfigFactory, "_create_from_registry") as mock_create,
+        ):
+            StageConfigFactory.create_from_model("fake/model")
+            mock_create.assert_called_once()
+            # Ensure that the passed pipeline_config is the right type
+            pipeline_cfg = mock_create.call_args[0][1]
+        assert isinstance(pipeline_cfg, PipelineConfig)
+        assert pipe_cfg.model_type == new_model_type
+
+    def test_resolver_registration(self, clean_pipeline_registry):
+        """Ensure that we can register and create a custom resolver."""
+        new_model_type = "new_model_type"
+        resolved_type = "resolved_type"
+
+        class FakeConfig(PretrainedConfig):
+            model_type = new_model_type
+
+        @pipeline_cfg_resolver(config_type=FakeConfig)
+        def custom_resolver(
+            hf_config: FakeConfig,
+        ) -> PipelineConfig:
+            return PipelineConfig(model_type=resolved_type)
+
+        # Register the new PipelineConfig
+        assert new_model_type not in OMNI_PIPELINES
+
+        register_pipeline(custom_resolver, model_type=new_model_type)
+        assert new_model_type in OMNI_PIPELINES
+        assert OMNI_PIPELINES[new_model_type] is custom_resolver
+
+        # Create the model
+        with (
+            patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()),
+            patch.object(StageConfigFactory, "_create_from_registry") as mock_create,
+        ):
+            StageConfigFactory.create_from_model("fake/model")
+            mock_create.assert_called_once()
+            # Ensure that the passed pipeline_config is the right type
+            pipeline_cfg = mock_create.call_args[0][1]
+        assert isinstance(pipeline_cfg, PipelineConfig)
+        assert pipeline_cfg.model_type == resolved_type
+
+    def test_resolve_when_autodetect_resolves_none(self):
+        """Regression test for: https://github.com/vllm-project/vllm-omni/issues/4726"""
+        deploy_path = get_deploy_config_path("ming_tts.yaml")
+        resolved_config = StageConfigFactory.create_from_model(
+            model="inclusionAI/Ming-omni-tts-0.5B",
+            deploy_config_path=deploy_path,
+        )
+        assert resolved_config is not None
+        assert len(resolved_config) > 0
+
+
 class TestResolveScheduler:
     def test_all_execution_types_handled(self):
         for et in StageExecutionType:
@@ -603,18 +690,6 @@ class TestResolveScheduler:
         assert _resolve_scheduler(StageExecutionType.DIFFUSION) is None
 
 
-class TestPipelineRegistry:
-    def test_register_and_lookup(self):
-        p = PipelineConfig(
-            model_type="__test_only__",
-            model_arch="A",
-            stages=(StagePipelineConfig(stage_id=0, model_stage="a"),),
-        )
-        register_pipeline(p)
-        assert _PIPELINE_REGISTRY["__test_only__"] is p
-        del _PIPELINE_REGISTRY["__test_only__"]
-
-
 class TestDeployConfigLoading:
     def test_custom_voice_dir_is_pipeline_wide_engine_arg(self, tmp_path):
         deploy_path = tmp_path / "qwen3_tts_custom_voice.yaml"
@@ -633,8 +708,9 @@ stages:
         )
 
         deploy = load_deploy_config(deploy_path)
-        pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+        pipeline = StageConfigFactory.resolve_pipeline_config("qwen3_tts")
         stages = merge_pipeline_deploy(pipeline, deploy)
+        assert isinstance(pipeline, PipelineConfig)
 
         assert deploy.custom_voice_dir == str(custom_voice_dir)
         assert {s.yaml_engine_args.get("custom_voice_dir") for s in stages} == {str(custom_voice_dir)}
@@ -664,10 +740,15 @@ stages:
         assert "compilation_config" not in deploy.stages[0].engine_extras
 
     def test_merge_pipeline_deploy(self):
-        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
             pytest.skip("Deploy config not found")
+
+        pipeline = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
 
         deploy = load_deploy_config(deploy_path)
         stages = merge_pipeline_deploy(pipeline, deploy)
@@ -680,7 +761,12 @@ stages:
         assert s0.yaml_extras["default_sampling_params"]["detokenize"] is True
 
     def test_merge_pipeline_deploy_preserves_num_replicas(self, tmp_path):
-        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
+        pipeline = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
         base = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not base.exists():
             pytest.skip("Deploy config not found")
@@ -894,14 +980,24 @@ stages:
 
 class TestQwen3OmniPipeline:
     def test_registered(self):
-        p = _PIPELINE_REGISTRY.get("qwen3_omni_moe")
-        assert p is not None
+        p = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(p, PipelineConfig)
         assert p.model_arch == "Qwen3OmniMoeForConditionalGeneration"
         assert len(p.stages) == 3
         assert p.validate() == []
 
     def test_thinker(self):
-        s = _PIPELINE_REGISTRY["qwen3_omni_moe"].get_stage(0)
+        p = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(0)
+        assert isinstance(s, StagePipelineConfig)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
         assert s.owns_tokenizer is True
@@ -909,14 +1005,28 @@ class TestQwen3OmniPipeline:
         assert s.sampling_constraints["detokenize"] is True
 
     def test_talker(self):
-        s = _PIPELINE_REGISTRY["qwen3_omni_moe"].get_stage(1)
+        p = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(1)
+        assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
         assert s.sampling_constraints["stop_token_ids"] == [2150]
         assert s.custom_process_input_func is not None
         assert s.custom_process_next_stage_input_func is not None
 
     def test_code2wav(self):
-        s = _PIPELINE_REGISTRY["qwen3_omni_moe"].get_stage(2)
+        p = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(2)
+        assert isinstance(s, StagePipelineConfig)
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
         assert s.custom_process_input_func is not None
@@ -924,14 +1034,18 @@ class TestQwen3OmniPipeline:
 
 class TestQwen2_5OmniPipeline:
     def test_registered(self):
-        p = _PIPELINE_REGISTRY.get("qwen2_5_omni")
-        assert p is not None
+        p = StageConfigFactory.resolve_pipeline_config("qwen2_5_omni")
+        assert isinstance(p, PipelineConfig)
         assert p.model_arch == "Qwen2_5OmniForConditionalGeneration"
         assert len(p.stages) == 3
         assert p.validate() == []
 
     def test_thinker(self):
-        s = _PIPELINE_REGISTRY["qwen2_5_omni"].get_stage(0)
+        p = StageConfigFactory.resolve_pipeline_config("qwen2_5_omni")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(0)
+        assert isinstance(s, StagePipelineConfig)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
         assert s.owns_tokenizer is True
@@ -939,13 +1053,25 @@ class TestQwen2_5OmniPipeline:
         assert s.requires_multimodal_data is True
 
     def test_talker(self):
-        s = _PIPELINE_REGISTRY["qwen2_5_omni"].get_stage(1)
+        p = StageConfigFactory.resolve_pipeline_config("qwen2_5_omni")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(1)
+        assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
         assert s.sampling_constraints["stop_token_ids"] == [8294]
-        assert s.custom_process_input_func is not None
+        # thinker2talker was removed: qwen2_5_omni has no async_chunk support,
+        # so sync_process_input_func always wins and custom_process_input_func
+        # was dead code.
+        assert s.custom_process_input_func is None
+        assert s.sync_process_input_func is not None
 
     def test_code2wav(self):
-        s = _PIPELINE_REGISTRY["qwen2_5_omni"].get_stage(2)
+        p = StageConfigFactory.resolve_pipeline_config("qwen2_5_omni")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(2)
+        assert isinstance(s, StagePipelineConfig)
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
         assert s.engine_output_type == "audio"
@@ -953,14 +1079,19 @@ class TestQwen2_5OmniPipeline:
 
 class TestQwen3TTSPipeline:
     def test_registered(self):
-        p = _PIPELINE_REGISTRY.get("qwen3_tts")
+        p = StageConfigFactory.resolve_pipeline_config("qwen3_tts")
+        assert isinstance(p, PipelineConfig)
         assert p is not None
         assert p.model_arch == "Qwen3TTSTalkerForConditionalGeneration"
         assert len(p.stages) == 2
         assert p.validate() == []
 
     def test_talker_stage(self):
-        s = _PIPELINE_REGISTRY["qwen3_tts"].get_stage(0)
+        p = StageConfigFactory.resolve_pipeline_config("qwen3_tts")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(0)
+        assert isinstance(s, StagePipelineConfig)
         assert s.model_stage == "qwen3_tts"
         assert s.execution_type == StageExecutionType.LLM_AR
         assert s.owns_tokenizer is True
@@ -970,7 +1101,11 @@ class TestQwen3TTSPipeline:
         assert s.model_arch is None
 
     def test_code2wav_stage_has_per_stage_model_arch(self):
-        s = _PIPELINE_REGISTRY["qwen3_tts"].get_stage(1)
+        p = StageConfigFactory.resolve_pipeline_config("qwen3_tts")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(1)
+        assert isinstance(s, StagePipelineConfig)
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
         assert s.engine_output_type == "audio"
@@ -986,7 +1121,7 @@ class TestQwen3TTSPipeline:
             pytest.skip("qwen3_tts deploy yaml not found")
 
         deploy = load_deploy_config(deploy_path)
-        pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+        pipeline = OMNI_PIPELINES["qwen3_tts"]
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         # Stage 0 inherits pipeline-level model_arch
@@ -1025,14 +1160,18 @@ class TestQwen3TTSPipeline:
 
 class TestMingFlashOmniPipeline:
     def test_registered(self):
-        p = _PIPELINE_REGISTRY.get("ming_flash_omni")
-        assert p is not None
+        p = StageConfigFactory.resolve_pipeline_config("ming_flash_omni")
+        assert isinstance(p, PipelineConfig)
         assert p.model_arch == "MingFlashOmniForConditionalGeneration"
         assert len(p.stages) == 2
         assert p.validate() == []
 
     def test_thinker_stage(self):
-        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(0)
+        p = StageConfigFactory.resolve_pipeline_config("ming_flash_omni")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(0)
+        assert isinstance(s, StagePipelineConfig)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
         assert s.owns_tokenizer is True
@@ -1042,7 +1181,11 @@ class TestMingFlashOmniPipeline:
         assert s.sampling_constraints["detokenize"] is True
 
     def test_talker_stage(self):
-        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(1)
+        p = StageConfigFactory.resolve_pipeline_config("ming_flash_omni")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(1)
+        assert isinstance(s, StagePipelineConfig)
         assert s.model_stage == "ming_tts"
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.input_sources == (0,)
@@ -1052,28 +1195,40 @@ class TestMingFlashOmniPipeline:
         # Per-stage model_arch override (Ming talker has its own self-contained LLM)
         assert s.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
         assert s.tokenizer_subdir == "talker/llm"
-        assert s.custom_process_input_func is not None
+        # thinker2talker was removed: ming_flash_omni has no async_chunk support
+        # and both thinker2talker / thinker2talker_token_only called _build_talker_inputs
+        # identically, so custom_process_input_func was dead code.
+        assert s.custom_process_input_func is None
+        assert s.sync_process_input_func is not None
 
     def test_talker_stage_processor_wiring_resolves(self):
-        """The custom_process_input_func string must point to a real callable.
+        """The sync_process_input_func string must point to a real callable.
 
         Lazy string references only fail at first inference otherwise — this
         catches typos in the pipeline declaration at import / registration time.
         """
-        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(1)
-        module_path, _, attr = s.custom_process_input_func.rpartition(".")
+        p = StageConfigFactory.resolve_pipeline_config("ming_flash_omni")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(1)
+        assert isinstance(s, StagePipelineConfig)
+        module_path, _, attr = s.sync_process_input_func.rpartition(".")
         module = importlib.import_module(module_path)
         assert callable(getattr(module, attr))
 
     def test_tts_pipeline_registered(self):
-        p = _PIPELINE_REGISTRY.get("ming_flash_omni_tts")
-        assert p is not None
+        p = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_tts")
+        assert isinstance(p, PipelineConfig)
         assert p.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
         assert len(p.stages) == 1
         assert p.validate() == []
 
     def test_tts_stage(self):
-        s = _PIPELINE_REGISTRY["ming_flash_omni_tts"].get_stage(0)
+        p = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_tts")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(0)
+        assert isinstance(s, StagePipelineConfig)
         assert s.model_stage == "ming_tts"
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.input_sources == ()
@@ -1096,7 +1251,8 @@ class TestMingFlashOmniPipeline:
         # We won't test stage 0/1 colocation contract here,
         # as there could exist more variant of custom device setup
 
-        pipeline = _PIPELINE_REGISTRY["ming_flash_omni"]
+        pipeline = StageConfigFactory.resolve_pipeline_config("ming_flash_omni")
+        assert isinstance(pipeline, PipelineConfig)
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert len(stages) == 2
         assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
@@ -1112,20 +1268,24 @@ class TestMingFlashOmniPipeline:
         assert len(deploy.stages) == 1
         assert deploy.pipeline == "ming_flash_omni_tts"
 
-        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_tts"]
+        pipeline = OMNI_PIPELINES["ming_flash_omni_tts"]
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert len(stages) == 1
         assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniTalkerForConditionalGeneration"
 
     def test_thinker_only_pipeline_registered(self):
-        p = _PIPELINE_REGISTRY.get("ming_flash_omni_thinker_only")
-        assert p is not None
+        p = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_thinker_only")
+        assert isinstance(p, PipelineConfig)
         assert p.model_arch == "MingFlashOmniForConditionalGeneration"
         assert len(p.stages) == 1
         assert p.validate() == []
 
     def test_thinker_only_stage(self):
-        s = _PIPELINE_REGISTRY["ming_flash_omni_thinker_only"].get_stage(0)
+        p = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_thinker_only")
+        assert isinstance(p, PipelineConfig)
+
+        s = p.get_stage(0)
+        assert isinstance(s, StagePipelineConfig)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
         assert s.input_sources == ()
@@ -1146,20 +1306,21 @@ class TestMingFlashOmniPipeline:
         assert len(deploy.stages) == 1
         assert deploy.pipeline == "ming_flash_omni_thinker_only"
 
-        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_thinker_only"]
+        pipeline = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_thinker_only")
+        assert isinstance(pipeline, PipelineConfig)
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert len(stages) == 1
         assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
 
     def test_image_pipeline_registered(self):
-        p = _PIPELINE_REGISTRY.get("ming_flash_omni_image")
+        p = OMNI_PIPELINES.get("ming_flash_omni_image")
         assert p is not None
         assert p.model_arch == "MingFlashOmniForConditionalGeneration"
         assert len(p.stages) == 2
         assert p.validate() == []
 
     def test_image_thinker_stage(self):
-        s = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(0)
+        s = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_image").get_stage(0)
         assert s.model_stage == "thinker"
         assert s.execution_type == StageExecutionType.LLM_AR
         assert s.input_sources == ()
@@ -1173,7 +1334,7 @@ class TestMingFlashOmniPipeline:
         assert s.prompt_expand_func is not None
 
     def test_image_dit_stage(self):
-        s = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(1)
+        s = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_image").get_stage(1)
         assert s.model_stage == "dit"
         assert s.execution_type == StageExecutionType.DIFFUSION
         assert s.input_sources == (0,)
@@ -1185,8 +1346,11 @@ class TestMingFlashOmniPipeline:
 
     def test_image_processor_wiring_resolves(self):
         """The prompt_expand_func and custom_process_input_func strings must point to real callables."""
-        thinker = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(0)
-        dit = _PIPELINE_REGISTRY["ming_flash_omni_image"].get_stage(1)
+        pipeline = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_image")
+        assert isinstance(pipeline, PipelineConfig)
+
+        thinker = pipeline.get_stage(0)
+        dit = pipeline.get_stage(1)
         for ref in (thinker.prompt_expand_func, dit.custom_process_input_func):
             module_path, _, attr = ref.rpartition(".")
             module = importlib.import_module(module_path)
@@ -1205,7 +1369,8 @@ class TestMingFlashOmniPipeline:
         assert deploy.connectors is not None
         assert "shared_memory_connector" in deploy.connectors
 
-        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_image"]
+        pipeline = StageConfigFactory.resolve_pipeline_config("ming_flash_omni_image")
+        assert isinstance(pipeline, PipelineConfig)
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert len(stages) == 2
         # Stage 0 thinker: AR worker that emits latents.
@@ -1356,12 +1521,16 @@ class TestCLIOverrideFlow:
     """Test --stage-overrides JSON merge into StageConfig."""
 
     def test_stage_overrides_merge(self):
-        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
             pytest.skip("Deploy config not found")
 
         deploy = load_deploy_config(deploy_path)
+        pipeline = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         # Simulate --stage-overrides '{"0": {"gpu_memory_utilization": 0.5}}'
@@ -1370,12 +1539,16 @@ class TestCLIOverrideFlow:
         assert stages[0].runtime_overrides["gpu_memory_utilization"] == 0.5
 
     def test_global_override_applies_to_all(self):
-        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
             pytest.skip("Deploy config not found")
 
         deploy = load_deploy_config(deploy_path)
+        pipeline = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         overrides = {"enforce_eager": True}
@@ -1392,8 +1565,11 @@ class TestAuraOmniDeploy:
         assert deploy.pipeline == "aura_omni"
 
     def test_aura_omni_deploy_resolves_four_native_stages(self):
+        pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni")
+
         stages = StageConfigFactory._create_from_registry(
             "qwen3_tts",
+            pipeline_cfg,
             cli_overrides={},
             deploy_config_path=str(Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"),
         )
@@ -1417,8 +1593,14 @@ class TestSentinelDefaultPrecedence:
     to YAML / dataclass defaults (#3035)."""
 
     def _stages(self, cli_overrides):
+        model_type = "qwen3_omni_moe"
+        pipeline_cfg = StageConfigFactory.resolve_pipeline_config(
+            model_type,
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
         return StageConfigFactory._create_from_registry(
             "qwen3_omni_moe",
+            pipeline_cfg,
             cli_overrides=cli_overrides,
         )
 
@@ -1483,7 +1665,8 @@ class TestSentinelDefaultPrecedence:
         """A single ``qwen3_tts`` pipeline picks per-chunk vs end-to-end
         processors based on ``deploy.async_chunk``, without needing a
         separate variant pipeline registration."""
-        pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+        pipeline = StageConfigFactory.resolve_pipeline_config("qwen3_tts")
+        assert isinstance(pipeline, PipelineConfig)
 
         # async_chunk=True → stage 0's per-chunk processor wires up, stage 1
         # has no sync input processor.
@@ -1545,24 +1728,23 @@ class TestSentinelDefaultPrecedence:
         )
 
     def test_ming_flash_omni_topology(self):
-        """Guard ming_flash_omni's PR3 cleanup: stage 0 has no full-payload
-        producer hook (the connector path was removed as fake -- arch is not
-        in ``_FULL_PAYLOAD_INPUT_STAGES``), and stage 1 still wires the
-        legacy ``thinker2talker`` (custom_process_input_func) plus the
-        ``thinker2talker_token_only`` placeholder (sync_process_input_func).
+        """Guard ming_flash_omni's SIP cleanup: stage 0 has no full-payload
+        producer hook (arch is not in ``_FULL_PAYLOAD_INPUT_STAGES``), and
+        stage 1 uses only ``thinker2talker_token_only`` (sync_process_input_func).
+        The dead ``thinker2talker`` (custom_process_input_func) was removed
+        because ming_flash_omni has no async_chunk support and both functions
+        called ``_build_talker_inputs`` identically.
         Merge under either async_chunk mode must not re-introduce a
         stage-0 full-payload hook."""
-        from vllm_omni.config.stage_config import DeployConfig, merge_pipeline_deploy
-
-        pipeline = _PIPELINE_REGISTRY["ming_flash_omni"]
+        pipeline = StageConfigFactory.resolve_pipeline_config("ming_flash_omni")
+        assert isinstance(pipeline, PipelineConfig)
 
         stage0, stage1 = pipeline.stages
         assert stage0.custom_process_next_stage_input_func is None, (
             "ming_flash_omni stage 0 must not declare a full-payload producer "
             "(connector path is not active for this arch)."
         )
-        assert stage1.custom_process_input_func is not None
-        assert stage1.custom_process_input_func.endswith("thinker2talker")
+        assert stage1.custom_process_input_func is None
         assert stage1.sync_process_input_func is not None
         assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
 
@@ -1587,15 +1769,30 @@ class TestSamplingConstraintsPrecedence:
     """Test that pipeline sampling_constraints override deploy defaults."""
 
     def test_constraints_win(self):
-        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
             pytest.skip("Deploy config not found")
 
         deploy = load_deploy_config(deploy_path)
+        pipeline = StageConfigFactory.resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         # Pipeline says detokenize=True for thinker, deploy can't override
         assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is True
         # Pipeline says stop_token_ids=[2150] for talker
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [2150]
+
+
+class TestPipelineConfigResolvers:
+    @pytest.mark.parametrize("resolver", [obj for obj in OMNI_PIPELINES.values() if callable(obj)])
+    def test_all_resolvers_reject_bad_types(self, resolver):
+        """Ensure that all resolvers registered reject incorrect config types."""
+
+        class NotTheRightHfConfig(PretrainedConfig):
+            pass
+
+        assert resolver(NotTheRightHfConfig()) is None

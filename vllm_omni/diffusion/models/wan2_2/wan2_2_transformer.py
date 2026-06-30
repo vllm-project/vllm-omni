@@ -40,7 +40,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
@@ -799,7 +799,7 @@ class WanTransformer3DModel(nn.Module):
     # The _sp_plan specifies sharding/gathering at module boundaries:
     # - rope: Split both RoPE outputs (freqs_cos, freqs_sin) via split_output=True
     # - timestep_proj_prepare: Split timestep_proj for TI2V models (4D tensor)
-    # - blocks.0: Split hidden_states input at the first transformer block
+    # - _sp_shard_point: Split hidden_states before CacheDiT-wrapped transformer blocks
     # - proj_out: Gather outputs after the final projection layer
     #
     # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
@@ -822,10 +822,10 @@ class WanTransformer3DModel(nn.Module):
                 split_dim=1, expected_dims=4, split_output=True, auto_pad=True
             ),  # [B, seq, 6, dim]
         },
-        # Shard hidden_states at first transformer block input
-        # (after patch_embedding + flatten + transpose)
-        "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),  # [B, seq, dim]
+        # Shard hidden_states before entering transformer blocks. This keeps
+        # CacheDiT block wrappers aligned with the local SP shard.
+        "_sp_shard_point": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
         },
         # Shard output scale/shift for TI2V (3D); T2V outputs 2D and skips sharding
         "output_scale_shift_prepare": {
@@ -856,7 +856,6 @@ class WanTransformer3DModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
-
         # Store config for compatibility
         self.config = type(
             "Config",
@@ -938,6 +937,7 @@ class WanTransformer3DModel(nn.Module):
 
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
+        self._sp_shard_point = nn.Identity()
         if is_pipeline_last_stage():
             self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
         else:
@@ -981,10 +981,11 @@ class WanTransformer3DModel(nn.Module):
             self._cached_rope_emb = rotary_emb
 
         if is_pipeline_first_stage():
-            # Patch embedding and flatten to sequence
-            # (hidden_states is sharded at blocks.0 input by _sp_plan)
+            # Patch embedding and flatten to sequence. SP sharding happens at
+            # _sp_shard_point so downstream block wrappers see local tensors.
             hidden_states = self.patch_embedding(hidden_states)
             hidden_states = hidden_states.flatten(2).transpose(1, 2)
+            hidden_states = self._sp_shard_point(hidden_states)
         else:
             if intermediate_tensors is None:
                 raise RuntimeError("intermediate_tensors must be provided for non-first PP stages")
@@ -1017,18 +1018,12 @@ class WanTransformer3DModel(nn.Module):
             parallel_config is not None
             and parallel_config.sequence_parallel_size > 1
             and parallel_config.mask_sp_padding
-            and ctx.sp_original_seq_len is not None
-            and ctx.sp_padding_size > 0
         ):
-            batch_size = hidden_states.shape[0]
-            padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-            hidden_states_mask = torch.ones(
-                batch_size,
-                padded_seq_len,
-                dtype=torch.bool,
-                device=hidden_states.device,
+            hidden_states_mask = build_local_sp_padding_mask(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                hidden_states.device,
             )
-            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
             if hidden_states_mask.all():
                 hidden_states_mask = None
         elif (

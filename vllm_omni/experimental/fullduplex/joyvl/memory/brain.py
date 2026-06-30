@@ -25,6 +25,7 @@ class InteractionBrain:
         delegation: DelegationBridge | None = None,
         chunk_frames: int = 16,
         long_term_every_n_chunks: int = 5,
+        long_term_window: int = 15,
         keep_qa_history: bool = True,
         frame_seconds: float = 1.0,
         enable_delegation: bool = True,
@@ -33,6 +34,7 @@ class InteractionBrain:
         self._delegation = delegation
         self._chunk_frames = chunk_frames
         self._long_term_every_n = long_term_every_n_chunks
+        self._long_term_window = long_term_window
         self._keep_qa_history = keep_qa_history
         self._frame_seconds = frame_seconds
         self._enable_delegation = enable_delegation
@@ -58,10 +60,10 @@ class InteractionBrain:
         self._consolidate_lock = asyncio.Lock()
 
     def now(self) -> str:
-        return f"{self.frame_index * self._frame_seconds:.1f}s"
+        return f"{self.frame_index * self._frame_seconds:.1f} seconds"
 
     def last_frame_time(self) -> str:
-        return f"{max(0, self.frame_index - 1) * self._frame_seconds:.1f}s"
+        return f"{max(0, self.frame_index - 1) * self._frame_seconds:.1f} seconds"
 
     def tick(self, n: int = 1) -> None:
         self.frame_index += n
@@ -131,9 +133,14 @@ class InteractionBrain:
             summary = await self._summarizer.summarize_chunk(chunk_index, frame_range, frames)
             self.memory.mid_term_summaries.append(MidTermSummary(chunk_index, frame_range, summary))
             if len(self.memory.mid_term_summaries) >= self._long_term_every_n:
-                self.memory.long_term_memory = await self._summarizer.compress_to_long_term(
-                    self.memory.long_term_memory, self.memory.mid_term_summaries
-                )
+                block = await self._summarizer.compress_to_long_term(self.memory.mid_term_summaries)
+                if block:
+                    self.memory.long_term_blocks.append(block)
+                    window = self._long_term_window
+                    if window > 0 and len(self.memory.long_term_blocks) > window:
+                        # drop oldest blocks so long-term memory stays bounded over hours
+                        del self.memory.long_term_blocks[: len(self.memory.long_term_blocks) - window]
+                    self.memory.long_term_memory = "\n\n".join(self.memory.long_term_blocks)
                 self.memory.mid_term_summaries.clear()
 
     async def flush(self, frames: list[tuple[str, str]]) -> None:

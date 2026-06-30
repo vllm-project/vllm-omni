@@ -44,6 +44,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         super().set_device(device)
+
+        # Register vllm_ascend custom ops (torch.ops._C_ascend.*).
+        from vllm_ascend.utils import enable_custom_op
+
+        enable_custom_op()
+
         # Ascend quantized weights are converted from ND to FRACTAL_NZ
         # after loading. Enable internal format so the NZ storage layout
         # is preserved for fused NPU kernels.
@@ -56,6 +62,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker"
+
+    @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+        from vllm_ascend.ascend_config import init_ascend_config
+
+        init_ascend_config(vllm_config)
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
@@ -136,6 +148,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.npu.mem_get_info(device)
         return free
+
+    @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.npu.mem_get_info(device)
+        return free, total
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:

@@ -291,7 +291,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 device = inputs_embeds.device
             else:
                 num_tokens = 1
-                device = torch.device("cuda")
+                device = current_omni_platform.get_torch_device()
             hidden_dim = self.config.hidden_size if hasattr(self.config, "hidden_size") else 2560
 
             # Profile/dummy run: both input_ids and inputs_embeds are None.

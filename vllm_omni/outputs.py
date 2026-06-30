@@ -44,12 +44,15 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     that may be produced by non-autoregressive stages.
 
     Attributes:
-        multimodal_outputs: Optional per-request list of multimodal output
-            dicts, indexed by req_index. Each element is a dict mapping
-            output keys to tensors/values (e.g., [{"audio": tensor}, ...]).
+        multimodal_outputs: Optional per-request list of client-facing multimodal
+            output dicts, indexed by req_index.
+        inter_stage_outputs: Optional per-request list of inter-stage payload dicts
+            for connector transport (``save_async`` / full_payload).  Not forwarded
+            to the orchestrator output processor.
     """
 
     multimodal_outputs: list[dict[str, object]] | None = None
+    inter_stage_outputs: list[dict[str, object]] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
@@ -175,6 +178,7 @@ class OmniRequestOutput:
         final_output_type: str = "image",
         stage_durations: dict[str, float] | None = None,
         peak_memory_mb: float = 0.0,
+        finished: bool = True,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -211,7 +215,7 @@ class OmniRequestOutput:
             _custom_output=custom_output or {},
             stage_durations=stage_durations or {},
             peak_memory_mb=peak_memory_mb,
-            finished=True,
+            finished=finished,
         )
 
     @property
