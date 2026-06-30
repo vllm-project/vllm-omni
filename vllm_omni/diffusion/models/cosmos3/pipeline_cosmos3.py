@@ -1666,12 +1666,21 @@ class Cosmos3OmniDiffusersPipeline(
         self,
         target_audio_samples: int,
         generator: torch.Generator,
+        *,
+        sp_video_shape: tuple[int, int, int] | None = None,
+        sp_num_vision_items: int = 1,
     ) -> tuple[torch.Tensor, int]:
         sound_tokenizer = self._get_sound_tokenizer()
         hop_size = int(
             getattr(sound_tokenizer, "hop_size", None) or getattr(sound_tokenizer, "temporal_compression_factor")
         )
         latent_frames = max(1, math.ceil(max(1, int(target_audio_samples)) / hop_size))
+        if sp_video_shape is not None:
+            latent_frames = self.transformer.sound_latent_frames_for_sequence_parallel(
+                video_shape=sp_video_shape,
+                sound_frames=latent_frames,
+                num_vision_items=sp_num_vision_items,
+            )
         sound_dim = int(getattr(sound_tokenizer, "latent_ch", 64))
         transformer_sound_dim = int(getattr(self.transformer, "sound_dim", sound_dim))
         if sound_dim != transformer_sound_dim:
@@ -3119,17 +3128,21 @@ class Cosmos3OmniDiffusersPipeline(
             image_latent = None
             condition_latents = None
 
+        T_latent = latents.shape[2]
+        H_latent = latents.shape[3]
+        W_latent = latents.shape[4]
+        video_shape = (T_latent, H_latent, W_latent)
+
         sound_latents = None
         target_audio_samples = None
         sound_sample_rate = None
         if sound_enabled:
             target_audio_samples, _, sound_sample_rate = self._resolve_sound_target_samples(sp, num_frames, frame_rate)
-            sound_latents, _ = self._prepare_sound_latents(target_audio_samples, generator)
-
-        T_latent = latents.shape[2]
-        H_latent = latents.shape[3]
-        W_latent = latents.shape[4]
-        video_shape = (T_latent, H_latent, W_latent)
+            sound_latents, _ = self._prepare_sound_latents(
+                target_audio_samples,
+                generator,
+                sp_video_shape=video_shape,
+            )
 
         # --- Denoising loop ---
         shared_kwargs = dict(video_shape=video_shape, fps=frame_rate)
