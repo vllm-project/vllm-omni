@@ -164,7 +164,7 @@ def parse_args():
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit"],
+        choices=["cache_dit", "tea_cache"],
         help="Cache backend to use for image generation acceleration.",
     )
     parser.add_argument(
