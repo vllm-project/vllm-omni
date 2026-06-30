@@ -23,6 +23,15 @@ from tests.helpers.media import (
 
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
+# Transcript gates default to whisper ``small`` for speed. ``small`` mishears a
+# short TTS clip ~0.5% of the time (e.g. "Hello"->"fellow", or hallucinating a
+# leading SFX token), which flakes the deterministic similarity gate. A test can
+# opt in to ASR escalation by setting ``transcript_escalation_model`` to a
+# whisper model name (e.g. ``"large-v3"``) in its request_config: on a failed
+# fast pass the clip is re-transcribed with that stronger ASR before the test
+# fails, so a weak-ASR mishear is rescued while a genuine model artifact still
+# fails (the strong ASR mismatches too). Tests that do not opt in keep the
+# strict behaviour.
 _PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
 _MIN_PCM_SPEECH_HNR_DB = 1.0
 _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
@@ -456,7 +465,15 @@ def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_l
     if "audio" not in modalities:
         return False
     keywords_dict = request_config.get("key_words", {}) or {}
-    if keywords_dict.get("audio") and "text" not in modalities:
+    # When text is not an output modality, the keyword loop validates keywords
+    # against the audio transcript -- for keywords under ANY word_type
+    # (text/image/audio/video), not just "audio". Mirror that here so the
+    # transcript is actually computed; otherwise the loop hits
+    # `assert transcript is not None` with transcript=None (e.g. an audio-only
+    # request carrying key_words={"text": [...]}).
+    if "text" not in modalities and any(
+        keywords_dict.get(word_type) for word_type in ("text", "image", "audio", "video")
+    ):
         return True
     if request_config.get("audio_ref_text"):
         return True
@@ -590,6 +607,56 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                 )
 
 
+def _assert_transcript_matches(
+    transcript: str,
+    audio_bytes: bytes | None,
+    expected_text: Any,
+    *,
+    threshold: float,
+    escalation_model: str | None = None,
+) -> None:
+    """Assert spoken audio matches ``expected_text``.
+
+    ``transcript`` is the fast whisper-``small`` result. If it clears
+    ``threshold`` the check passes immediately.
+
+    When ``escalation_model`` is set (opt-in via the ``transcript_escalation_model``
+    request_config key) and the fast check fails, the clip is re-transcribed with
+    that stronger ASR and the assertion is decided on its verdict -- so a weak
+    whisper-``small`` mishear on a short clip does not flake the gate, while a
+    genuine model artifact still fails (the strong ASR mismatches too). When
+    ``escalation_model`` is ``None`` the original strict behaviour is preserved,
+    so other tests are unaffected.
+    """
+    expected = str(expected_text).strip().lower()
+    similarity = cosine_similarity_text(transcript.strip().lower(), expected)
+    print(f"Cosine similarity: {similarity:.3f}")
+    if similarity > threshold:
+        return
+
+    if escalation_model and audio_bytes:
+        print(
+            f"whisper-small below threshold ({similarity:.2f} <= {threshold}); "
+            f"escalating to whisper-{escalation_model} to rule out an ASR mishear"
+        )
+        strong_transcript = convert_audio_bytes_to_text(audio_bytes, model_size=escalation_model)
+        strong_similarity = cosine_similarity_text(strong_transcript.strip().lower(), expected)
+        print(
+            f"audio content (whisper-{escalation_model}): {strong_transcript}\n"
+            f"Cosine similarity (whisper-{escalation_model}): {strong_similarity:.3f}"
+        )
+        assert strong_similarity > threshold, (
+            f"Transcript doesn't match input after ASR escalation: "
+            f"input={expected_text!r}; whisper-small='{transcript}' (sim={similarity:.2f}); "
+            f"whisper-{escalation_model}='{strong_transcript}' (sim={strong_similarity:.2f})"
+        )
+        return
+
+    assert similarity > threshold, (
+        f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
+    )
+
+
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
     """Validate speech API results from :class:`~tests.helpers.runtime.OmniResponse`.
 
@@ -643,10 +710,12 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             if expected_text:
                 print(f"audio content is: {transcript}")
                 print(f"input text is: {expected_text}")
-                similarity = cosine_similarity_text(transcript.strip().lower(), str(expected_text).lower())
-                print(f"Cosine similarity: {similarity:.3f}")
-                assert similarity > 0.9, (
-                    f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
+                _assert_transcript_matches(
+                    transcript,
+                    getattr(response, "audio_bytes", None),
+                    expected_text,
+                    threshold=0.9,
+                    escalation_model=request_config.get("transcript_escalation_model"),
                 )
         _assert_preset_voice_gender_from_audio(
             response.audio_bytes,

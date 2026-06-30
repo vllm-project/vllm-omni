@@ -284,10 +284,17 @@ class HeliosPipeline(
     ) -> DiffusionRequestState:
         """Initialize Helios request state for chunk-wise step execution."""
         del kwargs
-        req = OmniDiffusionRequest(
-            prompt=state.prompt,
-            sampling_params=state.sampling,
-            request_id=state.request_id,
+        # Wrap the single request in a DiffusionRequestBatch so the batch
+        # compatibility properties (`prompts`, etc.) used below are available;
+        # OmniDiffusionRequest itself only exposes a singular `prompt`.
+        req = DiffusionRequestBatch(
+            requests=[
+                OmniDiffusionRequest(
+                    prompt=state.prompt,
+                    sampling_params=state.sampling,
+                    request_id=state.request_id,
+                )
+            ]
         )
         extra = getattr(state.sampling, "extra_args", {}) or {}
 

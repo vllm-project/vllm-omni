@@ -205,7 +205,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return False
 
-    def schedule(self) -> SchedulerOutput:  # type: ignore[override]
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
@@ -223,7 +223,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
 
         try:
-            scheduler_output = super().schedule()
+            scheduler_output = super().schedule(throttle_prefills)
         finally:
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue

@@ -1261,7 +1261,7 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
-from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request
+from vllm.benchmarks.serve import TaskType, _merge_overrides, calculate_metrics_for_embeddings, get_request
 
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
@@ -1334,6 +1334,8 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
+    test_extra_body = _merge_overrides(extra_body, input_requests[0].request_overrides)
+    test_chat_messages = input_requests[0].chat_messages
 
     assert (
         test_mm_content is None
@@ -1351,7 +1353,8 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=extra_body,
+        extra_body=test_extra_body,
+        chat_messages=test_chat_messages,
     )
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
@@ -1415,7 +1418,8 @@ async def benchmark(
             multi_modal_content=test_mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=test_extra_body,
+            chat_messages=test_chat_messages,
         )
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
@@ -1481,6 +1485,7 @@ async def benchmark(
             request.multi_modal_data,
             request.request_id,
         )
+        per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -1497,8 +1502,9 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=per_request_extra_body,
             request_id=request_id,
+            chat_messages=request.chat_messages,
         )
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
@@ -1670,6 +1676,8 @@ async def benchmark(
             prompt_len=test_prompt_len,
             output_len=test_output_len,
             logprobs=logprobs,
+            extra_body=test_extra_body,
+            chat_messages=test_chat_messages,
         )
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:

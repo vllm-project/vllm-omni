@@ -459,7 +459,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self._async_chunk:
             inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
         else:
-            inter_stage_outputs, multimodal_outputs = None, per_req_payloads
+            # See gpu_ar_model_runner: non-async-chunk ships the full payload to the next
+            # stage; #4527's (None, per_req_payloads) starved the downstream stage. (PR #4792)
+            inter_stage_outputs, multimodal_outputs = per_req_payloads, per_req_payloads
 
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()

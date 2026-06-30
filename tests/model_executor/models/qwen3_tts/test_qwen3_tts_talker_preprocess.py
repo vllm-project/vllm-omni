@@ -41,6 +41,7 @@ def _make_minimal_talker(
     def _default_raise(**_kwargs):
         raise AssertionError("build_prompt_embeds was not stubbed in this test")
 
+    model._embedding_dtype = torch.bfloat16
     model._prompt_builder = SimpleNamespace(
         build_prompt_embeds=build_prompt_embeds if build_prompt_embeds is not None else _default_raise,
     )
@@ -89,6 +90,7 @@ def _make_minimal_builder(
     )
     builder._speaker_cache = None
     builder._text_tokenizer = None
+    builder._embedding_dtype = torch.bfloat16
     builder._ref_audio_artifact_cache_max_entries = 256
     builder._ref_audio_artifact_cache = OrderedDict()
     builder._resampler_cache = OrderedDict()

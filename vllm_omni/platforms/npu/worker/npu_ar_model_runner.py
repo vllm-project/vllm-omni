@@ -1145,7 +1145,10 @@ class NPUARModelRunner(OmniNPUModelRunner):
         if self._async_chunk:
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            pooler_inter, pooler_client = None, pooler_output
+            # Non-async-chunk ships the full payload to the next stage via
+            # inter_stage_outputs (the NPU runner has no separate full-payload
+            # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
+            pooler_inter, pooler_client = pooler_output, pooler_output
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
         multimodal_outputs = self._build_multimodal_outputs(pooler_client)
         model_runner_output = OmniModelRunnerOutput(
