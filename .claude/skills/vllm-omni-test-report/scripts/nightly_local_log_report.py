@@ -55,6 +55,13 @@ from pytest_log_parse import (  # noqa: E402
     parse_pytest_log,
 )
 from report_html_theme import EDITORIAL_THEME_CSS  # noqa: E402
+from report_naming import (  # noqa: E402
+    default_nightly_html_path,
+    nightly_report_title,
+    resolve_report_date_iso,
+)
+
+_SKILL_DIR = _SCRIPTS.parent
 
 
 def _buildkite_token() -> str | None:
@@ -2705,10 +2712,20 @@ def main() -> None:
         f"repo-root from --repo-root, $REPO_ROOT, or {DEFAULT_LAPTOP_REPO_ROOT_DISPLAY}).",
     )
     parser.add_argument(
+        "--report-date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="UTC date for default output filename/title (default: today UTC). "
+        "Never derived from logs/nightly_jobs_* directory suffixes.",
+    )
+    parser.add_argument(
         "--html-report",
         type=Path,
         default=None,
-        help="Write HTML report to this file.",
+        help=(
+            "Write HTML report to this file. "
+            f"Default when omitted: <skill-dir>/{default_nightly_html_path(_SKILL_DIR).name}"
+        ),
     )
     parser.add_argument(
         "--markdown-report",
@@ -2717,10 +2734,15 @@ def main() -> None:
         help="Write Markdown report to this file (optional).",
     )
     parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print report to stdout instead of the default dated HTML file.",
+    )
+    parser.add_argument(
         "--to-stdout",
         choices=("html", "markdown"),
         default="html",
-        help="Format when printing to stdout and no --html-report/--markdown-report (default: html).",
+        help="Format when using --stdout (default: html).",
     )
     parser.add_argument(
         "--no-buildkite",
@@ -2772,14 +2794,22 @@ def main() -> None:
     )
     parser.add_argument(
         "--title",
-        default="Nightly local test report",
-        help="Report title.",
+        default=None,
+        help="Report title (default: Nightly Buildkite report - <report-date>).",
     )
     args = parser.parse_args()
 
     if args.html_report and args.markdown_report:
         print("Use only one of --html-report or --markdown-report.", file=sys.stderr)
         sys.exit(2)
+    if args.stdout and (args.html_report or args.markdown_report):
+        print("Use --stdout without --html-report or --markdown-report.", file=sys.stderr)
+        sys.exit(2)
+
+    report_date = resolve_report_date_iso(args.report_date)
+    title = args.title or nightly_report_title(report_date)
+    if args.html_report is None and args.markdown_report is None and not args.stdout:
+        args.html_report = default_nightly_html_path(_SKILL_DIR, report_date)
 
     if args.repo_root is not None:
         repo = args.repo_root.resolve()
@@ -2813,7 +2843,7 @@ def main() -> None:
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", encoding="utf-8") as fp:
             emit_report_html(
-                title=args.title,
+                title=title,
                 repo_root=repo,
                 log_dir=log_dir,
                 out_fp=fp,
@@ -2822,12 +2852,13 @@ def main() -> None:
                 bk_note=bk_note,
                 kanban_cfg=kanban_cfg,
             )
+        print(f"Wrote {out}")
     elif args.markdown_report:
         out = args.markdown_report
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", encoding="utf-8") as fp:
             emit_report(
-                title=args.title,
+                title=title,
                 repo_root=repo,
                 log_dir=log_dir,
                 out_fp=fp,
@@ -2836,10 +2867,11 @@ def main() -> None:
                 bk_note=bk_note,
                 kanban_cfg=kanban_cfg,
             )
+        print(f"Wrote {out}")
     else:
         if args.to_stdout == "markdown":
             emit_report(
-                title=args.title,
+                title=title,
                 repo_root=repo,
                 log_dir=log_dir,
                 out_fp=sys.stdout,
@@ -2850,7 +2882,7 @@ def main() -> None:
             )
         else:
             emit_report_html(
-                title=args.title,
+                title=title,
                 repo_root=repo,
                 log_dir=log_dir,
                 out_fp=sys.stdout,

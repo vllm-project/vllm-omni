@@ -14,7 +14,19 @@ description: Two report kinds; **default output is always HTML** unless the user
 
 ## Default output (HTML)
 
-**Unless the user explicitly asks for Markdown** (e.g. “generate md / markdown”, hand-editing, or `patch_report_*.py`), **always produce HTML**: `compose_full_report.py` (default) and `nightly_local_log_report.py --html-report <path>.html`. Use `--format markdown` or `--markdown-report` / `--to-stdout markdown` **only** after that explicit request.
+**Unless the user explicitly asks for Markdown** (e.g. “generate md / markdown”, hand-editing, or `patch_report_*.py`), **always produce HTML**: `compose_full_report.py` (default) and `nightly_local_log_report.py` (writes dated HTML by default). Use `--format markdown` or `--markdown-report` / `--stdout` **only** after that explicit request.
+
+## Report naming (required)
+
+**Always use the UTC calendar date when the report is generated** (`YYYY-MM-DD`), **not** timestamps from synced log directories.
+
+| Do | Don't |
+|----|-------|
+| `nightly-report-buildkite-latest-2026-06-26.html` (today UTC) | `nightly-report-buildkite-latest-20250628-143022.html` |
+| Omit `--html-report` / `--out` — scripts default to dated filenames | Parse `logs/nightly_jobs_20250628-143022` suffix for the report name |
+| Optional override: `--report-date YYYY-MM-DD` | Use log dir mtime or Buildkite build `created_at` for the filename |
+
+Shared helpers live in `scripts/report_naming.py`. `push_report_to_kanban.py` archives non-canonical filenames under **today UTC** unless `--date` is set.
 
 ## Agent Quick Path
 
@@ -40,11 +52,14 @@ When archive/push intent is present, **after** HTML generation:
 gh auth status   # required before push
 export KANBAN_REPO_ROOT="${KANBAN_REPO_ROOT:-~/vllm-omni-kanban}"   # confirm with user first
 
-# 1) Generate report (no push)
+# 1) Generate report (no push) — default output uses UTC today in filename/title
 python scripts/nightly_local_log_report.py \
-  --html-report ./nightly-report-buildkite-latest-YYYY-MM-DD.html \
-  --kanban-repo-root "$KANBAN_REPO_ROOT" \
-  --title "Nightly Buildkite report - YYYY-MM-DD"
+  --kanban-repo-root "$KANBAN_REPO_ROOT"
+
+# Or pin archive date explicitly:
+# python scripts/nightly_local_log_report.py \
+#   --report-date 2026-06-26 \
+#   --kanban-repo-root "$KANBAN_REPO_ROOT"
 
 # 2) Archive + stage (separate command; prints preview, no push)
 python scripts/push_report_to_kanban.py \
@@ -66,7 +81,7 @@ Standalone (report already on disk): run `push_report_to_kanban.py` then `push_k
 ### Nightly Quick Path
 
 Ask for or infer:
-- Output date/name, e.g. `nightly-report-buildkite-latest-YYYY-MM-DD.html`.
+- **Report date for filename/title:** UTC **today** when generating (scripts default automatically). **Never** copy from `nightly_jobs_YYYYMMDD-HHMMSS` log dir suffixes.
 - Buildkite token in the environment (`BUILDKITE_TOKEN` or `BUILDKITE_API_TOKEN`) unless the user explicitly wants `--no-buildkite`.
 - Kanban repo root for baseline comparison: default **`~/vllm-omni-kanban`** ([confirm with user](references/confirm-laptop-path-defaults.md)) or `--kanban-repo-root`.
 - Optional pinned Buildkite build: `--buildkite-build N`.
@@ -80,9 +95,7 @@ export REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
 export BUILDKITE_TOKEN=...   # optional; omit with --no-buildkite
 python scripts/prepare_kanban_before_report.py
 python scripts/nightly_local_log_report.py \
-  --html-report ./nightly-report-buildkite-latest-YYYY-MM-DD.html \
-  --kanban-repo-root "$KANBAN_REPO_ROOT" \
-  --title "Nightly Buildkite report - YYYY-MM-DD"
+  --kanban-repo-root "$KANBAN_REPO_ROOT"
 ```
 
 ### Release Quick Path
@@ -138,13 +151,11 @@ export KANBAN_REPO_ROOT="${KANBAN_REPO_ROOT:-~/vllm-omni-kanban}"
 python scripts/prepare_kanban_before_report.py
 export BUILDKITE_TOKEN=...   # optional; omit with --no-buildkite
 python scripts/nightly_local_log_report.py \
-  --html-report ./nightly-report.html \
   --kanban-repo-root "$KANBAN_REPO_ROOT"
 python scripts/nightly_local_log_report.py \
-  --html-report ./nightly-report.html \
   --kanban-repo-root "$KANBAN_REPO_ROOT" \
   --kanban-refresh-from-raw
-python scripts/nightly_local_log_report.py --no-buildkite --html-report ./local-only.html
+python scripts/nightly_local_log_report.py --no-buildkite
 ```
 
 Other flags: `--title`, `--buildkite-build`, `--kanban-repo-root`, `--kanban-raw-root`, `--kanban-refresh-from-raw`, `--kanban-expected-remote`, `--kanban-expected-branch`. **Markdown** (only if the user explicitly asks): `--markdown-report`, `--to-stdout markdown`. See `python scripts/nightly_local_log_report.py --help`.

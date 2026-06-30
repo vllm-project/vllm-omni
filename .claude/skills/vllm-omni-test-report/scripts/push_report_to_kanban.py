@@ -35,7 +35,6 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copy2
 
@@ -51,6 +50,7 @@ from laptop_path_defaults import (
     DEFAULT_KANBAN_REPO_ROOT_DISPLAY,
     resolve_kanban_repo_root,
 )
+from report_naming import utc_report_date_iso  # noqa: E402
 
 GH_CLI_INSTALL_HINT = (
     "GitHub CLI (gh) is not installed. Archive push requires gh:\n"
@@ -78,7 +78,6 @@ RELEASE_LOOSE_RE = re.compile(
     r"^vllm-omni-test-report(?:-preview)?-(?P<date>\d{4}-\d{2}-\d{2})\.html$",
     re.IGNORECASE,
 )
-DATE_IN_NAME_RE = re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})")
 
 
 @dataclass(frozen=True)
@@ -233,11 +232,8 @@ def infer_report_kind_and_date(
         if match:
             return kind, match.group("date")
 
-    dates = DATE_IN_NAME_RE.findall(name)
-    if dates:
-        return kind, dates[-1]
-
-    return kind, datetime.now(timezone.utc).date().isoformat()
+    # Non-canonical filenames may embed log-sync timestamps; use generation date instead.
+    return kind, utc_report_date_iso()
 
 
 def build_archive_plan(
@@ -406,8 +402,7 @@ def infer_plan_from_staged_rel(rel: str) -> ArchivePlan:
         if match:
             report_date = match.group("date")
         else:
-            dates = DATE_IN_NAME_RE.findall(name)
-            report_date = dates[-1] if dates else datetime.now(timezone.utc).date().isoformat()
+            report_date = utc_report_date_iso()
         return ArchivePlan(
             kind="nightly",
             report_date=report_date,
@@ -419,8 +414,7 @@ def infer_plan_from_staged_rel(rel: str) -> ArchivePlan:
     if match:
         report_date = match.group("date")
     else:
-        dates = DATE_IN_NAME_RE.findall(name)
-        report_date = dates[-1] if dates else datetime.now(timezone.utc).date().isoformat()
+        report_date = utc_report_date_iso()
     return ArchivePlan(
         kind="release",
         report_date=report_date,
@@ -845,7 +839,7 @@ def main() -> None:
         "--date",
         dest="report_date",
         default=None,
-        help="Report date YYYY-MM-DD (default: parse from filename or UTC today).",
+        help="Report date YYYY-MM-DD (default: UTC today when filename is not canonical).",
     )
     parser.add_argument(
         "--remote",

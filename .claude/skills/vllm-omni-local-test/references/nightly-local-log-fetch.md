@@ -179,13 +179,14 @@ python scripts/prepare_kanban_before_report.py
 
 This pulls latest kanban, copies perf JSON + job logs from **`logs/nightly_jobs`** into **`data/local_nightly_raw/manual_*`** when present, and runs **`mkdocs build`** to refresh **`docs/assets/charts/*_history.json`**.
 
-3. HTML nightly report — from **`skills/vllm-omni-test-report/`** ([../../vllm-omni-test-report/SKILL.md](../../vllm-omni-test-report/SKILL.md), report kind **nightly**):
+3. HTML nightly report — from **`skills/vllm-omni-test-report/`** ([../../vllm-omni-test-report/SKILL.md](../../vllm-omni-test-report/SKILL.md), report kind **nightly**). Output filename uses **UTC today**, not the remote `nightly_jobs_*` suffix:
 
 ```bash
 export REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
 export KANBAN_REPO_ROOT="${KANBAN_REPO_ROOT:-~/vllm-omni-kanban}"
-python scripts/nightly_local_log_report.py --html-report ./nightly-report.html \
+python scripts/nightly_local_log_report.py \
   --kanban-repo-root "$KANBAN_REPO_ROOT"
+# default output: ./nightly-report-buildkite-latest-YYYY-MM-DD.html (generation date)
 # log-dir default: $REPO_ROOT/logs/nightly_jobs
 ```
 

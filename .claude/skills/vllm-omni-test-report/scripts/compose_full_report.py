@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 _SCRIPTS = Path(__file__).resolve().parent
@@ -47,6 +47,11 @@ from release_md_to_html import (  # noqa: E402
     RELEASE_CONCLUSION_PLACEHOLDER,
     convert_release_report_markdown,
     materialize_release_conclusion_in_markdown,
+)
+from report_naming import (  # noqa: E402
+    release_report_basename,
+    release_report_preview_basename,
+    resolve_report_date_iso,
 )
 
 CI_FAILURE_LABEL = "ci-failure"  # matches GitHub label on vllm-project/vllm-omni
@@ -988,10 +993,19 @@ def main() -> None:
         help="Output format (default: html). Use markdown for patch_report_*.py workflows.",
     )
     parser.add_argument(
+        "--report-date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="UTC date for default --out filename (default: today UTC). "
+        "Never derived from --log-dir-h* or nightly_jobs_* suffixes.",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=None,
-        help=("Output path. Default: <skill-dir>/vllm-omni-test-report-YYYY-MM-DD.html or .md when --format markdown."),
+        help=(
+            "Output path. Default: <skill-dir>/vllm-omni-test-report-YYYY-MM-DD.html (or .md when --format markdown)."
+        ),
     )
     parser.add_argument(
         "--stats-from",
@@ -1039,6 +1053,7 @@ def main() -> None:
 
     skill_dir = Path(__file__).resolve().parent.parent
     scripts_dir = skill_dir / "scripts"
+    report_date = resolve_report_date_iso(args.report_date)
 
     token = (os.environ.get("BUILDKITE_API_TOKEN") or os.environ.get("BUILDKITE_TOKEN") or "").strip()
     if not args.preview and not token:
@@ -1049,15 +1064,15 @@ def main() -> None:
         sys.exit(2)
 
     if args.preview:
-        today_d = datetime.now(timezone.utc).date()
-        today_utc = today_d.isoformat()
+        today_utc = report_date
         stats_to = args.stats_to or today_utc
-        stats_from = args.stats_from or today_d.replace(day=1).isoformat()
+        stats_from = args.stats_from or datetime.strptime(today_utc, "%Y-%m-%d").date().replace(day=1).isoformat()
         md = preview_report_markdown(skill_dir, stats_from=stats_from, stats_to=stats_to)
         out_path = args.out
         if out_path is None:
             ext = ".html" if args.format == "html" else ".md"
-            out_path = skill_dir / f"vllm-omni-test-report-preview-{today_utc}{ext}"
+            base = release_report_preview_basename(report_date)
+            out_path = skill_dir / (base.replace(".html", ext) if ext == ".md" else base)
         else:
             out_path = Path(args.out)
         if args.format == "html":
@@ -1095,10 +1110,9 @@ def main() -> None:
         print(f"Wrote {out_path}")
         return
 
-    today_d = datetime.now(timezone.utc).date()
-    today_utc = today_d.isoformat()
+    today_utc = report_date
     stats_to = args.stats_to or today_utc
-    stats_from = args.stats_from or today_d.replace(day=1).isoformat()
+    stats_from = args.stats_from or datetime.strptime(today_utc, "%Y-%m-%d").date().replace(day=1).isoformat()
 
     build_no = latest_scheduled_nightly_number(token)
     build_url = f"https://api.buildkite.com/v2/organizations/{ORG}/pipelines/{PIPELINE}/builds/{build_no}"
@@ -1143,7 +1157,8 @@ def main() -> None:
     out_path = args.out
     if out_path is None:
         ext = ".html" if args.format == "html" else ".md"
-        out_path = skill_dir / f"vllm-omni-test-report-{today_utc}{ext}"
+        base = release_report_basename(report_date)
+        out_path = skill_dir / (base.replace(".html", ext) if ext == ".md" else base)
     else:
         out_path = Path(args.out)
 
