@@ -16,28 +16,22 @@ connectors:
       codec_left_context_frames: 50
       initial_codec_chunk_frames: 100
 
-stage_args:
+stages:
   - stage_id: 0
-    runtime:
-      devices: "0"
-    engine_args:
-      model_stage: miso_tts
-      max_num_seqs: 2
-      model_arch: MisoTTSTalkerForConditionalGeneration
-      worker_type: ar
-      gpu_memory_utilization: 0.85
-      enforce_eager: true
-      enable_prefix_caching: false
-      max_num_batched_tokens: 512
-      max_model_len: 2048
-      skip_mm_profiling: true
-      trust_remote_code: true
-      # The HF repo tokenizer is invalid; use Llama 3.2 1B tokenizer for request parsing.
-      tokenizer: meta-llama/Llama-3.2-1B
-      hf_overrides:
-        model_type: miso_tts
-        architectures:
-          - MisoTTSTalkerForConditionalGeneration
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.85
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 512
+    max_model_len: 2048
+    devices: "0"
+    skip_mm_profiling: true
+    # The HF repo tokenizer is invalid; use Llama 3.2 1B tokenizer for request parsing.
+    tokenizer: meta-llama/Llama-3.2-1B
+    hf_overrides:
+      model_type: miso_tts
+      architectures:
+        - MisoTTSTalkerForConditionalGeneration
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -48,29 +42,21 @@ stage_args:
       detokenize: false
 
   - stage_id: 1
-    runtime:
-      devices: "0"
-    engine_args:
-      model_stage: mimi
-      max_num_seqs: 4
-      model_arch: MisoTTSMimiDecoder
-      worker_type: generation
-      gpu_memory_utilization: 0.15
-      enforce_eager: true
-      enable_prefix_caching: false
-      max_num_batched_tokens: 65536
-      max_model_len: 65536
-      skip_mm_profiling: true
-      skip_tokenizer_init: true
-      trust_remote_code: true
-      hf_overrides:
-        model_type: miso_tts
-        architectures:
-          - MisoTTSMimiDecoder
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    skip_mm_profiling: true
+    skip_tokenizer_init: true
     input_connectors:
       from_stage_0: connector_of_shared_memory
-    final_output: true
-    final_output_type: audio
+    hf_overrides:
+      model_type: miso_tts
+      architectures:
+        - MisoTTSMimiDecoder
     default_sampling_params:
       temperature: 0.0
       top_k: -1
