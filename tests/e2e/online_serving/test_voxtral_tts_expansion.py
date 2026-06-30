@@ -56,6 +56,7 @@ def test_speech_english_streaming(omni_server, openai_client) -> None:
             "voice": "casual_female",
             "language": "English",
             "stream": True,
+            "stream_format": "audio",
             "response_format": "pcm",
             "timeout": 120.0,
             "min_audio_bytes": _MIN_AUDIO_BYTES_BASIC,

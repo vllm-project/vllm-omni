@@ -122,8 +122,8 @@ Content-Type: application/json
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
-| `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. Omit (null) for a single non-streaming binary response. See [Response Format](#response-format). |
-| `stream` | bool | false | Legacy streaming switch, equivalent to `stream_format="audio"`. Requires `response_format="pcm"` or `"wav"`. Speed adjustment is not supported when streaming. |
+| `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
+| `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
@@ -143,18 +143,15 @@ The response shape depends on the streaming parameters:
 complete clip as binary audio data with an appropriate `Content-Type` header (e.g.
 `audio/wav`). The raw-bytes body has no JSON carrier, so no `usage` is reported.
 
-**Raw audio stream** (`stream=true` or `stream_format="audio"`). Streams raw
-audio bytes (PCM or WAV) as they are decoded.
+**Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
+WAV) as they are decoded.
 
 Both streaming modes (`stream_format="audio"` and `"sse"`) require
 `response_format="pcm"` or `"wav"`, and `speed` must be `1.0` (or omitted).
 
-**SSE stream** (`stream_format="sse"`). Streams [OpenAI `speech.audio.*` Server-Sent
-Events](https://platform.openai.com/docs/api-reference/audio-streaming). Set
-`stream_format="sse"` and leave the legacy `stream` unset: `stream=true` takes
-precedence and forces the raw-audio path, so the response would be audio bytes with
-no `speech.audio.*` events (and no terminal `usage`). Each event has an `event:`
-line and a JSON `data:` line:
+**SSE stream** (`stream=true` or `stream_format="sse"`). Streams [OpenAI
+`speech.audio.*` Server-Sent Events](https://platform.openai.com/docs/api-reference/audio-streaming).
+Each event has an `event:` line and a JSON `data:` line:
 
 - `speech.audio.delta` — a base64 audio chunk:
 

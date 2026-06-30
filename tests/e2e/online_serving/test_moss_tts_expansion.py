@@ -137,6 +137,7 @@ def test_text_to_audio_002_streaming(omni_server, openai_client, ref_audio_data_
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
         "response_format": "pcm",
         "ref_audio": ref_audio_data_url,
         "min_hnr_db": -5.0,

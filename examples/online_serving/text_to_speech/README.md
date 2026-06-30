@@ -79,7 +79,7 @@ response = client.audio.speech.create(
 response.stream_to_file("output.wav")
 ```
 
-Streaming PCM output (where supported) — set `stream=true` with `response_format="pcm"`:
+Streaming PCM output (where supported) — set `stream=true`, `stream_format="audio"`, and `response_format="pcm"`:
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -88,6 +88,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "input": "Hello, how are you?",
         "voice": "default",
         "stream": true,
+        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
@@ -363,6 +364,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         \"input\": \"Hello, streaming output from MOSS-TTS-Nano.\",
         \"ref_audio\": \"data:audio/wav;base64,${REF_AUDIO}\",
         \"stream\": true,
+        \"stream_format\": \"audio\",
         \"response_format\": \"pcm\"
     }" --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
 ```
@@ -528,10 +530,11 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "voice": "vivian",
         "language": "English",
         "stream": true,
+        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
-Streaming requires `response_format="pcm"` and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
+Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
 
 ### Streaming WebSocket
 The `/v1/audio/speech/stream` endpoint accepts text incrementally, splits it at sentence boundaries, and emits one PCM stream per sentence:
@@ -632,7 +635,7 @@ After startup, `/v1/audio/voices` lists `alice`, and `/v1/audio/speech` can use 
 ```bash
 python voxcpm2/gradio_demo.py
 ```
-Uses an AudioWorklet-based player adapted from the Qwen3-TTS demo for gap-free playback. Audio is streamed from the OpenAI Speech endpoint with `stream=true`.
+Uses an AudioWorklet-based player adapted from the Qwen3-TTS demo for gap-free playback. Raw PCM audio is streamed from the OpenAI Speech endpoint with `stream=true` and `stream_format="audio"`.
 
 ---
 
