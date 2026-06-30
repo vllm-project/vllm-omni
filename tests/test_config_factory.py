@@ -1564,6 +1564,38 @@ class TestAuraOmniDeploy:
 
         assert deploy.pipeline == "aura_omni"
 
+    @pytest.mark.parametrize(
+        ("model_type", "deploy_name", "expected_model_stage"),
+        [
+            ("qwen3_asr", "aura_asr_service.yaml", "asr"),
+            ("qwen3_vl", "aura_vl_service.yaml", "aura"),
+        ],
+    )
+    def test_aura_split_deploy_pipeline_overrides_unregistered_model_type(
+        self,
+        model_type,
+        deploy_name,
+        expected_model_stage,
+    ):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / deploy_name
+
+        class FakeConfig(PretrainedConfig):
+            pass
+
+        hf_config = FakeConfig()
+        hf_config.model_type = model_type
+
+        with patch("vllm_omni.config.config_factory.get_config", return_value=hf_config):
+            stages = StageConfigFactory.create_from_model(
+                "fake/model",
+                deploy_config_path=str(deploy_path),
+            )
+
+        assert stages is not None
+        assert len(stages) == 1
+        assert stages[0].model_stage == expected_model_stage
+        assert stages[0].stage_type == StageType.LLM
+
     def test_aura_omni_deploy_resolves_four_native_stages(self):
         pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni")
 
@@ -1586,6 +1618,45 @@ class TestAuraOmniDeploy:
         assert stages[1].yaml_engine_args["model_arch"] == "AuraQwen3VLForConditionalGeneration"
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
+
+    @pytest.mark.parametrize(
+        ("deploy_name", "expected_model_stage", "expected_model_arch"),
+        [
+            ("aura_asr_service.yaml", "asr", "Qwen3ASRForConditionalGeneration"),
+            ("aura_vl_service.yaml", "aura", "AuraQwen3VLForConditionalGeneration"),
+        ],
+    )
+    def test_aura_split_single_stage_deploys(self, deploy_name, expected_model_stage, expected_model_arch):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / deploy_name
+        pipeline_cfg = StageConfigFactory.resolve_pipeline_config("qwen3_tts")
+        stages = StageConfigFactory._create_from_registry(
+            "qwen3_tts",
+            pipeline_cfg,
+            cli_overrides={},
+            deploy_config_path=str(deploy_path),
+        )
+
+        assert len(stages) == 1
+        assert stages[0].model_stage == expected_model_stage
+        assert stages[0].final_output is True
+        assert stages[0].final_output_type == "text"
+        assert stages[0].yaml_engine_args["model_arch"] == expected_model_arch
+
+    def test_aura_split_tts_deploy_keeps_async_chunk(self):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_tts_service.yaml"
+        pipeline_cfg = StageConfigFactory.resolve_pipeline_config("qwen3_tts")
+        stages = StageConfigFactory._create_from_registry(
+            "qwen3_tts",
+            pipeline_cfg,
+            cli_overrides={},
+            deploy_config_path=str(deploy_path),
+        )
+
+        assert [stage.model_stage for stage in stages] == ["qwen3_tts", "code2wav"]
+        assert stages[0].yaml_engine_args["async_chunk"] is True
+        assert (
+            stages[0].yaml_engine_args["custom_process_next_stage_input_func"].endswith("talker2code2wav_async_chunk")
+        )
 
 
 class TestSentinelDefaultPrecedence:

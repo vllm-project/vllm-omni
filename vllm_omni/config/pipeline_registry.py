@@ -33,7 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
-from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
+from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_ASR_PIPELINE, AURA_OMNI_PIPELINE, AURA_VL_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
     BAGEL_SINGLE_STAGE_PIPELINE,
@@ -90,6 +90,8 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
+    "aura_asr": AURA_ASR_PIPELINE,
+    "aura_vl": AURA_VL_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,

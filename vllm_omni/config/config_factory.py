@@ -73,6 +73,25 @@ class StageConfigFactory:
             if _looks_like_dreamzero(model):
                 model_type = "dreamzero"
 
+        if deploy_config_path is not None:
+            deploy_path = Path(deploy_config_path)
+            if deploy_path.exists():
+                deploy_cfg = load_deploy_config(deploy_path)
+                if deploy_cfg.pipeline:
+                    pipeline_cfg = cls.resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
+                    if pipeline_cfg is None:
+                        raise KeyError(
+                            f"Pipeline {deploy_cfg.pipeline!r} from {deploy_path.name!r} "
+                            f"not found in OMNI_PIPELINES. Available: "
+                            f"{sorted(OMNI_PIPELINES.keys())}"
+                        )
+                    return cls._create_from_registry(
+                        deploy_cfg.pipeline,
+                        pipeline_cfg,
+                        cli_overrides,
+                        deploy_config_path,
+                    )
+
         if model_type and model_type in OMNI_PIPELINES:
             pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
             if pipeline_cfg is not None:

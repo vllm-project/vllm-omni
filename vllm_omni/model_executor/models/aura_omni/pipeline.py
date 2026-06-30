@@ -82,3 +82,46 @@ AURA_OMNI_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+AURA_ASR_PIPELINE = PipelineConfig(
+    model_type="aura_asr",
+    model_arch="Qwen3ASRForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="asr",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="text",
+            model_arch="Qwen3ASRForConditionalGeneration",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
+
+AURA_VL_PIPELINE = PipelineConfig(
+    model_type="aura_vl",
+    model_arch="AuraQwen3VLForConditionalGeneration",
+    hf_architectures=("AuraQwen3VLForConditionalGeneration",),
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="aura",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="text",
+            model_arch="AuraQwen3VLForConditionalGeneration",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)

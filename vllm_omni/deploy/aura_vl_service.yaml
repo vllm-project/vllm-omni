@@ -1,0 +1,19 @@
+pipeline: aura_vl
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.6
+    trust_remote_code: true
+    enable_prefix_caching: true
+    async_scheduling: true
+    max_model_len: 262144
+    max_num_batched_tokens: 15360
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.5
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+      repetition_penalty: 1.0
