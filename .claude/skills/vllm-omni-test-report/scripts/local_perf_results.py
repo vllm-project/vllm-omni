@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 
 def default_nightly_log_dir(repo_root: Path) -> Path:
@@ -23,7 +24,9 @@ _LOCAL_PERF_STEM_PREFIXES = (
     "result_test_",
     "result_",
 )
-_TIMESTAMP_SUFFIX_RE = re.compile(r"_\d{8}[-_]\d{6}$")
+_TIMESTAMP_SUFFIX_RE = re.compile(r"_(\d{8})[-_]\d{6}$")
+_NIGHTLY_JOBS_RUN_DIR_RE = re.compile(r"^nightly_jobs_(\d{8})(?:-\d{6})?$", re.I)
+NIGHTLY_JOBS_SOURCE_MARKER = ".nightly_jobs_source"
 _JSON_TEST_FIELDS = (
     "test_name",
     "test",
@@ -84,6 +87,86 @@ def test_key_from_perf_filename(filename: str) -> str:
     return _TIMESTAMP_SUFFIX_RE.sub("", stem)
 
 
+def _yyyymmdd_from_nightly_jobs_basename(name: str) -> str | None:
+    match = _NIGHTLY_JOBS_RUN_DIR_RE.match((name or "").strip())
+    return match.group(1) if match else None
+
+
+def _read_nightly_jobs_source_marker(marker_path: Path) -> str | None:
+    if not marker_path.is_file():
+        return None
+    try:
+        text = marker_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        day = _yyyymmdd_from_nightly_jobs_basename(line.strip())
+        if day:
+            return day
+    return None
+
+
+def _yyyymmdd_from_perf_filenames(result_dir: Path) -> str | None:
+    dates: list[str] = []
+    for path in local_perf_result_files(result_dir):
+        match = _TIMESTAMP_SUFFIX_RE.search(path.stem)
+        if match:
+            dates.append(match.group(1))
+    return max(dates) if dates else None
+
+
+def infer_nightly_run_date_yyyymmdd(log_dir: Path) -> str | None:
+    """Infer ``YYYYMMDD`` from synced ``nightly_jobs_*`` source, not prep execution time."""
+    log_dir = log_dir.resolve()
+    for marker in (
+        log_dir / NIGHTLY_JOBS_SOURCE_MARKER,
+        log_dir.parent / NIGHTLY_JOBS_SOURCE_MARKER,
+    ):
+        day = _read_nightly_jobs_source_marker(marker)
+        if day:
+            return day
+
+    day = _yyyymmdd_from_nightly_jobs_basename(log_dir.name)
+    if day:
+        return day
+
+    resolved = resolve_local_perf_result_dir(log_dir)
+    if resolved is not None:
+        day = _yyyymmdd_from_perf_filenames(resolved)
+        if day:
+            return day
+    return _yyyymmdd_from_perf_filenames(log_dir)
+
+
+def _add_test_key_variants(keys: set[str], raw: str) -> None:
+    text = str(raw).strip()
+    if not text:
+        return
+    keys.add(text)
+    keys.add(Path(text).stem)
+
+
+def _test_keys_from_json_obj(obj: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for field in _JSON_TEST_FIELDS:
+        val = obj.get(field)
+        if val:
+            _add_test_key_variants(keys, str(val))
+    return keys
+
+
+def _test_keys_from_json_payload(payload: Any) -> set[str]:
+    """Collect test keys from dict payloads and diffusion aggregated JSON arrays."""
+    keys: set[str] = set()
+    if isinstance(payload, dict):
+        keys.update(_test_keys_from_json_obj(payload))
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                keys.update(_test_keys_from_json_obj(item))
+    return keys
+
+
 def test_keys_from_perf_file(path: Path) -> set[str]:
     keys: set[str] = set()
     base = test_key_from_perf_filename(path.name)
@@ -92,16 +175,8 @@ def test_keys_from_perf_file(path: Path) -> set[str]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return keys
-    if not isinstance(payload, dict):
-        return keys
-    for field in _JSON_TEST_FIELDS:
-        val = payload.get(field)
-        if val:
-            text = str(val).strip()
-            if text:
-                keys.add(text)
-                keys.add(Path(text).stem)
+        return {k for k in keys if k}
+    keys.update(_test_keys_from_json_payload(payload))
     return {k for k in keys if k}
 
 

@@ -43,7 +43,7 @@ docs/assets/test_reports/
 
 | Report kind | **Commit these paths** | Do **not** commit |
 |-------------|------------------------|-------------------|
-| **nightly** | `data/nightly_test_report/nightly-report-buildkite-latest-YYYY-MM-DD.html` **+** optional `data/local_nightly_raw/manual_YYYYMMDD/` (or `manual_YYYYMMDD_HHMMSS/`) when created by [prepare_kanban_before_report.py](../scripts/prepare_kanban_before_report.py) | `docs/assets/test_reports/**`, `data/local_nightly_raw/.last_manual_dir` |
+| **nightly** | `data/nightly_test_report/nightly-report-buildkite-latest-YYYY-MM-DD.html` **+** optional `data/local_nightly_raw/manual_YYYYMMDD/` when created by [prepare_kanban_before_report.py](../scripts/prepare_kanban_before_report.py) | `docs/assets/test_reports/**`, `data/local_nightly_raw/.last_manual_dir` |
 | **release** | `data/release_test_report/vllm-omni-release-test-report-YYYY-MM-DD.html` (+ same `manual_*` if you ran nightly prep and want raw archived) | `docs/assets/test_reports/**` |
 
 Kanban **MkDocs** (`mkdocs serve` / `mkdocs build`) runs `scripts/mkdocs_hooks.py` → `scripts/sync_test_reports.py`, which **locally** copies `data/*_test_report/` into `docs/assets/test_reports/` for the Reports page ([docs/reports.md](https://github.com/hsliuustc0106/vllm-omni-kanban/blob/main/docs/reports.md)). That output is gitignored and regenerated at build time — **do not** `git add` it during archive push.

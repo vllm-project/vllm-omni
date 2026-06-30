@@ -160,7 +160,8 @@ if [[ -d "$REPO_ROOT/logs/nightly_jobs" ]]; then
   rm -rf "$REPO_ROOT/logs/nightly_jobs"
 fi
 mv "$LATEST_LOCAL" "$REPO_ROOT/logs/nightly_jobs"
-echo "Synced to: $REPO_ROOT/logs/nightly_jobs"
+echo "$(basename "$LATEST_LOCAL")" > "$REPO_ROOT/logs/nightly_jobs/.nightly_jobs_source"
+echo "Synced to: $REPO_ROOT/logs/nightly_jobs (source: $(cat "$REPO_ROOT/logs/nightly_jobs/.nightly_jobs_source"))"
 ```
 
 Job logs and perf JSON (wherever they sit under the run dir) remain under **`$REPO_ROOT/logs/nightly_jobs`**. Report scripts scan that tree recursively.

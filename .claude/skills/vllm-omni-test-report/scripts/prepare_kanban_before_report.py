@@ -5,8 +5,10 @@ Prepare the vllm-omni-kanban checkout before generating a nightly/release HTML r
 Workflow (run from ``skills/vllm-omni-test-report/`` after log sync):
 
 1. ``git pull --rebase`` on the local https://github.com/hsliuustc0106/vllm-omni-kanban clone.
-2. When ``$REPO_ROOT/logs/nightly_jobs`` contains perf JSON, create a new
-   ``data/local_nightly_raw/manual_<suffix>/`` directory, copy result JSON, and copy
+2. When ``$REPO_ROOT/logs/nightly_jobs`` contains perf JSON, sync into
+   ``data/local_nightly_raw/manual_YYYYMMDD/`` (``YYYYMMDD`` from synced ``nightly_jobs_*`` run date,
+   not prep execution time; re-sync replaces same-day dir):
+   copy result JSON and
    ``logs/nightly_jobs/local_pytest_hunyuan_image.log`` (or ``test_hunyuan_image3.log``) as
    ``test_hunyuan_image3.log``.
 3. ``mkdocs build`` in the kanban repo (``mkdocs_hooks`` → sync + ``generate_charts``)
@@ -22,7 +24,6 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
 from kanban_local_nightly_raw import (
@@ -41,8 +42,10 @@ from laptop_path_defaults import (
     resolve_laptop_repo_root,
 )
 from local_perf_results import (
+    NIGHTLY_JOBS_SOURCE_MARKER,
     PERF_JSON_GLOBS,
     default_nightly_log_dir,
+    infer_nightly_run_date_yyyymmdd,
     local_perf_result_files,
     resolve_local_perf_result_dir,
 )
@@ -98,28 +101,25 @@ def pull_kanban_repo(
     return branch
 
 
-def allocate_manual_dir(raw_root: Path, now: datetime | None = None) -> Path:
-    """Return ``manual_YYYYMMDD`` or ``manual_YYYYMMDD_HHMMSS`` when the day slot exists."""
-    now = now or datetime.now()
+def allocate_manual_dir(raw_root: Path, *, day_yyyymmdd: str | None = None) -> Path:
+    """Return ``manual_YYYYMMDD`` using the synced nightly run date when available."""
+    if not day_yyyymmdd:
+        raise ValueError("day_yyyymmdd is required (infer from synced nightly_jobs_* before calling)")
     raw_root.mkdir(parents=True, exist_ok=True)
-    base = f"manual_{now.strftime('%Y%m%d')}"
-    candidate = raw_root / base
-    if not candidate.exists():
-        return candidate
-    suffix = now.strftime("%H%M%S")
-    alt = raw_root / f"{base}_{suffix}"
-    counter = 1
-    while alt.exists():
-        alt = raw_root / f"{base}_{suffix}_{counter}"
-        counter += 1
-    return alt
+    return raw_root / f"manual_{day_yyyymmdd}"
+
+
+def _reset_manual_dir(manual_dir: Path) -> None:
+    """Ensure ``manual_dir`` exists empty (same-day re-sync replaces prior contents)."""
+    if manual_dir.exists():
+        shutil.rmtree(manual_dir)
+    manual_dir.mkdir(parents=True, exist_ok=True)
 
 
 def sync_local_nightly_raw(
     kanban_repo: Path,
     *,
     log_dir: Path,
-    now: datetime | None = None,
 ) -> tuple[Path | None, list[str], list[str], list[str]]:
     """Copy perf JSON + job logs from ``log_dir`` into a new ``manual_*`` directory under kanban."""
     notes: list[str] = []
@@ -135,8 +135,17 @@ def sync_local_nightly_raw(
         return None, [], [], notes
 
     raw_root = (kanban_repo / LOCAL_NIGHTLY_RAW).resolve()
-    manual_dir = allocate_manual_dir(raw_root, now=now)
-    manual_dir.mkdir(parents=True, exist_ok=False)
+    run_day = infer_nightly_run_date_yyyymmdd(log_dir)
+    if not run_day:
+        notes.append(
+            f"Could not infer nightly run date from {log_dir} "
+            f"(expected {NIGHTLY_JOBS_SOURCE_MARKER} or nightly_jobs_YYYYMMDD-* name); skipped manual_* sync."
+        )
+        return None, [], [], notes
+
+    manual_dir = allocate_manual_dir(raw_root, day_yyyymmdd=run_day)
+    notes.append(f"manual_* date from synced log run: {run_day} → {manual_dir.name}")
+    _reset_manual_dir(manual_dir)
 
     perf_copied: list[str] = []
     used_names: set[str] = set()
@@ -206,7 +215,6 @@ def prepare_kanban_before_report(
     skip_pull: bool = False,
     skip_manual_sync: bool = False,
     skip_mkdocs: bool = False,
-    now: datetime | None = None,
 ) -> PrepareResult:
     kanban_repo = kanban_repo.resolve()
     notes: list[str] = []
@@ -230,7 +238,6 @@ def prepare_kanban_before_report(
             manual_dir, perf_copied, log_copied, sync_notes = sync_local_nightly_raw(
                 kanban_repo,
                 log_dir=job_log_dir,
-                now=now,
             )
             notes.extend(sync_notes)
             if manual_dir is not None:

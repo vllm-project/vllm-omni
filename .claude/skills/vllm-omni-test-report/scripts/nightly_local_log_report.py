@@ -1458,7 +1458,7 @@ def _daily_focus_data(
     kanban_cfg: KanbanAssetsConfig,
     log_dir: Path,
 ) -> dict[str, Any]:
-    bk_perf_summary, _ = _buildkite_perf_rows(kanban_cfg)
+    bk_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir, exclude_local_overlap=True)
     local_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
     focus_items = _focus_perf_items(bk_perf_summary, local_perf_summary)
     focus_kind, top_items = _select_focus_perf_items(focus_items)
@@ -1736,10 +1736,58 @@ def _filter_perf_summary_for_local(
     return out
 
 
+def _recompute_perf_summary_stats(rows: list[dict[str, Any]]) -> dict[str, int]:
+    stats = {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
+    for row in rows:
+        st = str(row.get("status") or "n/a")
+        stats[st] = stats.get(st, 0) + 1
+    return stats
+
+
+def _filter_perf_summary_exclude_local_overlap(
+    summary: dict[str, Any],
+    *,
+    log_dir: Path,
+    local_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Drop Buildkite rows for tests already covered in Local performance baseline comparison."""
+    if local_summary.get("status") != "ok" or not local_summary.get("rows"):
+        return summary
+
+    resolved_dir = resolve_local_perf_result_dir(log_dir.resolve())
+    local_keys = collect_local_perf_test_keys(resolved_dir)
+    if not local_keys:
+        return summary
+
+    original_rows = [row for row in summary.get("rows", []) if isinstance(row, dict)]
+    filtered = [row for row in original_rows if not perf_row_matches_local_test(row, local_keys)]
+    excluded = len(original_rows) - len(filtered)
+
+    out = dict(summary)
+    out["rows"] = filtered
+    out["summary"] = _recompute_perf_summary_stats(filtered)
+    if filtered:
+        out["status"] = "ok"
+        out["message"] = ""
+    else:
+        out["status"] = "empty"
+        out["message"] = "No Buildkite-only baseline rows; cases with local perf JSON are shown under Local Test only."
+    out["buildkite_perf_scope"] = {
+        "excluded_local_overlap": excluded,
+        "local_test_key_count": len(local_keys),
+        "message": (
+            f"Excluded {excluded} row(s) already shown under Local performance baseline comparison "
+            f"({len(local_keys)} local test key(s))."
+        ),
+    }
+    return out
+
+
 def _buildkite_perf_rows(
     kanban_cfg: KanbanAssetsConfig,
     *,
     log_dir: Path | None = None,
+    exclude_local_overlap: bool = False,
 ) -> tuple[dict[str, Any], dict[str, list[list[str]]]]:
     summary = build_assets_perf_summary(
         assets_dir=kanban_cfg.assets_dir,
@@ -1754,7 +1802,16 @@ def _buildkite_perf_rows(
     if summary.get("status") != "ok" or kanban_cfg.refresh_warnings:
         summary["raw_fallback"] = _kanban_raw_assets_diagnostic(kanban_cfg, summary)
     if log_dir is not None:
-        summary = _filter_perf_summary_for_local(summary, log_dir=log_dir)
+        local_summary = _filter_perf_summary_for_local(summary, log_dir=log_dir)
+        if exclude_local_overlap:
+            if local_summary.get("rows"):
+                summary = _filter_perf_summary_exclude_local_overlap(
+                    summary,
+                    log_dir=log_dir,
+                    local_summary=local_summary,
+                )
+        else:
+            summary = local_summary
     grouped_rows = _grouped_rows_from_summary(summary)
     return summary, grouped_rows
 
@@ -1819,10 +1876,12 @@ def _render_buildkite_perf_inner_html(
     *,
     model_subcard_class: str = "report-subcard--bk-perf-model",
     log_dir: Path | None = None,
+    exclude_local_overlap: bool = False,
 ) -> str:
     summary, grouped_rows = _buildkite_perf_rows(
         kanban_cfg,
         log_dir=log_dir,
+        exclude_local_overlap=exclude_local_overlap,
     )
     parts: list[str] = [
         '<p class="meta"><strong>Data source:</strong> '
@@ -1836,6 +1895,9 @@ def _render_buildkite_perf_inner_html(
                 '<p class="meta"><strong>Perf JSON:</strong> '
                 f"<code>{html.escape(str(local_scope['resolved_dir']))}</code></p>"
             )
+    bk_scope = summary.get("buildkite_perf_scope") or {}
+    if bk_scope.get("message"):
+        parts.append(f'<p class="meta"><strong>Buildkite filter:</strong> {html.escape(str(bk_scope["message"]))}</p>')
     history = summary.get("history") or {}
     if history:
         file_count = len(history.get("files") or [])
@@ -1866,10 +1928,14 @@ def _render_buildkite_perf_inner_html(
         '<p class="hint">'
         + (
             "Showing baseline comparison in kanban history only for cases with perf JSON under logs/nightly_jobs."
-            if log_dir is not None
+            if log_dir is not None and not exclude_local_overlap
             else (
-                f"Showing latest day ({html.escape(str(summary.get('latest_day') or 'N/A'))}) "
-                f"model records that include a baseline."
+                "Showing Buildkite-only baseline rows; cases with local perf JSON appear under Local Test only."
+                if exclude_local_overlap
+                else (
+                    f"Showing latest day ({html.escape(str(summary.get('latest_day') or 'N/A'))}) "
+                    f"model records that include a baseline."
+                )
             )
         )
         + "</p>"
@@ -1913,6 +1979,12 @@ def _append_buildkite_perf_markdown(
     lines: list[str], summary: dict[str, Any], grouped_rows: dict[str, list[list[str]]]
 ) -> None:
     lines.append(f"- **Data source:** `{summary.get('assets_dir') or ''}`")
+    local_scope = summary.get("local_perf_scope") or {}
+    if local_scope.get("message"):
+        lines.append(f"- **Local filter:** {_md_cell(str(local_scope['message']))}")
+    bk_scope = summary.get("buildkite_perf_scope") or {}
+    if bk_scope.get("message"):
+        lines.append(f"- **Buildkite filter:** {_md_cell(str(bk_scope['message']))}")
     history = summary.get("history") or {}
     if history:
         lines.append(
@@ -1957,6 +2029,8 @@ def _append_buildkite_markdown(
     bk_jobs: list[dict[str, Any]] | None,
     bk_note: str | None,
     kanban_cfg: KanbanAssetsConfig,
+    *,
+    log_dir: Path | None = None,
 ) -> None:
     lines.append("## Buildkite: latest scheduled nightly (main)")
     lines.append("")
@@ -1965,7 +2039,11 @@ def _append_buildkite_markdown(
         lines.append("")
         lines.append("### Performance baseline comparison")
         lines.append("")
-        summary, grouped_rows = _buildkite_perf_rows(kanban_cfg)
+        summary, grouped_rows = _buildkite_perf_rows(
+            kanban_cfg,
+            log_dir=log_dir,
+            exclude_local_overlap=log_dir is not None,
+        )
         _append_buildkite_perf_markdown(lines, summary, grouped_rows)
         return
     if not bk_build or bk_jobs is None:
@@ -1973,7 +2051,11 @@ def _append_buildkite_markdown(
         lines.append("")
         lines.append("### Performance baseline comparison")
         lines.append("")
-        summary, grouped_rows = _buildkite_perf_rows(kanban_cfg)
+        summary, grouped_rows = _buildkite_perf_rows(
+            kanban_cfg,
+            log_dir=log_dir,
+            exclude_local_overlap=log_dir is not None,
+        )
         _append_buildkite_perf_markdown(lines, summary, grouped_rows)
         return
     bn = int(bk_build["number"])
@@ -1997,7 +2079,11 @@ def _append_buildkite_markdown(
     lines.append("")
     lines.append("### Performance baseline comparison")
     lines.append("")
-    summary, grouped_rows = _buildkite_perf_rows(kanban_cfg)
+    summary, grouped_rows = _buildkite_perf_rows(
+        kanban_cfg,
+        log_dir=log_dir,
+        exclude_local_overlap=log_dir is not None,
+    )
     _append_buildkite_perf_markdown(lines, summary, grouped_rows)
     for rec in bk_jobs:
         info = rec.get("info")
@@ -2085,7 +2171,7 @@ def emit_report(
         ),
     )
 
-    _append_buildkite_markdown(lines, bk_build, bk_jobs, bk_note, kanban_cfg)
+    _append_buildkite_markdown(lines, bk_build, bk_jobs, bk_note, kanban_cfg, log_dir=log_dir)
 
     lines.append("## Local cluster (nightly_jobs)")
     lines.append("")
@@ -2324,6 +2410,7 @@ def _render_buildkite_section_html(
     *,
     note: str | None,
     kanban_cfg: KanbanAssetsConfig,
+    log_dir: Path | None = None,
 ) -> str:
     summary_inner: list[str] = []
     fail_inner = '<p class="note">No data: Buildkite step logs were not loaded.</p>'
@@ -2440,7 +2527,11 @@ def _render_buildkite_section_html(
             ),
             _details_subcard(
                 "Performance baseline comparison",
-                _render_buildkite_perf_inner_html(kanban_cfg),
+                _render_buildkite_perf_inner_html(
+                    kanban_cfg,
+                    log_dir=log_dir,
+                    exclude_local_overlap=log_dir is not None,
+                ),
                 open_default=False,
                 details_class="report-subcard--bk-perf",
                 icon_paths=_SVG_CHART_BARS,
@@ -2538,6 +2629,7 @@ def emit_report_html(
             bk_jobs,
             note=bk_note,
             kanban_cfg=kanban_cfg,
+            log_dir=log_dir,
         )
     )
 

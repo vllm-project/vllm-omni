@@ -26,9 +26,10 @@ The script runs this via **`gh auth git-credential`** (same as report archive pu
 
 **When** `$REPO_ROOT/logs/nightly_jobs` contains perf JSON (`result_test_*.json`, `diffusion_result_*.json`, `benchmark_results_*.json` — scanned recursively, including under **`results/`** if present):
 
-1. Create a **new** directory under **`$KANBAN_REPO_ROOT/data/local_nightly_raw/`**:
-   - Name: **`manual_YYYYMMDD`**
-   - If that name already exists: **`manual_YYYYMMDD_HHMMSS`** (or with numeric suffix)
+1. Sync into **`$KANBAN_REPO_ROOT/data/local_nightly_raw/manual_YYYYMMDD/`**:
+   - **`YYYYMMDD`** comes from the synced **`nightly_jobs_*`** run (see **`logs/nightly_jobs/.nightly_jobs_source`** written at fetch time), **not** from when you run prep on the laptop
+   - Name is always **`manual_YYYYMMDD`** (no time suffix)
+   - If that directory already exists for the same run date, it is **cleared and repopulated**
 2. Copy into it:
    - All matching perf JSON from **`$REPO_ROOT/logs/nightly_jobs`** (flat copy, original basenames — unchanged)
    - **Only** one Hunyuan Image job log from **`$REPO_ROOT/logs/nightly_jobs`** → **`test_hunyuan_image3.log`**:

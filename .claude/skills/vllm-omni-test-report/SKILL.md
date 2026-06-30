@@ -28,6 +28,8 @@ description: Two report kinds; **default output is always HTML** unless the user
 
 Shared helpers live in `scripts/report_naming.py`. `push_report_to_kanban.py` archives non-canonical filenames under **today UTC** unless `--date` is set.
 
+**Exception — kanban `manual_*`:** `prepare_kanban_before_report.py` names `data/local_nightly_raw/manual_YYYYMMDD/` from the **synced nightly run date** (`logs/nightly_jobs/.nightly_jobs_source` or perf JSON timestamps), not laptop execution time. See [kanban-pre-report-prep.md](references/kanban-pre-report-prep.md).
+
 ## Agent Quick Path
 
 **Laptop path defaults (required before sync / prep / report):** Before log sync, kanban prep, or nightly HTML on the **laptop**, show and confirm local **`REPO_ROOT`** (`~/vllm-omni`) and **`KANBAN_REPO_ROOT`** (`~/vllm-omni-kanban`) — see [references/confirm-laptop-path-defaults.md](references/confirm-laptop-path-defaults.md). Wait for user **confirm / use defaults** or custom paths before proceeding. (Cluster **`REPO_ROOT`** `/rebase/vllm-omni` is confirmed separately via [vllm-omni-local-test](../vllm-omni-local-test/SKILL.md).)
@@ -130,7 +132,7 @@ python scripts/compose_full_report.py \
 
 **Daily focus summary:** Nightly HTML and Markdown place **今日重点** immediately after the title. It summarizes Buildkite / Local job failures and lists all baseline-backed performance regressions whose normalized `Status` is `fail` across Buildkite and Local; the HTML table supports Model checkbox filtering. A **major performance regression** is any baseline comparison row whose normalized `Status` is `fail` (current threshold: worse than baseline by more than 6%, using metric direction from `kanban_assets_perf_summary.py`). If there are no `fail` rows, the summary may show the worst `normal` rows as observation items; if baseline data is missing, it reports that explicitly instead of guessing.
 
-**Performance baseline comparison (Local + Buildkite):** The Buildkite section reads kanban **`docs/assets/charts/*_history.json`** for all models; the **Local** section reads the same history but **shows only** cases with perf JSON under `$REPO_ROOT/logs/nightly_jobs`. Run **`prepare_kanban_before_report.py`** before generating the report (pull → optional `manual_*` sync → `mkdocs build`).
+**Performance baseline comparison (Local + Buildkite):** The Buildkite section reads kanban **`docs/assets/charts/*_history.json`** but **excludes rows already shown under Local Test** when local perf JSON exists; the **Local** section shows only synced `logs/nightly_jobs` cases. Run **`prepare_kanban_before_report.py`** before generating the report (pull → optional `manual_*` sync → `mkdocs build`).
 
 **Full local logs (HTML):** Each failed local job has a **View full log** button that toggles the concatenated raw log text. If the merged files exceed **2 MiB** (see `FULL_LOG_EMBED_MAX_BYTES` in `scripts/nightly_local_log_report.py`), the report does **not** embed the text and instead lists absolute paths to open locally.
 By default the script also pulls **main** latest **scheduled nightly** from Buildkite (vllm/vllm-omni), downloads each reportable step log, and adds **reason / heuristic analysis / excerpts** for failures (same parsing as local). Set **`BUILDKITE_TOKEN`** or **`BUILDKITE_API_TOKEN`** in the environment; use **`--no-buildkite`** for local-only. Optional **`--buildkite-build N`** to pin a build number.
