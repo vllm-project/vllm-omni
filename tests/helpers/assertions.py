@@ -465,7 +465,15 @@ def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_l
     if "audio" not in modalities:
         return False
     keywords_dict = request_config.get("key_words", {}) or {}
-    if keywords_dict.get("audio") and "text" not in modalities:
+    # When text is not an output modality, the keyword loop validates keywords
+    # against the audio transcript -- for keywords under ANY word_type
+    # (text/image/audio/video), not just "audio". Mirror that here so the
+    # transcript is actually computed; otherwise the loop hits
+    # `assert transcript is not None` with transcript=None (e.g. an audio-only
+    # request carrying key_words={"text": [...]}).
+    if "text" not in modalities and any(
+        keywords_dict.get(word_type) for word_type in ("text", "image", "audio", "video")
+    ):
         return True
     if request_config.get("audio_ref_text"):
         return True
