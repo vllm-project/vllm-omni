@@ -335,3 +335,45 @@ def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
         "cfg_text_scale": 4.0,
         "think": False,
     }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("MammothModa2DiTPipeline") == frozenset(
+        {
+            "text_guidance_scale",
+            "cfg_range",
+            "num_inference_steps",
+        }
+    )
+    assert get_extra_output_params("MammothModa2DiTPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("MammothModa2DiTPipeline") is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammothmoda2_text_to_image_prompt_builder() -> None:
+    # Image dims are converted to the AR grid (width/16 x height/16); the negative
+    # prompt is ignored (MammothModa2 t2i uses CFG, not an explicit negative path).
+    assert build_text_to_image_prompt(
+        "MammothModa2DiTPipeline",
+        prompt="a cat",
+        negative_prompt="blurry",
+        height=512,
+        width=768,
+    ) == {
+        "prompt": (
+            "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
+            "<|im_start|>user\na cat<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<|image start|>48*32<|image token|>"
+        ),
+        "additional_information": {
+            "omni_task": ["t2i"],
+            "ar_width": [48],
+            "ar_height": [32],
+            "image_height": [512],
+            "image_width": [768],
+        },
+    }

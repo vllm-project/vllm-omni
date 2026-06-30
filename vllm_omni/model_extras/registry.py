@@ -34,6 +34,14 @@ from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+    MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+    MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_text_to_image_prompt as build_mammothmoda2_text_to_image_prompt,
+)
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -142,6 +150,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
         "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
+    },
+    "MammothModa2DiTPipeline": {
+        "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_mammothmoda2_text_to_image_prompt,
     },
 }
 

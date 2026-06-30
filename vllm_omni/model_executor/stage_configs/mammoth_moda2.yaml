@@ -36,6 +36,15 @@ stage_args:
       trust_remote_code: true
       engine_output_type: image
       enable_prefix_caching: false
+    # Declares extra_args so has_sampling_extra_args is enabled, routing the t2i knobs
+    # (text_guidance_scale, cfg_range, num_inference_steps) declared in
+    # vllm_omni/model_extras/mammothmodal2_preview.py from extra_body into the DiT
+    # forward. Values here are the defaults applied when a request omits a knob.
+    default_sampling_params:
+      extra_args:
+        text_guidance_scale: 9.0
+        cfg_range: [0.0, 1.0]
+        num_inference_steps: 50
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2dit
     final_output: true
