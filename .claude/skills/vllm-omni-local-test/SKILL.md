@@ -1,6 +1,6 @@
 ---
 name: vllm-omni-local-test
-description: **H200** or **H800** cluster nightly runs — confirm default **`REPO_ROOT`**, **`HF_HOME`**, **`CUDA_VISIBLE_DEVICES`** with user before run; after connect, **`cd "$REPO_ROOT"`** and **ask whether to `git pull`** before cases; then **`source /rebase/.venv/bin/activate`**, `run_nightly_jobs.sh` (optional **`--test-type local`**, **`--label-substr`**, **`--log-dir logs/nightly_jobs_*`**). Defaults: **`REPO_ROOT=/rebase/vllm-omni`**; H200 **`HF_HOME=/models/`**, **`CUDA_VISIBLE_DEVICES=0,1,2,3`**; H800 **`HF_HOME=/home/models/`**, GPU via **`nvidia-smi`** or explicit list. Use when user specifies H200/H800, local nightly jobs, or fetching latest **`nightly_jobs_*`** logs.
+description: **H200** or **H800** cluster nightly runs — confirm default **`REPO_ROOT`**, **`HF_HOME`**, **`CUDA_VISIBLE_DEVICES`** with user before run; after connect, **`cd "$REPO_ROOT"`** and **ask whether to `git pull`** before cases; then **`source /rebase/.venv/bin/activate`**, `run_nightly_jobs.sh` (optional **`--test-type local`**, **`--label-substr`**, **`--log-dir logs/nightly_jobs_*`**). **Log sync scope:** user says **local** → latest **`nightly_jobs_local_*` only**; **default** → latest **`nightly_jobs_local_*` + latest `nightly_jobs_YYYYMMDD-*`**. Defaults: **`REPO_ROOT=/rebase/vllm-omni`**; H200 **`HF_HOME=/models/`**, **`CUDA_VISIBLE_DEVICES=0,1,2,3`**; H800 **`HF_HOME=/home/models/`**, GPU via **`nvidia-smi`** or explicit list. Use when user specifies H200/H800, local nightly jobs, or fetching nightly logs.
 ---
 
 # vLLM-Omni Local Test (cluster run & log sync)
@@ -171,7 +171,9 @@ srun --jobid="$JOBID" --overlap docker exec "$CONTAINER_NAME" bash -lc '
 
 ## 3. Sync logs off-cluster
 
-**H200 and H800 share the same workflow** — [references/nightly-local-log-fetch.md](references/nightly-local-log-fetch.md) **[Log sync workflow](references/nightly-local-log-fetch.md#log-sync-workflow)** (**required:** clear local **`logs/`** → resolve latest remote **`logs/nightly_jobs_*`** → tarball → extract → rename to **`logs/nightly_jobs`** → **`nightly_local_log_report.py`**).
+**H200 and H800 share the same workflow** — [references/nightly-local-log-fetch.md](references/nightly-local-log-fetch.md) **[Log sync workflow](references/nightly-local-log-fetch.md#log-sync-workflow)** (**required:** clear local **`logs/`** → resolve remote run dir(s) per **sync scope** → tarball → extract → **merge** into **`logs/nightly_jobs`** → report).
+
+**Sync scope:** user explicitly asks for **local** logs → **`SYNC_SCOPE=local`** (latest **`nightly_jobs_local_*` only**). **Default** → **`SYNC_SCOPE=default`** (latest **`nightly_jobs_local_*` + latest `nightly_jobs_YYYYMMDD-*`**).
 
 ---
 
@@ -184,7 +186,7 @@ srun --jobid="$JOBID" --overlap docker exec "$CONTAINER_NAME" bash -lc '
 5. **Ask whether to `git pull`** in **`$REPO_ROOT`** for this run ([git pull before run](references/nightly-local-environment.md#git-pull-before-run-confirm-with-user)); run **`git pull`** only after user confirms.
 6. Run **`run_nightly_jobs.sh`** per [Test run mode](#test-run-mode).
 7. **Confirm laptop path defaults** — show **`REPO_ROOT=~/vllm-omni`** and **`KANBAN_REPO_ROOT=~/vllm-omni-kanban`** ([confirm-laptop-path-defaults](../vllm-omni-test-report/references/confirm-laptop-path-defaults.md)); wait for user **confirm / use defaults** or custom paths **before** sync / kanban prep / report.
-8. After the run finishes: **clear local `$REPO_ROOT/logs`**, then sync the **latest** remote **`logs/nightly_jobs_*`** to **`logs/nightly_jobs`** via [Log sync workflow](references/nightly-local-log-fetch.md#log-sync-workflow); run [kanban prep](../vllm-omni-test-report/references/kanban-pre-report-prep.md) **`prepare_kanban_before_report.py`**, then report via **vllm-omni-test-report**.
+8. After the run finishes: **clear local `$REPO_ROOT/logs`**, then sync per [Log sync workflow](references/nightly-local-log-fetch.md#log-sync-workflow) (**local-only** or **default** scope) into **`logs/nightly_jobs`**; run [kanban prep](../vllm-omni-test-report/references/kanban-pre-report-prep.md) **`prepare_kanban_before_report.py`**, then report via **vllm-omni-test-report**.
 
 ## References
 

@@ -39,7 +39,7 @@ include:
 - `vllm-omni-local-test`: runs nightly jobs on **H200** or **H800** cluster
   machines — confirm `REPO_ROOT`, `HF_HOME`, and `CUDA_VISIBLE_DEVICES` with the
   user, optional `git pull`, then `tools/nightly/run_nightly_jobs.sh` (full
-  nightly, `--test-type local`, or `--label-substr`); sync latest `logs/nightly_jobs_*`
+  nightly, `--test-type local`, or `--label-substr`); sync logs per scope (`local` → `nightly_jobs_local_*`; default → `nightly_jobs_local_*` + `nightly_jobs_YYYYMMDD-*`)
   to `logs/nightly_jobs` on the laptop for reporting; see
   `references/nightly-local-h200.md` / `nightly-local-h800.md` and
   `nightly-local-log-fetch.md`

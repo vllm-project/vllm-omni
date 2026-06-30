@@ -5,9 +5,9 @@ Prepare the vllm-omni-kanban checkout before generating a nightly/release HTML r
 Workflow (run from ``skills/vllm-omni-test-report/`` after log sync):
 
 1. ``git pull --rebase`` on the local https://github.com/hsliuustc0106/vllm-omni-kanban clone.
-2. When ``$REPO_ROOT/logs/nightly_jobs`` contains perf JSON, sync into
-   ``data/local_nightly_raw/manual_YYYYMMDD/`` (``YYYYMMDD`` from synced ``nightly_jobs_*`` run date,
-   not prep execution time; re-sync replaces same-day dir):
+2. When ``$REPO_ROOT/logs/.kanban_perf_source`` (or local-only ``nightly_jobs_local_*`` sync) contains perf JSON,
+   sync into ``data/local_nightly_raw/manual_YYYYMMDD/`` (``YYYYMMDD`` from **``nightly_jobs_local_*``** only;
+   **general** ``nightly_jobs_YYYYMMDD-*`` perf JSON is **not** copied to kanban):
    copy result JSON and
    ``logs/nightly_jobs/local_pytest_hunyuan_image.log`` (or ``test_hunyuan_image3.log``) as
    ``test_hunyuan_image3.log``.
@@ -42,12 +42,12 @@ from laptop_path_defaults import (
     resolve_laptop_repo_root,
 )
 from local_perf_results import (
+    KANBAN_PERF_SOURCE_DIRNAME,
     NIGHTLY_JOBS_SOURCE_MARKER,
-    PERF_JSON_GLOBS,
     default_nightly_log_dir,
-    infer_nightly_run_date_yyyymmdd,
+    infer_kanban_manual_date_yyyymmdd,
     local_perf_result_files,
-    resolve_local_perf_result_dir,
+    resolve_kanban_manual_log_dir,
 )
 from push_report_to_kanban import (
     _git_current_branch,
@@ -120,31 +120,39 @@ def sync_local_nightly_raw(
     kanban_repo: Path,
     *,
     log_dir: Path,
+    repo_root: Path,
 ) -> tuple[Path | None, list[str], list[str], list[str]]:
-    """Copy perf JSON + job logs from ``log_dir`` into a new ``manual_*`` directory under kanban."""
+    """Copy perf JSON + job logs from ``nightly_jobs_local_*`` only into kanban ``manual_*``."""
     notes: list[str] = []
     log_dir = log_dir.resolve()
-    resolved = resolve_local_perf_result_dir(log_dir)
-    if resolved is None:
-        notes.append(f"No perf JSON under {log_dir} (patterns: {', '.join(PERF_JSON_GLOBS)}); skipped manual_* sync.")
+    repo_root = repo_root.resolve()
+    kanban_log_dir = resolve_kanban_manual_log_dir(repo_root=repo_root, log_dir=log_dir)
+    if kanban_log_dir is None:
+        notes.append(
+            f"No nightly_jobs_local_* perf JSON for kanban manual_* "
+            f"(general nightly_jobs_* perf is excluded; expected {KANBAN_PERF_SOURCE_DIRNAME} "
+            f"after log sync); skipped manual_* sync."
+        )
         return None, [], [], notes
 
-    perf_files = local_perf_result_files(resolved)
+    perf_files = local_perf_result_files(kanban_log_dir)
     if not perf_files:
-        notes.append(f"Perf results directory exists but has no JSON: {resolved}; skipped manual_* sync.")
+        notes.append(f"Kanban perf source has no JSON under {kanban_log_dir}; skipped manual_* sync.")
         return None, [], [], notes
 
     raw_root = (kanban_repo / LOCAL_NIGHTLY_RAW).resolve()
-    run_day = infer_nightly_run_date_yyyymmdd(log_dir)
+    run_day = infer_kanban_manual_date_yyyymmdd(repo_root=repo_root, log_dir=log_dir)
     if not run_day:
         notes.append(
-            f"Could not infer nightly run date from {log_dir} "
-            f"(expected {NIGHTLY_JOBS_SOURCE_MARKER} or nightly_jobs_YYYYMMDD-* name); skipped manual_* sync."
+            f"Could not infer manual_* date from nightly_jobs_local_* sources under {log_dir} "
+            f"(expected {NIGHTLY_JOBS_SOURCE_MARKER} with nightly_jobs_local_* line); skipped manual_* sync."
         )
         return None, [], [], notes
 
     manual_dir = allocate_manual_dir(raw_root, day_yyyymmdd=run_day)
-    notes.append(f"manual_* date from synced log run: {run_day} → {manual_dir.name}")
+    notes.append(
+        f"manual_* from nightly_jobs_local_* only: {run_day} → {manual_dir.name} (kanban perf root: {kanban_log_dir})"
+    )
     _reset_manual_dir(manual_dir)
 
     perf_copied: list[str] = []
@@ -166,7 +174,7 @@ def sync_local_nightly_raw(
         perf_copied.append(dest_name)
 
     log_copied: list[str] = []
-    src_log = resolve_hunyuan_nightly_source_log(log_dir)
+    src_log = resolve_hunyuan_nightly_source_log(kanban_log_dir)
     if src_log is not None:
         dest_log = HUNYUAN_MANUAL_DEST_LOG
         if dest_log in used_names:
@@ -238,6 +246,7 @@ def prepare_kanban_before_report(
             manual_dir, perf_copied, log_copied, sync_notes = sync_local_nightly_raw(
                 kanban_repo,
                 log_dir=job_log_dir,
+                repo_root=repo_root,
             )
             notes.extend(sync_notes)
             if manual_dir is not None:

@@ -25,8 +25,12 @@ _LOCAL_PERF_STEM_PREFIXES = (
     "result_",
 )
 _TIMESTAMP_SUFFIX_RE = re.compile(r"_(\d{8})[-_]\d{6}$")
-_NIGHTLY_JOBS_RUN_DIR_RE = re.compile(r"^nightly_jobs_(\d{8})(?:-\d{6})?$", re.I)
+_NIGHTLY_JOBS_RUN_DIR_RE = re.compile(
+    r"^nightly_jobs(?:_local)?_(\d{8})(?:-\d{6})?$",
+    re.I,
+)
 NIGHTLY_JOBS_SOURCE_MARKER = ".nightly_jobs_source"
+KANBAN_PERF_SOURCE_DIRNAME = ".kanban_perf_source"
 _JSON_TEST_FIELDS = (
     "test_name",
     "test",
@@ -99,11 +103,12 @@ def _read_nightly_jobs_source_marker(marker_path: Path) -> str | None:
         text = marker_path.read_text(encoding="utf-8")
     except OSError:
         return None
+    dates: list[str] = []
     for line in text.splitlines():
         day = _yyyymmdd_from_nightly_jobs_basename(line.strip())
         if day:
-            return day
-    return None
+            dates.append(day)
+    return max(dates) if dates else None
 
 
 def _yyyymmdd_from_perf_filenames(result_dir: Path) -> str | None:
@@ -115,8 +120,71 @@ def _yyyymmdd_from_perf_filenames(result_dir: Path) -> str | None:
     return max(dates) if dates else None
 
 
+def kanban_perf_source_dir(repo_root: Path) -> Path:
+    return repo_root / "logs" / KANBAN_PERF_SOURCE_DIRNAME
+
+
+def is_nightly_jobs_local_source_name(name: str) -> bool:
+    return (name or "").strip().lower().startswith("nightly_jobs_local_")
+
+
+def nightly_jobs_source_names(log_dir: Path) -> list[str]:
+    log_dir = log_dir.resolve()
+    for marker in (log_dir / NIGHTLY_JOBS_SOURCE_MARKER, log_dir.parent / NIGHTLY_JOBS_SOURCE_MARKER):
+        if not marker.is_file():
+            continue
+        try:
+            names = [line.strip() for line in marker.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except OSError:
+            continue
+        if names:
+            return names
+    if is_nightly_jobs_local_source_name(log_dir.name):
+        return [log_dir.name]
+    return []
+
+
+def infer_kanban_manual_date_yyyymmdd(*, repo_root: Path, log_dir: Path) -> str | None:
+    """``YYYYMMDD`` for ``manual_*`` — from ``nightly_jobs_local_*`` sources only."""
+    dates: list[str] = []
+    for name in nightly_jobs_source_names(log_dir):
+        if not is_nightly_jobs_local_source_name(name):
+            continue
+        day = _yyyymmdd_from_nightly_jobs_basename(name)
+        if day:
+            dates.append(day)
+    if dates:
+        return max(dates)
+
+    staged = kanban_perf_source_dir(repo_root)
+    if staged.is_dir():
+        day = _yyyymmdd_from_perf_filenames(staged)
+        if day:
+            return day
+    return None
+
+
+def resolve_kanban_manual_log_dir(*, repo_root: Path, log_dir: Path) -> Path | None:
+    """Perf/log tree for kanban ``manual_*`` — ``nightly_jobs_local_*`` only, not general ``nightly_jobs_*``."""
+    staged = kanban_perf_source_dir(repo_root).resolve()
+    if staged.is_dir():
+        resolved = resolve_local_perf_result_dir(staged)
+        if resolved is not None and local_perf_result_files(resolved):
+            return resolved
+
+    names = nightly_jobs_source_names(log_dir)
+    if names and all(is_nightly_jobs_local_source_name(n) for n in names):
+        resolved = resolve_local_perf_result_dir(log_dir)
+        if resolved is not None and local_perf_result_files(resolved):
+            return resolved
+    return None
+
+
 def infer_nightly_run_date_yyyymmdd(log_dir: Path) -> str | None:
-    """Infer ``YYYYMMDD`` from synced ``nightly_jobs_*`` source, not prep execution time."""
+    """Infer ``YYYYMMDD`` from synced run marker (any source).
+
+    Prefer ``infer_kanban_manual_date_yyyymmdd`` for kanban manual dirs.
+    """
     log_dir = log_dir.resolve()
     for marker in (
         log_dir / NIGHTLY_JOBS_SOURCE_MARKER,

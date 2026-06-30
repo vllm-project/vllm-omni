@@ -28,7 +28,7 @@ description: Two report kinds; **default output is always HTML** unless the user
 
 Shared helpers live in `scripts/report_naming.py`. `push_report_to_kanban.py` archives non-canonical filenames under **today UTC** unless `--date` is set.
 
-**Exception — kanban `manual_*`:** `prepare_kanban_before_report.py` names `data/local_nightly_raw/manual_YYYYMMDD/` from the **synced nightly run date** (`logs/nightly_jobs/.nightly_jobs_source` or perf JSON timestamps), not laptop execution time. See [kanban-pre-report-prep.md](references/kanban-pre-report-prep.md).
+**Exception — kanban `manual_*`:** only **`nightly_jobs_local_*`** perf JSON (via **`logs/.kanban_perf_source`**) is copied to kanban; general **`nightly_jobs_YYYYMMDD-*`** perf stays in **`logs/nightly_jobs`** for the report only. See [kanban-pre-report-prep.md](references/kanban-pre-report-prep.md).
 
 ## Agent Quick Path
 
@@ -128,7 +128,7 @@ python scripts/compose_full_report.py \
 
 ## Nightly report (local logs + optional Buildkite nightly, HTML)
 
-**Prerequisite:** `LOG_DIR` on disk - paths and pytest rules in [references/nightly-local-log-layout.md](references/nightly-local-log-layout.md). To **produce** logs on cluster, follow [vllm-omni-local-test](../vllm-omni-local-test/SKILL.md) (**H200** or **H800**). To **copy** logs to your laptop, use [../vllm-omni-local-test/references/nightly-local-log-fetch.md](../vllm-omni-local-test/references/nightly-local-log-fetch.md) — **required before each sync:** **`rm -rf` local `$REPO_ROOT/logs`**, then pull latest **`logs/nightly_jobs_*`** → rename to **`logs/nightly_jobs`**.
+**Prerequisite:** `LOG_DIR` on disk - paths and pytest rules in [references/nightly-local-log-layout.md](references/nightly-local-log-layout.md). To **produce** logs on cluster, follow [vllm-omni-local-test](../vllm-omni-local-test/SKILL.md) (**H200** or **H800**). To **copy** logs to your laptop, use [../vllm-omni-local-test/references/nightly-local-log-fetch.md](../vllm-omni-local-test/references/nightly-local-log-fetch.md) — **required before each sync:** **`rm -rf` local `$REPO_ROOT/logs`**, then pull per **sync scope** (`local` → latest **`nightly_jobs_local_*` only**; **default** → latest **`nightly_jobs_local_*` + latest `nightly_jobs_YYYYMMDD-*`**) → **merge** into **`logs/nightly_jobs`**.
 
 **Daily focus summary:** Nightly HTML and Markdown place **Daily focus** immediately after the title. It summarizes Buildkite / Local job failures and lists all baseline-backed performance regressions whose normalized `Status` is `fail` across Buildkite and Local; the HTML table supports Model checkbox filtering. A **major performance regression** is any baseline comparison row whose normalized `Status` is `fail` (current threshold: worse than baseline by more than 6%, using metric direction from `kanban_assets_perf_summary.py`). If there are no `fail` rows, the summary may show the worst `normal` rows as observation items; if baseline data is missing, it reports that explicitly instead of guessing.
 

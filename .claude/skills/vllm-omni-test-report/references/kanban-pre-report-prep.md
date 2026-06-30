@@ -24,16 +24,16 @@ The script runs this via **`gh auth git-credential`** (same as report archive pu
 
 ### 2. Sync local perf + logs → `data/local_nightly_raw/manual_*`
 
-**When** `$REPO_ROOT/logs/nightly_jobs` contains perf JSON (`result_test_*.json`, `diffusion_result_*.json`, `benchmark_results_*.json` — scanned recursively, including under **`results/`** if present):
+**Only `nightly_jobs_local_*` perf** goes to kanban. After log sync, **`prepare_kanban_before_report.py`** reads **`$REPO_ROOT/logs/.kanban_perf_source`** (populated from the latest local run during fetch merge). **General `nightly_jobs_YYYYMMDD-*` perf JSON is not copied to kanban** (it may still exist under **`logs/nightly_jobs`** for the HTML report).
+
+**When** `.kanban_perf_source` (or a local-only sync) contains perf JSON (`result_test_*.json`, `diffusion_result_*.json`, `benchmark_results_*.json`):
 
 1. Sync into **`$KANBAN_REPO_ROOT/data/local_nightly_raw/manual_YYYYMMDD/`**:
-   - **`YYYYMMDD`** comes from the synced **`nightly_jobs_*`** run (see **`logs/nightly_jobs/.nightly_jobs_source`** written at fetch time), **not** from when you run prep on the laptop
-   - Name is always **`manual_YYYYMMDD`** (no time suffix)
+   - **`YYYYMMDD`** from **`nightly_jobs_local_*`** in **`.nightly_jobs_source`**, not from general nightly
    - If that directory already exists for the same run date, it is **cleared and repopulated**
 2. Copy into it:
-   - All matching perf JSON from **`$REPO_ROOT/logs/nightly_jobs`** (flat copy, original basenames — unchanged)
-   - **Only** one Hunyuan Image job log from **`$REPO_ROOT/logs/nightly_jobs`** → **`test_hunyuan_image3.log`**:
-     **`local_pytest_hunyuan_image.log`** (preferred) or **`test_hunyuan_image3.log`** if already renamed locally
+   - All matching perf JSON from **`.kanban_perf_source`** (unchanged basenames)
+   - **Only** one Hunyuan Image job log from the same tree → **`test_hunyuan_image3.log`**
 
 Example kanban layout (committed over time):
 
@@ -43,7 +43,7 @@ data/local_nightly_raw/manual_20260622/
   test_hunyuan_image3.log
 ```
 
-If **`logs/nightly_jobs`** has **no perf JSON**, skip this step (still run step 3 to refresh charts from existing raw data).
+If **`.kanban_perf_source`** has **no perf JSON** (no local run synced), skip this step (still run step 3 to refresh charts from existing raw data).
 
 ### 3. MkDocs build (regenerate chart history)
 
