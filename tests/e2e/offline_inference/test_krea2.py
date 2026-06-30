@@ -39,7 +39,7 @@ pytestmark_raw = [
 
 
 @pytest.mark.parametrize("omni_runner", [_RAW_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "A100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.full_model
 @pytest.mark.diffusion
 def test_krea2_raw_text_to_image(omni_runner_handler: OmniRunnerHandler):
@@ -65,7 +65,7 @@ _TURBO_RUNNER_PARAM = (MODEL_TURBO, {"model_config": {"is_distilled": True}})
 
 
 @pytest.mark.parametrize("omni_runner", [_TURBO_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "A100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.full_model
 @pytest.mark.diffusion
 def test_krea2_turbo_text_to_image(omni_runner_handler: OmniRunnerHandler):
@@ -86,7 +86,7 @@ def test_krea2_turbo_text_to_image(omni_runner_handler: OmniRunnerHandler):
 
 
 @pytest.mark.parametrize("omni_runner", [_TURBO_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "A100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.full_model
 @pytest.mark.diffusion
 def test_krea2_deterministic_seed(omni_runner_handler: OmniRunnerHandler):
