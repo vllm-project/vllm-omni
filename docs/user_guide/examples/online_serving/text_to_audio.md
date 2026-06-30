@@ -1,193 +1,169 @@
-# Text-To-Audio
+# Text-To-Audio Online Serving
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/stable_audio>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_audio>.
 
-This example demonstrates how to deploy Stable Audio models for online text-to-audio generation using vLLM-Omni.
+
+This example demonstrates how to deploy text/video-to-audio diffusion models for
+online audio generation using vLLM-Omni.
 
 ## Supported Models
 
-| Model | Description |
-|-------|-------------|
-| `stabilityai/stable-audio-open-1.0` | Open-source audio generation, up to ~47 seconds, 44.1 kHz stereo |
+| Model | Model ID | Tasks | Endpoint |
+|-------|----------|-------|----------|
+| Stable Audio Open | `stabilityai/stable-audio-open-1.0` | text-to-audio | `POST /v1/audio/generate` |
+| AudioX | `zhangj1an/AudioX` | `t2a` / `t2m` / `v2a` / `v2m` / `tv2a` / `tv2m` | `POST /v1/chat/completions` |
 
-## Start Server
+The two models use different serving APIs, so each has its own server and curl
+script. Both share the unified offline entrypoint
+[`examples/offline_inference/text_to_audio/text_to_audio.py`](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_audio/text_to_audio.py).
 
-### Basic Start
+## Stable Audio Open
 
-```bash
-vllm-omni serve stabilityai/stable-audio-open-1.0 \
-    --host 0.0.0.0 \
-    --port 8091 \
-    --gpu-memory-utilization 0.9 \
-    --trust-remote-code \
-    --enforce-eager \
-    --omni
-```
+Stable Audio Open is served through the OpenAI-compatible
+`POST /v1/audio/generate` endpoint: a JSON request in, binary audio (WAV by
+default) out.
 
-## API Calls
+> Stable Audio Open is a gated Hugging Face model. Accept the license on the
+> model card and `huggingface-cli login` before downloading the checkpoint.
 
-### Method 1: Using curl
+### Start Server
 
 ```bash
-# Run all curl examples
-bash curl_examples.sh
-
-# Or execute directly
-curl -X POST http://localhost:8091/v1/audio/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "The sound of a cat purring",
-        "audio_length": 10.0
-    }' --output cat.wav
+bash run_server_stable_audio.sh                 # defaults: MODEL=stabilityai/stable-audio-open-1.0, PORT=8091
 ```
 
-### Method 2: Using Python Client
+Or directly:
 
 ```bash
-cd examples/online_serving/stable_audio
-
-# Simple generation
-python stable_audio_client.py \
-    --text "The sound of a cat purring"
-
-# With custom duration
-python stable_audio_client.py \
-    --text "A dog barking" \
-    --audio_length 5.0
-
-# With all parameters
-python stable_audio_client.py \
-    --text "Thunder and rain" \
-    --audio_length 15.0 \
-    --negative_prompt "Low quality" \
-    --guidance_scale 7.0 \
-    --num_inference_steps 100 \
-    --seed 42 \
-    --output thunder.wav
+vllm serve stabilityai/stable-audio-open-1.0 --omni \
+    --port 8091 --gpu-memory-utilization 0.9 --trust-remote-code --enforce-eager
 ```
 
-The Python client supports the following command-line arguments:
+Environment overrides: `MODEL`, `PORT`.
 
-- `--api_url`: API endpoint URL (default: `http://localhost:8091/v1/audio/generate`)
-- `--text`: Text prompt for audio generation (default: `"The sound of a cat purring"`)
-- `--audio_length`: Audio length in seconds (default: `10.0`, max ~47s for `stable-audio-open-1.0`)
-- `--audio_start`: Audio start time in seconds (default: `0.0`)
-- `--negative_prompt`: Negative prompt for classifier-free guidance (default: `"Low quality"`)
-- `--guidance_scale`: Guidance scale for diffusion (default: `7.0`)
-- `--num_inference_steps`: Number of inference steps (default: `100`)
-- `--seed`: Random seed for reproducibility (default: `None`)
-- `--response_format`: Audio output format (default: `wav`). Options: `wav`, `mp3`, `flac`, `pcm`
-- `--output`: Output file path (default: `stable_audio_output.wav`)
+### Send Requests (curl)
 
-### Method 3: Using Python httpx
+```bash
+# Using the provided script (env-overridable PROMPT, AUDIO_LENGTH, SEED, OUTPUT_PATH, ...)
+bash run_curl_stable_audio.sh
 
-```python
-import httpx
-
-response = httpx.post(
-    "http://localhost:8091/v1/audio/generate",
-    json={
-        "input": "The sound of ocean waves crashing on a beach",
-        "audio_length": 10.0,
-        "negative_prompt": "Low quality, distorted",
-        "guidance_scale": 7.0,
-        "num_inference_steps": 100,
-    },
-    timeout=300.0,
-)
-
-with open("ocean.wav", "wb") as f:
-    f.write(response.content)
-```
-
-## Request Format
-
-### Simple Generation
-
-```json
-{
-    "input": "The sound of ocean waves"
-}
-```
-
-### Generation with Parameters
-
-```json
-{
+# Or directly
+curl -sS -X POST http://localhost:8091/v1/audio/generate \
+  -H "Content-Type: application/json" \
+  -d '{
     "input": "A piano playing a gentle melody",
     "audio_length": 10.0,
     "negative_prompt": "Low quality, distorted, noisy",
-    "guidance_scale": 8.0,
-    "num_inference_steps": 150,
+    "guidance_scale": 7.0,
+    "num_inference_steps": 100,
     "seed": 42,
     "response_format": "wav"
-}
+  }' --output stable_audio_output.wav
 ```
-
-## API Reference
-
-### Endpoint
-
-```
-POST /v1/audio/generate
-Content-Type: application/json
-```
-
-### Generation Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `input` | string | **required** | Text prompt describing the audio to generate |
-| `model` | string | server's model | Model to use (optional, should match server if specified) |
-| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, opus |
-| `speed` | float | 1.0 | Playback speed (0.25 - 4.0) |
-| `audio_length` | float | null | Audio duration in seconds (max ~47s for `stable-audio-open-1.0`) |
+| `audio_length` | float | ~47s | Audio duration in seconds (max ~47s for `stable-audio-open-1.0`) |
 | `audio_start` | float | 0.0 | Audio start time in seconds |
-| `negative_prompt` | string | null | Text describing what to avoid in generation |
-| `guidance_scale` | float | model default | Classifier-free guidance scale (higher = more adherence to prompt) |
-| `num_inference_steps` | int | model default | Number of denoising steps (higher = better quality, slower) |
-| `seed` | int | null | Random seed for reproducible generation |
+| `negative_prompt` | string | null | Text describing what to avoid |
+| `guidance_scale` | float | 7.0 | Classifier-free guidance scale |
+| `num_inference_steps` | int | model default | Number of denoising steps |
+| `seed` | int | null | Random seed for reproducibility |
+| `response_format` | string | "wav" | Output format: `wav`, `mp3`, `flac`, `pcm`, `opus` |
 
-### Response Format
+See [`docs/serving/audio_generate_api.md`](https://github.com/vllm-project/vllm-omni/tree/main/docs/serving/audio_generate_api.md)
+for the full API reference.
 
-Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/wav`).
+## AudioX
 
-## Tuning Tips
+AudioX is served through the standard OpenAI chat-completions endpoint and
+requires an explicit pipeline class at launch. Per-request task and sampler
+knobs (declared in
+[`vllm_omni/model_extras/audiox.py`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/model_extras/audiox.py))
+are sent under `extra_body`. The response carries base64 WAV in
+`choices[0].message.audio.data`.
 
-1. **Audio Length**: Keep under 47 seconds for `stable-audio-open-1.0`.
-2. **Quality vs Speed**:
-   - 50 steps: Fast, decent quality (quick previews)
-   - 100 steps: Good balance (general purpose)
-   - 150+ steps: High quality, slower (final / critical audio)
-3. **Guidance Scale**:
-   - Lower (3 - 5): More creative / varied output
-   - Default (7): Good balance
-   - Higher (10+): Strict adherence to the prompt
-4. **Negative Prompts**: Use to avoid unwanted characteristics such as `"Low quality"`, `"distorted"`, `"noisy"`.
-5. **Seeds**: Set a fixed seed to get deterministic, reproducible results.
+### Start Server
 
-## File Description
+```bash
+bash run_server_audiox.sh                 # defaults: MODEL=zhangj1an/AudioX, PORT=8099
+```
 
-| File | Description |
-|------|-------------|
-| `curl_examples.sh` | Curl examples covering common use cases |
-| `stable_audio_client.py` | Python client with full CLI argument support |
+Or directly:
 
-## Troubleshooting
+```bash
+DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN \
+  vllm serve zhangj1an/AudioX --omni --model-class-name AudioXPipeline --port 8099
+```
 
-1. **Audio generation model did not produce audio output**: Verify the server started successfully and the model loaded without errors.
-2. **Connection refused**: Make sure the server is running on the correct port.
-3. **Generation timeout**: Reduce `num_inference_steps` or `audio_length`, and check GPU memory with `nvidia-smi`.
-4. **Out of memory**: Lower `--gpu-memory-utilization` or reduce `audio_length`.
-5. **Audio quality issues**: Increase `num_inference_steps`, add a negative prompt, or raise `guidance_scale`.
+Environment overrides: `MODEL`, `PORT`, `DIFFUSION_ATTENTION_BACKEND`.
+
+### Send Requests (curl)
+
+```bash
+# text-to-audio (default TASK=t2a)
+bash run_curl_audiox.sh
+
+# text-to-music
+TASK=t2m PROMPT="Uplifting ukulele tune for a travel vlog" bash run_curl_audiox.sh
+
+# text+video-to-audio (v2*/tv2* require VIDEO; local files are inlined as a data URI)
+TASK=tv2a PROMPT="drum beating sound and human talking" \
+  VIDEO=https://zeyuet.github.io/AudioX/static/samples/V2M/1XeBotOFqHA.mp4 \
+  bash run_curl_audiox.sh
+```
+
+Or directly:
+
+```bash
+curl -sS -X POST http://localhost:8099/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "zhangj1an/AudioX",
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "Uplifting ukulele"}]}],
+    "extra_body": {
+      "num_inference_steps": 250,
+      "guidance_scale": 7.0,
+      "seed": 42,
+      "audiox_task": "t2m",
+      "seconds_total": 10.0,
+      "sigma_min": 0.03,
+      "sigma_max": 1000.0
+    }
+  }' > t2m.json
+```
+
+`extra_body` knobs (declared in `vllm_omni/model_extras/audiox.py`):
+
+| Key | Description |
+|-----|-------------|
+| `audiox_task` | One of `t2a` / `t2m` / `v2a` / `v2m` / `tv2a` / `tv2m` |
+| `num_inference_steps` | Number of denoising steps |
+| `guidance_scale` | Classifier-free guidance scale |
+| `seed` | Random seed for reproducibility |
+| `seconds_start` | Audio start offset in seconds |
+| `seconds_total` | Audio duration in seconds (fixed ~10s for the upstream bundle) |
+| `sigma_min` / `sigma_max` | Sampler sigma range |
+
+For `v2*` / `tv2*` tasks, attach the video as a `video_url` content item (a
+`data:video/mp4;base64,...` URI for local files, or an http(s) URL).
 
 ## Example materials
 
-??? abstract "stable_audio_client.py"
-    ``````py
-    --8<-- "examples/online_serving/stable_audio/stable_audio_client.py"
-    ``````
-??? abstract "curl_examples.sh"
+??? abstract "run_curl_audiox.sh"
     ``````sh
-    --8<-- "examples/online_serving/stable_audio/curl_examples.sh"
+    --8<-- "examples/online_serving/text_to_audio/run_curl_audiox.sh"
+    ``````
+??? abstract "run_curl_stable_audio.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_audio/run_curl_stable_audio.sh"
+    ``````
+??? abstract "run_server_audiox.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_audio/run_server_audiox.sh"
+    ``````
+??? abstract "run_server_stable_audio.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_audio/run_server_stable_audio.sh"
     ``````
