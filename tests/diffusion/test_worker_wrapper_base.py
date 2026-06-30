@@ -41,7 +41,7 @@ def mock_od_config(mocker: MockerFixture):
     config.cache_backend = None
     config.cache_config = None
     config.model = "test-model"
-    config.diffusion_load_format = None
+    config.diffusion_load_format = "default"
     config.dtype = "float32"
     config.max_cpu_loras = 0
     config.lora_path = None
@@ -184,7 +184,7 @@ class TestWorkerWrapperBaseDelegation:
         mock_reqs = [mocker.Mock()]
         result = wrapper.execute_model(mock_reqs, mock_od_config)
 
-        wrapper.worker.execute_model.assert_called_once_with(mock_reqs, mock_od_config)
+        wrapper.worker.execute_model.assert_called_once_with(mock_reqs, mock_od_config, kv_prefetch_jobs=None)
         assert result == mock_output
 
     def test_load_weights_delegation(self, mocker: MockerFixture, mock_od_config):

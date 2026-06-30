@@ -19,7 +19,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 NUM_TOKENS = 8
 HIDDEN_DIM = 16
 NUM_TIMESTEPS = 5
-# generate_image uses timesteps[:-1], so actual steps = NUM_TIMESTEPS - 1
+# Official BAGEL samples num_timesteps points then drops the terminal t=0,
+# yielding num_timesteps - 1 denoise steps.
 EXPECTED_STEPS = NUM_TIMESTEPS - 1
 
 
@@ -27,6 +28,9 @@ def _make_mock_bagel(mocker: MockerFixture):
     """Create a mock Bagel with forward returning constant velocity."""
     mock = mocker.MagicMock(spec=Bagel)
     mock._sp_size = 1
+    # MagicMock would otherwise auto-return a truthy stub for this flag; pin it
+    # to the official BAGEL schedule convention (num_timesteps points).
+    mock._denoise_schedule_extra_step = False
 
     # forward returns a small constant velocity so x_t changes each step
     def fake_forward(self, x_t, **kwargs):
@@ -56,10 +60,7 @@ def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False)
         packed_vae_token_indexes=torch.arange(2, seq_len, dtype=torch.long),
         packed_seqlens=torch.tensor([seq_len], dtype=torch.int),
         packed_position_ids=torch.arange(seq_len, dtype=torch.long),
-        packed_indexes=torch.arange(seq_len, dtype=torch.long),
         past_key_values=NaiveCache(1),
-        key_values_lens=torch.tensor([0], dtype=torch.int),
-        packed_key_value_indexes=torch.zeros(0, dtype=torch.long),
         num_timesteps=NUM_TIMESTEPS,
         timestep_shift=1.0,
         cfg_text_scale=1.0,
@@ -68,11 +69,8 @@ def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False)
     if cfg:
         base |= dict(
             cfg_text_scale=4.0,
-            cfg_text_packed_query_indexes=torch.arange(seq_len, dtype=torch.long),
             cfg_text_packed_position_ids=torch.arange(seq_len, dtype=torch.long),
             cfg_text_past_key_values=NaiveCache(1),
-            cfg_text_key_values_lens=torch.tensor([0], dtype=torch.int),
-            cfg_text_packed_key_value_indexes=torch.zeros(0, dtype=torch.long),
         )
     return base
 

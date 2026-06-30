@@ -14,7 +14,7 @@ from tests.helpers.runtime import (
     dummy_messages_from_mix_data,
 )
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 # L4: 4 GPUs + TP=4; XPU B60: 2 cards (use num_cards={"cuda": 4, "xpu": 4} if needed)
 FOUR_CARD_MARKS = hardware_marks(
@@ -31,6 +31,20 @@ _DEFAULT_MODEL = "stepfun-ai/NextStep-1.1"
 def _get_diffusion_feature_cases(model: str):
     """Single online config: TP=4, explicit pipeline class."""
     return [
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--tensor-parallel-size",
+                    "2",
+                    "--model-class-name",
+                    "NextStep11Pipeline",
+                    "--enable-cpu-offload",
+                ],
+            ),
+            id="nextstep_tp2_cpu_offload",
+            marks=FOUR_CARD_MARKS,
+        ),
         pytest.param(
             OmniServerParams(
                 model=model,

@@ -28,14 +28,15 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioOutput
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
     StableAudioDiTModel,
     StableAudioSchedulerWrapper,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -64,7 +65,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
+class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -76,12 +77,19 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         prefix: Weight prefix for loading (default: "")
     """
 
+    supports_request_batch = False
+
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the
     # ``multimodal_output`` payload includes the sample rate (mirrors the
     # contract introduced for AudioX in #2077).
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 44100
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = ["projection_model"]
 
     def __init__(
         self,
@@ -109,6 +117,11 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             ),
         ]
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        sa_subfolders = ["tokenizer", "text_encoder", "vae", "projection_model", "scheduler"]
+        prefetch_subfolders(model, sa_subfolders, local_files_only=local_files_only)
+
         # Load tokenizer
         self.tokenizer = T5TokenizerFast.from_pretrained(
             model,
@@ -117,27 +130,33 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         )
 
         # Load text encoder
-        self.text_encoder = T5EncoderModel.from_pretrained(
+        self.text_encoder = from_pretrained_with_prefetch(
+            T5EncoderModel.from_pretrained,
             model,
             subfolder="text_encoder",
-            torch_dtype=dtype,
+            prefetch_list=sa_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         # Load VAE (AutoencoderOobleck for audio)
-        self.vae = AutoencoderOobleck.from_pretrained(
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderOobleck.from_pretrained,
             model,
             subfolder="vae",
-            torch_dtype=torch.float32,
+            prefetch_list=sa_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=torch.float32,
         ).to(self.device)
 
         # Load projection model (using diffusers implementation)
-        self.projection_model = StableAudioProjectionModel.from_pretrained(
+        self.projection_model = from_pretrained_with_prefetch(
+            StableAudioProjectionModel.from_pretrained,
             model,
             subfolder="projection_model",
-            torch_dtype=dtype,
+            prefetch_list=sa_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         # Initialize transformer from HF config to keep architecture aligned with checkpoint.
@@ -368,7 +387,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         audio_end_in_s: float | None = None,
@@ -588,9 +607,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         # Trim to requested length
         audio = audio[:, :, waveform_start:waveform_end]
 
-        return DiffusionOutput(
-            output=audio, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return DiffusionOutput(output=audio, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

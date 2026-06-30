@@ -29,7 +29,6 @@ import os
 
 from PIL import Image
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -141,6 +140,12 @@ def parse_args():
         help="Number of GPUs for tensor parallelism.",
     )
     parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs for CFG parallelism.",
+    )
+    parser.add_argument(
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
@@ -155,8 +160,19 @@ def parse_args():
             "of extra CPU<->GPU transfers."
         ),
     )
+    parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["cache_dit", "tea_cache"],
+        help="Cache backend to use for image generation acceleration.",
+    )
+    parser.add_argument(
+        "--enable-cache-dit-summary",
+        action="store_true",
+        help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
 
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
@@ -182,6 +198,9 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
+        cache_backend=args.cache_backend,
+        enable_cache_dit_summary=args.enable_cache_dit_summary,
+        cfg_parallel_size=args.cfg_parallel_size,
     )
 
     extra_args = {
@@ -225,6 +244,8 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Think mode     : {args.think}")
     print(f"  TP size        : {args.tensor_parallel_size}")
+    print(f"  CFG size       : {args.cfg_parallel_size}")
+    print(f"  Cache backend  : {args.cache_backend or 'none'}")
     print(f"{'=' * 60}\n")
 
     # Build prompt dict

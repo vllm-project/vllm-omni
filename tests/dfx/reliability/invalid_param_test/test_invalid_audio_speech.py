@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HTTP + WebSocket validation for Qwen3-TTS Base: ``/v1/audio/speech``, ``/v1/audio/speech/stream``, batch, voices."""
+"""HTTP + WebSocket validation for Qwen3-TTS Base and Higgs Audio V3 ``/v1/audio/speech`` (and related routes)."""
 
 from __future__ import annotations
 
@@ -53,6 +53,19 @@ _QWEN3_TTS_SPEECH = [
             server_args=_SPEECH_SERVER_ARGS,
         ),
         id="qwen3_tts",
+        marks=_L4_SPEECH_HW,
+    ),
+]
+
+_HIGGS_AUDIO_V3_SPEECH = [
+    pytest.param(
+        OmniServerParams(
+            model="bosonai/higgs-audio-v3-tts-4b",
+            stage_config_path=get_deploy_config_path("higgs_multimodal_qwen3.yaml"),
+            server_args=_SPEECH_SERVER_ARGS,
+            env_dict={"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"},
+        ),
+        id="higgs_audio_v3",
         marks=_L4_SPEECH_HW,
     ),
 ]
@@ -122,9 +135,6 @@ def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: 
             {"response_format": "mpeg"}, ("response_format", "literal_error", "wav"), id="response_format_invalid"
         ),
         pytest.param({"stream_format": 1}, ("stream_format", "literal_error", "audio"), id="stream_format_wrong_type"),
-        pytest.param(
-            {"stream_format": "sse"}, ("stream_format", "value_error", "audio"), id="stream_format_sse_blocked"
-        ),
         pytest.param({"stream": "wrong_type"}, ("stream", "bool_parsing", "validation error"), id="stream_wrong_type"),
         pytest.param(
             {
@@ -238,6 +248,78 @@ def test_speech_invalid_field_values(
         body.pop("ref_audio", None)
         body.pop("ref_text", None)
     body.update(ov)
+    openai_client.send_audio_speech_http_request(
+        {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
+    )
+
+
+# Higgs Audio V3: ``references[]`` cookbook alias and serving-layer 400 rejections.
+# Raw HTTP keeps JSON bodies intact (OpenAI SDK strips unknown fields such as ``references``).
+@pytest.mark.parametrize(
+    "extra_json, err_message",
+    [
+        pytest.param({"input": "", "response_format": "wav"}, ("input", "empty"), id="input_empty"),
+        pytest.param({"input": "   ", "response_format": "wav"}, ("input", "empty"), id="input_whitespace_only"),
+        pytest.param(
+            {"input": "Hello world.", "max_new_tokens": 0}, ("max_new_tokens", "least 1"), id="max_new_tokens_below_min"
+        ),
+        pytest.param(
+            {
+                "input": "Hello world.",
+                "references": [
+                    {"audio_path": REF_AUDIO_URL, "text": REF_TEXT},
+                    {"audio_path": REF_AUDIO_URL, "text": REF_TEXT},
+                ],
+                "response_format": "wav",
+            },
+            ("references", "only supports a single reference"),
+            id="multi_reference_payload",
+        ),
+        pytest.param(
+            {"input": "Hello world.", "references": [], "response_format": "wav"},
+            ("references", "non-empty"),
+            id="references_empty_array",
+        ),
+        pytest.param(
+            {"input": "Hello world.", "references": [{"text": REF_TEXT}], "response_format": "wav"},
+            ("audio_path", "required"),
+            id="references_missing_audio_path",
+        ),
+        pytest.param(
+            {"input": "Hello world.", "references": [1], "response_format": "wav"},
+            ("references[0]", "must be an object"),
+            id="references_bad_element_type",
+        ),
+        pytest.param(
+            {
+                "input": "Hello world.",
+                "ref_audio": REF_AUDIO_URL,
+                "references": [{"audio_path": "https://example.com/other.wav"}],
+                "response_format": "wav",
+            },
+            ("mutually exclusive", "ref_audio", "references"),
+            id="ref_audio_and_references_exclusive",
+        ),
+        pytest.param(
+            {
+                "input": "Hello world.",
+                "ref_text": "different transcript",
+                "references": [{"audio_path": REF_AUDIO_URL, "text": REF_TEXT}],
+                "response_format": "wav",
+            },
+            ("references[0].text", "ref_text", "conflict"),
+            id="references_text_conflicts_ref_text",
+        ),
+    ],
+)
+@pytest.mark.parametrize("omni_server", _HIGGS_AUDIO_V3_SPEECH, indirect=True)
+def test_speech_higgs_invalid_field_values(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+    extra_json: dict[str, object],
+    err_message: str | tuple[str, ...],
+) -> None:
+    body = {"model": omni_server.model, **extra_json}
     openai_client.send_audio_speech_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
@@ -624,7 +706,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             {"consent": "c1", "name": "v1"},
             ("audio_sample", "speaker_embedding", "provided"),
             id="neither_audio_nor_embedding",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
@@ -676,7 +757,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             {"consent": "consent_ok", "name": "evil/name"},
             ("voice name", "invalid voice name"),
             id="invalid_name_path_sep",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
@@ -701,21 +781,18 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             {"consent": "consent_ok", "name": "v_bad_mime_{uuid}"},
             ("mime", "unsupported", "audio/mp4"),
             id="audio_unsupported_mime",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_short",
             {"consent": "consent_ok", "name": "v_short_{uuid}"},
             ("too short", "reference audio"),
             id="audio_too_short",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_bad_body",
             {"consent": "consent_ok", "name": "v_bad_wav_{uuid}"},
             ("decode", "audio", "Format not recognised"),
             id="audio_decode_error",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             None,
@@ -726,7 +803,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("speaker_embedding", "valid JSON"),
             id="speaker_embedding_invalid_json",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             None,
@@ -737,7 +813,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("speaker_embedding", "non-empty"),
             id="speaker_embedding_empty",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             None,
@@ -748,7 +823,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("speaker_embedding", "finite"),
             id="speaker_embedding_nan",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             None,
@@ -759,7 +833,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("expected", "dimensions", "1024"),
             id="speaker_embedding_wrong_dim",
-            marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "wav_ok",
@@ -770,7 +843,6 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
             },
             ("mutually exclusive", "audio_sample", "speaker_embedding"),
             id="audio_and_embedding_mutually_exclusive",
-            marks=_SKIP_ISSUE_3649,
         ),
     ],
 )

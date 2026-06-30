@@ -44,7 +44,6 @@ COVO_AUDIO_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
-            custom_process_input_func=f"{_PROC}.llm2code2wav",
             sync_process_input_func=f"{_PROC}.llm2code2wav_token_only",
             sampling_constraints={"detokenize": False},
         ),

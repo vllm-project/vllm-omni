@@ -119,6 +119,8 @@ class OmniModelConfig(ModelConfig):
 
     stage_id: int = 0
     async_chunk: bool = False
+    # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
+    active_stream_window: int = 0
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None

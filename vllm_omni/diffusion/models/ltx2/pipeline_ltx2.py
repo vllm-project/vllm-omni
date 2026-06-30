@@ -36,10 +36,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.lora.request import LoRARequest
 
 from .ltx2_transformer import LTX2VideoTransformer3DModel
@@ -156,9 +157,15 @@ class _VideoAudioScheduler:
         return ((video_out, audio_out),)
 
 
-class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsComponentDiscovery):
+    supports_request_batch = False
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+
     # Audio is diffused jointly with video; warmup must size audio tokens.
-    support_audio_output = True
+    dummy_run_num_frames = 2
 
     def __init__(
         self,
@@ -185,6 +192,19 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             ),
         ]
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained.
+        ltx2_subfolders = [
+            "tokenizer",
+            "text_encoder",
+            "connectors",
+            "vae",
+            "audio_vae",
+            "vocoder",
+            "scheduler",
+        ]
+        prefetch_subfolders(model, ltx2_subfolders, local_files_only=local_files_only)
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
             subfolder="tokenizer",
@@ -193,36 +213,46 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         # prefer mmap loading as default device is cuda, and the output of text encoder
         # could be deterministic.
         with torch.device("cpu"):
-            self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+            self.text_encoder = from_pretrained_with_prefetch(
+                Gemma3ForConditionalGeneration.from_pretrained,
                 model,
                 subfolder="text_encoder",
-                torch_dtype=dtype,
+                prefetch_list=ltx2_subfolders,
                 local_files_only=local_files_only,
+                torch_dtype=dtype,
             ).to(self.device)
-        self.connectors = LTX2TextConnectors.from_pretrained(
+        self.connectors = from_pretrained_with_prefetch(
+            LTX2TextConnectors.from_pretrained,
             model,
             subfolder="connectors",
-            torch_dtype=dtype,
+            prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
-        self.vae = AutoencoderKLLTX2Video.from_pretrained(
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLLTX2Video.from_pretrained,
             model,
             subfolder="vae",
-            torch_dtype=dtype,
+            prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
-        self.audio_vae = AutoencoderKLLTX2Audio.from_pretrained(
+        self.audio_vae = from_pretrained_with_prefetch(
+            AutoencoderKLLTX2Audio.from_pretrained,
             model,
             subfolder="audio_vae",
-            torch_dtype=dtype,
+            prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
-        self.vocoder = LTX2Vocoder.from_pretrained(
+        self.vocoder = from_pretrained_with_prefetch(
+            LTX2Vocoder.from_pretrained,
             model,
             subfolder="vocoder",
-            torch_dtype=dtype,
+            prefetch_list=ltx2_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
@@ -718,7 +748,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
     @torch.no_grad()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -1108,9 +1138,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
             audio = self.vocoder(generated_mel_spectrograms)
 
-        if not return_dict:
-            return DiffusionOutput(output=(video, audio))
-
         return DiffusionOutput(output=(video, audio))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1120,6 +1147,9 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
 class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     """LTX2TwoStagesPipeline is for two stages image to video generation"""
+
+    dummy_run_num_frames = 2
+    supports_request_batch = False
 
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
@@ -1169,7 +1199,7 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -1195,8 +1225,8 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
-    ):
-        video_latent, audio_latent = self.pipe(
+    ) -> DiffusionOutput:
+        stage1_output = self.pipe(
             req=req,
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -1224,7 +1254,8 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             return_dict=return_dict,
             attention_kwargs=attention_kwargs,
             max_sequence_length=max_sequence_length,
-        ).output
+        )
+        video_latent, audio_latent = stage1_output.output
 
         upscaled_video_latent = self.upsample_pipe(
             latents=video_latent,
@@ -1251,12 +1282,16 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             self.pipe.scheduler = new_scheduler
 
         # We only want to change num_inference_steps here, so no need
-        # to deep copy the whole request
+        # to deep copy the whole request. `req` is a DiffusionRequestBatch
+        # whose `sampling_params` is a read-only property, so clone the
+        # underlying request(s) and override their sampling params instead.
         stage_2_req = copy.copy(req)
-        stage_2_req.sampling_params = req.sampling_params.clone()
-        stage_2_req.sampling_params.num_inference_steps = 3
+        stage_2_req.requests = [copy.copy(r) for r in req.requests]
+        for stage_2_request in stage_2_req.requests:
+            stage_2_request.sampling_params = stage_2_request.sampling_params.clone()
+            stage_2_request.sampling_params.num_inference_steps = 3
 
-        video, audio = self.pipe(
+        stage2_output = self.pipe(
             req=stage_2_req,
             latents=upscaled_video_latent,
             audio_latents=audio_latent,
@@ -1268,7 +1303,8 @@ class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             generator=generator,
             output_type="np",
             return_dict=False,
-        ).output
+        )
+        video, audio = stage2_output.output
 
         return DiffusionOutput(output=(video, audio))
 

@@ -223,8 +223,12 @@ def _get_open_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_port(host: str, port: int, timeout: int = 1200) -> None:
-    """Block until the given host:port accepts connections or timeout expires."""
+def _wait_for_port(host: str, port: int, timeout: int = 1200, proc: subprocess.Popen | None = None) -> None:
+    """Block until the given host:port accepts connections or timeout expires.
+
+    If *proc* is provided, also monitors the process; raises RuntimeError
+    immediately if the server process exits before the port becomes available.
+    """
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -234,6 +238,10 @@ def _wait_for_port(host: str, port: int, timeout: int = 1200) -> None:
                     return
         except Exception:
             pass
+        if proc is not None:
+            ret = proc.poll()
+            if ret is not None:
+                raise RuntimeError(f"Server process exited with code {ret} before port {host}:{port} became ready")
         time.sleep(2)
     raise RuntimeError(f"Server did not start on {host}:{port} within {timeout}s")
 
@@ -331,7 +339,7 @@ class DiffusionServer:
             env=env,
             cwd=str(Path(__file__).parent.parent.parent.parent),
         )
-        _wait_for_port(self.host, self.port)
+        _wait_for_port(self.host, self.port, proc=self.proc)
         print(f"DiffusionServer ready on {self.host}:{self.port}")
 
     def __enter__(self):
@@ -548,6 +556,10 @@ def benchmark_params(request, diffusion_server):
 # ---------------------------------------------------------------------------
 
 
+_STAGE_METRICS_ENDPOINTS = {"/v1/chat/completions"}
+_DIFFUSION_PIPELINE_PROFILER_ARG = "enable-diffusion-pipeline-profiler"
+
+
 def run_benchmark(
     host: str,
     port: int,
@@ -599,6 +611,11 @@ def run_benchmark(
         "--output-file",
         str(tmp_result_file),
     ]
+
+    serve_args_dict = (server_cfg or {}).get("serve_args_dict")
+    profiler_enabled = isinstance(serve_args_dict, dict) and bool(serve_args_dict.get(_DIFFUSION_PIPELINE_PROFILER_ARG))
+    if endpoint in _STAGE_METRICS_ENDPOINTS and profiler_enabled:
+        cmd.append("--return-stage-metrics")
 
     for key, value in params.items():
         if key in exclude_keys or value is None:

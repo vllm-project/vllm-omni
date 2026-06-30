@@ -31,11 +31,12 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hidream_image import HiDreamImageTransformer2DModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.get_logger(__name__)
@@ -177,24 +178,55 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         # Check if model is a local path
         local_files_only = os.path.exists(model)
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the in-repo component set before any from_pretrained
+        # (``text_encoder_4`` lives in a separate Llama repo and is unaffected).
+        hidream_subfolders = [
+            "scheduler",
+            "vae",
+            "text_encoder",
+            "tokenizer",
+            "text_encoder_2",
+            "tokenizer_2",
+            "text_encoder_3",
+            "tokenizer_3",
+        ]
+        prefetch_subfolders(model, hidream_subfolders, local_files_only=local_files_only)
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
-        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKL.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=hidream_subfolders,
+            local_files_only=local_files_only,
+        ).to(self.device)
+        self.text_encoder = from_pretrained_with_prefetch(
+            CLIPTextModelWithProjection.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=hidream_subfolders,
+            local_files_only=local_files_only,
         )
         self.tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder_2", local_files_only=local_files_only
+        self.text_encoder_2 = from_pretrained_with_prefetch(
+            CLIPTextModelWithProjection.from_pretrained,
+            model,
+            subfolder="text_encoder_2",
+            prefetch_list=hidream_subfolders,
+            local_files_only=local_files_only,
         )
         self.tokenizer_2 = CLIPTokenizer.from_pretrained(
             model, subfolder="tokenizer_2", local_files_only=local_files_only
         )
-        self.text_encoder_3 = T5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder_3", local_files_only=local_files_only
+        self.text_encoder_3 = from_pretrained_with_prefetch(
+            T5EncoderModel.from_pretrained,
+            model,
+            subfolder="text_encoder_3",
+            prefetch_list=hidream_subfolders,
+            local_files_only=local_files_only,
         )
         self.tokenizer_3 = T5Tokenizer.from_pretrained(
             model, subfolder="tokenizer_3", local_files_only=local_files_only
@@ -834,7 +866,7 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] = None,
         prompt_2: str | list[str] | None = None,
         prompt_3: str | list[str] | None = None,
@@ -864,7 +896,7 @@ class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 128,
         **kwargs,
-    ):
+    ) -> DiffusionOutput:
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
         prompt = extracted_prompt or prompt
 

@@ -6,8 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -70,13 +69,13 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
-    def add_req(self, requests: OmniDiffusionRequest) -> DiffusionOutput:
-        """Add requests to the execution queue."""
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Execute request-mode work from a scheduler output."""
         pass
 
     @abstractmethod
-    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Execute request-mode work from a scheduler output."""
+    def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Execute request-mode work as a single batched RPC."""
         pass
 
     @abstractmethod

@@ -106,6 +106,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
+        pipe.transformer.set_attention_backend("_flash_3_hub")
         generator = torch.Generator(device="cuda").manual_seed(SEED)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT,
@@ -167,6 +168,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
+        pipe.transformer.set_attention_backend("_flash_3_hub")
         generator = torch.Generator(device="cuda").manual_seed(SEED_2512)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT_2512,

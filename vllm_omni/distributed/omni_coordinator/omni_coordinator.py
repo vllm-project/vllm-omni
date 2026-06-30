@@ -43,17 +43,20 @@ class OmniCoordinator:
             heartbeat_timeout: Seconds before a replica is considered
                 unhealthy if no heartbeat / update is received.
         """
-        self._router_zmq_addr = router_zmq_addr
-        self._pub_zmq_addr = pub_zmq_addr
         self._heartbeat_timeout = heartbeat_timeout
 
         # Dedicated ZMQ context for this coordinator instance.
         self._ctx = zmq.Context()
         self._router = self._ctx.socket(zmq.ROUTER)
-        self._router.bind(self._router_zmq_addr)
+        self._router.bind(router_zmq_addr)
+        # Recover the actual bound address (port=0 → real port).
+        self.router_zmq_addr = self._router.getsockopt_string(zmq.LAST_ENDPOINT)
+        self._pub_zmq_addr = pub_zmq_addr  # keep original for internal use
 
         self._pub = self._ctx.socket(zmq.PUB)
-        self._pub.bind(self._pub_zmq_addr)
+        self._pub.bind(pub_zmq_addr)
+        # Recover the actual bound address (port=0 → real port).
+        self.pub_zmq_addr = self._pub.getsockopt_string(zmq.LAST_ENDPOINT)
 
         self._replicas: dict[str, ReplicaInfo] = {}
         self._lock = threading.Lock()
@@ -186,6 +189,15 @@ class OmniCoordinator:
             self._ctx.term()
         except zmq.ZMQError:
             pass
+
+    def wait_for_shutdown(self) -> None:
+        """Block until the coordinator is asked to stop.
+
+        ``OmniCoordinatorRuntime`` runs the coordinator in a child process.
+        The child needs a small, explicit blocking lifecycle API so it does
+        not return immediately after construction.
+        """
+        self._stop_event.wait()
 
     def _parse_replica_event(self, data: dict[str, Any]) -> ReplicaEvent | None:
         """Parse wire payload dict into ReplicaEvent. Returns None if invalid."""

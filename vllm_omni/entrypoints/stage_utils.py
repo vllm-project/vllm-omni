@@ -11,9 +11,39 @@ from vllm_omni.platforms import current_omni_platform
 logger = logging.getLogger(__name__)
 
 
+def resolve_stage_physical_devices(
+    stage_id: int,
+    devices: str | int | None,
+    *,
+    visible_baseline: str | None = None,
+) -> str | None:
+    """Map logical stage devices to physical IDs without mutating process env.
+
+    When ``visible_baseline`` is provided it is used for logical-to-physical
+    mapping instead of the current device-control env var. This keeps parallel
+    stage initialization correct even if another thread has temporarily
+    narrowed ``CUDA_VISIBLE_DEVICES`` for a different stage.
+    """
+    if devices in (None, "cpu"):
+        return None
+
+    if not isinstance(devices, (int, str)):
+        raise TypeError(f"Expected str or int device IDs for stage initialization, got type {type(devices)}")
+
+    device_list = _parse_device_list(devices)
+    env_var = current_omni_platform.device_control_env_var
+    visible_devices = visible_baseline if visible_baseline is not None else os.environ.get(env_var)
+    if visible_devices is not None:
+        visible_device_list = _parse_device_list(visible_devices)
+        device_list = _map_device_list(stage_id, device_list, visible_device_list)
+    return ",".join(device_list)
+
+
 def set_stage_devices(
     stage_id: int,
     devices: str | int | None,
+    *,
+    visible_baseline: str | None = None,
 ) -> str | None:
     """Configure per-stage device visibility and current device (CUDA or NPU).
 
@@ -42,19 +72,18 @@ def set_stage_devices(
         The list of physical devices that were set for the given stage
         or None if we have no passed devices / are using cpu.
     """
-    env_var = current_omni_platform.device_control_env_var
-    vis = os.environ.get(env_var)
-
     if devices in (None, "cpu"):
         logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
         return None
 
     elif isinstance(devices, (int, str)):
-        device_list = _parse_device_list(devices)
-        if vis is not None:
-            visible_device_list = _parse_device_list(vis)
-            device_list = _map_device_list(stage_id, device_list, visible_device_list)
-        device_str = ",".join(device_list)
+        device_str = resolve_stage_physical_devices(
+            stage_id,
+            devices,
+            visible_baseline=visible_baseline,
+        )
+        if device_str is None:
+            return None
         current_omni_platform.set_device_control_env_var(device_str)
         return device_str
 
@@ -95,25 +124,25 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
     if not all(device.isdigit() for device in device_list):
         raise ValueError("Logical devices must be non-negative integers")
 
-    # Idempotency: if every requested id already names an entry in the visible
-    # pool (by value, not by index), treat the YAML field as physical and skip
-    # the remap. This avoids a double-mapping crash when a parent harness has
-    # already narrowed CUDA_VISIBLE_DEVICES to specific physical ids before
-    # spawning the subprocess (the test runtime's OmniServerStageCli does this
-    # — it sets each stage subprocess's env via ``_set_stage_device_env``).
-    # Without this guard, a YAML ``devices: "1"`` against a narrowed visible
-    # list ``["1"]`` would try ``visible[1]`` (out of range) and raise.
-    visible_set = set(visible_device_list)
-    if all(device in visible_set for device in device_list):
-        logger.info(
-            "Stage %s requested devices %s are already in the visible set %s; using as-is (no remap).",
+    logical_ids = [int(device) for device in device_list]
+
+    # If ALL logical device IDs are >= num_visible, none can be 0-based indices
+    # into the visible list — they must be physical device IDs.  This happens
+    # during multi-replica stage initialization where split_devices_for_replicas
+    # assigns physical device IDs (e.g. "2") that are not part of the current
+    # process's CUDA_VISIBLE_DEVICES but are valid physical GPUs.  Pass them
+    # through directly so the replica subprocess inherits the correct device.
+    if logical_ids and all(d >= num_visible for d in logical_ids):
+        logger.warning(
+            "Stage %s has device IDs %s, none of which are < the visible device count %d "
+            "(visible=%s). Treating them as physical device IDs and passing through.",
             stage_id,
             device_list,
+            num_visible,
             visible_device_list,
         )
         return list(device_list)
 
-    logical_ids = [int(device) for device in device_list]
     mapped_devices = [visible_device_list[idx] for idx in logical_ids if idx < num_visible]
     mapping_pairs = [
         f"{logical_id}->{visible_device_list[logical_id]}" for logical_id in logical_ids if logical_id < num_visible

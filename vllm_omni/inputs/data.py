@@ -33,6 +33,9 @@ class OmniTextPrompt(TextPrompt):
     """
 
     negative_prompt: NotRequired[str]
+    # Using modalities field to differentiate between different tasks for the same pipeline
+    # for example Cosmos3OmniDiffusersPipeline handles t2i and t2v in the same pipeline.
+    modalities: NotRequired[list[str]]
     prompt_embeds: NotRequired[torch.Tensor]
     negative_prompt_embeds: NotRequired[torch.Tensor]
     additional_information: NotRequired[dict[str, Any]]
@@ -323,6 +326,15 @@ class OmniDiffusionSamplingParams:
 
     @property
     def resolved_frame_rate(self) -> float | None:
+        """Frame rate the model should run at, or ``None`` if the user did not provide one.
+
+        Precedence is ``frame_rate`` (the model-internal rate) over ``fps`` (the
+        request/output-encoding alias). Returns ``None`` when neither was set, which is
+        the model-agnostic "fps not provided" signal the video serving layer emits when
+        the request omits fps. Consumers MUST treat ``None`` as "use your own default" and
+        guard the read (e.g. ``req.sampling_params.resolved_frame_rate or 24.0``); never
+        feed it into arithmetic unguarded.
+        """
         if self.frame_rate is not None:
             return float(self.frame_rate)
 

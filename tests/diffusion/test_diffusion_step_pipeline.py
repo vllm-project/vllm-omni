@@ -39,7 +39,8 @@ from vllm_omni.diffusion.sched.interface import (
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -111,6 +112,23 @@ class _InterruptingStepPipeline(_StepPipeline):
     def post_decode(self, state, **kwargs):
         del state, kwargs
         raise AssertionError("post_decode should not run after interrupt")
+
+
+class _FakePeakMemoryPlatform:
+    def __init__(self, reserved_mb: list[float]):
+        self._reserved_mb = reserved_mb
+        self.reset_calls = 0
+
+    def reset_peak_memory_stats(self):
+        self.reset_calls += 1
+
+    def max_memory_reserved(self):
+        index = min(self.reset_calls - 1, len(self._reserved_mb) - 1)
+        return int(self._reserved_mb[index] * 1024**2)
+
+    def max_memory_allocated(self):
+        index = min(self.reset_calls - 1, len(self._reserved_mb) - 1)
+        return int((self._reserved_mb[index] - 100) * 1024**2)
 
 
 class _IdentityNoiseTransformer(torch.nn.Module):
@@ -204,15 +222,10 @@ class _DistributedStepPipeline(CFGParallelMixin):
 
 
 def _make_step_request(num_inference_steps: int = 2):
-    return SimpleNamespace(
-        prompts=["a prompt"],
+    return OmniDiffusionRequest(
+        prompt="a prompt",
         request_id="req-1",
-        sampling_params=SimpleNamespace(
-            generator=None,
-            seed=None,
-            generator_device=None,
-            num_inference_steps=num_inference_steps,
-        ),
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_inference_steps),
     )
 
 
@@ -225,7 +238,7 @@ def _assert_aborted_output(output: DiffusionOutput, request_id: str) -> None:
 
 def _make_engine_request(req_id: str = "req-1", num_inference_steps: int = 2) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[f"prompt-{req_id}"],
+        prompt=f"prompt-{req_id}",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_inference_steps),
         request_id=req_id,
     )
@@ -248,13 +261,16 @@ def _make_runner():
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        streaming_output=False,
     )
     runner.device = torch.device("cpu")
     runner.pipeline = _StepPipeline()
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace()
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
+    )
     return runner
 
 
@@ -264,17 +280,21 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        streaming_output=False,
     )
     runner.device = device
     runner.pipeline = _DistributedStepPipeline(mode=mode, device=device)
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace()
+    runner.kv_transfer_manager = SimpleNamespace(
+        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
+    )
     return runner
 
 
 def _make_scheduler_output(req, request_id="req-1", step_id=0, finished_req_ids=None):
+    req.request_id = request_id
     return DiffusionSchedulerOutput(
         step_id=step_id,
         scheduled_new_reqs=[NewRequestData(request_id=request_id, req=req)],
@@ -298,6 +318,17 @@ def _make_batch_scheduler_output(reqs, *, step_id=0, finished_req_ids=None):
     )
 
 
+def _make_input_batch_state(request_id: str, latent_value: float) -> DiffusionRequestState:
+    state = DiffusionRequestState(
+        request_id=request_id,
+        sampling=SimpleNamespace(),
+        prompt=None,
+    )
+    state.latents = torch.tensor([[latent_value]])
+    state.timesteps = torch.tensor([1.0])
+    return state
+
+
 def _make_cached_scheduler_output(request_id="req-1", step_id=1, finished_req_ids=None):
     return DiffusionSchedulerOutput(
         step_id=step_id,
@@ -311,7 +342,7 @@ def _make_cached_scheduler_output(request_id="req-1", step_id=1, finished_req_id
 
 def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:
     engine = object.__new__(DiffusionEngine)
-    engine.od_config = SimpleNamespace(model_class_name="QwenImagePipeline")
+    engine.od_config = SimpleNamespace(model_class_name="QwenImagePipeline", streaming_output=False)
     engine.pre_process_func = None
     engine.post_process_func = None
     engine.scheduler = scheduler
@@ -375,6 +406,38 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
 
 
 @pytest.mark.cpu
+def test_input_batch_cached_repack_refreshes_state_references_without_prompt_embeds():
+    first_state = _make_input_batch_state("req-1", 1.0)
+    batch = InputBatch.make_batch([first_state])
+    assert batch.prompt_embeds is None
+
+    replacement_state = _make_input_batch_state("req-1", 2.0)
+    repacked = InputBatch.make_batch([replacement_state], cached_batch=batch)
+
+    assert repacked is batch
+    assert repacked.states[0] is replacement_state
+    assert repacked.prompt_embeds is None
+    torch.testing.assert_close(repacked.latents, replacement_state.latents)
+
+
+@pytest.mark.cpu
+def test_input_batch_cached_repack_keeps_static_prompt_fields_for_same_composition():
+    first_state = _make_input_batch_state("req-1", 1.0)
+    first_state.prompt_embeds = torch.ones(1, 2, 3)
+    first_state.prompt_embeds_mask = torch.ones(1, 2, dtype=torch.bool)
+    batch = InputBatch.make_batch([first_state])
+
+    replacement_state = _make_input_batch_state("req-1", 2.0)
+    replacement_state.prompt_embeds = torch.full((1, 2, 3), 2.0)
+    replacement_state.prompt_embeds_mask = torch.ones(1, 2, dtype=torch.bool)
+    repacked = InputBatch.make_batch([replacement_state], cached_batch=batch)
+
+    assert repacked.states[0] is replacement_state
+    torch.testing.assert_close(repacked.latents, replacement_state.latents)
+    torch.testing.assert_close(repacked.prompt_embeds, torch.ones(1, 2, 3))
+
+
+@pytest.mark.cpu
 class TestRunner:
     """DiffusionModelRunner.execute_stepwise"""
 
@@ -406,6 +469,24 @@ class TestRunner:
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
 
+    def test_carries_peak_memory_across_stepwise_request_lifecycle(self, monkeypatch):
+        runner = _make_runner()
+        req = _make_step_request()
+        fake_platform = _FakePeakMemoryPlatform([1500.0, 1200.0])
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        monkeypatch.setattr(model_runner_module, "current_omni_platform", fake_platform)
+
+        first = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        first_output = first.get_request_output("req-1")
+        assert first_output.finished is False
+        assert first_output.result is None
+
+        second = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+        second_output = second.get_request_output("req-1")
+        assert second_output.finished is True
+        assert second_output.result is not None
+        assert second_output.result.peak_memory_mb == pytest.approx(1500.0)
+
     def test_rejects_multi_request_step_batch(self):
         runner = _make_runner()
         req_1 = _make_step_request()
@@ -426,6 +507,36 @@ class TestRunner:
 
         result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
         assert len(result) == 2
+
+    def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
+        runner = _make_runner()
+        captured: dict[str, object] = {}
+        kv_payload = object()
+
+        class _CapturingStepPipeline(_StepPipeline):
+            def prepare_encode(self, state, **kwargs):
+                captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
+                return super().prepare_encode(state, **kwargs)
+
+        class _KVTransferManager:
+            def receive_multi_kv_cache_distributed(self, req, cfg_kv_collect_func=None, target_device=None):
+                captured["cfg_kv_collect_func"] = cfg_kv_collect_func
+                captured["target_device"] = target_device
+                req.sampling_params.past_key_values = kv_payload
+
+        runner.pipeline = _CapturingStepPipeline()
+        runner.pipeline.device = torch.device("cpu")
+        runner.od_config.cfg_kv_collect_func = "collect-cfg"
+        runner.kv_transfer_manager = _KVTransferManager()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        req = _make_step_request()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+
+        assert captured["past_key_values"] is kv_payload
+        assert captured["cfg_kv_collect_func"] == "collect-cfg"
+        assert captured["target_device"] == torch.device("cpu")
+        assert getattr(req.sampling_params, "past_key_values", None) is None
 
     def test_rejects_missing_cached_state(self):
         runner = _make_runner()
@@ -485,6 +596,7 @@ class TestRunner:
             step_execution=True,
             model_class_name="RequestOnlyPipeline",
             parallel_config=SimpleNamespace(use_hsdp=False),
+            streaming_output=False,
         )
         runner.device = torch.device("cpu")
         runner.pipeline = None
@@ -632,6 +744,7 @@ class TestExecutor:
 
     def test_execute_step_passes_through_runner_output(self, mocker: MockerFixture):
         executor = object.__new__(MultiprocDiffusionExecutor)
+        executor.od_config = SimpleNamespace(streaming_output=False)
         executor._ensure_open = lambda: None
         expected = RunnerOutput(request_id="req-step", step_index=1, finished=False, result=None)
         executor.collective_rpc = mocker.Mock(return_value=expected)

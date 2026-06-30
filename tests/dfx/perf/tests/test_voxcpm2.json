@@ -1,0 +1,198 @@
+[
+  {
+    "test_name": "test_voxcpm2",
+    "server_params": {
+      "model": "openbmb/VoxCPM2",
+      "trust_remote_code": true
+    },
+    "benchmark_params": [
+      {
+        "task": "voice_clone",
+        "eval_phase": "latency",
+        "dataset_name": "seed-tts",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "linyueqian/seed-tts-eval-subset",
+        "num_prompts": [
+          20
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "seed_tts_locale": "en",
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [
+            130.2115
+          ],
+          "median_audio_rtf": [
+            0.0488
+          ]
+        }
+      },
+      {
+        "task": "voice_clone",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "linyueqian/seed-tts-eval-subset",
+        "num_prompts": [
+          80
+        ],
+        "max_concurrency": [
+          8
+        ],
+        "seed_tts_locale": "en",
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [
+            475.3357
+          ],
+          "median_audio_rtf": [
+            0.1671
+          ],
+          "audio_throughput": [
+            22.8717
+          ]
+        }
+      },
+      {
+        "task": "voice_clone",
+        "eval_phase": "quality",
+        "enabled": false,
+        "dataset_name": "seed-tts",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "linyueqian/seed-tts-eval-subset",
+        "num_prompts": [
+          200
+        ],
+        "max_concurrency": [
+          4
+        ],
+        "seed_tts_locale": "en",
+        "seed_tts_wer_eval": true,
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "mean_audio_rtf": [
+            0.45
+          ]
+        }
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "latency",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [
+          20
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "voice": "default"
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [
+            75.7427
+          ],
+          "median_audio_rtf": [
+            0.0419
+          ]
+        }
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [
+          80
+        ],
+        "max_concurrency": [
+          8
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "voice": "default"
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [
+            351.5855
+          ],
+          "median_audio_rtf": [
+            0.1207
+          ],
+          "audio_throughput": [
+            73.7632
+          ]
+        }
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "stress",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [
+          100
+        ],
+        "request_rate": [
+          2.0
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "voice": "default"
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "median_audio_ttfp_ms": [
+            80.1095
+          ],
+          "median_audio_rtf": [
+            0.0485
+          ],
+          "audio_throughput": [
+            18.3715
+          ]
+        }
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "quality",
+        "enabled": false,
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [
+          200
+        ],
+        "max_concurrency": [
+          4
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "voice": "default"
+        },
+        "seed_tts_wer_eval": true,
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {
+          "mean_audio_rtf": [
+            0.35
+          ]
+        }
+      }
+    ]
+  }
+]

@@ -5,6 +5,7 @@
 Model specific tests for CacheDiT enablement.
 """
 
+import sys
 from unittest.mock import Mock, patch
 
 import pytest
@@ -12,39 +13,104 @@ import torch
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
 
 import vllm_omni.diffusion.cache.cache_dit_backend as cd_backend
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig, CacheDiTBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
+from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
+from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
 from vllm_omni.platforms import current_omni_platform
 
+# NOTE: We patch DreamID Omni's modules here with mocks so that we can import and inspect
+# the class even though the dependency may not be set up correctly; this is ok for these
+# tests because we just inspect it and never initialize the model.
+for mod in ("dreamid_omni", "dreamid_omni.modules", "dreamid_omni.modules.model"):
+    sys.modules.setdefault(mod, Mock())
+# isort: split
+from vllm_omni.diffusion.models.dreamid_omni.fusion import FusionModel as DreamIdOmniModel  # noqa: E402
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-SEPARATE_CFG_ENABLERS = [
-    cd_backend.enable_cache_for_dreamid_omni,
-    cd_backend.enable_cache_for_ltx2,
-    cd_backend.enable_cache_for_helios,
-    cd_backend.enable_cache_for_wan22,
-    cd_backend.enable_cache_for_longcat_image,
+SEPARATE_CFG_TRANSFORMERS = [
+    DreamIdOmniModel,
+    LTX2VideoTransformer3DModel,
+    HeliosTransformer3DModel,
+    LongCatImageTransformer2DModel,
+    Cosmos3VFMTransformer,
 ]
 
 SAMPLE_CACHE_CONFIG = DiffusionCacheConfig()
 
 
-@pytest.mark.parametrize("enabler", SEPARATE_CFG_ENABLERS)
+def test_wan22_vace_uses_wan22_custom_cache_dit_enabler():
+    assert cd_backend.CUSTOM_DIT_ENABLERS["Wan22VACEPipeline"] is cd_backend.enable_cache_for_wan22
+
+
+@pytest.mark.parametrize("transformer_model", SEPARATE_CFG_TRANSFORMERS)
+def test_cache_dit_configs_have_separate_cfg(transformer_model):
+    """Check models with separate CFG set has_separate_cfg=True in their configs."""
+    assert hasattr(transformer_model, "_cache_dit_adapter_config")
+    assert isinstance(transformer_model._cache_dit_adapter_config, CacheDiTAdapterConfig)
+    assert transformer_model._cache_dit_adapter_config.has_separate_cfg is True
+
+
 @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
 @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
-def test_separate_cfg(mock_cache_dit, mock_block_adapter, enabler):
-    """Ensure that custom enablers for models with separate CFG pass
-    the param through to cache_dit correctly.
-
-    Regression test for: https://github.com/vllm-project/vllm-omni/pull/2860
-    """
+def test_separate_wan22_custom_enabler_has_separate_cfg(mock_cache_dit, mock_block_adapter):
+    """Ensure that Wan22, which has a custom enabler, setts custom CFG correctly."""
     mock_pipeline = Mock()
-    enabler(mock_pipeline, SAMPLE_CACHE_CONFIG)
+    cd_backend.enable_cache_for_wan22(mock_pipeline, SAMPLE_CACHE_CONFIG)
 
     mock_cache_dit.enable_cache.assert_called_once()
     adapter_kwargs = mock_block_adapter.call_args.kwargs
     assert adapter_kwargs["has_separate_cfg"] is True
+
+
+@pytest.mark.parametrize("has_transformer_2", [False, True])
+@patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
+@patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+def test_wan22_custom_enabler_passes_taylorseer_calibrator(
+    mock_cache_dit,
+    mock_block_adapter,
+    has_transformer_2,
+):
+    mock_pipeline = Mock()
+    mock_pipeline.transformer.blocks = [Mock()]
+    if has_transformer_2:
+        mock_pipeline.transformer_2.blocks = [Mock()]
+    else:
+        mock_pipeline.transformer_2 = None
+    cache_config = DiffusionCacheConfig(enable_taylorseer=True, taylorseer_order=1)
+
+    cd_backend.enable_cache_for_wan22(mock_pipeline, cache_config)
+
+    enable_cache_kwargs = mock_cache_dit.enable_cache.call_args.kwargs
+    calibrator_config = enable_cache_kwargs["calibrator_config"]
+    assert calibrator_config is not None
+    assert calibrator_config.taylorseer_order == 1
+
+    adapter_kwargs = mock_block_adapter.call_args.kwargs
+    for modifier in adapter_kwargs["params_modifiers"]:
+        assert modifier._context_kwargs["calibrator_config"] is calibrator_config
+
+
+@patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
+@patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+def test_cosmos3_cache_dit_wraps_gen_layers(mock_cache_dit, mock_block_adapter):
+    """Cosmos3 should cache only the repeated GEN pathway blocks."""
+    mock_pipeline = Mock()
+    gen_layers = object()
+    mock_pipeline.transformer.gen_layers = gen_layers
+    mock_pipeline.transformer._cache_dit_adapter_config = Cosmos3VFMTransformer._cache_dit_adapter_config
+
+    cd_backend.enable_cache_for_cosmos3(mock_pipeline, SAMPLE_CACHE_CONFIG)
+
+    mock_cache_dit.enable_cache.assert_called_once()
+    adapter_kwargs = mock_block_adapter.call_args.kwargs
+    assert adapter_kwargs["transformer"] is mock_pipeline.transformer
+    assert adapter_kwargs["blocks"] == [gen_layers]
+    assert adapter_kwargs["has_separate_cfg"] is True
+    assert adapter_kwargs["check_forward_pattern"] is False
 
 
 # This test is skipped on ROCm since rocm_unquantized_gemm doesn't support CPU backend
