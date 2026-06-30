@@ -1145,7 +1145,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         if self._async_chunk:
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            pooler_inter, pooler_client = None, pooler_output
+            pooler_inter, pooler_client = pooler_output, pooler_output
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
         multimodal_outputs = self._build_multimodal_outputs(pooler_client)
         model_runner_output = OmniModelRunnerOutput(

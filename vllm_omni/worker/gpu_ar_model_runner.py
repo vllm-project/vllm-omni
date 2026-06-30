@@ -1654,7 +1654,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self._async_chunk:
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            pooler_inter, pooler_client = None, pooler_output
+            # Non-async-chunk still ships the full payload to the next stage via
+            # accumulate_full_payload_output; only client mm keys are split when
+            # async_chunk is enabled.
+            pooler_inter, pooler_client = pooler_output, pooler_output
 
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
