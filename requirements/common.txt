@@ -30,3 +30,7 @@ janus>=1.0.0
 msgpack>=1.0.0
 pydantic>=2.1.0
 pydantic-settings>=2.0.0
+# Required for GGUF-quantized diffusion model loading (gguf_adapters). The CI
+# base image does not ship it, so declare it explicitly. The loader also guards
+# this import so a missing gguf no longer breaks all diffusion model loading.
+gguf>=0.10.0
