@@ -545,7 +545,7 @@ def _github_issue_submit_script() -> str:
       btn.addEventListener("click", function () {{
         var expanded = scope.classList.toggle("focus-filter-scope--expanded");
         btn.setAttribute("aria-expanded", expanded ? "true" : "false");
-        btn.textContent = expanded ? "收起表格" : "展开表格";
+        btn.textContent = expanded ? "Collapse table" : "Expand table";
       }});
     }});
     applyPerfFilters(scope);
@@ -1421,10 +1421,11 @@ def _render_focus_perf_table_html(items: list[NightlyFocusItem]) -> str:
     parts: list[str] = [
         '<div class="perf-filter-scope focus-filter-scope" data-perf-filter-scope="daily-focus-regressions">',
         '<div class="perf-filter-bar focus-filter-bar">',
-        '<fieldset class="focus-model-filter"><legend>Model <span>不勾选 = All</span></legend>',
+        '<fieldset class="focus-model-filter"><legend>Model <span>No selection = All</span></legend>',
         "".join(model_checks),
         "</fieldset>",
-        '<button type="button" class="focus-expand-btn" data-focus-expand="0" aria-expanded="false">展开表格</button>',
+        '<button type="button" class="focus-expand-btn" data-focus-expand="0" '
+        'aria-expanded="false">Expand table</button>',
         "</div>",
         '<div class="table-scroll">',
         '<table class="summary focus-table">',
@@ -1469,16 +1470,19 @@ def _daily_focus_data(
     job_fail_count = int(bk_job_counts["fail"]) + int(local_job_counts["fail"])
     perf_fail_count = int(bk_perf_counts["fail"]) + int(local_perf_counts["fail"])
     if job_fail_count or perf_fail_count:
-        conclusion = f"需要关注：发现 {job_fail_count} 个测试失败/异常，{perf_fail_count} 条大型性能下降。"
+        conclusion = (
+            f"Attention needed: {job_fail_count} test failure(s)/anomaly(ies) and "
+            f"{perf_fail_count} major performance regression(s) detected."
+        )
         severity = "fail"
     elif focus_kind == "normal":
-        conclusion = "未发现大型性能下降；下方列出轻微波动观察项。"
+        conclusion = "No major performance regressions; minor fluctuations listed below for observation."
         severity = "normal"
     elif focus_items:
-        conclusion = "未发现大型性能下降。"
+        conclusion = "No major performance regressions detected."
         severity = "ok"
     else:
-        conclusion = "未发现可判定的大型性能下降；baseline 数据缺失或为空。"
+        conclusion = "No major regressions could be determined; baseline data is missing or empty."
         severity = "unknown"
     return {
         "conclusion": conclusion,
@@ -1542,7 +1546,7 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
         _heading_html(
             "h2",
             _SVG_SPARK,
-            html.escape("今日重点"),
+            html.escape("Daily focus"),
             sub=html.escape("Performance regressions and test failures"),
         ),
         f'<p class="focus-conclusion">{html.escape(str(data["conclusion"]))}</p>',
@@ -1552,7 +1556,7 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
     ]
     top_items: list[NightlyFocusItem] = data.get("top_items") or []
     if top_items:
-        label = "全部重点性能下降" if data.get("focus_kind") == "fail" else "轻微波动观察项"
+        label = "All major regressions" if data.get("focus_kind") == "fail" else "Minor fluctuation watchlist"
         parts.extend(
             [
                 f'<h3 class="focus-table-title">{html.escape(label)}</h3>',
@@ -1567,33 +1571,33 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
             notes.append(f"Local perf: {data['local_perf_message']}")
         if notes:
             parts.append(
-                '<div class="note"><strong>数据提示:</strong><ul>'
+                '<div class="note"><strong>Data note:</strong><ul>'
                 + "".join(f"<li>{html.escape(str(note))}</li>" for note in notes)
                 + "</ul></div>"
             )
         else:
-            parts.append('<p class="note">没有需要置顶展示的性能下降项。</p>')
+            parts.append('<p class="note">No performance regressions require top-level display.</p>')
     parts.append("</section>")
     return "\n".join(parts)
 
 
 def _append_daily_focus_markdown(lines: list[str], data: dict[str, Any]) -> None:
-    lines.append("## 今日重点")
+    lines.append("## Daily focus")
     lines.append("")
-    lines.append(f"- **结论:** {_md_cell(str(data['conclusion']))}")
+    lines.append(f"- **Conclusion:** {_md_cell(str(data['conclusion']))}")
     bk_jobs = data["bk_job_counts"]
     local_jobs = data["local_job_counts"]
     bk_perf = data["bk_perf_counts"]
     local_perf = data["local_perf_counts"]
     lines.append(
-        f"- **测试失败:** Buildkite `{int(bk_jobs['fail'])}/{int(bk_jobs['total'])}`，"
+        f"- **Test failures:** Buildkite `{int(bk_jobs['fail'])}/{int(bk_jobs['total'])}`, "
         f"Local `{int(local_jobs['fail'])}/{int(local_jobs['total'])}`"
     )
-    lines.append(f"- **性能 fail:** Buildkite `{int(bk_perf['fail'])}`，Local `{int(local_perf['fail'])}`")
+    lines.append(f"- **Performance fail:** Buildkite `{int(bk_perf['fail'])}`, Local `{int(local_perf['fail'])}`")
     lines.append("")
     top_items: list[NightlyFocusItem] = data.get("top_items") or []
     if top_items:
-        title = "### 全部重点性能下降" if data.get("focus_kind") == "fail" else "### 轻微波动观察项"
+        title = "### All major regressions" if data.get("focus_kind") == "fail" else "### Minor fluctuation watchlist"
         lines.append(title)
         lines.append("")
         lines.append(
@@ -1603,6 +1607,18 @@ def _append_daily_focus_markdown(lines: list[str], data: dict[str, Any]) -> None
             )
         )
         lines.append("")
+        return
+    notes = []
+    if data.get("bk_perf_status") != "ok" and data.get("bk_perf_message"):
+        notes.append(f"Buildkite perf: {data['bk_perf_message']}")
+    if data.get("local_perf_status") != "ok" and data.get("local_perf_message"):
+        notes.append(f"Local perf: {data['local_perf_message']}")
+    if notes:
+        for note in notes:
+            lines.append(f"- **Data note:** {_md_cell(str(note))}")
+    else:
+        lines.append("*No performance regressions require top-level display.*")
+    lines.append("")
 
 
 def _render_perf_model_table_html(table_id: str, rows: list[list[str]]) -> str:
