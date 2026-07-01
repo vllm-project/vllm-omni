@@ -29,7 +29,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
@@ -341,7 +341,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
@@ -395,6 +395,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
             logger.info("Using injected KV Cache (direct)")
+            injected_kv = NaiveCache.from_object(injected_kv)
             gen_context["past_key_values"] = injected_kv
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
@@ -431,6 +432,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 )
 
             if cfg_text_kv is not None:
+                cfg_text_kv = NaiveCache.from_object(cfg_text_kv)
                 cfg_text_seq_len = cfg_text_kv.key_cache[0].shape[0]
                 cfg_text_context["past_key_values"] = cfg_text_kv
                 cfg_text_context["kv_lens"] = [cfg_text_seq_len]
@@ -458,6 +460,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 else:
                     cfg_img_context["ropes"] = [cfg_img_seq_len]
             else:
+                cfg_img_kv = NaiveCache.from_object(cfg_img_kv)
                 cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = cfg_img_kv
                 cfg_img_context["kv_lens"] = [cfg_img_seq_len]
@@ -553,6 +556,8 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     for k, v in gen_input_img.items():
                         if torch.is_tensor(v):
                             gen_input_img[k] = v.to(self.device)
+                    for k in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+                        gen_input_img.pop(k, None)
                     with torch.autocast(
                         device_type=self.device.type,
                         enabled=self.device.type != "cpu",
@@ -604,7 +609,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
             # cfg_text_context: update with negative prompt (no text condition).
             # When empty, keep cfg_text_context as-is (kv_lens=0) to match
-            # original BAGEL; _merge_naive_caches handles None KV entries.
+            # original BAGEL.
             neg_prompt = extra_args.get("negative_prompt", "")
             if neg_prompt:
                 neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(

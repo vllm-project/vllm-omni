@@ -143,6 +143,11 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         return free
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.cuda.mem_get_info(device)
+        return free, total
+
+    @classmethod
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
@@ -158,10 +163,18 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
-        """Copied from vllm/platforms/rocm/platform.py v0.20.0 with force using vllm_c kernels"""
+        """Copied from upstream RocmPlatform with inductor-aware logic.
+
+        When inductor is active (compiling) use native as the default;
+        otherwise prefer vllm_c kernels where available.
+        Preserves omni-specific is_custom_op_enabled('rms_norm') check.
+        """
+        from vllm.config.compilation import CompilationMode
+
         # TODO(luka/TJ) use aiter, vllm_c, native by default on ROCm
         cc = vllm_config.compilation_config
-        default = ["vllm_c", "native"]  # Originally using "native" here when compiling
+        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        default = ["native"] if using_inductor else ["vllm_c", "native"]
 
         # This (mostly) preserves previous CustomOp behavior
         # Necessary on ROCm because it's common that users

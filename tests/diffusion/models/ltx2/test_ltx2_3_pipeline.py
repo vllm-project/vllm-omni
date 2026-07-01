@@ -465,15 +465,116 @@ class TestCFGParallelHelpers:
 class TestCFGParallelForwardPath:
     """Test the LTX-2.3 CFG-parallel denoising path without loading model weights."""
 
+    def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        pipe = object.__new__(ltx23.LTX23Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.device = torch.device("cpu")
+        pipe.tokenizer_max_length = 4
+        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 1)
+
+        class StopAtEncodePromptError(Exception):
+            pass
+
+        captured = {}
+
+        def fake_encode_prompt(**kwargs):
+            captured.update(kwargs)
+            raise StopAtEncodePromptError
+
+        object.__setattr__(pipe, "encode_prompt", fake_encode_prompt)
+
+        prompt_embeds_a = torch.zeros(2, 3)
+        prompt_embeds_b = torch.ones(2, 3)
+        negative_prompt_embeds_a = torch.full((2, 3), 2.0)
+        negative_prompt_embeds_b = torch.full((2, 3), 3.0)
+        prompt_attention_mask_a = torch.tensor([True, True])
+        prompt_attention_mask_b = torch.tensor([True, False])
+        negative_attention_mask_a = torch.tensor([False, True])
+        negative_attention_mask_b = torch.tensor([False, False])
+
+        requests = [
+            OmniDiffusionRequest(
+                prompt={
+                    "prompt": "prompt-a",
+                    "negative_prompt": "negative-a",
+                    "prompt_embeds": prompt_embeds_a,
+                    "negative_prompt_embeds": negative_prompt_embeds_a,
+                    "prompt_attention_mask": prompt_attention_mask_a,
+                    "negative_prompt_attention_mask": negative_attention_mask_a,
+                },
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=32,
+                    width=32,
+                    num_frames=1,
+                    frame_rate=1.0,
+                    num_inference_steps=2,
+                ),
+                request_id="ltx23-prompt-local-a",
+            ),
+            OmniDiffusionRequest(
+                prompt={
+                    "prompt": "prompt-b",
+                    "negative_prompt": "negative-b",
+                    "prompt_embeds": prompt_embeds_b,
+                    "negative_prompt_embeds": negative_prompt_embeds_b,
+                    "attention_mask": prompt_attention_mask_b,
+                    "negative_attention_mask": negative_attention_mask_b,
+                },
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=32,
+                    width=32,
+                    num_frames=1,
+                    frame_rate=1.0,
+                    num_inference_steps=2,
+                ),
+                request_id="ltx23-prompt-local-b",
+            ),
+        ]
+
+        with pytest.raises(StopAtEncodePromptError):
+            pipe.forward(DiffusionRequestBatch(requests=requests))
+
+        assert captured["prompt"] is None
+        assert captured["negative_prompt"] is None
+        torch.testing.assert_close(
+            captured["prompt_embeds"],
+            torch.stack([prompt_embeds_a, prompt_embeds_b], dim=0),
+        )
+        torch.testing.assert_close(
+            captured["negative_prompt_embeds"],
+            torch.stack([negative_prompt_embeds_a, negative_prompt_embeds_b], dim=0),
+        )
+        torch.testing.assert_close(
+            captured["prompt_attention_mask"],
+            torch.stack([prompt_attention_mask_a, prompt_attention_mask_b], dim=0),
+        )
+        torch.testing.assert_close(
+            captured["negative_prompt_attention_mask"],
+            torch.stack([negative_attention_mask_a, negative_attention_mask_b], dim=0),
+        )
+
     @pytest.mark.parametrize(("cfg_rank", "expected_prompt_value"), [(0, 1.0), (1, 0.0)])
+    @pytest.mark.parametrize(
+        ("frame_rate_input", "audio_sampling_rate", "expected_frame_rate"),
+        [(1.0, 1, 1.0), (None, 24, 24.0)],
+    )
     def test_forward_cfg_parallel_steps_video_and_audio_scheduler(
         self,
         monkeypatch,
         cfg_rank,
         expected_prompt_value,
+        frame_rate_input,
+        audio_sampling_rate,
+        expected_frame_rate,
     ):
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         pipe = object.__new__(ltx23.LTX23Pipeline)
@@ -484,7 +585,7 @@ class TestCFGParallelForwardPath:
         pipe.vae_temporal_compression_ratio = 1
         pipe.transformer_spatial_patch_size = 1
         pipe.transformer_temporal_patch_size = 1
-        pipe.audio_sampling_rate = 1
+        pipe.audio_sampling_rate = audio_sampling_rate
         pipe.audio_hop_length = 1
         pipe.audio_vae_temporal_compression_ratio = 1
         pipe.audio_vae_mel_compression_ratio = 1
@@ -553,8 +654,11 @@ class TestCFGParallelForwardPath:
                 assert prompt_embeds.shape[0] == 2
                 return prompt_embeds, prompt_embeds, prompt_attention_mask
 
+        rope_video_fps: list[float] = []
+
         class FakeRope:
             def prepare_video_coords(self, batch_size, num_frames, height, width, device, fps):
+                rope_video_fps.append(fps)
                 return torch.zeros(batch_size, num_frames * height * width, 3, device=device)
 
             def prepare_audio_coords(self, batch_size, num_frames, device):
@@ -606,12 +710,12 @@ class TestCFGParallelForwardPath:
         video_latents = torch.tensor([[[1.0, -2.0]]])
         audio_latents = torch.tensor([[[0.5, 3.0]]])
         req = OmniDiffusionRequest(
-            prompts=[{"prompt": "prompt", "negative_prompt": "negative"}],
+            prompt={"prompt": "prompt", "negative_prompt": "negative"},
             sampling_params=OmniDiffusionSamplingParams(
                 height=32,
                 width=32,
                 num_frames=1,
-                frame_rate=1.0,
+                frame_rate=frame_rate_input,
                 num_inference_steps=2,
                 guidance_scale=4.0,
                 latents=video_latents,
@@ -621,7 +725,7 @@ class TestCFGParallelForwardPath:
             request_id="ltx23-cfg-parallel-forward-test",
         )
 
-        output = pipe.forward(req)
+        output = pipe.forward(DiffusionRequestBatch(requests=[req]))[0]
 
         expected_video_noise = ltx23.LTX23Pipeline._combine_x0_space_cfg(
             video_latents,
@@ -650,6 +754,11 @@ class TestCFGParallelForwardPath:
         video_out, audio_out = output.output
         torch.testing.assert_close(video_out, (video_latents - 2 * expected_video_noise).reshape(1, 2, 1, 1, 1))
         torch.testing.assert_close(audio_out, (audio_latents - 2 * expected_audio_noise).reshape(1, 1, 1, 2))
+
+        # fps regression guard: an omitted request fps (frame_rate_input=None) must resolve
+        # to the model's own 24.0 default, not crash on None; a provided rate is passed through.
+        assert rope_video_fps
+        assert all(fps == expected_frame_rate for fps in rope_video_fps)
 
 
 class TestRegistryIntegration:
@@ -692,16 +801,27 @@ class TestRegistryIntegration:
             assert name in _DIFFUSION_POST_PROCESS_FUNCS, f"{name} not in _DIFFUSION_POST_PROCESS_FUNCS"
             assert _DIFFUSION_POST_PROCESS_FUNCS[name] == "get_ltx2_post_process_func"
 
-    def test_cache_dit_enablers_registered(self):
-        """Pipeline variants must be registered in CUSTOM_DIT_ENABLERS."""
+    def test_cache_dit_for_ltx2_does_not_have_custom_enablers_registered(self):
+        """Pipeline variants are *not* registered in CUSTOM_DIT_ENABLERS."""
         from vllm_omni.diffusion.cache.cache_dit_backend import CUSTOM_DIT_ENABLERS
 
+        # NOTE: We used to have custom enablers for this model, but refactored to handle
+        # it more generically. Now we only need to ensure it has git cache adapter config.
         expected = [
             "LTX23Pipeline",
             "LTX23ImageToVideoPipeline",
         ]
         for name in expected:
-            assert name in CUSTOM_DIT_ENABLERS, f"{name} not in CUSTOM_DIT_ENABLERS"
+            assert name not in CUSTOM_DIT_ENABLERS, f"{name} not in CUSTOM_DIT_ENABLERS"
+
+    def test_ltx2_transformer_has_dit_cache_config(self):
+        """Ensure LTX2 has a Cache DiT adapter config and that it uses separate CFG."""
+        from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+        from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
+
+        adapter_config = getattr(LTX2VideoTransformer3DModel, "_cache_dit_adapter_config")
+        assert isinstance(adapter_config, CacheDiTAdapterConfig)
+        assert adapter_config.has_separate_cfg
 
 
 class TestVocoderSampleRateDetection:

@@ -43,10 +43,10 @@ def _make_pipeline(cls):
     return pipeline
 
 
-def _make_request(prompts=None, **sp_kwargs) -> OmniDiffusionRequest:
+def _make_request(prompt=None, **sp_kwargs) -> OmniDiffusionRequest:
     sp = OmniDiffusionSamplingParams(**sp_kwargs)
     return OmniDiffusionRequest(
-        prompts=prompts or [{"prompt": "a cat dancing"}],
+        prompt=prompt if prompt is not None else {"prompt": "a cat dancing"},
         sampling_params=sp,
         request_id="dmd2-sanitize",
     )
@@ -133,35 +133,23 @@ def test_is_cfg_negative_forced_false(pipeline):
 
 
 def test_negative_prompt_stripped_from_prompt_dict(pipeline):
-    req = _make_request(prompts=[{"prompt": "a cat", "negative_prompt": "blurry"}])
+    req = _make_request(prompt={"prompt": "a cat", "negative_prompt": "blurry"})
     pipeline._sanitize_dmd2_request(req)
-    assert "negative_prompt" not in req.prompts[0]
-    assert req.prompts[0]["prompt"] == "a cat"
+    assert "negative_prompt" not in req.prompt
+    assert req.prompt["prompt"] == "a cat"
 
 
 def test_no_negative_prompt_unchanged(pipeline):
-    req = _make_request(prompts=[{"prompt": "a cat"}])
+    req = _make_request(prompt={"prompt": "a cat"})
     pipeline._sanitize_dmd2_request(req)
-    assert req.prompts[0] == {"prompt": "a cat"}
+    assert req.prompt == {"prompt": "a cat"}
 
 
 def test_string_prompt_not_mutated(pipeline):
     """String prompts (not dicts) must pass through unchanged."""
-    req = _make_request(prompts=["a cat dancing"])
+    req = _make_request(prompt="a cat dancing")
     pipeline._sanitize_dmd2_request(req)
-    assert req.prompts == ["a cat dancing"]
-
-
-def test_multiple_prompts_all_sanitized(pipeline):
-    req = _make_request(
-        prompts=[
-            {"prompt": "a cat", "negative_prompt": "blurry"},
-            {"prompt": "a dog", "negative_prompt": "ugly"},
-        ]
-    )
-    pipeline._sanitize_dmd2_request(req)
-    for p in req.prompts:
-        assert "negative_prompt" not in p
+    assert req.prompt == "a cat dancing"
 
 
 # ---------------------------------------------------------------------------

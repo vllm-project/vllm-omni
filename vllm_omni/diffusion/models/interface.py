@@ -56,15 +56,19 @@ class SupportsStepExecution(Protocol):
 
     def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
         """Prepare request-level inputs and return initialized state."""
+        ...
 
     def denoise_step(self, input_batch: InputBatch, **kwargs: Any) -> torch.Tensor | None:
         """Run one denoise forward on the runner-assembled batch."""
+        ...
 
     def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
         """Run one scheduler step."""
+        ...
 
     def post_decode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput:
-        """Decode output after denoise loop."""
+        """Decode output after denoise loop or at a partial chunk boundary."""
+        ...
 
 
 @runtime_checkable

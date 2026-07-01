@@ -24,7 +24,7 @@ Check the model's HF repo for `model_index.json`. This determines your path:
 
 | Scenario | How to identify | Migration path |
 |----------|----------------|----------------|
-| **Already supported** | `_class_name` in `model_index.json` matches a key in `_DIFFUSION_MODELS` in `registry.py` | Skip to Step 5 (test) and Step 7 (docs) |
+| **Already supported** | `_class_name` in `model_index.json` matches a key in `_DIFFUSION_MODELS` in `registry.py` | Skip implementation, then validate model-specific examples, tests, and docs as needed |
 | **Diffusers-based** | Has standard `model_index.json` with `_diffusers_version`, subfolders for `transformer/`, `vae/`, etc. | Follow **Path A** below |
 | **Custom/private repo** | No diffusers `model_index.json`, weights in non-standard format, custom model code in a separate git repo | Follow **Path B** below |
 | **Hybrid** | Has some diffusers components (VAE) but custom transformer/fusion | Mix of Path A and Path B |
@@ -52,7 +52,7 @@ vllm_omni/diffusion/models/your_model_name/
 2. Replace attention with `vllm_omni.diffusion.attention.layer.Attention` (QKV shape: `[B, seq, heads, head_dim]`).
 3. Add `od_config: OmniDiffusionConfig | None = None` to `__init__`.
 4. Add `load_weights()` method mapping diffusers weight names to vllm-omni names.
-5. Add class attributes: `_repeated_blocks`, `_layerwise_offload_blocks_attr`.
+5. Add class attributes for acceleration features such as `_repeated_blocks` and `_layerwise_offload_blocks_attrs` (see [references/transformer-adaptation.md](references/transformer-adaptation.md) for examples).
 
 ### A4. Adapt pipeline
 
@@ -78,13 +78,34 @@ class YourPipeline(nn.Module):
 
 Add post/pre-process functions in the same pipeline file. Register them in `registry.py`.
 
+### A4.1 Add progress bar support (recommended)
+
+For pipelines with a standard denoising loop, prefer the existing progress bar pattern instead of hand-rolled logging.
+
+```python
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+
+class YourPipeline(nn.Module, ProgressBarMixin):
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        # ... prepare timesteps / latents ...
+        with self.progress_bar(total=len(timesteps)) as progress_bar:
+            for i, t in enumerate(timesteps):
+                # predict noise / scheduler step
+                latents = ...
+                progress_bar.update()
+
+        return DiffusionOutput(output=output)
+```
+
+For custom loop structures, follow `vllm_omni/diffusion/models/progress_bar.py` and existing pipelines using `ProgressBarMixin`.
+
 ### A5. Register, test, docs → continue at Step 4 below.
 
 ---
 
 ## Path B: Custom/Private Repo Model
 
-For models without a diffusers pipeline — weights in custom format, model code in a private repo. Real examples: DreamID-Omni, BAGEL, HunyuanImage3.
+For models without a diffusers pipeline — weights in custom format, model code in a private repo. Real examples: DreamID-Omni, BAGEL, HunyuanImage3. See [references/custom-model-patterns.md](references/custom-model-patterns.md) for concrete custom-model integration patterns.
 
 ### B1. Understand the reference repo
 
@@ -134,7 +155,7 @@ Copy the essential model files into `vllm_omni/diffusion/models/<name>/` and ada
 
 ### B4. Handle custom weight loading
 
-Custom models have two patterns for weight loading:
+Custom models have two common patterns for weight loading:
 
 **Pattern 1: Bypass standard loader** (DreamID-Omni style)
 
@@ -149,8 +170,10 @@ class CustomPipeline(nn.Module):
         self.vae = custom_init_vae(model, device=self.device)
         self.text_encoder = custom_init_text_encoder(model, device=self.device)
         self.transformer = CustomFusionModel(CONFIG)
-        load_custom_checkpoint(self.transformer,
-            checkpoint_path=os.path.join(model, "model.safetensors"))
+        load_custom_checkpoint(
+            self.transformer,
+            checkpoint_path=os.path.join(model, "model.safetensors"),
+        )
         # NO weights_sources defined — bypasses standard loader
 
     def load_weights(self, weights):
@@ -162,6 +185,8 @@ class CustomPipeline(nn.Module):
 When weights are in safetensors format but need name remapping:
 
 ```python
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
 class CustomPipeline(nn.Module):
     def __init__(self, *, od_config, prefix=""):
         super().__init__()
@@ -187,7 +212,9 @@ class CustomPipeline(nn.Module):
             # Remap original weight names to vllm-omni module names
             name = self._remap_weight_name(name)
             if name in params:
-                default_weight_loader(params[name], tensor)
+                param = params[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, tensor)
                 loaded.add(name)
         return loaded
 ```
@@ -281,12 +308,12 @@ For Omni or custom models, create:
 ### Step 7: Update Documentation
 
 Required updates:
-1. `docs/user_guide/diffusion/parallelism_acceleration.md` — parallelism support table
+1. `docs/user_guide/diffusion/parallelism/overview.md` — parallelism support overview/table
 2. `docs/user_guide/diffusion/cpu_offload_diffusion.md` — if CPU offload supported (add to supported models table)
-3. `docs/user_guide/diffusion/teacache.md` — if TeaCache supported
-4. `docs/user_guide/diffusion/cache_dit_acceleration.md` — if Cache-DiT supported
-5. `examples/offline_inference/xxx/README.md` — offline example docs
-6. `examples/online_serve/xxx/README.md` — online serve docs
+3. `docs/user_guide/diffusion/cache_acceleration/teacache.md` — if TeaCache supported
+4. `docs/user_guide/diffusion/cache_acceleration/cache_dit.md` — if Cache-DiT supported
+5. Offline example docs under `examples/offline_inference/<name>/` (`README.md` or category-specific `.md`)
+6. `examples/online_serving/<name>/README.md` — online serving docs
 
 ### Step 8: Add E2E Tests
 
@@ -537,7 +564,7 @@ class YourTransformer(nn.Module):
 #### 10e. Update parallelism documentation
 
 After adding parallelism support, update:
-1. `docs/user_guide/diffusion/parallelism_acceleration.md` — add your model to the support table
+1. `docs/user_guide/diffusion/parallelism/overview.md` — add your model to the support overview/table
 2. Record which parallelism methods are supported (USP, Ring, CFG, TP, HSDP, VAE-Patch)
 
 ### Step 11: Add CPU Offload Support

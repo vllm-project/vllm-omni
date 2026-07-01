@@ -38,12 +38,50 @@ from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
+
+
+def _normalize_pipeline_outputs(
+    outputs: object,
+    *,
+    expected_count: int,
+    allow_single_output: bool,
+    pipeline_name: str,
+) -> list[DiffusionOutput]:
+    if isinstance(outputs, DiffusionOutput):
+        if allow_single_output and expected_count == 1:
+            return [outputs]
+        raise RuntimeError(
+            f"{pipeline_name}.forward returned a single DiffusionOutput; "
+            "request-batch forward must return list[DiffusionOutput]."
+        )
+
+    if not isinstance(outputs, list):
+        raise RuntimeError(
+            f"{pipeline_name}.forward returned {type(outputs).__name__}; "
+            "expected DiffusionOutput or list[DiffusionOutput]."
+        )
+
+    if len(outputs) != expected_count:
+        raise RuntimeError(
+            f"{pipeline_name}.forward returned {len(outputs)} outputs for {expected_count} requests; "
+            "expected exactly one DiffusionOutput per request."
+        )
+
+    bad_index = next((idx for idx, output in enumerate(outputs) if not isinstance(output, DiffusionOutput)), None)
+    if bad_index is not None:
+        raise RuntimeError(
+            f"{pipeline_name}.forward returned list item {bad_index} with type "
+            f"{type(outputs[bad_index]).__name__}; expected DiffusionOutput."
+        )
+
+    return outputs
 
 
 class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
@@ -80,14 +118,29 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
 
-        # Initialize KV cache manager for connector management
+        # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+
+        # Prefetch covers TP / SP / CFG-Parallel / HSDP.  Disabled when a CFG
+        # companion KV collector is set (that KV is not backgrounded).
+        has_cfg_companion_kv = getattr(od_config, "cfg_kv_collect_func", None) is not None
+
+        self._kv_prefetch_enabled = (
+            bool(self.kv_transfer_manager.config.enable_kv_async_prefetch)
+            and not has_cfg_companion_kv
+            and self.kv_transfer_manager.config.need_recv_cache
+        )
+
+    @property
+    def target_device(self) -> torch.device | None:
+        return getattr(self.pipeline, "device", None)
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
         if model is None:
             return
+
         try:
             setattr(self.pipeline, attr_name, regionally_compile(model, dynamic=True))
             logger.info("Model runner: %s compiled with torch.compile.", attr_name)
@@ -152,10 +205,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         logger.info("Model runner: Model loaded successfully.")
 
+        if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
+            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+            self.od_config.step_execution = True
+
         if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                f"{self.od_config.model_class_name} does not support that contract."
+            )
+        if self.od_config.streaming_output and not self.supports_step_mode():
+            raise ValueError(
+                "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
@@ -232,12 +294,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return None
         return self.prompt_embed_cache.stats()
 
-    def _record_peak_memory(self, output: DiffusionOutput) -> None:
-        """Record peak GPU memory for the current forward pass into output.
+    def _sample_peak_memory_mb(self) -> float:
+        """Return peak GPU memory for the current forward pass in MB.
 
-        Must be called immediately after pipeline.forward(), with
+        Must be called immediately after the measured forward/step work, with
         reset_peak_memory_stats() called just before it, so the measurement
-        reflects this request only and not the global historical maximum.
+        reflects the current execution slice and not the global historical
+        maximum.
 
         Uses max_memory_reserved (CUDA memory pool high-water mark) rather than
         max_memory_allocated so that allocator fragmentation is also visible.
@@ -246,7 +309,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         peak_reserved_bytes = current_omni_platform.max_memory_reserved()
         peak_allocated_bytes = current_omni_platform.max_memory_allocated()
 
-        output.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
         peak_allocated_gb = peak_allocated_bytes / (1024**3)
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
@@ -258,8 +321,173 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb,
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
+        return peak_memory_mb
 
-    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def _prepare_request_for_forward(
+        self,
+        req: OmniDiffusionRequest,
+        *,
+        od_config: OmniDiffusionConfig,
+        kv_prefetch_jobs: dict | None = None,
+        use_prefetch: bool = False,
+    ) -> None:
+        # Receive AR KV. Single-request execution can use the prefetch path:
+        # consume prior-forward payload, sync-fallback on miss; request-batch
+        # execution keeps the synchronous per-request receive path.
+        kv_recv_t0 = time.perf_counter()
+        if use_prefetch and self._kv_prefetch_enabled:
+            self.kv_transfer_manager.consume_and_distribute_kv_cache(
+                req,
+                target_device=self.target_device,
+            )
+        else:
+            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                req,
+                cfg_kv_collect_func=getattr(od_config, "cfg_kv_collect_func", None),
+                target_device=self.target_device if use_prefetch else getattr(self.pipeline, "device", None),
+            )
+        kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
+        logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
+
+        # Kick off the next request's prefetch (+ H2D) to overlap this forward.
+        if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
+            self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
+
+        if req.sampling_params.generator is None and req.sampling_params.seed is not None:
+            if req.sampling_params.generator_device is not None:
+                gen_device = req.sampling_params.generator_device
+            elif self.device.type == "cpu":
+                gen_device = "cpu"
+            else:
+                gen_device = self.device
+            req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+
+    def _refresh_cache_for_requests(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        *,
+        od_config: OmniDiffusionConfig,
+    ) -> None:
+        first_req = reqs[0]
+        if (
+            getattr(first_req, "skip_cache_refresh", False)
+            or self.cache_backend is None
+            or not self.cache_backend.is_enabled()
+        ):
+            return
+
+        # Refresh cache context if needed. Batch admission groups requests by
+        # SamplingParamsKey, so the first request's num_inference_steps applies
+        # to the whole runner batch.
+        num_inference_steps = first_req.sampling_params.num_inference_steps
+        if num_inference_steps is None and od_config.cache_backend in (
+            "tea_cache",
+            "step_cache",
+        ):
+            # When num_inference_steps is None, some pipelines defer to their
+            # own defaults. TeaCache refresh ignores this value; step_cache
+            # refresh is a no-op because per-chunk state resets in the denoise
+            # loop. Use the pipeline default when available to keep refresh
+            # behavior aligned with single-request execution.
+            num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
+
+        if num_inference_steps is not None:
+            self.cache_backend.refresh(self.pipeline, num_inference_steps)
+        else:
+            logger.warning(
+                "Failed to refresh the diffusion transformer cache; backend %s "
+                "currently requires num_inference_steps to be passed explicitly",
+                od_config.cache_backend,
+            )
+
+    def _runner_output_from_outputs(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        outputs: list[DiffusionOutput],
+    ) -> BatchRunnerOutput:
+        return BatchRunnerOutput.from_list(
+            [
+                RunnerOutput(
+                    request_id=reqs[i].request_id,
+                    step_index=None,
+                    finished=True,
+                    result=outputs[i],
+                )
+                for i in range(len(reqs))
+            ]
+        )
+
+    def _execute_request_list(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        *,
+        od_config: OmniDiffusionConfig,
+        allow_single_output: bool,
+        require_request_batch_support: bool,
+        kv_prefetch_jobs: dict | None = None,
+        record_name: str,
+    ) -> BatchRunnerOutput:
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not reqs:
+            return BatchRunnerOutput.from_list([])
+        for req in reqs:
+            if req.prompt is None:
+                raise ValueError("Cannot execute model with empty prompt")
+        if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
+            raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
+
+        # Use no_grad() for HSDP compatibility, inference_mode() otherwise for
+        # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
+        # counters, which inference tensors do not track.
+        use_hsdp = od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            for req in reqs:
+                self._prepare_request_for_forward(
+                    req,
+                    od_config=od_config,
+                    kv_prefetch_jobs=kv_prefetch_jobs,
+                    use_prefetch=allow_single_output,
+                )
+
+            self._refresh_cache_for_requests(reqs, od_config=od_config)
+
+            batch = DiffusionRequestBatch(requests=reqs)
+            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            if is_primary:
+                current_omni_platform.reset_peak_memory_stats()
+
+            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
+                with record_function(record_name):
+                    raw_outputs = self.pipeline.forward(batch)
+                    outputs = _normalize_pipeline_outputs(
+                        raw_outputs,
+                        expected_count=len(reqs),
+                        allow_single_output=allow_single_output,
+                        pipeline_name=type(self.pipeline).__name__,
+                    )
+
+            if is_primary and outputs:
+                batch_peak_memory_mb = self._sample_peak_memory_mb()
+                for output in outputs:
+                    output.peak_memory_mb = max(output.peak_memory_mb, batch_peak_memory_mb)
+
+            # Log prompt-embed cache activity; hits/misses accumulate across requests.
+            prompt_embed_cache = getattr(self, "prompt_embed_cache", None)
+            if is_primary and prompt_embed_cache is not None:
+                logger.debug("prompt-embed cache: %s", prompt_embed_cache.stats())
+
+            if (
+                self.cache_backend is not None
+                and self.cache_backend.is_enabled()
+                and od_config.cache_backend == "cache_dit"
+                and od_config.enable_cache_dit_summary
+            ):
+                cache_summary(self.pipeline, details=True)
+
+        return self._runner_output_from_outputs(reqs, outputs)
+
+    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
@@ -275,90 +503,37 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             not track. For non-HSDP inference, we use torch.inference_mode() for better
             performance.
         """
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if len(req.prompts) == 0:
-            raise ValueError("Cannot execute model with empty request list")
+        runner_output = self._execute_request_list(
+            [req],
+            od_config=self.od_config,
+            allow_single_output=True,
+            require_request_batch_support=False,
+            kv_prefetch_jobs=kv_prefetch_jobs,
+            record_name="pipeline_forward",
+        )
+        output = runner_output.runner_outputs[0].result
+        assert output is not None
+        return output
 
-        # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
-        use_hsdp = self.od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
-            # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                req,
-                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                target_device=getattr(self.pipeline, "device", None),
-            )
+    def execute_model_batch(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        od_config: OmniDiffusionConfig,
+    ) -> BatchRunnerOutput:
+        """Execute scheduled request-mode requests through the batch forward path.
 
-            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-                if req.sampling_params.generator_device is not None:
-                    gen_device = req.sampling_params.generator_device
-                elif self.device.type == "cpu":
-                    gen_device = "cpu"
-                else:
-                    gen_device = self.device
-                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
-
-            # Refresh cache context if needed
-            if (
-                not getattr(req, "skip_cache_refresh", False)
-                and self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-            ):
-                # FIXME (Alex): When num_inference_steps is None, we defer to
-                # pipelines for default, but don't refresh the cache; the right
-                # way to do this is to merge the sampling params first.
-                #
-                # For now, if num_inference_steps is not set, we pass 0 to allow
-                # TeaCache to refresh to align with the param signature. This is
-                # okay to force refresh TeaCache because the refresh does not use
-                # num_inference_steps at all (i.e., just resets state and clears
-                # stale residuals).
-                num_inference_steps = req.sampling_params.num_inference_steps
-                if num_inference_steps is None and self.od_config.cache_backend in (
-                    "tea_cache",
-                    "step_cache",
-                ):
-                    # TeaCache refresh ignores the value; step_cache refresh is a
-                    # no-op (per-chunk state resets in the denoise loop). DreamZero often
-                    # leaves sampling_params.num_inference_steps unset and uses the
-                    # pipeline default instead.
-                    num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
-
-                if num_inference_steps is not None:
-                    self.cache_backend.refresh(self.pipeline, num_inference_steps)
-                else:
-                    logger.warning(
-                        "Failed to refresh the diffusion transformer cache; backend %s "
-                        "currently requires num_inference_steps to be passed explicitly",
-                        self.od_config.cache_backend,
-                    )
-
-            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if is_primary:
-                current_omni_platform.reset_peak_memory_stats()
-
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-                with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(req)
-
-            if is_primary:
-                self._record_peak_memory(output)
-
-            # Log prompt-embed cache activity (hits/misses accumulate across requests).
-            if is_primary and self.prompt_embed_cache is not None:
-                logger.debug("prompt-embed cache: %s", self.prompt_embed_cache.stats())
-
-            # NOTE:
-            if (
-                self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-                and self.od_config.cache_backend == "cache_dit"
-                and self.od_config.enable_cache_dit_summary
-            ):
-                cache_summary(self.pipeline, details=True)
-
-            return output
+        Builds a ``DiffusionRequestBatch`` from scheduled new requests, runs
+        per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
+        must declare ``supports_request_batch = True``.
+        """
+        reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
+        return self._execute_request_list(
+            reqs,
+            od_config=od_config,
+            allow_single_output=False,
+            require_request_batch_support=True,
+            record_name="pipeline_forward_batch",
+        )
 
     # ------------------------------------------------------------------
     # Step-wise execution
@@ -381,21 +556,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             # process new requests
             for sched_new_req in scheduler_output.scheduled_new_reqs:
                 request_id = sched_new_req.request_id
-                req = sched_new_req.req
                 new_request_ids.append(request_id)
                 if request_id in self.state_cache:
                     raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
                 new_state = DiffusionRequestState(
                     request_id=request_id,
-                    sampling=copy.deepcopy(req.sampling_params),
-                    prompts=req.prompts,
+                    sampling=copy.deepcopy(sched_new_req.req.sampling_params),
+                    prompt=sched_new_req.req.prompt,
+                    kv_sender_info=sched_new_req.req.kv_sender_info,
                 )
-                state_req = copy.copy(req)
+                state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
                 self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     state_req,
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=getattr(self.pipeline, "device", None),
+                    target_device=self.target_device,
                 )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
@@ -457,7 +632,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         scatter_latents(states, input_batch)
 
         for state in states:
-            if interrupted or state.denoise_completed:
+            if interrupted or state.request_denoise_completed:
                 self.state_cache.pop(state.request_id, None)
 
     def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
@@ -486,13 +661,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             states, new_request_ids = self._update_states(scheduler_output)
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = self._prepare_attn_metadata(input_batch)
+            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            if is_primary:
+                current_omni_platform.reset_peak_memory_stats()
 
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
-                noise_pred = self.pipeline.denoise_step(input_batch)
+                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
@@ -511,27 +689,71 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     offset = 0
                     for req in states:
                         row_num = req.latents.shape[0]
-                        self.pipeline.step_scheduler(
-                            req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                        )
-                        offset = offset + row_num
-                        if req.denoise_completed:
-                            result = self.pipeline.post_decode(req)
-                        else:
-                            result = None
-                        runner_output_list.append(
-                            RunnerOutput(
-                                request_id=req.request_id,
-                                step_index=req.step_index,
-                                finished=req.denoise_completed,
-                                result=result,
+                        try:
+                            self.pipeline.step_scheduler(
+                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                             )
-                        )
+                            offset = offset + row_num
+                            if self.od_config.streaming_output:
+                                should_decode = req.chunk_denoise_completed
+                            else:
+                                should_decode = req.denoise_completed
+
+                            if should_decode:
+                                result = self.pipeline.post_decode(req)
+                            else:
+                                result = None
+                            # finished should be computed after post_decode() advanced chunk_index
+                            finished = (
+                                req.request_denoise_completed
+                                if self.od_config.streaming_output
+                                else req.denoise_completed
+                            )
+                            runner_output_list.append(
+                                RunnerOutput(
+                                    request_id=req.request_id,
+                                    step_index=req.step_index,
+                                    finished=finished,
+                                    result=result,
+                                )
+                            )
+                        except Exception as per_req_exc:
+                            offset = offset + row_num
+                            logger.error(
+                                "Stepwise per-request error for %s: %s",
+                                req.request_id,
+                                per_req_exc,
+                                exc_info=True,
+                            )
+                            runner_output_list.append(
+                                RunnerOutput(
+                                    request_id=req.request_id,
+                                    step_index=req.step_index,
+                                    finished=True,
+                                    result=DiffusionOutput(error=str(per_req_exc)),
+                                )
+                            )
 
                     if noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."
+                        )
+
+                if is_primary:
+                    batch_peak_memory_mb = self._sample_peak_memory_mb()
+                    states_by_id = {state.request_id: state for state in states}
+                    for state in states:
+                        state.peak_memory_mb = max(state.peak_memory_mb, batch_peak_memory_mb)
+                    for runner_output in runner_output_list:
+                        if runner_output.result is None:
+                            continue
+                        state = states_by_id.get(runner_output.request_id)
+                        if state is None:
+                            continue
+                        runner_output.result.peak_memory_mb = max(
+                            runner_output.result.peak_memory_mb,
+                            state.peak_memory_mb,
                         )
 
                 self._update_states_after(states, input_batch, pipeline_interrupted)

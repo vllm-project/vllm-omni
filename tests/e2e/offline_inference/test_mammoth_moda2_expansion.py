@@ -99,7 +99,7 @@ def _sample_pixels(img_tensor: torch.Tensor) -> list[float]:
 # End-to-end test
 # ---------------------------------------------------------------------------
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]

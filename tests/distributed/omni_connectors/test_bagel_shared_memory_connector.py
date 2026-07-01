@@ -7,7 +7,7 @@ End-to-end tests for Bagel with shared memory connector: img2img and text2img.
 - img2img: validates output vs reference pixels within a ±10 tolerance.
 - text2img: validates output vs reference pixels within a ±5 tolerance
   (equivalent to `examples/offline_inference/bagel/end2end.py` with
-  text2img modality and 15 steps).
+  text2img modality and 14 steps).
 """
 
 import os
@@ -45,7 +45,6 @@ REFERENCE_PIXELS = [
     {"position": (700, 600), "rgb": (100, 87, 94)},
     {"position": (256, 256), "rgb": (181, 201, 221)},
 ]
-
 
 # text2img reference pixels (aligned with offline `bagel/end2end.py` text2img, 15 steps)
 # "Generated with seed=52, num_inference_steps=15,
@@ -228,7 +227,6 @@ def _resolve_deploy_config(config_path: str, run_level: str) -> str:
     return config_path
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
@@ -245,7 +243,6 @@ def test_bagel_img2img_shared_memory_connector(run_level):
             _validate_pixels(generated_image)
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})

@@ -60,7 +60,7 @@ def _write_synthetic_dreamzero_videos(client_mod, video_dir: Path) -> None:
         _write_synthetic_video(video_dir / file_name, client_mod.cv2, channel=channel)
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.distributed_cuda
 @hardware_test(res={"cuda": "H100"}, num_cards=2)

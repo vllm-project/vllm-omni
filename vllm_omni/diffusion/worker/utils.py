@@ -40,7 +40,8 @@ class DiffusionRequestState:
     # ── Identity / request-level inputs ──
     request_id: str
     sampling: OmniDiffusionSamplingParams
-    prompts: list[OmniPromptType] | None = None
+    prompt: OmniPromptType | None = None
+    kv_sender_info: dict | None = None
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None
@@ -54,6 +55,12 @@ class DiffusionRequestState:
     # ── Timestep schedule (set once by prepare_encode) ──
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
+
+    # ── Optional chunked streaming progress ──
+    chunk_index: int = 0
+    step_in_chunk: int = 0
+    total_chunks: int = 1
+    chunk_num_steps: int | None = None
 
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
@@ -71,6 +78,9 @@ class DiffusionRequestState:
     # become part of the shared step-execution contract.
     # For example: Wan condition tensors / masks, or Bagel KV contexts.
     extra: dict[str, Any] = field(default_factory=dict)
+
+    # Peak device memory observed while this request is active in step mode.
+    peak_memory_mb: float = 0.0
 
     # ── Properties ──
 
@@ -102,6 +112,18 @@ class DiffusionRequestState:
         if total_steps == 0:
             return False
         return self.step_index >= total_steps
+
+    @property
+    def chunk_denoise_completed(self) -> bool:
+        if self.chunk_num_steps is None:
+            return False
+        return self.step_in_chunk >= self.chunk_num_steps
+
+    @property
+    def request_denoise_completed(self) -> bool:
+        if self.chunk_num_steps is None:
+            return self.denoise_completed
+        return self.chunk_index >= self.total_chunks
 
     @property
     def new_request(self) -> bool:
