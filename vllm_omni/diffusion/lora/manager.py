@@ -21,6 +21,7 @@ from vllm.lora.utils import (
     replace_submodule,
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
+from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.utils import (
@@ -297,6 +298,15 @@ class DiffusionLoRAManager:
             peft_helper.target_modules,
         )
 
+        # Some PEFT diffusion LoRAs save linear projection keys as
+        # `...to_out.0...` while vLLM expects the leaf module suffix `to_out`.
+        # Normalize only this known projection form before checkpoint parsing.
+        weights_mapper = WeightsMapper(
+            orig_to_new_substr={
+                ".to_out.0.": ".to_out.",
+            }
+        )
+
         lora_model = LoRAModel.from_local_checkpoint(
             lora_path,
             expected_lora_modules=self._expected_lora_modules,
@@ -306,7 +316,7 @@ class DiffusionLoRAManager:
             dtype=self.dtype,
             model_vocab_size=None,
             tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            weights_mapper=None,
+            weights_mapper=weights_mapper,
         )
 
         logger.info(
@@ -368,7 +378,17 @@ class DiffusionLoRAManager:
 
         # Default denoising components plus any a pipeline opts into via
         # ``_lora_components`` (opt-in; other pipelines unchanged).
-        default_components = ("transformer", "transformer_2", "dit", "bagel")
+        #
+        # NOTE: SDXL-style pipelines expose the denoiser as ``unet``.
+        # Without scanning this component, adapters can load/activate while
+        # effectively applying to zero layers, producing base-identical output.
+        default_components = (
+            "transformer",
+            "transformer_2",
+            "dit",
+            "bagel",
+            "unet",
+        )
         extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
         for component_name in (*default_components, *extra_components):
             if not hasattr(self.pipeline, component_name):
