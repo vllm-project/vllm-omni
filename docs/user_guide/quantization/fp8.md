@@ -44,10 +44,16 @@ pip install vllm-omni[quack]
 pip install 'quack-kernels[cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
-It is enabled automatically once installed (no flag needed) and is **Blackwell-only**:
-on Hopper/Ada the CUTLASS FP8 kernel already fuses bias, so quack is not used there.
-Set `VLLM_OMNI_USE_QUACK_FP8=0` to force the FlashInfer path. If `quack-kernels` is
-not installed, FP8 still works — it just keeps the unfused FlashInfer path.
+It is enabled automatically once installed (no flag needed) and is **datacenter
+Blackwell only** (`sm_100` / `sm_101` / `sm_103`, compute capability `10.x`, e.g.
+B200): quack's CuteDSL GEMM uses the 5th-gen `tcgen05` tensor-core MMA, which exists
+only on those parts. On Hopper/Ada the CUTLASS FP8 kernel already fuses bias, and on
+workstation/consumer Blackwell (`sm_120` / `sm_121`, compute capability `12.x`, e.g.
+RTX PRO 6000 / RTX 50-series) `tcgen05` is absent — so quack is **not** auto-enabled
+there and FlashInfer's native FP8 path is used instead. Set
+`VLLM_OMNI_USE_QUACK_FP8=1` to force quack on, or `VLLM_OMNI_USE_QUACK_FP8=0` to force
+the FlashInfer path. If `quack-kernels` is not installed, FP8 still works — it just
+keeps the unfused FlashInfer path.
 
 #### Compile cache and warmup
 
