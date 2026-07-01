@@ -141,6 +141,7 @@ class TestSpeakerEmbeddingBase:
             "x_vector_only_mode": True,
             "response_format": "pcm",
             "stream": True,
+            "stream_format": "audio",
             "max_new_tokens": MAX_NEW_TOKENS,
         }
         with httpx.Client(timeout=120.0) as client:

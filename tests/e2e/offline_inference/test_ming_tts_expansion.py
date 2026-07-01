@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""End-to-end offline inference tests for Ming-omni-tts."""
+"""E2E expansion tests for Ming-omni-tts offline inference (nightly CI)."""
 
 import asyncio
 import uuid
@@ -31,6 +31,12 @@ DEPLOY_CONFIG = get_deploy_config_path("ming_tts.yaml")
 TEST_TEXT = "我会一直在这里陪着你，直到你慢慢地沉入那个最温柔的梦里。"
 TEST_INSTRUCTION = "轻柔的ASMR耳语，慢速，贴近麦克风"
 MIN_AUDIO_SAMPLES = 1000
+
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.tts,
+    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4704"),
+]
 
 
 @pytest.fixture(scope="module")
@@ -163,8 +169,6 @@ def _extract_multimodal_output(output) -> Mapping[str, Any]:
     raise AssertionError("No multimodal audio output found in Ming generate results")
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_ming_tts_offline_basic(ming_engine, ming_tokenizer) -> None:
     """Test blocking Ming generation through Omni."""
@@ -185,8 +189,6 @@ def test_ming_tts_offline_basic(ming_engine, ming_tokenizer) -> None:
     assert sample_rate == SAMPLE_RATE, f"Expected Ming output sample rate {SAMPLE_RATE}, got {sample_rate}"
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_ming_tts_speaker_conditioning_differs(ming_engine, ming_tokenizer) -> None:
     """Test that different Ming speaker controls produce different waveform outputs."""
@@ -220,8 +222,6 @@ def test_ming_tts_speaker_conditioning_differs(ming_engine, ming_tokenizer) -> N
     )
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_ming_tts_multiple_prompts_queued(ming_engine, ming_tokenizer) -> None:
     """Regression: supported max_num_seqs=1 config must still drain queued prompts."""
@@ -251,8 +251,6 @@ def test_ming_tts_multiple_prompts_queued(ming_engine, ming_tokenizer) -> None:
         assert np.max(np.abs(waveform.numpy())) > 0.01, f"Request {i} audio appears silent"
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_ming_tts_offline_streaming(async_omni_engine, ming_tokenizer) -> None:
     """Test async_chunk streaming Ming generation through AsyncOmni."""

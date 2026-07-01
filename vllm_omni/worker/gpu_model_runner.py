@@ -318,6 +318,12 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         Raises:
             AssertionError: If the model does not support M-RoPE
+
+        Note:
+            Upstream vLLM (commit 470229c37) added a fallback for the case
+            where ``req_state.prompt_token_ids`` is None but
+            ``req_state.prompt_embeds`` is available.  Omni models always set
+            ``prompt_token_ids``, so this fallback is deliberately omitted.
         """
         image_grid_thw = []
         video_grid_thw = []
@@ -1524,7 +1530,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_input_tokens: int,
         intermediate_tensors: IntermediateTensors | None = None,
     ):
-        """Align with v0.14.0 preprocess and omni's additional information handling."""
+        """Align with v0.14.0 preprocess and omni's additional information handling.
+
+        Note:
+            Upstream vLLM (commit c621af169) added a conditional in the
+            ``supports_mm_inputs`` path to handle precomputed ``prompt_embeds``
+            alongside multimodal inputs.  Omni models that reach this override
+            always go through the omni-specific ``model.preprocess`` /
+            ``has_preprocess`` code path below, so the upstream change is
+            deliberately not ported.
+        """
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder

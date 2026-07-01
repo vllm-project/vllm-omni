@@ -35,7 +35,7 @@ class DiffusionRequestStatus(enum.IntEnum):
 
 @dataclass(frozen=True, eq=True)
 class SamplingParamsKey:
-    """Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
+    """Denoise step level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
 
     Only requests with the same key can be batched together.
     Fields not included here are treated as request-local and do not
@@ -60,8 +60,60 @@ class SamplingParamsKey:
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
 
+    # Output count. Requests with different num_outputs_per_prompt produce
+    # differently shaped outputs and cannot share a batch.
+    num_outputs_per_prompt: int = 1
+
     # LoRA identity. Requests with different adapters or scales must run in
     # separate batches so the worker can activate exactly one adapter per step.
+    lora_int_id: int | None = None
+    lora_scale: float = 1.0
+
+
+@dataclass(frozen=True, eq=True)
+class RequestBatchSamplingParamsKey:
+    """Request level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
+
+    Only request-batch-wide fields belong here. Request-local values such as
+    seeds, generators, latent tensors, timesteps, and pipeline-specific
+    ``extra_args`` are read per request from
+    ``DiffusionRequestBatch.sampling_params_list``.
+    """
+
+    # Spatial / temporal shape.
+    height: object = None
+    width: object = None
+    num_frames: int = 1
+    resolution: object = 640
+    fps: object = None
+    frame_rate: object = None
+    boundary_ratio: object = None
+
+    # CFG / guidance.
+    do_classifier_free_guidance: bool = False
+    guidance_scale: float = 0.0
+    guidance_scale_provided: bool = False
+    guidance_scale_2: object = None
+    guidance_rescale: float = 0.0
+    true_cfg_scale: object = None
+    cfg_normalize: bool = False
+    strength: object = None
+
+    # Scheduling / output shape.
+    num_inference_steps: object = None
+    sigmas: object = None
+    max_sequence_length: object = None
+    num_outputs_per_prompt: int = 1
+    eta: float = 0.0
+    decode_timestep: object = None
+    decode_noise_scale: object = None
+    output_type: object = None
+
+    # Model-specific batch defaults used by request-mode pipelines.
+    layers: int = 4
+    use_en_prompt: bool = False
+
+    # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
 
@@ -72,7 +124,7 @@ class DiffusionRequestState:
 
     request_id: str
     req: OmniDiffusionRequest
-    sampling_params_key: SamplingParamsKey | None = None
+    sampling_params_key: SamplingParamsKey | RequestBatchSamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
@@ -82,7 +134,12 @@ class DiffusionRequestState:
 
 @dataclass
 class NewRequestData:
-    """Full request payload for a newly scheduled diffusion request."""
+    """Payload for a newly scheduled diffusion request.
+
+    Carries the already-initialized request object so executors and workers do
+    not re-run ``OmniDiffusionRequest.__post_init__`` and mutate sentinel-based
+    fields like ``guidance_scale_provided``.
+    """
 
     request_id: str
     req: OmniDiffusionRequest
@@ -161,6 +218,14 @@ class SchedulerInterface(ABC):
     @abstractmethod
     def has_requests(self) -> bool:
         """Return whether the scheduler still owns runnable requests."""
+
+    @abstractmethod
+    def num_waiting_requests(self) -> int:
+        """Return the number of requests waiting to be scheduled."""
+
+    @abstractmethod
+    def num_running_requests(self) -> int:
+        """Return the number of requests currently running."""
 
     @abstractmethod
     def pop_request_state(self, request_id: str) -> DiffusionRequestState | None:

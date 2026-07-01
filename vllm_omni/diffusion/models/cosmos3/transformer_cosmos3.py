@@ -1373,6 +1373,30 @@ class Cosmos3VFMTransformer(nn.Module):
             f"ulysses_degree ({ulysses_size}). {adjust_detail}"
         )
 
+    def sound_latent_frames_for_sequence_parallel(
+        self,
+        *,
+        video_shape: tuple[int, int, int],
+        sound_frames: int,
+        num_vision_items: int = 1,
+    ) -> int:
+        # Sound is the only modality the packed GEN sequence pairs with here: action and
+        # sound are never generated together (the pipeline rejects action+sound), so the
+        # base is just the vision tokens.
+        #
+        # Note: padded frames go through attention and are only trimmed on decode, so SP
+        # output is not bit-exact with non-SP (the extra frame perturbs the kept ones).
+        from vllm_omni.diffusion.distributed.parallel_state import get_ulysses_parallel_world_size
+
+        ulysses_size = get_ulysses_parallel_world_size()
+        if ulysses_size <= 1 or sound_frames <= 0:
+            return sound_frames
+        t, h, w = video_shape
+        hp, wp, _, _ = self._pad_to_patch_size(h, w)
+        base = num_vision_items * t * hp * wp
+        pad = (-(base + sound_frames)) % ulysses_size
+        return sound_frames + pad
+
     # -- Forward -------------------------------------------------------------
 
     def forward(

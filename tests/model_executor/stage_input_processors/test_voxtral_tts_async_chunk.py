@@ -23,9 +23,9 @@ def _make_stage(engine_outputs):
 
 
 def _make_output(audio_tensors):
-    """Build a single generator output with multimodal_output["audio"] = audio_tensors."""
+    """Build a single generator output with multimodal_output codes.audio."""
     return SimpleNamespace(
-        outputs=[SimpleNamespace(multimodal_output={"audio": audio_tensors})],
+        outputs=[SimpleNamespace(multimodal_output={"codes": {"audio": audio_tensors}})],
     )
 
 
@@ -92,7 +92,7 @@ def test_empty_chunk_when_not_finished():
 
     payload = generator2tokenizer_async_chunk(
         transfer_manager=transfer_manager,
-        multimodal_output={"audio": torch.zeros((0,))},
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
         request=request,
     )
 
@@ -153,7 +153,7 @@ def test_normal_chunk_emission():
 
     # Feed 25 frames one by one
     for i in range(25):
-        multimodal_output = {"audio": torch.tensor([float(i)] * 4)}
+        multimodal_output = {"codes": {"audio": torch.tensor([float(i)] * 4)}}
         payload = generator2tokenizer_async_chunk(
             transfer_manager=transfer_manager,
             multimodal_output=multimodal_output,
@@ -181,7 +181,7 @@ def test_small_initial_chunks():
 
     # Feed 5 frames (should trigger emission because codec_chunk_frames_at_begin=5)
     for i in range(5):
-        multimodal_output = {"audio": torch.tensor([float(i + 1)] * 3)}
+        multimodal_output = {"codes": {"audio": torch.tensor([float(i + 1)] * 3)}}
         payload = generator2tokenizer_async_chunk(
             transfer_manager=transfer_manager,
             multimodal_output=multimodal_output,
@@ -208,7 +208,7 @@ def test_no_emission_between_boundaries():
 
     # Feed 3 frames (3 % 5 != 0, should not emit)
     for i in range(3):
-        multimodal_output = {"audio": torch.tensor([float(i)] * 4)}
+        multimodal_output = {"codes": {"audio": torch.tensor([float(i)] * 4)}}
         payload = generator2tokenizer_async_chunk(
             transfer_manager=transfer_manager,
             multimodal_output=multimodal_output,
@@ -230,7 +230,7 @@ def test_context_handling_format():
 
     # Feed 5 frames to trigger a chunk (chunk_size_at_begin=5)
     for i in range(5):
-        multimodal_output = {"audio": torch.tensor([float(i + 10)] * 2)}  # codebook_dim=2
+        multimodal_output = {"codes": {"audio": torch.tensor([float(i + 10)] * 2)}}  # codebook_dim=2
         payload = generator2tokenizer_async_chunk(
             transfer_manager=transfer_manager,
             multimodal_output=multimodal_output,

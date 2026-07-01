@@ -45,8 +45,8 @@ from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
@@ -752,7 +752,7 @@ class Flux2KleinPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
         reference_image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
         mask_image: PIL.Image.Image | list[PIL.Image.Image] | None = None,

@@ -36,7 +36,7 @@ _OMNI_RUNNER_PARAM_OFFLOAD = (
 )
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize(
         "omni_runner",

@@ -204,6 +204,7 @@ class AsyncOmniEngine:
     _log_stats: bool = False
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
+    _enable_orch_monitor: bool = False
 
     def __init__(
         self,
@@ -233,6 +234,7 @@ class AsyncOmniEngine:
         # replica) vllm:* wrap stays registered but reads zero. Respects the
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
+        self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -425,6 +427,7 @@ class AsyncOmniEngine:
                 running_counter=self._running_counter,
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
+                enable_orch_monitor=self._enable_orch_monitor,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -1000,6 +1003,7 @@ class AsyncOmniEngine:
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
+            "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
             "cache_backend": cache_backend,

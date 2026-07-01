@@ -1849,17 +1849,22 @@ class TestStreamingProtocolValidation:
             OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm", speed=2.0)
 
     def test_stream_valid(self):
-        """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted."""
+        """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted as SSE."""
         req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm")
         assert req.stream is True
+        assert req.is_sse_stream() is True
+        assert req.is_raw_audio_stream() is False
 
         req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
         assert req.stream is True
+        assert req.is_sse_stream() is True
+        assert req.is_raw_audio_stream() is False
 
     def test_stream_format_audio_is_valid(self):
         req = OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm")
         assert req.stream_format == "audio"
         assert req.is_raw_audio_stream() is True
+        assert req.is_sse_stream() is False
 
     def test_sse_stream_format_is_valid(self):
         """stream_format='sse' is accepted for /audio/speech."""
@@ -1867,6 +1872,7 @@ class TestStreamingProtocolValidation:
 
         assert req.stream_format == "sse"
         assert req.is_sse_stream() is True
+        assert req.is_raw_audio_stream() is False
 
 
 class TestStreamingResponse:
@@ -1939,13 +1945,24 @@ class TestStreamingResponse:
         app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
         return app
 
+    @staticmethod
+    def _assert_sse_audio_response(response, response_format: str = "pcm"):
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "event: speech.audio.delta" in body
+        assert "event: speech.audio.done" in body
+        data_line = next(line for line in body.splitlines() if line.startswith("data: "))
+        payload = json.loads(data_line.removeprefix("data: "))
+        assert payload["type"] == "speech.audio.delta"
+        assert payload["response_format"] == response_format
+        assert base64.b64decode(payload["audio"])
+
     def test_streaming(self, streaming_app):
-        """stream=True must return audio/pcm with non-empty body."""
+        """stream=True defaults to OpenAI speech.audio.* SSE events."""
         client = TestClient(streaming_app)
         response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
-        assert response.status_code == 200
-        assert "audio/pcm" in response.headers["content-type"]
-        assert len(response.content) > 0
+        self._assert_sse_audio_response(response)
 
     def test_stream_format_audio_streaming(self, streaming_app):
         """stream_format=audio without stream=True returns raw audio/pcm chunks."""
@@ -1967,23 +1984,24 @@ class TestStreamingResponse:
             json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
         )
 
-        assert response.status_code == 200
-        assert "text/event-stream" in response.headers["content-type"]
-        body = response.text
-        assert "event: speech.audio.delta" in body
-        assert "event: speech.audio.done" in body
-        data_line = next(line for line in body.splitlines() if line.startswith("data: "))
-        payload = json.loads(data_line.removeprefix("data: "))
-        assert payload["type"] == "speech.audio.delta"
-        assert payload["response_format"] == "pcm"
-        assert base64.b64decode(payload["audio"])
+        self._assert_sse_audio_response(response)
 
-    def test_stream_true_prefers_raw_audio_over_sse(self, streaming_app):
-        """stream=True keeps the existing raw audio stream behavior even with stream_format=sse."""
+    def test_stream_true_with_stream_format_sse_uses_sse(self, streaming_app):
+        """stream=True and stream_format=sse both select SSE streaming."""
         client = TestClient(streaming_app)
         response = client.post(
             "/v1/audio/speech",
             json={"input": "Hello", "stream": True, "stream_format": "sse", "response_format": "pcm"},
+        )
+
+        self._assert_sse_audio_response(response)
+
+    def test_stream_format_audio_with_stream_true_opts_into_raw_audio(self, streaming_app):
+        """stream_format=audio remains an explicit raw audio opt-in."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "stream_format": "audio", "response_format": "pcm"},
         )
 
         assert response.status_code == 200
@@ -3021,7 +3039,10 @@ class TestWAVStreaming:
     def test_wav_streaming_success(self, wav_streaming_app):
         """Test WAV format streaming returns correct content type and includes WAV header."""
         client = TestClient(wav_streaming_app)
-        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "wav"})
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "stream_format": "audio", "response_format": "wav"},
+        )
 
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
@@ -3040,7 +3061,10 @@ class TestWAVStreaming:
 
         unsupported_formats = ["mp3"]
         for fmt in unsupported_formats:
-            response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": fmt})
+            response = client.post(
+                "/v1/audio/speech",
+                json={"input": "Hello", "stream": True, "stream_format": "audio", "response_format": fmt},
+            )
             assert response.status_code == 422
 
 
@@ -3331,6 +3355,23 @@ class TestTTSAsyncOffloading:
             return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
         )
         request = OpenAICreateSpeechRequest(input="hello", stream_format="sse")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        mock_coerce.assert_called_once_with(qwen3_tts_server.engine_client.default_sampling_params_list, True)
+
+    def test_prepare_speech_generation_treats_stream_true_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
+        """stream=True should request delta-style multimodal outputs for SSE streaming."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        mock_coerce = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
+        )
+        request = OpenAICreateSpeechRequest(input="hello", stream=True, response_format="pcm")
 
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 

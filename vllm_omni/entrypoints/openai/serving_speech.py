@@ -82,6 +82,11 @@ _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
+# CosyVoice3 talker expects its reference transcript wrapped in the model
+# instruction template; without the delimiter the talker re-speaks the
+# reference (issue #4644). Matches the offline example/test and upstream demo.
+_COSYVOICE3_PROMPT_DELIMITER = "<|endofprompt|>"
+_COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DELIMITER}"
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
@@ -3208,8 +3213,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
         audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
 
+        # Wrap the reference transcript in the CosyVoice3 instruction template
+        # so the talker emits target-only speech (see _COSYVOICE3_PROMPT_PREFIX).
+        # Skip if the caller already supplied a formatted prompt_text.
+        ref_text = request.ref_text or ""
+        if _COSYVOICE3_PROMPT_DELIMITER not in ref_text:
+            ref_text = f"{_COSYVOICE3_PROMPT_PREFIX}{ref_text}"
         mm_kwargs: dict[str, Any] = {
-            "prompt_text": request.ref_text,
+            "prompt_text": ref_text,
             "sample_rate": sr,
         }
         # Pass voice metadata for caching in the processor
@@ -4027,11 +4038,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
 
-        Streaming is supported via ``stream_format='audio'`` or the legacy
-        ``stream=True`` switch, with ``response_format='pcm'`` or ``'wav'``.
-        ``stream_format='sse'`` returns OpenAI ``speech.audio.*`` SSE events instead.
-        Each Code2Wav chunk is yielded as raw audio bytes as soon as it is decoded.
-        For WAV format, a header with placeholder size values is emitted first.
+        Streaming is supported via the ``stream=True`` switch or ``stream_format='sse'``,
+        which return OpenAI ``speech.audio.*`` SSE events. ``stream_format='audio'``
+        opts into raw audio streaming with ``response_format='pcm'`` or ``'wav'``.
+        Raw audio streaming yields each Code2Wav chunk as raw bytes as soon as it is
+        decoded. Raw WAV streaming emits a header with placeholder size values first.
         """
         if self._diffusion_mode:
             return await self._create_diffusion_speech(request)
@@ -4049,14 +4060,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         try:
-            if request.is_raw_audio_stream():
-                if request.word_timestamps:
-                    return self.create_error_response(
-                        "word_timestamps=true is currently supported by the WebSocket "
-                        "/v1/audio/speech/stream path. Use session.config with "
-                        "stream_audio=true and response_format='pcm'."
-                    )
+            if request.is_streaming() and request.word_timestamps:
+                return self.create_error_response(
+                    "word_timestamps=true is currently supported by the WebSocket "
+                    "/v1/audio/speech/stream path. Use session.config with "
+                    "stream_audio=true and response_format='pcm'."
+                )
 
+            if request.is_raw_audio_stream():
                 response_format, error = self._validate_speech_streaming_request(
                     request,
                     mode_label="Streaming",

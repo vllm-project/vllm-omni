@@ -23,12 +23,12 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _request(
-    prompts: list[str] | None = None,
+    prompt: str | dict | None = None,
     *,
     num_outputs_per_prompt: int = 1,
 ) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=prompts or ["prompt"],
+        prompt=prompt or "prompt",
         request_id="req-1",
         sampling_params=OmniDiffusionSamplingParams(
             num_inference_steps=1,
@@ -69,7 +69,7 @@ def test_formatter_preserves_single_video_audio_actions_and_custom_output(
     )
 
     results = format_diffusion_outputs(
-        request=_request(["prompt-0"]),
+        request=_request("prompt-0"),
         od_config=_config(),
         diffusion_output=DiffusionOutput(
             output=None,
@@ -118,7 +118,7 @@ def test_formatter_preserves_text_custom_output(monkeypatch: pytest.MonkeyPatch)
     )
 
     [result] = format_diffusion_outputs(
-        request=_request(["describe this"]),
+        request=_request("describe this"),
         od_config=_config(),
         diffusion_output=DiffusionOutput(output="caption"),
         output_data="caption",
@@ -147,7 +147,7 @@ def test_formatter_preserves_audio_output_with_model_sample_rate_fallback(
     postprocess_output = normalize_diffusion_postprocess_output(["waveform"], {})
 
     [result] = format_diffusion_outputs(
-        request=_request(["speak"]),
+        request=_request("speak"),
         od_config=_config("audio_model"),
         diffusion_output=DiffusionOutput(output=["waveform"]),
         output_data=["waveform"],
@@ -180,7 +180,7 @@ def test_formatter_preserves_audio_model_video_audio_and_actions(
     )
 
     [result] = format_diffusion_outputs(
-        request=_request(["watch and listen"]),
+        request=_request("watch and listen"),
         od_config=_config("audio_video_model"),
         diffusion_output=DiffusionOutput(output=None),
         output_data={"raw": "output"},
@@ -212,7 +212,7 @@ def test_formatter_preserves_audio_only_postprocess_dict(
     )
 
     [result] = format_diffusion_outputs(
-        request=_request(["speak"]),
+        request=_request("speak"),
         od_config=_config("audio_model"),
         diffusion_output=DiffusionOutput(output=None),
         output_data={"raw": "output"},
@@ -241,7 +241,7 @@ def test_formatter_preserves_single_prompt_multiple_audio_outputs(
     postprocess_output = normalize_diffusion_postprocess_output(["waveform-0", "waveform-1"], {})
 
     [result] = format_diffusion_outputs(
-        request=_request(["speak"], num_outputs_per_prompt=2),
+        request=_request("speak", num_outputs_per_prompt=2),
         od_config=_config("audio_model"),
         diffusion_output=DiffusionOutput(output=["waveform-0", "waveform-1"]),
         output_data=["waveform-0", "waveform-1"],
@@ -255,7 +255,7 @@ def test_formatter_preserves_single_prompt_multiple_audio_outputs(
     assert result.multimodal_output == {"audio": ["waveform-0", "waveform-1"]}
 
 
-def test_formatter_preserves_multi_prompt_audio_and_action_slicing(
+def test_formatter_preserves_single_prompt_audio_and_action_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
@@ -271,7 +271,7 @@ def test_formatter_preserves_multi_prompt_audio_and_action_slicing(
     )
 
     results = format_diffusion_outputs(
-        request=_request(["prompt-0", "prompt-1"]),
+        request=_request("prompt-0"),
         od_config=_config(),
         diffusion_output=DiffusionOutput(output=None),
         output_data={"raw": "output"},
@@ -279,29 +279,22 @@ def test_formatter_preserves_multi_prompt_audio_and_action_slicing(
         timings=_timings(),
     )
 
-    assert len(results) == 2
-    assert results[0].images == ["frame-0"]
-    assert results[1].images == ["frame-1"]
+    assert len(results) == 1
+    assert results[0].images == ["frame-0", "frame-1"]
+    assert results[0].prompt == "prompt-0"
     assert results[0].custom_output == {"shared": True}
-    assert results[1].custom_output == {"shared": True}
-    assert results[0].multimodal_output["audio"] == "audio-0"
-    assert results[1].multimodal_output["audio"] == "audio-1"
+    assert results[0].multimodal_output["audio"] == ["audio-0", "audio-1"]
     assert results[0].multimodal_output["fps"] == 12.5
-    assert results[1].multimodal_output["fps"] == 12.5
     torch.testing.assert_close(
         results[0].multimodal_output["actions"],
-        torch.tensor([1.0, 2.0]),
-    )
-    torch.testing.assert_close(
-        results[1].multimodal_output["actions"],
-        torch.tensor([3.0, 4.0]),
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
     )
 
 
 def test_format_empty_diffusion_outputs_preserves_empty_response_shape() -> None:
-    results = format_empty_diffusion_outputs(_request(["prompt-0", "prompt-1"]))
+    results = format_empty_diffusion_outputs(_request("prompt-0"))
 
-    assert len(results) == 2
-    assert [result.prompt for result in results] == ["prompt-0", "prompt-1"]
-    assert [result.images for result in results] == [[], []]
-    assert [result.metrics for result in results] == [{}, {}]
+    assert len(results) == 1
+    assert [result.prompt for result in results] == ["prompt-0"]
+    assert [result.images for result in results] == [[]]
+    assert [result.metrics for result in results] == [{}]
