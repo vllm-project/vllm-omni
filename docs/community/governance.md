@@ -33,16 +33,20 @@ Lead maintainers are responsible for the overall direction and strategy of the p
 
 Committers have write access and merge rights. They typically have deep expertise in specific areas of this project and shepherd the community contributions:
 
+- [@alex-jw-brooks](https://github.com/alex-jw-brooks): Frontend, Configuration, and Entrypoint Support
+- [@amy-why-3459](https://github.com/amy-why-3459): Omni Modality Model and World Model Support
 - [@david6666666](https://github.com/david6666666): Quantization and Community Relationship
-- [@gcanlin](https://github.com/gcanlin): Hardware plugin and NPU integration
+- [@gcanlin](https://github.com/gcanlin): Hardware plugin, NPU integration, and TTS Model Support
 - [@Isotr0py](https://github.com/Isotr0py): Diffusion and Quantization
 - [@linyueqian](https://github.com/linyueqian): TTS and Omni Support
 - [@lishunyang12](https://github.com/lishunyang12): Quantization and Configuration
 - [@princepride](https://github.com/princepride): Diffusion and Omni Support
 - [@RuixiangMa](https://github.com/RuixiangMa): Diffusion models, parallel, cache, and docs
 - [@SamitHuang](https://github.com/SamitHuang): RL, Diffusion, and cache
+- [@Sy0307](https://github.com/Sy0307): TTS Model and AR Engine Support
 - [@tzhouam](https://github.com/tzhouam): Engine and New Model Support
 - [@wtomin](https://github.com/wtomin): Diffusion models, parallel, and docs
+- [@xuechendi](https://github.com/xuechendi): Diffusion and Intel GPU Support
 - [@ZeldaHuang](https://github.com/ZeldaHuang): Omni Support
 - [@ZJY0516](https://github.com/ZJY0516): Diffusion attention backend, kernel fusion, and CustomOp
 - [@yuanheng-zhao](https://github.com/yuanheng-zhao): Diffusion cache, offload, and Omni Support
@@ -53,7 +57,7 @@ This section breaks down diffusion-related responsibilities. If you have PRs tou
 
 ### Runtime-related
 
-- Diffusion models: @RuixiangMa, @wtomin
+- Diffusion models: @RuixiangMa, @wtomin, @xuechendi
 
 ### Optimization
 
@@ -61,6 +65,7 @@ This section breaks down diffusion-related responsibilities. If you have PRs tou
 - Attention backend: @ZJY0516
 - Cache: @yuanheng-zhao, @RuixiangMa, @SamitHuang
 - Offload: @yuanheng-zhao
+- Intel GPU support: @xuechendi
 - Quantization: @lishunyang12, @david6666666
 - Kernel fusion / communication-computation: @ZJY0516
 
