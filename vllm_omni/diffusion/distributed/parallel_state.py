@@ -35,6 +35,7 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 from .group_coordinator import (
@@ -781,6 +782,13 @@ def initialize_model_parallel(
         fs=fully_shard_degree,
         order="tp-sp-pp-cfg-dp",
     )
+    use_moe_parallel_mapping = False
+    if enable_expert_parallel:
+        od_config = get_forward_context().omni_diffusion_config
+        use_moe_parallel_mapping = bool(od_config and od_config.is_moe)
+        if not use_moe_parallel_mapping:
+            raise RuntimeError("Expert parallelism enabled for a non-MoE model")
+
     sp_group_ranks = rank_generator.get_ranks("sp")
     global _DP
     assert _DP is None, "data parallel group is already initialized"
@@ -827,7 +835,7 @@ def initialize_model_parallel(
         ulysses_group=ulysses_pg,
         ring_group=ring_pg,
     )
-    if enable_expert_parallel:
+    if use_moe_parallel_mapping:
         # Diffusion normally uses its own SP group. Map it to vLLM PCP only for
         # expert-parallel runtimes that rely on vLLM FusedMoE group semantics.
         vllm_parallel_state._PCP = _SP
@@ -839,7 +847,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
-    if enable_expert_parallel and cfg_parallel_size > 1:
+    if use_moe_parallel_mapping and cfg_parallel_size > 1:
         # CFG is a diffusion-specific replica dimension. Fold it into vLLM DP
         # only when constructing the vLLM EP layout for expert-parallel paths.
         vllm_parallel_state._DP = init_model_parallel_group(
@@ -859,7 +867,7 @@ def initialize_model_parallel(
     )
 
     _EXPERT_PARALLEL_GROUP_RANKS = None
-    if enable_expert_parallel:
+    if use_moe_parallel_mapping:
         ep_group_ranks = rank_generator.get_ranks("tp-sp-cfg-dp")
         vllm_parallel_state._EP = init_model_parallel_group(
             group_ranks=ep_group_ranks,

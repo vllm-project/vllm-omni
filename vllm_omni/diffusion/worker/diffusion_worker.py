@@ -249,7 +249,7 @@ class DiffusionWorker:
         parallel_config = self.od_config.parallel_config
         vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
-        if parallel_config.enable_expert_parallel:
+        if parallel_config.enable_expert_parallel and self.od_config.is_moe:
             # Diffusion uses its own DP/CFG/SP groups normally. vLLM groups are
             # only remapped for expert-parallel runtimes that consume vLLM's
             # FusedMoE/EP semantics.
