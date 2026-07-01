@@ -575,3 +575,90 @@ def test_lora_manager_discovers_bagel_component(monkeypatch):
     assert "bagel.language_model.qkv_proj" in manager._lora_modules
     # Verify the module was actually replaced in the tree (not just recorded)
     assert isinstance(pipeline.bagel.language_model.qkv_proj, _DummyBaseLayerWithLoRA)
+
+
+def test_lora_manager_discovers_unet_component(monkeypatch):
+    """Verify that _replace_layers_with_lora finds layers under 'unet'."""
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+
+    def _fake_from_layer_diffusion(*, layer: torch.nn.Module, **_kwargs):
+        if isinstance(layer, _FakeLinearBase):
+            return _DummyBaseLayerWithLoRA(layer)
+        return layer
+
+    replace_calls: list[str] = []
+
+    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub, replace_calls),
+    )
+
+    # Pipeline with a 'unet' component (no 'transformer')
+    pipeline = torch.nn.Module()
+    pipeline.unet = torch.nn.Module()
+    pipeline.unet.down_block = torch.nn.Module()
+    pipeline.unet.down_block.proj = _FakeLinearBase()
+
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    peft_helper = type("_PH", (), {"r": 1})()
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert "down_block.proj" in replace_calls
+    assert "unet.down_block.proj" in manager._lora_modules
+    # Verify the module was actually replaced in the tree (not just recorded)
+    assert isinstance(pipeline.unet.down_block.proj, _DummyBaseLayerWithLoRA)
+
+
+def test_lora_manager_load_adapter_uses_to_out_normalization_mapper(monkeypatch):
+    """Verify _load_adapter passes a mapper that normalizes '.to_out.0.' names."""
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    monkeypatch.setattr(manager_mod, "get_adapter_absolute_path", lambda p: p)
+
+    peft_helper = type("_PH", (), {"r": 1, "lora_alpha": 1, "target_modules": ["to_out"]})()
+    monkeypatch.setattr(manager_mod.PEFTHelper, "from_local_dir", lambda *args, **kwargs: peft_helper)
+
+    captured: dict[str, object] = {}
+
+    class _DummyLoRAModel:
+        id = 1
+        loras = {}
+
+    def _fake_from_local_checkpoint(*args, **kwargs):
+        captured["weights_mapper"] = kwargs.get("weights_mapper")
+        return _DummyLoRAModel()
+
+    monkeypatch.setattr(manager_mod.LoRAModel, "from_local_checkpoint", _fake_from_local_checkpoint)
+
+    req = LoRARequest(
+        lora_name="adapter_1",
+        lora_int_id=1,
+        lora_path="/tmp/adapter_1",
+    )
+
+    manager._load_adapter(req)
+
+    mapper = captured.get("weights_mapper")
+    assert mapper is not None
+    assert mapper._map_name("foo.to_out.0.weight") == "foo.to_out.weight"
