@@ -343,13 +343,16 @@ def load_stage_configs_from_model(
             for key, val in overrides.items():
                 cli_overrides[f"stage_{stage_id_str}_{key}"] = val
 
-    stages = StageConfigFactory.create_from_model(
+    # Current runtime initialization still consumes legacy OmegaConf stage
+    # configs. ``StageConfigFactory.create_from_model`` now produces the
+    # structured ``VllmOmniConfig`` object; future RFC #4021 changes will
+    # migrate the engine/runtime consumers and replace this legacy resolver.
+    stages = StageConfigFactory.create_legacy_stage_configs_from_model(
         model,
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
     )
     if stages is not None:
-        # Convert StageConfig objects to OmegaConf for backward compat
         return [stage.to_omegaconf() for stage in stages]
 
     # Legacy fallback: load from YAML

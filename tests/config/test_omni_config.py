@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from transformers import Qwen3OmniMoeConfig
 
 from vllm_omni.config import omni_config as omni_config_module
 from vllm_omni.config.omni_config import (
@@ -603,6 +604,34 @@ def test_from_registry_matches_stage_config_to_omegaconf_behavior_for_representa
     assert omega_stage.engine_args.scheduler_cls == omni_stage.scheduler_cls
     assert omega_stage.runtime.process is True
     assert omega_stage.runtime.requires_multimodal_data == omni_stage.requires_multimodal_data
+
+
+def test_from_registry_uses_hf_config_for_callable_resolver():
+    hf_config = Qwen3OmniMoeConfig()
+    hf_config.enable_audio_output = False
+
+    omni_config = VllmOmniConfig.from_registry("qwen3_omni_moe", hf_config=hf_config)
+
+    assert omni_config.pipeline_config.model_type == "qwen3_omni_moe_thinker_only"
+    assert len(omni_config.stage_configs) == 1
+    assert omni_config.stage_configs[0].model_stage == "thinker"
+
+
+def test_from_registry_deploy_pipeline_override_resolves_from_registry():
+    deploy_path = _DEPLOY_DIR / "aura_omni.yaml"
+
+    omni_config = VllmOmniConfig.from_registry(
+        "qwen3_tts",
+        deploy_config_path=str(deploy_path),
+    )
+
+    assert omni_config.pipeline_config.model_type == "aura_omni"
+    assert [stage.model_stage for stage in omni_config.stage_configs] == [
+        "asr",
+        "aura",
+        "qwen3_tts",
+        "code2wav",
+    ]
 
 
 def test_from_registry_matches_to_omegaconf_diffusion_parallel_config():

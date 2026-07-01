@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field
+from transformers import PretrainedConfig
 from vllm.config.utils import config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -234,11 +235,14 @@ def _registered_pipeline_keys() -> list[str]:
     return sorted(OMNI_PIPELINES)
 
 
-def _resolve_registered_pipeline(model_type: str) -> PipelineConfig | None:
+def _resolve_registered_pipeline(
+    model_type: str,
+    hf_config: PretrainedConfig | None = None,
+) -> PipelineConfig | None:
     from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 
     registered = OMNI_PIPELINES[model_type]
-    return registered(None) if callable(registered) else registered
+    return registered(hf_config) if callable(registered) else registered
 
 
 @config
@@ -1219,6 +1223,7 @@ class VllmOmniConfig:
     def from_registry(
         cls,
         model_type: str,
+        hf_config: PretrainedConfig | None = None,
         deploy_config_path: str | None = None,
         cli_overrides: dict[str, Any] | None = None,
     ) -> VllmOmniConfig:
@@ -1240,20 +1245,20 @@ class VllmOmniConfig:
                 f"(resolved from {deploy_path.name!r}). Available: "
                 f"{_registered_pipeline_keys()}"
             )
-        pipeline = _resolve_registered_pipeline(pipeline_key)
+        pipeline = _resolve_registered_pipeline(pipeline_key, hf_config)
         if pipeline is None:
-            raise ValueError(
-                f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig without an HF config"
-            )
+            raise ValueError(f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig")
 
-        deploy_for_registry = copy.deepcopy(deploy)
+        deploy_with_cli_overrides = copy.deepcopy(deploy)
         if cli_overrides.get("async_chunk") is not None:
-            deploy_for_registry.async_chunk = bool(cli_overrides["async_chunk"])
+            deploy_with_cli_overrides.async_chunk = bool(cli_overrides["async_chunk"])
         for name in _PIPELINE_DEPLOY_CLI_FIELDS:
             if cli_overrides.get(name) is not None:
-                setattr(deploy_for_registry, name, _copy_value(cli_overrides[name]))
+                setattr(deploy_with_cli_overrides, name, _copy_value(cli_overrides[name]))
 
-        deploy_for_registry = _apply_platform_overrides(deploy_for_registry)
+        deploy_for_registry = _apply_platform_overrides(copy.deepcopy(deploy_with_cli_overrides))
+        if len(pipeline.stages) <= 1:
+            deploy_for_registry.async_chunk = False
         _validate_async_chunk_support(pipeline, deploy_for_registry)
         deploy_by_id = {stage.stage_id: stage for stage in deploy_for_registry.stages}
         model = cli_overrides.get("model")

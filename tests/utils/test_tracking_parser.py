@@ -44,6 +44,11 @@ _TEST_DEPLOY = DeployConfig(
 @pytest.fixture()
 def mock_stages(monkeypatch):
     """Register a fake pipeline and mock deploy YAML loading."""
+    from vllm_omni import platforms
+
+    platform = platforms.current_omni_platform
+    monkeypatch.setattr(platform, "device_name", "cpu", raising=False)
+    monkeypatch.setattr(platform, "device_type", "cpu", raising=False)
     monkeypatch.setitem(OMNI_PIPELINES, _TEST_MODEL, _TEST_PIPELINE)
     monkeypatch.setattr(
         "vllm_omni.config.config_factory.load_deploy_config",
@@ -453,6 +458,12 @@ def test_cli_overrides_config(tmp_path):
 
 
 ### Integration tests for arg resolution through StageConfigFactory
+#
+# These tests still target the transitional legacy StageConfig path because the
+# current runtime reads explicit CLI values from ``stage.runtime_overrides``.
+# After RFC #4021 migrates engine startup to consume ``VllmOmniConfig`` directly,
+# these assertions should move to the structured config/runtime boundary and the
+# ``_create_legacy_from_registry`` calls should be removed.
 def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
     """Explicitly passed CLI values reach runtime_overrides on all stages."""
     p = TrackingArgumentParser()
@@ -460,7 +471,7 @@ def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
     ns = p.parse_args(["--max-num-seqs", "999"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages = StageConfigFactory._create_legacy_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
@@ -477,7 +488,7 @@ def test_omitted_default_not_in_runtime_overrides(mock_stages):
     ns = p.parse_args([])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages = StageConfigFactory._create_legacy_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
@@ -499,7 +510,7 @@ def test_config_file_args_reach_runtime_overrides(mock_stages):
         ns = p.parse_args(["--config", "fake.yaml"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages = StageConfigFactory._create_legacy_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
@@ -517,7 +528,7 @@ def test_per_stage_override_routes_correctly(mock_stages):
     ns = p.parse_args(["--stage-0-gpu-memory-utilization", "0.42"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages = StageConfigFactory._create_legacy_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
@@ -539,7 +550,7 @@ def test_explicit_args_omitted_from_yaml(mock_stages):
     ns = p.parse_args(["--enforce-eager"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages = StageConfigFactory._create_legacy_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,

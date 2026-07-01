@@ -5,7 +5,6 @@ Unit tests for StageConfigFactory and related classes.
 """
 
 import importlib
-import inspect
 import warnings
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -16,6 +15,7 @@ from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
 from vllm_omni.config.stage_config import (
     DeployConfig,
@@ -37,6 +37,15 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _stable_test_platform(monkeypatch):
+    from vllm_omni import platforms
+
+    platform = platforms.current_omni_platform
+    monkeypatch.setattr(platform, "device_name", "cpu", raising=False)
+    monkeypatch.setattr(platform, "device_type", "cpu", raising=False)
 
 
 Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
@@ -596,6 +605,17 @@ class TestPipelineConfigNew:
 
 
 class TestPipelineRegistration:
+    def test_create_from_model_returns_structured_omni_config(self):
+        class FakeConfig(PretrainedConfig):
+            model_type = "qwen3_tts"
+
+        with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
+            omni_config = StageConfigFactory.create_from_model("fake/model")
+
+        assert isinstance(omni_config, VllmOmniConfig)
+        assert omni_config.pipeline_config is OMNI_PIPELINES["qwen3_tts"]
+        assert len(omni_config.stage_configs) == 2
+
     def test_pipeline_registration(self, clean_pipeline_registry):
         """Ensure that we can register and create a custom pipeline config."""
         new_model_type = "new_model_type"
@@ -613,13 +633,12 @@ class TestPipelineRegistration:
         # Create the model
         with (
             patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()),
-            patch.object(StageConfigFactory, "_create_from_registry") as mock_create,
+            patch.object(VllmOmniConfig, "from_registry") as mock_create,
         ):
             StageConfigFactory.create_from_model("fake/model")
             mock_create.assert_called_once()
-            # Ensure that the passed pipeline_config is the right type
-            pipeline_cfg = mock_create.call_args[0][1]
-        assert isinstance(pipeline_cfg, PipelineConfig)
+            assert mock_create.call_args.args == (new_model_type,)
+            assert isinstance(mock_create.call_args.kwargs["hf_config"], FakeConfig)
         assert pipe_cfg.model_type == new_model_type
 
     def test_resolver_registration(self, clean_pipeline_registry):
@@ -644,16 +663,16 @@ class TestPipelineRegistration:
         assert OMNI_PIPELINES[new_model_type] is custom_resolver
 
         # Create the model
+        fake_config = FakeConfig()
         with (
-            patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()),
-            patch.object(StageConfigFactory, "_create_from_registry") as mock_create,
+            patch("vllm_omni.config.config_factory.get_config", return_value=fake_config),
+            patch.object(VllmOmniConfig, "from_registry") as mock_create,
         ):
             StageConfigFactory.create_from_model("fake/model")
             mock_create.assert_called_once()
-            # Ensure that the passed pipeline_config is the right type
-            pipeline_cfg = mock_create.call_args[0][1]
-        assert isinstance(pipeline_cfg, PipelineConfig)
-        assert pipeline_cfg.model_type == resolved_type
+            assert mock_create.call_args.args == (new_model_type,)
+            assert mock_create.call_args.kwargs["hf_config"] is fake_config
+        assert custom_resolver(fake_config).model_type == resolved_type
 
 
 class TestResolveScheduler:
@@ -1549,7 +1568,7 @@ class TestAuraOmniDeploy:
     def test_aura_omni_deploy_resolves_four_native_stages(self):
         pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni")
 
-        stages = StageConfigFactory._create_from_registry(
+        stages = StageConfigFactory._create_legacy_from_registry(
             "qwen3_tts",
             pipeline_cfg,
             cli_overrides={},
@@ -1580,7 +1599,7 @@ class TestSentinelDefaultPrecedence:
             model_type,
             Q3_OMNI_ALL_STAGES_HF_CONFIG,
         )
-        return StageConfigFactory._create_from_registry(
+        return StageConfigFactory._create_legacy_from_registry(
             "qwen3_omni_moe",
             pipeline_cfg,
             cli_overrides=cli_overrides,
@@ -1637,11 +1656,6 @@ class TestSentinelDefaultPrecedence:
         stages = self._stages(simulated_vars_args)
         for stage in stages:
             assert stage.runtime_overrides == {}
-
-    def test_create_from_registry_no_cli_explicit_keys_param(self):
-        sig = inspect.signature(StageConfigFactory._create_from_registry)
-        named = [p for p in sig.parameters.values() if p.kind != p.VAR_KEYWORD]
-        assert "cli_explicit_keys" not in {p.name for p in named}
 
     def test_async_chunk_dispatches_processors(self):
         """A single ``qwen3_tts`` pipeline picks per-chunk vs end-to-end
