@@ -1248,7 +1248,7 @@ class Orchestrator:
                         src_stage_id,
                         next_logical,
                     )
-                    await self.output_async_queue.put(
+                    self.output_sync_queue.put_nowait(
                         OutputMessage(
                             request_id=req_id,
                             stage_id=next_logical,
@@ -1416,7 +1416,7 @@ class Orchestrator:
                 final_output_type or "text",
                 final_stage_id,
             )
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,

@@ -132,7 +132,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
     rpc_q = janus.Queue()
     orchestrator = Orchestrator(
         request_async_queue=request_q.async_q,
-        output_async_queue=output_q.async_q,
+        output_sync_queue=output_q.sync_q,
         rpc_async_queue=rpc_q.async_q,
         stage_pools=stage_pools,
         async_chunk=False,
