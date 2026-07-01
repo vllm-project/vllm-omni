@@ -9,7 +9,7 @@
 # python tools/nightly/generate_nightly_perf_excel.py runs (even if some perf jobs failed;
 # the script only aggregates JSON already present under tests/dfx/perf/results).
 # Excel and generate_nightly_perf_excel.log are written under $REPO_ROOT/logs/;
-# per-job tee logs use LOG_DIR (see --log-dir). Then remaining jobs run.
+# per-job tee logs use LOG_DIR (see --log-dir; default is timestamped under $REPO_ROOT/logs/).
 #
 # Test kind (--test-type / TEST_TYPE), multiple allowed (OR semantics):
 #   Repeat the flag and/or use comma-separated values, e.g.
@@ -62,8 +62,13 @@
 # Optional environment:
 #   REPO_ROOT     - vllm-omni root (working directory for pytest); see above
 #   YML           - path to test-nightly.yml (default: $REPO_ROOT/.buildkite/test-nightly.yml)
-#   LOG_DIR       - logs + generated job scripts (default: $REPO_ROOT/logs/nightly_jobs);
-#                   per-job *.log plus timing_summary.log after the run
+#   LOG_DIR       - logs + generated job scripts; when unset, a timestamped directory under
+#                   $REPO_ROOT/logs/ is created:
+#                     nightly_jobs_YYYYMMDD-HHMMSS       (default / YAML nightly steps)
+#                     nightly_local_jobs_YYYYMMDD-HHMMSS (--test-type local only)
+#                     nightly_stability_jobs_YYYYMMDD-HHMMSS (--test-type stability only)
+#                   per-job *.log plus timing_summary.log after the run;
+#                   perf JSON from tests/dfx/perf/results/ (produced this run) -> $LOG_DIR/perf_results/
 #   TEST_TYPE     - comma-separated and/or repeated flags (default: all); see above
 #   MODEL_TYPE    - comma-separated and/or repeated flags (default: all); see above
 #   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename;
@@ -218,6 +223,28 @@ done
 TEST_TYPE="$(_finalize_test_type_csv)"
 MODEL_TYPE="$(_finalize_model_type_csv)"
 
+# Default log directory basename: date + local timestamp; prefix depends on TEST_TYPE.
+_nightly_log_dir_basename() {
+  local ts has_local=0 has_stability=0 has_yaml=0 _t
+  ts="$(date +%Y%m%d-%H%M%S)"
+  IFS=',' read -ra _TTOK <<< "${TEST_TYPE}"
+  for _t in "${_TTOK[@]}"; do
+    _t="$(printf '%s' "${_t}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "${_t}" in
+      local) has_local=1 ;;
+      stability) has_stability=1 ;;
+      perf | acc | function | all) has_yaml=1 ;;
+    esac
+  done
+  if [[ "${has_local}" -eq 1 && "${has_yaml}" -eq 0 && "${has_stability}" -eq 0 ]]; then
+    printf 'nightly_local_jobs_%s' "${ts}"
+  elif [[ "${has_stability}" -eq 1 && "${has_yaml}" -eq 0 && "${has_local}" -eq 0 ]]; then
+    printf 'nightly_stability_jobs_%s' "${ts}"
+  else
+    printf 'nightly_jobs_%s' "${ts}"
+  fi
+}
+
 BUILDKITE_REL=".buildkite/test-nightly.yml"
 
 _find_repo_containing_nightly() {
@@ -275,7 +302,11 @@ else
   YML="${REPO_ROOT}/${BUILDKITE_REL}"
 fi
 
-LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/nightly_jobs}"
+if [[ -z "${LOG_DIR:-}" ]]; then
+  LOG_DIR="${REPO_ROOT}/logs/$(_nightly_log_dir_basename)"
+fi
+
+echo "Log directory: ${LOG_DIR}" >&2
 
 # Require nightly YAML only when at least one non-stability test kind needs it (validated in Python too).
 _needs_nightly_yml=0
@@ -856,6 +887,52 @@ fi
 # shellcheck source=tools/run_jobs_common.sh
 source "${SCRIPT_DIR}/../run_jobs_common.sh"
 
+PERF_RESULTS_SRC="${REPO_ROOT}/tests/dfx/perf/results"
+
+# Copy perf benchmark JSON written under tests/dfx/perf/results/ during this run into LOG_DIR.
+_collect_perf_result_jsons() {
+  local since_epoch="${1:?}"
+  local dest="${LOG_DIR}/perf_results"
+
+  if [[ ! -d "${PERF_RESULTS_SRC}" ]]; then
+    return 0
+  fi
+
+  COLLECT_SINCE_EPOCH="${since_epoch}" \
+  python3 - <<'PY'
+import os
+import shutil
+import sys
+from pathlib import Path
+
+repo = Path(os.environ["REPO_ROOT"]).resolve()
+src = repo / "tests" / "dfx" / "perf" / "results"
+dest = Path(os.environ["LOG_DIR"]).resolve() / "perf_results"
+since = float(os.environ["COLLECT_SINCE_EPOCH"])
+
+if not src.is_dir():
+    sys.exit(0)
+
+copied = 0
+for path in sorted(src.rglob("*.json")):
+    if not path.is_file():
+        continue
+    try:
+        if path.stat().st_mtime < since:
+            continue
+    except OSError:
+        continue
+    rel = path.relative_to(src)
+    out = dest / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, out)
+    copied += 1
+
+if copied:
+    print(f"Collected {copied} perf result JSON file(s) -> {dest}", file=sys.stderr)
+PY
+}
+
 # Run jobs: YAML perf steps first (if manifest exists), then generate Excel (always when
 # manifest non-empty, even if some perf jobs failed; Excel uses whatever JSON exists on disk),
 # then remaining jobs. Paths align with nightly Buildkite (tests/dfx/perf/results).
@@ -926,6 +1003,8 @@ run_generated_jobs_with_tee() {
     _run_one_job_with_timing "${_job}" || any_fail=1
   done
   shopt -u nullglob
+
+  _collect_perf_result_jsons "${_run_start}"
 
   _run_jobs_print_timing_summary "${_run_start}" "${any_fail}"
   if [[ "${any_fail}" -ne 0 ]]; then
