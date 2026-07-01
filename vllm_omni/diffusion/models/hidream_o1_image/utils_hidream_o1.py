@@ -14,6 +14,7 @@ import math
 
 import einops
 import torch
+import torchvision.transforms as T
 from PIL import Image
 
 PATCH_SIZE = 32
@@ -275,3 +276,74 @@ def build_packed_attention_metadata(
         full_attn_spans[b].sort(key=lambda x: x[0])
 
     return dense_mask.unsqueeze(1), full_attn_spans
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Reference image preprocessing helpers
+# ---------------------------------------------------------------------------
+
+# Normalization transform matching the reference repo's ``TENSOR_TRANSFORM``
+# (normalize raw [0,255] pixels to the [-1, 1] range expected by the model).
+_REF_TRANSFORM = T.Compose([
+    T.ToTensor(),                    # [0,255] HWC → [0,1] CHW
+    T.Normalize([0.5], [0.5]),       # [0,1] → [-1,1] per channel
+])
+
+
+def adaptive_ref_max_size(K: int, output_max: int) -> int:
+    """Return the max side-length for K reference images at the given output resolution.
+
+    Mirrors the reference repo's pipeline.py adaptive sizing table so that
+    total ref-image token count grows sub-linearly with K, keeping sequence
+    length reasonable for personalization with many references.
+    """
+    if K == 1:
+        return output_max
+    if K == 2:
+        return output_max * 48 // 64
+    if K <= 4:
+        return output_max // 2
+    if K <= 8:
+        return output_max * 24 // 64
+    return output_max // 4
+
+
+def preprocess_ref_patches(
+    pil_list: list[Image.Image],
+    max_size: int,
+    patch_size: int = PATCH_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | str = "cpu",
+) -> tuple[torch.Tensor, list[int]]:
+    """Convert a list of reference PIL images into patchified pixel tensors.
+
+    Each image is resized (aspect-ratio preserving, snapped to ``patch_size``
+    multiples), normalized to ``[-1, 1]``, then patchified. All patches are
+    concatenated into a single ``[1, total_tokens, C*patch_size*patch_size]``
+    tensor, matching the format that ``forward_generation`` expects for the
+    ``vinputs`` concat.
+
+    Args:
+        pil_list: raw reference PIL images (RGB).
+        max_size: maximum side length (from ``adaptive_ref_max_size``).
+        patch_size: spatial patch size (always 32 for this model).
+        dtype: target tensor dtype.
+        device: target device.
+
+    Returns:
+        ref_patches: ``[1, total_tokens, C*P*P]`` float tensor.
+        ref_image_lens: list of patch-token counts per image (one per ref).
+    """
+    patches_list = []
+    ref_image_lens: list[int] = []
+    for pil in pil_list:
+        pil_r = resize_pilimage(pil.convert("RGB"), max_size, patch_size)
+        x = _REF_TRANSFORM(pil_r)  # [C, H, W] in [-1, 1]
+        w, h = pil_r.size
+        hp, wp = h // patch_size, w // patch_size
+        # patchify single image: [1, C, H, W] → [1, hp*wp, C*P*P]
+        xp = patchify(x.unsqueeze(0), patch_size=patch_size)
+        patches_list.append(xp)
+        ref_image_lens.append(hp * wp)
+    ref_patches = torch.cat(patches_list, dim=1).to(device=device, dtype=dtype)
+    return ref_patches, ref_image_lens

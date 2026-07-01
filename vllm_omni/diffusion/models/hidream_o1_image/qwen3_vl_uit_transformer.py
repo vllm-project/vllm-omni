@@ -324,6 +324,25 @@ def _build_attention_subclasses() -> dict[str, type]:
 
             return self.norm(hidden_states)
 
+        @staticmethod
+        def _deepstack_process(
+            hidden_states: torch.Tensor,
+            visual_pos_masks: torch.Tensor,
+            visual_embeds: torch.Tensor,
+        ) -> torch.Tensor:
+            """Residually add deepstack vision features at VLM-ref-image positions.
+
+            Near-verbatim port of the reference repo's
+            ``Qwen3VLTextModel._deepstack_process`` (qwen3_vl_transformers.py:938-944).
+            `visual_pos_masks` is True at every image-token-id position in the
+            (text + vinputs) sequence; `visual_embeds` is the merged intermediate
+            vision feature for the same set of positions.
+            """
+            visual_pos_masks = visual_pos_masks.to(hidden_states.device)
+            local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds.to(hidden_states.dtype)
+            hidden_states[visual_pos_masks, :] = local_this
+            return hidden_states
+
     return {
         "Qwen3VLTextRMSNorm": Qwen3VLTextRMSNorm,
         "Qwen3VLTextAttention": Qwen3VLTextAttention,
@@ -404,8 +423,19 @@ class HiDreamO1UiTModel(nn.Module):
 
     def get_image_features(
         self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        return self.visual(pixel_values, grid_thw=image_grid_thw)
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run the Qwen3-VL vision tower and return (merged_patches, deepstack_features).
+
+        HF's ``Qwen3VLVisionModel.forward()`` returns a
+        ``BaseModelOutputWithDeepstackFeatures`` with:
+        - ``pooler_output``: spatially-merged patch embeddings,
+          shape ``[total_merged_patches, hidden_size]``.
+        - ``deepstack_features``: list of intermediate-layer features
+          (one per ``config.deepstack_visual_indexes`` entry), each
+          ``[total_merged_patches, hidden_size]``.
+        """
+        out = self.visual(pixel_values, grid_thw=image_grid_thw)
+        return out.pooler_output, out.deepstack_features
 
     def forward_generation(
         self,
@@ -458,7 +488,7 @@ class HiDreamO1UiTModel(nn.Module):
                 ]
             else:
                 image_embeds, deepstack_visual_embeds = self.get_image_features(pixel_values, image_grid_thw)
-                image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_token_id = self.config.image_token_id
             image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)

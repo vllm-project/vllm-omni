@@ -165,3 +165,114 @@ class TestFindClosestResolution:
         w, h = find_closest_resolution(1000, 1000)
         assert w % 32 == 0
         assert h % 32 == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Reference-image sequence / masking / position-ID tests
+# ---------------------------------------------------------------------------
+
+from PIL import Image as PILImage  # noqa: E402
+
+from vllm_omni.diffusion.models.hidream_o1_image.utils_hidream_o1 import (  # noqa: E402
+    adaptive_ref_max_size,
+    preprocess_ref_patches,
+)
+
+
+class TestAdaptiveRefMaxSize:
+    def test_single_ref_full_resolution(self):
+        assert adaptive_ref_max_size(1, 1024) == 1024
+
+    def test_two_refs_smaller(self):
+        assert adaptive_ref_max_size(2, 1024) < 1024
+
+    def test_sizes_monotonically_decrease(self):
+        sizes = [adaptive_ref_max_size(k, 1024) for k in range(1, 12)]
+        # Each jump at 1, 2, 4, 8 boundaries should be non-increasing
+        for a, b in zip(sizes, sizes[1:]):
+            assert a >= b
+
+    def test_minimum_is_positive(self):
+        assert adaptive_ref_max_size(20, 256) > 0
+
+
+class TestPreprocessRefPatches:
+    def test_single_ref_shape(self):
+        pil = PILImage.new("RGB", (64, 64), color=(128, 64, 32))
+        patches, lens = preprocess_ref_patches([pil], max_size=64, patch_size=32)
+        assert patches.shape == (1, (64 // 32) * (64 // 32), 3 * 32 * 32)
+        assert lens == [(64 // 32) * (64 // 32)]
+
+    def test_two_refs_concat(self):
+        pil_a = PILImage.new("RGB", (64, 32), color=(0, 0, 0))
+        pil_b = PILImage.new("RGB", (32, 64), color=(255, 255, 255))
+        patches, lens = preprocess_ref_patches([pil_a, pil_b], max_size=128, patch_size=32)
+        assert patches.shape[0] == 1
+        assert patches.shape[1] == sum(lens)
+        assert len(lens) == 2
+
+    def test_normalized_to_minus_one_one(self):
+        # Solid white image → all pixels 1.0 after /255 → (1.0 - 0.5) / 0.5 = 1.0
+        pil = PILImage.new("RGB", (32, 32), color=(255, 255, 255))
+        patches, _ = preprocess_ref_patches([pil], max_size=32, patch_size=32, dtype=torch.float32)
+        assert patches.max().item() == pytest.approx(1.0, abs=1e-4)
+        # Solid black image → all pixels 0.0 → (0.0 - 0.5) / 0.5 = -1.0
+        pil_black = PILImage.new("RGB", (32, 32), color=(0, 0, 0))
+        patches_b, _ = preprocess_ref_patches([pil_black], max_size=32, patch_size=32, dtype=torch.float32)
+        assert patches_b.min().item() == pytest.approx(-1.0, abs=1e-4)
+
+
+class TestEditSampleTokenTypes:
+    """Tests for the token_type assignment in a synthetic edit-like sequence.
+    Uses build_packed_attention_metadata directly, mimicking the layout that
+    _build_edit_sample would produce for K=1 reference image.
+    """
+
+    def _make_edit_token_types(self, txt_len: int, tgt_len: int, ref_len: int) -> torch.Tensor:
+        """Synthetic token_types_raw for:
+            [text(0)...txt_len-1 tokens][tms(3)][target(1)...tgt_len][ref_pixel(2)...ref_len]
+        The tms token is at position txt_len-1 (last text position).
+        """
+        total = txt_len + tgt_len + ref_len
+        raw = torch.zeros((1, total), dtype=torch.long)
+        raw[0, txt_len - 1] = 3          # tms
+        raw[0, txt_len: txt_len + tgt_len] = 1   # target patches
+        raw[0, txt_len + tgt_len:] = 2           # ref pixel patches
+        return raw
+
+    def test_vinput_mask_excludes_ref_pixel_patches(self):
+        """vinput_mask must be True ONLY for type=1 (target) positions."""
+        raw = self._make_edit_token_types(txt_len=5, tgt_len=4, ref_len=3)
+        vinput_mask = raw == 1
+        assert vinput_mask[0, :5].sum() == 0     # text: no
+        assert vinput_mask[0, 5:9].sum() == 4    # target: all True
+        assert vinput_mask[0, 9:].sum() == 0     # ref pixel: no
+
+    def test_single_contiguous_gen_span(self):
+        """tms + target + ref_pixel form one contiguous gen span (no multi-span needed)."""
+        raw = self._make_edit_token_types(txt_len=5, tgt_len=4, ref_len=3)
+        token_types = (raw > 0).long()
+        _, spans = build_packed_attention_metadata(token_types)
+        # tms is at position 4, gen ends at position 11 (4+1+4+3=12 total, idx 11 incl.)
+        assert len(spans[0]) == 1
+        start, end = spans[0][0]
+        assert start == 4   # tms position (txt_len - 1)
+        assert end == 12    # exclusive end (txt_len - 1 + 1 + tgt_len + ref_len = 12)
+
+    def test_ref_pixel_rows_attend_to_everything(self):
+        """Gen rows (including ref pixel patches) must be fully True (bidirectional)."""
+        raw = self._make_edit_token_types(txt_len=5, tgt_len=4, ref_len=3)
+        token_types = (raw > 0).long()
+        dense_mask, _ = build_packed_attention_metadata(token_types)
+        # Check a ref pixel row (e.g., row 9 = first ref pixel token)
+        ref_pixel_row = dense_mask[0, 0, 9, :]
+        assert ref_pixel_row.all(), "Ref pixel token must attend to the full sequence"
+
+    def test_text_rows_do_not_attend_to_gen_tokens(self):
+        """Text rows must be causally masked -- they cannot see tms / target / ref pixels."""
+        raw = self._make_edit_token_types(txt_len=5, tgt_len=4, ref_len=3)
+        token_types = (raw > 0).long()
+        dense_mask, _ = build_packed_attention_metadata(token_types)
+        # Text row at position 3 (before tms at 4): should not attend to 4..11
+        text_row = dense_mask[0, 0, 3, :]
+        assert not text_row[4:].any(), "Text row must not attend to gen positions"
