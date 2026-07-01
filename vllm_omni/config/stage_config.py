@@ -338,6 +338,7 @@ class StageDeployConfig:
     sequence_parallel_size: int | None = None
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None
+    vae_parallel_mode: str | None = None
     use_hsdp: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None
@@ -602,7 +603,8 @@ def _apply_platform_overrides(
     if platform is None:
         from vllm_omni.platforms import current_omni_platform
 
-        platform = current_omni_platform.device_name.lower()
+        device_name = current_omni_platform.device_name
+        platform = device_name.lower() if device_name is not None else None
     if platform is None or deploy.platforms is None:
         return deploy
     platform_section = deploy.platforms.get(platform)
@@ -690,6 +692,7 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "active_stream_window",
     "custom_voice_dir",
 )
+PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
 
 
 def _build_engine_args(
@@ -782,21 +785,27 @@ def merge_pipeline_deploy(
     if len(pipeline.stages) <= 1:
         deploy.async_chunk = False
 
-    # A pipeline supports async_chunk if any stage has either an explicit
-    # async-chunk-only processor slot OR a custom next-stage processor (some
-    # pipelines like qwen3_omni wire async-chunk processing directly through
-    # ``custom_process_next_stage_input_func``). Only raise when neither is
-    # present — that's the "user enabled async_chunk but pipeline has no
-    # inter-stage processing at all" case.
-    if deploy.async_chunk and not any(
-        ps.async_chunk_process_next_stage_input_func or ps.custom_process_next_stage_input_func
-        for ps in pipeline.stages
+    # async_chunk only applies to multi-stage pipelines: a pipeline with no
+    # consumer stages (every stage has empty input_sources) has no inter-stage
+    # edges, so async_chunk is a no-op and we skip the check entirely.
+    # For pipelines that DO have inter-stage edges, require a dedicated per-step
+    # async producer (``async_chunk_process_next_stage_input_func``).
+    # ``custom_process_next_stage_input_func`` is the full-payload / connector-path
+    # producer and does NOT imply async_chunk support — pipelines like qwen2_5_omni
+    # and covo_audio have it but removed their consumer-side ``custom_process_input_func``
+    # because they don't support async_chunk, so accepting them here would silently
+    # miswire the consumer stage instead of raising a clear error.
+    _has_inter_stage_edges = any(ps.input_sources for ps in pipeline.stages)
+    if (
+        deploy.async_chunk
+        and _has_inter_stage_edges
+        and not any(ps.async_chunk_process_next_stage_input_func for ps in pipeline.stages)
     ):
         raise ValueError(
             f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a next-stage input processor "
-            "(``async_chunk_process_next_stage_input_func`` or ``custom_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk processor on the pipeline."
+            "declares a dedicated async-chunk next-stage processor "
+            "(``async_chunk_process_next_stage_input_func``). "
+            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
         )
 
     result: list[StageConfig] = []

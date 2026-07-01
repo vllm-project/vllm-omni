@@ -262,8 +262,8 @@ class CUDAGraphAcousticTransformerWrapper:
         fake_eos = self.static_fake_eos[padded_size][:actual_size].clone()
         audio_codes = self.static_audio_codes[padded_size][:actual_size].clone()
 
-        # Package into expected format: (fake_eos, {"audio": [list of tensors]})
+        # Package into expected format: (fake_eos, {"codes": {"audio": [list of tensors]}})
         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))
-        mm_tokens = {"audio": audio_list}
+        mm_tokens = {"codes": {"audio": audio_list}}
 
         return fake_eos, mm_tokens

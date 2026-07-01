@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Action-token helpers for Cosmos3 UVA/action generation."""
+"""Action-token helpers for Cosmos3 action generation.
+
+These helpers cover action modes that use action tokens as an auxiliary output
+stream: ``policy``, ``forward_dynamics``, and ``inverse_dynamics``. The pipeline
+returns predicted actions through ``custom_output`` rather than as a normal
+``modalities`` entry.
+"""
 
 from __future__ import annotations
 

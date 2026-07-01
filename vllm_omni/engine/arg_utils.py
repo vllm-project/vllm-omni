@@ -40,7 +40,10 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
         )
-        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingDenseConfig
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+            MingDenseConfig,
+            MingMoeConfig,
+        )
         from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
             MossTTSLocalConfig,
             MossTTSRealtimeConfig,
@@ -66,6 +69,7 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("dense", MingDenseConfig),
+        ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
@@ -168,6 +172,8 @@ class OmniEngineArgs(EngineArgs):
     # in __post_init__ based on worker_type (ar/generation), so None is safe here.
     enable_sleep_mode: bool = False
     omni: bool = False
+    # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
+    request_batch_max_wait_ms: float = 0.0
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -434,6 +440,7 @@ class OrchestratorArgs:
 
     # === Observability ===
     log_stats: bool = False
+    enable_orch_monitor: bool = False
 
     # === Headless Mode (also forwarded to engine — see SHARED_FIELDS) ===
     stage_id: int | None = None
@@ -473,6 +480,7 @@ class OrchestratorArgs:
     diffusion_kv_cache_skip_layers: str | None = None
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
+    vae_parallel_mode: str = "tile"
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

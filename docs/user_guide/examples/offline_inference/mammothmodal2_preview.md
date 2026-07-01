@@ -7,29 +7,22 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 
 Download model
 ```bash
-hf bytedance-research/MammothModa2-Preview --local-dir ./MammothModa2-Preview
+hf download bytedance-research/MammothModa2-Preview --local-dir ./MammothModa2-Preview
 ```
 
 ### Text-to-Image (T2I)
 
-```bash
-python examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_t2i.py \
-  --model ./MammothModa2-Preview \
-  --stage-config ./vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml \
-  --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
-  --height 1024 \
-  --width 1024 \
-  --num-inference-steps 50 \
-  --text-guidance-scale 4.0 \
-  --out output.png
-```
+Text-to-image now runs through the shared offline image example
+(`examples/offline_inference/text_to_image/text_to_image.py`). See the recipe
+`recipes/MammothModa2/MammothModa2-Preview.md` for the full command and the
+`extra_body` knobs (`text_guidance_scale`, `cfg_range`, `num_inference_steps`).
 
 ### Image Summary
 
 ```bash
 python examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_image_summarize.py \
   --model ./MammothModa2-Preview \
-  --stage-config ./vllm_omni/model_executor/stage_configs/mammoth_moda2_ar.yaml \
+  --deploy-config ./vllm_omni/deploy/mammoth_moda2_ar.yaml \
   --question "Summarize this image." \
   --image ./image.png
 ```
@@ -39,8 +32,4 @@ python examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_image_s
 ??? abstract "run_mammothmoda2_image_summarize.py"
     ``````py
     --8<-- "examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_image_summarize.py"
-    ``````
-??? abstract "run_mammothmoda2_t2i.py"
-    ``````py
-    --8<-- "examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_t2i.py"
     ``````

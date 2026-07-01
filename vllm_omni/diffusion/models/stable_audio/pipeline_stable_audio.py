@@ -35,8 +35,8 @@ from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
     StableAudioSchedulerWrapper,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -76,6 +76,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
         od_config: OmniDiffusion configuration object
         prefix: Weight prefix for loading (default: "")
     """
+
+    supports_request_batch = False
 
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the
@@ -385,7 +387,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         audio_end_in_s: float | None = None,
@@ -605,9 +607,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
         # Trim to requested length
         audio = audio[:, :, waveform_start:waveform_end]
 
-        return DiffusionOutput(
-            output=audio, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return DiffusionOutput(output=audio, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

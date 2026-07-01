@@ -45,6 +45,7 @@ from vllm_omni.diffusion.utils.size_utils import (
     normalize_min_aligned_size,
 )
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -80,63 +81,61 @@ def get_qwen_image_layered_pre_process_func(
         request: OmniDiffusionRequest,
     ):
         """Pre-process requests for QwenImageLayeredPipeline."""
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if not raw_image:  # None or empty list
-                raise ValueError("""Received no input image. This model requires one input image to run.""")
-            elif isinstance(raw_image, list):
-                if len(raw_image) > 1:
-                    raise ValueError(
-                        """Received multiple input images. Only a single image is supported by this model."""
-                    )
-                else:
-                    raw_image = raw_image[0]
-
-            if isinstance(raw_image, str):
-                image = PIL.Image.open(raw_image)
+        if not raw_image:  # None or empty list
+            raise ValueError("""Received no input image. This model requires one input image to run.""")
+        elif isinstance(raw_image, list):
+            if len(raw_image) > 1:
+                raise ValueError("""Received multiple input images. Only a single image is supported by this model.""")
             else:
-                image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
+                raw_image = raw_image[0]
 
-            if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
-                image = image.convert("RGBA")
+        if isinstance(raw_image, str):
+            image = PIL.Image.open(raw_image)
+        else:
+            image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
 
-            # 1. calculate dimensions
-            image_size = image.size
-            assert request.sampling_params.resolution in [640, 1024], (
-                f"resolution must be either 640 or 1024, but got {request.sampling_params.resolution}"
-            )
-            calculated_width, calculated_height = calculate_dimensions(
-                request.sampling_params.resolution * request.sampling_params.resolution, image_size[0] / image_size[1]
-            )
-            height = calculated_height
-            width = calculated_width
+        if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
+            image = image.convert("RGBA")
 
-            height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
+        # 1. calculate dimensions
+        image_size = image.size
+        assert request.sampling_params.resolution in [640, 1024], (
+            f"resolution must be either 640 or 1024, but got {request.sampling_params.resolution}"
+        )
+        calculated_width, calculated_height = calculate_dimensions(
+            request.sampling_params.resolution * request.sampling_params.resolution, image_size[0] / image_size[1]
+        )
+        height = calculated_height
+        width = calculated_width
 
-            # Store calculated dimensions in request
-            prompt["additional_information"]["calculated_height"] = calculated_height
-            prompt["additional_information"]["calculated_width"] = calculated_width
-            request.sampling_params.height = height
-            request.sampling_params.width = width
+        height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
 
-            # 2. Preprocess image
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
-                image = image_processor.resize(image, calculated_height, calculated_width)
-                prompt_image = image
-                image = image_processor.preprocess(image, calculated_height, calculated_width)
-                image = image.unsqueeze(2)
-                # image = image.to(dtype=self.text_encoder.dtype)  # do it later
+        # Store calculated dimensions in request
+        prompt["additional_information"]["calculated_height"] = calculated_height
+        prompt["additional_information"]["calculated_width"] = calculated_width
+        request.sampling_params.height = height
+        request.sampling_params.width = width
 
-                # Store preprocessed image and prompt image in request
-                prompt["additional_information"]["preprocessed_image"] = image
-                prompt["additional_information"]["prompt_image"] = prompt_image
-            request.prompts[i] = prompt
+        # 2. Preprocess image
+        if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
+            image = image_processor.resize(image, calculated_height, calculated_width)
+            prompt_image = image
+            image = image_processor.preprocess(image, calculated_height, calculated_width)
+            image = image.unsqueeze(2)
+            # image = image.to(dtype=self.text_encoder.dtype)  # do it later
+
+            # Store preprocessed image and prompt image in request
+            prompt["additional_information"]["preprocessed_image"] = image
+            prompt["additional_information"]["prompt_image"] = prompt_image
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -276,7 +275,11 @@ class QwenImageLayeredPipeline(
         ]
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
-        self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = QwenImageTransformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+            **transformer_kwargs,
+        )
 
         # Pipeline configuration & processing parameters
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
@@ -647,7 +650,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
