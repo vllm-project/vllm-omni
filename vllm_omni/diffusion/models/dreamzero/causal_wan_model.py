@@ -14,7 +14,7 @@ Key differences from WanTransformer3DModel:
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -31,7 +31,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.sp_sharding import sp_gather
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.models.dreamzero.action_encoder import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
@@ -52,6 +55,38 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
     )
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
+
+
+def _with_precise_bf16_matmul_reduction(func: Callable) -> Callable:
+    """Keep SP-sharded bf16 GEMMs numerically aligned with full-sequence GEMMs."""
+
+    def wrapped(self, *args, **kwargs):
+        x = kwargs.get("x")
+        if x is None and args:
+            x = args[0]
+        should_disable = (
+            torch.is_tensor(x)
+            and x.dtype == torch.bfloat16
+            and hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction")
+        )
+        if not should_disable:
+            return func(self, *args, **kwargs)
+
+        old_flag = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = old_flag
+
+    return wrapped
+
+
+def _dreamzero_sp_gather(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    try:
+        return sp_gather(tensor, dim=dim, validate=False)
+    except AssertionError:
+        return tensor
 
 
 def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
@@ -500,7 +535,7 @@ class CausalWanSelfAttention(nn.Module):
             self.head_dim,
             causal=False,
             softmax_scale=self.head_dim**-0.5,
-            skip_sequence_parallel=True,
+            skip_sequence_parallel=False,
         )
 
     def forward(
@@ -567,24 +602,23 @@ class CausalWanSelfAttention(nn.Module):
             action_v = v[:, -action_register_length:]
             v = v[:, :-action_register_length]
 
-        updated_k = kv_cache[0]
-        updated_v = kv_cache[1]
-        new_k = torch.cat([updated_k, roped_key], dim=1)
-        new_v = torch.cat([updated_v, v], dim=1)
-        new_k = new_k[:, -self.max_attention_size :]
-        new_v = new_v[:, -self.max_attention_size :]
-
+        attn_metadata = None
         if action_register_length is not None:
-            q_cat = torch.cat([roped_query, roped_action_query], dim=1)
-            k_cat = torch.cat([new_k, roped_action_key], dim=1)
-            v_cat = torch.cat([new_v, action_v], dim=1)
-        else:
-            q_cat = roped_query
-            k_cat = new_k
-            v_cat = new_v
+            attn_metadata = AttentionMetadata(
+                joint_query=roped_action_query,
+                joint_key=roped_action_key,
+                joint_value=action_v,
+                joint_strategy="rear",
+            )
 
-        x = self.attn(q_cat, k_cat, v_cat)
-        updated_kv_cache = torch.stack([new_k, new_v], dim=0)
+        x, updated_kv_cache = self.attn.forward_with_kv_cache(
+            roped_query,
+            roped_key,
+            v,
+            kv_cache,
+            max_cache_len=self.max_attention_size,
+            attn_metadata=attn_metadata,
+        )
 
         x = x.flatten(2)
         x = self.o(x)
@@ -700,6 +734,18 @@ class CausalHead(nn.Module):
         return x
 
 
+class DreamZeroSPPrepare(nn.Module):
+    """Module boundary for _sp_plan to shard video tensors together."""
+
+    def forward(
+        self,
+        x_video: torch.Tensor,
+        e_video: torch.Tensor,
+        freqs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return x_video, e_video, freqs
+
+
 # ── Main Model ──────────────────────────────────────────────────────
 
 
@@ -710,6 +756,13 @@ class CausalWanModel(nn.Module):
     """
 
     _layerwise_offload_blocks_attrs = ["blocks"]
+    _sp_plan = {
+        "sp_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=False),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=False),
+            2: SequenceParallelInput(split_dim=0, expected_dims=3, split_output=True, auto_pad=False),
+        },
+    }
 
     def __init__(
         self,
@@ -799,6 +852,7 @@ class CausalWanModel(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, dim * 6),
         )
+        self.sp_prepare = DreamZeroSPPrepare()
 
         cross_attn_type = "t2v_cross_attn" if model_type == "t2v" else "i2v_cross_attn"
         self.blocks = nn.ModuleList(
@@ -841,6 +895,17 @@ class CausalWanModel(nn.Module):
             self.img_emb = MLPProj(1280, dim)
 
         self.init_weights()
+
+    def kv_cache_num_heads(self, ulysses_degree: int = 1) -> int:
+        heads = self.blocks[0].self_attn.tp_num_heads
+        if ulysses_degree <= 1:
+            return heads
+        if heads % ulysses_degree != 0:
+            raise ValueError(
+                f"DreamZero self-attn KV heads ({heads}) must be divisible by "
+                f"ulysses_degree ({ulysses_degree}) in strict mode."
+            )
+        return heads // ulysses_degree
 
     def init_weights(self) -> None:
         """Initialize parameters."""
@@ -913,6 +978,7 @@ class CausalWanModel(nn.Module):
         x = x.reshape(B, c, *[i * j for i, j in zip(grid_size, self.patch_size)])
         return x
 
+    @_with_precise_bf16_matmul_reduction
     def _forward_blocks(
         self,
         x: torch.Tensor,
@@ -932,6 +998,7 @@ class CausalWanModel(nn.Module):
         x = x.flatten(start_dim=2).transpose(1, 2)
         B = x.shape[0]
         F_t = timestep.shape[1]
+        video_seq_len = seq_len
 
         if action is not None:
             # Current DreamZero checkpoints have one local action/state adapter.
@@ -959,6 +1026,22 @@ class CausalWanModel(nn.Module):
         e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))
         e = e.unflatten(dim=0, sizes=(B, -1))
         e0 = self.time_projection(e)
+
+        x_video = x[:, :seq_len]
+        x_action = x[:, seq_len:] if action_register_length is not None else None
+        e_video = e0[:, :seq_len]
+        e_action = e0[:, seq_len:] if action_register_length is not None else None
+
+        x_video, e_video, freqs = self.sp_prepare(x_video, e_video, freqs)
+        local_video_seq_len = x_video.shape[1]
+        if x_action is not None:
+            x = torch.cat([x_video, x_action], dim=1)
+            e0 = torch.cat([e_video, e_action], dim=1)
+        else:
+            x = x_video
+            e0 = e_video
+        seq_len = local_video_seq_len
+
         e0 = e0.unflatten(dim=2, sizes=(6, self.dim))
 
         context = self.text_embedding(context)
@@ -988,8 +1071,8 @@ class CausalWanModel(nn.Module):
         else:
             action_noise_pred = None
 
-        x_video = x[:, :seq_len]
-        e_video = e[:, :seq_len]
+        x_video = _dreamzero_sp_gather(x[:, :seq_len], dim=1)
+        e_video = e[:, :video_seq_len]
         x_video = self.head(x_video, e_video.unsqueeze(2))
 
         return x_video, action_noise_pred, updated_kv_caches

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Literal
 
 import torch
@@ -13,6 +14,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 
 logger = init_logger(__name__)
+TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 SDPAMaskMode = Literal["broadcast_k", "full_qk"]
@@ -103,18 +105,44 @@ class SDPAImpl(AttentionImpl):
         if attn_metadata:
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
+        orig_dtype = query.dtype
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=self.causal,
-            scale=self.softmax_scale,
-            enable_gqa=self.requires_gqa,
-        )
+        force_fp32 = os.environ.get("DIFFUSION_SDPA_FORCE_FP32", "").lower() in TRUE_VALUES
+        if force_fp32:
+            query, key, value = (x.float() for x in (query, key, value))
+            if attention_mask is not None and attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.float()
+        if os.environ.get("DIFFUSION_SDPA_FORCE_MATH", "").lower() in TRUE_VALUES:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_math=True,
+                enable_mem_efficient=False,
+                enable_cudnn=False,
+            ):
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=self.causal,
+                    scale=self.softmax_scale,
+                    enable_gqa=self.requires_gqa,
+                )
+        else:
+            output = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=self.causal,
+                scale=self.softmax_scale,
+                enable_gqa=self.requires_gqa,
+            )
         out = output.permute(0, 2, 1, 3)
+        if force_fp32 and out.dtype != orig_dtype:
+            out = out.to(orig_dtype)
         return out
 
     def forward_cuda(

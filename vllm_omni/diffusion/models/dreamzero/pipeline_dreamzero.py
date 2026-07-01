@@ -27,12 +27,16 @@ from vllm_omni.diffusion.cache.stepcache import (
     get_stepcache_state,
     is_stepcache_active,
 )
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
 )
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+    get_ulysses_parallel_world_size,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dreamzero.causal_wan_model import CausalWanModel
@@ -56,6 +60,16 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
+
+
+def _get_runtime_ulysses_degree() -> int:
+    try:
+        return max(1, int(get_ulysses_parallel_world_size()))
+    except (AssertionError, RuntimeError):
+        config = get_current_diffusion_config_or_none()
+        if config is None:
+            return 1
+        return max(1, int(getattr(config.parallel_config, "ulysses_degree", 1) or 1))
 
 
 class VideoActionScheduler:
@@ -642,7 +656,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         batch_size = image_latents.shape[0]
         device = image_latents.device
         dtype = image_latents.dtype
-        num_heads = getattr(self.transformer.blocks[0].self_attn, "tp_num_heads", self.transformer.num_heads)
+        ulysses_degree = _get_runtime_ulysses_degree()
+        num_heads = self.transformer.kv_cache_num_heads(ulysses_degree=ulysses_degree)
         head_dim = self.transformer.dim // self.transformer.num_heads
 
         if state.current_start_frame == 0:
