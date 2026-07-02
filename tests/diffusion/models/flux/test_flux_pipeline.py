@@ -21,6 +21,8 @@ def _make_flux_sampling(**overrides):
         "true_cfg_scale": 4.0,
         "num_outputs_per_prompt": 0,
         "latents": None,
+        "output_type": None,
+        "max_sequence_length": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -131,7 +133,7 @@ def test_forward_collates_request_prompt_tensors_for_flux(monkeypatch):
                     "negative_prompt_embeds": negative_prompt_embeds_a,
                     "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds_a,
                 },
-                sampling_params=_make_flux_sampling(generator=gen_a, latents=latents_a),
+                sampling_params=_make_flux_sampling(generator=gen_a, latents=latents_a, output_type="latent"),
             ),
             SimpleNamespace(
                 request_id="flux-prompt-b",
@@ -145,12 +147,12 @@ def test_forward_collates_request_prompt_tensors_for_flux(monkeypatch):
                         "negative_pooled_prompt_embeds": [negative_pooled_prompt_embeds_b],
                     },
                 },
-                sampling_params=_make_flux_sampling(generator=gen_b, latents=latents_b),
+                sampling_params=_make_flux_sampling(generator=gen_b, latents=latents_b, output_type="latent"),
             ),
         ]
     )
 
-    outputs = pipeline.forward(batch, output_type="latent")
+    outputs = pipeline.forward(batch)
 
     assert encode_calls[0]["prompt"] is None
     assert encode_calls[0]["prompt_2"] is None
