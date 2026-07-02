@@ -299,6 +299,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self.max_action_dim: int = ah_config["max_action_dim"]
 
         self.negative_prompt: str = model_config.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
+        # The negative prompt is a model constant: encode it once, lazily, and
+        # reuse across every forward/session (UMT5 encode is deterministic).
+        self._negative_prompt_embeds_cache: torch.Tensor | None = None
 
         # Embodiment name -> numeric ID mapping (model knowledge)
         self.embodiment_name_to_id: dict[str, int] = model_config.get(
@@ -678,9 +681,16 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             y = torch.concat([msk, y], dim=1)
 
             if state is not None:
-                # Seed the AR streaming encoder after the compiled full encode above;
-                # ``cudagraph_mark_step_begin`` isolates eager feat_cache work from CUDAGraph.
-                self._vae_stream_seed(state, image_input[:, :, :1])
+                if not state.vae_stream_initialized:
+                    # Seed the AR streaming encoder after the compiled full encode above;
+                    # ``cudagraph_mark_step_begin`` isolates eager feat_cache work from CUDAGraph.
+                    self._vae_stream_seed(state, image_input[:, :, :1])
+                else:
+                    # Window ("inference") restart with a live stream: keep the real
+                    # frame history in the Wan feat_cache and append the restart
+                    # observation instead of reseeding from scratch.
+                    self._cudagraph_mark_step_begin()
+                    self._vae_stream_append_frame(state, image_input[:, :, :1])
 
         return clip_context, y, new_image
 
@@ -1223,22 +1233,45 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         videos = self._preprocess_video(videos)  # -> [B,C,T,H,W] bf16
         _, _, num_frames_raw, height, width = videos.shape
 
-        prompt_embeds = self._encode_text(text_tokens, attention_mask)
+        # Optional phase timing (DZ_PHASE_TIMING=1): logs per-forward stage costs
+        # (text encode / obs VAE encode / KV prefill / denoise) at INFO. Each mark
+        # synchronizes CUDA, so leave it off for timed benchmark runs.
+        _pt = None
+        if os.environ.get("DZ_PHASE_TIMING"):
+            import time as _time
+
+            torch.cuda.synchronize()
+            _pt = {"time": _time, "t0": _time.perf_counter(), "marks": []}
+
+        def _pt_mark(name: str) -> None:
+            if _pt is not None:
+                torch.cuda.synchronize()
+                _pt["marks"].append((name, _pt["time"].perf_counter()))
+
+        # Prompt embeds are constant within a session (a prompt change triggers a
+        # "session" reset above, which clears this cache alongside state.language).
+        if state.prompt_embeds is None:
+            state.prompt_embeds = self._encode_text(text_tokens, attention_mask)
+        prompt_embeds = state.prompt_embeds
         # Negative prompt for CFG uncond branch (model constant)
         negative_prompt_embeds = None
         if self.cfg_scale > 1.0:
-            neg_inputs = self.tokenizer(
-                self.negative_prompt,
-                max_length=512,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-                add_special_tokens=True,
-            )
-            negative_prompt_embeds = self._encode_text(
-                neg_inputs["input_ids"].to(device),
-                neg_inputs["attention_mask"].to(device),
-            )
+            if self._negative_prompt_embeds_cache is None:
+                neg_inputs = self.tokenizer(
+                    self.negative_prompt,
+                    max_length=512,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                    add_special_tokens=True,
+                )
+                self._negative_prompt_embeds_cache = self._encode_text(
+                    neg_inputs["input_ids"].to(device),
+                    neg_inputs["attention_mask"].to(device),
+                )
+            negative_prompt_embeds = self._negative_prompt_embeds_cache
+
+        _pt_mark("text_encode")
 
         # Extract first/last frame for CLIP + VAE encoding
         if num_frames_raw == 4 or num_frames_raw == 9:
@@ -1269,6 +1302,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             latent_dtype = videos.dtype
             with torch.no_grad():
                 image = self._encode_observation_latents(state, videos, latent_dtype=latent_dtype)
+        _pt_mark("obs_vae_encode")
 
         batch_size = image.shape[0]
         generator = torch.Generator(device=device).manual_seed(self.seed)
@@ -1309,6 +1343,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             do_true_cfg,
             state,
         )
+        _pt_mark("prefill_kv")
 
         sample_scheduler = copy.deepcopy(self.scheduler)
         sample_scheduler_action = copy.deepcopy(self.scheduler)
@@ -1350,6 +1385,19 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state_features=state_features,
             embodiment_id=embodiment_id,
         )
+        if _pt is not None:
+            _pt_mark("diffuse")
+            prev_t = _pt["t0"]
+            parts = []
+            for name, t in _pt["marks"]:
+                parts.append(f"{name}={1000 * (t - prev_t):.1f}ms")
+                prev_t = t
+            logger.info(
+                "DZ_PHASE_TIMING csf=%s total=%.1fms %s",
+                state.current_start_frame,
+                1000 * (prev_t - _pt["t0"]),
+                " ".join(parts),
+            )
 
         if state.current_start_frame == 1:
             video_out = torch.cat([image, video_out], dim=1)

@@ -119,9 +119,13 @@ class DreamZeroState:
 
         self.clip_feas = None
         self.ys = None
-        self.reset_vae_encoder_stream()
         if clear_video_latents:
+            # Session reset: drop the prompt-embed cache and VAE encoder stream.
             self.language = None
+            self.prompt_embeds = None
+            self.reset_vae_encoder_stream()
+        # Window ("inference") resets keep both: the prompt is unchanged, and the
+        # Wan feat_cache history is independent of the DiT attention window.
 
     def reset_vae_encoder_stream(self) -> None:
         """Clear incremental Wan VAE encoder state used across AR steps."""
