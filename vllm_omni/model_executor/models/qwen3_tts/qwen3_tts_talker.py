@@ -592,7 +592,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         audio_codes = torch.cat(audio_codes_list, dim=0)
         span_len = int(audio_codes.shape[0])
-        hidden = hidden[:span_len]
         mm: OmniPayload = {"codes": {"audio": audio_codes}}
         if ref_code_len_list:
             mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
@@ -717,6 +716,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
             info_update.setdefault("codes", {})["audio"] = zeros
             return input_ids_out, prompt_embeds, info_update
+
+        if span_len > 1:
+            inputs_embeds_out = (
+                self.embed_input_ids(input_ids.reshape(-1, 1).to(torch.long))
+                .to(device=input_ids.device, dtype=dtype)
+                .reshape(span_len, -1)
+            )
+            return input_ids, inputs_embeds_out, {"meta": {"codec_streaming": codec_streaming}}
 
         # Decode: span_len == 1
         # Pop one text-step vector from tailing_text_hidden queue.
