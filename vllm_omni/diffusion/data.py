@@ -374,6 +374,12 @@ class DiffusionCacheConfig:
     # Policy for force refresh: "once" refreshes only at the hint step,
     # "repeat" refreshes every force_refresh_step_hint steps.
     force_refresh_step_policy: str = "once"
+    # Inter-request cache parameters [inter_request only]
+    inter_request_max_entries: int = 100
+    inter_request_max_memory_gb: float = 4.0
+    inter_request_record_step_latents: bool = False
+    inter_request_step_latents_dir: str = "./step_latents"
+    inter_request_persistent_cache_dir: str | None = None
 
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)

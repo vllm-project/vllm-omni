@@ -22,7 +22,11 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
+import threading
+
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.inter_request.backend import InterRequestCacheBackend
+from vllm_omni.diffusion.cache.inter_request.cache_store import StepLatentData
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
     resolve_prompt_embed_cache_config,
@@ -223,6 +227,22 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return None
         return self.prompt_embed_cache.stats()
 
+    def _update_cache_image_embedding(self, cache_key_hash: str, image_tensor: torch.Tensor) -> None:
+        # Skip image embedding update for video (5D tensor [B,C,T,H,W])
+        if image_tensor.dim() == 5:
+            return
+        # Copy tensor to CPU before async to avoid NPU synchronization issues
+        image_tensor_cpu = image_tensor.detach().clone().cpu()
+
+        def _worker():
+            try:
+                self.cache_backend.update_image_embedding(cache_key_hash, image_tensor_cpu)
+            except Exception as e:
+                logger.debug("Failed to update image embedding: %s", e)
+
+        t_thread = threading.Thread(target=_worker, daemon=True)
+        t_thread.start()
+
     def _record_peak_memory(self, output: DiffusionOutput) -> None:
         """Record peak GPU memory for the current forward pass into output.
 
@@ -290,6 +310,51 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     gen_device = self.device
                 req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
 
+
+            # Inter-request cache: check for cached DiT output before computation
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+                if resume_from_step > 0:
+                    step_latents_list = self.cache_backend.lookup_step_latents(req, target_device=self.device)
+                    if step_latents_list is not None and len(step_latents_list) >= resume_from_step:
+                        resume_data = step_latents_list[resume_from_step - 1]
+                        req.sampling_params.resume_latents = resume_data.latent
+                        logger.info(
+                            "Inter-request cache: resuming from step %d", resume_from_step,
+                        )
+                    else:
+                        req.sampling_params.resume_from_step = 0
+                else:
+                    cached_output = self.cache_backend.lookup(req, target_device=self.device)
+                    if cached_output is not None:
+                        logger.info("Inter-request cache HIT: skipping DiT computation entirely")
+                        return DiffusionOutput(output=cached_output)
+
+                    if self.cache_backend.clip_enabled:
+                        clip_result = self.cache_backend.semantic_lookup(req, target_device=self.device)
+                        clip_latents, clip_step_latents, clip_sim, clip_cached_prompt, clip_match_type = clip_result
+                        if clip_latents is not None and clip_step_latents is not None:
+                            total_steps = req.sampling_params.num_inference_steps or len(clip_step_latents)
+                            current_prompt = ""
+                            if req.prompts and isinstance(req.prompts[0], dict):
+                                current_prompt = req.prompts[0].get("prompt", "")
+                            elif req.prompts and isinstance(req.prompts[0], str):
+                                current_prompt = req.prompts[0]
+                            clip_resume_step = self.cache_backend.compute_skip_steps(
+                                clip_sim, total_steps,
+                                query_prompt=current_prompt,
+                                cached_prompt=clip_cached_prompt,
+                                match_type=clip_match_type,
+                            )
+                            if clip_resume_step > 0 and len(clip_step_latents) >= clip_resume_step:
+                                resume_data = clip_step_latents[clip_resume_step - 1]
+                                req.sampling_params.resume_latents = resume_data.latent
+                                req.sampling_params.resume_from_step = clip_resume_step
+                                logger.info(
+                                    "CLIP semantic match: similarity=%.4f, resuming from step %d/%d",
+                                    clip_sim, clip_resume_step, total_steps,
+                                )
+
             # Refresh cache context if needed
             if (
                 not getattr(req, "skip_cache_refresh", False)
@@ -310,7 +375,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     num_inference_steps = 0
 
                 if num_inference_steps is not None:
-                    self.cache_backend.refresh(self.pipeline, num_inference_steps)
+                    _resume_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+                    self.cache_backend.refresh(
+                        self.pipeline,
+                        num_inference_steps,
+                        resume_from_step=_resume_step,
+                    )
                 else:
                     logger.warning(
                         "Failed to refresh the diffusion transformer cache; backend %s "
@@ -322,12 +392,48 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
+            is_dummy = "dummy" in req.request_ids[0] if req.request_ids else False
+
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                self.cache_backend.before_forward(is_dummy=is_dummy)
+
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
                     output = self.pipeline.forward(req)
 
             if is_primary:
                 self._record_peak_memory(output)
+
+            cache_key_hash = None
+            resume_from_step = getattr(req.sampling_params, "resume_from_step", 0) or 0
+            if (
+                isinstance(self.cache_backend, InterRequestCacheBackend)
+                and self.cache_backend.is_enabled()
+                and output.output is not None
+                and not is_dummy
+                and resume_from_step == 0
+            ):
+                step_latents_data = None
+                recorder = self.cache_backend.recorder
+                if recorder is not None and recorder.num_steps > 0:
+                    step_latents_data = [
+                        StepLatentData(
+                            step_index=r.step_index,
+                            timestep=r.timestep,
+                            latent=r.latent,
+                        )
+                        for r in recorder.records
+                    ]
+                cache_key_hash = self.cache_backend.store(
+                    req, output.output, step_latents=step_latents_data
+                )
+                if cache_key_hash is not None:
+                    output.custom_output["cache_key_hash"] = cache_key_hash
+                    self._update_cache_image_embedding(cache_key_hash, output.output)
+                logger.info("Inter-request cache: stored DiT output for future reuse")
+
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                self.cache_backend.after_forward(cache_key_hash=cache_key_hash, is_dummy=is_dummy)
 
             # Log prompt-embed cache activity (hits/misses accumulate across requests).
             if is_primary and self.prompt_embed_cache is not None:
@@ -337,7 +443,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if (
                 self.cache_backend is not None
                 and self.cache_backend.is_enabled()
-                and self.od_config.cache_backend == "cache_dit"
+                and self.od_config.cache_backend in ("cache_dit", "inter_request+cache_dit", "cache_dit+inter_request")
                 and self.od_config.enable_cache_dit_summary
             ):
                 cache_summary(self.pipeline, details=True)
@@ -464,6 +570,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = self._prepare_attn_metadata(input_batch)
 
+            is_dummy = "dummy" in req.request_ids[0] if req.request_ids else False
+
+            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
+                self.cache_backend.before_forward(is_dummy=is_dummy)
+
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
@@ -514,3 +625,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self._update_states_after(states, input_batch, pipeline_interrupted)
 
                 return BatchRunnerOutput.from_list(runner_output_list)
+
+    def shutdown(self) -> None:
+        logger.info(
+            "DiffusionModelRunner shutdown: cache_backend=%s, type=%s",
+            self.cache_backend,
+            type(self.cache_backend).__name__ if self.cache_backend else None,
+        )
+        if (
+            isinstance(self.cache_backend, InterRequestCacheBackend)
+            and self.cache_backend.is_enabled()
+        ):
+            self.cache_backend.shutdown()

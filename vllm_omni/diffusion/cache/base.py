@@ -73,7 +73,13 @@ class CacheBackend(ABC):
         raise NotImplementedError("Subclasses must implement enable()")
 
     @abstractmethod
-    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+    def refresh(
+        self,
+        pipeline: Any,
+        num_inference_steps: int,
+        verbose: bool = True,
+        **kwargs: Any,
+    ) -> None:
         """
         Refresh cache state for new generation.
 
@@ -86,6 +92,8 @@ class CacheBackend(ABC):
             num_inference_steps: Number of inference steps for the current generation.
                                 May be used for cache context updates.
             verbose: Whether to log refresh operations (default: True)
+            **kwargs: Additional keyword arguments (e.g., resume_from_step for
+                     composite backends that need to adjust effective step count).
         """
         raise NotImplementedError("Subclasses must implement refresh()")
 
