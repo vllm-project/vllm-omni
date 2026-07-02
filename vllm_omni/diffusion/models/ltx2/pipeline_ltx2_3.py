@@ -171,18 +171,6 @@ class _LTX23DenoiseContext:
     conditioning_mask_for_model: torch.Tensor | None = None
 
 
-def _stack_prompt_field_if_present(values: list[Any], field_name: str) -> torch.Tensor | None:
-    if not any(value is not None for value in values):
-        return None
-    missing_indices = [idx for idx, value in enumerate(values) if value is None]
-    if missing_indices:
-        raise ValueError(
-            f"`{field_name}` must be provided for every prompt when provided "
-            f"for any prompt. Missing prompt indices: {missing_indices}."
-        )
-    return torch.stack(values)
-
-
 def _repeat_prompt_tensor_for_outputs(tensor: torch.Tensor, num_videos_per_prompt: int) -> torch.Tensor:
     if num_videos_per_prompt == 1:
         return tensor
