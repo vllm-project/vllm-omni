@@ -183,6 +183,12 @@ def _stack_prompt_field_if_present(values: list[Any], field_name: str) -> torch.
     return torch.stack(values)
 
 
+def _repeat_prompt_tensor_for_outputs(tensor: torch.Tensor, num_videos_per_prompt: int) -> torch.Tensor:
+    if num_videos_per_prompt == 1:
+        return tensor
+    return tensor.repeat_interleave(num_videos_per_prompt, dim=0)
+
+
 def _detect_vocoder_output_sample_rate(model: str) -> int | None:
     """Detect the vocoder output sample rate from vocoder/config.json.
 
@@ -513,12 +519,9 @@ class LTX23Pipeline(
         # [49 x (B, seq, 3840)] -> [B, seq, 3840, 49] -> [B, seq, 188160]
         prompt_embeds = torch.stack(hidden_states, dim=-1).flatten(2, 3).to(dtype=dtype)
 
-        _, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
-
         prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
-        prompt_attention_mask = prompt_attention_mask.repeat(num_videos_per_prompt, 1)
+        prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
+        prompt_attention_mask = _repeat_prompt_tensor_for_outputs(prompt_attention_mask, num_videos_per_prompt)
 
         return prompt_embeds, prompt_attention_mask
 
@@ -544,6 +547,8 @@ class LTX23Pipeline(
         else:
             batch_size = prompt_embeds.shape[0]
 
+        negative_prompt_embeds_provided = negative_prompt_embeds is not None
+
         if prompt_embeds is None:
             prompt_embeds, prompt_attention_mask = self._get_gemma_prompt_embeds(
                 prompt=prompt,
@@ -552,6 +557,9 @@ class LTX23Pipeline(
                 device=device,
                 dtype=dtype,
             )
+        elif num_videos_per_prompt > 1:
+            prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
+            prompt_attention_mask = _repeat_prompt_tensor_for_outputs(prompt_attention_mask, num_videos_per_prompt)
 
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             negative_prompt = negative_prompt or ""
@@ -575,6 +583,12 @@ class LTX23Pipeline(
                 max_sequence_length=max_sequence_length,
                 device=device,
                 dtype=dtype,
+            )
+        elif do_classifier_free_guidance and negative_prompt_embeds_provided and num_videos_per_prompt > 1:
+            negative_prompt_embeds = _repeat_prompt_tensor_for_outputs(negative_prompt_embeds, num_videos_per_prompt)
+            negative_prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                negative_prompt_attention_mask,
+                num_videos_per_prompt,
             )
 
         return prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask

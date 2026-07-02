@@ -208,6 +208,48 @@ class TestLTX23RequestParsing:
 
 
 class TestLTX23ForwardStages:
+    def test_encode_prompt_repeats_precomputed_embeds_for_num_outputs(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        prompt_embeds = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
+        negative_prompt_embeds = torch.tensor([[[-1.0], [-2.0]], [[-3.0], [-4.0]]])
+        prompt_attention_mask = torch.tensor([[True, False], [False, True]])
+        negative_prompt_attention_mask = torch.tensor([[False, False], [True, True]])
+
+        (
+            repeated_prompt_embeds,
+            repeated_prompt_attention_mask,
+            repeated_negative_prompt_embeds,
+            repeated_negative_prompt_attention_mask,
+        ) = pipe.encode_prompt(
+            prompt=None,
+            do_classifier_free_guidance=True,
+            num_videos_per_prompt=2,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            device=torch.device("cpu"),
+        )
+
+        torch.testing.assert_close(
+            repeated_prompt_embeds,
+            torch.tensor([[[1.0], [2.0]], [[1.0], [2.0]], [[3.0], [4.0]], [[3.0], [4.0]]]),
+        )
+        torch.testing.assert_close(
+            repeated_negative_prompt_embeds,
+            torch.tensor([[[-1.0], [-2.0]], [[-1.0], [-2.0]], [[-3.0], [-4.0]], [[-3.0], [-4.0]]]),
+        )
+        torch.testing.assert_close(
+            repeated_prompt_attention_mask,
+            torch.tensor([[True, False], [True, False], [False, True], [False, True]]),
+        )
+        torch.testing.assert_close(
+            repeated_negative_prompt_attention_mask,
+            torch.tensor([[False, False], [False, False], [True, True], [True, True]]),
+        )
+
     def test_t2v_forward_delegates_to_shared_forward_impl(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
