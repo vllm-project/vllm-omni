@@ -610,7 +610,7 @@ class TestPipelineRegistration:
             model_type = "qwen3_tts"
 
         with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
-            omni_config = StageConfigFactory.create_from_model("fake/model")
+            omni_config = StageConfigFactory.create_from_model("fake/model", {}, None)
 
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.pipeline_config is OMNI_PIPELINES["qwen3_tts"]
@@ -621,7 +621,7 @@ class TestPipelineRegistration:
             model_type = "dreamzero"
 
         with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
-            omni_config = StageConfigFactory.create_from_model("fake/model")
+            omni_config = StageConfigFactory.create_from_model("fake/model", {}, None)
 
         assert isinstance(omni_config, VllmOmniConfig)
         stage = omni_config.stage_by_id(0)
@@ -646,7 +646,7 @@ class TestPipelineRegistration:
             patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()),
             patch.object(VllmOmniConfig, "from_registry") as mock_create,
         ):
-            StageConfigFactory.create_from_model("fake/model")
+            StageConfigFactory.create_from_model("fake/model", {}, None)
             mock_create.assert_called_once()
             assert mock_create.call_args.args == (new_model_type,)
             assert isinstance(mock_create.call_args.kwargs["hf_config"], FakeConfig)
@@ -680,22 +680,45 @@ class TestPipelineRegistration:
             patch("vllm_omni.config.config_factory.get_config", return_value=fake_config),
             patch.object(VllmOmniConfig, "from_registry") as mock_create,
         ):
-            StageConfigFactory.create_from_model("fake/model")
+            StageConfigFactory.create_from_model("fake/model", {}, None)
             mock_create.assert_called_once()
             assert mock_create.call_args.args == (new_model_type,)
             assert mock_create.call_args.kwargs["hf_config"] is fake_config
             assert mock_create.call_args.kwargs["cli_overrides"] == {"model": "fake/model"}
         assert custom_resolver(fake_config).model_type == resolved_type
 
-    def test_resolve_when_autodetect_resolves_none(self):
-        """Regression test for: https://github.com/vllm-project/vllm-omni/issues/4726"""
-        deploy_path = get_deploy_config_path("ming_tts.yaml")
-        resolved_config = StageConfigFactory.create_from_model(
-            model="inclusionAI/Ming-omni-tts-0.5B",
-            deploy_config_path=deploy_path,
+    def test_legacy_and_structured_paths_share_deploy_pipeline_override(self, clean_pipeline_registry, tmp_path):
+        pipeline_key = "deploy_only_pipeline"
+        pipe_cfg = PipelineConfig(
+            model_type=pipeline_key,
+            model_arch="DeployOnlyArch",
+            stages=(StagePipelineConfig(stage_id=0, model_stage="diffusion"),),
         )
-        assert resolved_config is not None
-        assert len(resolved_config.stage_configs) > 0
+        register_pipeline(pipe_cfg)
+
+        # Use a synthetic deploy config so ``pipeline:`` is the only resolvable
+        # signal; the fake HF model_type/architectures intentionally do not
+        # match the registry.
+        deploy_path = tmp_path / "deploy_only.yaml"
+        deploy_path.write_text(f"pipeline: {pipeline_key}\n", encoding="utf-8")
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "dense"
+            architectures = ("UnregisteredArch",)
+
+        with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
+            omni_config = StageConfigFactory.create_from_model("fake/model", {}, str(deploy_path))
+            legacy_configs = StageConfigFactory.create_legacy_stage_configs_from_model(
+                "fake/model",
+                {},
+                str(deploy_path),
+            )
+
+        assert omni_config is not None
+        assert omni_config.pipeline_config is pipe_cfg
+        assert legacy_configs is not None
+        assert len(legacy_configs) == 1
+        assert legacy_configs[0].yaml_engine_args["model_arch"] == "DeployOnlyArch"
 
 
 class TestResolveScheduler:

@@ -32,6 +32,15 @@ from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 logger = init_logger(__name__)
 
 
+@dataclasses.dataclass(frozen=True)
+class PipelineResolution:
+    """Result of resolving a model/deploy pair against ``OMNI_PIPELINES``."""
+
+    registry_key: str
+    pipeline_config: PipelineConfig
+    hf_config: PretrainedConfig | None
+
+
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
 
@@ -50,9 +59,8 @@ class StageConfigFactory:
     def create_from_model(
         cls,
         model: str,
-        cli_overrides: dict[str, Any] | None = None,
-        deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None,
     ) -> VllmOmniConfig | None:
         """Load pipeline + deploy config, merge with CLI overrides.
 
@@ -61,124 +69,20 @@ class StageConfigFactory:
         back to using the Transformers config & finding pipelines that have overlapping
         supported architectures.
         """
-        if cli_overrides is None:
-            cli_overrides = {}
+        resolution = cls.resolve_pipeline_from_model(model, cli_overrides, deploy_config_path)
+        if resolution is None:
+            return None
+
         # Preserve the explicit create_from_model() argument for structured
         # diffusion stages. It intentionally overrides any stale
         # cli_overrides["model"], since auto-detection above uses this model.
         registry_cli_overrides = {**cli_overrides, "model": model}
-
-        trust_remote_code = cli_overrides.get("trust_remote_code", True)
-        if trust_remote_code is None:
-            trust_remote_code = False
-
-        model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
-        if model_type == "vla":
-            if _looks_like_dreamzero(model):
-                model_type = "dreamzero"
-
-        # --- 1. Explicit deploy-config pipeline override (highest precedence) ---
-        # A deploy YAML may set ``pipeline: <model_type>`` to force routing for
-        # models whose HF config has a generic/colliding ``model_type`` or no
-        # matching architectures. Ming-omni-tts, for example, reports
-        # model_type="dense" with arch BailingMMNative…, which matches no
-        # pipeline — without this it falls through to the diffusion default and
-        # dies with "Model class BailingMMNativeForConditionalGeneration not
-        # found in diffusion model registry". Honor the key before auto-detection.
-        explicit_pipeline = None
-        if deploy_config_path:
-            try:
-                explicit_pipeline = load_deploy_config(deploy_config_path).pipeline
-            except Exception:
-                logger.exception("Failed to read 'pipeline' key from deploy config %s", deploy_config_path)
-        if explicit_pipeline:
-            pipeline_cfg = cls.resolve_pipeline_config(explicit_pipeline, hf_config)
-            if pipeline_cfg is not None:
-                return VllmOmniConfig.from_registry(
-                    explicit_pipeline,
-                    hf_config=hf_config,
-                    deploy_config_path=deploy_config_path,
-                    cli_overrides=registry_cli_overrides,
-                )
-            logger.warning(
-                "Deploy config %s requested pipeline %r which is not in OMNI_PIPELINES; "
-                "falling back to auto-detection.",
-                deploy_config_path,
-                explicit_pipeline,
-            )
-
-        # --- 2. Auto-detected model_type registered in OMNI_PIPELINES ---
-        if model_type and model_type in OMNI_PIPELINES:
-            pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
-            if pipeline_cfg is not None:
-                return VllmOmniConfig.from_registry(
-                    model_type,
-                    hf_config=hf_config,
-                    deploy_config_path=deploy_config_path,
-                    cli_overrides=registry_cli_overrides,
-                )
-
-        # --- HF architecture fallback: some models report a generic
-        # model_type that collides with another model. Match by the
-        # hf_architectures declared on each registered PipelineConfig.
-        if hf_config is not None:
-            logger.warning("Inferred model type %s is not registered to an Omni pipeline", model_type)
-            hf_archs = set(getattr(hf_config, "architectures", []) or [])
-            if hf_archs:
-                for registered_key, registered in OMNI_PIPELINES.items():
-                    pipeline_cfg = registered if isinstance(registered, PipelineConfig) else registered(hf_config)
-                    # Resolvers that get configs of the incorrect type should return None
-                    if pipeline_cfg is None:
-                        continue
-                    predicate = pipeline_cfg.hf_config_predicate
-                    if predicate is not None:
-                        try:
-                            if not predicate(hf_config):
-                                logger.debug(
-                                    "Pipeline %r matched on architectures %s but its "
-                                    "hf_config_predicate rejected the loaded config; "
-                                    "continuing fallback search.",
-                                    pipeline_cfg.model_type,
-                                    sorted(hf_archs.intersection(pipeline_cfg.hf_architectures)),
-                                )
-                                continue
-                        except Exception:
-                            logger.exception(
-                                "Pipeline %r hf_config_predicate raised; skipping.",
-                                pipeline_cfg.model_type,
-                            )
-                            continue
-
-                    if isinstance(pipeline_cfg, PipelineConfig) and hf_archs.intersection(
-                        pipeline_cfg.hf_architectures
-                    ):
-                        return VllmOmniConfig.from_registry(
-                            registered_key,
-                            hf_config=hf_config,
-                            deploy_config_path=deploy_config_path,
-                            cli_overrides=registry_cli_overrides,
-                        )
-
-        # --- Explicit deploy-config pipeline ---
-        # When auto-detection above resolves nothing (generic/missing HF model_type
-        # and no matching architecture), honor an explicit pipeline key in the deploy config
-        if deploy_config_path is not None:
-            deploy_path = Path(deploy_config_path)
-            if deploy_path.exists():
-                deploy_cfg = load_deploy_config(deploy_path)
-                if deploy_cfg.pipeline:
-                    pipeline_cfg = cls.resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
-                    if pipeline_cfg is not None:
-                        return VllmOmniConfig.from_registry(
-                            pipeline_cfg.model_type,
-                            hf_config=hf_config,
-                            deploy_config_path=deploy_config_path,
-                            cli_overrides=registry_cli_overrides,
-                        )
-
-        # Not in the pipeline registry — let the caller fall back to the
-        # legacy ``stage_configs/*.yaml`` path (resolve_model_config_path).
-        return None
+        return VllmOmniConfig.from_registry(
+            resolution.registry_key,
+            hf_config=resolution.hf_config,
+            deploy_config_path=deploy_config_path,
+            cli_overrides=registry_cli_overrides,
+        )
 
     @classmethod
     def create_legacy_stage_configs_from_model(
@@ -201,6 +105,25 @@ class StageConfigFactory:
         if cli_overrides is None:
             cli_overrides = {}
 
+        resolution = cls.resolve_pipeline_from_model(model, cli_overrides, deploy_config_path)
+        if resolution is None:
+            return None
+
+        return cls._create_legacy_from_registry(
+            resolution.registry_key,
+            resolution.pipeline_config,
+            cli_overrides,
+            deploy_config_path,
+        )
+
+    @classmethod
+    def resolve_pipeline_from_model(
+        cls,
+        model: str,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None,
+    ) -> PipelineResolution | None:
+        """Resolve a model/deploy pair once for structured and legacy consumers."""
         trust_remote_code = cli_overrides.get("trust_remote_code", True)
         if trust_remote_code is None:
             trust_remote_code = False
@@ -209,21 +132,28 @@ class StageConfigFactory:
         if model_type == "vla" and _looks_like_dreamzero(model):
             model_type = "dreamzero"
 
+        explicit_pipeline = cls._get_deploy_pipeline(deploy_config_path)
+        if explicit_pipeline:
+            pipeline_cfg = cls.resolve_pipeline_config(explicit_pipeline, hf_config)
+            if pipeline_cfg is not None:
+                return PipelineResolution(explicit_pipeline, pipeline_cfg, hf_config)
+            logger.warning(
+                "Deploy config %s requested pipeline %r which is not in OMNI_PIPELINES; "
+                "falling back to auto-detection.",
+                deploy_config_path,
+                explicit_pipeline,
+            )
+
         if model_type and model_type in OMNI_PIPELINES:
             pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
             if pipeline_cfg is not None:
-                return cls._create_legacy_from_registry(
-                    model_type,
-                    pipeline_cfg,
-                    cli_overrides,
-                    deploy_config_path,
-                )
+                return PipelineResolution(model_type, pipeline_cfg, hf_config)
 
         if hf_config is not None:
             logger.warning("Inferred model type %s is not registered to an Omni pipeline", model_type)
             hf_archs = set(getattr(hf_config, "architectures", []) or [])
             if hf_archs:
-                for registered in OMNI_PIPELINES.values():
+                for registered_key, registered in OMNI_PIPELINES.items():
                     pipeline_cfg = registered if isinstance(registered, PipelineConfig) else registered(hf_config)
                     if pipeline_cfg is None:
                         continue
@@ -249,13 +179,21 @@ class StageConfigFactory:
                     if isinstance(pipeline_cfg, PipelineConfig) and hf_archs.intersection(
                         pipeline_cfg.hf_architectures
                     ):
-                        return cls._create_legacy_from_registry(
-                            pipeline_cfg.model_type,
-                            pipeline_cfg,
-                            cli_overrides,
-                            deploy_config_path,
-                        )
+                        return PipelineResolution(registered_key, pipeline_cfg, hf_config)
         return None
+
+    @classmethod
+    def _get_deploy_pipeline(cls, deploy_config_path: str | None) -> str | None:
+        if not deploy_config_path:
+            return None
+        deploy_path = Path(deploy_config_path)
+        if not deploy_path.exists():
+            return None
+        try:
+            return load_deploy_config(deploy_path).pipeline
+        except Exception:
+            logger.exception("Failed to read 'pipeline' key from deploy config %s", deploy_config_path)
+            return None
 
     @classmethod
     def _create_legacy_from_registry(

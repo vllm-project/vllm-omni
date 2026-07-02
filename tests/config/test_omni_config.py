@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 from transformers import Qwen3OmniMoeConfig
 
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import omni_config as omni_config_module
 from vllm_omni.config.omni_config import (
     BaseVllmOmniStageConfig,
@@ -619,7 +620,7 @@ def test_from_registry_uses_hf_config_for_callable_resolver():
 
 
 def test_from_registry_deploy_pipeline_override_resolves_from_registry():
-    deploy_path = _DEPLOY_DIR / "aura_omni.yaml"
+    deploy_path = get_deploy_config_path("aura_omni.yaml")
 
     omni_config = VllmOmniConfig.from_registry(
         "qwen3_tts",

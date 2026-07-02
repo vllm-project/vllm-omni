@@ -1264,7 +1264,7 @@ class VllmOmniConfig:
             if cli_overrides.get(name) is not None:
                 setattr(deploy_with_cli_overrides, name, _copy_value(cli_overrides[name]))
 
-        deploy_for_registry = _apply_platform_overrides(copy.deepcopy(deploy_with_cli_overrides))
+        deploy_for_registry = _apply_platform_overrides(deploy_with_cli_overrides)
         if len(pipeline.stages) <= 1:
             deploy_for_registry.async_chunk = False
         _validate_async_chunk_support(pipeline, deploy_for_registry)
