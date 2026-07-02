@@ -628,57 +628,39 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         return latents
 
-    def forward(
-        self,
-        req: DiffusionRequestBatch,
-        prompt: str | list[str] = "",
-        prompt_2: str | list[str] = "",
-        prompt_3: str | list[str] = "",
-        negative_prompt: str | list[str] = "",
-        negative_prompt_2: str | list[str] = "",
-        negative_prompt_3: str | list[str] = "",
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 28,
-        sigmas: list[float] | None = None,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        pooled_prompt_embeds: torch.Tensor | None = None,
-        negative_pooled_prompt_embeds: torch.Tensor | None = None,
-        max_sequence_length: int = 256,
-    ) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         sampling_params_list = req.sampling_params_list
         common_sampling_params = sampling_params_list[0]
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        negative_prompt = [
-            "" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts
-        ] or negative_prompt
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
+        negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+        prompt_2 = ""
+        prompt_3 = ""
+        negative_prompt_2 = ""
+        negative_prompt_3 = ""
+        prompt_embeds = None
+        negative_prompt_embeds = None
 
         height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        sigmas = common_sampling_params.sigmas or sigmas
-        max_sequence_length = common_sampling_params.max_sequence_length or max_sequence_length
-        num_inference_steps = common_sampling_params.num_inference_steps or num_inference_steps
+        sigmas = common_sampling_params.sigmas
+        max_sequence_length = common_sampling_params.max_sequence_length or 256
+        num_inference_steps = common_sampling_params.num_inference_steps or 28
         num_images_per_prompt = (
-            common_sampling_params.num_outputs_per_prompt
-            if common_sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
+            common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )
-        if generator is None:
-            generator = req.collate_request_generators(num_images_per_prompt, generator)
-        latents = req.collate_request_tensors("latents", latents)
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        latents = req.collate_request_tensors("latents", None)
+        output_type = common_sampling_params.output_type or "pil"
+
         prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
             req.prompts,
             {
                 "prompt_embeds": prompt_embeds,
                 "negative_prompt_embeds": negative_prompt_embeds,
-                "pooled_prompt_embeds": pooled_prompt_embeds,
-                "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
+                "pooled_prompt_embeds": None,
+                "negative_pooled_prompt_embeds": None,
             },
         )
         prompt_embeds = prompt_fields["prompt_embeds"]
@@ -717,9 +699,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self._current_timestep = None
         self._interrupt = False
 
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
+        if prompt is not None:
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
@@ -771,7 +751,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         )
 
         self._current_timestep = None
-        if self.output_type == "latent":
+        if output_type == "latent":
             image = latents
         else:
             # Ensure the latents are the same dtype as the VAE for decode
