@@ -74,6 +74,8 @@
 #   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename;
 #                   local: substring of test_*.py basename or tests/dfx/perf/tests/*.json filename
 #   DRY_RUN=1     - print extracted commands only; do not write scripts or run pytest
+#   RUN_JOB_TIMEOUT_KILL_AFTER - seconds after SIGTERM before SIGKILL on inline pytest
+#                              timeout (default: 60; baked into generated job scripts)
 #
 set -euo pipefail
 
@@ -541,6 +543,30 @@ def step_timeout_minutes(step: dict) -> int | None:
     return minutes if minutes > 0 else None
 
 
+_INLINE_TIMEOUT_PREFIX = re.compile(r"^timeout\s+(?:-\S+\s+)*\S+\s+", re.IGNORECASE)
+
+
+def timeout_kill_after_seconds() -> int:
+    raw = os.environ.get("RUN_JOB_TIMEOUT_KILL_AFTER", "60")
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return 60
+    return seconds if seconds > 0 else 60
+
+
+def prepend_timeout_to_pytest(pytest_line: str, timeout_min: int | None) -> str:
+    """Prepend GNU timeout directly before pytest (Buildkite inline style)."""
+    if timeout_min is None:
+        return pytest_line.strip()
+    line = _INLINE_TIMEOUT_PREFIX.sub("", pytest_line.strip())
+    kill_after = timeout_kill_after_seconds()
+    return (
+        f"timeout --foreground --verbose --kill-after={kill_after} "
+        f"{timeout_min}m {line}"
+    )
+
+
 def _write_job_timeouts_manifest(jobs_dir: Path, job_timeouts: dict[str, int]) -> None:
     manifest_path = jobs_dir / ".job_timeouts"
     if job_timeouts:
@@ -836,7 +862,7 @@ def main() -> None:
                 script_lines.append(f"# Buildkite timeout_in_minutes: {timeout_min}")
                 job_timeouts[key] = timeout_min
             script_lines.extend(exports)
-            script_lines.extend(pys)
+            script_lines.extend(prepend_timeout_to_pytest(p, timeout_min) for p in pys)
             _write_job_script(key, script_lines, jobs_dir)
             if "Perf Test" in label and key not in perf_job_keys:
                 perf_job_keys.append(key)

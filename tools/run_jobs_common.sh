@@ -3,6 +3,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Shared timing helpers for tools/run_*_jobs.sh (source this file; do not execute).
+#
+# Job timeouts: generated job scripts embed GNU timeout on the pytest line itself
+# (see prepend_timeout_to_pytest in run_*_jobs.sh). This runner only executes
+# bash job.sh and records exit 124 as TIMED OUT via jobs/.job_timeouts metadata.
 
 if [[ -n "${_RUN_JOBS_COMMON_LOADED:-}" ]]; then
   return 0 2>/dev/null || exit 0
@@ -81,16 +85,12 @@ _run_one_job_with_timing() {
   base="$(basename "${_job}" .sh)"
   out="${LOG_DIR}/${base}.log"
   if timeout_min="$(_run_jobs_lookup_timeout_minutes "${base}")"; then
-    echo "==> ${_job}  (tee ${out}, timeout ${timeout_min}m)" >&2
+    echo "==> ${_job}  (tee ${out}, pytest inline timeout ${timeout_min}m)" >&2
   else
     echo "==> ${_job}  (tee ${out})" >&2
   fi
   start="$(_run_jobs_epoch_seconds)"
-  if [[ -n "${timeout_min}" ]]; then
-    (cd "${REPO_ROOT}" && timeout "${timeout_min}m" bash "${_job}") 2>&1 | tee "${out}"
-  else
-    (cd "${REPO_ROOT}" && bash "${_job}") 2>&1 | tee "${out}"
-  fi
+  (cd "${REPO_ROOT}" && bash "${_job}") 2>&1 | tee "${out}"
   job_status="${PIPESTATUS[0]}"
   end="$(_run_jobs_epoch_seconds)"
   elapsed=$((end - start))
@@ -98,7 +98,9 @@ _run_one_job_with_timing() {
   if [[ "${job_status}" -eq 0 ]]; then
     echo "    finished in $(_run_jobs_format_duration "${elapsed}")" >&2
   elif [[ "${job_status}" -eq 124 && -n "${timeout_min}" ]]; then
-    echo "    timed out after ${timeout_min}m (Buildkite timeout_in_minutes)" >&2
+    echo "    timed out (inline timeout ${timeout_min}m on pytest, exit 124)" >&2
+  elif [[ "${job_status}" -eq 124 ]]; then
+    echo "    timed out (exit 124)" >&2
   else
     echo "    failed after $(_run_jobs_format_duration "${elapsed}") (exit ${job_status})" >&2
   fi
