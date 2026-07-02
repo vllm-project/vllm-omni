@@ -91,7 +91,11 @@ def test_text2flow_token_only_strips_reference_speech_prefix_from_cumulative_ids
     assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
 
 
-def test_text2flow_token_only_marks_prompt_trim_for_stop_token_completion():
+def test_text2flow_token_only_does_not_mark_prompt_trim():
+    # The talker prompt is wrapped with the CosyVoice3 instruction template in
+    # _build_cosyvoice3_prompt, so the talker emits target-only speech and no
+    # prompt-trim offset is required; the flow stage trims prompt_feat itself
+    # (issue #4644). Confirm no talker_prefill_offset is set.
     source_outputs = [
         _source_output(
             "req-stop",
@@ -104,7 +108,8 @@ def test_text2flow_token_only_marks_prompt_trim_for_stop_token_completion():
     outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
 
     assert outputs[0]["prompt_token_ids"] == [1, 2, 6562]
-    assert outputs[0]["additional_information"]["meta"]["talker_prefill_offset"] == 2
+    meta = outputs[0]["additional_information"].get("meta") or {}
+    assert "talker_prefill_offset" not in meta
 
 
 def test_text2flow_full_payload_does_not_send_codec_ids():
@@ -140,7 +145,7 @@ def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
@@ -167,7 +172,7 @@ def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes
 
     payload = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
@@ -188,13 +193,13 @@ def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
 
     payload1 = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     payload2 = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
@@ -216,14 +221,14 @@ def test_talker2code2wav_async_chunk_waits_for_prelookahead_and_emits_cumulative
 
     payload_pending = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [1, 2, 3]
     payload_ready = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
@@ -246,14 +251,14 @@ def test_talker2code2wav_async_chunk_final_flush_uses_previous_token_offset():
 
     payload_stream = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [3, 4, 5, 6]
     payload_final = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )
@@ -281,14 +286,14 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
 
     payload_pending = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     request.output_token_ids = [8, 9, 10, 11]
     payload_ready = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
@@ -310,13 +315,13 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
 
     payload_stream = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=False,
     )
     payload_final = talker2code2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
         is_finished=True,
     )

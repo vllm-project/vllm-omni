@@ -1,0 +1,80 @@
+# Higgs-audio v3 deploy, high-throughput profile.
+#
+# This is the default production profile for medium/high concurrency serving.
+# Stage 0 keeps enforce_eager=true so Higgs' local MLP CUDA graph remains active.
+# Do not enable vLLM FULL_DECODE graph here: it replaces the local MLP graph
+# path instead of stacking on top of it.
+#
+# Plain TTS only (no voice cloning). async_chunk streams codec chunks from
+# Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
+# worth of work). Stage 1 honors meta.left_context_size + meta.right_holdback_size
+# so the per-chunk codec windows stitch into a coherent PCM stream.
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      # Stream PCM bytes back to the client as Stage 1 emits each chunk.
+      codec_streaming: true
+      # Streaming chunk shape for talker2code2wav_async_chunk:
+      #   codec_chunk_frames        steady-state new frames per emit
+      #   codec_left_context_frames sliding past context to avoid leading-edge artifacts
+      #   codec_right_holdback_frames trailing frames held back so the codec
+      #                              has future context for emit-region tail samples
+      #   initial_codec_chunk_frames smaller first chunk to minimize TTFA
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+      codec_right_holdback_frames: 4
+      initial_codec_chunk_frames: 1
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.6
+    enforce_eager: true
+    attention_backend: FLASHINFER
+    trust_remote_code: true
+    # Stage-0 prefix caching is on by default. The talker's HS opt-out and
+    # deferred ``codes.audio`` mm-output write (see higgs_audio_v3_talker.py)
+    # keep per-step bookkeeping negligible; any shared text prefix across
+    # concurrent requests is a net throughput win. Stage 1 (codec decoder)
+    # has no KV cache and stays disabled.
+    enable_prefix_caching: true
+    async_scheduling: false
+    max_num_batched_tokens: 4096
+    max_model_len: 8192
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0

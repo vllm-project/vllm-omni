@@ -32,7 +32,7 @@ BAGEL_MOONCAKE_CI_DEPLOY = get_deploy_config_path("ci/bagel_mooncake.yaml")
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
-# "Generated with seed=52, num_inference_steps=14,
+# "Generated with seed=52, num_inference_steps=15,
 # prompt='A cute cat'"
 REFERENCE_PIXELS = [
     {"position": (100, 100), "rgb": (115, 113, 94)},
@@ -63,7 +63,7 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, num_inference_steps: int = 14) -> list:
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
     """Configure sampling parameters for Bagel text2img generation.
 
     Args:
@@ -266,7 +266,6 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
     return temp_file.name
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

@@ -49,7 +49,7 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -85,6 +85,10 @@ class _ZPipelineRequest:
     sampling_params: _ZPipelineSamplingParams
     prompts: list[dict[str, Any]] = field(default_factory=lambda: [{"prompt": "", "negative_prompt": ""}])
 
+    @property
+    def num_reqs(self) -> int:
+        return 1
+
 
 class MingImagePipeline(ZImagePipeline):
     """Ming-flash-omni-2.0 text-to-image diffusion pipeline.
@@ -94,6 +98,8 @@ class MingImagePipeline(ZImagePipeline):
       * ``byte5``             — Optional ByT5 glyph encoder (loaded if checkpoint
                                 ships ``byt5/``)
     """
+
+    supports_request_batch = False
 
     def __init__(
         self,
@@ -198,7 +204,7 @@ class MingImagePipeline(ZImagePipeline):
         self.condition_encoder.load_from_checkpoint(model_path)
 
         # Optional ByT5 glyph/text encoder. Only loaded when the checkpoint
-        # ``extra_args.image_gen.byte5_text`` requests will be ignored.
+        # ships a byt5/ subfolder; otherwise byte5_text requests are ignored
         byte5_dir = Path(model_path) / "byt5"
         if byte5_dir.exists():
             self.byte5 = MingByT5Encoder.from_checkpoint(byte5_dir, device=self.device, dtype=dtype)
@@ -217,13 +223,12 @@ class MingImagePipeline(ZImagePipeline):
         """Resolve byte5 glyph texts.
 
         Two sources, in order of priority:
-          1. ``extra["byte5_text"]`` — auto-extracted from the user prompt's
-             quoted spans by ``thinker2imagegen`` (already wrapped as
-             ``'Text "<glyph>". '`` by Ming's ``get_text_from_prompt``).
-          2. ``sampling_params.extra_args["image_gen"]["byte5_text"]`` — an
-             explicit override for programmatic callers; raw strings without
-             the ``Text "..."`` wrapper are auto-wrapped here to match the
-             distribution ByT5 was trained on.
+        1. `extra["byte5_text"]`: auto-extracted from the user prompt's quoted spans
+            by thinker2imagegen (already wrapped as `'Text "<glyph>". '`
+            by Ming's get_text_from_prompt).
+        2. `sampling_params.extra_args["byte5_text"]`:
+            raw strings without the `Text "..."` wrapper are auto-wrapped here
+            to match the distribution ByT5 was trained on.
         """
         # Source 1: auto-extracted, already wrapped. Return as-is if non-empty.
         raw = extra.get("byte5_text")
@@ -236,7 +241,7 @@ class MingImagePipeline(ZImagePipeline):
 
         # Source 2: explicit override — wrap raw strings so the byte5 encoder
         # sees the same ``Text "<glyph>". `` format Ming used during training.
-        raw = ((getattr(sampling_params, "extra_args", None) or {}).get("image_gen") or {}).get("byte5_text")
+        raw = (getattr(sampling_params, "extra_args", None) or {}).get("byte5_text")
         if isinstance(raw, str):
             raw = [raw]
         if isinstance(raw, list):
@@ -273,18 +278,18 @@ class MingImagePipeline(ZImagePipeline):
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Run one text-to-image generation request.
 
         Args:
-            req: Diffusion request. The cross-stage thinker hidden states
+            req: Single-request batch. The cross-stage thinker hidden states
                 must be present at
                 ``req.prompts[0]["extra"]["thinker_hidden_states"]`` as a
                 ``[N, H]`` (or ``[1, N, H]``) tensor, placed there by
                 ``thinker2imagegen``.
 
         Returns:
-            DiffusionOutput with ``.output`` set to a ``[B, 3, H, W]``
+            One DiffusionOutput with ``.output`` set to a ``[B, 3, H, W]``
             image tensor in ``[-1, 1]``. The vllm-omni diffusion engine's
             output adapter converts this to PIL/base64 downstream.
         """
@@ -366,21 +371,23 @@ class MingImagePipeline(ZImagePipeline):
                 negative_cap_feats = torch.cat((negative_cap_feats, torch.zeros_like(byte5_feats)), dim=1)
             logger.debug("[MingImagePipeline.forward] byte5 cat'd: cap_feats=%s", tuple(cap_feats.shape))
 
-        # Sampling knobs: extra_args.image_gen.* > sampling_params.* > MingImageGenConfig defaults.
+        # Sampling knobs, in priority order:
+        #   top-level extra_args[key] > sampling_params.* attr >
+        #   MingImageGenConfig default. Knobs live flat on extra_args
         sp = req.sampling_params
         cfg = self.image_gen_config
-        ig = (sp.extra_args or {}).get("image_gen") or {}
+        ea = sp.extra_args or {}
         resolved: dict[str, Any] = {}
-        for ig_key, sp_attr, default in (
+        for ea_key, sp_attr, default in (
             ("height", "height", cfg.default_height),
             ("width", "width", cfg.default_width),
             ("steps", "num_inference_steps", cfg.num_inference_steps),
             ("cfg", "guidance_scale", cfg.guidance_scale),
             ("seed", "seed", None),
         ):
-            for v in (ig.get(ig_key), getattr(sp, sp_attr), default):
+            for v in (ea.get(ea_key), getattr(sp, sp_attr), default):
                 if v is not None:
-                    resolved[ig_key] = v
+                    resolved[ea_key] = v
                     break
 
         height = int(resolved["height"])
@@ -393,7 +400,7 @@ class MingImagePipeline(ZImagePipeline):
         # ``sp.generator`` causes two problems:
         #   (1) if the caller pre-seeded it with sp.seed (e.g. the top-level
         #       ``seed`` key on OmniDiffusionSamplingParams), any override via
-        #       ``extra_args.image_gen.seed`` would be silently ignored; and
+        #       `extra_args["seed"]` would be silently ignored; and
         #   (2) a persistent generator instance accumulates state across
         #       requests → same-seed replays produce different outputs.
         if seed is not None:
@@ -435,11 +442,11 @@ class MingImagePipeline(ZImagePipeline):
             num_inference_steps,
             guidance_scale,
             seed,
-            ig,
+            ea,
             None if ref_latent is None else tuple(ref_latent.shape),
         )
         try:
-            output = super().forward(
+            outputs = super().forward(
                 z_req,
                 prompt=None,
                 height=height,
@@ -455,6 +462,7 @@ class MingImagePipeline(ZImagePipeline):
         finally:
             set_forward_context_ref_latent(None)
 
+        output = outputs[0]
         if hasattr(output, "output") and output.output is not None:
             raw = output.output
         elif hasattr(output, "images"):

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any
 
@@ -16,10 +17,9 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.cosyvoice3.utils import unpad_prompt_conditioning
 
 logger = init_logger(__name__)
-
-_COSYVOICE3_SPEECH_TOKEN_SIZE = 6561
 
 
 def _build_prompt_embed_struct(prompt_payload: dict[str, Any]) -> EmbeddingsStruct | None:
@@ -83,20 +83,6 @@ def _prompt_speech_token_ids(multi_modal_data: dict[str, Any]) -> list[int]:
     return _to_token_id_list(speech_token)
 
 
-def _has_speech_stop_token(output_ids: list[Any]) -> bool:
-    return any(token_id >= _COSYVOICE3_SPEECH_TOKEN_SIZE for token_id in _to_token_id_list(output_ids))
-
-
-def _set_non_stream_prompt_trim(additional_info: dict[str, Any], prompt_speech_len: int) -> None:
-    if prompt_speech_len <= 0:
-        return
-    meta = additional_info.get("meta")
-    if not isinstance(meta, dict):
-        meta = {}
-        additional_info["meta"] = meta
-    meta["talker_prefill_offset"] = prompt_speech_len
-
-
 def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
     if isinstance(x, list):
         if not x:
@@ -152,8 +138,6 @@ def text2flow(
         output_ids = _strip_prompt_prefix(raw_output_ids, prefix_ids)
         output_ids = _strip_prompt_prefix(output_ids, prompt_speech_ids)
         additional_info = dict(multi_modal_data)
-        if _has_speech_stop_token(raw_output_ids):
-            _set_non_stream_prompt_trim(additional_info, len(prompt_speech_ids))
         additional_info.setdefault("ids", {})["prompt"] = prefix_ids
         engine_inputs.append(OmniTokensPrompt(prompt_token_ids=output_ids, additional_information=additional_info))
     return engine_inputs
@@ -161,7 +145,7 @@ def text2flow(
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -192,18 +176,33 @@ def talker2code2wav_async_chunk(
                 info = _decode_additional_information(getattr(request, "additional_information", None))
                 info_embed = info.get("embed", {}) if isinstance(info, dict) else {}
                 prompt_payload = {}
-                for key in ("speech_token", "speech_feat", "embedding"):
+                cond_keys = ("speech_token", "speech_feat", "embedding", "speech_token_len")
+                for key in cond_keys:
                     value = _to_cpu_tensor(info_embed.get(key))
                     if value is not None:
                         prompt_payload[key] = value
-                if isinstance(pooling_output, dict):
-                    po_embed = pooling_output.get("embed", {}) if isinstance(pooling_output.get("embed"), dict) else {}
-                    for key in ("speech_token", "speech_feat", "embedding"):
+                if isinstance(multimodal_output, Mapping):
+                    mm_embed = multimodal_output.get("embed", {})
+                    if not isinstance(mm_embed, Mapping):
+                        mm_embed = multimodal_output
+                    for key in cond_keys:
                         if key in prompt_payload:
                             continue
-                        value = _to_cpu_tensor(po_embed.get(key))
+                        value = _to_cpu_tensor(mm_embed.get(key))
                         if value is not None:
                             prompt_payload[key] = value
+                # Drop any right-padding carried from batched talker emission so
+                # the chunk-routing math (prompt_token_len) and the conditioning
+                # sent to code2wav use the true prompt length.
+                if "speech_token" in prompt_payload:
+                    st_unpad, sf_unpad = unpad_prompt_conditioning(
+                        prompt_payload.get("speech_token"),
+                        prompt_payload.get("speech_feat"),
+                        prompt_payload.pop("speech_token_len", None),
+                    )
+                    prompt_payload["speech_token"] = st_unpad
+                    if sf_unpad is not None:
+                        prompt_payload["speech_feat"] = sf_unpad
                 prompt_token = prompt_payload.get("speech_token")
                 prompt_token_len = (
                     int(prompt_token.shape[1])
@@ -372,8 +371,6 @@ def text2flow_token_only(
         prompt_speech_ids = _prompt_speech_token_ids(multi_modal_data)
         output_ids = _strip_prompt_prefix(output_ids, prompt_speech_ids)
         additional_info: dict[str, Any] = dict(multi_modal_data)
-        if _has_speech_stop_token(raw_output_ids):
-            _set_non_stream_prompt_trim(additional_info, len(prompt_speech_ids))
         additional_info.setdefault("ids", {})["prompt"] = prefix_ids
         engine_inputs.append(
             OmniTokensPrompt(

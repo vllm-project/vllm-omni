@@ -110,12 +110,18 @@ BASE_CAPTION_TEMPLATE: dict[str, Any] = {
 }
 
 
-def create_instruction(user_input: dict[str, Any]) -> str:
+def create_instruction(user_input: Any) -> str | None:
     """Return a JSON caption string for ``audio_sequence[0]``.
 
     Only keys already present on the base template are merged in; unknown
     keys are silently ignored to keep the output schema stable.
     """
+    if user_input is None:
+        return None
+    if isinstance(user_input, str):
+        return user_input
+    if not isinstance(user_input, dict):
+        raise ValueError(f"Ming instruction must be str, dict, or None; got {type(user_input).__name__}")
     caption = copy.deepcopy(BASE_CAPTION_TEMPLATE)
     item = caption["audio_sequence"][0]
     for key, value in user_input.items():

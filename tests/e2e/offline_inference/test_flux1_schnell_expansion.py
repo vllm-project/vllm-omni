@@ -5,6 +5,7 @@
 
 import pytest
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunnerHandler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -13,12 +14,13 @@ MODEL = "black-forest-labs/FLUX.1-schnell"
 _OMNI_RUNNER_PARAM = (MODEL, None)
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_flux_schnell_text_to_image(omni_runner_handler: OmniRunnerHandler):
     """Test FLUX.1-schnell text-to-image generation."""
     request_config = {

@@ -23,6 +23,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings, PixArtAlphaTextProjection
 from diffusers.utils import (
     BaseOutput,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -62,7 +64,17 @@ def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) ->
         kwargs["has_weight"] = elementwise_affine
     elif not elementwise_affine:
         raise TypeError("RMSNorm backend does not support disabling affine weights.")
-    return RMSNorm(hidden_size, **kwargs)
+    norm = RMSNorm(hidden_size, **kwargs)
+    weight = getattr(norm, "weight", None)
+    if (
+        not elementwise_affine
+        and isinstance(weight, torch.Tensor)
+        and not isinstance(weight, nn.Parameter)
+        and "weight" not in dict(norm.named_buffers())
+    ):
+        delattr(norm, "weight")
+        norm.register_buffer("weight", weight, persistent=False)
+    return norm
 
 
 def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -681,7 +693,7 @@ class LTX2Attention(torch.nn.Module):
         # LTX-2.3: per-head gated attention
         # leave unquantized for this linear
         if apply_gated_attention:
-            self.to_gate_logits = nn.Linear(query_dim, heads, bias=True)
+            self.to_gate_logits = nn.Linear(query_dim, self.query_num_heads, bias=True)
         else:
             self.to_gate_logits = None
 
@@ -1438,6 +1450,14 @@ class LTX2VideoTransformer3DModel(nn.Module):
         qk_norm (`str`, defaults to `"rms_norm_across_heads"`):
             The normalization layer to use.
     """
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_0,
+        },
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
 
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = ["norm"]

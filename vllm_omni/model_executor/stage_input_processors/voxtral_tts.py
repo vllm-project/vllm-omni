@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -15,6 +16,21 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 logger = init_logger(__name__)
 
 
+def _codec_audio_tensors(multimodal_output: OmniPayload | dict[str, Any]) -> list[torch.Tensor] | None:
+    """Inter-stage codec frames from ``codes.audio``."""
+    if not isinstance(multimodal_output, Mapping):
+        return None
+    codes = multimodal_output.get("codes")
+    if not isinstance(codes, Mapping) or "audio" not in codes:
+        return None
+    audio = codes["audio"]
+    if isinstance(audio, torch.Tensor):
+        return [audio]
+    if isinstance(audio, list) and audio:
+        return audio
+    return None
+
+
 def generator2tokenizer(
     source_outputs: list[Any],
     _prompt: OmniTokensPrompt | TextPrompt = None,
@@ -23,7 +39,10 @@ def generator2tokenizer(
     tokenizer_inputs = []
     for generator_output in source_outputs:
         output = generator_output.outputs[0]
-        audio_tokens = torch.cat(output.multimodal_output["audio"], dim=-1).flatten().detach().cpu().tolist()
+        audio_tensors = _codec_audio_tensors(output.multimodal_output)
+        if not audio_tensors:
+            raise ValueError("Missing codes.audio in generator multimodal_output")
+        audio_tokens = torch.cat(audio_tensors, dim=-1).flatten().detach().cpu().tolist()
         tokenizer_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=audio_tokens,
@@ -35,29 +54,32 @@ def generator2tokenizer(
     return tokenizer_inputs
 
 
-def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
-    audio = pooling_output.get("audio")
-    if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
+    audio_tensors = _codec_audio_tensors(multimodal_output)
+    if not audio_tensors:
         return None
-    return audio.flatten()
+    frame = audio_tensors[-1]
+    if not isinstance(frame, torch.Tensor) or frame.numel() == 0:
+        return None
+    return frame.flatten()
 
 
 def generator2tokenizer_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload,
+    multimodal_output: OmniPayload | dict[str, Any],
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
-    if isinstance(pooling_output, dict):
-        frame = _extract_last_frame(pooling_output)
+    if isinstance(multimodal_output, Mapping):
+        frame = _extract_last_frame(multimodal_output)
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     elif not finished:
-        # Some steps may not produce pooling_output. Only flush on finish.
+        # Some steps may not produce multimodal_output. Only flush on finish.
         return None
 
     connector = getattr(transfer_manager, "connector", None)

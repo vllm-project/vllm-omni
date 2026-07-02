@@ -221,73 +221,8 @@ async def run_batch(
 
 
 # ------------------------------------------------------------------
-# Explicit batch — single generate() call with list of prompts
-# ------------------------------------------------------------------
-
-
-async def run_batch_explicit(
-    omni: AsyncOmni,
-    prompts: list[dict[str, str]],
-    label: str = "batch_explicit",
-) -> float:
-    """Send all prompts as a single batch via generate(prompt=[...]).
-
-    Passes a *list* of prompts so that all are processed in **one**
-    ``DiffusionEngine.step()`` call.  The orchestrator detects
-    ``isinstance(prompt, list)`` and routes to the batch path.
-
-    A single ``OmniRequestOutput`` is yielded containing ALL generated
-    images combined.
-    """
-    print(f"⚡ Running {label.upper()} mode – {len(prompts)} prompts in ONE engine call ...")
-    sp = _default_sampling_params()
-    request_id = f"{label}-{uuid.uuid4().hex[:8]}"
-    start = time.perf_counter()
-
-    result: OmniRequestOutput | None = None
-    async for output in omni.generate(
-        prompt=prompts,
-        request_id=request_id,
-        sampling_params_list=[sp],
-    ):
-        result = output
-
-    elapsed = time.perf_counter() - start
-    if result is not None:
-        images = _extract_images(result)
-        print(f"   Got {len(images)} images total from batch, request_id={result.request_id}")
-    else:
-        print("   ⚠️  No output received from batch generate()")
-
-    print(f"   ✅ Total {label} mode: {elapsed:.2f}s\n")
-    return elapsed
-
-
-# ------------------------------------------------------------------
 # Async validation helpers
 # ------------------------------------------------------------------
-
-
-async def validate_batch_explicit(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
-    """Validate generate(prompt=[...]) returns a single result with all images."""
-    print(f"🔍 Validating batch generate() correctness with {len(prompts)} prompts ...")
-    sp = _default_sampling_params()
-    request_id = f"validate-batch-{uuid.uuid4().hex[:8]}"
-
-    result: OmniRequestOutput | None = None
-    async for output in omni.generate(
-        prompt=prompts,
-        request_id=request_id,
-        sampling_params_list=[sp],
-    ):
-        result = output
-
-    assert result is not None, "No output received from batch generate()"
-    images = _extract_images(result)
-    # Batch mode returns ONE output with ALL images combined
-    assert len(images) == len(prompts), f"Expected {len(prompts)} images (one per prompt), got {len(images)}"
-    assert result.request_id == request_id, f"Expected request_id={request_id}, got {result.request_id}"
-    print(f"   ✅ Batch returned {len(images)} images with correct request_id.\n")
 
 
 async def validate_concurrent(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
@@ -330,17 +265,14 @@ async def compare_single_vs_parallel(
         await warmup(omni, WARMUP_PROMPTS)
         single_time = await run_single(omni, prompts)
         parallel_time = await run_batch(omni, prompts, label="parallel")
-        explicit_time = await run_batch_explicit(omni, prompts, label="batch_explicit")
     finally:
         omni.shutdown()
 
     speedup_parallel = single_time / parallel_time if parallel_time > 0 else float("inf")
-    speedup_explicit = single_time / explicit_time if explicit_time > 0 else float("inf")
     print("=" * 60)
     print(f"📊 Summary ({len(prompts)} prompts)")
     print(f"   Sequential        : {single_time:.2f}s")
     print(f"   Parallel (gather) : {parallel_time:.2f}s  ({speedup_parallel:.2f}x)")
-    print(f"   Explicit batch    : {explicit_time:.2f}s  ({speedup_explicit:.2f}x)")
     print("=" * 60)
 
 
@@ -362,12 +294,8 @@ async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> 
 
         if mode == "validate":
             await validate_concurrent(omni, prompts)
-        elif mode == "validate_batch":
-            await validate_batch_explicit(omni, prompts)
         elif mode == "batch":
             await run_batch(omni, prompts, label="measurement")
-        elif mode == "batch_explicit":
-            await run_batch_explicit(omni, prompts)
         elif mode == "single":
             await run_single(omni, prompts)
         else:
@@ -495,13 +423,10 @@ def test_diffusion_batching_async_concurrent(model_name: str):
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
-def test_diffusion_batching_async_explicit_batch(model_name: str):
-    """Test that AsyncOmni batch mode (generate(prompt=[...])) dispatches
-    all prompts in a single engine call and returns a single combined result.
-
-    The list-prompt path routes through the orchestrator's
-    ``add_batch_request_async`` → ``AsyncOmni.generate_batch``
-    and yields ONE ``OmniRequestOutput`` with ALL images combined.
+def test_diffusion_batching_list_prompt_rejected(model_name: str):
+    """Test that list-prompt batch requests are rejected at the diffusion
+    stage boundary.  Users should submit multiple independent requests to
+    leverage scheduler batching instead.
     """
 
     async def _inner():
@@ -511,25 +436,14 @@ def test_diffusion_batching_async_explicit_batch(model_name: str):
             sp = _default_sampling_params()
             request_id = f"explicit-batch-{uuid.uuid4().hex[:8]}"
 
-            # Batch mode: pass list of prompts → single request_id
-            result: OmniRequestOutput | None = None
-            async for output in omni.generate(
-                prompt=prompts,
-                request_id=request_id,
-                sampling_params_list=[sp],
-            ):
-                result = output
-
-            assert result is not None, "No output received from batch generate()"
-
-            images = _extract_images(result)
-            # One image per prompt, all in a single output
-            assert len(images) == len(prompts), f"Expected {len(prompts)} images in combined output, got {len(images)}"
-            assert result.request_id == request_id, f"Expected request_id={request_id}, got {result.request_id}"
-            for i, img in enumerate(images):
-                assert img.width == 256, f"Image {i} width mismatch"
-                assert img.height == 256, f"Image {i} height mismatch"
-            print(f"   ✅ Batch returned {len(images)} images, request_id={result.request_id}")
+            with pytest.raises(ValueError, match="Diffusion stages accept only a single prompt per request"):
+                async for _output in omni.generate(
+                    prompt=prompts,
+                    request_id=request_id,
+                    sampling_params_list=[sp],
+                ):
+                    pass
+            print("   ✅ List-prompt batch correctly rejected")
         finally:
             omni.shutdown()
 
@@ -613,12 +527,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1, help="Diffusion batch size (1 = no batching)")
     parser.add_argument(
         "--mode",
-        choices=["batch", "batch_explicit", "single", "compare", "validate", "validate_batch"],
+        choices=["batch", "single", "compare", "validate"],
         default="compare",
         help=(
-            "Run mode: 'batch' (parallel gather), 'batch_explicit' (list-prompt batch API), "
-            "'single' (sequential), 'compare' (all three), "
-            "'validate' (concurrent correctness), 'validate_batch' (list-prompt correctness)"
+            "Run mode: 'batch' (parallel gather), 'single' (sequential), "
+            "'compare' (single vs parallel), 'validate' (concurrent correctness)"
         ),
     )
     args = parser.parse_args()

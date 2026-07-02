@@ -40,7 +40,9 @@ def _json_unpack(data):
 
 
 def _engine_with_policy_config(policy_config=None):
-    od_config = SimpleNamespace(model_config={"policy_server_config": policy_config or TEST_POLICY_SERVER_CONFIG})
+    if policy_config is None:
+        policy_config = TEST_POLICY_SERVER_CONFIG
+    od_config = SimpleNamespace(model_config={"policy_server_config": policy_config})
     return SimpleNamespace(get_diffusion_od_config=lambda: od_config)
 
 
@@ -170,6 +172,15 @@ def test_create_policy_server_returns_none_without_policy_config():
     )
 
     assert serving is None
+
+
+def test_policy_server_config_allows_explicit_empty_config():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=_engine_with_policy_config(policy_config={}),
+        model_name="nvidia/Cosmos3-Nano-Policy-DROID",
+    )
+
+    assert serving.policy_server_config.to_dict() == {}
 
 
 def test_policy_server_config_reads_engine_model_config():

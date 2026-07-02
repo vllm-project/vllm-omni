@@ -114,6 +114,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._listener_ready = threading.Event()
         self._local_buffers: dict[str, Any] = {}
         self._local_buffers_lock = threading.Lock()
+        self._put_lock = threading.Lock()
         self._req_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
@@ -382,6 +383,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         put_key = self._make_key(put_key, from_stage, to_stage)
 
+        # Serialize concurrent put() calls on the same connector to prevent
+        # races in the alloc -> copy -> store-metadata flow at the Mooncake
+        # C++ engine level.
+        with self._put_lock:
+            return self._put_impl(put_key, data)
+
+    def _put_impl(self, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+        """Internal put implementation, called under _put_lock."""
         try:
             src_addr = 0
             size = 0
@@ -683,12 +692,20 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return None
 
         # 1. Allocate Destination Buffer from Pool
+        # For non-fast-path (serialized objects), allocate a few extra bytes
+        # as padding.  Mooncake's TCP/memcpy transport may prepend a leading
+        # protocol byte (0x01) before the payload.  The extra padding allows
+        # the receiver to detect and skip this byte without truncating the
+        # actual payload.  The padding is harmless for fast-path (ManagedBuffer)
+        # because the caller reads exact-size slices.
+        _MOONCAKE_TCP_PADDING = 4 if not is_fast_path else 0
+        alloc_size = data_size + _MOONCAKE_TCP_PADDING
         try:
-            offset = self.allocator.alloc(data_size)
-            recv_buffer = ManagedBuffer(self.allocator, offset, data_size, self.pool)
+            offset = self.allocator.alloc(alloc_size)
+            recv_buffer = ManagedBuffer(self.allocator, offset, alloc_size, self.pool)
             dst_ptr = self.base_ptr + offset
         except MemoryError:
-            logger.error(f"Failed to allocate {data_size} bytes in receive pool")
+            logger.error(f"Failed to allocate {alloc_size} bytes in receive pool")
             return None
 
         _t2 = _time_mod.perf_counter()
@@ -766,8 +783,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                         _t_copy_end = _time_mod.perf_counter()
                         _copy_ms = (_t_copy_end - _t_copy_start) * 1000
 
+                        # Try deserializing the first data_size bytes.  Mooncake's
+                        # TCP/memcpy transport may prepend a leading protocol byte
+                        # (0x01) before the payload — handle this by retrying from
+                        # offset 1 if the first attempt raises DecodeError.
                         _t_deser_start = _time_mod.perf_counter()
-                        val = OmniSerializer.deserialize(raw_bytes)
+                        payload = raw_bytes[:data_size]
+                        try:
+                            val = OmniSerializer.deserialize(payload)
+                        except msgspec.DecodeError:
+                            # Likely a leading Mooncake TCP protocol byte — retry
+                            # from offset 1, using the extra padding bytes if needed.
+                            payload = raw_bytes[1 : data_size + 1]
+                            val = OmniSerializer.deserialize(payload)
                         _t_deser_end = _time_mod.perf_counter()
                         _deser_ms = (_t_deser_end - _t_deser_start) * 1000
 

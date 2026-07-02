@@ -32,6 +32,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
+from vllm_omni.inputs.data import OmniTokensPrompt
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -46,6 +47,15 @@ _NUM_REAL_CODES = 1024  # codes in [0, 1023] are real
 _DEFAULT_CODEC_CHUNK_FRAMES = 25
 _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES = 25
 _DEFAULT_CODEC_RIGHT_HOLDBACK_FRAMES = 4
+
+
+def _empty_code2wav_prompt() -> Any:
+    return OmniTokensPrompt(
+        prompt_token_ids=[],
+        multi_modal_data=None,
+        mm_processor_kwargs=None,
+        additional_information=None,
+    )
 
 
 def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
@@ -91,9 +101,8 @@ def talker2code2wav(
     _requires_multimodal_data: bool = False,
 ) -> list[Any]:
     """Sync: collect all talker codes, revert delay pattern, filter, pass to code2wav."""
-    from vllm_omni.inputs.data import OmniTokensPrompt
 
-    code2wav_inputs: list[OmniTokensPrompt] = []
+    code2wav_inputs: list[Any] = []
     for talker_output in source_outputs:
         if not talker_output.finished:
             continue
@@ -103,14 +112,7 @@ def talker2code2wav(
 
         audio_codes = mm_codes.get("audio")
         if audio_codes is None or not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-            code2wav_inputs.append(
-                OmniTokensPrompt(
-                    prompt_token_ids=[],
-                    multi_modal_data=None,
-                    mm_processor_kwargs=None,
-                    additional_information=None,
-                )
-            )
+            code2wav_inputs.append(_empty_code2wav_prompt())
             continue
 
         audio_codes = audio_codes.to(torch.long)
@@ -135,7 +137,12 @@ def talker2code2wav(
         codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
 
         # Step 1: Revert delay pattern
-        codes_qt = _revert_delay_pattern(codes_qt)
+        try:
+            codes_qt = _revert_delay_pattern(codes_qt)
+        except ValueError as exc:
+            logger.warning("Skipping invalid Higgs Audio v3 code sequence for Stage 1: %s", exc)
+            code2wav_inputs.append(_empty_code2wav_prompt())
+            continue
 
         # Step 2: Replace out-of-range codes (BOC=1024, EOC=1025, -1) with 0.
         # Must use torch.where, NOT clamp: clamp(max=1023) turns 1025→1023
@@ -154,14 +161,7 @@ def talker2code2wav(
             codes_qt = codes_qt[:, :-1]
 
         if codes_qt.numel() == 0:
-            code2wav_inputs.append(
-                OmniTokensPrompt(
-                    prompt_token_ids=[],
-                    multi_modal_data=None,
-                    mm_processor_kwargs=None,
-                    additional_information=None,
-                )
-            )
+            code2wav_inputs.append(_empty_code2wav_prompt())
             continue
 
         # Code2Wav expects codebook-major flat: [Q * num_frames]
@@ -214,7 +214,7 @@ def _extract_last_step_row(pooling_output: OmniPayload) -> torch.Tensor | None:
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload | None,
+    multimodal_output: OmniPayload | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -244,6 +244,7 @@ def talker2code2wav_async_chunk(
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
+    pooling_output = multimodal_output
 
     # Per-request rolling state. ``code_prompt_token_ids`` is the
     # framework-provided buffer; ``higgs_v3_emitted_frames`` tracks how many
@@ -336,7 +337,21 @@ def talker2code2wav_async_chunk(
         return None
 
     codes_qt = torch.tensor(window_rows, dtype=torch.long).t().contiguous()
-    de_delayed = _revert_delay_pattern(codes_qt)
+    try:
+        de_delayed = _revert_delay_pattern(codes_qt)
+    except ValueError:
+        logger.warning(
+            "async_chunk: insufficient frames for delay pattern reversal "
+            "(T=%d < Q=%d, request=%s). Returning empty chunk.",
+            codes_qt.shape[1],
+            codes_qt.shape[0],
+            request_id,
+        )
+        emitted_frames.pop(request_id, None)
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+            meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+        )
     # Replace BOC=1024/EOC=1025 (and any negative pads) with 0; matches the
     # sync-path substitution. Clamp would turn 1025 into 1023 which is a
     # VALID codec code and decodes to audible artifacts.

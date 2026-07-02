@@ -62,6 +62,7 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
         "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "response_format": "wav",
         "voice": "default",
@@ -91,5 +92,6 @@ def test_response_format_001(omni_server, openai_client) -> None:
         "voice": "default",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        "min_hnr_db": -2.0,
     }
     openai_client.send_audio_speech_request(request_config)

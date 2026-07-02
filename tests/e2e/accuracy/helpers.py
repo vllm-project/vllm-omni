@@ -305,7 +305,7 @@ def assert_video_similarity_metrics(
     offline_path: Path,
     ssim_threshold: float,
     psnr_threshold: float,
-) -> None:
+) -> tuple[float, float]:
     ssim_output = run_ffmpeg_similarity("ssim", online_path, offline_path)
     psnr_output = run_ffmpeg_similarity("psnr", online_path, offline_path)
     ssim_score = parse_ssim_score(ssim_output)
@@ -339,6 +339,7 @@ def assert_video_similarity_metrics(
         f"PSNR below threshold: got {psnr_score:.6f}, expected >= {psnr_threshold:.6f}. "
         f"online={online_path} offline={offline_path}"
     )
+    return ssim_score, psnr_score
 
 
 def assert_similarity(

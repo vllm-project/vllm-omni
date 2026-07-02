@@ -9,14 +9,15 @@ import inspect
 import queue
 import threading
 import time
-from collections.abc import Iterable
-from dataclasses import dataclass, field
-from typing import Any
+from collections.abc import AsyncGenerator, Iterable
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
@@ -25,8 +26,21 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.io_support import (
+    get_dummy_run_num_frames,
+    image_color_format,
+    supports_audio_output,
+    supports_multimodal_input,
+)
+from vllm_omni.diffusion.output_formatter import (
+    DiffusionStepTimings,
+    format_diffusion_outputs,
+    format_empty_diffusion_outputs,
+    normalize_diffusion_postprocess_output,
+)
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
+    get_diffusion_action_post_process_func,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
@@ -34,53 +48,63 @@ from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusio
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
+from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
-
-@dataclass
-class _RpcTask:
-    """A pending collective_rpc invocation queued for the busy loop."""
-
-    method: str
-    args: tuple
-    kwargs: dict | None
-    deadline: float | None
-    unique_reply_rank: int | None
-    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
+__all__ = [
+    "DiffusionEngine",
+    "_RpcTask",
+    "_move_tensor_tree_to_cpu",
+    "get_dummy_run_num_frames",
+    "image_color_format",
+    "supports_audio_output",
+    "supports_multimodal_input",
+]
 
 
-def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
-    if od_config.diffusion_load_format == "diffusers" and (pipe_cls := od_config.diffusers_pipeline_cls) is not None:
-        signature = inspect.signature(pipe_cls.__call__)
-        support_image_input = "image" in signature.parameters
-        support_audio_input = (
-            "audio" in signature.parameters or "audio_latents" in signature.parameters
-        )  # ref. LTX-2 format
-        return support_image_input, support_audio_input
-
-    supports_image_input = False
-    supports_audio_input = False
-
-    model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
-    if model_cls is not None:
-        supports_image_input = bool(getattr(model_cls, "support_image_input", False))
-        supports_audio_input = bool(getattr(model_cls, "support_audio_input", False))
-    return supports_image_input, supports_audio_input
+def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
+    if func is None:
+        return False
+    parameters = inspect.signature(func).parameters
+    return parameter_name in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
-def image_color_format(model_class_name: str) -> str:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    return getattr(model_cls, "color_format", "RGB")
+def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
+    if custom_pipeline_args is None:
+        return None
+
+    try:
+        pipeline_cls = custom_pipeline_args["pipeline_class"]
+    except KeyError as exc:
+        raise ValueError("custom_pipeline_args must include 'pipeline_class'.") from exc
+
+    if isinstance(pipeline_cls, type):
+        return pipeline_cls
+    if isinstance(pipeline_cls, str):
+        try:
+            return resolve_obj_by_qualname(pipeline_cls)
+        except (AttributeError, ImportError, ValueError) as exc:
+            raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+    raise TypeError(
+        f"custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
+        f"got {type(pipeline_cls).__name__}"
+    )
 
 
-def supports_audio_output(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    if model_cls is None:
+        model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
     if model_cls is None:
         return False
-    return bool(getattr(model_cls, "support_audio_output", False))
+    return bool(getattr(model_cls, "supports_request_batch", False))
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -95,41 +119,16 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
     return value
 
 
-def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
-    """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
+@dataclass
+class _RpcTask:
+    """A pending collective_rpc invocation queued for the busy loop."""
 
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
-        return int(getattr(model_cls, "dummy_run_num_frames"))
-    return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
-
-
-def get_extra_body_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of extra_body keys accepted by a pipeline.
-
-    Each pipeline can declare ``EXTRA_BODY_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which request-level parameters should be forwarded from
-    ``extra_body`` to ``OmniDiffusionSamplingParams.extra_args``.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_BODY_PARAMS", frozenset()))
-
-
-def get_extra_output_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of custom_output keys to expose in API response metrics.
-
-    Each pipeline can declare ``EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which ``DiffusionOutput.custom_output`` keys should be
-    copied into the response ``metrics`` dict.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
+    method: str
+    args: tuple
+    kwargs: dict | None
+    deadline: float | None
+    unique_reply_rank: int | None
+    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
 
 
 class DiffusionEngine:
@@ -148,25 +147,31 @@ class DiffusionEngine:
         self.od_config = od_config
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
+        self.action_post_process_func = get_diffusion_action_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
-        self._post_process_accepts_sampling_params = bool(
-            self.post_process_func is not None
-            and "sampling_params" in inspect.signature(self.post_process_func).parameters
+        self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
+        self._action_post_process_accepts_sampling_params = _func_accepts_parameter(
+            self.action_post_process_func, "sampling_params"
         )
+        self._action_post_process_accepts_custom_output = _func_accepts_parameter(
+            self.action_post_process_func, "custom_output"
+        )
+
+        self.step_execution = bool(getattr(od_config, "step_execution", False))
+        if self.od_config.streaming_output and not self.step_execution:
+            logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
+            self.od_config.step_execution = True
+            self.step_execution = True
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.step_execution = bool(getattr(od_config, "step_execution", False))
         self.scheduler: SchedulerInterface = scheduler or (
             StepScheduler() if self.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
-        if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
-            max_num_seqs = self.scheduler.max_num_running_reqs
-            self.scheduler.max_num_running_reqs = 1
-            logger.warning(f"Non-stepwise-execution does not support max-num-seqs={max_num_seqs}, set it to 1.")
+        self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -179,11 +184,24 @@ class DiffusionEngine:
         self._rpc_lock = threading.RLock()
         self._cv = threading.Condition(self._rpc_lock)
         self._out_queue: dict[str, asyncio.Future] = {}
+        self._out_queue_streaming: dict[str, asyncio.Queue[DiffusionOutput]] = {}
         self._closed = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+        if self.step_execution:
+            self.execute_fn = self.executor.execute_step
+        elif self.supports_request_batch:
+            self.execute_fn = self.executor.execute_batch
+        else:
+            self.execute_fn = self.executor.execute_request
+
+        if self.supports_request_batch:
+            logger.info(
+                "[RequestBatch] engine init max_num_seqs=%s max_wait_ms=%s",
+                getattr(od_config, "max_num_seqs", None),
+                getattr(od_config, "request_batch_max_wait_ms", None),
+            )
 
         try:
             self._dummy_run()
@@ -227,25 +245,52 @@ class DiffusionEngine:
         exec_start_time = time.perf_counter()
         output = await self.async_add_req_and_wait_for_response(request)
         exec_total_time = time.perf_counter() - exec_start_time
+        return self.postprocess_output(request, output, diffusion_engine_start_time, preprocess_time, exec_total_time)
 
+    async def step_streaming(self, request: OmniDiffusionRequest) -> AsyncGenerator[list[OmniRequestOutput], None]:
+        await self._check_and_start_background_loop()
+
+        diffusion_engine_start_time = time.perf_counter()
+
+        preprocess_time = 0.0
+        if self.pre_process_func is not None:
+            preprocess_start_time = time.perf_counter()
+            request = self.pre_process_func(request)
+            preprocess_time = time.perf_counter() - preprocess_start_time
+            logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
+
+        exec_start_time = time.perf_counter()
+        generator = self.async_add_req_and_stream_response(request)
+        async for output in generator:
+            exec_total_time = time.perf_counter() - exec_start_time
+            yield self.postprocess_output(
+                request, output, diffusion_engine_start_time, preprocess_time, exec_total_time
+            )
+
+    def postprocess_output(
+        self,
+        request: OmniDiffusionRequest,
+        output: DiffusionOutput,
+        diffusion_engine_start_time: float,
+        preprocess_time: float,
+        exec_total_time: float,
+    ) -> list[OmniRequestOutput]:
+        """Convert a DiffusionOutput to a list of OmniRequestOutput, attaching profiling metrics."""
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
+            if is_client_error_status(output.error_status_code):
+                raise client_error_from_metadata(
+                    output.error,
+                    status_code=output.error_status_code,
+                    error_type=output.error_type,
+                )
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
         if output.output is None:
             logger.warning("Output is None, returning empty OmniRequestOutput")
-            return [
-                OmniRequestOutput.from_diffusion(
-                    request_id=request.request_id,
-                    images=[],
-                    prompt=prompt,
-                    metrics={},
-                    latents=None,
-                )
-                for i, prompt in enumerate(request.prompts)
-            ]
+            return format_empty_diffusion_outputs(request, finished=output.finished)
 
         # When CPU offload is enabled, move output to CPU before
         # post-processing to avoid device OOM — model weights may still
@@ -254,8 +299,14 @@ class DiffusionEngine:
         if self.od_config.enable_cpu_offload:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
+        custom_output = output.custom_output or {}
+        action_payload = None
+        action_only_output = bool(custom_output.get("action_only_output"))
+
         postprocess_start_time = time.perf_counter()
-        if self.post_process_func is not None:
+        if action_only_output:
+            outputs = []
+        elif self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
             if self._post_process_accepts_sampling_params:
@@ -264,18 +315,30 @@ class DiffusionEngine:
                 outputs = self.post_process_func(output_data)
         else:
             outputs = output_data
-        audio_payload = None
-        custom_output = output.custom_output or {}
-        model_audio_sample_rate = None
-        model_fps = None
-        action_payload = None
-        if isinstance(outputs, dict):
-            audio_payload = outputs.get("audio")
-            action_payload = outputs.get("actions")
-            custom_output.update(outputs.get("custom_output") or {})
-            model_audio_sample_rate = outputs.get("audio_sample_rate")
-            model_fps = outputs.get("fps")
-            outputs = outputs.get("video", outputs)
+
+        postprocess_output = normalize_diffusion_postprocess_output(outputs, custom_output)
+        custom_output = postprocess_output.custom_output
+        action_payload = postprocess_output.action_payload
+        if action_payload is None:
+            action_payload = custom_output.get("actions")
+            if action_payload is not None:
+                postprocess_output = replace(postprocess_output, action_payload=action_payload)
+        action_post_process_func = getattr(self, "action_post_process_func", None)
+        if action_payload is None and action_post_process_func is not None:
+            raw_action_payload = custom_output.get("action")
+            if raw_action_payload is not None:
+                action_kwargs: dict[str, Any] = {}
+                if getattr(self, "_action_post_process_accepts_custom_output", False):
+                    action_kwargs["custom_output"] = custom_output
+                if getattr(self, "_action_post_process_accepts_sampling_params", False):
+                    action_kwargs["sampling_params"] = request.sampling_params
+                action_payload = action_post_process_func(raw_action_payload, **action_kwargs)
+                custom_output = {**custom_output, "actions": action_payload}
+                postprocess_output = replace(
+                    postprocess_output,
+                    custom_output=custom_output,
+                    action_payload=action_payload,
+                )
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
@@ -289,184 +352,19 @@ class DiffusionEngine:
             step_total_ms,
         )
 
-        # Convert to OmniRequestOutput format
-        # Ensure outputs is a list
-        if not isinstance(outputs, list):
-            outputs = [outputs] if outputs is not None else []
-
-        metrics = {
-            "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-            "diffusion_engine_total_time_ms": step_total_ms,
-            "image_num": int(request.sampling_params.num_outputs_per_prompt),
-            "resolution": int(request.sampling_params.resolution),
-            "postprocess_time_ms": postprocess_time * 1000,
-        }
-
-        # Detect text output: when the pipeline returns a string (e.g.,
-        # SenseNova-U1 / BAGEL single-stage img2text / text2text), wrap it
-        # as a text-type response instead of an image.
-        is_text_output = isinstance(output_data, str) and custom_output.get("text_output") is not None
-
-        # Handle single request or multiple requests
-        is_audio_output = supports_audio_output(self.od_config.model_class_name)
-        if is_audio_output and model_audio_sample_rate is None:
-            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
-            model_audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
-
-        def _audio_mm(payload: Any) -> dict[str, Any]:
-            mm: dict[str, Any] = {"audio": payload}
-            if model_audio_sample_rate is not None:
-                mm["audio_sample_rate"] = model_audio_sample_rate
-            return mm
-
-        if len(request.prompts) == 1:
-            # Single request: return single OmniRequestOutput
-            prompt = request.prompts[0]
-            request_id = request.request_id
-
-            if is_text_output:
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics=metrics,
-                        custom_output=custom_output,
-                        final_output_type="text",
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
-            if is_audio_output:
-                request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        trajectory_latents=output.trajectory_latents,
-                        trajectory_timesteps=output.trajectory_timesteps,
-                        trajectory_log_probs=output.trajectory_log_probs,
-                        trajectory_decoded=output.trajectory_decoded,
-                        multimodal_output=_audio_mm(request_audio_payload),
-                        final_output_type="audio",
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
-            else:
-                mm_output = {}
-                if audio_payload is not None:
-                    mm_output["audio"] = audio_payload
-                if model_audio_sample_rate is not None:
-                    mm_output["audio_sample_rate"] = model_audio_sample_rate
-                if model_fps is not None:
-                    mm_output["fps"] = model_fps
-                if action_payload is not None:
-                    mm_output["actions"] = action_payload
-                return [
-                    OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=outputs,
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        trajectory_latents=output.trajectory_latents,
-                        trajectory_timesteps=output.trajectory_timesteps,
-                        trajectory_log_probs=output.trajectory_log_probs,
-                        trajectory_decoded=output.trajectory_decoded,
-                        custom_output=custom_output,
-                        multimodal_output=mm_output,
-                        stage_durations=output.stage_durations,
-                        peak_memory_mb=output.peak_memory_mb,
-                    ),
-                ]
-        else:
-            # Multiple requests: return list of OmniRequestOutput
-            # Split images based on num_outputs_per_prompt for each request
-            results = []
-            output_idx = 0
-            request_id = request.request_id
-
-            for i, prompt in enumerate(request.prompts):
-                # Get images for this request
-                num_outputs = request.sampling_params.num_outputs_per_prompt
-                start_idx = output_idx
-                end_idx = start_idx + num_outputs
-                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
-                output_idx = end_idx
-
-                if is_audio_output:
-                    request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=[],
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
-                            multimodal_output=_audio_mm(request_audio_payload),
-                            final_output_type="audio",
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
-                        ),
-                    )
-                else:
-                    mm_output = {}
-                    if audio_payload is not None:
-                        sliced_audio = audio_payload
-                        if isinstance(audio_payload, (list, tuple)):
-                            sliced_audio = audio_payload[start_idx:end_idx]
-                            if len(sliced_audio) == 1:
-                                sliced_audio = sliced_audio[0]
-                        elif hasattr(audio_payload, "shape") and getattr(audio_payload, "shape", None) is not None:
-                            if len(audio_payload.shape) > 0 and audio_payload.shape[0] >= end_idx:
-                                sliced_audio = audio_payload[start_idx:end_idx]
-                                if num_outputs == 1:
-                                    sliced_audio = sliced_audio[0]
-                        mm_output["audio"] = sliced_audio
-                    if model_audio_sample_rate is not None:
-                        mm_output["audio_sample_rate"] = model_audio_sample_rate
-                    if model_fps is not None:
-                        mm_output["fps"] = model_fps
-                    if action_payload is not None:
-                        sliced_actions = action_payload
-                        if isinstance(action_payload, (list, tuple)):
-                            sliced_actions = action_payload[start_idx:end_idx]
-                            if len(sliced_actions) == 1:
-                                sliced_actions = sliced_actions[0]
-                        elif hasattr(action_payload, "shape") and getattr(action_payload, "shape", None) is not None:
-                            if len(action_payload.shape) > 0 and action_payload.shape[0] >= end_idx:
-                                sliced_actions = action_payload[start_idx:end_idx]
-                                if num_outputs == 1:
-                                    sliced_actions = sliced_actions[0]
-                        mm_output["actions"] = sliced_actions
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=request_outputs,
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
-                            custom_output=custom_output,
-                            multimodal_output=mm_output,
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
-                        ),
-                    )
-
-            return results
+        return format_diffusion_outputs(
+            request=request,
+            od_config=self.od_config,
+            diffusion_output=output,
+            output_data=output_data,
+            postprocess_output=postprocess_output,
+            timings=DiffusionStepTimings(
+                preprocess_time_s=preprocess_time,
+                exec_time_s=exec_total_time,
+                postprocess_time_s=postprocess_time,
+                total_time_ms=step_total_ms,
+            ),
+        )
 
     def _busy_loop(self):
         while not self.stop_event.is_set():
@@ -489,14 +387,20 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
+                if self.supports_request_batch:
+                    self._wait_for_request_batch_admission_locked()
+
                 sched_output = self.scheduler.schedule()
 
             if sched_output.is_empty:
-                self._handle_finished_requests(sched_output.finished_req_ids, None)
+                if self.od_config.streaming_output:
+                    self._handle_empty_streaming_requests(sched_output.finished_req_ids)
+                else:
+                    self._handle_finished_requests(sched_output.finished_req_ids, None)
                 continue
 
             try:
-                runner_output = self.execute_fn(sched_output)
+                runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
             except Exception as exc:
                 logger.error(
                     "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
@@ -507,7 +411,7 @@ class DiffusionEngine:
                             request_id=request_id,
                             step_index=None,
                             finished=True,
-                            result=DiffusionOutput(error=str(exc)),
+                            result=DiffusionOutput.from_exception(exc),
                         )
                         for request_id in sched_output.scheduled_request_ids
                     ]
@@ -516,10 +420,72 @@ class DiffusionEngine:
             self._process_aborts_queue()
             self._process_rpc_queue()
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-            self._handle_finished_requests(finished_req_ids, runner_output)
+            if self.od_config.streaming_output:
+                self._handle_step_streaming_runner_output(
+                    finished_req_ids,
+                    sched_output.scheduled_request_ids,
+                    runner_output,
+                )
+            else:
+                self._handle_finished_requests(finished_req_ids, runner_output)
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _wait_for_request_batch_admission_locked(self) -> None:
+        """Wait for compatible requests to accumulate before scheduling a wave.
+
+        Caller must hold ``self._cv``.
+        """
+        if self.step_execution or not self.supports_request_batch:
+            return
+
+        max_wait_s = self.od_config.request_batch_max_wait_ms / 1000.0
+        if max_wait_s == 0:
+            return
+
+        max_batch = self.scheduler.max_num_running_reqs
+        waiting = self.scheduler.num_waiting_requests()
+        running = self.scheduler.num_running_requests()
+
+        if running > 0:
+            return
+
+        start = time.monotonic()
+        deadline = start + max_wait_s
+        last_waiting = -1
+        stable_since = start
+        # Require a short idle period with no queue growth so bursty HTTP
+        # ingress can land before the first schedule() of a wave.
+        stable_window_s = min(0.05, max_wait_s / 5.0)
+
+        while not self.stop_event.is_set():
+            waiting = self.scheduler.num_waiting_requests()
+            now = time.monotonic()
+
+            if waiting >= max_batch:
+                break
+            if waiting > 0 and (now - stable_since) >= stable_window_s:
+                break
+            if now >= deadline:
+                break
+
+            if waiting > last_waiting:
+                stable_since = now
+                last_waiting = waiting
+
+            remaining = deadline - now
+            self._cv.wait(timeout=min(remaining, 0.002))
+
+        waited_ms = (time.monotonic() - start) * 1000.0
+        final_waiting = self.scheduler.num_waiting_requests()
+        if final_waiting > 0:
+            logger.info(
+                "[RequestBatch] admission wait done waiting=%d max_batch=%d waited_ms=%.1f",
+                final_waiting,
+                max_batch,
+                waited_ms,
+            )
 
     def _process_rpc_queue(self) -> None:
         """Execute pending collective_rpc tasks from the busy-loop thread.
@@ -591,6 +557,57 @@ class DiffusionEngine:
             out = self._finalize_finished_request(rid, _output, missing_result_error)
             self._complete_future(fut, out)
 
+    def _handle_empty_streaming_requests(
+        self,
+        finished_ids: set[str],
+        missing_result_error: str = "Diffusion streaming request finished without execution output.",
+    ) -> None:
+        """Mirrors `_handle_finished_requests()` in non-streaming mode when used for empty scheduler output."""
+        for rid in finished_ids:
+            out = self._finalize_finished_request(rid, None, missing_result_error=missing_result_error)
+            self._put_streaming_output_with_cv(rid, out)
+
+    def _handle_step_streaming_runner_output(
+        self,
+        finished_req_ids: set[str],
+        scheduled_request_ids: list[str],
+        runner_output: BaseRunnerOutput,
+    ) -> None:
+        """
+        Deliver partial step-execution outputs in streaming mode.
+
+        Step execution returns one ``RunnerOutput`` per scheduled request per
+        engine tick. Most denoise steps have ``result=None``; chunk boundaries
+        return a ``DiffusionOutput`` that must be delivered even before the
+        scheduler marks the request finished.
+        """
+        delivered_finished_req_ids: set[str] = set()
+
+        # finished_ids may have some requests that are not scheduler in this round.
+        # First handle this-round requests.
+        for request_id in scheduled_request_ids:
+            req_output = runner_output.get_request_output(request_id)
+            if request_id in finished_req_ids:
+                # This entire request is finished (this is the last chunk)
+                out = self._finalize_finished_request(
+                    request_id,
+                    req_output,
+                    missing_result_error="Diffusion streaming execution finished without a final output.",
+                )
+                self._put_streaming_output_with_cv(request_id, out)
+                delivered_finished_req_ids.add(request_id)
+            elif req_output is not None and req_output.result is not None:
+                # This is a non-terminal chunk. So it is not in scheduler's finished_req_ids, but still need delivering.
+                self._put_streaming_output_with_cv(request_id, req_output.result)
+
+        # Then handle other requests that are finished in this round.
+        for request_id in finished_req_ids - delivered_finished_req_ids:
+            out = self._finalize_finished_request(
+                request_id,
+                missing_result_error="Diffusion streaming request finished without execution output.",
+            )
+            self._put_streaming_output_with_cv(request_id, out)
+
     @staticmethod
     def make_engine(
         config: OmniDiffusionConfig,
@@ -610,9 +627,14 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
-            fut = self.main_loop.create_future()
-            request_id = self.scheduler.add_request(request)
-            self._out_queue[request_id] = fut
+            if not self.od_config.streaming_output:
+                fut = self.main_loop.create_future()
+                request_id = self.scheduler.add_request(request)
+                self._out_queue[request_id] = fut
+            else:
+                queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+                request_id = self.scheduler.add_request(request)
+                self._out_queue_streaming[request_id] = queue
             self._cv.notify_all()
 
         return request_id
@@ -628,11 +650,38 @@ class DiffusionEngine:
             logger.error(f"Wait for response failed: {e}")
             raise
 
+    async def get_streaming_result(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
+        """Mirrors `get_result()` in non-streaming mode."""
+        with self._cv:
+            queue = self._out_queue_streaming.get(request_id)
+        if queue is None:
+            raise RuntimeError(f"Request {request_id} not found in output queue.")
+        try:
+            while True:
+                output: DiffusionOutput = await queue.get()
+                yield output
+                if output.finished:
+                    break
+        except Exception as e:
+            logger.error(f"Wait for response failed: {e}")
+            raise
+        finally:
+            # In streaming mode, an output queue is maintained until the terminal chunk is met.
+            # So unlike the non-streaming mode where output Future is popped in `_handle_finished_requests` (immediately
+            # after the request is returned), the streaming mode needs to pop the output queue here (one layer above).
+            with self._cv:
+                if self._out_queue_streaming.get(request_id) is queue:
+                    self._out_queue_streaming.pop(request_id, None)
+
     async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         # No lock needed: add_request is already protected by self._cv, and
         # all executor calls are serialized inside the busy loop.
         request_id = self.add_request(request)
         return await self.get_result(request_id)
+
+    def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
+        request_id = self.add_request(request)
+        return self.get_streaming_result(request_id)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
@@ -655,7 +704,7 @@ class DiffusionEngine:
                 # within _dummy_run, only one request will be scheduled
                 request_id = sched_output.scheduled_request_ids[0]
                 try:
-                    runner_output = self.execute_fn(sched_output)
+                    runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
                 except EngineDeadError:
                     raise
                 except Exception as exc:
@@ -664,7 +713,7 @@ class DiffusionEngine:
                         request_id=request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
 
                 self._process_aborts_queue()
@@ -675,10 +724,10 @@ class DiffusionEngine:
                 if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
-                    runner_output = runner_output.get_request_output(target_request_id)
+                    req_output = runner_output.get_request_output(target_request_id)
                     return self._finalize_finished_request(
                         target_request_id,
-                        runner_output=runner_output,
+                        runner_output=req_output,
                         missing_result_error="Diffusion execution finished without a final output.",
                     )
 
@@ -728,7 +777,7 @@ class DiffusionEngine:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
         req = OmniDiffusionRequest(
-            prompts=[prompt],
+            prompt=prompt,
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
@@ -873,8 +922,28 @@ class DiffusionEngine:
         else:
             _set_result()
 
+    def _put_streaming_queue_output(
+        self,
+        queue: asyncio.Queue[DiffusionOutput],
+        output: DiffusionOutput,
+    ) -> None:
+        """Append to streaming output queue in a safe event loop. Mirrors `_complete_future()` in non-streaming mode."""
+        loop = self.main_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(queue.put_nowait, output)
+        else:
+            queue.put_nowait(output)
+
+    def _put_streaming_output_with_cv(self, request_id: str, output: DiffusionOutput) -> None:
+        with self._cv:
+            queue = self._out_queue_streaming.get(request_id)
+        if queue is None:
+            return
+        self._put_streaming_queue_output(queue, output)
+
     def close(self) -> None:
         pending_futures: list[asyncio.Future] = []
+        pending_streaming_queues: list[asyncio.Queue[DiffusionOutput]] = []
         with self._cv:
             if self._closed and self._shutdown_complete:
                 return
@@ -883,12 +952,16 @@ class DiffusionEngine:
                 if self.stop_event is not None:
                     self.stop_event.set()
                 pending_futures = list(self._out_queue.values())
+                pending_streaming_queues = list(self._out_queue_streaming.values())
                 self._out_queue.clear()
+                self._out_queue_streaming.clear()
                 self._cv.notify_all()
 
         closed_output = DiffusionOutput(error="DiffusionEngine is closed.")
         for fut in pending_futures:
             self._complete_future(fut, closed_output)
+        for streaming_queue in pending_streaming_queues:
+            self._put_streaming_queue_output(streaming_queue, closed_output)
 
         worker_thread = self.worker_thread
         if worker_thread is not None:
@@ -954,9 +1027,12 @@ class DiffusionEngine:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+            # Preserve runner-provided abort details when available.
+            if runner_output is not None and runner_output.result is not None and runner_output.result.aborted:
+                return runner_output.result
             return DiffusionOutput(
                 aborted=True,
-                abort_message=f"Request {state.req.request_id} aborted.",
+                abort_message=f"Request {request_id} aborted.",
             )
 
         if runner_output is not None and runner_output.result is not None:

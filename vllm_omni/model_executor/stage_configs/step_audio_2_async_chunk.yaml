@@ -1,0 +1,78 @@
+# Stage config for Step-Audio2 with async_chunk support
+#
+# Two-stage pipeline with streaming between stages:
+#   Stage 0 (Thinker): Audio understanding → Text + Audio tokens (streamed in chunks)
+#   Stage 1 (Token2Wav): Audio tokens → Waveform (24kHz)
+#
+# Key difference from step_audio_2.yaml:
+#   - async_chunk: true enables streaming from Thinker to Token2Wav
+#   - Thinker uses custom_process_next_stage_input_func to send audio token chunks
+#   - Token2Wav receives chunks incrementally instead of waiting for full output
+#
+# Hardware requirement: 1-2 GPUs (can run on single GPU with devices: "0" for both)
+
+async_chunk: true
+stage_args:
+  # Stage 0: Thinker (Audio Understanding + Token Generation)
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0,1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: step_audio2_thinker
+      model_arch: StepAudio2ThinkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 1024
+      tensor_parallel_size: 2
+      engine_output_type: latent
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.step_audio2.thinker2token2wav_async_chunk
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: -1
+      max_tokens: 1024
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05
+
+  # Stage 1: Token2Wav (Audio Synthesis)
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "3"
+      max_batch_size: 1
+    engine_args:
+      model_stage: token2wav
+      model_arch: StepAudio2Token2WavModel
+      worker_type: generation
+      hf_overrides:
+        architectures: ["StepAudio2Token2WavForConditionalGeneration"]
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.3
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      max_num_batched_tokens: 2048
+      engine_output_type: audio
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false

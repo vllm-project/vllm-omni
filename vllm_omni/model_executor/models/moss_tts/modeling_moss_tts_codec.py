@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -20,6 +19,9 @@ from vllm_omni.model_executor.models.moss_tts.audio_tokenizer import (
     MossAudioTokenizerConfig,
     MossAudioTokenizerModel,
 )
+from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
+    MossTTSCUDAGraphCodecWrapper,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -28,20 +30,19 @@ logger = init_logger(__name__)
 class MossTTSCodecDecoder(nn.Module):
     """Stage-1 decoder for all MOSS-TTS variants.
 
-    Consumes ``(T, NQ)`` audio VQ codes emitted by Stage 0 and decodes them
+    Consumes ``(NQ, T)`` audio VQ codes emitted by Stage 0 and decodes them
     to a 24 kHz mono waveform using the vendored
     ``MossAudioTokenizerModel``.
 
     All five variants share the same codec checkpoint
     ``OpenMOSS-Team/MOSS-Audio-Tokenizer``.  The number of quantizers
-    (``n_vq``) is passed as a ``num_quantizers`` argument to ``batch_decode``
-    so one codec instance handles both ``n_vq=32`` (MOSS-TTS) and ``n_vq=16``
-    (all other variants) without swapping weights.
+    (``n_vq``) is read from ``hf_config`` at construction time and fixed for
+    the lifetime of the instance; the same checkpoint can be configured as
+    ``n_vq=32`` (MOSS-TTS) or ``n_vq=16`` (all other variants) without
+    swapping weights.
 
-    The codec checkpoint path defaults to the value stored in
-    ``vllm_config.model_config.hf_config.codec_model_name_or_path`` but can
-    be overridden by setting the environment variable
-    ``MOSS_TTS_CODEC_PATH``.
+    The codec checkpoint path comes from
+    ``vllm_config.model_config.hf_config.codec_model_name_or_path``.
     """
 
     input_modalities = "audio"
@@ -60,10 +61,19 @@ class MossTTSCodecDecoder(nn.Module):
 
         cfg = vllm_config.model_config.hf_config
         self._n_vq: int = int(getattr(cfg, "n_vq", getattr(cfg, "rvq", 16)))
-        self._codec_path: str = str(getattr(cfg, "codec_model_name_or_path", "OpenMOSS-Team/MOSS-Audio-Tokenizer"))
+        self._codec_path: str = str(
+            getattr(
+                cfg,
+                "codec_model_name_or_path",
+                getattr(cfg, "audio_tokenizer_name_or_path", "OpenMOSS-Team/MOSS-Audio-Tokenizer"),
+            )
+        )
 
-        # Resolved at load_weights() time
+        # Resolved at load_weights() time, once the codec checkpoint's own
+        # config (sampling rate, channel count) is known.
         self._codec: MossAudioTokenizerModel | None = None
+        self._cuda_graph_wrapper: MossTTSCUDAGraphCodecWrapper | None = None
+        self._n_channels: int = 1
         self._sr_tensor = torch.tensor(self._OUTPUT_SAMPLE_RATE, dtype=torch.int32)
 
     # ------------------------------------------------------------------
@@ -100,10 +110,11 @@ class MossTTSCodecDecoder(nn.Module):
 
         Stage 0 emits flat codebook-major ``[NQ * T_chunk]`` audio codes. The
         chunk transfer adapter assigns those to ``request.prompt_token_ids``,
-        which arrives here as ``input_ids``. Per-request offsets are derived
-        from ``runtime_additional_information``-attached request metadata; meta
-        like ``left_context_size`` (overlap context for the causal decoder)
-        also lives there.
+        which arrives here as ``input_ids`` concatenated across all requests.
+        Per-request slice boundaries are computed from
+        ``kwargs["num_scheduled_tokens"]`` (a list of token counts, one per
+        request).  ``runtime_additional_information`` carries per-request
+        metadata such as ``left_context_size``.
 
         Returns
         -------
@@ -113,7 +124,7 @@ class MossTTSCodecDecoder(nn.Module):
         """
         sr_tensor = self._sr_tensor
         empty = torch.zeros((0,), dtype=torch.float32)
-        info_list: list[dict[str, Any]] = runtime_additional_information or []
+        info_list: list[dict[str, Any]] = runtime_additional_information or [{}]
         num_req = max(len(info_list), 1)
 
         if self._codec is None:
@@ -141,7 +152,7 @@ class MossTTSCodecDecoder(nn.Module):
         # kwargs if available, else assume one request.
         ids_flat = input_ids.reshape(-1).to(dtype=torch.long)
         num_scheduled_tokens = kwargs.get("num_scheduled_tokens")
-        if isinstance(num_scheduled_tokens, list) and len(num_scheduled_tokens) == num_req:
+        if isinstance(num_scheduled_tokens, (list, tuple)) and len(num_scheduled_tokens) == num_req:
             offsets = [0]
             for n in num_scheduled_tokens:
                 offsets.append(offsets[-1] + int(n))
@@ -163,46 +174,62 @@ class MossTTSCodecDecoder(nn.Module):
                 continue
             t_chunk = int(seg.numel() // self._n_vq)
             codes_nq_t = seg.reshape(self._n_vq, t_chunk).to(device=device)
-            # Clamp out-of-range codes (the talker uses ``audio_pad_code``
-            # =``codebook_size`` for delay-pattern padding; passing it to the
-            # codec embedding lookup would be an OOB index. The downstream
-            # de-delay step is intended to drop those rows, but until that's
-            # wired we clamp so the kernel does not assert.)
+            # Clamp out-of-range codes: the talker uses ``audio_pad_code``
+            # (= ``codebook_size``) for delay-pattern padding.  The stage input
+            # processor de-delays and drops pad rows before forwarding here, but
+            # clamp as a defensive guard against any edge-case leakage.
             codebook_size = self._codec.config.codebook_size
             codes_nq_t = codes_nq_t.clamp_(0, int(codebook_size) - 1)
 
-            # left_context_size: number of left-context frames prepended to
-            # this chunk by the stage input processor (overlap-add pattern,
-            # same as Qwen3-TTS code2wav).  We decode them together with the
-            # real chunk for smooth boundaries, then trim them from the output.
             meta = (info.get("meta", {}) if isinstance(info, dict) else {}) or {}
-            left_ctx = meta.get("left_context_size", 0)
+            left_ctx = self._runtime_value(info, meta, "left_context_size", 0)
             if isinstance(left_ctx, (list, tuple)):
                 left_ctx = int(left_ctx[0]) if left_ctx else 0
             elif isinstance(left_ctx, torch.Tensor):
                 left_ctx = int(left_ctx.reshape(-1)[0].item()) if left_ctx.numel() else 0
             left_ctx = int(left_ctx)
 
-            out = self._codec.batch_decode(codes_list=[codes_nq_t], num_quantizers=self._n_vq)
+            if self._cuda_graph_wrapper is not None:
+                out = self._cuda_graph_wrapper.decode(codes_nq_t)
+            else:
+                out = self._codec.batch_decode(codes_list=[codes_nq_t], num_quantizers=self._n_vq)
 
             if out.audio is None:
                 continue
 
-            wav = out.audio.reshape(-1).to(dtype=torch.float32).cpu()
+            # ``out.audio`` is ``(1, C, T)``; keep the channel axis for
+            # stereo codecs (Local-v1.5) and flatten to ``(T,)`` for mono
+            # ones (Delay/Realtime) to preserve their existing output shape.
+            wav = out.audio[0].to(dtype=torch.float32).cpu()
             if out.audio_lengths is not None:
-                wav = wav[: int(out.audio_lengths[0].item())]
+                wav = wav[..., : int(out.audio_lengths[0].item())]
 
-            # Trim left-context samples.
+            # Trim left-context samples (per-channel sample axis, so the
+            # trim amount is identical for mono and interleaved-stereo).
             if left_ctx > 0:
-                trim = left_ctx * self._codec.downsample_rate
-                wav = wav[trim:]
+                trim = min(left_ctx * self._codec.downsample_rate, wav.shape[-1])
+                if trim < left_ctx * self._codec.downsample_rate:
+                    logger.warning(
+                        "left_ctx trim (%d samples) exceeds wav length (%d); returning empty audio.",
+                        left_ctx * self._codec.downsample_rate,
+                        wav.shape[-1],
+                    )
+                wav = wav[..., trim:]
 
-            audios[i] = wav
+            audios[i] = wav.reshape(-1) if self._n_channels == 1 else wav
 
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
+
+    @staticmethod
+    def _runtime_value(info: Any, meta: dict[str, Any], name: str, default: Any = None) -> Any:
+        if name in meta:
+            return meta[name]
+        if isinstance(info, dict) and name in info:
+            return info[name]
+        return default
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -220,11 +247,10 @@ class MossTTSCodecDecoder(nn.Module):
         for _ in weights:
             pass
 
-        codec_path = os.environ.get("MOSS_TTS_CODEC_PATH", self._codec_path)
+        codec_path = self._codec_path
         logger.info("Loading MOSS Audio Tokenizer from %s", codec_path)
 
-        codec_cfg = MossAudioTokenizerConfig.from_pretrained(codec_path)
-        codec = MossAudioTokenizerModel(codec_cfg)
+        codec_cfg, codec = self._build_codec(codec_path)
 
         model_loader = DefaultModelLoader(self.vllm_config.load_config)
         source = DefaultModelLoader.Source(
@@ -241,10 +267,19 @@ class MossTTSCodecDecoder(nn.Module):
         # and the rest stay at their random init, which produces noise that
         # sounds correct in duration but is structurally garbage.
         _SUFFIX_REMAP: list[tuple[str, str]] = [
+            # v1 (MOSS-Audio-Tokenizer) naming.
             (".self_attn.in_projs.0.", ".attn.in_proj."),
             (".self_attn.out_projs.0.", ".attn.out_proj."),
             (".linear1.", ".ff1."),
             (".linear2.", ".ff2."),
+            # v2 (MOSS-Audio-Tokenizer-v2) uses different submodule names for
+            # the same attention/FFN sublayers — no trailing "s"/index on
+            # in_proj/out_proj, and an `ffn.{0,2}` Sequential instead of
+            # separate linear1/linear2 attributes.
+            (".self_attn.in_proj.", ".attn.in_proj."),
+            (".self_attn.out_proj.", ".attn.out_proj."),
+            (".ffn.0.", ".ff1."),
+            (".ffn.2.", ".ff2."),
             (".layer_scale_1.", ".ls1."),
             (".layer_scale_2.", ".ls2."),
             (".input_proj.", ".in_proj."),
@@ -281,21 +316,78 @@ class MossTTSCodecDecoder(nn.Module):
         codec.to(device=device, dtype=torch.float32)
         codec.eval()
         self._codec = codec
+        self._n_channels = int(getattr(codec_cfg, "number_channels", 1) or 1)
+        self._sr_tensor = torch.tensor(int(codec_cfg.sampling_rate), dtype=torch.int32)
 
         logger.info(
-            "MOSS Audio Tokenizer loaded: sampling_rate=%d, n_vq=%d",
+            "MOSS Audio Tokenizer loaded: sampling_rate=%d, n_vq=%d, n_channels=%d",
             codec_cfg.sampling_rate,
             codec_cfg.num_quantizers,
+            self._n_channels,
         )
 
-        # Move sr_tensor to the same device
-        self._sr_tensor = self._sr_tensor.to(device=device)
+        self._maybe_enable_decoder_cudagraph(device)
 
         # vLLM's track_weights_loading() compares the returned set against
         # ``self.named_parameters()``. After ``self._codec = codec`` above,
         # those parameters are registered with the ``_codec.`` prefix, so
         # mirror that here.
         return {f"_codec.{name}" for name, _ in codec.named_parameters()}
+
+    def _build_codec(self, codec_path: str) -> tuple[Any, nn.Module]:
+        try:
+            from transformers import AutoConfig, AutoModel
+
+            codec_cfg = AutoConfig.from_pretrained(codec_path, trust_remote_code=True)
+            codec = AutoModel.from_config(codec_cfg, trust_remote_code=True)
+            logger.info("Using MOSS Audio Tokenizer remote-code classes from %s", codec_path)
+            return codec_cfg, codec
+        except Exception:
+            logger.exception(
+                "Failed to instantiate official MOSS Audio Tokenizer via HF remote code; "
+                "falling back to vendored codec."
+            )
+
+        codec_cfg = MossAudioTokenizerConfig.from_pretrained(codec_path)
+        codec = MossAudioTokenizerModel(codec_cfg)
+        return codec_cfg, codec
+
+    def _maybe_enable_decoder_cudagraph(self, device: torch.device) -> None:
+        """Capture CUDA Graphs for the codec decoder if enforce_eager is False."""
+        if getattr(self.vllm_config.model_config, "enforce_eager", True):
+            return
+        if self._codec is None:
+            return
+
+        # Read capture sizes from the connector's extra config (same convention
+        # as Qwen3-TTS), falling back to a sensible default covering common
+        # codec_chunk_frames values used in moss_tts.yaml.
+        capture_sizes: list[int] = [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        if isinstance(extra_cfg, dict):
+            raw = extra_cfg.get("decode_cudagraph_capture_sizes")
+            if raw is not None:
+                if isinstance(raw, (list, tuple)):
+                    parsed = sorted({int(v) for v in raw if int(v) > 0})
+                elif isinstance(raw, str):
+                    parsed = sorted({int(v.strip()) for v in raw.split(",") if v.strip()})
+                else:
+                    parsed = [int(raw)]
+                if parsed:
+                    capture_sizes = parsed
+
+        self._cuda_graph_wrapper = MossTTSCUDAGraphCodecWrapper(
+            model=self._codec,
+            capture_sizes=capture_sizes,
+            num_quantizers=self._n_vq,
+            enabled=True,
+        )
+        self._cuda_graph_wrapper.warmup(device)
 
 
 __all__ = ["MossTTSCodecDecoder"]
