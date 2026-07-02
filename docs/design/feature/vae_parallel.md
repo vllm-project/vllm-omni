@@ -446,6 +446,7 @@ Complete examples in the codebase:
 | **Wan2.2** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py` | ✅ | ✅ |
 | **Qwen-Image** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py` | ✅ | ❌ |
 | **FLUX.2-dev** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_flux2.py` | ✅ | ✅ |
+| **LTX-2 / LTX-2.3** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_ltx2.py` | ✅ | ✅ |
 
 ---
 
