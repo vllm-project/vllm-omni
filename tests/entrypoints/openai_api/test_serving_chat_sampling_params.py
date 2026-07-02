@@ -102,6 +102,7 @@ def mock_request(mocker: MockerFixture):
     request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
+    request.n = None
     # Must be real Python objects (not MagicMock) so the code's explicit-field
     # and extra_body checks work correctly.
     request.model_fields_set = set()
@@ -130,6 +131,7 @@ def test_openai_sampling_fields_contains_expected_fields():
         "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
+        "n",
     }
     assert OmniOpenAIServingChat._OPENAI_SAMPLING_FIELDS == expected_fields
 
@@ -225,6 +227,16 @@ def test_request_presence_penalty_overrides(serving_chat, mock_request):
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     assert result[0].presence_penalty == 0.3
+
+
+def test_request_n_overrides(serving_chat, mock_request):
+    """Test that request n is forwarded to SamplingParams for parallel completions."""
+    mock_request.n = 3
+    mock_request.model_fields_set = {"n"}
+
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
+
+    assert result[0].n == 3
 
 
 def test_non_comprehension_stages_use_cloned_defaults(serving_chat, mock_request):
