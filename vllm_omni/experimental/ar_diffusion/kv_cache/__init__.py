@@ -20,26 +20,32 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
     ChunkWindowSpec,
-    allocate_kv_pool,
+    allocate_kv_pool_with_views,
     chunk_slot_mapping,
     compute_slot_mapping,
-    pool_gather_window,
     pool_write_chunk,
     resident_block_ids,
+)
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionPagedForwardContext,
+    ARDiffusionPagedLayerContext,
+    ar_diffusion_paged_attention,
 )
 
 __all__ = [
     "ARDiffusionKVCache",
     "ARDiffusionKVConfig",
+    "ARDiffusionPagedForwardContext",
+    "ARDiffusionPagedLayerContext",
     "ARDiffusionRequestAdapter",
     "ChunkWindowManager",
     "ChunkWindowSpec",
-    "allocate_kv_pool",
+    "allocate_kv_pool_with_views",
+    "ar_diffusion_paged_attention",
     "build_kv_manager",
     "chunk_slot_mapping",
     "compute_num_blocks",
     "compute_slot_mapping",
-    "pool_gather_window",
     "pool_write_chunk",
     "resident_block_ids",
 ]

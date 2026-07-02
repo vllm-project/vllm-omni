@@ -102,20 +102,21 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     _ar_diffusion_kv_state = None  # set by the runner before each forward
 
-    def _kv_get(self, state, is_negative):
-        return self._ar_diffusion_kv_state.get_kv_caches(is_negative)
+    def _kv_get(self, state, is_negative, seq_len=None, update_kv_cache=False):
+        return self._ar_diffusion_kv_state.get_kv_caches(
+            is_negative,
+            seq_len=seq_len,
+            commit_current=update_kv_cache,
+        )
 
     def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
-        # The engine owns all KV allocation: self-attn is allocated per chunk in
-        # _kv_update and read via _kv_get (empty window at prefill start); cross-attn
-        # is populated eagerly in _kv_populate_cross. Nothing to create model-side.
+        # The engine owns all KV allocation: self-attn is allocated lazily from
+        # paged contexts, and cross-attn is populated eagerly in _kv_populate_cross.
+        # Nothing is created model-side.
         return
 
-    def _kv_update(self, state, layer_idx, updated_kv, is_negative, seq_len=None):
-        self._ar_diffusion_kv_state.update_kv_cache(layer_idx, updated_kv, is_negative, seq_len)
-
-    def _kv_commit(self):
-        self._ar_diffusion_kv_state.commit_chunk()
+    def _kv_commit(self, is_negative: bool):
+        self._ar_diffusion_kv_state.commit_paged_context(is_negative)
 
     def _kv_get_cross(self, state, is_negative):
         """Cross-attn cache from the engine pool (text k/v + I2V image k_img/v_img)."""
@@ -432,20 +433,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state=kwargs.get("state_features"),
             embodiment_id=kwargs.get("embodiment_id"),
         )
-        if kwargs.get("update_kv_cache", False) and updated_kv_caches:
-            state = kwargs.get("dreamzero_state", self.state)
+        if kwargs.get("update_kv_cache", False):
             is_neg = kwargs.get("is_negative", False)
-            if self._ar_diffusion_kv_state is not None:
-                logger.info(
-                    "AR-Diffusion pipeline predict_noise -> write-back: is_neg=%s seq_len=%s current_start_frame=%s layers=%d",
-                    is_neg,
-                    kwargs.get("seq_len"),
-                    kwargs.get("current_start_frame"),
-                    len(updated_kv_caches),
-                )
-            for i, kv in enumerate(updated_kv_caches):
-                self._kv_update(state, i, kv, is_neg, kwargs.get("seq_len"))
-            self._kv_commit()
+            logger.info(
+                "AR-Diffusion pipeline predict_noise -> commit paged context: "
+                "is_neg=%s seq_len=%s current_start_frame=%s layers=%d",
+                is_neg,
+                kwargs.get("seq_len"),
+                kwargs.get("current_start_frame"),
+                len(updated_kv_caches),
+            )
+            self._kv_commit(is_neg)
 
         return video_pred, action_pred
 
@@ -921,7 +919,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=self._kv_get(state, False),
+                kv_cache=self._kv_get(state, False, seq_len=frame_seqlen, update_kv_cache=True),
                 crossattn_cache=self._kv_get_cross(state, False),
                 is_negative=False,
                 **common,
@@ -929,7 +927,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             negative_kwargs = (
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=self._kv_get(state, True),
+                    kv_cache=self._kv_get(state, True, seq_len=frame_seqlen, update_kv_cache=True),
                     crossattn_cache=self._kv_get_cross(state, True),
                     is_negative=True,
                     **common,
@@ -971,7 +969,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=self._kv_get(state, False),
+                kv_cache=self._kv_get(state, False, seq_len=seq_len, update_kv_cache=True),
                 crossattn_cache=self._kv_get_cross(state, False),
                 is_negative=False,
                 **common,
@@ -979,7 +977,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             negative_kwargs = (
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=self._kv_get(state, True),
+                    kv_cache=self._kv_get(state, True, seq_len=seq_len, update_kv_cache=True),
                     crossattn_cache=self._kv_get_cross(state, True),
                     is_negative=True,
                     **common,
@@ -1073,7 +1071,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     hidden_states=noisy_input.transpose(1, 2),
                     timestep_video=timestep,
                     encoder_hidden_states=prompt_embeds,
-                    kv_cache=self._kv_get(state, False),
+                    kv_cache=self._kv_get(state, False, seq_len=seq_len, update_kv_cache=False),
                     crossattn_cache=self._kv_get_cross(state, False),
                     y=y,
                     clip_feature=state.clip_feas,
@@ -1088,7 +1086,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                         hidden_states=noisy_input.transpose(1, 2),
                         timestep_video=timestep,
                         encoder_hidden_states=negative_prompt_embeds,
-                        kv_cache=self._kv_get(state, True),
+                        kv_cache=self._kv_get(state, True, seq_len=seq_len, update_kv_cache=False),
                         crossattn_cache=self._kv_get_cross(state, True),
                         y=y,
                         clip_feature=state.clip_feas,

@@ -9,8 +9,13 @@ KV stack on CPU (block bookkeeping only, no GPU tensors).
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import KVCacheSpecKind, get_kv_cache_spec_kind
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import RequestStatus
+
+try:
+    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+except ModuleNotFoundError:
+    KVCacheSpecRegistry = None
+    from vllm.v1.core.single_type_kv_cache_manager import spec_manager_map
 
 from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ARDiffusionKVCache,
@@ -18,6 +23,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ARDiffusionRequestAdapter,
     ChunkWindowManager,
     ChunkWindowSpec,
+    allocate_kv_pool_with_views,
     build_kv_manager,
     compute_num_blocks,
 )
@@ -46,7 +52,11 @@ def make_spec(*, chunk_size=BLOCK, window_chunks=2, sink_chunks=0, reset_at_boun
 def test_spec_registration_resolves_to_chunk_window_manager():
     # Without explicit registration the MRO walk would fall back to the parent
     # SlidingWindowManager; assert the subclass manager wins.
-    assert KVCacheSpecRegistry.get_manager_class(make_spec()) is ChunkWindowManager
+    spec = make_spec()
+    if KVCacheSpecRegistry is not None:
+        assert KVCacheSpecRegistry.get_manager_class(spec) is ChunkWindowManager
+    else:
+        assert spec_manager_map[type(spec)] is ChunkWindowManager
 
 
 def test_spec_kind_is_sliding_window():
@@ -136,6 +146,26 @@ def test_adapter_status_is_vllm_enum():
 def test_compute_num_blocks():
     # 1 MiB budget at fraction 0.5 with 16 KiB pages -> 32 blocks.
     assert compute_num_blocks(1 << 20, 0.5, 16 << 10) == 32
+
+
+def test_paged_pool_layout_exposes_flat_slot_views():
+    kv_pools, k_pools, v_pools = allocate_kv_pool_with_views(
+        num_blocks=4,
+        block_size=BLOCK,
+        num_layers=1,
+        num_kv_heads=4,
+        head_dim=64,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    assert kv_pools[0].shape == (2, 4, BLOCK, 4, 64)
+    assert k_pools[0].shape == (4 * BLOCK, 4, 64)
+    assert v_pools[0].shape == (4 * BLOCK, 4, 64)
+
+    k_pools[0][BLOCK + 3].fill_(7)
+    v_pools[0][2 * BLOCK + 5].fill_(11)
+    assert torch.equal(kv_pools[0][0, 1, 3], k_pools[0][BLOCK + 3])
+    assert torch.equal(kv_pools[0][1, 2, 5], v_pools[0][2 * BLOCK + 5])
 
 
 def test_build_manager_allocate_free_roundtrip():

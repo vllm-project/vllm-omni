@@ -1,25 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ARDiffusionKVState — per-request bridge between a model rollout and the AR-Diffusion KV pool.
-
-This is the one model-facing piece of the KV stack (everything in ``paged.py`` /
-``manager.py`` is engine-generic). A second model (e.g. the Cosmos port) adds a
-sibling here that reuses the same pool primitives.
-
-Phase 1 keeps the existing attention kernel unchanged — it only changes *where*
-the past-window KV comes from (the pool) and *where* the committed chunk's KV is
-stored (the pool). The model's ``self_attn`` still receives a contiguous
-``(batch, window, n_heads, head_dim)`` K/V pair; the gather materializes that
-tensor from the resident pool blocks.
-"""
+"""DreamZero-facing AR-Diffusion KV bridge backed by paged self-attention."""
 
 from __future__ import annotations
 
-import os
-
-import torch
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged import _drop_batch, pool_write_chunk
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionPagedForwardContext,
+    ARDiffusionPagedLayerContext,
+)
 
 _log = init_logger(__name__)
 
@@ -27,18 +16,10 @@ _log = init_logger(__name__)
 class ARDiffusionKVState:
     """Per-request bridge between a DreamZero rollout and the AR-Diffusion KV pool.
 
-    Replaces the model-local ``DreamZeroState`` KV methods::
-      state.get_kv_caches(neg)    →  bde_state.get_kv_caches(neg)
-      state.update_kv_cache(i,kv) →  bde_state.update_kv_cache(i,kv,neg)
-      state.create_kv_caches(...) →  no-op (pool is pre-allocated)
-
-    One ``ARDiffusionKVState`` per request holds the ``ARDiffusionKVCache`` and both CFG adapters
-    (positive / negative). The runner sets ``pipeline._ar_diffusion_kv_state`` before
-    ``pipeline.forward(req)``; the pipeline delegates every KV call to it when
-    the attribute is present and not None.
-
-    Call ``commit_chunk()`` after all layers have been written for a chunk
-    (once per chunk, not per denoise step).
+    The self-attention path is paged-only: ``get_kv_caches`` returns lightweight
+    per-layer contexts, and each attention layer writes current K/V into the
+    pool before calling the FlashAttention block-table kernel.  No resident
+    window is gathered into a contiguous tensor.
     """
 
     def __init__(self, kv_cache, pos_adapter, neg_adapter, num_layers: int) -> None:
@@ -46,23 +27,8 @@ class ARDiffusionKVState:
         self.pos = pos_adapter
         self.neg = neg_adapter
         self.num_layers = num_layers
-        # --- Approach 2: true chunk-paged write / gather -----------------------
-        # Each get gathers the resident window from the paged pool blocks; each
-        # update writes only the genuinely-new tokens (seq_len growth) into newly
-        # allocated frame-blocks, evicting out-of-window blocks via the
-        # ChunkWindowManager. ``_committed`` is the absolute token count written to
-        # the pool per branch; ``_pending`` holds this forward's new-chunk slot maps.
         self._committed: dict[bool, int] = {False: 0, True: 0}
-        self._pending: dict[bool, list] = {False: [], True: []}
-        # The resident window is frozen across a forward's denoise steps (KV is
-        # only written back after the last step), so the per-step gather is
-        # re-materializing the same tensors ~16x. Memoize the gathered window per
-        # branch; invalidate on write-back (window grows) and on reset.
-        self._gather_cache: dict[bool, list | None] = {False: None, True: None}
-        # Profiling escape hatch: AR_DIFFUSION_KV_NO_MEMO=1 disables the per-forward gather
-        # memoization so every denoise step re-gathers the window (the pre-memo
-        # behavior), for A/B measurement of the memoization win. Default: enabled.
-        self._memo_enabled = os.environ.get("AR_DIFFUSION_KV_NO_MEMO") != "1"
+        self._paged_pending: dict[bool, ARDiffusionPagedForwardContext | None] = {False: None, True: None}
         # Cross-attn KV is populated once after text encoding (eager), then
         # read every denoising step. Tracked per half: the text K/V depend only
         # on the session prompt (survive window-boundary resets), while the I2V
@@ -74,27 +40,82 @@ class ARDiffusionKVState:
     def _adapter(self, is_negative: bool):
         return self.neg if is_negative else self.pos
 
-    def get_kv_caches(self, is_negative: bool) -> list:
-        # Engine owns the read end-to-end: at prefill start the adapter has no
-        # resident blocks, so gather returns zero-length windows (the empty seed
-        # the model concatenates against) — no model-local fallback needed.
-        branch = "neg" if is_negative else "pos"
-        cached = self._gather_cache[is_negative] if self._memo_enabled else None
-        if cached is not None:  # window unchanged this forward -> reuse (no re-gather)
-            return cached
+    def get_kv_caches(
+        self,
+        is_negative: bool,
+        seq_len: int | None = None,
+        commit_current: bool = False,
+    ) -> list[ARDiffusionPagedLayerContext]:
+        if seq_len is None:
+            raise ValueError("AR-Diffusion paged self-attention requires seq_len in get_kv_caches()")
+        return self.prepare_paged_context(is_negative, seq_len, commit_current)
+
+    def prepare_paged_context(
+        self,
+        is_negative: bool,
+        seq_len: int,
+        commit_current: bool,
+    ) -> list[ARDiffusionPagedLayerContext]:
+        """Return per-layer paged attention contexts for one branch forward.
+
+        Allocation is lazy: constructing both CFG branches' kwargs must not
+        allocate manager blocks for a branch that a CFG-parallel rank will not run.
+        The first self-attn layer that consumes the context allocates the current
+        video slots, then all layers share that branch-level state.
+        """
+        cs = self.kv_cache.spec.chunk_size
+        if int(seq_len) % cs != 0:
+            raise AssertionError(
+                f"AR-Diffusion expects frame-aligned seq_len (multiple of chunk_size={cs}), got {seq_len}"
+            )
+
+        pending = self._paged_pending.get(is_negative)
+        if pending is not None and pending.commit_current and pending._allocated_video and not pending._committed:
+            raise RuntimeError("AR-Diffusion paged context replaced before its managed current chunk was committed")
+
         adapter = self._adapter(is_negative)
-        windows = self.kv_cache.gather_window_all_layers(adapter)
-        if self._memo_enabled:
-            self._gather_cache[is_negative] = windows
+        branch = "neg" if is_negative else "pos"
+        forward_ctx = ARDiffusionPagedForwardContext(
+            kv_cache=self.kv_cache,
+            adapter=adapter,
+            is_negative=is_negative,
+            history_block_ids=self.kv_cache.window_block_ids(adapter),
+            seq_len=int(seq_len),
+            commit_current=bool(commit_current),
+            max_video_tokens=int(self.kv_cache.spec.sliding_window),
+        )
+        self._paged_pending[is_negative] = forward_ctx
         _log.info(
-            "AR-Diffusion GET   [%s] source=paged-gather layers=%d window0=%s resident_blocks=%d/%d",
+            "AR-Diffusion GET   [%s] source=paged-attn layers=%d history_blocks=%d seq_len=%d commit_current=%s",
             branch,
             self.num_layers,
-            tuple(windows[0].shape),
-            len(self.kv_cache.window_block_ids(adapter)),
-            self.kv_cache.spec.window_chunks,
+            len(forward_ctx.history_block_ids),
+            int(seq_len),
+            bool(commit_current),
         )
-        return windows
+        return [ARDiffusionPagedLayerContext(layer_idx=i, forward_ctx=forward_ctx) for i in range(self.num_layers)]
+
+    def commit_paged_context(self, is_negative: bool) -> None:
+        """Commit the managed current video blocks after a successful forward."""
+        ctx = self._paged_pending.get(is_negative)
+        if ctx is None:
+            return
+        branch = "neg" if is_negative else "pos"
+        if ctx.commit_current and ctx._allocated_video:
+            n_chunks = ctx.seq_len // self.kv_cache.spec.chunk_size
+            for _ in range(n_chunks):
+                ctx.adapter.on_chunk_committed()
+            self._committed[is_negative] += ctx.seq_len
+            _log.info(
+                "AR-Diffusion COMMIT [%s] paged-attn new_tokens=%d chunks=%d resident=%d/%d",
+                branch,
+                ctx.seq_len,
+                n_chunks,
+                len(self.kv_cache.window_block_ids(ctx.adapter)),
+                self.kv_cache.spec.window_chunks,
+            )
+        ctx.mark_committed()
+        self._paged_pending[is_negative] = None
 
     def get_cross_kv_caches(self, is_negative: bool) -> list[dict]:
         """Return pool-backed cross-attn cache dicts.
@@ -118,76 +139,11 @@ class ARDiffusionKVState:
             )
         return [self.kv_cache.read_cross_kv(i, is_negative) for i in range(self.num_layers)]
 
-    def update_kv_cache(self, layer_idx: int, updated_kv: torch.Tensor, is_negative: bool, seq_len) -> None:
-        branch = "neg" if is_negative else "pos"
-        adapter = self._adapter(is_negative)
-        cs = self.kv_cache.spec.chunk_size
-        if layer_idx == 0:
-            # The K appended this forward is the current observation's length
-            # (seq_len), not the cumulative-minus-committed delta. Allocate those
-            # frame-blocks once per forward (shared across layers).
-            new_count = int(seq_len)
-            # DreamZero appends whole frames each forward and chunk_size ==
-            # frame_seqlen, so seq_len is always a multiple of cs. Guard the
-            # invariant: a non-frame-aligned model would otherwise silently drop
-            # the leading new_count % cs tokens and desync num_computed.
-            assert new_count % cs == 0, (
-                f"AR-Diffusion expects frame-aligned seq_len (multiple of chunk_size={cs}), got {new_count}"
-            )
-            n_chunks = new_count // cs
-            slots = []
-            for _ in range(n_chunks):
-                self.kv_cache.allocate_chunk(adapter)  # allocate + evict old
-                slots.append(self.kv_cache.chunk_write_slots(adapter))
-                adapter.on_chunk_committed()
-            self._pending[is_negative] = slots
-            self._committed[is_negative] += new_count
-            # The window just grew; the memoized gather is stale -> force re-gather
-            # on the next forward's first read of this branch.
-            self._gather_cache[is_negative] = None
-            _log.info(
-                "AR-Diffusion WRITE [%s] new_tokens=%d -> %d frame-chunks  resident=%d/%d  storing %d layers",
-                branch,
-                new_count,
-                n_chunks,
-                len(self.kv_cache.window_block_ids(adapter)),
-                self.kv_cache.spec.window_chunks,
-                self.num_layers,
-            )
-        slots = self._pending[is_negative]
-        if not slots:
-            return
-        n = len(slots) * cs
-        k_all = _drop_batch(updated_kv[0])[-n:]  # (n, n_heads, head_dim) — the new tokens
-        v_all = _drop_batch(updated_kv[1])[-n:]
-        kpool = self.kv_cache._k_pools[layer_idx]
-        vpool = self.kv_cache._v_pools[layer_idx]
-        for c, sm in enumerate(slots):
-            k = k_all[c * cs : (c + 1) * cs].unsqueeze(0).to(kpool.dtype)
-            v = v_all[c * cs : (c + 1) * cs].unsqueeze(0).to(vpool.dtype)
-            pool_write_chunk(kpool, vpool, k, v, sm)
-
-    def commit_chunk(self) -> None:
-        """No-op for DreamZero (logs only).
-
-        The per-chunk advance already happened in :meth:`update_kv_cache`, which
-        calls ``adapter.on_chunk_committed()`` at layer 0 while allocating each
-        frame-chunk. This method exists so the pipeline's ``_kv_commit`` bridge has
-        a symmetric call; the resident window is retained across forwards.
-        """
-        _log.info("AR-Diffusion COMMIT (paged; resident window retained across forwards)")
-
     def close(self) -> None:
-        """Final teardown — free both branches' resident pool blocks.
-
-        Unlike :meth:`reset`, this does **not** restart the adapters: the caller is
-        dropping this ``ARDiffusionKVState`` for good (session eviction / shutdown), so the
-        blocks return to the ``BlockPool`` and the dead adapters are discarded with
-        the state. Frees pool ownership that would otherwise leak when a session is
-        evicted from the runner's session map.
-        """
+        """Final teardown: free both branches' resident pool blocks."""
         self.kv_cache.end_request(self.pos)
         self.kv_cache.end_request(self.neg)
+        self._paged_pending = {False: None, True: None}
 
     def reset(self, *, keep_cross_text: bool = False) -> None:
         """Drop this session's KV — mirrors the model-local ``state.reset()``.
@@ -206,12 +162,11 @@ class ARDiffusionKVState:
                 Session resets (prompt change / explicit reset) pass ``False``.
         """
         pos_id, neg_id = self.pos.request_id, self.neg.request_id
-        self.close()  # free resident blocks for both branches
-        self.pos = self.kv_cache.begin_request(pos_id)  # fresh, empty window
+        self.close()
+        self.pos = self.kv_cache.begin_request(pos_id)
         self.neg = self.kv_cache.begin_request(neg_id)
         self._committed = {False: 0, True: 0}
-        self._pending = {False: [], True: []}
-        self._gather_cache = {False: None, True: None}
+        self._paged_pending = {False: None, True: None}
         if not keep_cross_text:
             self._cross_text_populated = {False: False, True: False}
         self._cross_img_populated = {False: False, True: False}

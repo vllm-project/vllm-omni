@@ -6,13 +6,9 @@ Cosmos port) reuses unchanged. Three concerns live here:
 
 * **Slot mapping** — absolute token positions → physical KV-cache slots, the
   standard PagedAttention layout ``slot(pos) = block_id(pos) * block_size +
-  (pos % block_size)``. Phase 1 is single-request and gathers the resident
-  window into the model's existing attention rather than calling vLLM's paged
-  kernel, so a thin slot-mapping helper is used instead of vLLM's ``BlockTables``.
-* **Pool I/O** — allocate per-layer flat K/V pools, write a committed chunk into
-  slots, and gather the resident window back as a contiguous tensor. The
-  per-forward gather copy is the deliberate Phase-1 simplification the fused
-  paged backend retires in Phase 2.
+  (pos % block_size)``.
+* **Pool I/O** — allocate per-layer FlashAttention-compatible paged K/V pools
+  plus flat compatibility views for direct slot writes.
 * **Chunk-window eviction** — a ``SlidingWindowSpec`` subclass whose unit is a
   *chunk* (``sliding_window = window_chunks * chunk_size``) plus a manager that
   evicts at chunk boundaries. Memory policy / refcounting / ``null_block``
@@ -27,7 +23,21 @@ from dataclasses import dataclass
 import torch
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
-from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
+
+try:
+    from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
+except ModuleNotFoundError:
+
+    def register_kv_cache_spec(*, manager_class, uniform_type_base_spec=None):
+        """Compatibility shim for vLLM versions without kv_cache_spec_registry."""
+
+        def decorator(spec_class):
+            from vllm.v1.core.single_type_kv_cache_manager import spec_manager_map
+
+            spec_manager_map[spec_class] = manager_class
+            return spec_class
+
+        return decorator
 
 
 # ── Slot mapping ────────────────────────────────────────────────────────────
@@ -85,10 +95,10 @@ def resident_block_ids(block_ids: Sequence[int], null_block_id: int) -> list[int
     return [int(b) for b in block_ids if int(b) != null_block_id]
 
 
-# ── Pool I/O (allocate / write / gather) ────────────────────────────────────
+# ── Pool I/O (allocate / write) ─────────────────────────────────────────────
 
 
-def allocate_kv_pool(
+def allocate_kv_pool_with_views(
     num_blocks: int,
     block_size: int,
     num_layers: int,
@@ -96,19 +106,23 @@ def allocate_kv_pool(
     head_dim: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Allocate per-layer paged K and V pools on *device*.
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    """Allocate vLLM-style paged KV pools plus flat slot-write views.
 
-    Each pool is a contiguous ``(num_blocks * block_size, num_kv_heads, head_dim)``
-    tensor — a flat address space indexed by ``slot = block_id * block_size + offset``.
-    The slot mapping (above) tells writes and gathers where each token lives.
+    The owning tensor follows FlashAttention's block-table cache layout:
+    ``(2, num_blocks, block_size, num_kv_heads, head_dim)``, where dim-0 is
+    ``[K, V]``.  The flat K/V views keep ``slot = block_id * block_size +
+    offset`` writes simple without changing the kernel-facing cache layout.
     """
+    kv_pools: list[torch.Tensor] = []
     k_pools: list[torch.Tensor] = []
     v_pools: list[torch.Tensor] = []
     for _ in range(num_layers):
-        k_pools.append(torch.empty(num_blocks * block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
-        v_pools.append(torch.empty(num_blocks * block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
-    return k_pools, v_pools
+        kv = torch.empty(2, num_blocks, block_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+        kv_pools.append(kv)
+        k_pools.append(kv[0].reshape(num_blocks * block_size, num_kv_heads, head_dim))
+        v_pools.append(kv[1].reshape(num_blocks * block_size, num_kv_heads, head_dim))
+    return kv_pools, k_pools, v_pools
 
 
 def pool_write_chunk(
@@ -129,54 +143,6 @@ def pool_write_chunk(
     """
     k_pool[slot_mapping] = new_k[0]  # batch index 0
     v_pool[slot_mapping] = new_v[0]
-
-
-def build_window_slots(window_block_ids: list[int], block_size: int, device: torch.device) -> torch.Tensor:
-    """Flat slot index covering all resident blocks, in table order.
-
-    Vectorized (no Python loop): ``slot = block_id * block_size + offset`` for every
-    ``offset in [0, block_size)``. The window's blocks are identical across all layers
-    within a forward, so this is built once per forward and shared.
-    """
-    if not window_block_ids:
-        # No resident blocks (e.g. prefill start, before the first chunk is
-        # committed): an empty slot index gathers a zero-length window, which is
-        # the concat-identity the model's attention expects as its initial KV.
-        return torch.empty(0, dtype=torch.long, device=device)
-    starts = torch.tensor(window_block_ids, dtype=torch.long, device=device) * block_size
-    offsets = torch.arange(block_size, device=device)
-    return (starts[:, None] + offsets[None, :]).reshape(-1)
-
-
-def pool_gather_window(
-    k_pool: torch.Tensor,
-    v_pool: torch.Tensor,
-    window_block_ids: list[int],
-    block_size: int,
-    max_attention_size: int,
-    *,
-    slots: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Materialize the resident window K/V as a contiguous tensor.
-
-    Gathers all slots belonging to ``window_block_ids`` (in table order), trims to
-    the last ``max_attention_size`` tokens (matching the existing ``cat`` + slice),
-    and returns a ``(2, batch, window_tokens, n_heads, head_dim)`` tensor — exactly
-    the format DreamZero's attention expects as ``kv_cache``. Pass a precomputed
-    ``slots`` (from :func:`build_window_slots`) to share the index across layers.
-    """
-    if slots is None:
-        slots = build_window_slots(window_block_ids, block_size, k_pool.device)
-    # Gather then trim to the attention window.
-    wk = k_pool[slots]  # (window_slots, n_heads, head_dim)
-    wv = v_pool[slots]
-    wk = wk[-max_attention_size:]  # (window, n_heads, head_dim)
-    wv = wv[-max_attention_size:]
-    # Add the batch dim then stack as (2, batch, window, n_heads, head_dim).
-    wk = wk.unsqueeze(0)  # (1, window, n_heads, head_dim)
-    wv = wv.unsqueeze(0)
-    window = torch.stack([wk, wv], dim=0)  # (2, 1, window, n_heads, head_dim)
-    return window
 
 
 def _drop_batch(t: torch.Tensor) -> torch.Tensor:

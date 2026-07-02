@@ -510,7 +510,7 @@ class CausalWanSelfAttention(nn.Module):
         freqs_action: torch.Tensor,
         freqs_state: torch.Tensor,
         action_register_length: int | None,
-        kv_cache: torch.Tensor | None = None,
+        kv_cache: torch.Tensor | Any | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -567,28 +567,107 @@ class CausalWanSelfAttention(nn.Module):
             action_v = v[:, -action_register_length:]
             v = v[:, :-action_register_length]
 
-        updated_k = kv_cache[0]
-        updated_v = kv_cache[1]
-        new_k = torch.cat([updated_k, roped_key], dim=1)
-        new_v = torch.cat([updated_v, v], dim=1)
-        new_k = new_k[:, -self.max_attention_size :]
-        new_v = new_v[:, -self.max_attention_size :]
-
-        if action_register_length is not None:
-            q_cat = torch.cat([roped_query, roped_action_query], dim=1)
-            k_cat = torch.cat([new_k, roped_action_key], dim=1)
-            v_cat = torch.cat([new_v, action_v], dim=1)
+        if getattr(kv_cache, "is_ar_diffusion_paged_context", False):
+            x = self._forward_ar_diffusion_paged(
+                roped_query=roped_query,
+                roped_key=roped_key,
+                value=v,
+                roped_action_query=roped_action_query,
+                roped_action_key=roped_action_key,
+                action_value=action_v,
+                action_register_length=action_register_length,
+                kv_cache=kv_cache,
+            )
         else:
-            q_cat = roped_query
-            k_cat = new_k
-            v_cat = new_v
+            updated_k = kv_cache[0]
+            updated_v = kv_cache[1]
+            new_k = torch.cat([updated_k, roped_key], dim=1)
+            new_v = torch.cat([updated_v, v], dim=1)
+            new_k = new_k[:, -self.max_attention_size :]
+            new_v = new_v[:, -self.max_attention_size :]
 
-        x = self.attn(q_cat, k_cat, v_cat)
-        updated_kv_cache = torch.stack([new_k, new_v], dim=0)
+            if action_register_length is not None:
+                q_cat = torch.cat([roped_query, roped_action_query], dim=1)
+                k_cat = torch.cat([new_k, roped_action_key], dim=1)
+                v_cat = torch.cat([new_v, action_v], dim=1)
+            else:
+                q_cat = roped_query
+                k_cat = new_k
+                v_cat = new_v
+
+            x = self.attn(q_cat, k_cat, v_cat)
+            updated_kv_cache = torch.stack([new_k, new_v], dim=0)
 
         x = x.flatten(2)
         x = self.o(x)
         return x, updated_kv_cache
+
+    def _forward_ar_diffusion_paged(
+        self,
+        *,
+        roped_query: torch.Tensor,
+        roped_key: torch.Tensor,
+        value: torch.Tensor,
+        roped_action_query: torch.Tensor | None,
+        roped_action_key: torch.Tensor | None,
+        action_value: torch.Tensor | None,
+        action_register_length: int | None,
+        kv_cache: Any,
+    ) -> torch.Tensor:
+        from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import ar_diffusion_paged_attention
+
+        if roped_key.shape[0] != 1:
+            raise RuntimeError("AR-Diffusion paged self-attention currently expects batch_size=1")
+        if roped_key.shape[1] != kv_cache.seq_len:
+            raise RuntimeError(
+                "AR-Diffusion paged context seq_len="
+                f"{kv_cache.seq_len} but current video KV has {roped_key.shape[1]} tokens"
+            )
+
+        ctx = kv_cache.forward_ctx
+        layer_idx = kv_cache.layer_idx
+        device = roped_key.device
+        ctx.ensure_video_slots(device)
+
+        k_pool = ctx.kv_cache._k_pools[layer_idx]
+        v_pool = ctx.kv_cache._v_pools[layer_idx]
+        video_slots = ctx.current_video_slot_mapping
+        if video_slots is None:
+            raise RuntimeError("AR-Diffusion paged context did not prepare current video slots")
+        k_pool[video_slots] = roped_key[0].to(k_pool.dtype)
+        v_pool[video_slots] = value[0].to(v_pool.dtype)
+
+        action_len = int(action_register_length or 0)
+        if action_len > 0:
+            if roped_action_key is None or action_value is None or roped_action_query is None:
+                raise RuntimeError("AR-Diffusion paged action path missing action query/key/value tensors")
+            ctx.ensure_action_slots(action_len, device)
+            action_slots = ctx.action_slot_mapping
+            if action_slots is None:
+                raise RuntimeError("AR-Diffusion paged context did not prepare action slots")
+            k_pool[action_slots] = roped_action_key[0].to(k_pool.dtype)
+            v_pool[action_slots] = action_value[0].to(v_pool.dtype)
+            q_cat = torch.cat([roped_query, roped_action_query], dim=1)
+        else:
+            q_cat = roped_query
+
+        block_table, query_start_loc, seq_lens, max_query_len, max_seq_len = ctx.build_block_table(
+            action_len=action_len,
+            query_len=q_cat.shape[1],
+            device=device,
+        )
+        return ar_diffusion_paged_attention(
+            q_cat,
+            ctx.kv_cache.key_cache(layer_idx),
+            ctx.kv_cache.value_cache(layer_idx),
+            block_table=block_table,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            max_query_len=max_query_len,
+            max_seq_len=max_seq_len,
+            softmax_scale=self.head_dim**-0.5,
+            causal=False,
+        )
 
 
 # ── Attention Block ─────────────────────────────────────────────────
@@ -646,7 +725,7 @@ class CausalWanAttentionBlock(nn.Module):
         freqs_state: torch.Tensor,
         context: torch.Tensor,
         action_register_length: int | None = None,
-        kv_cache: torch.Tensor | None = None,
+        kv_cache: torch.Tensor | Any | None = None,
         crossattn_cache: dict | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
@@ -925,10 +1004,10 @@ class CausalWanModel(nn.Module):
         action: torch.Tensor | None,
         timestep_action: torch.Tensor | None,
         state: torch.Tensor | None,
-        kv_cache: list[torch.Tensor],
+        kv_cache: list[Any],
         current_start_frame: int,
         crossattn_cache: list[dict] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor | None]]:
         x = x.flatten(start_dim=2).transpose(1, 2)
         B = x.shape[0]
         F_t = timestep.shape[1]
@@ -966,7 +1045,7 @@ class CausalWanModel(nn.Module):
             clip_embedding = self.img_emb(clip_feature)
             context = torch.cat([clip_embedding, context], dim=1)
 
-        updated_kv_caches: list[torch.Tensor] = []
+        updated_kv_caches: list[torch.Tensor | None] = []
         for block_index, block in enumerate(self.blocks):
             x, updated_kv_cache = block(
                 x=x,
@@ -1000,7 +1079,7 @@ class CausalWanModel(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         seq_len: int,
-        kv_cache: list[torch.Tensor],
+        kv_cache: list[Any],
         current_start_frame: int,
         crossattn_cache: list[dict] | None = None,
         y: torch.Tensor | None = None,

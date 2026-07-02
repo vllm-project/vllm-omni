@@ -12,6 +12,8 @@ thin.
 
 from __future__ import annotations
 
+import inspect
+import os
 from collections.abc import Sequence
 
 import torch
@@ -28,10 +30,8 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowSpec,
-    allocate_kv_pool,
-    build_window_slots,
+    allocate_kv_pool_with_views,
     chunk_slot_mapping,
-    pool_gather_window,
     pool_write_chunk,
     resident_block_ids,
 )
@@ -135,13 +135,13 @@ def build_kv_manager(
         kv_cache_tensors=tensors,
         kv_cache_groups=[group],
     )
-    return KVCacheManager(
-        config,
-        max_model_len=max_model_len,
-        scheduler_block_size=spec.block_size,
-        hash_block_size=spec.block_size,
-        enable_caching=enable_caching,
-    )
+    kwargs = dict(max_model_len=max_model_len, hash_block_size=spec.block_size, enable_caching=enable_caching)
+    params = inspect.signature(KVCacheManager).parameters
+    if "scheduler_block_size" in params:
+        kwargs["scheduler_block_size"] = spec.block_size
+    if "max_num_batched_tokens" in params:
+        kwargs["max_num_batched_tokens"] = max_model_len
+    return KVCacheManager(config, **kwargs)
 
 
 class ARDiffusionKVCache:
@@ -273,17 +273,34 @@ class ARDiffusionKVCache:
                 config.window_chunks,
             )
             num_blocks = min_blocks
-        layer_names = [f"bde.layer.{i}" for i in range(num_layers)]
+        layer_names = [f"ar_diffusion.layer.{i}" for i in range(num_layers)]
         self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
+        self.managed_num_blocks = num_blocks
         self.num_blocks = num_blocks
+        # Scratch blocks are outside KVCacheManager ownership. They hold current
+        # denoise-step video KV when update_kv_cache=False and action/state KV in
+        # both modes; they are reused every forward and never committed.
+        scratch_per_branch = int(os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "8"))
+        if scratch_per_branch <= 0:
+            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be positive")
+        self.scratch_blocks_per_branch = scratch_per_branch
+        self.scratch_num_blocks = 2 * scratch_per_branch
+        self.num_blocks_total = self.managed_num_blocks + self.scratch_num_blocks
         self.null_block_id = self.manager.block_pool.null_block.block_id
 
         # Allocate the per-layer paged K/V pools on the given device.
+        self._kv_pools: list[torch.Tensor] = []
         self._k_pools: list[torch.Tensor] = []
         self._v_pools: list[torch.Tensor] = []
         if device is not None:
-            self._k_pools, self._v_pools = allocate_kv_pool(
-                num_blocks, block_size, num_layers, num_kv_heads, head_size, dtype, device
+            self._kv_pools, self._k_pools, self._v_pools = allocate_kv_pool_with_views(
+                self.num_blocks_total,
+                block_size,
+                num_layers,
+                num_kv_heads,
+                head_size,
+                dtype,
+                device,
             )
 
     # -- cross-attention pool access -------------------------------------------
@@ -378,6 +395,15 @@ class ARDiffusionKVCache:
         )
         return table
 
+    def allocate_token_slots(self, adapter: ARDiffusionRequestAdapter, num_tokens: int) -> list[int]:
+        """Allocate managed blocks for an in-flight video span without committing it."""
+        if num_tokens <= 0:
+            raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+        blocks = self.manager.allocate_slots(adapter, num_new_tokens=num_tokens)
+        if blocks is None:
+            raise RuntimeError("AR-Diffusion KV pool exhausted while allocating paged attention slots")
+        return self.block_table(adapter)
+
     def block_table(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         return list(self.manager.get_block_ids(adapter.request_id)[0])
 
@@ -390,25 +416,43 @@ class ARDiffusionKVCache:
             self.block_size,
         )
 
+    def scratch_block_ids(self, is_negative: bool, start: int, count: int) -> list[int]:
+        """Return branch-local scratch block ids outside manager ownership."""
+        if count < 0 or start < 0:
+            raise ValueError(f"scratch start/count must be non-negative, got start={start}, count={count}")
+        if start + count > self.scratch_blocks_per_branch:
+            raise RuntimeError(
+                "AR-Diffusion paged attention scratch blocks exhausted: "
+                f"need [{start}, {start + count}) of {self.scratch_blocks_per_branch}. "
+                "Increase AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH."
+            )
+        branch_offset = self.scratch_blocks_per_branch if is_negative else 0
+        base = self.managed_num_blocks + branch_offset + start
+        return list(range(base, base + count))
+
+    def key_cache(self, layer_idx: int) -> torch.Tensor:
+        return self._kv_pools[layer_idx][0]
+
+    def value_cache(self, layer_idx: int) -> torch.Tensor:
+        return self._kv_pools[layer_idx][1]
+
     def window_block_ids(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
-        """Resident (non-null) blocks the read path gathers the window from."""
+        """Resident (non-null) managed blocks visible to paged attention."""
         return resident_block_ids(self.block_table(adapter), self.null_block_id)
 
     def commit_chunk(self, adapter: ARDiffusionRequestAdapter) -> None:
         """Advance the adapter by one chunk after its K/V is written.
 
-        This is the standalone per-chunk advance used by the unit lifecycle and the
-        ``tests/bde`` suite. In the DreamZero production path the advance happens
-        elsewhere: :meth:`ARDiffusionKVState.update_kv_cache` (gather.py) calls
-        ``adapter.on_chunk_committed()`` directly as it allocates each frame-chunk,
-        and the pipeline's ``_kv_commit`` -> :meth:`ARDiffusionKVState.commit_chunk` is only
-        a no-op log. Call once per chunk, not per denoise step.
+        This standalone primitive is used by low-level manager tests. In the
+        DreamZero paged-attention path, :meth:`ARDiffusionKVState.commit_paged_context`
+        advances the adapter only after the forward succeeds. Call once per
+        committed chunk, not per denoise step.
         """
         _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
         _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
-    # -- pool-backed K/V access (Step 4 — gather / write) --------------------
+    # -- pool-backed K/V access --------------------------------------------
 
     def write_chunk_kv(
         self,
@@ -434,58 +478,3 @@ class ARDiffusionKVCache:
             new_v,
             slots,
         )
-
-    def gather_window(self, layer_index: int, adapter: ARDiffusionRequestAdapter) -> torch.Tensor:
-        """Gather the resident-window K/V for one layer.
-
-        Returns a ``(2, 1, window, n_heads, head_dim)`` tensor — the format
-        DreamZero's existing attention expects as its ``kv_cache`` argument.
-        """
-        window_ids = self.window_block_ids(adapter)
-        window = pool_gather_window(
-            self._k_pools[layer_index],
-            self._v_pools[layer_index],
-            window_ids,
-            self.block_size,
-            self.spec.sliding_window,
-        )
-        _log.debug(
-            "AR-Diffusion gather: req=%s layer=%d blocks=%s window=%s dev=%s",
-            adapter.request_id,
-            layer_index,
-            window_ids,
-            tuple(window.shape),
-            window.device,
-        )
-        return window
-
-    def gather_window_all_layers(self, adapter: ARDiffusionRequestAdapter) -> list[torch.Tensor]:
-        """Gather the resident-window K/V for every layer in one shot.
-
-        The window's block table is identical across layers within a forward, so
-        the block-id lookup and the flat slot index are computed **once** and shared
-        across all per-layer gathers — removing the per-layer Python work that the
-        single-layer ``gather_window`` repeats. Returns one
-        ``(2, 1, window, n_heads, head_dim)`` tensor per layer.
-        """
-        window_ids = self.window_block_ids(adapter)
-        slots = build_window_slots(window_ids, self.block_size, self._k_pools[0].device)
-        windows = [
-            pool_gather_window(
-                self._k_pools[i],
-                self._v_pools[i],
-                window_ids,
-                self.block_size,
-                self.spec.sliding_window,
-                slots=slots,
-            )
-            for i in range(self.num_layers)
-        ]
-        _log.debug(
-            "AR-Diffusion gather-all: req=%s layers=%d blocks=%d window=%s",
-            adapter.request_id,
-            self.num_layers,
-            len(window_ids),
-            tuple(windows[0].shape),
-        )
-        return windows
