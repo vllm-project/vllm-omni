@@ -63,6 +63,10 @@ class StageConfigFactory:
         """
         if cli_overrides is None:
             cli_overrides = {}
+        # Preserve the explicit create_from_model() argument for structured
+        # diffusion stages. It intentionally overrides any stale
+        # cli_overrides["model"], since auto-detection above uses this model.
+        registry_cli_overrides = {**cli_overrides, "model": model}
 
         trust_remote_code = cli_overrides.get("trust_remote_code", True)
         if trust_remote_code is None:
@@ -90,11 +94,11 @@ class StageConfigFactory:
         if explicit_pipeline:
             pipeline_cfg = cls.resolve_pipeline_config(explicit_pipeline, hf_config)
             if pipeline_cfg is not None:
-                return cls._create_from_registry(
+                return VllmOmniConfig.from_registry(
                     explicit_pipeline,
-                    pipeline_cfg,
-                    cli_overrides,
-                    deploy_config_path,
+                    hf_config=hf_config,
+                    deploy_config_path=deploy_config_path,
+                    cli_overrides=registry_cli_overrides,
                 )
             logger.warning(
                 "Deploy config %s requested pipeline %r which is not in OMNI_PIPELINES; "
@@ -111,7 +115,7 @@ class StageConfigFactory:
                     model_type,
                     hf_config=hf_config,
                     deploy_config_path=deploy_config_path,
-                    cli_overrides=cli_overrides,
+                    cli_overrides=registry_cli_overrides,
                 )
 
         # --- HF architecture fallback: some models report a generic
@@ -152,7 +156,7 @@ class StageConfigFactory:
                             registered_key,
                             hf_config=hf_config,
                             deploy_config_path=deploy_config_path,
-                            cli_overrides=cli_overrides,
+                            cli_overrides=registry_cli_overrides,
                         )
 
         # --- Explicit deploy-config pipeline ---
@@ -165,11 +169,11 @@ class StageConfigFactory:
                 if deploy_cfg.pipeline:
                     pipeline_cfg = cls.resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
                     if pipeline_cfg is not None:
-                        return cls._create_from_registry(
+                        return VllmOmniConfig.from_registry(
                             pipeline_cfg.model_type,
-                            pipeline_cfg,
-                            cli_overrides,
-                            deploy_config_path,
+                            hf_config=hf_config,
+                            deploy_config_path=deploy_config_path,
+                            cli_overrides=registry_cli_overrides,
                         )
 
         # Not in the pipeline registry — let the caller fall back to the

@@ -616,6 +616,17 @@ class TestPipelineRegistration:
         assert omni_config.pipeline_config is OMNI_PIPELINES["qwen3_tts"]
         assert len(omni_config.stage_configs) == 2
 
+    def test_create_from_model_preserves_model_on_structured_diffusion_stage(self):
+        class FakeConfig(PretrainedConfig):
+            model_type = "dreamzero"
+
+        with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
+            omni_config = StageConfigFactory.create_from_model("fake/model")
+
+        assert isinstance(omni_config, VllmOmniConfig)
+        stage = omni_config.stage_by_id(0)
+        assert stage.diffusion_config.model == "fake/model"
+
     def test_pipeline_registration(self, clean_pipeline_registry):
         """Ensure that we can register and create a custom pipeline config."""
         new_model_type = "new_model_type"
@@ -639,6 +650,7 @@ class TestPipelineRegistration:
             mock_create.assert_called_once()
             assert mock_create.call_args.args == (new_model_type,)
             assert isinstance(mock_create.call_args.kwargs["hf_config"], FakeConfig)
+            assert mock_create.call_args.kwargs["cli_overrides"] == {"model": "fake/model"}
         assert pipe_cfg.model_type == new_model_type
 
     def test_resolver_registration(self, clean_pipeline_registry):
@@ -672,6 +684,7 @@ class TestPipelineRegistration:
             mock_create.assert_called_once()
             assert mock_create.call_args.args == (new_model_type,)
             assert mock_create.call_args.kwargs["hf_config"] is fake_config
+            assert mock_create.call_args.kwargs["cli_overrides"] == {"model": "fake/model"}
         assert custom_resolver(fake_config).model_type == resolved_type
 
     def test_resolve_when_autodetect_resolves_none(self):
@@ -682,7 +695,7 @@ class TestPipelineRegistration:
             deploy_config_path=deploy_path,
         )
         assert resolved_config is not None
-        assert len(resolved_config) > 0
+        assert len(resolved_config.stage_configs) > 0
 
 
 class TestResolveScheduler:
