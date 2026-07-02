@@ -69,7 +69,11 @@ class StageConfigFactory:
         back to using the Transformers config & finding pipelines that have overlapping
         supported architectures.
         """
-        resolution = cls.resolve_pipeline_from_model(model, cli_overrides, deploy_config_path)
+        resolution = cls.resolve_pipeline_from_model(
+            model=model,
+            trust_remote_code=cls._get_trust_remote_code(cli_overrides),
+            deploy_config_path=deploy_config_path,
+        )
         if resolution is None:
             return None
 
@@ -105,7 +109,11 @@ class StageConfigFactory:
         if cli_overrides is None:
             cli_overrides = {}
 
-        resolution = cls.resolve_pipeline_from_model(model, cli_overrides, deploy_config_path)
+        resolution = cls.resolve_pipeline_from_model(
+            model=model,
+            trust_remote_code=cls._get_trust_remote_code(cli_overrides),
+            deploy_config_path=deploy_config_path,
+        )
         if resolution is None:
             return None
 
@@ -120,14 +128,10 @@ class StageConfigFactory:
     def resolve_pipeline_from_model(
         cls,
         model: str,
-        cli_overrides: dict[str, Any],
+        trust_remote_code: bool,
         deploy_config_path: str | None,
     ) -> PipelineResolution | None:
         """Resolve a model/deploy pair once for structured and legacy consumers."""
-        trust_remote_code = cli_overrides.get("trust_remote_code", True)
-        if trust_remote_code is None:
-            trust_remote_code = False
-
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
         if model_type == "vla" and _looks_like_dreamzero(model):
             model_type = "dreamzero"
@@ -181,6 +185,11 @@ class StageConfigFactory:
                     ):
                         return PipelineResolution(registered_key, pipeline_cfg, hf_config)
         return None
+
+    @staticmethod
+    def _get_trust_remote_code(cli_overrides: dict[str, Any]) -> bool:
+        trust_remote_code = cli_overrides.get("trust_remote_code", True)
+        return False if trust_remote_code is None else bool(trust_remote_code)
 
     @classmethod
     def _get_deploy_pipeline(cls, deploy_config_path: str | None) -> str | None:
