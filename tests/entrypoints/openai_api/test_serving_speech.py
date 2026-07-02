@@ -3221,25 +3221,25 @@ class TestCosyVoice3Serving:
 
     def test_validate_cosyvoice3_empty_input(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="", ref_audio="data:audio/wav;base64,abc", ref_text="hello")
-        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        error = cosyvoice3_server._get_tts_adapter().validate(request)
         assert error is not None
         assert "empty" in error.lower()
 
     def test_validate_cosyvoice3_missing_ref_audio(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_text="hello")
-        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        error = cosyvoice3_server._get_tts_adapter().validate(request)
         assert error is not None
         assert "ref_audio" in error.lower()
 
     def test_validate_cosyvoice3_missing_ref_text(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
-        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        error = cosyvoice3_server._get_tts_adapter().validate(request)
         assert error is not None
         assert "ref_text" in error.lower()
 
     def test_validate_cosyvoice3_invalid_ref_audio_format(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="/local/path.wav", ref_text="hello")
-        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        error = cosyvoice3_server._get_tts_adapter().validate(request)
         assert error is not None
         assert "url" in error.lower() or "format" in error.lower()
 
@@ -3249,7 +3249,7 @@ class TestCosyVoice3Serving:
             ref_audio="data:audio/wav;base64,abc123",
             ref_text="Reference transcript",
         )
-        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        error = cosyvoice3_server._get_tts_adapter().validate(request)
         assert error is None
 
     def test_validate_cosyvoice3_max_new_tokens_range(self, cosyvoice3_server):
@@ -3259,17 +3259,22 @@ class TestCosyVoice3Serving:
             ref_text="hello",
             max_new_tokens=0,
         )
-        error = cosyvoice3_server._validate_cosyvoice3_request(request)
+        error = cosyvoice3_server._get_tts_adapter().validate(request)
         assert error is not None
         assert "max_new_tokens" in error
 
     def test_prepare_speech_generation_cosyvoice3(self, cosyvoice3_server, mocker: MockerFixture):
-        cosyvoice3_server._build_cosyvoice3_prompt = mocker.AsyncMock(
-            return_value={
-                "prompt": "Hello",
-                "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
-                "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
-            }
+        adapter = cosyvoice3_server._get_tts_adapter()
+        adapter.build = mocker.AsyncMock(
+            return_value=PreparedRequest(
+                prompt={
+                    "prompt": "Hello",
+                    "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
+                    "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
+                },
+                tts_params={},
+                model_type="cosyvoice3",
+            )
         )
         cosyvoice3_server._apply_cosyvoice3_dynamic_tokens = mocker.MagicMock(side_effect=lambda spl, req: spl)
 
@@ -3283,7 +3288,7 @@ class TestCosyVoice3Serving:
         assert request_id.startswith("speech-")
         assert generator == "generator"
         assert tts_params == {}
-        cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
+        adapter.build.assert_awaited_once()
 
 
 # ---- GLM-TTS Serving Tests ----

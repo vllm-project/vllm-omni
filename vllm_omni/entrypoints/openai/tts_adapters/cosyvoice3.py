@@ -11,6 +11,9 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, Prepare
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
+# CosyVoice3 talker expects its reference transcript wrapped in the model
+# instruction template; without the delimiter the talker re-speaks the
+# reference (issue #4644). Matches the offline example/test and upstream demo.
 _COSYVOICE3_PROMPT_DELIMITER = "<|endofprompt|>"
 _COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DELIMITER}"
 
