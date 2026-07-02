@@ -63,6 +63,40 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
 
+_DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S = 30.0
+_BROADCAST_DEQUEUE_TIMEOUT_ENV = "VLLM_OMNI_DIFFUSION_WORKER_BROADCAST_TIMEOUT_S"
+
+
+def _get_broadcast_dequeue_timeout_s() -> float:
+    raw_timeout = os.environ.get(
+        _BROADCAST_DEQUEUE_TIMEOUT_ENV,
+        str(_DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S),
+    )
+    try:
+        timeout_s = float(raw_timeout)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.1fs",
+            _BROADCAST_DEQUEUE_TIMEOUT_ENV,
+            raw_timeout,
+            _DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S,
+        )
+        return _DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S
+
+    if timeout_s <= 0:
+        logger.warning(
+            "Invalid %s=%r; using default %.1fs",
+            _BROADCAST_DEQUEUE_TIMEOUT_ENV,
+            raw_timeout,
+            _DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S,
+        )
+        return _DEFAULT_BROADCAST_DEQUEUE_TIMEOUT_S
+
+    return timeout_s
+
+
+_BROADCAST_DEQUEUE_TIMEOUT_S = _get_broadcast_dequeue_timeout_s()
+
 
 @dataclass
 class _DiffusionVllmModelConfig:
@@ -979,12 +1013,16 @@ class WorkerProc:
 
     def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
-        logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
+        logger.info(
+            "Worker %s ready to receive requests via shared memory (broadcast dequeue timeout %.3fs)",
+            self.gpu_id,
+            _BROADCAST_DEQUEUE_TIMEOUT_S,
+        )
 
         while self._running:
             msg = None
             try:
-                msg = self.mq.dequeue(timeout=1.0)
+                msg = self.mq.dequeue(timeout=_BROADCAST_DEQUEUE_TIMEOUT_S)
             except Exception:
                 if self.wake_event and self.wake_event.is_set():
                     self.wake_event.clear()
