@@ -327,7 +327,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             # (_trim_replay_output -> actual*upsample - 555) are short, so it applies to both.
             tail = max(0, int(code_seq_len * self.total_upsample) - batch_wav.shape[-1])
             start = max(0, left_context_size[idx] * self.total_upsample - tail)
-            wav_chunk = batch_wav[idx, :, start : code_seq_len * self.total_upsample]
+            new_frames = max(0, code_seq_len - left_context_size[idx])
+            end = min(batch_wav.shape[-1], start + new_frames * self.total_upsample)
+            wav_chunk = batch_wav[idx, :, start:end]
             wavs.append(wav_chunk)
         return wavs
 
