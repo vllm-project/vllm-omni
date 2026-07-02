@@ -16,7 +16,12 @@ from vllm_omni.config.stage_config import (
     StageDeployConfig,
     StagePipelineConfig,
 )
-from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
+from vllm_omni.utils.tracking_parser import (
+    UNSET,
+    TrackingArgumentParser,
+    TrackingNamespace,
+    build_shadow_kwargs,
+)
 
 ### Fake pipeline/deploy config for integration tests
 
@@ -327,9 +332,10 @@ def test_omitted_nargs():
 
 
 ### Tests for in-place mutating actions (append / extend / count).
-# These actions make argparse mutate the shadow default in place, so the
-# shadow default cannot be the bare ``object()`` sentinel (it would raise
-# AttributeError/TypeError). See _UnsetList / _UnsetCount in tracking_parser.
+# These actions mutate their default in place, which would crash on the bare
+# ``UNSET`` sentinel. The shadow parser remaps them to a non-mutating store-style
+# action (see build_shadow_kwargs in tracking_parser), so the real namespace
+# still accumulates while explicit-arg tracking keeps working.
 def test_append_action_omitted():
     """Omitted append args parse without error and aren't marked explicit."""
     p = TrackingArgumentParser()
@@ -419,6 +425,36 @@ def test_group_append_action_explicit():
     assert ns.explicit_keys == {"tag"}
     assert isinstance(ns, TrackingNamespace)
     assert ns.tag == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("append", "store"),
+        ("extend", "store"),
+        ("append_const", "store_const"),
+        ("count", "store_const"),
+    ],
+)
+def test_build_shadow_kwargs_remaps_mutating_actions(action, expected):
+    """Mutating actions are remapped to a store-style action with an UNSET default."""
+    shadow = build_shadow_kwargs({"action": action, "const": "c"})
+    assert shadow["action"] == expected
+    assert shadow["default"] is UNSET
+
+
+def test_build_shadow_kwargs_count_gets_marker_const():
+    """count carries no const, so the remapped store_const gets a non-UNSET marker."""
+    shadow = build_shadow_kwargs({"action": "count"})
+    assert shadow["action"] == "store_const"
+    assert shadow["const"] is not UNSET
+
+
+def test_build_shadow_kwargs_leaves_other_actions_untouched():
+    """Non-mutating actions keep their action and only get the UNSET default."""
+    shadow = build_shadow_kwargs({"action": "store_true"})
+    assert shadow["action"] == "store_true"
+    assert shadow["default"] is UNSET
 
 
 def test_parse_known_args_tracking():
