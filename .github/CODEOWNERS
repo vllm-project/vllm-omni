@@ -22,30 +22,30 @@
 /.buildkite/ @yenuo26 @congw729
 
 # Engine and model_executor
-/vllm_omni/core/ @tzhouam @yinpeiqi @fake0fan
-/vllm_omni/engine/ @tzhouam @yinpeiqi @fake0fan
-/vllm_omni/entrypoints/ @tzhouam @yinpeiqi @fake0fan
+/vllm_omni/core/ @tzhouam @yinpeiqi @fake0fan @Sy0307
+/vllm_omni/engine/ @tzhouam @yinpeiqi @fake0fan @Sy0307
+/vllm_omni/entrypoints/ @tzhouam @yinpeiqi @fake0fan @alex-jw-brooks
 /vllm_omni/model_executor/ @tzhouam @gcanlin
 /vllm_omni/worker/ @tzhouam @gcanlin
 
 # Diffusion
-/vllm_omni/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @david6666666
+/vllm_omni/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @david6666666 @xuechendi
 /vllm_omni/lora/ @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @yuanheng-zhao
 
 # Diffusion CPU offloading
-/vllm_omni/diffusion/offloader/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @yuanheng-zhao
+/vllm_omni/diffusion/offloader/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @yuanheng-zhao @xuechendi
 
 # Omni and TTS support
 /vllm_omni/transformers_utils/ @tzhouam @yuanheng-zhao
-/vllm_omni/model_executor/models/ @linyueqian @ZeldaHuang @princepride @yuanheng-zhao @amy-why-3459 @Bounty-hunter
+/vllm_omni/model_executor/models/ @linyueqian @ZeldaHuang @princepride @yuanheng-zhao @amy-why-3459 @Bounty-hunter @Sy0307 @gcanlin
 
 # Benchmarks
 /benchmarks/accuracy/ @david6666666
 /benchmarks/build_dataset/ @linyueqian @yuanheng-zhao
-/benchmarks/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa
+/benchmarks/diffusion/ @Isotr0py @princepride @SamitHuang @wtomin @ZJY0516 @RuixiangMa @xuechendi
 /benchmarks/distributed/ @princepride
 /benchmarks/glm_image/ @princepride @JaredforReal
-/benchmarks/tts/ @linyueqian @ZeldaHuang @princepride
+/benchmarks/tts/ @linyueqian @ZeldaHuang @princepride @Sy0307 @gcanlin
 
 # Usability and Observability
 /vllm_omni/deploy/ @tzhouam @lishunyang12
@@ -53,13 +53,13 @@
 /vllm_omni/profiler/ @gcanlin
 
 # ComfyUI
-/apps/ @fhfuih
+/apps/ @fhfuih @alex-jw-brooks
 
 # Large Scale Serving
 /vllm_omni/distributed/ @princepride @yuanheng-zhao @xuechendi @natureofnature @fake0fan
 
 # Quantization and configuration
-/vllm_omni/config/ @lishunyang12
+/vllm_omni/config/ @lishunyang12 @alex-jw-brooks
 /vllm_omni/quantization/ @david6666666 @Isotr0py @lishunyang12
 
 # Hardware plugins and accelerators

@@ -27,6 +27,79 @@ examples in this repository.
 
 ## GPU
 
+### 1x NVIDIA GeForce RTX 5090 32GB
+
+#### Environment
+
+- OS: Ubuntu 24.04.4 LTS
+- Python: 3.12.3
+- PyTorch: 2.11.0+cu130
+- Driver / runtime: NVIDIA driver 580.159.03, CUDA 13.0
+- GPU: NVIDIA GeForce RTX 5090, 32 GB (`32607 MiB`)
+- vLLM version: 0.23.0
+- vLLM-Omni version or commit: 0.23.0rc2.dev140+gbe60d7c7c (`be60d7c7`)
+- Tested with: `mistral-common==1.11.5`
+
+#### Command
+
+```bash
+vllm serve mistralai/Voxtral-4B-TTS-2603 \
+    --omni \
+    --port 8091 \
+    --trust-remote-code
+```
+
+The deploy config is auto-loaded from `vllm_omni/deploy/voxtral_tts.yaml`.
+
+#### Verification
+
+Health check and voices:
+
+```bash
+curl -s -o /tmp/voxtral_health.txt -w '%{http_code}' http://127.0.0.1:8091/health
+curl -s http://127.0.0.1:8091/v1/audio/voices
+```
+
+Non-streaming WAV:
+
+```bash
+curl -X POST http://127.0.0.1:8091/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistralai/Voxtral-4B-TTS-2603",
+    "input": "Hello, this is Voxtral TTS running on an NVIDIA GeForce RTX 5090 with vLLM-Omni.",
+    "voice": "casual_female",
+    "language": "English",
+    "response_format": "wav"
+  }' \
+  --output /tmp/voxtral_5090.wav
+```
+
+Streaming PCM:
+
+```bash
+curl -X POST http://127.0.0.1:8091/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistralai/Voxtral-4B-TTS-2603",
+    "input": "Hello, this is Voxtral TTS streaming PCM on an NVIDIA GeForce RTX 5090.",
+    "voice": "casual_female",
+    "language": "English",
+    "stream": true,
+    "response_format": "pcm"
+  }' \
+  --output /tmp/voxtral_5090_stream.pcm
+
+ffmpeg -f s16le -ar 24000 -ac 1 -i /tmp/voxtral_5090_stream.pcm /tmp/voxtral_5090_stream.wav -y
+ffprobe -hide_banner /tmp/voxtral_5090_stream.wav
+```
+
+#### Notes
+
+- Output: 24 kHz mono WAV/PCM; both non-streaming and streaming requests passed.
+- Memory usage: ~27.3 GiB after warmup (Stage 0 ~25.5 GiB, Stage 1 ~1.7 GiB).
+- Key flags: `--omni` is required; `--trust-remote-code` is recommended.
+
 ### 1x RTX 4090 24GB
 
 #### Environment
@@ -80,6 +153,7 @@ curl -X POST http://127.0.0.1:8091/v1/audio/speech \
     "voice": "casual_female",
     "language": "English",
     "stream": true,
+    "stream_format": "audio",
     "response_format": "pcm"
   }' \
   --output voxtral_stream.pcm

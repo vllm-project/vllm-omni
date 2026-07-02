@@ -52,8 +52,7 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SIGMA_SHIFT,
 )
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.platforms import current_omni_platform
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
@@ -487,10 +486,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         latents: tuple[torch.Tensor, torch.Tensor],
         do_true_cfg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Post-step sync: .contiguous() + platform synchronize."""
+        """Post-step sync: .contiguous() + cuda.synchronize()"""
         latents = tuple(t.contiguous() for t in latents)
         if do_true_cfg and get_classifier_free_guidance_world_size() > 1:
-            current_omni_platform.synchronize()
+            device = next((t.device for t in latents if t.is_cuda), None)
+            if device is not None:
+                torch.cuda.current_stream(device).synchronize()
         return latents
 
     # -----------------------------------------------------------------------
@@ -898,7 +899,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return transform, transform.transform_input(robot_obs)
 
     @torch.no_grad()
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
         """Full inference step. Called by DiffusionEngine.step()."""
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")

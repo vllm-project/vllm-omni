@@ -49,7 +49,7 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -85,6 +85,10 @@ class _ZPipelineRequest:
     sampling_params: _ZPipelineSamplingParams
     prompts: list[dict[str, Any]] = field(default_factory=lambda: [{"prompt": "", "negative_prompt": ""}])
 
+    @property
+    def num_reqs(self) -> int:
+        return 1
+
 
 class MingImagePipeline(ZImagePipeline):
     """Ming-flash-omni-2.0 text-to-image diffusion pipeline.
@@ -94,6 +98,8 @@ class MingImagePipeline(ZImagePipeline):
       * ``byte5``             — Optional ByT5 glyph encoder (loaded if checkpoint
                                 ships ``byt5/``)
     """
+
+    supports_request_batch = False
 
     def __init__(
         self,
@@ -272,18 +278,18 @@ class MingImagePipeline(ZImagePipeline):
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Run one text-to-image generation request.
 
         Args:
-            req: Diffusion request. The cross-stage thinker hidden states
+            req: Single-request batch. The cross-stage thinker hidden states
                 must be present at
                 ``req.prompts[0]["extra"]["thinker_hidden_states"]`` as a
                 ``[N, H]`` (or ``[1, N, H]``) tensor, placed there by
                 ``thinker2imagegen``.
 
         Returns:
-            DiffusionOutput with ``.output`` set to a ``[B, 3, H, W]``
+            One DiffusionOutput with ``.output`` set to a ``[B, 3, H, W]``
             image tensor in ``[-1, 1]``. The vllm-omni diffusion engine's
             output adapter converts this to PIL/base64 downstream.
         """
@@ -440,7 +446,7 @@ class MingImagePipeline(ZImagePipeline):
             None if ref_latent is None else tuple(ref_latent.shape),
         )
         try:
-            output = super().forward(
+            outputs = super().forward(
                 z_req,
                 prompt=None,
                 height=height,
@@ -456,6 +462,7 @@ class MingImagePipeline(ZImagePipeline):
         finally:
             set_forward_context_ref_latent(None)
 
+        output = outputs[0]
         if hasattr(output, "output") and output.output is not None:
             raw = output.output
         elif hasattr(output, "images"):

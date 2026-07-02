@@ -160,9 +160,11 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output flux2-dev.png
 ```
 
-### Batch Requests (Multiple Prompts)
+### Multiple Prompts
 
-You can pass multiple prompts in a single `generate` call.
+You can pass multiple prompts in a single `generate` call. For diffusion
+pipelines, each prompt is submitted as a separate logical request; compatible
+requests may be automatically batched by the scheduler and runner.
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -181,17 +183,8 @@ if __name__ == "__main__":
 
 !!! info
 
-    Not all models support batch inference, and batch requesting mostly does not provide significant
-    performance improvement. This feature is primarily for interface compatibility with vLLM and to
-    allow for future improvements.
-
-!!! info
-
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by
-    default, and the input list is sliced into single-item requests before feeding into the diffusion
-    pipeline. For models that do internally support batched inputs, you can
-    [modify this configuration](https://github.com/vllm-project/vllm-omni/tree/main/configuration/stage_configs.md) to let the model accept a
-    longer batch of prompts.
+    For diffusion request-level batching controls such as `max_num_seqs`, see
+    [Request-Level Batching](../../diffusion/request_batching.md).
 
 ### Negative Prompts
 
