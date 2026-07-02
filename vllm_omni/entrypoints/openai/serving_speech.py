@@ -82,11 +82,6 @@ _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
-# CosyVoice3 talker expects its reference transcript wrapped in the model
-# instruction template; without the delimiter the talker re-speaks the
-# reference (issue #4644). Matches the offline example/test and upstream demo.
-_COSYVOICE3_PROMPT_DELIMITER = "<|endofprompt|>"
-_COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DELIMITER}"
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
@@ -452,7 +447,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None) == "fish_speech_slow_ar"
         )
         self._fish_speech_tokenizer = None
-        self._covo_audio_tokenizer = None
         # Cached per process: the CosyVoice3 Qwen tokenizer + resolved model
         # path used for dynamic-token sizing. Without this, every request
         # re-ran snapshot_download + reloaded the tokenizer (~100 ms on the
@@ -1490,17 +1484,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
-        if self._tts_model_type == "step_audio2":
-            # StepAudio2 only requires non-empty input text
-            if not request.input or not request.input.strip():
-                return "Input text cannot be empty"
-            return None
+        if self._tts_model_type in {"step_audio2", "cosyvoice3"}:
+            adapter = self._get_tts_adapter()
+            if adapter is not None:
+                return adapter.validate(request)
+
         if self._tts_model_type == "voxtral_tts":
             return self._validate_voxtral_tts_request(request)
         if self._tts_model_type == "fish_tts":
             return self._validate_fish_tts_request(request)
-        if self._tts_model_type == "cosyvoice3":
-            return self._validate_cosyvoice3_request(request)
         if self._tts_model_type == "voxcpm2":
             return self._validate_voxcpm2_request(request)
         if self._tts_model_type == "ming_flash_omni_tts":
@@ -2322,30 +2314,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    def _validate_cosyvoice3_request(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Validate CosyVoice3 request parameters. Returns error message or None."""
-        if not request.input or not request.input.strip():
-            return "Input text cannot be empty"
-
-        # CosyVoice3 requires reference audio for voice cloning
-        if request.ref_audio is None:
-            return "CosyVoice3 requires 'ref_audio' (reference audio for voice cloning)"
-
-        fmt_err = self._validate_ref_audio_format(request.ref_audio)
-        if fmt_err:
-            return fmt_err
-
-        if not request.ref_text or not request.ref_text.strip():
-            return "CosyVoice3 requires 'ref_text' (transcript of the reference audio)"
-
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
-                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
-            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
-                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
-
-        return None
-
     def _validate_ming_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate Ming TTS request parameters. Returns error message or None."""
         if not request.input or not request.input.strip():
@@ -3095,33 +3063,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "multi_modal_data": {"audio": [(audio.audio_array, audio.sampling_rate)]},
             }
 
-    # ---- Step-Audio2 helpers ----
-
-    def _build_step_audio2_prompt(
-        self,
-        request: OpenAICreateSpeechRequest,
-    ) -> dict[str, Any]:
-        """Build prompt for Step-Audio2 TTS.
-
-        Constructs the chat prompt with ``<tts_start>`` as the last token
-        of the assistant turn (without ``<|im_end|>``), so the thinker
-        continues generating audio tokens.
-
-        Prompt format::
-            <|im_start|>system\\n{system_prompt}<|im_end|>\\n
-            <|im_start|>user\\n{input_text}<|im_end|>\\n
-            <|im_start|>assistant\\n<tts_start>
-        """
-        system_prompt = getattr(request, "instructions", None) or "You are a voice assistant. Read the text aloud."
-        text = request.input
-
-        raw_prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{text}<|im_end|>\n"
-            f"<|im_start|>assistant\n<tts_start>"
-        )
-        return {"prompt": raw_prompt}
-
     # ---- Fish Speech helpers ----
 
     def _build_fish_speech_prompt(
@@ -3189,84 +3130,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = additional_information
         return prompt
-
-    # ---- CosyVoice3 helpers ----
-
-    async def _build_cosyvoice3_prompt(
-        self,
-        request: OpenAICreateSpeechRequest,
-        *,
-        has_inline_ref_audio: bool = False,
-    ) -> dict[str, Any]:
-        """Build prompt for CosyVoice3.
-
-        CosyVoice3 uses multimodal input with reference audio for voice cloning.
-        The prompt format matches the offline example: text prompt + audio data
-        + mm_processor_kwargs with prompt_text.
-        """
-        # Resolve reference audio
-        wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
-        audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
-
-        # Wrap the reference transcript in the CosyVoice3 instruction template
-        # so the talker emits target-only speech (see _COSYVOICE3_PROMPT_PREFIX).
-        # Skip if the caller already supplied a formatted prompt_text.
-        ref_text = request.ref_text or ""
-        if _COSYVOICE3_PROMPT_DELIMITER not in ref_text:
-            ref_text = f"{_COSYVOICE3_PROMPT_PREFIX}{ref_text}"
-        mm_kwargs: dict[str, Any] = {
-            "prompt_text": ref_text,
-            "sample_rate": sr,
-        }
-        # Pass voice metadata for caching in the processor
-        if request.voice:
-            voice_lower = request.voice.lower()
-            if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
-                mm_kwargs["voice_name"] = voice_lower
-                mm_kwargs["voice_created_at"] = self._voice_created_at(voice_lower)
-
-        return {
-            "prompt": request.input,
-            "multi_modal_data": {
-                "audio": audio_data,
-            },
-            "mm_processor_kwargs": mm_kwargs,
-        }
-
-    # ---- Covo-Audio helpers ----
-
-    def _build_covo_audio_prompt(
-        self,
-        request: OpenAICreateSpeechRequest,
-    ) -> dict[str, Any]:
-        """Build a chat-style prompt for Covo-Audio-Chat.
-
-        Covo-Audio requires a specific system prompt that instructs the model
-        to interleave text and audio tokens in its output.  We render the
-        messages through the chat template and pass prompt_token_ids so that
-        the engine does not need to re-tokenize.
-        """
-        from transformers import AutoTokenizer
-
-        from vllm_omni.model_executor.models.covo_audio.prompt_utils import (
-            build_covo_audio_prompt_token_ids,
-        )
-
-        if self._covo_audio_tokenizer is None:
-            model_name = self.engine_client.model_config.model
-            try:
-                self._covo_audio_tokenizer = AutoTokenizer.from_pretrained(
-                    model_name,
-                    trust_remote_code=True,
-                )
-            except Exception as exc:
-                raise RuntimeError(f"Failed to load Covo-Audio tokenizer from '{model_name}': {exc}") from exc
-
-        prompt_ids = build_covo_audio_prompt_token_ids(
-            self._covo_audio_tokenizer,
-            request.input,
-        )
-        return {"prompt_token_ids": prompt_ids}
 
     def _apply_cosyvoice3_dynamic_tokens(
         self,
