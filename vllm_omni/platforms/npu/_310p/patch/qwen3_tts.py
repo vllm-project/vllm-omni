@@ -5,16 +5,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
+
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
 from transformers.models.mimi import modeling_mimi
+from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
+from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
+from vllm_ascend.sample.sampler import apply_top_k_top_p, random_sample
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, maybe_trans_nz, nd_to_nz_2d
 
 from vllm_omni.model_executor.models.common import qwen3_code_predictor
-from vllm_omni.model_executor.models.qwen3_tts import prompt_embeds_builder, qwen3_tts_talker
+from vllm_omni.model_executor.models.qwen3_tts import (
+    prompt_embeds_builder,
+    qwen3_tts_code2wav,
+    qwen3_tts_code_predictor_vllm,
+    qwen3_tts_talker,
+)
+from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz import modeling_qwen3_tts_tokenizer_v2
 
+ACL_FORMAT_FRACTAL_Z = 4
 _RUNTIME_DTYPE = torch.float16
 _CPU_DEVICE = torch.device("cpu")
+_PATCHED = False
+_CODE2WAV_PATCHED = False
+
+logger = init_logger(__name__)
 
 
 class _MimiEuclideanCodebook310P(modeling_mimi.MimiEuclideanCodebook):
@@ -35,7 +55,10 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
-        self.encoder.to(dtype=_RUNTIME_DTYPE)
+        # The Mimi tokenizer encoder is used only while building ref_audio
+        # prompts.  Keep this preprocessing-only module on CPU because the 310P
+        # NPU path is sensitive to changing reference-audio shapes.
+        self.encoder.to(device=_CPU_DEVICE, dtype=torch.float32)
         return loaded
 
     def _encode_ref_audio_batch(
@@ -51,7 +74,7 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
             resampler = AudioResampler(target_sr=target_sr)
             wavs = [resampler.resample(w.astype(np.float32), orig_sr=int(sr)) for w in wavs]
 
-        inputs = fe(raw_audio=wavs, sampling_rate=target_sr, return_tensors="pt").to(device).to(_RUNTIME_DTYPE)
+        inputs = fe(raw_audio=wavs, sampling_rate=target_sr, return_tensors="pt").to(_CPU_DEVICE).to(torch.float32)
 
         with torch.inference_mode():
             encoded = self.encoder.encode(
@@ -100,7 +123,142 @@ class _Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbed
         return spk.to(dtype=dtype)
 
 
+# ===================================================================
+#  Code2Wav layer patches
+# ===================================================================
+#
+# Code2Wav runs under the 310P graph path after the stage-0 Talker has
+# produced codec tokens.  Keep the portable tokenizer implementation
+# unchanged, and install only the fused operators that preserve the decoder
+# math exactly on 310P.
+
+
+class _Qwen3TTSCode2Wav310P(qwen3_tts_code2wav.Qwen3TTSCode2Wav):
+    """Qwen3-TTS Code2Wav specialized for the 310P NPU path."""
+
+    def _prepare_weights_310p(self) -> None:
+        decoder = self.decoder
+        device = next(decoder.parameters()).device
+
+        decoder.to(device=device, dtype=torch.float16)
+
+        linear_count = 0
+        conv_count = 0
+        with torch.no_grad():
+            for module in decoder.modules():
+                if hasattr(module, "weight") and module.__class__.__name__ == "Linear":
+                    module.weight.data = maybe_trans_nz(module.weight.data)
+                    linear_count += 1
+                elif isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)) and module.groups == 1:
+                    # Stage-1 uses 1D convs that lower to Conv2D on 310P. Pack
+                    # groups==1 filters once so the captured decode graph does
+                    # not pay the same filter-layout conversion every replay.
+                    module.weight.data = torch_npu.npu_format_cast(
+                        module.weight.data.contiguous(), ACL_FORMAT_FRACTAL_Z
+                    )
+                    conv_count += 1
+
+        logger.info("Prepared 310P code2wav weights: linear=%d conv=%d dtype=float16", linear_count, conv_count)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded = super().load_weights(weights)
+        self._prepare_weights_310p()
+        return loaded
+
+
+class _Qwen3TTSTokenizerV2DecoderRMSNorm310P(modeling_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2DecoderRMSNorm):
+    """Code2Wav RMSNorm on 310P using the fused NPU kernel."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
+
+
+def _code2wav_apply_rotary_pos_emb_310p(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Apply Code2Wav RoPE with the Ascend fused rotary kernel on 310P."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return torch_npu.npu_rotary_mul(q, cos, sin), torch_npu.npu_rotary_mul(k, cos, sin)
+
+
+# ===================================================================
+#  CodePredictor layer patches
+# ===================================================================
+#
+# Keep the portable implementation in common/qwen3_code_predictor.py.
+# The overrides below are installed only by the 310P platform patch because
+# the short CodePredictor loop is graph-captured on 310P and profiling shows
+# repeated layout conversion plus unfused normalization/RoPE kernels there.
+
+
+class _RMSNorm310P(nn.Module):
+    """RMSNorm using the Ascend NPU fused kernel on 310P.
+
+    The generic layer keeps HuggingFace-compatible PyTorch math.  On 310P that
+    expands to multiple small elementwise kernels, so the patch uses the fused
+    operator while retaining the generic fallback for non-NPU execution.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.device.type != "npu":
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+            return self.weight * hidden_states.to(input_dtype)
+
+        hidden_states, _ = torch_npu.npu_rms_norm(
+            hidden_states,
+            self.weight,
+            self.variance_epsilon,
+        )
+        return hidden_states
+
+
+class _RotaryEmbedding310P(nn.Module):
+    """RoPE with a static cos/sin cache for CodePredictor.
+
+    CodePredictor only attends over ``num_code_groups + 1`` tokens.  Caching
+    the table removes repeated outer-product, cos, and sin kernels from the
+    captured 310P loop without changing the shared implementation.
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        rope_theta = getattr(config, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # CodePredictor attends over a fixed short sequence, so the RoPE table
+        # can be materialized once before NPU graph capture.
+        max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
+        positions = torch.arange(max_seq, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cos_cached[position_ids], self.sin_cached[position_ids]
+
+
 class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttention):
+    """Attention override using 310P RoPE and flash-attention kernels.
+
+    The shared attention path is written in portable PyTorch.  This override
+    keeps the 310P-specific RoPE op, token alignment, and FRACTAL_NZ mask path
+    scoped to the platform patch.
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._buffers.pop("_fusion_causal_mask", None)
@@ -112,7 +270,7 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.device.type != "npu" or attention_mask is None:
-            return super().forward(hidden_states, position_embeddings)
+            return super().forward(hidden_states, position_embeddings, attention_mask=attention_mask)
 
         bsz, seq_len, _ = hidden_states.shape
         hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
@@ -125,18 +283,19 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        q = (q * cos) + (qwen3_code_predictor._rotate_half(q) * sin)
-        k = (k * cos) + (qwen3_code_predictor._rotate_half(k) * sin)
+        # Use the fused Ascend RoPE op instead of expanding RoPE into
+        # elementwise mul/add/rotate-half kernels.
+        q = torch_npu.npu_rotary_mul(q, cos, sin)
+        k = torch_npu.npu_rotary_mul(k, cos, sin)
 
         real_tokens = int(bsz) * int(seq_len)
         output_dtype = q.dtype
 
-        import torch_npu
-        from vllm_ascend.utils import aligned_16
-
-        q_f = aligned_16(q.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_heads, self.head_dim))
-        k_f = aligned_16(k.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
-        v_f = aligned_16(v.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
+        # 310P flash attention consumes token-major fp16 inputs with 16-token
+        # alignment; seq_lens carries the padding information.
+        q_f = aligned_16(q.transpose(1, 2).reshape(real_tokens, self.num_heads, self.head_dim))
+        k_f = aligned_16(k.transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
+        v_f = aligned_16(v.transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
 
         aligned_tokens = int(q_f.shape[0])
         seq_lens = torch.full((int(bsz),), int(seq_len), dtype=torch.int32, device="cpu")
@@ -160,6 +319,13 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
 
 
 class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDecoderLayer):
+    """Decoder layer override with fused residual RMSNorm.
+
+    Profiling indicates the residual add followed by RMSNorm as a cluster of small
+    kernels on 310P.  ``npu_add_rms_norm`` matches this pattern directly and
+    reduces graph-captured launch work in each CodePredictor layer.
+    """
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -169,14 +335,24 @@ class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDeco
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask=attention_mask)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fuse the residual add and post-attention RMSNorm for 310P.
+        hidden_states, _, residual = torch_npu.npu_add_rms_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
         return residual + self.mlp(hidden_states)
 
 
 class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseModel):
+    """Base model override with a cached 310P causal mask.
+
+    The 310P flash-attention path consumes the additive causal mask in
+    FRACTAL_NZ format.  The CodePredictor sequence length is fixed and short,
+    so the mask is built once and reused across graph replays.
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._attention_mask_310p = None
@@ -192,10 +368,8 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
             return super().forward(inputs_embeds, position_ids)
 
         if self._attention_mask_310p is None or self._attention_mask_310p_device != inputs_embeds.device:
-            import torch_npu
-            from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
-            from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d
-
+            # Store the additive causal mask in the format consumed by the
+            # 310P flash-attention kernel.
             mask = AttentionMaskBuilder310.gen_causal_additive_mask(
                 self._attention_mask_310p_max_seq,
                 inputs_embeds.device,
@@ -205,23 +379,303 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
 
         input_dtype = inputs_embeds.dtype
         hidden_states = inputs_embeds
-        with torch.amp.autocast(inputs_embeds.device.type, enabled=False, dtype=torch.float32):
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
-            for layer in self.layers:
-                hidden_states = layer(
-                    hidden_states,
-                    position_embeddings,
-                    attention_mask=self._attention_mask_310p,
-                )
-            hidden_states = self.norm(hidden_states)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings,
+                attention_mask=self._attention_mask_310p,
+            )
+        hidden_states = self.norm(hidden_states)
         return hidden_states.to(input_dtype)
 
 
+class _Qwen3TTSTalkerCodePredictor310P(
+    qwen3_tts_code_predictor_vllm.Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+):
+    """Qwen3-TTS code predictor specialized for the 310P NPU path."""
+
+    def __init__(
+        self,
+        *,
+        vllm_config,
+        config,
+        talker_config,
+        prefix: str = "code_predictor",
+    ) -> None:
+        super().__init__(
+            vllm_config=vllm_config,
+            config=config,
+            talker_config=talker_config,
+            prefix=prefix,
+        )
+        self._static_310p_ready = False
+        self._projected_codec_embed_weight = None
+
+    def _prepare_static_weights_310p(self) -> None:
+        if self._static_310p_ready:
+            return
+
+        self._lm_heads_list = list(self.lm_head)
+        self._codec_embeds_list = list(self.model.codec_embedding)
+
+        with torch.no_grad():
+            for child in self.modules():
+                if isinstance(child, nn.Linear):
+                    child.weight.data = maybe_trans_nz(child.weight.data)
+
+            if not self._wrapper_config.use_parallel_embedding:
+                self._projected_codec_embed_weight = torch.stack(
+                    [self.small_to_mtp_projection(embed.weight).detach() for embed in self._codec_embeds_list],
+                    dim=0,
+                ).contiguous()
+
+        self._static_310p_ready = True
+
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
+        self._prepare_static_weights_310p()
+        return loaded
+
+    def _setup_compile(self) -> None:
+        if self._compiled_model_fwd is not None:
+            return
+
+        param = next(self.model.parameters())
+        self._model_dtype = param.dtype
+        self.model.rotary_emb.to(device=param.device, dtype=self._model_dtype)
+        self._prepare_static_weights_310p()
+
+        if not qwen3_code_predictor.current_omni_platform.supports_torch_inductor():
+            self._compiled_model_fwd = self.model.forward
+            if qwen3_code_predictor.current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
+                self._warmup_buckets()
+                self._capture_npu_graphs()
+                logger.info("code_predictor: eager mode + NPU graphs")
+            else:
+                logger.warning_once("code_predictor: torch.compile disabled")
+            return
+
+        self._compiled_model_fwd = torch.compile(
+            self.model.forward,
+            dynamic=False,
+            options={"epilogue_fusion": False},
+        )
+        self._warmup_buckets()
+
+        if self._wrapper_config.use_cuda_graphs:
+            self._capture_cuda_graphs()
+            logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
+        else:
+            logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if layer0_code.device.type != "npu":
+            return super().forward(
+                layer0_code,
+                layer0_embed,
+                last_talker_hidden,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+                generators=generators,
+            )
+
+        bsz = int(layer0_code.shape[0])
+        if generators is not None and len(generators) != bsz:
+            raise ValueError(f"generators must have one entry per row: got {len(generators)} for batch {bsz}")
+        num_groups = self._num_groups
+        device = layer0_code.device
+
+        self._setup_compile()
+        dtype = self._model_dtype
+
+        padded_bsz = self._padded_bsz(bsz)
+        self._ensure_buffers(device, dtype, padded_bsz)
+
+        proj_buf = self._proj_buf
+        max_seq = num_groups + 1
+        projection = self.small_to_mtp_projection
+        model_fwd = self._compiled_model_fwd
+        lm_heads = self._lm_heads_list
+        codec_embeds = self._codec_embeds_list
+        projected_codec_embed_weight = self._projected_codec_embed_weight
+        if generators is not None:
+            npu_generators = {i: row_generator for i, row_generator in enumerate(generators) if row_generator}
+        elif generator is not None:
+            npu_generators = {i: generator for i in range(bsz)}
+        else:
+            npu_generators = {}
+
+        proj_buf[:padded_bsz].zero_()
+        initial_embeds = torch.cat(
+            (
+                last_talker_hidden.reshape(bsz, 1, -1),
+                layer0_embed.reshape(bsz, 1, -1),
+            ),
+            dim=1,
+        )
+        if initial_embeds.dtype != dtype:
+            initial_embeds = initial_embeds.to(dtype)
+        proj_buf[:bsz, :2, :].copy_(projection(initial_embeds))
+
+        stored_mode = self._wrapper_config.sampling_mode == "stored"
+        if stored_mode:
+            s_top_k = self._top_k
+            s_top_p = self._top_p
+        else:
+            use_sampling = do_sample and temperature > 0
+            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+            if use_sampling and top_p != 1.0:
+                raise NotImplementedError(
+                    "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+                )
+
+        top_k_tensor = None
+        top_p_tensor = None
+        if stored_mode:
+            top_k_hint = s_top_k if s_top_k > 0 else None
+            if s_top_k > 0:
+                top_k_tensor = torch.full((bsz,), s_top_k, dtype=torch.int32, device=device)
+            if s_top_p < 1.0:
+                top_p_tensor = torch.full((bsz,), s_top_p, dtype=dtype, device=device)
+        elif use_sampling:
+            top_k_hint = top_k if top_k > 0 else None
+            if top_k > 0:
+                top_k_tensor = torch.full((bsz,), top_k, dtype=torch.int32, device=device)
+        else:
+            top_k_hint = None
+
+        if self._wrapper_config.return_proj_buf:
+            all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
+            all_codes[:, 0] = layer0_code.reshape(bsz, -1)[:, :1]
+        else:
+            all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
+            all_codes[:, 0] = layer0_code.reshape(bsz)
+
+        for step in range(1, num_groups):
+            graph_key: int | tuple[int, int] = padded_bsz
+            seq_len = max_seq
+            if self._prefix_graphs_enabled:
+                prefix_key = (padded_bsz, step + 1)
+                if prefix_key in self._device_graphs:
+                    graph_key = prefix_key
+                    seq_len = step + 1
+            pos_ids = self._bucket_pos_ids.get(graph_key)
+            if pos_ids is None:
+                pos_ids = (
+                    torch.arange(seq_len, device=device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(padded_bsz, -1)
+                    .contiguous()
+                )
+
+            device_graph_entry = self._device_graphs.get(graph_key)
+            if device_graph_entry is not None:
+                device_graph_entry[0].replay()
+                hidden_out = device_graph_entry[1]
+            else:
+                hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
+
+            logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+
+            if stored_mode:
+                if top_k_tensor is not None or top_p_tensor is not None:
+                    logits = apply_top_k_top_p(logits, p=top_p_tensor, k=top_k_tensor, top_k=top_k_hint)
+                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                code = random_sample(probs, npu_generators)
+            else:
+                if use_sampling:
+                    scaled = logits * inv_temperature
+                    if top_k_tensor is not None:
+                        scaled = apply_top_k_top_p(scaled, p=None, k=top_k_tensor, top_k=top_k_hint)
+                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                    code = random_sample(probs, npu_generators)
+                else:
+                    code = logits.argmax(dim=-1, keepdim=True)
+
+            if self._wrapper_config.return_proj_buf:
+                code = code.unsqueeze(-1)
+
+            if self._wrapper_config.return_proj_buf:
+                all_codes[:, step] = code
+            else:
+                all_codes[:, step] = code.reshape(bsz)
+
+            if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
+                if projected_codec_embed_weight is not None:
+                    proj_buf[:bsz, step + 1, :].copy_(
+                        F.embedding(code.reshape(-1), projected_codec_embed_weight[step - 1])
+                    )
+                else:
+                    new_embed = codec_embeds[step - 1](code)
+                    proj_buf[:bsz, step + 1, :].copy_(projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1))
+
+        if self._wrapper_config.return_proj_buf:
+            return all_codes, proj_buf[:bsz].clone()
+        return all_codes
+
+
+# ===================================================================
+#  Patch registration
+# ===================================================================
+
+
 def apply_talker_patches() -> None:
+    """Install Qwen3-TTS Talker and CodePredictor 310P patches.
+
+    The generic model modules stay unchanged.  Patch registration swaps in the
+    310P-specialized CodePredictor classes and wrapper methods only when the
+    310P platform applies the Talker patch.
+    """
+
+    global _PATCHED
+
+    if _PATCHED:
+        return
+
     modeling_mimi.MimiEuclideanCodebook = _MimiEuclideanCodebook310P
     qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration = _Qwen3TTSTalker310P
     qwen3_tts_talker.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilder310P
+    qwen3_tts_talker.Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM = _Qwen3TTSTalkerCodePredictor310P
+    qwen3_tts_code_predictor_vllm.Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM = (
+        _Qwen3TTSTalkerCodePredictor310P
+    )
+    qwen3_tts_code_predictor_vllm.CodePredictorBaseModel = _Qwen3CodePredictorBaseModel310P
+    qwen3_tts_code_predictor_vllm.Qwen3TTSTalkerCodePredictorModelVLLM = _Qwen3CodePredictorBaseModel310P
     prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilder310P
+    qwen3_code_predictor._RMSNorm = _RMSNorm310P
+    qwen3_code_predictor._RotaryEmbedding = _RotaryEmbedding310P
     qwen3_code_predictor.CodePredictorAttention = _Qwen3CodePredictorAttention310P
     qwen3_code_predictor.CodePredictorDecoderLayer = _Qwen3CodePredictorDecoderLayer310P
     qwen3_code_predictor.CodePredictorBaseModel = _Qwen3CodePredictorBaseModel310P
+
+    _PATCHED = True
+
+
+def apply_code2wav_patches() -> None:
+    """Install the 310P Code2Wav runtime patch."""
+    global _CODE2WAV_PATCHED
+
+    if _CODE2WAV_PATCHED:
+        return
+
+    qwen3_tts_code2wav.Qwen3TTSCode2Wav = _Qwen3TTSCode2Wav310P
+    modeling_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2DecoderRMSNorm = _Qwen3TTSTokenizerV2DecoderRMSNorm310P
+    modeling_qwen3_tts_tokenizer_v2.apply_rotary_pos_emb = _code2wav_apply_rotary_pos_emb_310p
+
+    _CODE2WAV_PATCHED = True
