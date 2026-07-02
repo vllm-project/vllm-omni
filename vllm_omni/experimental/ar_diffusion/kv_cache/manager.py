@@ -294,21 +294,24 @@ class ARDiffusionKVCache:
         self,
         layer_idx: int,
         is_negative: bool,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
         k_img: torch.Tensor | None = None,
         v_img: torch.Tensor | None = None,
     ) -> None:
         """Write one layer's cross-attn K/V into the pool.
 
         ``k`` / ``v``: ``(B, text_len, tp_num_heads, head_dim)``; only batch-0
-        is copied (B=1 for inference). The ``is_negative`` flag selects the
-        correct CFG branch slot. ``k_img`` / ``v_img`` (I2V image tokens,
-        ``(B, 257, ...)``) are written when the image pool is allocated.
+        is copied (B=1 for inference). ``None`` skips the text half (window
+        restarts keep the still-valid text K/V and rewrite only the image half).
+        The ``is_negative`` flag selects the correct CFG branch slot. ``k_img`` /
+        ``v_img`` (I2V image tokens, ``(B, 257, ...)``) are written when the
+        image pool is allocated.
         """
         branch = 1 if is_negative else 0
-        self._cross_k[layer_idx][branch].copy_(k[0])
-        self._cross_v[layer_idx][branch].copy_(v[0])
+        if k is not None:
+            self._cross_k[layer_idx][branch].copy_(k[0])
+            self._cross_v[layer_idx][branch].copy_(v[0])
         if k_img is not None and self._cross_k_img:
             self._cross_k_img[layer_idx][branch].copy_(k_img[0])
             self._cross_v_img[layer_idx][branch].copy_(v_img[0])

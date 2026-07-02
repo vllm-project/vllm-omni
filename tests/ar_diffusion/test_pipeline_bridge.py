@@ -135,8 +135,8 @@ def test_get_cross_kv_caches_raises_before_populate():
     for neg in (False, True):
         with pytest.raises(RuntimeError, match="cross-attn read before"):
             st.get_cross_kv_caches(neg)
-    # Guards the full AND: _cross_populated alone is not enough without a pool.
-    st._cross_populated[False] = True
+    # Guards the full AND: the populated flag alone is not enough without a pool.
+    st._cross_text_populated[False] = True
     with pytest.raises(RuntimeError, match="cross-attn read before"):
         st.get_cross_kv_caches(False)
 
@@ -152,7 +152,7 @@ def test_get_cross_kv_caches_returns_pool_dicts_when_populated():
         v = torch.randn(1, L, N_HEADS, HEAD_DIM)
         kv.write_cross_kv(i, False, k, v)
         written.append((k, v))
-    st._cross_populated[False] = True
+    st._cross_text_populated[False] = True
 
     out = st.get_cross_kv_caches(False)
     assert len(out) == 2

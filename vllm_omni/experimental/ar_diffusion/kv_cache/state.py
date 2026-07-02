@@ -64,9 +64,12 @@ class ARDiffusionKVState:
         # behavior), for A/B measurement of the memoization win. Default: enabled.
         self._memo_enabled = os.environ.get("AR_DIFFUSION_KV_NO_MEMO") != "1"
         # Cross-attn KV is populated once after text encoding (eager), then
-        # read every denoising step.  Reset clears these flags so the next
-        # forward repopulates from the new text encoding.
-        self._cross_populated: dict[bool, bool] = {False: False, True: False}
+        # read every denoising step. Tracked per half: the text K/V depend only
+        # on the session prompt (survive window-boundary resets), while the I2V
+        # image-token K/V come from the current observation's CLIP features and
+        # must be re-projected on every window restart.
+        self._cross_text_populated: dict[bool, bool] = {False: False, True: False}
+        self._cross_img_populated: dict[bool, bool] = {False: False, True: False}
 
     def _adapter(self, is_negative: bool):
         return self.neg if is_negative else self.pos
@@ -101,10 +104,17 @@ class ARDiffusionKVState:
         were, the model would lazily project and write cross KV itself, violating
         engine ownership. Fail loud rather than fall back to the model.
         """
-        if not (self._cross_populated[is_negative] and self.kv_cache.cross_attn_length > 0):
+        img_ok = not self.kv_cache._cross_k_img or self._cross_img_populated[is_negative]
+        if not (self._cross_text_populated[is_negative] and img_ok and self.kv_cache.cross_attn_length > 0):
             raise RuntimeError(
-                "AR-Diffusion cross-attn read before _kv_populate_cross (neg=%s, cross_attn_length=%d) "
-                "— the engine must own all cross KV" % (is_negative, self.kv_cache.cross_attn_length)
+                "AR-Diffusion cross-attn read before _kv_populate_cross (neg=%s, cross_attn_length=%d, "
+                "text=%s img=%s) — the engine must own all cross KV"
+                % (
+                    is_negative,
+                    self.kv_cache.cross_attn_length,
+                    self._cross_text_populated[is_negative],
+                    self._cross_img_populated[is_negative],
+                )
             )
         return [self.kv_cache.read_cross_kv(i, is_negative) for i in range(self.num_layers)]
 
@@ -179,7 +189,7 @@ class ARDiffusionKVState:
         self.kv_cache.end_request(self.pos)
         self.kv_cache.end_request(self.neg)
 
-    def reset(self) -> None:
+    def reset(self, *, keep_cross_text: bool = False) -> None:
         """Drop this session's KV — mirrors the model-local ``state.reset()``.
 
         DreamZero resets at the attention-window boundary (``should_reset``); the
@@ -188,6 +198,12 @@ class ARDiffusionKVState:
         object (and thus ``pipeline._ar_diffusion_kv_state``) is preserved across the reset
         so the runner's session mapping stays valid — only the pool-backed state
         is recycled.
+
+        Args:
+            keep_cross_text: On window ("inference") resets the session prompt is
+                unchanged, so the text cross-attn K/V in the static pool buffers are
+                still valid — keep them and only force the image half to repopulate.
+                Session resets (prompt change / explicit reset) pass ``False``.
         """
         pos_id, neg_id = self.pos.request_id, self.neg.request_id
         self.close()  # free resident blocks for both branches
@@ -196,5 +212,12 @@ class ARDiffusionKVState:
         self._committed = {False: 0, True: 0}
         self._pending = {False: [], True: []}
         self._gather_cache = {False: None, True: None}
-        self._cross_populated = {False: False, True: False}
-        _log.info("AR-Diffusion RESET [%s/%s] session KV cleared (window boundary)", pos_id, neg_id)
+        if not keep_cross_text:
+            self._cross_text_populated = {False: False, True: False}
+        self._cross_img_populated = {False: False, True: False}
+        _log.info(
+            "AR-Diffusion RESET [%s/%s] session KV cleared (window boundary; cross text %s)",
+            pos_id,
+            neg_id,
+            "kept" if keep_cross_text else "cleared",
+        )

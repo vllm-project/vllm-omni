@@ -124,36 +124,46 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _kv_populate_cross(self, context: torch.Tensor, clip_feature, is_negative: bool) -> None:
         """Eagerly project cross-attn K/V for all layers into the AR-Diffusion pool.
 
-        Caches the session-invariant cross-attn projections once (re-run after a
-        window-boundary reset, when ``_cross_populated`` clears): the text ``k``/``v``
-        from ``text_embedding(context)``, and for I2V the image-token ``k_img``/
-        ``v_img`` from ``img_emb(clip_feature)`` (the 257 image tokens the forward
-        splits off, cached model-side by #4154). Must run after the image is encoded
-        so ``clip_feature`` is available.
+        Caches the session-invariant cross-attn projections once, per half: the text
+        ``k``/``v`` from ``text_embedding(context)`` survive window-boundary resets
+        (prompt unchanged within a session — only session resets clear them), while
+        the I2V image-token ``k_img``/``v_img`` from ``img_emb(clip_feature)`` (the
+        257 image tokens the forward splits off, cached model-side by #4154) are
+        re-projected on every window restart from the fresh CLIP features. Must run
+        after the image is encoded so ``clip_feature`` is available.
         """
         s = self._ar_diffusion_kv_state
-        if s._cross_populated.get(is_negative, False):
+        need_text = not s._cross_text_populated.get(is_negative, False)
+        need_img = (
+            clip_feature is not None
+            and getattr(self.transformer, "model_type", "t2v") == "i2v"
+            and not s._cross_img_populated.get(is_negative, False)
+        )
+        if not need_text and not need_img:
             return
-        projected = self.transformer.text_embedding(context)
-        img_ctx = None
-        if clip_feature is not None and getattr(self.transformer, "model_type", "t2v") == "i2v":
-            img_ctx = self.transformer.img_emb(clip_feature)
+        projected = self.transformer.text_embedding(context) if need_text else None
+        img_ctx = self.transformer.img_emb(clip_feature) if need_img else None
         for i, block in enumerate(self.transformer.blocks):
             ca = block.cross_attn
             n, d = ca.tp_num_heads, ca.head_dim
-            k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
-            v = ca.v(projected).unflatten(2, (n, d))
+            k = v = None
+            if projected is not None:
+                k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
+                v = ca.v(projected).unflatten(2, (n, d))
             k_img = v_img = None
             if img_ctx is not None:
                 k_img = ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d))
                 v_img = ca.v_img(img_ctx).unflatten(2, (n, d))
             s.kv_cache.write_cross_kv(i, is_negative, k, v, k_img, v_img)
-        s._cross_populated[is_negative] = True
+        if need_text:
+            s._cross_text_populated[is_negative] = True
+        if need_img:
+            s._cross_img_populated[is_negative] = True
         logger.info(
             "AR-Diffusion CROSS POPULATE [%s]: %d layers, text=%s img=%s",
             "neg" if is_negative else "pos",
             len(self.transformer.blocks),
-            tuple(context.shape),
+            "kept" if projected is None else tuple(context.shape),
             None if img_ctx is None else tuple(img_ctx.shape),
         )
 
@@ -163,9 +173,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         DreamZero resets at the attention-window boundary; the engine pool drops the
         same window so the next forward starts fresh. ``clear_video_latents=False``
         keeps the accumulated video latents for export.
+
+        ``clear_video_latents=False`` also marks a window ("inference") reset: the
+        prompt is unchanged, so the pool keeps the text cross-attn K/V and only the
+        image half repopulates on the restart forward.
         """
         state.reset(clear_video_latents=clear_video_latents)
-        self._ar_diffusion_kv_state.reset()
+        self._ar_diffusion_kv_state.reset(keep_cross_text=not clear_video_latents)
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         """Initialize pipeline components.
@@ -1293,7 +1307,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             # Eager cross-attn population (AR-Diffusion only): cache text + image-token K/V
             # into the pool now that the image is encoded (clip_feas available).
             # Runs on the first forward of a session and after each window-boundary
-            # reset (current_start_frame returns to 0); _cross_populated guards re-entry.
+            # reset (current_start_frame returns to 0); the populate guards (text/img halves) gate re-entry.
             self._kv_populate_cross(prompt_embeds, state.clip_feas, is_negative=False)
             if negative_prompt_embeds is not None:
                 self._kv_populate_cross(negative_prompt_embeds, state.clip_feas, is_negative=True)
