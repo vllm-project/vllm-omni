@@ -30,15 +30,16 @@ class OmniRequest(Request):
 
     def __init__(
         self,
+        *args,
         prompt_embeds: PromptEmbedsPayload | torch.Tensor | None = None,
         # Optional external request ID for tracking
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
-        *args,
         **kwargs,
     ):
-        prompt_embeds_tensor = self._maybe_decode_prompt_embeds(prompt_embeds)
-        super().__init__(prompt_embeds=prompt_embeds_tensor, *args, **kwargs)
+        if prompt_embeds is not None:
+            kwargs["prompt_embeds"] = self._maybe_decode_prompt_embeds(prompt_embeds)
+        super().__init__(*args, **kwargs)
         # Preserve serialized prompt embeddings payload (optional)
         self.prompt_embeds_payload: PromptEmbedsPayload | None = (
             prompt_embeds if isinstance(prompt_embeds, PromptEmbedsPayload) else None

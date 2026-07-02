@@ -137,19 +137,19 @@ def _to_code_tensor(codes: Any) -> torch.Tensor | None:
 
 def llm2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload,
+    multimodal_output: OmniPayload | dict[str, Any],
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """
-    Async chunk version: convert stage-0 pooling_output to code2wav payload (pooling / connector accumulation).
+    Async chunk version: convert stage-0 multimodal_output to code2wav payload (pooling / connector accumulation).
 
     Accumulates codes in connector per request_id,
     returns payload only when chunk_size is full or request is finished; returns None when waiting.
     """
     # Null guard: chunk_transfer_adapter calls this every emit step
-    # including no-output steps where pooling_output is None.
-    if pooling_output is None or not isinstance(pooling_output, dict):
+    # including no-output steps where multimodal_output is None.
+    if multimodal_output is None or not isinstance(multimodal_output, dict):
         if is_finished:
             connector = getattr(transfer_manager, "connector", None)
             raw_cfg = getattr(connector, "config", {}) or {}
@@ -187,10 +187,8 @@ def llm2code2wav_async_chunk(
 
     # Text-only paths (e.g. modalities=["text"]) yield no codec pooling output;
     # stage-0 still drives the chunk transfer adapter, so treat None as "no codes
-    # this step" rather than letting `.get()` raise AttributeError — an unhandled
-    # error here drops the chunk, starves stage-1 of the finished payload, and
-    # the stage subprocesses die before the final token is emitted.
-    po_codes = pooling_output.get("codes", {}) if pooling_output is not None else {}
+    # this step" rather than letting `.get()` raise AttributeError.
+    po_codes = multimodal_output.get("codes", {}) if multimodal_output is not None else {}
     if "audio" not in po_codes:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)

@@ -29,14 +29,14 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportAudioOutput
+from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
     StableAudioDiTModel,
     StableAudioSchedulerWrapper,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -65,7 +65,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
+class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -77,12 +77,19 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         prefix: Weight prefix for loading (default: "")
     """
 
+    supports_request_batch = False
+
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the
     # ``multimodal_output`` payload includes the sample rate (mirrors the
     # contract introduced for AudioX in #2077).
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 44100
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = ["projection_model"]
 
     def __init__(
         self,
@@ -380,7 +387,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         audio_end_in_s: float | None = None,
@@ -600,9 +607,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         # Trim to requested length
         audio = audio[:, :, waveform_start:waveform_end]
 
-        return DiffusionOutput(
-            output=audio, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return DiffusionOutput(output=audio, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

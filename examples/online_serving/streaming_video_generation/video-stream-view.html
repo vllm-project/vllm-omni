@@ -1,0 +1,11 @@
+<!-- This file and the corresponding JS file are needed to display a streamable video view in the Gradio demo.
+ Gradio's built-in video player does not support modern M4S streaming format. -->
+<div id="vllm-streaming-video-view" style="display:flex; flex-direction:column; gap:10px;">
+  <video id="vllm-streaming-video-player" autoplay muted controls playsinline
+    style="width:100%; min-height:320px; background:#111; border-radius:8px;"></video>
+  <div style="display:flex; align-items:center; gap:10px;">
+    <span id="vllm-streaming-video-status" style="font-weight:600;">Ready</span>
+  </div>
+  <pre id="vllm-streaming-video-log" style="height:220px; overflow:auto; margin:0; padding:10px; border-radius:8px;
+              background:#0f172a; color:#dbeafe; font-size:12px; white-space:pre-wrap;">Ready.</pre>
+</div>

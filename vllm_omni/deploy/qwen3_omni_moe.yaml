@@ -31,12 +31,8 @@ stages:
     enable_prefix_caching: false
     devices: "0"
     default_sampling_params:
-      temperature: 0.4
-      top_p: 0.9
-      top_k: 1
+      temperature: 0.0
       max_tokens: 2048
-      seed: 42
-      repetition_penalty: 1.05
 
   - stage_id: 1
     max_num_batched_tokens: 32768
@@ -81,13 +77,19 @@ platforms:
         gpu_memory_utilization: 0.6
         tensor_parallel_size: 2
         max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE   # Qwen3-Omni not FULL-cudagraph-safe on NPU
         devices: "0,1"
       - stage_id: 1
         gpu_memory_utilization: 0.6
         max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE   # code_predictor MaskedSelect / inner NPU graph replay
         devices: "2"
       - stage_id: 2
         gpu_memory_utilization: 0.3
+        compilation_config:
+          cudagraph_mode: PIECEWISE
         devices: "2"
 
   # Code2Wav decode uses UpSample1d, which calls F.conv_transpose1d.

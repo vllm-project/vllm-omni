@@ -2,6 +2,9 @@
 # HF: OpenMOSS-Team/MOSS-VoiceGenerator
 # Zero-shot voice design — create a new voice from a text description.
 async_chunk: true
+# OpenMOSS-Team/MOSS-VoiceGenerator ships custom modeling code; the newer vLLM
+# ModelConfig hard-rejects it at validation without this (was lenient before).
+trust_remote_code: true
 
 connectors:
   shm:
@@ -19,6 +22,11 @@ stages:
   - stage_id: 0
     max_num_seqs: 8
     gpu_memory_utilization: 0.60
+    # The MOSS talker (custom audio heads + per-request GPU buffers) is not
+    # CUDA-graph-safe; FULL-decode graph capture crashes the worker. Run the
+    # LLM stage eager, matching the other TTS talker configs (ming_tts,
+    # moss_tts_nano).
+    enforce_eager: true
     enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 4096

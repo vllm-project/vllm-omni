@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
@@ -44,7 +45,40 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+
+
+def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
+    """Convert a flattened payload to strictly ``dict[str, torch.Tensor]``.
+
+    Non-tensor scalars (int, float, bool) are wrapped with ``torch.tensor()``.
+    Values that cannot be safely converted are dropped with a warning.
+    This enforces the tensor-only invariant required by the
+    ``OmniEngineCoreOutput.multimodal_output`` wire field and msgspec
+    serialization. Mirrors ``gpu_ar_model_runner._ensure_tensor_values``.
+    """
+    result: dict[str, torch.Tensor] = {}
+    for key, val in payload.items():
+        if isinstance(val, torch.Tensor):
+            result[key] = val
+        elif isinstance(val, (int, float, bool)):
+            result[key] = torch.tensor(val)
+        elif isinstance(val, (list, tuple)):
+            try:
+                result[key] = torch.tensor(val)
+            except (ValueError, TypeError, RuntimeError):
+                logger.warning(
+                    "Dropping non-tensorizable multimodal output key '%s' (type=%s) from wire payload.",
+                    key,
+                    type(val).__name__,
+                )
+        else:
+            logger.warning(
+                "Dropping non-tensor multimodal output key '%s' (type=%s) from wire payload.",
+                key,
+                type(val).__name__,
+            )
+    return result
 
 
 class ExecuteModelState(NamedTuple):
@@ -76,6 +110,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        self._async_chunk = getattr(self.model_config, "async_chunk", False)
         self._downstream_payload_cache: dict[str, bool] = {}
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -163,7 +198,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         num_tokens_padded: int,
     ):
         if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-            if multimodal_outputs is not None and not isinstance(multimodal_outputs, dict):
+            if multimodal_outputs is not None and not isinstance(multimodal_outputs, Mapping):
                 logger.warning_once(
                     "prefix caching expects mm outputs to be a dict, but got %s",
                     type(multimodal_outputs),
@@ -215,6 +250,26 @@ class NPUARModelRunner(OmniNPUModelRunner):
             return combined_hidden_states[rid]
         return hidden_states_cpu[start:end]
 
+
+    def _build_multimodal_outputs(
+        self,
+        per_req_payloads: list[dict[str, object] | None] | None,
+    ) -> list[dict[str, torch.Tensor] | None] | None:
+        if self.vllm_config.model_config.engine_output_type == "text":
+            return None
+        if per_req_payloads is None:
+            return None
+        wire_payloads: list[dict[str, torch.Tensor] | None] = []
+        for payload in per_req_payloads:
+            if not payload:
+                wire_payloads.append(None)
+            else:
+                wire_payloads.append(_ensure_tensor_values(payload))
+        if all(item is None for item in wire_payloads):
+            return None
+        return wire_payloads
+
+
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
         if not isinstance(info, dict):
@@ -240,9 +295,38 @@ class NPUARModelRunner(OmniNPUModelRunner):
     def _resolve_pooler_payload_req_ids(self, req_ids_output_copy: list[str]) -> tuple[str, list[str]]:
         downstream_req_ids = [rid for rid in req_ids_output_copy if self._request_needs_downstream_stage_payload(rid)]
         engine_output_type = (self.vllm_config.model_config.engine_output_type or "").lower()
+        # Single-stage AR TTS models (e.g. VoxCPM2) finish on this stage but still
+        # need multimodal payloads for final audio postprocess/output.
         if engine_output_type == "audio" and not downstream_req_ids:
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
+
+    @staticmethod
+    def _sparse_mm_req_ids(multimodal_outputs: Any) -> list[str] | None:
+        if not isinstance(multimodal_outputs, dict):
+            return None
+        meta = multimodal_outputs.get("meta")
+        req_ids = None
+        sparse_audio = False
+        if isinstance(meta, dict):
+            req_ids = meta.get("req_id")
+            sparse_audio = NPUARModelRunner._is_sparse_audio_marker(meta.get("sparse_audio"))
+        if req_ids is None:
+            req_ids = multimodal_outputs.get("meta.req_id")
+            sparse_audio = NPUARModelRunner._is_sparse_audio_marker(multimodal_outputs.get("meta.sparse_audio"))
+        if not sparse_audio:
+            return None
+        if not isinstance(req_ids, list):
+            return None
+        return [rid for rid in req_ids if isinstance(rid, str)]
+
+    @staticmethod
+    def _is_sparse_audio_marker(value: Any) -> bool:
+        if isinstance(value, list):
+            return any(str(item).lower() in ("1", "true", "yes", "on") for item in value)
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
     #  -------------------------------------- Omni-new -------------------------------------------------
 
     @torch.inference_mode()
@@ -610,7 +694,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if multimodal_outputs is not None:
                 keys_or_type = (
                     list(multimodal_outputs.keys())
-                    if isinstance(multimodal_outputs, dict)
+                    if isinstance(multimodal_outputs, Mapping)
                     else type(multimodal_outputs)
                 )
                 logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
@@ -910,16 +994,27 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        sparse_mm_req_ids = self._sparse_mm_req_ids(multimodal_outputs)
+        sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
+        if engine_output_type == "audio" and sparse_mm_req_ids is not None:
+            sparse_req_id_set = set(sparse_mm_req_ids)
+            downstream_req_ids = [rid for rid in req_ids_output_copy if rid in sparse_req_id_set]
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
-        if needs_pooler_payload:
+        audio_sparse_output = engine_output_type == "audio" and sparse_mm_req_ids is not None
+        needs_scheduled_hidden_payload = needs_pooler_payload and (
+            self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
+        )
+        if needs_scheduled_hidden_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
             )
-            if len(downstream_req_ids) == len(req_ids_output_copy):
+            if audio_sparse_output:
+                pass
+            elif len(downstream_req_ids) == len(req_ids_output_copy):
                 hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
             else:
                 req_hidden_states_cpu = {}
@@ -931,9 +1026,14 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 dtype=np.int32,
             )
         query_start_loc_cpu = self.query_start_loc.cpu
+        if callable(query_start_loc_cpu):
+            query_start_loc_cpu = query_start_loc_cpu()
 
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
+            combined_hidden_states = None
+            combined_multimodal_outputs = None
+            mm_cpu = None
             if self.omni_prefix_cache is not None:
                 (
                     combined_hidden_states,
@@ -943,8 +1043,10 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )
-            else:
-                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
+            if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
+                mm_cpu = build_mm_cpu(
+                    flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                )
 
             self._process_additional_information_updates(
                 hidden_states,
@@ -973,17 +1075,20 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 start = int(query_start_loc_cpu[idx])
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
-                if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                    req_hidden_states = req_hidden_states_cpu[rid]
-                else:
-                    req_hidden_states = self._resolve_req_hidden_states(
-                        hidden_states_cpu,
-                        combined_hidden_states,
-                        rid,
-                        start,
-                        end,
-                    )
-                payload: dict[str, object] = {"hidden": req_hidden_states}
+                payload: dict[str, object] = {}
+                if not audio_sparse_output:
+                    if req_hidden_states_cpu is not None and combined_hidden_states is None:
+                        req_hidden_states = req_hidden_states_cpu[rid]
+                    else:
+                        req_hidden_states = self._resolve_req_hidden_states(
+                            hidden_states_cpu,
+                            combined_hidden_states,
+                            rid,
+                            start,
+                            end,
+                        )
+                    payload["hidden"] = req_hidden_states
+
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
                     if combined_multimodal_outputs:
@@ -1006,6 +1111,25 @@ class NPUARModelRunner(OmniNPUModelRunner):
                             mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
                     else:
                         for mm_key, mm_val in mm_cpu.items():
+                            if mm_key in {"meta.req_id", "meta.sparse_audio"}:
+                                continue
+                            if audio_sparse_output and isinstance(mm_val, list):
+                                sparse_idx = sparse_mm_index.get(rid)
+                                if sparse_idx is None:
+                                    continue
+                                if sparse_idx >= len(mm_val):
+                                    logger.warning(
+                                        "Sparse multimodal payload mismatch for request %s: index %d >= %d.",
+                                        rid,
+                                        sparse_idx,
+                                        len(mm_val),
+                                    )
+                                    continue
+                                sparse_val = mm_val[sparse_idx]
+                                mm_payload[mm_key] = (
+                                    sparse_val.clone() if isinstance(sparse_val, torch.Tensor) else sparse_val
+                                )
+                                continue
                             mm_payload[mm_key] = to_payload_element(
                                 element=mm_val,
                                 idx=idx,
@@ -1017,13 +1141,25 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 
+        pooler_output = pooler_output or []
+        if self._async_chunk:
+            pooler_inter, pooler_client = partition_payload_list(pooler_output)
+        else:
+            # Non-async-chunk ships the full payload to the next stage via
+            # inter_stage_outputs (the NPU runner has no separate full-payload
+            # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
+            pooler_inter, pooler_client = pooler_output, pooler_output
+        inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
+        multimodal_outputs = self._build_multimodal_outputs(pooler_client)
         model_runner_output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=(pooler_output if engine_output_type != "text" and needs_pooler_payload else None),
+            pooler_output=None,
+            multimodal_outputs=multimodal_outputs,
+            inter_stage_outputs=inter_stage_outputs,
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,

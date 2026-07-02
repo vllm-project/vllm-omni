@@ -57,6 +57,22 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     )
 
 
+def enable_sensenova_u1_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Enable TeaCache for SenseNova-U1 denoising forwards."""
+    teacache_config = TeaCacheConfig(
+        transformer_type="SenseNovaU1ForCausalLM",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    transformer = pipeline.denoising_transformer
+    apply_teacache_hook(transformer, teacache_config)
+
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
 def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     """
     Enable TeaCache for Flux2 Klein model.
@@ -80,6 +96,7 @@ CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
+    "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
 }
 
 
@@ -180,6 +197,8 @@ class TeaCacheBackend(CacheBackend):
 
         # Extract transformer from pipeline
         transformer = pipeline.transformer
+        if not hasattr(transformer, "_hook_registry") and hasattr(pipeline, "denoising_transformer"):
+            transformer = pipeline.denoising_transformer
 
         if hasattr(transformer, "_hook_registry"):
             hook = transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME)

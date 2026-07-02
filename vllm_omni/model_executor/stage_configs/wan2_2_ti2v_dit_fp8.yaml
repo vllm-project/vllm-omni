@@ -1,0 +1,41 @@
+# Stage config for running Wan2.2 TI2V-5B DiT with ModelOpt FP8 auto-detect.
+# Single GPU (TI2V-5B fits 80GB BF16; FP8 drops by ~half).
+# For the A14B MoE variants, bump `tensor_parallel_size` and `devices`.
+#
+# Use with a ModelOpt FP8 checkpoint (e.g. produced by
+# examples/quantization/quantize_wan2_2_modelopt_fp8.py).
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      # Wan2.2 TI2V-5B is served by the base Wan22Pipeline, which auto-detects
+      # expand_timesteps (TI2V-5B mode) from model_index.json. (The standalone
+      # Wan22TI2VPipeline was consolidated into Wan22Pipeline upstream.)
+      model_class_name: Wan22Pipeline
+      max_num_seqs: 1
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      # Tile the VAE decode by default. Wan2.2's 480p peak is DiT-dominated (so
+      # FP8 is the main lever here), but tiling adds headroom for higher
+      # resolutions / longer clips at negligible cost. Override with --vae-use-tiling/false.
+      vae_use_tiling: true
+      parallel_config:
+        tensor_parallel_size: 1
+
+    final_output: true
+    final_output_type: video
+    is_comprehension: false
+    default_sampling_params:
+      seed: 42
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1

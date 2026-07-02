@@ -104,7 +104,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "voice": "default",
         "ref_audio": "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/zh_1.wav",
         "response_format": "wav",
-        "stream": true
+        "stream": true,
+        "stream_format": "audio"
     }' --output output.wav
 ```
 

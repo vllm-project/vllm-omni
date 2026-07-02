@@ -33,6 +33,15 @@ models:
       voice_clone:
         task_type: Base
 
+  bosonai/higgs-audio-v3-tts-4b:
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice: {}
+      voice_clone: {}
+
   openbmb/VoxCPM2:
     supported_tasks: [voice_clone, default_voice]
     trust_remote_code: true
@@ -65,6 +74,17 @@ models:
       voice_clone: {}
 
   OpenMOSS-Team/MOSS-TTS-Realtime:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
+  # MOSS-TTS-Local-Transformer-v1.5: Qwen3 backbone + 1-layer GPT2-style local
+  # depth transformer (n_vq=12), paired with the 48 kHz stereo
+  # MOSS-Audio-Tokenizer-v2 codec. Same voice-clone request shape as the
+  # other MOSS-TTS variants.
+  OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech
     endpoint: /v1/audio/speech

@@ -53,6 +53,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_sample_one as _ras_sample_one
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -411,7 +412,7 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
 
         # Load voice clone components (speech tokenizer + CampPlus)
         if load_voice_clone:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
             self.processor_device = device
             campplus_path = getattr(self, "_campplus_path", None) or resolve_glm_tts_campplus_path(model_dir)
             self._campplus_path = campplus_path

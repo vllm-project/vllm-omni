@@ -84,6 +84,11 @@ def _make_code2wav_model(
         token_mel_ratio=2 if with_stride_cfg else 0,
     )
     model.code2wav = _DummyCode2Wav(vocab_size=4, num_samples=num_samples, outputs=outputs)
+    # Short-circuit the lazy TensorRT estimator swap: these tests exercise the
+    # forward audio logic, not the TRT path. On a GPU CI runner the swap would
+    # otherwise run and dereference ``self.model_dir`` (only set in __init__,
+    # which this fixture bypasses via object.__new__).
+    model._code2wav_trt_done = True
     model.source_cache_len = 4
     model.speech_window = torch.hamming_window(8, periodic=False)
     model._stream_audio_cache_by_req = {}

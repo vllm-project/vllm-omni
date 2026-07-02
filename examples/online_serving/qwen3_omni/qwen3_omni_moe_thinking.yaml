@@ -20,7 +20,7 @@ stage_args:
       trust_remote_code: true
       engine_output_type: text
       distributed_executor_backend: "mp"
-      enable_prefix_caching: false
+      enable_prefix_caching: true
       hf_config_name: thinker_config
       tensor_parallel_size: 2
     final_output: true

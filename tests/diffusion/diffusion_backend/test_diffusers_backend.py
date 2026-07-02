@@ -18,6 +18,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.models.diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -48,7 +49,7 @@ def _make_request(**overrides) -> OmniDiffusionRequest:
         prompt_obj["negative_prompt"] = negative_prompt
 
     defaults = {
-        "prompts": [prompt_obj],
+        "prompt": prompt_obj,
         "sampling_params": OmniDiffusionSamplingParams(
             num_inference_steps=20,
             guidance_scale=7.5,
@@ -110,6 +111,11 @@ class _TransformerBackedPipeline(DiffusionPipeline):
         pass
 
 
+def _make_batch(**overrides) -> DiffusionRequestBatch:
+    """Wrap a single request in a DiffusionRequestBatch, matching the forward contract."""
+    return DiffusionRequestBatch(requests=[_make_request(**overrides)])
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 class TestPipelineArgumentsHandling:
@@ -128,7 +134,7 @@ class TestPipelineArgumentsHandling:
             "__call__",
             return_value=MockPipelineOutput(image=stub_image),
         )
-        output = adapter.forward(request)
+        output = adapter.forward(DiffusionRequestBatch(requests=[request]))
 
         assert isinstance(output, DiffusionOutput)
         assert isinstance(output.output, MockPipelineOutput)
@@ -363,7 +369,7 @@ class TestPipelineArgumentsHandling:
             "__call__",
             return_value=raw_output,
         )
-        output = adapter.forward(_make_request())
+        output = adapter.forward(_make_batch())
 
         assert isinstance(output, DiffusionOutput)
         assert output.output == raw_output
@@ -423,7 +429,7 @@ class TestPipelineArgumentsHandling:
             ),
         )
 
-        kwargs = adapter._build_call_kwargs(req)
+        kwargs = adapter._build_call_kwargs(DiffusionRequestBatch(requests=[req]))
 
         assert kwargs["prompt"] == "a cat on mars"
         assert kwargs["negative_prompt"] == "low quality"
@@ -621,7 +627,7 @@ class TestPipelineArgumentsHandling:
             ),
         )
         with pytest.raises(ValueError):
-            pipeline.forward(problematic_request)
+            pipeline.forward(DiffusionRequestBatch(requests=[problematic_request]))
 
 
 @pytest.mark.advanced_model
