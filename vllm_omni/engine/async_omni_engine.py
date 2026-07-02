@@ -204,6 +204,7 @@ class AsyncOmniEngine:
     _log_stats: bool = False
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
+    _enable_orch_monitor: bool = False
 
     def __init__(
         self,
@@ -233,6 +234,7 @@ class AsyncOmniEngine:
         # replica) vllm:* wrap stays registered but reads zero. Respects the
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
+        self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -425,6 +427,7 @@ class AsyncOmniEngine:
                 running_counter=self._running_counter,
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
+                enable_orch_monitor=self._enable_orch_monitor,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -953,6 +956,7 @@ class AsyncOmniEngine:
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
+            vae_parallel_mode = normalized_kwargs.get("vae_parallel_mode") or "tile"
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
@@ -971,6 +975,7 @@ class AsyncOmniEngine:
                 ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
+                vae_parallel_mode=vae_parallel_mode,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
@@ -998,6 +1003,7 @@ class AsyncOmniEngine:
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
+            "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
             "cache_backend": cache_backend,
@@ -1027,6 +1033,7 @@ class AsyncOmniEngine:
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             "extras": {
                 "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),

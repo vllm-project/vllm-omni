@@ -33,6 +33,62 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize legacy diffusion kwargs before config construction."""
+    normalized = dict(kwargs)
+
+    # Backwards-compatibility: older callers may use a diffusion-specific
+    # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
+    if "static_lora_scale" in normalized:
+        if "lora_scale" not in normalized:
+            normalized["lora_scale"] = normalized["static_lora_scale"]
+        normalized.pop("static_lora_scale", None)
+
+    # Backwards-compatibility: map "quantization" to "quantization_config"
+    # so callers using the old field name still work.
+    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
+        normalized["quantization_config"] = normalized.pop("quantization")
+    else:
+        normalized.pop("quantization", None)
+
+    # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
+    if normalized.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in normalized:
+        normalized["diffusion_kv_cache_dtype"] = normalized.pop("kv_cache_dtype")
+    else:
+        normalized.pop("kv_cache_dtype", None)
+    if normalized.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in normalized:
+        normalized["diffusion_kv_cache_skip_steps"] = normalized.pop("kv_cache_skip_steps")
+    else:
+        normalized.pop("kv_cache_skip_steps", None)
+    if normalized.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in normalized:
+        normalized["diffusion_kv_cache_skip_layers"] = normalized.pop("kv_cache_skip_layers")
+    else:
+        normalized.pop("kv_cache_skip_layers", None)
+
+    # Handle "diffusion_attention_backend" shorthand: merge into
+    # diffusion_attention_config before field filtering.
+    diffusion_attn_backend = normalized.pop("diffusion_attention_backend", None)
+    if diffusion_attn_backend is not None:
+        existing = normalized.get("diffusion_attention_config")
+        normalized["diffusion_attention_config"] = parse_attention_config(
+            existing,
+            attention_backend=diffusion_attn_backend,
+        )
+
+    # Check environment variable as fallback for cache_backend.
+    # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
+    if "cache_backend" not in normalized:
+        cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
+        normalized["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+
+    # Convert optional YAML null values to empty containers.
+    for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
+        if key in normalized and normalized[key] is None:
+            normalized[key] = {}
+
+    return normalized
+
+
 def parse_kv_cache_skip_selector(
     selector: str | list[int] | tuple[int, ...] | set[int] | None,
 ) -> set[int] | None:
@@ -127,6 +183,21 @@ class DiffusionParallelConfig:
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
 
+    vae_parallel_mode: str = "tile"
+    """VAE parallel decode strategy.
+
+    - "tile": Patch/tile parallel decode (default). Each rank decodes a subset
+      of spatial tiles and the results are stitched on rank 0.
+    - "spatial_shard_height": Spatially-sharded decode that splits decoder
+      feature maps along height and exchanges halo rows around spatial
+      convolutions.
+    - "spatial_shard_width": Same as "spatial_shard_height" but sharded along width.
+
+    The "spatial_shard_*" modes are decode-only and currently require
+    ``vae_patch_parallel_size`` to match the DiT group size; otherwise the VAE
+    falls back to tile-parallel decode at runtime.
+    """
+
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
 
@@ -158,6 +229,10 @@ class DiffusionParallelConfig:
             f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
         )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
+        assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+            f"but got {self.vae_parallel_mode!r}."
+        )
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
@@ -689,8 +764,17 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Streaming mode settings
+    streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
+
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
+
+    # Request-mode batch admission: wait briefly for compatible requests to
+    # accumulate in the scheduler waiting queue before the first schedule() of
+    # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
+    # 0 disables admission (default; no added latency).
+    request_batch_max_wait_ms: float = 0.0
 
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
@@ -764,6 +848,9 @@ class OmniDiffusionConfig:
 
     def __post_init__(self):
         self.master_port = self._resolve_master_port()
+        self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
+        if self.request_batch_max_wait_ms < 0:
+            raise ValueError(f"request_batch_max_wait_ms must be non-negative, got {self.request_batch_max_wait_ms}.")
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
@@ -1080,55 +1167,7 @@ class OmniDiffusionConfig:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
-        # Backwards-compatibility: older callers may use a diffusion-specific
-        # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale"
-        # before constructing the dataclass to avoid TypeError on unknown fields.
-        if "static_lora_scale" in kwargs:
-            if "lora_scale" not in kwargs:
-                kwargs["lora_scale"] = kwargs["static_lora_scale"]
-            kwargs.pop("static_lora_scale", None)
-
-        # Backwards-compatibility: map "quantization" to "quantization_config"
-        # so callers using the old field name still work.
-        if "quantization" in kwargs and kwargs.get("quantization_config", None) is None:
-            kwargs["quantization_config"] = kwargs.pop("quantization")
-        else:
-            kwargs.pop("quantization", None)
-
-        # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-        if kwargs.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in kwargs:
-            kwargs["diffusion_kv_cache_dtype"] = kwargs.pop("kv_cache_dtype")
-        else:
-            kwargs.pop("kv_cache_dtype", None)
-        if kwargs.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in kwargs:
-            kwargs["diffusion_kv_cache_skip_steps"] = kwargs.pop("kv_cache_skip_steps")
-        else:
-            kwargs.pop("kv_cache_skip_steps", None)
-        if kwargs.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in kwargs:
-            kwargs["diffusion_kv_cache_skip_layers"] = kwargs.pop("kv_cache_skip_layers")
-        else:
-            kwargs.pop("kv_cache_skip_layers", None)
-
-        # Handle "diffusion_attention_backend" shorthand: merge into
-        # diffusion_attention_config before field filtering.
-        diffusion_attn_backend = kwargs.pop("diffusion_attention_backend", None)
-        if diffusion_attn_backend is not None:
-            existing = kwargs.get("diffusion_attention_config")
-            kwargs["diffusion_attention_config"] = parse_attention_config(
-                existing,
-                attention_backend=diffusion_attn_backend,
-            )
-
-        # Check environment variable as fallback for cache_backend
-        # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
-        if "cache_backend" not in kwargs:
-            cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
-            kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
-
-        # Convert optional YAML null values to empty containers.
-        for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
-            if key in kwargs and kwargs[key] is None:
-                kwargs[key] = {}
+        kwargs = normalize_omni_diffusion_kwargs(kwargs)
 
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
@@ -1163,6 +1202,11 @@ class DiffusionOutput:
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+    # Streaming info (the defaults should make sense for non-streaming mode)
+    finished: bool = True
+    chunk_index: int = 0
+    total_chunks: int = 1
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)

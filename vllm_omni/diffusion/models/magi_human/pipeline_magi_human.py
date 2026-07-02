@@ -53,6 +53,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .magi_human_dit import (
     DiTModel,
@@ -2160,7 +2161,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
     @torch.inference_mode()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         height: int = 256,
         width: int = 448,

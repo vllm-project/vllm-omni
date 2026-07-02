@@ -38,13 +38,11 @@ from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
 logger = init_logger(__name__)
 
-try:
-    # ``set_device_control_env_var`` lives next to CoreEngineProcManager and
-    # is only required for non-CUDA DP, so we tolerate its absence on
-    # older / future vLLM revisions.
-    from vllm.v1.engine.utils import set_device_control_env_var  # type: ignore
-except ImportError:  # pragma: no cover - depends on vLLM build
-    set_device_control_env_var = None  # type: ignore[assignment]
+# ``set_device_control_env_var`` was removed from upstream vllm.
+# It was only required for non-CUDA DP; set to None so the existing
+# guard at the call-site (vllm_config is not None and ... is not None)
+# skips the call transparently.
+set_device_control_env_var = None
 
 
 class StageEngineCoreProcManager(CoreEngineProcManager):

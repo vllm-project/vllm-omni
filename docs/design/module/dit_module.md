@@ -199,7 +199,7 @@ class _BaseScheduler(SchedulerInterface):
 - **Shared cleanup logic**: Duplicate-request checks, finish handling, and state removal are centralized instead of
   duplicated in each policy.
 
-- **Current constraint boundary**: `_BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`, but request-mode diffusion is still clamped back to `1` by the engine. The step-wise path can keep this above `1` for compatible-request batching.
+- **Current constraint boundary**: `_BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`. Request-mode diffusion can use that capacity for compatible independent requests when the configured pipeline declares `supports_request_batch = True`; step-wise diffusion uses the same scheduler capacity for compatible step batches.
 
 #### 2.4 Current `RequestScheduler` Policy
 
@@ -215,7 +215,7 @@ class RequestScheduler(_BaseScheduler):
 
 - **FIFO request scheduling**: Waiting requests are promoted in queue order.
 
-- **Single-request admission**: `RequestScheduler` still admits one active request at a time because request-mode execution completes a whole request per dispatch.
+- **Compatible request admission**: `RequestScheduler` admits waiting requests while capacity remains and the request's `SamplingParamsKey` is compatible with the active batch. Request-mode execution keeps each logical request independent, while batch-capable pipelines receive the scheduled requests as a runner-side `DiffusionRequestBatch`.
 
 - **Executor result feedback**: `update_from_output()` converts executor output into `FINISHED_COMPLETED` or `FINISHED_ERROR` and returns finished request ids.
 
@@ -235,7 +235,12 @@ while True:
 
 - **No scheduler-owned IPC**: Scheduler no longer talks to workers directly.
 
-- **Split concurrency model**: Request-mode diffusion remains single-active-request, while the step-wise path can keep multiple compatible requests running and advance them independently between denoise steps.
+- **Split concurrency model**: Request-mode diffusion can schedule a static
+  batch of compatible independent requests for one full pipeline forward when
+  the pipeline supports request-level batching; the step-wise path can also
+  admit or remove compatible requests between denoise steps. See
+  [Request-Level Batching](../feature/diffusion_request_level_batching.md) and
+  [Continuous Batching for Step-Wise Diffusion](../feature/diffusion_continuous_batching.md).
 
 ---
 

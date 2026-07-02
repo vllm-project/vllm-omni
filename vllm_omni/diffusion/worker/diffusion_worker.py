@@ -48,7 +48,7 @@ from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -80,6 +80,10 @@ class _DiffusionVllmModelConfig:
 
     def is_nvfp4_quantized(self) -> bool:
         return self.quantization == "modelopt_fp4"
+
+    @property
+    def is_diffusion(self) -> bool:
+        return False
 
 
 def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
@@ -255,6 +259,7 @@ class DiffusionWorker:
             "Final IR op priority after setting vLLM-Omni overrides: %s", vllm_config.kernel_config.ir_op_priority
         )
         self.vllm_config = vllm_config
+        current_omni_platform.init_diffusion_worker_vllm_config(vllm_config)
 
         # Initialize distributed environment
         with (
@@ -368,7 +373,12 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
-    def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self,
+        req: OmniDiffusionRequest,
+        od_config: OmniDiffusionConfig,
+        kv_prefetch_jobs: dict | None = None,
+    ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
@@ -381,7 +391,29 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req)
+            output = self.model_runner.execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+        if profiler:
+            profiler.step()
+        return output
+
+    def execute_model_batch(
+        self, scheduler_output: DiffusionSchedulerOutput, od_config: OmniDiffusionConfig
+    ) -> BatchRunnerOutput:
+        """Batch forward: LoRA activate once, delegate to model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        # LoRA: same adapter/scale within batch guaranteed by SamplingParamsKey
+        if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
+            sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
+            try:
+                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
+            except Exception as exc:
+                if sp.lora_request is not None:
+                    raise
+                logger.warning("LoRA activation skipped: %s", exc)
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_model_batch(scheduler_output, od_config)
         if profiler:
             profiler.step()
         return output
@@ -645,6 +677,10 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
+        if self.model_runner is not None:
+            mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+            if mgr is not None:
+                mgr.shutdown_prefetch()
         destroy_distributed_env()
 
 
@@ -877,7 +913,7 @@ class WorkerProc:
                 continue
 
             else:
-                # Handle generation request
+                # Handle direct generation requests.
                 try:
                     output = self.worker.execute_model(msg, self.od_config)
                 except Exception as e:
@@ -1076,18 +1112,24 @@ class WorkerWrapperBase:
         """
         return self.worker.generate(requests)
 
-    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        od_config: OmniDiffusionConfig,
+        kv_prefetch_jobs: dict | None = None,
+    ) -> DiffusionOutput:
         """
         Execute a forward pass.
 
         Args:
             reqs: List of diffusion requests
             od_config: OmniDiffusionConfig configuration
+            kv_prefetch_jobs: Optional next-request KV prefetch descriptor.
 
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(reqs, od_config)
+        return self.worker.execute_model(reqs, od_config, kv_prefetch_jobs=kv_prefetch_jobs)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""

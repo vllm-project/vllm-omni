@@ -52,6 +52,8 @@ from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.metrics import definitions as defs
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
+_AUDIO_SAMPLE_RATE_ENV = "VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE"
+_AUDIO_CHANNELS_ENV = "VLLM_OMNI_BENCH_AUDIO_CHANNELS"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
@@ -107,6 +109,32 @@ def _audio_continuity_threshold_s() -> float:
         )
         return defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S
     return max(value, 0.0)
+
+
+def _audio_pcm_format() -> tuple[int, int]:
+    """Return ``(sample_rate, channels)`` of the streamed PCM response.
+
+    Defaults to 24 kHz mono (Qwen3-TTS / VoxCPM2 / most MOSS-TTS variants).
+    Override for models with a different codec output format (e.g.
+    MOSS-TTS-Local-Transformer-v1.5, which streams 48 kHz stereo PCM) via
+    ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` / ``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` -
+    getting this wrong silently skews audio_duration/audio_rtf/underrun stats.
+    """
+    sample_rate = 24000
+    channels = 1
+    raw_sr = os.environ.get(_AUDIO_SAMPLE_RATE_ENV)
+    if raw_sr:
+        try:
+            sample_rate = int(raw_sr)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %d", _AUDIO_SAMPLE_RATE_ENV, raw_sr, sample_rate)
+    raw_ch = os.environ.get(_AUDIO_CHANNELS_ENV)
+    if raw_ch:
+        try:
+            channels = int(raw_ch)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %d", _AUDIO_CHANNELS_ENV, raw_ch, channels)
+    return sample_rate, channels
 
 
 get_samples_old = datasets.get_samples
@@ -1105,9 +1133,9 @@ async def async_request_openai_audio_speech(
 ) -> MixRequestFuncOutput:
     """Streaming request to /v1/audio/speech endpoint.
 
-    Sends ``stream=true`` with ``response_format=pcm`` so the server returns
-    raw PCM chunks as they are decoded. This allows measuring TTFP (time to
-    first audio packet) separately from E2EL.
+    Sends ``stream=true`` with ``stream_format=audio`` and ``response_format=pcm``
+    so the server returns raw PCM chunks as they are decoded. This allows measuring
+    TTFP (time to first audio packet) separately from E2EL.
     """
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
@@ -1116,12 +1144,14 @@ async def async_request_openai_audio_speech(
         "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
         "input": request_func_input.prompt,
         "stream": True,
+        "stream_format": "audio",
         "response_format": "pcm",
     }
     _update_payload_common(payload, request_func_input)
     # Seed-TTS + WER: ``--extra-body`` may set stream=false / other formats; speech must stream PCM.
     if getattr(request_func_input, "seed_tts_row", False) and _seed_tts_capture_pcm_for_wer():
         payload["stream"] = True
+        payload["stream_format"] = "audio"
         payload["response_format"] = "pcm"
 
     headers = {
@@ -1133,10 +1163,10 @@ async def async_request_openai_audio_speech(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
-    # PCM format: 16-bit signed, 24 kHz, mono
-    sample_rate = 24000
+    # PCM format: 16-bit signed; sample_rate/channels are model-dependent
+    # (see _audio_pcm_format docstring).
+    sample_rate, channels = _audio_pcm_format()
     sample_width = 2  # 16-bit = 2 bytes
-    channels = 1
 
     st = time.perf_counter()
     output.start_time = st
@@ -1191,7 +1221,7 @@ async def async_request_openai_audio_speech(
                     ct = response.headers.get("Content-Type", "")
                     logger.warning(
                         "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
-                        "Check stream=true and response_format=pcm on the server.",
+                        "Check stream=true, stream_format=audio, and response_format=pcm on the server.",
                         ct,
                         api_url,
                     )
@@ -1231,7 +1261,7 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
-from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request
+from vllm.benchmarks.serve import TaskType, _merge_overrides, calculate_metrics_for_embeddings, get_request
 
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
@@ -1304,6 +1334,8 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
+    test_extra_body = _merge_overrides(extra_body, input_requests[0].request_overrides)
+    test_chat_messages = input_requests[0].chat_messages
 
     assert (
         test_mm_content is None
@@ -1321,7 +1353,8 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=extra_body,
+        extra_body=test_extra_body,
+        chat_messages=test_chat_messages,
     )
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
@@ -1385,7 +1418,8 @@ async def benchmark(
             multi_modal_content=test_mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=test_extra_body,
+            chat_messages=test_chat_messages,
         )
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
@@ -1451,6 +1485,7 @@ async def benchmark(
             request.multi_modal_data,
             request.request_id,
         )
+        per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -1467,8 +1502,9 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=per_request_extra_body,
             request_id=request_id,
+            chat_messages=request.chat_messages,
         )
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
@@ -1640,6 +1676,8 @@ async def benchmark(
             prompt_len=test_prompt_len,
             output_len=test_output_len,
             logprobs=logprobs,
+            extra_body=test_extra_body,
+            chat_messages=test_chat_messages,
         )
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:

@@ -241,6 +241,7 @@ datasets/
 *.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+!tests/assets/soulxsinger/*.json
 *.jsonl
 *.parquet
 

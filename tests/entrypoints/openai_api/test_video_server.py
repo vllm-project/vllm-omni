@@ -11,6 +11,7 @@ import json
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -99,6 +100,14 @@ class BlockingVideoHandler:
             raise
 
 
+class FakeServerSocket:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture(autouse=True)
 def isolated_video_backends(tmp_path, monkeypatch):
     """Use isolated in-memory metadata and local storage for each test."""
@@ -109,6 +118,91 @@ def isolated_video_backends(tmp_path, monkeypatch):
     monkeypatch.setattr(api_server, "VIDEO_TASKS", tasks)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
     return store, tasks, storage
+
+
+@pytest.mark.asyncio
+async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch):
+    events: list[str] = []
+    serve_started = asyncio.Event()
+    http_shutdown = asyncio.Event()
+    engine_context_exited = asyncio.Event()
+    sock = FakeServerSocket()
+
+    class FakeEngine:
+        stage_configs = []
+
+        async def get_supported_tasks(self):
+            return ("generate",)
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*args, **kwargs):
+        del args, kwargs
+        events.append("engine_enter")
+        try:
+            yield FakeEngine()
+        finally:
+            events.append("engine_exit")
+            engine_context_exited.set()
+
+    async def fake_serve_http(*args, **kwargs):
+        del args, kwargs
+        events.append("serve_http")
+        serve_started.set()
+
+        async def wait_for_shutdown():
+            await http_shutdown.wait()
+            events.append("http_shutdown")
+
+        return asyncio.create_task(wait_for_shutdown())
+
+    async def fake_storage_start():
+        events.append("storage_start")
+
+    async def fake_get_vllm_config(engine_client):
+        del engine_client
+        return None
+
+    async def fake_init_app_state(engine_client, state, args):
+        del engine_client, state, args
+        events.append("init_app_state")
+
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
+    monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
+
+    args = SimpleNamespace(
+        tool_parser_plugin="",
+        reasoning_parser_plugin="",
+        reasoning_parser=None,
+        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
+        enable_ssl_refresh=False,
+        host="127.0.0.1",
+        port=0,
+        uvicorn_log_level="info",
+        disable_uvicorn_access_log=True,
+        ssl_keyfile=None,
+        ssl_certfile=None,
+        ssl_ca_certs=None,
+        ssl_cert_reqs=None,
+        ssl_ciphers=None,
+        h11_max_incomplete_event_size=None,
+        h11_max_header_count=None,
+    )
+
+    worker_task = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:0", sock, args))
+    await asyncio.wait_for(serve_started.wait(), timeout=2)
+
+    assert not engine_context_exited.is_set()
+
+    http_shutdown.set()
+    await asyncio.wait_for(worker_task, timeout=2)
+
+    assert sock.closed
+    assert events.index("http_shutdown") < events.index("engine_exit")
 
 
 @pytest.fixture
@@ -1334,7 +1428,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
     extra_params = {
         "is_enable_stage2": True,
         "pyramid_num_stages": 3,
-        "pyramid_num_inference_steps_list": [20, 20, 20],
+        "pyramid_num_inference_steps_list": [1, 1, 1],
         "use_cfg_zero_star": True,
     }
     response = test_client.post(
@@ -1352,7 +1446,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
     captured = engine.captured_sampling_params_list[0]
     assert captured.extra_args["is_enable_stage2"] is True
     assert captured.extra_args["pyramid_num_stages"] == 3
-    assert captured.extra_args["pyramid_num_inference_steps_list"] == [20, 20, 20]
+    assert captured.extra_args["pyramid_num_inference_steps_list"] == [1, 1, 1]
     assert captured.extra_args["use_cfg_zero_star"] is True
 
 

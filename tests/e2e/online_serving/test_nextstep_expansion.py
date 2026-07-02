@@ -14,7 +14,7 @@ from tests.helpers.runtime import (
     dummy_messages_from_mix_data,
 )
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 # L4: 4 GPUs + TP=4; XPU B60: 2 cards (use num_cards={"cuda": 4, "xpu": 4} if needed)
 FOUR_CARD_MARKS = hardware_marks(

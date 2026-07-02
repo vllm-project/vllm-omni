@@ -24,6 +24,7 @@ For the full list of supported architectures across all modalities, see
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
+| SoulX-Singer | `Soul-AILab/SoulX-Singer` | ✓ (prompt audio) | — (batch only) | — (prompt + target audio) | — (chat client) |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
@@ -78,7 +79,7 @@ response = client.audio.speech.create(
 response.stream_to_file("output.wav")
 ```
 
-Streaming PCM output (where supported) — set `stream=true` with `response_format="pcm"`:
+Streaming PCM output (where supported) — set `stream=true`, `stream_format="audio"`, and `response_format="pcm"`:
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -87,6 +88,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "input": "Hello, how are you?",
         "voice": "default",
         "stream": true,
+        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
@@ -362,6 +364,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         \"input\": \"Hello, streaming output from MOSS-TTS-Nano.\",
         \"ref_audio\": \"data:audio/wav;base64,${REF_AUDIO}\",
         \"stream\": true,
+        \"stream_format\": \"audio\",
         \"response_format\": \"pcm\"
     }" --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
 ```
@@ -527,10 +530,11 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "voice": "vivian",
         "language": "English",
         "stream": true,
+        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
-Streaming requires `response_format="pcm"` and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
+Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
 
 ### Streaming WebSocket
 The `/v1/audio/speech/stream` endpoint accepts text incrementally, splits it at sentence boundaries, and emits one PCM stream per sentence:
@@ -631,7 +635,7 @@ After startup, `/v1/audio/voices` lists `alice`, and `/v1/audio/speech` can use 
 ```bash
 python voxcpm2/gradio_demo.py
 ```
-Uses an AudioWorklet-based player adapted from the Qwen3-TTS demo for gap-free playback. Audio is streamed from the OpenAI Speech endpoint with `stream=true`.
+Uses an AudioWorklet-based player adapted from the Qwen3-TTS demo for gap-free playback. Raw PCM audio is streamed from the OpenAI Speech endpoint with `stream=true` and `stream_format="audio"`.
 
 ---
 
@@ -661,3 +665,65 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 - Voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 - Voice cloning is gated upstream and may require a recent `mistral_common`.
 - A standalone CLI client is not yet shipped; the gradio demo is the canonical reference for now.
+
+---
+
+## SoulX-Singer
+
+Singing voice synthesis (SVS) and conversion (SVC) at 24 kHz. Single-stage DiT with inline preprocess. Uses the `/v1/chat/completions` endpoint with multimodal input (`prompt_audio` + `target_audio`).
+
+### Prerequisites
+
+Download DiT and preprocess weights, then set up separate SVS / SVC view directories and install dependencies as described in the [offline README](../../offline_inference/text_to_speech/README.md#soulx-singer). `config.json` `architectures` field is the single source of truth for SVS vs SVC — point `MODEL` at the matching directory.
+
+### Launch
+
+```bash
+# SVS (default)
+export MODEL=/path/to/SoulX-Singer
+export PREPROCESS=/path/to/SoulX-Singer-Preprocess
+bash examples/online_serving/text_to_speech/soulxsinger/run_server.sh
+
+# SVC
+export MODE=svc
+export MODEL=/path/to/SoulX-Singer-svc
+bash examples/online_serving/text_to_speech/soulxsinger/run_server.sh
+```
+
+Or equivalently, set `SOULX_PREPROCESS_WEIGHTS_DIR` and launch directly:
+```bash
+export SOULX_PREPROCESS_WEIGHTS_DIR=$PREPROCESS
+vllm serve $MODEL --omni \
+    --deploy-config vllm_omni/deploy/soulxsinger_${MODE}.yaml \
+    --port 8192 --trust-remote-code --enforce-eager
+```
+
+### Sending requests
+
+Audio paths must be reachable from the server host (local filesystem or data URL). The client sends prompt vocal via `input_audio` and target accompaniment via `extra_args['target_audio']`.
+
+```bash
+# Default demo audio: tests/assets/soulxsinger/zh_prompt.mp3 + music.mp3
+python examples/online_serving/text_to_speech/soulxsinger/openai_chat_client.py \
+    --prompt-audio /path/on/server/zh_prompt.mp3 \
+    --target-audio /path/on/server/music.mp3 \
+    --preprocess-weights-dir /path/on/server/SoulX-Singer-Preprocess \
+    -o output.wav
+```
+
+Use precomputed metadata to skip online preprocess with following command:
+```bash
+python examples/online_serving/text_to_speech/soulxsinger/openai_chat_client.py \
+    --prompt-metadata-path /path/on/server/zh_prompt.json \
+    --target-metadata-path /path/on/server/music.json \
+    --audio-path /path/on/server/zh_prompt.mp3 \
+    -o output.wav
+```
+
+`SOULX_PREPROCESS_WEIGHTS_DIR` makes `--preprocess-weights-dir` optional. See `openai_chat_client.py --help` for `--vocal-sep`, `--language`, `--num-inference-steps`, `--guidance-scale`, and `--seed`.
+
+### Notes
+
+- Output: 24 kHz mono WAV; batch only.
+- Defaults match upstream: `--guidance-scale 3.0`, `--seed 42`, `--auto-shift` on.
+- SVS `--control`: `score` or `melody`. MIDI / lyric QC: upstream `midi_editor` only.

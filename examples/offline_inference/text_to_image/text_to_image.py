@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import functools
 import json
 import time
 from pathlib import Path
@@ -38,14 +39,18 @@ def is_nextstep_model(model_name: str) -> bool:
     return False
 
 
-def parse_profiler_config(value: str) -> dict[str, Any]:
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
     try:
         config = json.loads(value)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
     if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
     return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 def parse_args() -> argparse.Namespace:
@@ -269,7 +274,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--extra-body",
-        type=parse_profiler_config,
+        type=functools.partial(parse_json_object, flag_name="--extra-body"),
         default=None,
         help=(
             "Model-specific generation params as a JSON object, e.g. "
@@ -425,6 +430,10 @@ def main():
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)
@@ -580,6 +589,12 @@ def main():
         if images:
             break
 
+    # Fallback: generation-stage pipelines (e.g. MammothModa2's AR->DiT) return the
+    # generated image as a tensor under multimodal_output instead of populating the
+    # `images` field that diffusion-stage pipelines fill.
+    if not images:
+        images = _images_from_multimodal_output(outputs)
+
     if not images:
         raise ValueError("No images found in request_output")
 
@@ -595,6 +610,37 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
+
+
+def _images_from_multimodal_output(outputs: list[Any]) -> list[Any]:
+    """Extract PIL images from multimodal_output tensors.
+
+    Generation-stage pipelines (e.g. MammothModa2's AR->DiT) return the generated
+    image as a tensor (normalized to [-1, 1], CHW) under ``multimodal_output``
+    rather than populating the ``images`` field. Convert any such tensors to PIL.
+    """
+    from PIL import Image
+
+    pil_images: list[Any] = []
+    for output in outputs:
+        req_out = getattr(output, "request_output", output)
+        for completion in getattr(req_out, "outputs", None) or []:
+            # multimodal_output is a MultimodalPayload (a Mapping) keyed by modality,
+            # matching how omni examples (ming_flash_omni / magi_human / dynin) read it.
+            mm = getattr(completion, "multimodal_output", None) or {}
+            if "image" not in mm:
+                continue
+            payload = mm["image"]
+            for tensor in payload if isinstance(payload, list) else [payload]:
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                img = tensor.detach().to("cpu", dtype=torch.float32)
+                if img.ndim == 4:
+                    img = img[0]
+                img = (img / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
+                img = img.permute(1, 2, 0).contiguous().numpy()
+                pil_images.append(Image.fromarray(img))
+    return pil_images
 
 
 if __name__ == "__main__":

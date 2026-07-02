@@ -1,7 +1,7 @@
 """WebSocket handler for streaming text input TTS.
 
-Accepts text incrementally via WebSocket, buffers and splits at sentence
-boundaries, and generates audio per sentence using the existing TTS pipeline.
+Accepts text incrementally via WebSocket, buffers it until input.done, and
+generates audio once for the buffered input using the existing TTS pipeline.
 
 Protocol:
     Client -> Server:
@@ -41,11 +41,6 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-from vllm_omni.entrypoints.openai.text_splitter import (
-    SPLIT_CLAUSE,
-    SPLIT_SENTENCE,
-    SentenceSplitter,
-)
 from vllm_omni.utils.forced_aligner import ForcedAlignerLoadError
 from vllm_omni.utils.forced_aligner import align as forced_align
 
@@ -63,8 +58,8 @@ class OmniStreamingSpeechHandler:
     """Handles WebSocket sessions for streaming text-input TTS.
 
     Each WebSocket connection is an independent session. Text arrives
-    incrementally, is split at sentence boundaries, and audio is generated
-    per sentence using the existing OmniOpenAIServingSpeech pipeline.
+    incrementally, is buffered until input.done, and audio is generated once
+    for the buffered input using the existing OmniOpenAIServingSpeech pipeline.
 
     Args:
         speech_service: The existing TTS serving instance (reused for
@@ -102,9 +97,7 @@ class OmniStreamingSpeechHandler:
                     await self._send_error(websocket, str(error))
                     return
 
-            boundary_re = SPLIT_CLAUSE if config.split_granularity == "clause" else SPLIT_SENTENCE
-            splitter = SentenceSplitter(boundary_re=boundary_re)
-            sentence_index = 0
+            text_parts: list[str] = []
 
             # 2. Receive text chunks until input.done
             while True:
@@ -138,23 +131,19 @@ class OmniStreamingSpeechHandler:
                     if not isinstance(text, str):
                         await self._send_error(websocket, "input.text requires a string value")
                         continue
-                    sentences = splitter.add_text(text)
-                    for sentence in sentences:
-                        await self._generate_and_send(websocket, config, sentence, sentence_index)
-                        sentence_index += 1
+                    text_parts.append(text)
 
                 elif msg_type == "input.done":
-                    # Flush remaining buffer
-                    remaining = splitter.flush()
-                    if remaining:
-                        await self._generate_and_send(websocket, config, remaining, sentence_index)
-                        sentence_index += 1
+                    full_text = "".join(text_parts).strip()
+                    total_sentences = 0
+                    if full_text:
+                        await self._generate_and_send(websocket, config, full_text, 0)
+                        total_sentences = 1
 
-                    # Send session.done
                     await websocket.send_json(
                         {
                             "type": "session.done",
-                            "total_sentences": sentence_index,
+                            "total_sentences": total_sentences,
                         }
                     )
                     return

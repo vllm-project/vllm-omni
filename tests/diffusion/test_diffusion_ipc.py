@@ -15,6 +15,7 @@ from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
 )
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -105,6 +106,30 @@ def test_rpc_result_envelope_diffusion_output_round_trips_through_shm() -> None:
     assert isinstance(result, DiffusionOutput)
     torch.testing.assert_close(result.output, tensor)
     assert unpacked["rank_statuses"] == [{"rank": 0, "ok": True}]
+
+
+def test_batch_runner_output_round_trips_nested_results_through_shm() -> None:
+    first = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    second = torch.arange(_large_numel(torch.float32), dtype=torch.float32) + 1
+    output = BatchRunnerOutput.from_list(
+        [
+            RunnerOutput(request_id="req-0", finished=True, result=DiffusionOutput(output=first)),
+            RunnerOutput(request_id="req-1", finished=True, result=DiffusionOutput(output={"image": second})),
+            RunnerOutput(request_id="req-error", finished=True, result=DiffusionOutput(error="boom")),
+        ]
+    )
+
+    pack_diffusion_output_shm(output)
+
+    assert output.runner_outputs[0].result.output["__tensor_shm__"] is True
+    assert output.runner_outputs[1].result.output["image"]["__tensor_shm__"] is True
+    assert output.runner_outputs[2].result.error == "boom"
+
+    unpack_diffusion_output_shm(output)
+
+    torch.testing.assert_close(output["req-0"].result.output, first)
+    torch.testing.assert_close(output["req-1"].result.output["image"], second)
+    assert output["req-error"].result.error == "boom"
 
 
 def test_pack_value_keeps_tensor_at_threshold_inline() -> None:
