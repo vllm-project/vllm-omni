@@ -100,7 +100,8 @@ def ar2diffusion(
 
     HunyuanImage3 produces one downstream diffusion request per parent AR
     request. ``source_outputs`` may include companion outputs, but the parent
-    output is always first and owns the downstream request identity.
+    output is expected first: the orchestrator bundles diffusion inputs as
+    ``[parent_output, *cfg_companion_outputs]`` before invoking this bridge.
 
     Args:
         prompt: Original user prompt (may contain multimodal data).
@@ -113,6 +114,7 @@ def ar2diffusion(
     if not source_outputs:
         return None
 
+    # The orchestrator constructs this list as [parent, *cfg_companions].
     ar_output = source_outputs[0]
     output = ar_output.outputs[0]
     generated_token_ids = output.cumulative_token_ids
