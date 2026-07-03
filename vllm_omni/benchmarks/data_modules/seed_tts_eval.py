@@ -57,8 +57,8 @@ from typing import Any
 import numpy as np
 from vllm.benchmarks.datasets import SampleRequest
 
-from vllm_omni.benchmarks.audio_format import stream_pcm_format_from_env
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
+from vllm_omni.metrics.definitions import stream_pcm_format_from_env
 
 logger = logging.getLogger(__name__)
 

@@ -36,7 +36,6 @@ from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
-from vllm_omni.benchmarks.audio_format import stream_pcm_format_from_env
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
@@ -1137,7 +1136,7 @@ async def async_request_openai_audio_speech(
     output.prompt_len = request_func_input.prompt_len
 
     # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
-    sample_rate, channels = stream_pcm_format_from_env()
+    sample_rate, channels = defs.stream_pcm_format_from_env()
     sample_width = 2  # 16-bit = 2 bytes
 
     st = time.perf_counter()
