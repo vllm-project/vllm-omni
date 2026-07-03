@@ -141,8 +141,7 @@ class StageConfigFactory:
         if pipeline_cfg is not None:
             return PipelineResolution(explicit_pipeline, pipeline_cfg, hf_config)
         logger.warning(
-            "Deploy config %s requested pipeline %r which is not in OMNI_PIPELINES; "
-            "falling back to auto-detection.",
+            "Deploy config %s requested pipeline %r which is not in OMNI_PIPELINES; falling back to auto-detection.",
             deploy_config_path,
             explicit_pipeline,
         )
