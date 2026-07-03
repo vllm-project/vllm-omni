@@ -751,7 +751,7 @@ async def omni_init_app_state(
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
         # OMNI: tokenization endpoints are not supported in pure diffusion mode.
-        state.openai_serving_tokenization = None
+        state.serving_tokenization = None
 
         # Use for_diffusion method to create chat handler
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
@@ -1014,7 +1014,7 @@ async def omni_init_app_state(
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
         else None
     )
-    state.openai_serving_tokenization = ServingTokenization(
+    state.serving_tokenization = ServingTokenization(
         state.openai_serving_models,
         state.openai_serving_render,
         request_logger=request_logger,
@@ -1154,7 +1154,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1245,7 +1245,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1283,7 +1283,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
 async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1326,7 +1326,7 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
 async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
     handler = OmniAudioGenerate(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
