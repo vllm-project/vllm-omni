@@ -2530,7 +2530,7 @@ def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
 def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixture):
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/speech")
-    raw_request.app.state.openai_serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = fake_base
     request = OpenAICreateSpeechRequest(input="Hello")
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
@@ -2543,7 +2543,7 @@ def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixt
 def test_api_server_create_speech_batch_without_handler_returns_404(mocker: MockerFixture):
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/speech/batch")
-    raw_request.app.state.openai_serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = fake_base
     request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
 
     response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
@@ -2612,7 +2612,7 @@ def test_api_server_create_audio_generate_without_handler_returns_404(mocker: Mo
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/generate")
     raw_request.app.state.openai_serving_audio_generate = None
-    raw_request.app.state.openai_serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = fake_base
     request = OpenAICreateAudioGenerateRequest(input="a bird singing")
 
     response = asyncio.run(api_server_module.create_audio_generate(request, raw_request))

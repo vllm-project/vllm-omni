@@ -483,17 +483,13 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+        if self.quant_config is not None:
+            cache_scale_mapper = self.quant_config.get_cache_scale_mapper()
+            if cache_scale_mapper is not None:
+                weights = cache_scale_mapper.apply(weights)
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
-                continue
-
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
