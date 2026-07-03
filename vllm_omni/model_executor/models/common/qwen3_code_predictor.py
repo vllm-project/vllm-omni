@@ -157,57 +157,26 @@ class CodePredictorAttention(nn.Module):
             )
             self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
 
-    def _forward_npu_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        bsz: int,
-        seq_len: int,
-    ) -> torch.Tensor:
+    def _forward_npu_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         import torch_npu
 
-        q_f, k_f, v_f = q, k, v
-        if self.is_gqa:
-            k_f = (
-                k[:, :, None, :, :]
-                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
-                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
-            )
-            v_f = (
-                v[:, :, None, :, :]
-                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
-                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
-            )
-
-        mask = self._fusion_causal_mask
-        mask = mask.contiguous()
-        q_f = q_f.contiguous()
-        k_f = k_f.contiguous()
-        v_f = v_f.contiguous()
-        return torch_npu.npu_fusion_attention(
-            q_f,
-            k_f,
-            v_f,
-            self.num_heads,
-            "BNSD",
-            pse=None,
-            padding_mask=None,
-            atten_mask=mask,
+        v = v.contiguous()
+        return torch_npu.npu_fused_infer_attention_score(
+            q,
+            k,
+            v,
+            pse_shift=None,
+            atten_mask=self._fusion_causal_mask,
+            actual_seq_lengths=None,
+            actual_seq_lengths_kv=None,
+            block_table=None,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
             scale=float(self.scaling),
-            keep_prob=1.0,
-            # Keep torch_npu's API spelling.
-            pre_tockens=2147483647,
-            next_tockens=2147483647,
-            inner_precise=0,
-            prefix=None,
-            actual_seq_qlen=None,
-            actual_seq_kvlen=None,
-            # Ascend SDPA is_causal migration example uses sparse_mode=2.
+            input_layout="BNSD",
             sparse_mode=2,
-            gen_mask_parallel=True,
-            # Keep sync=True for the NPU fused attention path.
-            sync=True,
+            block_size=0,
+            softmax_lse_flag=False,
         )[0]
 
     def forward(
@@ -240,7 +209,7 @@ class CodePredictorAttention(nn.Module):
                 enable_gqa=self.is_gqa,
             )
         else:
-            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+            attn_out = self._forward_npu_attention(q, k, v)
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -843,7 +812,7 @@ class CodePredictorWrapper(nn.Module):
                     sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
                     cumulative_probs = sorted_probs.cumsum(dim=-1)
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
-                    sorted_logits[remove_mask] = float("-inf")
+                    sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
                 probs = F.softmax(logits, dim=-1, dtype=torch.float32)
                 code = torch.multinomial(probs, num_samples=1, generator=generator)
