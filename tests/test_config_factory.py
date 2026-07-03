@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
 from vllm_omni.config.stage_config import (
@@ -32,7 +32,6 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     pipeline_cfg_resolver,
-    resolve_deploy_yaml,
     strip_parent_engine_args,
 )
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
@@ -741,9 +740,9 @@ stages:
         assert "compilation_config" not in deploy.stages[0].engine_extras
 
     def test_load_voxcpm2_deploy_config_preserves_engine_extras(self):
-        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "voxcpm2.yaml"
-        raw = resolve_deploy_yaml(deploy_path)
-        expected_runtime_config = raw["stages"][0]["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
+        deploy_path = get_deploy_config_path("voxcpm2.yaml")
+        raw_stage = get_deploy_config_stage("voxcpm2.yaml", 0)
+        expected_runtime_config = raw_stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
 
         deploy = load_deploy_config(deploy_path)
         runtime_config = deploy.stages[0].engine_extras["hf_overrides"]["voxcpm2_runtime_config"]
