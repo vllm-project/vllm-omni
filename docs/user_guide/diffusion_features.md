@@ -75,13 +75,17 @@ Extension methods add specialized capabilities to diffusion models beyond standa
 
 ### Execution Modes
 
-Execution modes control how the diffusion pipeline processes denoise steps.
+Execution modes control how the diffusion pipeline processes requests and
+denoise steps.
 
 | Method | Description | Best For |
 |--------|-------------|----------|
+| **[Request-Level Batching](diffusion/request_batching.md)** | Scheduler batches compatible independent diffusion requests into one pipeline forward pass | Bursty online serving and multi-request throughput |
 | **[Step Execution](diffusion/step_execution.md)** | Per-step denoise execution with mid-request abort support | Request cancellation between denoise steps, fine-grained execution control |
 
-**Note:** Step execution is currently supported by QwenImagePipeline only. See [Supported Models](#supported-models) for details.
+**Note:** Request-level batching is available for pipelines that declare the
+request-batch forward contract. Step execution is currently supported by
+QwenImagePipeline only. See [Supported Models](#supported-models) for details.
 
 ### Quantization Methods
 
@@ -129,7 +133,7 @@ The following tables show which models support each feature:
 | **Qwen-Image-Edit**      |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Qwen-Image-Edit-2509** |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |        ✅ (decode)         |          ✅           |       ❌        |        ❌         |
 | **Qwen-Image-Layered**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
-| **SenseNova-U1**         |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **SenseNova-U1**         |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Stable-Diffusion-XL**  |     ❌     |     ❌      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Stable-Diffusion3.5**  |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Z-Image**              |     ✅     |     ✅      |           ✅           |       ❓        |   ✅ (TP=2 only)   |          ❌          |   ✅    |             ❌             |      ✅ (decode)      |       ✅        |        ❌         |

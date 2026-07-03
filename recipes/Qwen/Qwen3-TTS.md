@@ -148,6 +148,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "voice": "vivian",
         "language": "English",
         "stream": true,
+        "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
@@ -163,7 +164,7 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 
 - Memory usage: The deploy config allocates `gpu_memory_utilization: 0.3` per stage (talker + code2wav share a single GPU). For the 0.6B variants or constrained GPUs, adjust via `--gpu-memory-utilization`.
 - Key flags: `--omni` is required. `--deploy-config` points to the bundled two-stage pipeline config.
-- Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Streaming requires `stream=true` with `response_format="pcm"`.
+- Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Raw audio streaming requires `stream=true`, `stream_format="audio"`, and `response_format="pcm"`.
 - Task/model matching: Each task type requires its matching model checkpoint. Using a CustomVoice model for a Base (voice clone) request will fail.
 - Known limitations: The server serves one model variant at a time. To switch task types (e.g., CustomVoice to Base), restart the server with the corresponding model.
 

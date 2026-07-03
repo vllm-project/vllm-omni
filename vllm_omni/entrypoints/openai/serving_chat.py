@@ -64,12 +64,12 @@ from vllm.entrypoints.openai.engine.protocol import (
     ToolCall,
     UsageInfo,
 )
-from vllm.entrypoints.openai.engine.serving import ChatLikeRequest, clamp_prompt_logprobs
+from vllm.entrypoints.openai.engine.serving import clamp_prompt_logprobs
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
-    parse_chat_output,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.serve.engine.typing import ChatLikeRequest
 from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
 from vllm.inputs import PromptType
@@ -90,6 +90,7 @@ from vllm.tokenizers.mistral import (
 )
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
+from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -145,6 +146,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _supported_speakers: set[str] | None = None
     _diffusion_extra_body_params: frozenset[str] | None = None
     _diffusion_extra_output_params: frozenset[str] | None = None
+
+    # Harmony flag (always False for vllm-omni models)
+    use_harmony: bool = False
+
+    def _should_stream_with_auto_tool_parsing(self, request: ChatCompletionRequest) -> bool:
+        """Check if streamed tokens should go through the tool-call parser.
+
+        We only want to do this IF user-provided tools are set, a tool parser
+        is configured, "auto" tool choice is enabled, and the request's tool
+        choice field indicates that "auto" tool choice should be used.
+
+        This method existed in upstream vLLM commit 91df0fad4 (OpenAIServingChat)
+        but was removed in the Harmony refactoring (PR #45171, #45104).  Omni's
+        independently-maintained ``chat_completion_stream_generator`` still calls
+        it, so we keep a local copy.
+        """
+        # parser_cls may be None (no tool parser configured); guard accordingly
+        tp_cls = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
+        return request.tools and tp_cls is not None and self.enable_auto_tools and request.tool_choice in ["auto", None]
 
     @classmethod
     def for_diffusion(
@@ -303,17 +323,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenizer = await self.engine_client.get_tokenizer()
 
             reasoning_parser: ReasoningParser | None = None
-            if self.reasoning_parser_cls:
-                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    request.chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
-                reasoning_parser = self.reasoning_parser_cls(
+            if self.parser_cls is not None and self.parser_cls.reasoning_parser_cls is not None:
+                chat_template_kwargs = self._effective_chat_template_kwargs(request)
+                reasoning_parser = self.parser_cls.reasoning_parser_cls(
                     tokenizer,
                     chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
                 )
 
-            tool_parser = self.tool_parser
+            tool_parser = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
 
             if isinstance(tokenizer, MistralTokenizer):
                 # because of issues with pydantic we need to potentially
@@ -351,7 +368,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
             if not self.use_harmony:
-                error_check_ret = self._validate_chat_template(
+                error_check_ret = self.openai_serving_render.validate_chat_template(
                     request_chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs,
                     trust_request_chat_template=self.trust_request_chat_template,
@@ -359,14 +376,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if error_check_ret is not None:
                     return error_check_ret
 
-                chat_template_kwargs = request.chat_template_kwargs or {}
-                chat_template_kwargs.update(reasoning_effort=request.reasoning_effort)
-
-                # Merge chat_template_kwargs with defaults
-                merged_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
+                # Effective kwargs fold request.chat_template_kwargs, reasoning_effort,
+                # and server defaults — mirrors OpenAIServingChat._effective_chat_template_kwargs.
+                merged_template_kwargs = self._effective_chat_template_kwargs(request)
                 conversation, engine_prompts = await self._preprocess_chat(
                     request,
                     request.messages,
@@ -1103,7 +1115,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return (
             output.finish_reason is not None
             and self.enable_auto_tools
-            and self.tool_parser is not None
+            and self.parser_cls is not None
+            and self.parser_cls.tool_parser_cls is not None
             and delta_message is not None
             and delta_message.tool_calls
         )
@@ -1226,8 +1239,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             all_previous_token_ids = None
         # Prepare the tool parser if it's needed
         try:
-            if tool_choice_auto and self.tool_parser:
-                tool_parsers: list[ToolParser | None] = [self.tool_parser(tokenizer, request.tools)] * num_choices
+            tool_parser_cls = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
+            if tool_choice_auto and tool_parser_cls is not None:
+                tool_parsers: list[ToolParser | None] = [
+                    tool_parser_cls(tokenizer, request.tools) for _ in range(num_choices)
+                ]
             else:
                 tool_parsers = [None] * num_choices
         except Exception as e:
@@ -1555,12 +1571,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 # either finished reasoning or no reasoning at all
                                 content = current_text
 
-                                delta_message, function_name_returned[i] = self.extract_tool_call_required_streaming(
+                                delta_message, function_name_returned[i] = extract_required_tool_call_streaming(
                                     previous_text=previous_text,
                                     current_text=content,
                                     delta_text=delta_text,
                                     function_name_returned=fn_name_returned,
                                     tool_call_idx=history_tool_call_cnt,
+                                    tool_call_id_type=self.tool_call_id_type,
                                 )
                                 if (
                                     delta_message
@@ -2256,12 +2273,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning, content, _ = parse_chat_output(token_ids)
+                # Use upstream's HarmonyParser (inherited as self.parser_cls for
+                # gpt_oss/harmony models) instead of vendoring a copy of the
+                # pre-refactor parse_chat_output. We take only reasoning+content;
+                # tool calls are extracted by omni's own path below.
+                if self.parser_cls is not None:
+                    parser = self.parser_cls(tokenizer, request.tools)
+                    reasoning, content, _ = parser.parse(
+                        "",
+                        request,
+                        model_output_token_ids=token_ids,
+                    )
+                else:
+                    reasoning, content = None, None
                 if not request.include_reasoning:
                     reasoning = None
 
-                if self.tool_parser is not None:
-                    tool_parser = self.tool_parser(tokenizer, request.tools)
+                if self.parser_cls is not None and self.parser_cls.tool_parser_cls is not None:
+                    tool_parser = self.parser_cls.tool_parser_cls(tokenizer, request.tools)
                     # NOTE: We use token_ids for openai tool parser
                     tool_call_info = tool_parser.extract_tool_calls(
                         "",
@@ -2309,7 +2338,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
-            if (not self.enable_auto_tools or not self.tool_parser) and (
+            if (not self.enable_auto_tools or self.parser_cls is None or self.parser_cls.tool_parser_cls is None) and (
                 not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
                 and request.tool_choice != "required"
             ):
@@ -2375,10 +2404,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request.tools
                 and (request.tool_choice == "auto" or request.tool_choice is None)
                 and self.enable_auto_tools
-                and self.tool_parser
+                and self.parser_cls is not None
+                and self.parser_cls.tool_parser_cls is not None
             ):
                 try:
-                    tool_parser = self.tool_parser(tokenizer, request.tools)
+                    tool_parser = self.parser_cls.tool_parser_cls(tokenizer, request.tools)
                 except RuntimeError as e:
                     logger.exception("Error in tool parser creation.")
                     return self.create_error_response(e)

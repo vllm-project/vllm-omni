@@ -35,7 +35,6 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
@@ -60,6 +59,11 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
+
+# Rank-layout metadata for expert parallelism. This is not a process group;
+# it is reused by platform-specific runtimes that must build companion groups
+# with the same rank layout as vLLM EP.
+_EXPERT_PARALLEL_GROUP_RANKS: list[list[int]] | None = None
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -190,7 +194,6 @@ class RankGenerator:
         self.fs = fs
         self.rank_offset = rank_offset
         self.world_size = tp * sp * pp * cfg * dp
-        self.ep = tp * sp * cfg * dp  # EP level exclude PP
 
         self.name_to_size = {
             "tp": self.tp,
@@ -253,15 +256,6 @@ class RankGenerator:
                 ranks.append(group)
             return ranks
 
-        if token == "ep":
-            ranks = []
-            num_pp_stages = self.pp
-            for i in range(num_pp_stages):
-                start = i * self.ep + self.rank_offset
-                end = start + self.ep
-                ranks.append(list(range(start, end)))
-            return ranks
-
         mask = self.get_mask(self.order, token)
         ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
         if self.rank_offset > 0:
@@ -307,6 +301,12 @@ def get_ring_parallel_world_size():
 
 def get_ring_parallel_rank():
     return get_sp_group().ring_rank
+
+
+def get_expert_parallel_group_ranks() -> list[list[int]]:
+    assert vllm_parallel_state._EP is not None, "expert parallel group is not initialized"
+    assert _EXPERT_PARALLEL_GROUP_RANKS is not None, "expert parallel group ranks are not initialized"
+    return _EXPERT_PARALLEL_GROUP_RANKS
 
 
 # PP
@@ -782,6 +782,13 @@ def initialize_model_parallel(
         fs=fully_shard_degree,
         order="tp-sp-pp-cfg-dp",
     )
+    use_moe_parallel_mapping = False
+    if enable_expert_parallel:
+        od_config = get_forward_context().omni_diffusion_config
+        use_moe_parallel_mapping = bool(od_config and od_config.is_moe)
+        if not use_moe_parallel_mapping:
+            raise RuntimeError("Expert parallelism enabled for a non-MoE model")
+
     sp_group_ranks = rank_generator.get_ranks("sp")
     global _DP
     assert _DP is None, "data parallel group is already initialized"
@@ -828,6 +835,10 @@ def initialize_model_parallel(
         ulysses_group=ulysses_pg,
         ring_group=ring_pg,
     )
+    if use_moe_parallel_mapping:
+        # Diffusion normally uses its own SP group. Map it to vLLM PCP only for
+        # expert-parallel runtimes that rely on vLLM FusedMoE group semantics.
+        vllm_parallel_state._PCP = _SP
 
     assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
     vllm_parallel_state._TP = init_model_parallel_group(
@@ -836,8 +847,17 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
+    if use_moe_parallel_mapping and cfg_parallel_size > 1:
+        # CFG is a diffusion-specific replica dimension. Fold it into vLLM DP
+        # only when constructing the vLLM EP layout for expert-parallel paths.
+        vllm_parallel_state._DP = init_model_parallel_group(
+            group_ranks=rank_generator.get_ranks("cfg-dp"),
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="data",
+        )
 
-    global _FS
+    global _FS, _EXPERT_PARALLEL_GROUP_RANKS
     assert _FS is None, "fully shard group is already initialized"
     _FS = init_model_parallel_group(
         group_ranks=rank_generator.get_ranks("fs", independent_ranks=True),
@@ -846,34 +866,40 @@ def initialize_model_parallel(
         parallel_mode="fully_shard",
     )
 
-    if enable_expert_parallel:
-        od_config: OmniDiffusionConfig | None = get_forward_context().omni_diffusion_config
-        if od_config and od_config.is_moe:
-            vllm_parallel_state._EP = init_model_parallel_group(
-                group_ranks=rank_generator.get_ranks("ep"),
-                local_rank=get_world_group().local_rank,
-                backend=backend,
-                parallel_mode="expert",
-            )
-        else:
-            raise RuntimeError("Expert parallelism enabled for a non-MoE model ")
+    _EXPERT_PARALLEL_GROUP_RANKS = None
+    if use_moe_parallel_mapping:
+        ep_group_ranks = rank_generator.get_ranks("tp-sp-cfg-dp")
+        vllm_parallel_state._EP = init_model_parallel_group(
+            group_ranks=ep_group_ranks,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="expert",
+        )
+        _EXPERT_PARALLEL_GROUP_RANKS = ep_group_ranks
 
     init_dit_group(dit_parallel_size, backend)
 
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP
+    global _DP, _CFG, _SP, _PP, _FS, _EXPERT_PARALLEL_GROUP_RANKS
+
+    if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
+        vllm_parallel_state._DP.destroy()
+    vllm_parallel_state._DP = None
+
     if _DP:
         _DP.destroy()
     _DP = None
 
-    global _CFG
     if _CFG:
         _CFG.destroy()
     _CFG = None
 
-    global _SP
+    if vllm_parallel_state._PCP and vllm_parallel_state._PCP is not _SP:
+        vllm_parallel_state._PCP.destroy()
+    vllm_parallel_state._PCP = None
+
     if _SP:
         _SP.destroy()
     _SP = None
@@ -885,13 +911,12 @@ def destroy_model_parallel():
     if vllm_parallel_state._EP:
         vllm_parallel_state._EP.destroy()
     vllm_parallel_state._EP = None
+    _EXPERT_PARALLEL_GROUP_RANKS = None
 
-    global _PP
     if _PP:
         _PP.destroy()
     _PP = None
 
-    global _FS
     if _FS:
         _FS.destroy()
     _FS = None

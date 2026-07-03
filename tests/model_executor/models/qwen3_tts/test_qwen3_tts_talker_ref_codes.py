@@ -74,3 +74,18 @@ def test_make_omni_output_omits_ref_key_when_no_request_has_one() -> None:
     )
 
     assert "ref" not in out.multimodal_outputs["codes"]
+
+
+def test_make_omni_output_keeps_hidden_states_for_replay_spans_without_audio_codes() -> None:
+    hidden = torch.arange(6 * 8, dtype=torch.float32).reshape(6, 8)
+
+    out = _make_talker().make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {"meta": {"codec_streaming": True}},
+            _info(1, None),
+        ],
+    )
+
+    assert torch.equal(out.text_hidden_states, hidden)
+    assert out.multimodal_outputs["codes"]["audio"].shape == (1, _NUM_CODE_GROUPS)
