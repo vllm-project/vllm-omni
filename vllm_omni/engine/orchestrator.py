@@ -1287,7 +1287,7 @@ class Orchestrator:
                             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
                         )
                         return
-                    if already_submitted and len(diffusion_prompt) == 1:
+                    if len(diffusion_prompt) == 1:
                         diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
