@@ -111,6 +111,8 @@ def can_use_fish_kvcache_attn(
 
 
 def _is_cuda_graph_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
     return bool(torch.cuda.is_current_stream_capturing())
 
 

@@ -127,7 +127,6 @@ def main(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    stage_configs_path = args.stage_configs_path or DEFAULT_STAGE_CONFIG
     model_name = args.model or DEFAULT_MODEL
 
     inputs = [
@@ -139,12 +138,17 @@ def main(args):
         )
     ]
 
-    omni = Omni(
+    omni_kwargs = dict(
         model=model_name,
-        stage_configs_path=stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
+    else:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path or DEFAULT_STAGE_CONFIG
+
+    omni = Omni(**omni_kwargs)
 
     t_start = time.perf_counter()
     for stage_outputs in omni.generate(inputs):
@@ -165,7 +169,6 @@ async def main_streaming(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    stage_configs_path = args.stage_configs_path or DEFAULT_STAGE_CONFIG
     model_name = args.model or DEFAULT_MODEL
 
     prompt = build_prompt(
@@ -175,23 +178,39 @@ async def main_streaming(args):
         model_name=model_name,
     )
 
-    omni = AsyncOmni(
+    omni_kwargs = dict(
         model=model_name,
-        stage_configs_path=stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
+    else:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path or DEFAULT_STAGE_CONFIG
+
+    omni = AsyncOmni(**omni_kwargs)
 
     request_id = "0"
     t_start = time.perf_counter()
     t_prev = t_start
     chunk_idx = 0
+    all_audio_chunks: list[torch.Tensor] = []
+    sample_rate = None
 
     async for stage_output in omni.generate(prompt, request_id=request_id):
         mm = stage_output.request_output.outputs[0].multimodal_output
         if not stage_output.finished:
             t_now = time.perf_counter()
             audio = mm.get("audio")
+            if audio is not None:
+                if isinstance(audio, list):
+                    all_audio_chunks.extend(audio)
+                else:
+                    all_audio_chunks.append(audio)
+            sr_raw = mm.get("sr")
+            if sr_raw is not None:
+                sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
             n = len(audio) if isinstance(audio, list) else (0 if audio is None else 1)
             dt_ms = (t_now - t_prev) * 1000
             ttfa_ms = (t_now - t_start) * 1000
@@ -202,10 +221,29 @@ async def main_streaming(args):
             t_prev = t_now
             chunk_idx += 1
         else:
+            # Collect any remaining audio in the final message
+            audio = mm.get("audio") if mm else None
+            if audio is not None:
+                if isinstance(audio, list):
+                    all_audio_chunks.extend(audio)
+                else:
+                    all_audio_chunks.append(audio)
+            sr_raw = mm.get("sr") if mm else None
+            if sr_raw is not None:
+                sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+
             t_end = time.perf_counter()
             total_ms = (t_end - t_start) * 1000
             logger.info("Request %s: done total=%.1fms chunks=%d", request_id, total_ms, chunk_idx)
-            _save_wav(output_dir, request_id, mm)
+
+            if all_audio_chunks and sample_rate:
+                audio_tensor = torch.cat(all_audio_chunks, dim=-1)
+                out_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+                sf.write(out_wav, audio_tensor.float().cpu().numpy().flatten(), samplerate=sample_rate, format="WAV")
+                logger.info("Request %s: saved audio to %s (sr=%d)", request_id, out_wav, sample_rate)
+            else:
+                logger.warning("Request %s: no audio chunks received", request_id)
 
 
 def parse_args():
@@ -237,10 +275,16 @@ def parse_args():
         help=f"HuggingFace model path (default: {DEFAULT_MODEL}).",
     )
     parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Deploy config YAML path (under vllm_omni/deploy/).",
+    )
+    parser.add_argument(
         "--stage-configs-path",
         type=str,
         default=None,
-        help="Path to stage configs YAML.",
+        help="Path to stage configs YAML (legacy, prefer --deploy-config).",
     )
     parser.add_argument(
         "--output-dir",
