@@ -150,8 +150,8 @@ class StageConfigFactory:
         if pipeline_cfg is not None:
             return PipelineResolution(model_type, pipeline_cfg, hf_config)
 
+        logger.warning("Inferred model type %s is not registered to an Omni pipeline", model_type)
         if hf_config is not None:
-            logger.warning("Inferred model type %s is not registered to an Omni pipeline", model_type)
             hf_archs = set(getattr(hf_config, "architectures", []) or [])
             if hf_archs:
                 for registered_key, registered in OMNI_PIPELINES.items():
