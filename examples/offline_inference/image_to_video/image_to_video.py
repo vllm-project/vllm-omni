@@ -30,6 +30,7 @@ Usage:
 
     # LTX-2.3 image-to-video
     python image_to_video.py --model dg845/LTX-2.3-Diffusers \
+        --model-class-name LTX23ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
         --height 384 --width 512 --num-frames 25 --num-inference-steps 20 \
         --frame-rate 24 --fps 24 --output ltx23_i2v.mp4
@@ -57,11 +58,6 @@ import numpy as np
 import PIL.Image
 import torch
 
-from examples.offline_inference.video_model_defaults import (
-    default_image_to_video_class_name,
-    is_ltx2_model,
-    is_ltx23_model,
-)
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
@@ -329,9 +325,8 @@ def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     model_name = str(args.model).lower() if args.model is not None else ""
-    model_class_name = default_image_to_video_class_name(args.model, args.model_class_name)
-    is_ltx2 = is_ltx2_model(model_name, model_class_name)
-    is_ltx23 = is_ltx23_model(model_name, model_class_name)
+    model_class_name = args.model_class_name
+    is_ltx2 = model_class_name in {"LTX2ImageToVideoPipeline", "LTX23ImageToVideoPipeline"}
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
@@ -357,9 +352,15 @@ def main():
             16,
         )
     elif is_ltx2:
-        d_num_frames = 25 if is_ltx23 else 121
-        d_steps = 20 if is_ltx23 else 40
-        d_fps, d_guidance, d_flow_shift, d_max_area, d_mod = 24, 4.0, 5.0, 512 * 768, 32
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            4.0,
+            121,
+            40,
+            5.0,
+            512 * 768,
+            32,
+        )
     else:  # Wan2.2 / HunyuanVideo-1.5
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 16, 5.0, 81, 50, 5.0, 480 * 832, 16
 
