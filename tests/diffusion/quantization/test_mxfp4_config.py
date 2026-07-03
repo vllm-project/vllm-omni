@@ -537,3 +537,118 @@ def test_single_scale_row_parallel_tp2_loader_simulation():
 
     for rank in range(_TP2):
         assert _shard(ckpt_weight_scale, layer.weight_scale, rank, _TP2, "input_dim").shape == layer.weight_scale.shape
+
+
+# ---------------------------------------------------------------------------
+# ROCm MXFP4 (gfx950) — get_quant_method dispatch
+#
+# These run on CPU: the platform check, gcnArchName probe and aiter op
+# registration are all mocked (stdlib unittest.mock + monkeypatch, so no
+# pytest-mock dependency).  They cover only the dispatch + weight-allocation
+# logic added by the ROCm PR — the AITER GEMM / quant kernels require real
+# gfx950 hardware and are intentionally NOT exercised here.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _rocm_platform(monkeypatch: pytest.MonkeyPatch):
+    """Make current_omni_platform report ROCm, and stub the aiter
+    custom-op registration so ROCmMxfp4*Method can be constructed without aiter."""
+    from vllm_omni.platforms import current_omni_platform
+    from vllm_omni.quantization import mxfp4_config
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(mxfp4_config, "_register_rocm_mxfp4_op", lambda: None)
+
+
+def _patch_gcn_arch(monkeypatch: pytest.MonkeyPatch, arch: str) -> None:
+    """Patch torch.cuda.get_device_properties(...).gcnArchName to return `arch`."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *a, **k: SimpleNamespace(gcnArchName=arch),
+    )
+
+
+def _fake_linear_layer():
+    """A stand-in that passes isinstance(layer, LinearBase) without a real layer."""
+    from unittest.mock import MagicMock
+
+    from vllm.model_executor.layers.linear import LinearBase
+
+    return MagicMock(spec=LinearBase)
+
+
+def test_rocm_online_dispatch_returns_rocm_method(_rocm_platform, monkeypatch):
+    """ROCm + gfx950 + online checkpoint must return ROCmMxfp4OnlineLinearMethod."""
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config, ROCmMxfp4OnlineLinearMethod
+
+    _patch_gcn_arch(monkeypatch, "gfx950:sramecc+:xnack-")
+    cfg = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=False)
+
+    method = cfg.get_quant_method(_fake_linear_layer(), "blocks.0.attn1.to_q")
+    assert isinstance(method, ROCmMxfp4OnlineLinearMethod)
+
+
+def test_rocm_ignored_layer_returns_unquantized(_rocm_platform, monkeypatch):
+    """A prefix in ignored_layers must return UnquantizedLinearMethod before the gfx950 probe."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    _patch_gcn_arch(monkeypatch, "gfx950:sramecc+:xnack-")
+    cfg = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=False, ignored_layers=["proj_out"])
+
+    assert isinstance(cfg.get_quant_method(_fake_linear_layer(), "proj_out"), UnquantizedLinearMethod)
+
+
+def test_rocm_non_gfx950_raises(_rocm_platform, monkeypatch):
+    """MXFP4 on ROCm requires gfx950; any other arch must raise."""
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config
+
+    _patch_gcn_arch(monkeypatch, "gfx942:sramecc+:xnack-")
+    cfg = DiffusionMXFP4Config(is_checkpoint_mxfp4_serialized=False)
+
+    with pytest.raises(NotImplementedError, match="gfx950"):
+        cfg.get_quant_method(_fake_linear_layer(), "blocks.0.attn1.to_q")
+
+
+# ---------------------------------------------------------------------------
+# ROCm MXFP4 — create_weights (online lazy meta-device placeholder)
+#
+# The base ROCmMxfp4LinearMethod is abstract (no create_weights); the online
+# subclass gets create_weights from _LazyWeightMixin, which registers a BF16
+# weight on the meta device to be materialised at load time.
+# ---------------------------------------------------------------------------
+
+
+def test_rocm_create_weights_column_parallel_tp2(_rocm_platform):
+    """Column-parallel TP=2: meta BF16 weight has the output halved, input full."""
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config, ROCmMxfp4OnlineLinearMethod
+
+    method = ROCmMxfp4OnlineLinearMethod(DiffusionMXFP4Config())
+    layer = _create_weights(method, input_size_per_partition=_TP2_K, output_partition_sizes=[_TP2_N // _TP2])
+
+    assert layer.weight.shape == (_TP2_N // _TP2, _TP2_K)
+    assert layer.weight.dtype == torch.bfloat16
+    assert layer.weight.device.type == "meta"
+    assert layer.weight.input_dim == 1
+    assert layer.weight.output_dim == 0
+    assert layer.logical_widths == [_TP2_N // _TP2]
+    assert layer.weight_block_size is None
+
+
+def test_rocm_create_weights_row_parallel_tp2(_rocm_platform):
+    """Row-parallel TP=2: meta BF16 weight has the input halved, output full."""
+    from vllm_omni.quantization.mxfp4_config import DiffusionMXFP4Config, ROCmMxfp4OnlineLinearMethod
+
+    method = ROCmMxfp4OnlineLinearMethod(DiffusionMXFP4Config())
+    layer = _create_weights(method, input_size_per_partition=_TP2_K // _TP2, output_partition_sizes=[_TP2_N])
+
+    assert layer.weight.shape == (_TP2_N, _TP2_K // _TP2)
+    assert layer.input_size_per_partition == _TP2_K // _TP2
+    assert layer.output_size_per_partition == _TP2_N
