@@ -124,6 +124,7 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
+    priority: int = 0,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -156,6 +157,7 @@ def build_engine_core_request_from_tokens(
         lora_request=getattr(params, "lora_request", None),
         cache_salt=prompt.get("cache_salt"),
         data_parallel_rank=None,
+        priority=priority,
         prompt_embeds=prompt_embeds,
         resumable=resumable,
         additional_information=additional_info_payload,
@@ -172,6 +174,7 @@ class OrchestratorRequestState:
     final_stage_id: int = -1
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
+    priority: int = 0
 
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
@@ -462,6 +465,7 @@ class Orchestrator:
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             final_output_stage_ids=final_output_stage_ids,
+            priority=msg.priority,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
         )
@@ -510,6 +514,7 @@ class Orchestrator:
                 preprocess_ms=msg.preprocess_ms,
                 request_timestamp=msg.request_timestamp,
                 enqueue_ts=msg.enqueue_ts,
+                priority=msg.priority,
             )
             await self._handle_add_request(fallback_msg)
             return
@@ -555,6 +560,7 @@ class Orchestrator:
             sampling_params_list=sampling_params_list,
             final_stage_id=0,
             final_output_stage_ids={0},
+            priority=msg.priority,
             request_timestamp=parent_state.request_timestamp,
         )
         self.request_states[companion_id] = companion_state
@@ -1014,6 +1020,8 @@ class Orchestrator:
         resumable: bool = False,
     ) -> Any:
         next_pool = self.stage_pools[next_stage_id]
+        req_state = self.request_states.get(req_id)
+        priority = req_state.priority if req_state is not None else 0
         if self._next_stage_input_is_tokens(next_input):
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
@@ -1022,6 +1030,7 @@ class Orchestrator:
                 model_config=next_pool.stage_vllm_config.model_config,
                 mm_features=mm_features,
                 resumable=resumable,
+                priority=priority,
             )
             request.external_req_id = request.request_id
             return request
@@ -1033,6 +1042,7 @@ class Orchestrator:
             params=params,
             supported_tasks=("generate",),
             arrival_time=_time.time(),
+            priority=priority,
             resumable=resumable,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
@@ -1348,6 +1358,7 @@ class Orchestrator:
                     model_config=next_pool.stage_vllm_config.model_config,
                     mm_features=req_state.mm_features,
                     resumable=next_stage_resumable,
+                    priority=req_state.priority,
                 )
                 request.external_req_id = request.request_id
                 if already_submitted:
@@ -1524,6 +1535,7 @@ class Orchestrator:
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
+                    priority=req_state.priority,
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(

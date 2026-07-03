@@ -22,6 +22,7 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.determinism import deterministic_sample_seed, is_batch_invariant_enabled
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -353,14 +354,30 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
             self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
 
-        if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-            if req.sampling_params.generator_device is not None:
-                gen_device = req.sampling_params.generator_device
-            elif self.device.type == "cpu":
-                gen_device = "cpu"
-            else:
-                gen_device = self.device
-            req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+        self._ensure_sampling_generator(
+            req.sampling_params,
+            request_ids=[req.request_id],
+        )
+
+    def _sampling_generator_device(self, sampling_params) -> torch.device | str:
+        if sampling_params.generator_device is not None:
+            return sampling_params.generator_device
+        if self.device.type == "cpu":
+            return "cpu"
+        return self.device
+
+    def _ensure_sampling_generator(self, sampling_params, *, request_ids: list[str]) -> None:
+        if sampling_params.generator is not None or sampling_params.seed is None:
+            return
+        gen_device = self._sampling_generator_device(sampling_params)
+        if is_batch_invariant_enabled() and request_ids:
+            seeds = [deterministic_sample_seed(sampling_params.seed, request_id) for request_id in request_ids]
+            if len(seeds) == 1:
+                sampling_params.generator = torch.Generator(device=gen_device).manual_seed(seeds[0])
+                return
+            sampling_params.generator = [torch.Generator(device=gen_device).manual_seed(seed) for seed in seeds]
+            return
+        sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
 
     def _refresh_cache_for_requests(
         self,
@@ -594,13 +611,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if state.request_id in new_request_ids:
                 # set generator
                 if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                    self._ensure_sampling_generator(state.sampling, request_ids=[state.request_id])
                 # encode
                 self.pipeline.prepare_encode(state)
 

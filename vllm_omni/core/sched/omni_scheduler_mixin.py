@@ -7,10 +7,12 @@ from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
+from vllm_omni.determinism import deterministic_request_key, is_batch_invariant_enabled
 
 logger = init_logger(__name__)
 
@@ -39,6 +41,35 @@ except ValueError:
 
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
+
+    @staticmethod
+    def _append_waiting_requests(waiting_queue, requests) -> None:
+        add_requests = getattr(waiting_queue, "add_requests", None)
+        if add_requests is not None:
+            add_requests(requests)
+            return
+        for request in requests:
+            waiting_queue.add_request(request)
+
+    def _apply_batch_invariant_limits(self) -> None:
+        if not is_batch_invariant_enabled():
+            return
+        self.max_num_running_reqs = 1
+        self.policy = SchedulingPolicy.FCFS
+        waiting = getattr(self, "waiting", None)
+        if waiting is None:
+            return
+        replacement = create_request_queue(self.policy)
+        self._append_waiting_requests(replacement, list(waiting))
+        self.waiting = replacement
+
+    def _order_waiting_for_batch_invariance(self) -> None:
+        waiting = getattr(self, "waiting", None)
+        if not is_batch_invariant_enabled() or waiting is None or len(waiting) < 2:
+            return
+        ordered = sorted(list(waiting), key=deterministic_request_key)
+        waiting.remove_requests(ordered)
+        self._append_waiting_requests(waiting, ordered)
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""

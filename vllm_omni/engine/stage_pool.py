@@ -958,6 +958,7 @@ class StagePool:
                 affinity_request_id=affinity_request_id,
             )
             client = self._diffusion_client(replica_id)
+            submit_kwargs.setdefault("priority", req_state.priority)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
@@ -1024,7 +1025,12 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+            await self._diffusion_client(replica_id).add_request_async(
+                request_id,
+                request,
+                params,
+                priority=req_state.priority,
+            )
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest

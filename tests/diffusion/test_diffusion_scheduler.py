@@ -27,11 +27,12 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def _make_request(req_id: str) -> OmniDiffusionRequest:
+def _make_request(req_id: str, *, priority: int = 0, seed: int | None = None) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompt=f"prompt_{req_id}",
-        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, seed=seed),
         request_id=req_id,
+        priority=priority,
     )
 
 
@@ -400,6 +401,41 @@ class TestRequestScheduler:
         assert _new_ids(first) == [req_id_a, req_id_b]
         assert first.num_running_reqs == 2
         assert first.num_waiting_reqs == 0
+
+    def test_batch_invariant_orders_waiting_by_priority_then_request_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        scheduler.add_request(_make_request("b", priority=20, seed=1))
+        scheduler.add_request(_make_request("c", priority=10, seed=2))
+        scheduler.add_request(_make_request("a", priority=10, seed=3))
+
+        first = scheduler.schedule()
+        assert _new_ids(first) == ["a"]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 2
+
+        scheduler.update_from_output(first, _make_request_output("a"))
+
+        second = scheduler.schedule()
+        assert _new_ids(second) == ["c"]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 1
+
+        scheduler.update_from_output(second, _make_request_output("c"))
+
+        third = scheduler.schedule()
+        assert _new_ids(third) == ["b"]
+        assert third.num_running_reqs == 1
+        assert third.num_waiting_reqs == 0
+
+    def test_batch_invariant_limits_running_requests_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=4))
+
+        assert scheduler.max_num_running_reqs == 1
 
     def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
         scheduler = RequestScheduler()

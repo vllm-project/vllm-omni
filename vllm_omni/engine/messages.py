@@ -27,6 +27,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     request_timestamp: float
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
+    priority: int = 0
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -37,6 +38,7 @@ class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
     prompt: EngineCoreRequest
     companion_prompt_text: object | None
     sampling_params_list: list[OmniSamplingParams]
+    priority: int = 0
 
 
 class AbortRequestMessage(EngineQueueMessage, kw_only=True):

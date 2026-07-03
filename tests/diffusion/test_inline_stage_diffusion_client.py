@@ -74,6 +74,34 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
 
 @pytest.mark.asyncio
+async def test_inline_dispatch_request_preserves_priority(client, mock_engine):
+    captured = {}
+
+    async def _step(request):
+        captured["request"] = request
+        return [OmniRequestOutput.from_diffusion(request_id=request.request_id, images=[])]
+
+    mock_engine.step.side_effect = _step
+
+    await client.add_request_async(
+        "req-priority",
+        "A test prompt",
+        OmniDiffusionSamplingParams(),
+        priority=29,
+    )
+
+    for _ in range(10):
+        output = client.get_diffusion_output_nowait()
+        if output is not None:
+            break
+        await asyncio.sleep(0.01)
+
+    assert output is not None
+    assert output.request_id == "req-priority"
+    assert captured["request"].priority == 29
+
+
+@pytest.mark.asyncio
 async def test_inline_dispatch_request_streaming_success(client, mock_engine):
     """Inline StageDiffusionClient correctly receives streaming chunk output from Diffusion Engine"""
     chunks = [

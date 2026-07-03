@@ -8,6 +8,7 @@ from dataclasses import fields
 
 from vllm.logger import init_logger
 
+from vllm_omni.determinism import deterministic_request_key, is_batch_invariant_enabled
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -77,6 +78,8 @@ class _BaseScheduler(SchedulerInterface):
             self.max_num_running_reqs = max(1, int(max_num_seqs))
         except (TypeError, ValueError):
             self.max_num_running_reqs = 1
+        if is_batch_invariant_enabled():
+            self.max_num_running_reqs = 1
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
         self._reset_scheduler_state()
@@ -102,6 +105,8 @@ class _BaseScheduler(SchedulerInterface):
             state = self._request_states.get(request_id)
             if state is not None:
                 scheduled_cached_request_ids.append(request_id)
+
+        self._order_waiting_for_batch_invariance()
 
         # Second, schedule WAITING requests while capacity remains.
         while self._waiting and len(self._running) < self.max_num_running_reqs:
@@ -287,3 +292,15 @@ class _BaseScheduler(SchedulerInterface):
         self, request: OmniDiffusionRequest
     ) -> SamplingParamsKey | RequestBatchSamplingParamsKey | None:
         return get_sampling_params_key(request)
+
+    def _order_waiting_for_batch_invariance(self) -> None:
+        if not is_batch_invariant_enabled() or len(self._waiting) < 2:
+            return
+
+        def key(request_id: str) -> tuple[int, str]:
+            state = self._request_states.get(request_id)
+            if state is None:
+                return (0, request_id)
+            return deterministic_request_key(state.req)
+
+        self._waiting = deque(sorted(self._waiting, key=key))

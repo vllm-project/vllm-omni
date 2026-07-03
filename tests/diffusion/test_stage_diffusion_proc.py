@@ -75,6 +75,29 @@ async def test_proc_streaming_request_yields_each_engine_chunk():
 
 
 @pytest.mark.asyncio
+async def test_process_request_preserves_priority():
+    captured = {}
+
+    class _Engine:
+        async def step(self, request):
+            captured["request"] = request
+            return [MockOmniRequestOutput(request_id=request.request_id)]
+
+    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc._engine = _Engine()
+
+    result = await stage_proc._process_request(
+        request_id="req-priority",
+        prompt="prompt",
+        sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+        priority=23,
+    )
+
+    assert result.request_id == "req-priority"
+    assert captured["request"].priority == 23
+
+
+@pytest.mark.asyncio
 async def test_proc_process_request_with_batching_async_output():
     stage_proc = object.__new__(StageDiffusionProc)
     stage_proc._engine = MockDiffusionEngine()

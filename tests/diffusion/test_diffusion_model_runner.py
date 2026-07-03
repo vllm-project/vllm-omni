@@ -342,6 +342,25 @@ class _BatchSingleOutputPipeline:
         return DiffusionOutput(output=batch.prompts[0])
 
 
+class _GeneratorDrivenBatchPipeline:
+    supports_request_batch = True
+
+    def forward(self, batch):
+        outputs = []
+        for sampling_params in batch.sampling_params_list:
+            generator = sampling_params.generator
+            assert isinstance(generator, torch.Generator)
+            outputs.append(
+                DiffusionOutput(
+                    output=(
+                        generator.initial_seed(),
+                        int(torch.randint(0, 2**31, (1,), generator=generator).item()),
+                    )
+                )
+            )
+        return outputs
+
+
 def _make_batch_runner(pipeline):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -364,6 +383,17 @@ def _make_scheduler_output(num_reqs: int):
     reqs = [_make_request() for _ in range(num_reqs)]
     for i, req in enumerate(reqs):
         req.request_id = f"req-{i}"
+    return SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req=req) for req in reqs])
+
+
+def _make_scheduler_output_for_request_ids(request_ids: list[str], *, seed: int):
+    reqs = []
+    for request_id in request_ids:
+        req = _make_request()
+        req.request_id = request_id
+        req.sampling_params.seed = seed
+        req.sampling_params.generator = None
+        reqs.append(req)
     return SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req=req) for req in reqs])
 
 
@@ -419,6 +449,78 @@ def test_execute_model_batch_preserves_per_request_sampling_and_seeds_generators
     assert [sp.generator.initial_seed() for sp in pipeline.last_batch.sampling_params_list] == [111, 222]
     with pytest.raises(AssertionError, match="multiple requests"):
         _ = pipeline.last_batch.sampling_params
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_batch_outputs_are_request_stable_in_batch_invariant_mode(monkeypatch):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+
+    def run_batch(request_ids: list[str]) -> dict[str, tuple[int, int]]:
+        runner = _make_batch_runner(_GeneratorDrivenBatchPipeline())
+        sched = _make_scheduler_output_for_request_ids(request_ids, seed=123)
+        result = DiffusionModelRunner.execute_model_batch(runner, sched, runner.od_config)
+        return {runner_output.request_id: runner_output.result.output for runner_output in result.runner_outputs}
+
+    canonical = run_batch(["req-a", "req-b"])
+    shuffled = run_batch(["req-b", "req-a"])
+    with_neighbor = run_batch(["req-extra", "req-a", "req-b"])
+
+    assert canonical["req-a"] == shuffled["req-a"] == with_neighbor["req-a"]
+    assert canonical["req-b"] == shuffled["req-b"] == with_neighbor["req-b"]
+    assert canonical["req-a"][0] == model_runner_module.deterministic_sample_seed(123, "req-a")
+    assert canonical["req-b"][0] == model_runner_module.deterministic_sample_seed(123, "req-b")
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_sampling_generator_derives_per_request_generators_in_batch_invariant_mode(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
+    sampling_params = SimpleNamespace(generator=None, seed=123, generator_device=None)
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+
+    runner._ensure_sampling_generator(sampling_params, request_ids=["req-b", "req-a"])
+
+    generators = sampling_params.generator
+    assert isinstance(generators, list)
+    assert len(generators) == 2
+    assert [generator.initial_seed() for generator in generators] == [
+        model_runner_module.deterministic_sample_seed(123, "req-b"),
+        model_runner_module.deterministic_sample_seed(123, "req-a"),
+    ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_sampling_generator_derives_single_request_generator_in_batch_invariant_mode(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
+    sampling_params = SimpleNamespace(generator=None, seed=123, generator_device=None)
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+
+    runner._ensure_sampling_generator(sampling_params, request_ids=["req-a"])
+
+    generator = sampling_params.generator
+    assert isinstance(generator, torch.Generator)
+    assert generator.initial_seed() == model_runner_module.deterministic_sample_seed(123, "req-a")
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_sampling_generator_keeps_single_generator_by_default(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
+    sampling_params = SimpleNamespace(generator=None, seed=123, generator_device=None)
+
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+
+    runner._ensure_sampling_generator(sampling_params, request_ids=["req-b", "req-a"])
+
+    generator = sampling_params.generator
+    assert isinstance(generator, torch.Generator)
+    assert generator.initial_seed() == 123
 
 
 @pytest.mark.core_model

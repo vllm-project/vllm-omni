@@ -55,6 +55,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 async_chunk=False,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        self._apply_batch_invariant_limits()
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """Diffusion fast path:
@@ -90,6 +91,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
+        self._order_waiting_for_batch_invariance()
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled

@@ -5,6 +5,7 @@
 import random
 from dataclasses import dataclass
 
+from vllm_omni.determinism import is_batch_invariant_enabled
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
@@ -29,6 +30,7 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict | None = None
+    priority: int = 0
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -38,6 +40,11 @@ class OmniDiffusionRequest:
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.
         if self.sampling_params.generator is None and self.sampling_params.seed is None:
+            if is_batch_invariant_enabled():
+                raise ValueError(
+                    "Diffusion requests must provide sampling_params.seed or "
+                    "sampling_params.generator when VLLM_BATCH_INVARIANT=1."
+                )
             self.sampling_params.seed = random.randint(0, 2**31 - 1)
 
         # Detect whether user explicitly provided guidance_scale.

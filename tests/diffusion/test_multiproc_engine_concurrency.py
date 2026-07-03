@@ -773,6 +773,21 @@ class TestStageDiffusionClientErrorPropagation:
         with pytest.raises(EngineDeadError):
             await client.add_request_async("req-3", "test prompt", None)
 
+    @pytest.mark.asyncio
+    async def test_add_request_payload_includes_priority(self):
+        client = self._make_client()
+        client._encoder.encode.side_effect = lambda payload: payload
+
+        await client.add_request_async(
+            "req-priority",
+            "test prompt",
+            OmniDiffusionSamplingParams(),
+            priority=31,
+        )
+
+        payload = client._request_socket.send.call_args.args[0]
+        assert payload["priority"] == 31
+
     def test_check_health_raises_when_dead(self):
         client = self._make_client(engine_dead=True)
 
