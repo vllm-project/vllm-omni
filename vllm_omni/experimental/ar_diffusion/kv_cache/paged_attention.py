@@ -11,22 +11,6 @@ import torch
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def _slot_mapping_for_blocks(
-    block_ids: list[int],
-    token_count: int,
-    block_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if token_count == 0:
-        return torch.empty(0, dtype=torch.long, device=device)
-    positions = torch.arange(token_count, dtype=torch.long)
-    return compute_slot_mapping(block_ids, positions, block_size).to(device=device)
-
-
 @dataclass
 class ARDiffusionPagedForwardContext:
     """Mutable branch-level state shared by all layer contexts in one forward."""
@@ -77,12 +61,12 @@ class ARDiffusionPagedForwardContext:
             self.current_video_slot_mapping = compute_slot_mapping(table, positions, self.block_size).to(device=device)
         else:
             self.current_video_block_ids = self.kv_cache.scratch_block_ids(self.is_negative, 0, n_blocks)
-            self.current_video_slot_mapping = _slot_mapping_for_blocks(
+            positions = torch.arange(self.seq_len, dtype=torch.long)
+            self.current_video_slot_mapping = compute_slot_mapping(
                 self.current_video_block_ids,
-                self.seq_len,
+                positions,
                 self.block_size,
-                device,
-            )
+            ).to(device=device)
         self._allocated_video = True
 
     def ensure_action_slots(self, action_len: int, device: torch.device) -> None:
@@ -97,19 +81,19 @@ class ARDiffusionPagedForwardContext:
         if self.action_slot_mapping is not None and self._action_len == action_len:
             return
 
-        action_blocks = _ceil_div(action_len, self.block_size)
+        action_blocks = (action_len + self.block_size - 1) // self.block_size
         scratch_offset = 0 if self.commit_current else len(self.current_video_block_ids)
         self.action_scratch_block_ids = self.kv_cache.scratch_block_ids(
             self.is_negative,
             scratch_offset,
             action_blocks,
         )
-        self.action_slot_mapping = _slot_mapping_for_blocks(
+        positions = torch.arange(action_len, dtype=torch.long)
+        self.action_slot_mapping = compute_slot_mapping(
             self.action_scratch_block_ids,
-            action_len,
+            positions,
             self.block_size,
-            device,
-        )
+        ).to(device=device)
         self._action_len = action_len
 
     def video_block_table(self, device: torch.device) -> tuple[list[int], int]:
