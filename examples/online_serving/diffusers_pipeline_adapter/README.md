@@ -6,7 +6,8 @@ vLLM-Omni supports running diffusion models with the diffusers backend, directly
 
 The diffusers backend is a black-box adapter. Its primary focus is to serve diffusion models online.
 Currently, the following features are NOT yet supported.
-It is not guaranteed whether they will be supported in the future.
+Community contributions are welcome to add these features when they can be
+implemented with clear Diffusers or vLLM-Omni behavior.
 
 - CFG parallel execution
 - Sequence parallel execution
@@ -67,6 +68,35 @@ But if that parameter is simultaneously set in both the vLLM-Omni interface and 
     In vLLM-Omni, the default values for some sampling parameters may be different from diffusers.
     Consider referring to [`OmniDiffusionSamplingParams`](../../../vllm_omni/inputs/data.py) for the default sampling parameters in the vLLM-Omni interface,
     and the corresponding [diffusers pipeline](https://huggingface.co/docs/diffusers/main/en/api/pipelines/overview)'s `__call__` function documentation.
+
+### Quantization
+
+Use `diffusers_load_kwargs` for Diffusers-native quantization options. If
+`diffusers_load_kwargs["quantization_config"]` is provided as a dictionary, the
+diffusers backend builds a Diffusers quantization config and lets Diffusers
+validate it before calling `DiffusionPipeline.from_pretrained()`.
+
+The diffusers backend also provides a small compatibility shortcut for
+vLLM-Omni quantization configs when `diffusers_load_kwargs` does not already
+contain `quantization_config`. Currently this maps online/dynamic `fp8` and
+online/dynamic `int8` to Diffusers/TorchAO dynamic quantization for transformer
+components such as `transformer` or `transformer_2`. This path requires
+`torchao` to be installed.
+
+For example, the CLI can request dynamic FP8 through the vLLM-Omni interface:
+
+```bash
+vllm serve "Qwen/Qwen-Image" \
+    --omni \
+    --diffusion-load-format diffusers \
+    --quantization-config '{"method": "fp8"}'
+```
+
+Other vLLM-Omni quantization methods, such as `gguf`, `modelopt`, `mxfp4`,
+`mxfp8`, serialized checkpoints, static FP8 configs, and layer-name skip lists
+such as `ignored_layers`, are intentionally not translated by this compatibility
+shortcut. Use Diffusers-native configuration through `diffusers_load_kwargs` or
+a native vLLM-Omni pipeline for those cases.
 
 ### Attention Backends
 
