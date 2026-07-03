@@ -137,6 +137,30 @@ def _audio_pcm_format() -> tuple[int, int]:
     return sample_rate, channels
 
 
+def _pcm_s16le_to_seed_tts_wer_bytes(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> bytes:
+    """Normalize streamed raw PCM to the 24 kHz mono PCM used by Seed-TTS WER."""
+    if not pcm_bytes:
+        return b""
+    channels = max(1, int(channels))
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if channels > 1:
+        usable = (pcm.size // channels) * channels
+        pcm = pcm[:usable].reshape(-1, channels).mean(axis=1)
+    pcm_f32 = pcm.astype(np.float32) / 32767.0
+    if int(sample_rate) != 24000 and pcm_f32.size:
+        from vllm.multimodal.audio import AudioResampler
+
+        resampler = AudioResampler(target_sr=24000)
+        pcm_f32 = resampler.resample(pcm_f32, orig_sr=int(sample_rate))
+    pcm_f32 = np.clip(pcm_f32, -1.0, 1.0)
+    return (pcm_f32 * 32767).astype(np.int16).tobytes()
+
+
 get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
@@ -1216,7 +1240,15 @@ async def async_request_openai_audio_speech(
                 output.audio_continuity_ok = continuity.is_continuous
                 output.audio_underrun_event_count = continuity.underrun_event_count
                 if pcm_capture is not None and pcm_capture:
-                    output.tts_output_pcm_bytes = bytes(pcm_capture)
+                    try:
+                        output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(
+                            bytes(pcm_capture),
+                            sample_rate=sample_rate,
+                            channels=channels,
+                        )
+                    except Exception as ex:
+                        logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
+                        output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
                     ct = response.headers.get("Content-Type", "")
                     logger.warning(
