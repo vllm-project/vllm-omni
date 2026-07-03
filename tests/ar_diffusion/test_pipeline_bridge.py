@@ -167,3 +167,16 @@ def test_get_kv_cache_requires_frame_aligned_seqlen():
     _, st = make_state()
     with pytest.raises(AssertionError, match="frame-aligned"):
         st.get_kv_caches(False, seq_len=BLOCK + 1, commit_current=True)
+
+
+def test_prepare_one_branch_allocates_nothing_for_the_other():
+    """CFG-parallel laziness: a rank prepares only the branch it runs."""
+    kv, st = make_state(num_layers=1, window_chunks=4)
+    pos_ctx = st.get_kv_caches(False, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+    neg_ctx = st.get_kv_caches(True, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+
+    pos_ctx.prepare(device=torch.device("cpu"), action_len=0, query_len=BLOCK)
+
+    assert pos_ctx._allocated_video
+    assert not neg_ctx._allocated_video
+    assert kv.window_block_ids(st.neg) == []

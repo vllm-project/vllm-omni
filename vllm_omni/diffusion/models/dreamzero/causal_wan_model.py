@@ -37,6 +37,20 @@ from vllm_omni.diffusion.models.dreamzero.action_encoder import (
     MultiEmbodimentActionEncoder,
 )
 
+# AR-Diffusion paged self-attention (in-tree experimental engine). Import at
+# module level so the isinstance check + custom-op call trace cleanly inside
+# the fullgraph-compiled DiT block (an import inside the traced region would
+# graph-break). The model still works without the engine: the payload type is
+# only ever constructed by the AR-Diffusion runner.
+try:
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+        ARDiffusionPagedLayerInputs,
+        paged_write_attn,
+    )
+except ImportError:  # pragma: no cover - experimental package always ships in-tree
+    ARDiffusionPagedLayerInputs = None
+    paged_write_attn = None
+
 # ── RoPE utilities ──────────────────────────────────────────────────
 
 
@@ -567,17 +581,25 @@ class CausalWanSelfAttention(nn.Module):
             action_v = v[:, -action_register_length:]
             v = v[:, :-action_register_length]
 
-        if getattr(kv_cache, "is_ar_diffusion_paged_context", False):
-            x = self._forward_ar_diffusion_paged(
-                roped_query=roped_query,
-                roped_key=roped_key,
-                value=v,
-                roped_action_query=roped_action_query,
-                roped_action_key=roped_action_key,
-                action_value=action_v,
-                action_register_length=action_register_length,
-                kv_cache=kv_cache,
-            )
+        if ARDiffusionPagedLayerInputs is not None and isinstance(kv_cache, ARDiffusionPagedLayerInputs):
+            # Fused write+attend custom op: one opaque node in the compiled
+            # graph (slot writes + FlashAttention block-table kernel inside).
+            # Metadata tensors were prepared once per forward in _forward_blocks.
+            if action_register_length is not None:
+                q_cat = torch.cat([roped_query, roped_action_query], dim=1)
+                k_act, v_act = roped_action_key[0], action_v[0]
+            else:
+                q_cat = roped_query
+                k_act = v_act = None
+            x = paged_write_attn(
+                kv_cache,
+                q_cat[0],
+                roped_key[0],
+                v[0],
+                k_act,
+                v_act,
+                self.head_dim**-0.5,
+            ).unsqueeze(0)
         else:
             updated_k = kv_cache[0]
             updated_v = kv_cache[1]
@@ -601,73 +623,6 @@ class CausalWanSelfAttention(nn.Module):
         x = x.flatten(2)
         x = self.o(x)
         return x, updated_kv_cache
-
-    def _forward_ar_diffusion_paged(
-        self,
-        *,
-        roped_query: torch.Tensor,
-        roped_key: torch.Tensor,
-        value: torch.Tensor,
-        roped_action_query: torch.Tensor | None,
-        roped_action_key: torch.Tensor | None,
-        action_value: torch.Tensor | None,
-        action_register_length: int | None,
-        kv_cache: Any,
-    ) -> torch.Tensor:
-        from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import ar_diffusion_paged_attention
-
-        if roped_key.shape[0] != 1:
-            raise RuntimeError("AR-Diffusion paged self-attention currently expects batch_size=1")
-        if roped_key.shape[1] != kv_cache.seq_len:
-            raise RuntimeError(
-                "AR-Diffusion paged context seq_len="
-                f"{kv_cache.seq_len} but current video KV has {roped_key.shape[1]} tokens"
-            )
-
-        ctx = kv_cache.forward_ctx
-        layer_idx = kv_cache.layer_idx
-        device = roped_key.device
-        ctx.ensure_video_slots(device)
-
-        k_pool = ctx.kv_cache._k_pools[layer_idx]
-        v_pool = ctx.kv_cache._v_pools[layer_idx]
-        video_slots = ctx.current_video_slot_mapping
-        if video_slots is None:
-            raise RuntimeError("AR-Diffusion paged context did not prepare current video slots")
-        k_pool[video_slots] = roped_key[0].to(k_pool.dtype)
-        v_pool[video_slots] = value[0].to(v_pool.dtype)
-
-        action_len = int(action_register_length or 0)
-        if action_len > 0:
-            if roped_action_key is None or action_value is None or roped_action_query is None:
-                raise RuntimeError("AR-Diffusion paged action path missing action query/key/value tensors")
-            ctx.ensure_action_slots(action_len, device)
-            action_slots = ctx.action_slot_mapping
-            if action_slots is None:
-                raise RuntimeError("AR-Diffusion paged context did not prepare action slots")
-            k_pool[action_slots] = roped_action_key[0].to(k_pool.dtype)
-            v_pool[action_slots] = action_value[0].to(v_pool.dtype)
-            q_cat = torch.cat([roped_query, roped_action_query], dim=1)
-        else:
-            q_cat = roped_query
-
-        block_table, query_start_loc, seq_lens, max_query_len, max_seq_len = ctx.build_block_table(
-            action_len=action_len,
-            query_len=q_cat.shape[1],
-            device=device,
-        )
-        return ar_diffusion_paged_attention(
-            q_cat,
-            ctx.kv_cache.key_cache(layer_idx),
-            ctx.kv_cache.value_cache(layer_idx),
-            block_table=block_table,
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
-            max_query_len=max_query_len,
-            max_seq_len=max_seq_len,
-            softmax_scale=self.head_dim**-0.5,
-            causal=False,
-        )
 
 
 # ── Attention Block ─────────────────────────────────────────────────
@@ -1044,6 +999,28 @@ class CausalWanModel(nn.Module):
         if clip_feature is not None:
             clip_embedding = self.img_emb(clip_feature)
             context = torch.cat([clip_embedding, context], dim=1)
+
+        # AR-Diffusion paged path: host-side prep ONCE per branch forward, outside
+        # the compiled blocks — allocate current video/action slots, build the
+        # padded block-table metadata all 40 layers share, and hand the compiled
+        # region plain tensors (ARDiffusionPagedLayerInputs) instead of a Python
+        # context object. Lazy-allocation contract preserved: only the branch this
+        # CFG-parallel rank executes reaches its _forward_blocks.
+        if kv_cache and getattr(kv_cache[0], "is_ar_diffusion_paged_context", False):
+            if B != 1:
+                raise RuntimeError("AR-Diffusion paged self-attention currently expects batch_size=1")
+            fctx = kv_cache[0].forward_ctx
+            if seq_len != fctx.seq_len:
+                raise RuntimeError(
+                    f"AR-Diffusion paged context seq_len={fctx.seq_len} "
+                    f"but current video KV has {seq_len} tokens"
+                )
+            fctx.prepare(
+                device=x.device,
+                action_len=int(action_register_length or 0),
+                query_len=int(x.shape[1]),
+            )
+            kv_cache = [c.to_layer_inputs() for c in kv_cache]
 
         updated_kv_caches: list[torch.Tensor | None] = []
         for block_index, block in enumerate(self.blocks):

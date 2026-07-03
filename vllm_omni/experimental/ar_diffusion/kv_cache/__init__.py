@@ -29,7 +29,10 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedForwardContext,
     ARDiffusionPagedLayerContext,
+    ARDiffusionPagedLayerInputs,
     ar_diffusion_paged_attention,
+    paged_write_attn,
+    set_current_paged_kv_cache,
 )
 
 __all__ = [
@@ -37,6 +40,7 @@ __all__ = [
     "ARDiffusionKVConfig",
     "ARDiffusionPagedForwardContext",
     "ARDiffusionPagedLayerContext",
+    "ARDiffusionPagedLayerInputs",
     "ARDiffusionRequestAdapter",
     "ChunkWindowManager",
     "ChunkWindowSpec",
@@ -46,6 +50,8 @@ __all__ = [
     "chunk_slot_mapping",
     "compute_num_blocks",
     "compute_slot_mapping",
+    "paged_write_attn",
     "pool_write_chunk",
     "resident_block_ids",
+    "set_current_paged_kv_cache",
 ]

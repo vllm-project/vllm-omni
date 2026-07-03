@@ -85,7 +85,7 @@ class ARDiffusionKVState:
             max_video_tokens=int(self.kv_cache.spec.sliding_window),
         )
         self._paged_pending[is_negative] = forward_ctx
-        _log.info(
+        _log.debug(
             "AR-Diffusion GET   [%s] source=paged-attn layers=%d history_blocks=%d seq_len=%d commit_current=%s",
             branch,
             self.num_layers,
@@ -106,7 +106,7 @@ class ARDiffusionKVState:
             for _ in range(n_chunks):
                 ctx.adapter.on_chunk_committed()
             self._committed[is_negative] += ctx.seq_len
-            _log.info(
+            _log.debug(
                 "AR-Diffusion COMMIT [%s] paged-attn new_tokens=%d chunks=%d resident=%d/%d",
                 branch,
                 ctx.seq_len,

@@ -435,7 +435,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
         if kwargs.get("update_kv_cache", False):
             is_neg = kwargs.get("is_negative", False)
-            logger.info(
+            logger.debug(
                 "AR-Diffusion pipeline predict_noise -> commit paged context: "
                 "is_neg=%s seq_len=%s current_start_frame=%s layers=%d",
                 is_neg,
@@ -473,6 +473,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         compile_ro = {"mode": "reduce-overhead", "fullgraph": True, "dynamic": False}
         # DiT blocks: default avoids CUDAGraph overwrite on modulation tensors; encoders use reduce-overhead.
+        # The AR-Diffusion paged self-attention is a registered custom op, so the
+        # block stays fullgraph even on that path.
         dit_compile = {"mode": "default", "fullgraph": True, "dynamic": False}
 
         logger.info(
