@@ -166,6 +166,8 @@ class ARDiffusionKVCache:
         cross_attn_length: int = 0,
         cross_attn_img_length: int = 0,
         device: torch.device | None = None,
+        local_branches: int = 2,
+        num_frame_per_block: int = 1,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -173,8 +175,17 @@ class ARDiffusionKVCache:
             raise ValueError("Phase 1 requires a bounded window (window_chunks)")
         if config.chunk_size <= 0:
             raise ValueError("ARDiffusionKVConfig.chunk_size must be set (> 0)")
+        if local_branches not in (1, 2):
+            raise ValueError(f"local_branches must be 1 or 2, got {local_branches}")
 
         self.config = config
+        # How many CFG branches allocate from THIS rank's pool. Under
+        # CFG-parallel x2 each rank executes exactly one branch (rank0 pos,
+        # rank1 neg) and the other branch's lazy contexts never allocate, so
+        # sizing for both would leave ~half the pool as idle capacity. A
+        # single-process run (TP1 / offline) executes both branches -> 2.
+        self.local_branches = local_branches
+        self.num_frame_per_block = max(1, int(num_frame_per_block))
         self.block_size = block_size
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -256,21 +267,23 @@ class ARDiffusionKVCache:
             config.gpu_memory_fraction,
             self.spec.page_size_bytes * num_layers,
         )
-        # Floor: one forward needs the resident window plus the in-flight chunk for
-        # BOTH CFG branches (pos/neg are independent adapters allocating from the
-        # same pool), with a little eviction-transient headroom. The memory-fraction
+        # Floor: one forward needs the resident window plus the in-flight chunk
+        # (num_frame_per_block frame-blocks) for every branch THIS rank runs,
+        # with a little eviction-transient headroom. The memory-fraction
         # heuristic can under-size this once block_size grows — e.g. frame-granular
         # paging at the true frame_seqlen makes each block larger and the pool
         # fewer-blocks — so guarantee the minimum the rollout cannot run without,
         # otherwise allocate_chunk hits an exhausted pool mid-forward.
-        min_blocks = 2 * (config.window_chunks + 1) + 2
+        min_blocks = self.local_branches * (config.window_chunks + self.num_frame_per_block) + 2
         if num_blocks < min_blocks:
             _log.warning(
                 "AR-Diffusion KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
-                "floor (2 CFG branches x (window_chunks=%d + 1) + 2 headroom)",
+                "floor (%d local CFG branch(es) x (window_chunks=%d + num_frame_per_block=%d) + 2 headroom)",
                 num_blocks,
                 min_blocks,
+                self.local_branches,
                 config.window_chunks,
+                self.num_frame_per_block,
             )
             num_blocks = min_blocks
         layer_names = [f"ar_diffusion.layer.{i}" for i in range(num_layers)]
@@ -280,11 +293,13 @@ class ARDiffusionKVCache:
         # Scratch blocks are outside KVCacheManager ownership. They hold current
         # denoise-step video KV when update_kv_cache=False and action/state KV in
         # both modes; they are reused every forward and never committed.
-        scratch_per_branch = int(os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "8"))
+        # Default 4: measured high-water is num_frame_per_block video blocks (2)
+        # + 1 action block per branch per forward, +1 margin.
+        scratch_per_branch = int(os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "4"))
         if scratch_per_branch <= 0:
             raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be positive")
         self.scratch_blocks_per_branch = scratch_per_branch
-        self.scratch_num_blocks = 2 * scratch_per_branch
+        self.scratch_num_blocks = self.local_branches * scratch_per_branch
         self.num_blocks_total = self.managed_num_blocks + self.scratch_num_blocks
         self.null_block_id = self.manager.block_pool.null_block.block_id
 
@@ -426,7 +441,9 @@ class ARDiffusionKVCache:
                 f"need [{start}, {start + count}) of {self.scratch_blocks_per_branch}. "
                 "Increase AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH."
             )
-        branch_offset = self.scratch_blocks_per_branch if is_negative else 0
+        # With one local branch (CFG-parallel x2) the rank's only branch maps to
+        # slot 0 whichever CFG side it is; the other branch never allocates here.
+        branch_offset = self.scratch_blocks_per_branch if (is_negative and self.local_branches == 2) else 0
         base = self.managed_num_blocks + branch_offset + start
         return list(range(base, base + count))
 

@@ -88,6 +88,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         available_bytes: int,
         cross_attn_length: int = 0,
         cross_attn_img_length: int = 0,
+        local_branches: int = 2,
+        num_frame_per_block: int = 1,
     ) -> None:
         """Construct the ARDiffusionKVCache (preallocating GPU pools on ``self.device``).
 
@@ -106,6 +108,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             available_bytes=available_bytes,
             cross_attn_length=cross_attn_length,
             cross_attn_img_length=cross_attn_img_length,
+            local_branches=local_branches,
+            num_frame_per_block=num_frame_per_block,
             device=self.device,
         )
         logger.info(
@@ -180,6 +184,19 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
         self.ar_diffusion_kv_config = dataclasses.replace(self.ar_diffusion_kv_config, chunk_size=chunk_size, window_chunks=window_chunks)
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
+        # Under CFG-parallel each rank executes exactly ONE branch (rank0 pos,
+        # rank1 neg; the other branch's lazy contexts never allocate on this
+        # rank), so its pool only needs one branch's capacity. A single-process
+        # run (cfg world 1) executes both branches from one pool.
+        try:
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_classifier_free_guidance_world_size,
+            )
+
+            cfg_world = int(get_classifier_free_guidance_world_size())
+        except Exception:
+            cfg_world = 1
+        local_branches = 1 if cfg_world >= 2 else 2
         logger.info(
             "AR-Diffusion preallocating (paged): frame_seqlen=%d num_frame_per_block=%d "
             "local_attn_size=%d -> chunk_size=%d window_chunks=%d (window=%d tokens)",
@@ -200,6 +217,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             available_bytes=free_bytes,
             cross_attn_length=cross_attn_length,
             cross_attn_img_length=cross_attn_img_length,
+            local_branches=local_branches,
+            num_frame_per_block=num_frame_per_block,
         )
 
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
