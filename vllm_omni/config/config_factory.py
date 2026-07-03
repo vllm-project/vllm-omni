@@ -137,21 +137,19 @@ class StageConfigFactory:
             model_type = "dreamzero"
 
         explicit_pipeline = cls._get_deploy_pipeline(deploy_config_path)
-        if explicit_pipeline:
-            pipeline_cfg = cls.resolve_pipeline_config(explicit_pipeline, hf_config)
-            if pipeline_cfg is not None:
-                return PipelineResolution(explicit_pipeline, pipeline_cfg, hf_config)
-            logger.warning(
-                "Deploy config %s requested pipeline %r which is not in OMNI_PIPELINES; "
-                "falling back to auto-detection.",
-                deploy_config_path,
-                explicit_pipeline,
-            )
+        pipeline_cfg = cls.resolve_pipeline_config(explicit_pipeline, hf_config)
+        if pipeline_cfg is not None:
+            return PipelineResolution(explicit_pipeline, pipeline_cfg, hf_config)
+        logger.warning(
+            "Deploy config %s requested pipeline %r which is not in OMNI_PIPELINES; "
+            "falling back to auto-detection.",
+            deploy_config_path,
+            explicit_pipeline,
+        )
 
-        if model_type and model_type in OMNI_PIPELINES:
-            pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
-            if pipeline_cfg is not None:
-                return PipelineResolution(model_type, pipeline_cfg, hf_config)
+        pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
+        if pipeline_cfg is not None:
+            return PipelineResolution(model_type, pipeline_cfg, hf_config)
 
         if hf_config is not None:
             logger.warning("Inferred model type %s is not registered to an Omni pipeline", model_type)
@@ -411,7 +409,10 @@ class StageConfigFactory:
         return build_stage_runtime_overrides(stage.stage_id, cli_overrides)
 
     @staticmethod
-    def resolve_pipeline_config(model_type: str, hf_config: PretrainedConfig | None = None) -> PipelineConfig | None:
+    def resolve_pipeline_config(
+        model_type: str | None,
+        hf_config: PretrainedConfig | None = None,
+    ) -> PipelineConfig | None:
         """Given a model type, resolve to the pipeline to be used. If the pipeline
         maps to a callable we resolve based on the HF config."""
         if model_type not in OMNI_PIPELINES:
