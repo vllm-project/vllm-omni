@@ -30,6 +30,9 @@ from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
+    DiffusionPipelineProfilerMixin,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -97,6 +100,51 @@ class _StepPipeline:
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
+class _ProfilingStepPipeline(_StepPipeline):
+    enable_diffusion_pipeline_profiler = True
+
+    def __init__(self):
+        super().__init__()
+        self._stage_durations: dict[str, float] = {}
+
+    @property
+    def stage_durations(self) -> dict[str, float]:
+        return dict(self._stage_durations)
+
+    def clear_profiler_records(self) -> None:
+        self._stage_durations.clear()
+
+    def prepare_encode(self, state, **kwargs):
+        result = super().prepare_encode(state, **kwargs)
+        self._stage_durations["QwenImagePipeline.text_encoder.forward"] = 1.0
+        return result
+
+    def denoise_step(self, input_batch, **kwargs):
+        result = super().denoise_step(input_batch, **kwargs)
+        self._stage_durations["QwenImagePipeline.diffuse"] = 2.0
+        return result
+
+    def post_decode(self, state, **kwargs):
+        result = super().post_decode(state, **kwargs)
+        self._stage_durations["QwenImagePipeline.vae.decode"] = 3.0
+        return result
+
+
+class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
+    _PROFILER_TARGETS: list[str] = []
+
+    def __init__(self):
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=True,
+        )
+
+    def forward(self):
+        return None
+
+    def denoise_step(self):
+        return "ok"
+
+
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
@@ -129,6 +177,9 @@ class _FakePeakMemoryPlatform:
     def max_memory_allocated(self):
         index = min(self.reset_calls - 1, len(self._reserved_mb) - 1)
         return int((self._reserved_mb[index] - 100) * 1024**2)
+
+    def is_available(self) -> bool:
+        return True
 
 
 class _IdentityNoiseTransformer(torch.nn.Module):
@@ -438,6 +489,16 @@ def test_input_batch_cached_repack_keeps_static_prompt_fields_for_same_compositi
 
 
 @pytest.mark.cpu
+def test_step_profiler_reports_denoise_step_as_diffuse():
+    pipeline = _AutoDenoiseProfilerPipeline()
+
+    assert pipeline.denoise_step() == "ok"
+
+    assert any(key.endswith(".diffuse") for key in pipeline.stage_durations)
+    assert not any(key.endswith(".denoise_step") for key in pipeline.stage_durations)
+
+
+@pytest.mark.cpu
 class TestRunner:
     """DiffusionModelRunner.execute_stepwise"""
 
@@ -468,6 +529,53 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
+
+    def test_stepwise_output_includes_stage_and_peak_metrics(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _ProfilingStepPipeline()
+        req = _make_step_request()
+        reset_calls = []
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        monkeypatch.setattr(
+            model_runner_module.current_omni_platform,
+            "is_available",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            model_runner_module.current_omni_platform,
+            "reset_peak_memory_stats",
+            lambda: reset_calls.append(True),
+        )
+        monkeypatch.setattr(
+            model_runner_module.current_omni_platform,
+            "max_memory_reserved",
+            lambda: 2 * 1024**2,
+        )
+        monkeypatch.setattr(
+            model_runner_module.current_omni_platform,
+            "max_memory_allocated",
+            lambda: 1024**2,
+        )
+
+        DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_scheduler_output(req, step_id=0),
+        )
+        result = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_cached_scheduler_output(step_id=1),
+        )
+
+        output = result.get_request_output("req-1")
+        assert output.finished is True
+        assert output.result is not None
+        assert output.result.peak_memory_mb == 2
+        assert output.result.stage_durations == {
+            "QwenImagePipeline.text_encoder.forward": 1.0,
+            "QwenImagePipeline.diffuse": 4.0,
+            "QwenImagePipeline.vae.decode": 3.0,
+        }
+        assert reset_calls == [True]
 
     def test_carries_peak_memory_across_stepwise_request_lifecycle(self, monkeypatch):
         runner = _make_runner()
