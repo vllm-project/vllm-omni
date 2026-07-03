@@ -35,8 +35,6 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-logger = init_logger(__name__)
-
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
@@ -51,9 +49,9 @@ from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDa
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.metrics import definitions as defs
 
+logger = init_logger(__name__)
+
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
-_AUDIO_SAMPLE_RATE_ENV = "VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE"
-_AUDIO_CHANNELS_ENV = "VLLM_OMNI_BENCH_AUDIO_CHANNELS"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
@@ -109,32 +107,6 @@ def _audio_continuity_threshold_s() -> float:
         )
         return defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S
     return max(value, 0.0)
-
-
-def _audio_pcm_format() -> tuple[int, int]:
-    """Return ``(sample_rate, channels)`` of the streamed PCM response.
-
-    Defaults to 24 kHz mono (Qwen3-TTS / VoxCPM2 / most MOSS-TTS variants).
-    Override for models with a different codec output format (e.g.
-    MOSS-TTS-Local-Transformer-v1.5, which streams 48 kHz stereo PCM) via
-    ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` / ``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` -
-    getting this wrong silently skews audio_duration/audio_rtf/underrun stats.
-    """
-    sample_rate = 24000
-    channels = 1
-    raw_sr = os.environ.get(_AUDIO_SAMPLE_RATE_ENV)
-    if raw_sr:
-        try:
-            sample_rate = int(raw_sr)
-        except ValueError:
-            logger.warning("Invalid %s=%r; using default %d", _AUDIO_SAMPLE_RATE_ENV, raw_sr, sample_rate)
-    raw_ch = os.environ.get(_AUDIO_CHANNELS_ENV)
-    if raw_ch:
-        try:
-            channels = int(raw_ch)
-        except ValueError:
-            logger.warning("Invalid %s=%r; using default %d", _AUDIO_CHANNELS_ENV, raw_ch, channels)
-    return sample_rate, channels
 
 
 def _pcm_s16le_to_seed_tts_wer_bytes(
@@ -1187,9 +1159,8 @@ async def async_request_openai_audio_speech(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
-    # PCM format: 16-bit signed; sample_rate/channels are model-dependent
-    # (see _audio_pcm_format docstring).
-    sample_rate, channels = _audio_pcm_format()
+    # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
+    sample_rate, channels = defs.stream_pcm_format_from_env()
     sample_width = 2  # 16-bit = 2 bytes
 
     st = time.perf_counter()

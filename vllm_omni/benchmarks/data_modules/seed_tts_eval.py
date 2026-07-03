@@ -39,6 +39,8 @@ Env: ``SEED_TTS_EVAL_DEVICE`` (e.g. ``cuda:0``, ``cpu``); ``SEED_TTS_HF_WHISPER_
 defaults to ``openai/whisper-large-v3`` (override for debugging only). Set
 ``SEED_TTS_WER_SAVE_AUDIO_DIR`` to save the captured 24 kHz mono WAV used by
 WER evaluation for each synthesized utterance.
+Streaming PCM is decoded using ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
+``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` (default: 24 kHz mono).
 """
 
 from __future__ import annotations
@@ -59,6 +61,7 @@ import numpy as np
 from vllm.benchmarks.datasets import SampleRequest
 
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
+from vllm_omni.metrics.definitions import stream_pcm_format_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -173,12 +176,27 @@ def process_one_official(hypo: str, truth: str, lang: str) -> tuple[float, str, 
     return wer, raw_truth, raw_hypo
 
 
-def _pcm_s16le_to_f32_16k(pcm: bytes, pcm_sample_rate: int = 24000) -> np.ndarray:
+def _pcm_s16le_to_f32_16k(
+    pcm: bytes,
+    pcm_sample_rate: int | None = None,
+    channels: int | None = None,
+) -> np.ndarray:
     import scipy.signal
 
     if not pcm:
         return np.zeros(0, dtype=np.float32)
+    if pcm_sample_rate is None or channels is None:
+        env_sample_rate, env_channels = stream_pcm_format_from_env()
+        if pcm_sample_rate is None:
+            pcm_sample_rate = env_sample_rate
+        if channels is None:
+            channels = env_channels
     raw = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        usable = (len(raw) // channels) * channels
+        if usable <= 0:
+            return np.zeros(0, dtype=np.float32)
+        raw = raw[:usable].reshape(-1, channels).mean(axis=1)
     target_len = int(len(raw) * 16000 / pcm_sample_rate)
     if target_len <= 0:
         return np.zeros(0, dtype=np.float32)

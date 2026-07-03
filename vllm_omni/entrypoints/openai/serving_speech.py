@@ -2620,15 +2620,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request,
         *,
-        include_language=False,
         include_voice=False,
         plain_text_passthrough=False,
     ):
         instruction_text = request.instructions.strip() if isinstance(request.instructions, str) else None
         instruction_dict: dict[str, Any] = {}
-
-        if include_language and request.language not in (None, "", "Auto"):
-            instruction_dict["方言"] = request.language
 
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
         if include_voice and request.voice and not (voice_lower and voice_lower in self.uploaded_speakers):
@@ -2652,7 +2648,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Build a Ming instruction payload from OpenAI speech fields."""
         return self._parse_ming_instruction_fields(
             request,
-            include_language=True,
             include_voice=True,
             plain_text_passthrough=True,
         )
