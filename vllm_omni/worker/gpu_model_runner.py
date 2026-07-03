@@ -1821,7 +1821,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         def _explicit_talker_seed(req_id: str) -> int | None:
             sampling_params = getattr(self.requests[req_id], "sampling_params", None)
             extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
-            seed = extra_args.get("qwen3_tts_request_seed") if isinstance(extra_args, dict) else None
+            seed = None
+            if isinstance(extra_args, dict):
+                seed = extra_args.get("tts_local_seed")
             return int(seed) if seed is not None else None
 
         if decode_batch_size > 1 and any(_explicit_talker_seed(req_id) is not None for req_id in decode_req_ids):
@@ -1869,6 +1871,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         if generator is not None:
             talker_kwargs["generator"] = generator
+        if getattr(self.model, "talker_mtp_accepts_req_infos", False):
+            talker_kwargs["req_ids"] = decode_req_ids
+            talker_kwargs["req_infos"] = [
+                self.model_intermediate_buffer.setdefault(req_id, {}) for req_id in decode_req_ids
+            ]
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
@@ -1888,8 +1895,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             start_offsets = [int(self.query_start_loc.cpu[id_to_index[req_id]]) for req_id in decode_req_ids]
         for idx, (req_id, start_offset) in enumerate(zip(decode_req_ids, start_offsets, strict=True)):
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
-            self._merge_additional_information_update(req_id, update_dict)
+            if code_predictor_codes is not None:
+                update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
+                self._merge_additional_information_update(req_id, update_dict)
 
     def _model_forward(
         self,

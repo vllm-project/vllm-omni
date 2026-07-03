@@ -76,6 +76,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
+        # Some stateful vocoder model may need to clean the state
+        # to avoid the leak of slots when the requests have been aborted.
+        if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
+            self.model.on_requests_finished(scheduler_output.finished_req_ids)
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
@@ -789,6 +793,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if hasattr(self.model, "get_dummy_runtime_additional_information"):
                 runtime_addi = self.model.get_dummy_runtime_additional_information(num_reqs)
                 model_kwargs["runtime_additional_information"] = runtime_addi
+            # Generation-stage code2wav models split flat input_ids using this
+            # shared contract. Dummy/profile runs use padded synthetic inputs,
+            # so expose one synthetic segment covering the actual tensor length.
+            model_kwargs["seq_token_counts"] = [int(num_tokens_padded)]
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
