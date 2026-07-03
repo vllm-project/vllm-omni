@@ -35,8 +35,8 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-from vllm_omni.benchmarks.audio_format import stream_pcm_format_from_env
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
+from vllm_omni.benchmarks.audio_format import stream_pcm_format_from_env
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
