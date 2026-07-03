@@ -446,7 +446,7 @@ class MingImagePipeline(ZImagePipeline):
             None if ref_latent is None else tuple(ref_latent.shape),
         )
         try:
-            outputs = super().forward(
+            outputs: DiffusionOutput = super().forward(
                 z_req,
                 prompt=None,
                 height=height,
@@ -462,13 +462,7 @@ class MingImagePipeline(ZImagePipeline):
         finally:
             set_forward_context_ref_latent(None)
 
-        output = outputs[0]
-        if hasattr(output, "output") and output.output is not None:
-            raw = output.output
-        elif hasattr(output, "images"):
-            raw = output.images
-        else:
-            raw = output
+        raw = outputs.output
         if not isinstance(raw, torch.Tensor):
             raise RuntimeError(f"ZImagePipeline returned non-tensor output: {type(raw).__name__}")
         if logger.isEnabledFor(logging.DEBUG):
@@ -478,7 +472,7 @@ class MingImagePipeline(ZImagePipeline):
                 raw.float().min().item(),
                 raw.float().max().item(),
             )
-        return DiffusionOutput(output=raw)
+        return outputs
 
 
 # ----------------------------------------------------------------------
