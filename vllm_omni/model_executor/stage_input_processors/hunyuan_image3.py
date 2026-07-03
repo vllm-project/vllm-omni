@@ -170,8 +170,7 @@ def ar2diffusion(
     cot_text_for_dit = _truncate_at_cot_end(generated_text)
 
     logger.info(
-        "[ar2diffusion] Request 0: AR generated %d tokens, text length=%d, "
-        "cot_text length=%d, target size=%dx%d (%s)",
+        "[ar2diffusion] Request 0: AR generated %d tokens, text length=%d, cot_text length=%d, target size=%dx%d (%s)",
         len(generated_token_ids),
         len(generated_text),
         len(cot_text_for_dit),
