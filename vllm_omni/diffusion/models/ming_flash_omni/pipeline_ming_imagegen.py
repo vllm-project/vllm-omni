@@ -415,6 +415,7 @@ class MingImagePipeline(ZImagePipeline):
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             generator=generator,
+            output_type="pt",
         )
         z_req = DiffusionRequestBatch(
             requests=[
