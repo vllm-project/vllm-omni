@@ -382,7 +382,7 @@ def forward(
         for p in req.prompts
     ]
 
-    # Extract sampling parameters
+    # Extract common sampling parameters
     sampling_params = req.sampling_params
     num_inference_steps = sampling_params.num_inference_steps or 50
     guidance_scale = sampling_params.guidance_scale or 7.5
