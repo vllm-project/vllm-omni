@@ -78,6 +78,14 @@ class InterRequestCacheBackend(CacheBackend):
         self._clip_tokenizer = None
         self._clip_model = None
         self._clip_device = None
+        # CLIP sub-attributes are only fully populated inside _init_clip_encoder().
+        # Pre-initialize them here so that update_image_embedding / encode_image
+        # can safely short-circuit when CLIP is not configured (otherwise they
+        # would raise AttributeError on the never-set attributes).
+        self._full_clip_model = None
+        self._clip_processor = None
+        self._clip_image_processor = None
+        self._use_fgclip = False
 
         logger.info(
             "InterRequestCacheBackend initialized: "

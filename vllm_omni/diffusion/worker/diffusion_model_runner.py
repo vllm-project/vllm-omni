@@ -570,11 +570,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = self._prepare_attn_metadata(input_batch)
 
-            is_dummy = "dummy" in req.request_ids[0] if req.request_ids else False
-
-            if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
-                self.cache_backend.before_forward(is_dummy=is_dummy)
-
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,

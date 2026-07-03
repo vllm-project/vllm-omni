@@ -273,3 +273,4 @@ cat response.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -
 | `run_curl_text_to_image.sh` | curl example                 |
 | `openai_chat_client.py`     | Python client                |
 | `gradio_demo.py`            | Gradio interactive interface |
+| `run_server_with_cache.py`  | Server with inter-request DiT cache reuse (see [Inter-Request Cache Guide](../../../docs/user_guide/diffusion/cache_acceleration/inter_request.md)) |

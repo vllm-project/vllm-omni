@@ -174,6 +174,10 @@ class DiTCacheStore:
         total = self._estimate_tensor_bytes(entry.latents)
         if entry.step_latents is not None:
             total += self._estimate_step_latents_bytes(entry.step_latents)
+        if entry.clip_embedding is not None:
+            total += self._estimate_tensor_bytes(entry.clip_embedding)
+        if entry.image_embedding is not None:
+            total += self._estimate_tensor_bytes(entry.image_embedding)
         return total
 
     def _evict_if_needed(self, required_bytes: int):
@@ -626,6 +630,38 @@ class DiTCacheStore:
                         "metadata": entry.metadata,
                     }
 
+                    # Persist cache_key so that semantic_search dimension filters
+                    # (height/width/steps/frames) survive a restart.
+                    if entry.cache_key is not None:
+                        ck = entry.cache_key
+                        meta["cache_key"] = {
+                            "prompt": ck.prompt,
+                            "negative_prompt": ck.negative_prompt,
+                            "height": ck.height,
+                            "width": ck.width,
+                            "num_inference_steps": ck.num_inference_steps,
+                            "guidance_scale": ck.guidance_scale,
+                            "true_cfg_scale": ck.true_cfg_scale,
+                            "seed": ck.seed,
+                            "sigmas": list(ck.sigmas) if ck.sigmas is not None else None,
+                            "max_sequence_length": ck.max_sequence_length,
+                            "num_images_per_prompt": ck.num_images_per_prompt,
+                            "num_frames": ck.num_frames,
+                        }
+
+                    # Persist text/image embeddings so loaded entries remain
+                    # searchable by semantic_search without re-encoding.
+                    if entry.clip_embedding is not None:
+                        torch.save(
+                            entry.clip_embedding.cpu(),
+                            entry_dir / "clip_embedding.pt",
+                        )
+                    if entry.image_embedding is not None:
+                        torch.save(
+                            entry.image_embedding.cpu(),
+                            entry_dir / "image_embedding.pt",
+                        )
+
                     if entry.step_latents is not None:
                         step_data = []
                         for s in entry.step_latents:
@@ -710,13 +746,53 @@ class DiTCacheStore:
                         old_entry = self._store[key_hash]
                         self._current_memory_bytes -= self._estimate_entry_bytes(old_entry)
 
+                    # Restore CacheKey so semantic_search dimension filters work.
+                    cache_key = None
+                    ck_meta = meta.get("cache_key")
+                    if ck_meta is not None:
+                        try:
+                            cache_key = CacheKey(
+                                prompt=ck_meta["prompt"],
+                                negative_prompt=ck_meta.get("negative_prompt", ""),
+                                height=ck_meta["height"],
+                                width=ck_meta["width"],
+                                num_inference_steps=ck_meta["num_inference_steps"],
+                                guidance_scale=ck_meta["guidance_scale"],
+                                true_cfg_scale=ck_meta["true_cfg_scale"],
+                                seed=ck_meta["seed"],
+                                sigmas=tuple(ck_meta["sigmas"]) if ck_meta.get("sigmas") is not None else None,
+                                max_sequence_length=ck_meta.get("max_sequence_length"),
+                                num_images_per_prompt=ck_meta["num_images_per_prompt"],
+                                num_frames=ck_meta.get("num_frames", 1),
+                            )
+                        except (KeyError, TypeError) as e:
+                            logger.debug("Could not restore CacheKey for %s: %s", key_hash[:8], e)
+
+                    # Restore embeddings so loaded entries stay semantically searchable.
+                    clip_embedding = None
+                    image_embedding = None
+                    clip_file = entry_dir / "clip_embedding.pt"
+                    img_file = entry_dir / "image_embedding.pt"
+                    if clip_file.exists():
+                        clip_embedding = torch.load(clip_file, map_location="cpu", weights_only=True)
+                    if img_file.exists():
+                        image_embedding = torch.load(img_file, map_location="cpu", weights_only=True)
+
                     entry = CacheEntry(
                         latents=latents,
                         cache_key_hash=meta.get("cache_key_hash", key_hash),
                         step_latents=step_latents,
                         metadata=meta.get("metadata"),
+                        clip_embedding=clip_embedding,
+                        cache_key=cache_key,
+                        image_embedding=image_embedding,
                     )
                     self._store[key_hash] = entry
+                    # Register in the semantic-search matrices so loaded entries
+                    # are visible to vectorized semantic_search.
+                    self._matrix_add(key_hash, clip_embedding)
+                    if image_embedding is not None:
+                        self._matrix_update_image(key_hash, image_embedding)
                     self._current_memory_bytes += self._estimate_entry_bytes(entry)
                     loaded_count += 1
 

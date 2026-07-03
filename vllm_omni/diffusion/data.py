@@ -380,6 +380,12 @@ class DiffusionCacheConfig:
     inter_request_record_step_latents: bool = False
     inter_request_step_latents_dir: str = "./step_latents"
     inter_request_persistent_cache_dir: str | None = None
+    # CLIP-based semantic matching parameters [inter_request only]
+    inter_request_clip_model_path: str | None = None
+    inter_request_clip_threshold: float = 0.75
+    inter_request_clip_min_skip: int = 5
+    inter_request_clip_max_skip_ratio: float = 0.5
+    inter_request_use_t2i_penalty: bool = True
 
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
