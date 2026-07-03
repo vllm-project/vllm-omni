@@ -275,7 +275,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
         seed=42,
-        extra_args={"qwen3_tts_request_seed": 42},
+        extra_args={"tts_local_seed": 42},
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(
@@ -319,11 +319,11 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
         seed=11,
-        extra_args={"qwen3_tts_request_seed": 11},
+        extra_args={"tts_local_seed": 11},
     )
     runner.requests["r2"].sampling_params = SimpleNamespace(
         seed=22,
-        extra_args={"qwen3_tts_request_seed": 22},
+        extra_args={"tts_local_seed": 22},
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))

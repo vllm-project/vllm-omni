@@ -3705,15 +3705,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
 
         if request.seed is not None and sampling_params_list:
-            if sampling_params_list is self.engine_client.default_sampling_params_list:
-                import copy
+            import copy
 
-                sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].seed = request.seed
-            if self._tts_model_type == "qwen3_tts":
-                if sampling_params_list[0].extra_args is None:
-                    sampling_params_list[0].extra_args = {}
-                sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            stage0_params = sampling_params_list[0]
+            stage0_params.seed = request.seed
+            if stage0_params.extra_args is None:
+                stage0_params.extra_args = {}
+            stage0_params.extra_args["tts_local_seed"] = request.seed
 
         generator = self.engine_client.generate(
             prompt=prompt,
