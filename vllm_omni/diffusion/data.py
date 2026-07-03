@@ -183,6 +183,21 @@ class DiffusionParallelConfig:
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
 
+    vae_parallel_mode: str = "tile"
+    """VAE parallel decode strategy.
+
+    - "tile": Patch/tile parallel decode (default). Each rank decodes a subset
+      of spatial tiles and the results are stitched on rank 0.
+    - "spatial_shard_height": Spatially-sharded decode that splits decoder
+      feature maps along height and exchanges halo rows around spatial
+      convolutions.
+    - "spatial_shard_width": Same as "spatial_shard_height" but sharded along width.
+
+    The "spatial_shard_*" modes are decode-only and currently require
+    ``vae_patch_parallel_size`` to match the DiT group size; otherwise the VAE
+    falls back to tile-parallel decode at runtime.
+    """
+
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
 
@@ -214,6 +229,10 @@ class DiffusionParallelConfig:
             f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
         )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
+        assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+            f"but got {self.vae_parallel_mode!r}."
+        )
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
@@ -751,6 +770,12 @@ class OmniDiffusionConfig:
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
+    # Request-mode batch admission: wait briefly for compatible requests to
+    # accumulate in the scheduler waiting queue before the first schedule() of
+    # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
+    # 0 disables admission (default; no added latency).
+    request_batch_max_wait_ms: float = 0.0
+
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
 
@@ -823,6 +848,9 @@ class OmniDiffusionConfig:
 
     def __post_init__(self):
         self.master_port = self._resolve_master_port()
+        self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
+        if self.request_batch_max_wait_ms < 0:
+            raise ValueError(f"request_batch_max_wait_ms must be non-negative, got {self.request_batch_max_wait_ms}.")
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig

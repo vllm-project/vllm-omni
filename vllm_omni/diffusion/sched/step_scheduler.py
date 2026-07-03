@@ -88,6 +88,10 @@ class StepScheduler(_BaseScheduler):
                 continue
 
             req_result = req_output.result
+            if req_result is not None and req_result.aborted:
+                terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ABORTED
+                terminal_errors[request_id] = None
+                continue
             output_error = req_result.error if req_result is not None else None
             if output_error is not None:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ERROR

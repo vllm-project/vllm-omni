@@ -11,7 +11,8 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
-from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -107,7 +108,7 @@ class Gr00tN1d7Pipeline(nn.Module):
         return actions
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
         del kwargs
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")

@@ -349,7 +349,7 @@ def test_consume_then_apply_attaches_payload():
     data, _ = receiver.consume_prefetched_kv(_req("rid-apply"))
     assert data is not None
 
-    req = OmniDiffusionRequest(prompts=["p"], sampling_params=OmniDiffusionSamplingParams(), request_id="rid-apply")
+    req = OmniDiffusionRequest(prompt="p", sampling_params=OmniDiffusionSamplingParams(), request_id="rid-apply")
     # Mirror consume_and_distribute_kv_cache's LOCAL apply path (CPU: record_stream no-op).
     receiver._record_stream_for_prefetched(data)
     receiver.apply_kv_cache_to_request(req, data)

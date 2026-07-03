@@ -156,14 +156,19 @@ class TestPerRequestRouting:
         assert torch.all(audio[0][1] == 0)  # this step's row 0 appended
         assert torch.all(audio[1] == 1)
 
-    def test_runs_without_spans_backward_compat(self):
-        """Missing request_token_spans must not crash (equal-split fallback)
-        and still yields a batch-aligned list."""
+    def test_runs_with_spans(self):
+        """request_token_spans are required for correct per-request routing;
+        verify that passing them produces a batch-aligned list."""
         talker = _make_bare_delay_talker()
         hidden = _row_indexed_hidden(2)
         info_dicts = [{}, {}]
+        spans = [(0, 1), (1, 2)]
 
-        result = talker.make_omni_output(hidden, runtime_additional_information=info_dicts)
+        result = talker.make_omni_output(
+            hidden,
+            runtime_additional_information=info_dicts,
+            request_token_spans=spans,
+        )
         audio = _audio_payload(result)
         assert isinstance(audio, list)
         assert len(audio) == 2
