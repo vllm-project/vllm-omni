@@ -468,6 +468,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
     # Get the non-reserved keys for this stage
     flat_args = {k: v for k, v in stage_data.items() if k not in _STAGE_RESERVED_KEYS}
+    explicit_engine_extras = dict(stage_data.get("engine_extras") or {})
     runtime_cfg = dict(stage_data.get("runtime", {}))
     devices = runtime_cfg.get("devices", stage_data.get("devices"))
     num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
@@ -495,7 +496,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
-    kwargs["engine_extras"] = flat_args
+    kwargs["engine_extras"] = _get_recursively_merged_dict(explicit_engine_extras, flat_args)
     return StageDeployConfig(**kwargs)
 
 
