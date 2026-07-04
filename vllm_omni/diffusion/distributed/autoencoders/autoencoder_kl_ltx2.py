@@ -183,6 +183,27 @@ class DistributedAutoencoderKLLTX2Video(AutoencoderKLLTX2Video, DistributedVaeMi
         return dec
 
     def encode_tile_split(self, x: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
+        """Split a sample-space video into overlapping spatial tiles for parallel encoding.
+
+        Args:
+            x: Sample-space input of shape ``(B, C, F, H, W)``. Tiles are sliced on the
+                ``tile_sample_stride_*`` grid with ``tile_sample_min_*`` extents, so
+                neighboring tiles overlap by ``min - stride`` sample pixels.
+
+        Returns:
+            A ``(tiletask_list, grid_spec)`` pair. Each task holds one full-frame-range
+            sample-space tile. ``grid_spec.tile_spec`` carries the latent-space merge
+            metadata: ``latent_height``/``latent_width`` (final crop), ``blend_height``/
+            ``blend_width`` (overlap extents), and ``tile_latent_stride_*`` (per-tile
+            crop). When every tile's spatial dims divide ``spatial_compression_ratio``,
+            it also carries ``max_tile_output_shape`` and ``tile_output_shapes`` — each
+            predicted as ``(B, 2 * latent_channels,
+            (F - 1) // temporal_compression_ratio + 1, tile_h // scr, tile_w // scr)`` —
+            which lets :class:`LTX2VaeExecutor` gather encoder outputs without a shape
+            all-reduce. For tiles with non-divisible spatial dims the encoder output
+            shape is not predictable, so both keys are omitted and the executor falls
+            back to the dynamic metadata-gather path.
+        """
         _, _, num_frames, height, width = x.shape
         latent_height = height // self.spatial_compression_ratio
         latent_width = width // self.spatial_compression_ratio
@@ -245,6 +266,16 @@ class DistributedAutoencoderKLLTX2Video(AutoencoderKLLTX2Video, DistributedVaeMi
         return tiletask_list, grid_spec
 
     def encode_tile_exec(self, task: TileTask, causal: bool | None = None) -> torch.Tensor:
+        """Encode one sample-space tile into latent moments.
+
+        Args:
+            task: Tile task whose tensor is a sample-space slice ``(B, C, F, tile_h, tile_w)``.
+            causal: Optional causal-padding override forwarded to the encoder.
+
+        Returns:
+            Encoder output of shape ``(B, 2 * latent_channels,
+            (F - 1) // temporal_compression_ratio + 1, tile_h // scr, tile_w // scr)``.
+        """
         if hasattr(self, "clear_cache"):
             self.clear_cache()
         return self.encoder(task.tensor, causal=causal)
@@ -252,6 +283,14 @@ class DistributedAutoencoderKLLTX2Video(AutoencoderKLLTX2Video, DistributedVaeMi
     def encode_tile_merge(
         self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec
     ) -> torch.Tensor:
+        """Blend and stitch encoded tiles into the full latent tensor.
+
+        Mirrors the sequential blending of diffusers' ``tiled_encode``: each tile is
+        blended against its upper/left neighbors over the latent-space ``blend_*``
+        extents, cropped to ``tile_latent_stride_*``, concatenated, and finally cropped
+        to ``(latent_height, latent_width)``. Returns latent moments of shape
+        ``(B, 2 * latent_channels, F_latent, latent_height, latent_width)``.
+        """
         grid_h, grid_w = grid_spec.grid_shape
         result_rows = []
 
@@ -283,6 +322,15 @@ class DistributedAutoencoderKLLTX2Video(AutoencoderKLLTX2Video, DistributedVaeMi
         return enc
 
     def tiled_encode(self, x: torch.Tensor, causal: bool | None = None) -> torch.Tensor:
+        """Distributed tiled encode: split across the DiT group, encode, gather, merge.
+
+        Drop-in replacement for diffusers' sequential ``tiled_encode`` — same signature,
+        same return (latent moments ``(B, 2 * latent_channels, F_latent, latent_height,
+        latent_width)``), numerically identical output. Falls back to the sequential
+        parent implementation when distribution is disabled (``vae_patch_parallel_size
+        <= 1``, tiling off, or no process group). The merged result is broadcast to all
+        ranks because every rank's denoiser consumes the latents.
+        """
         if not self.is_distributed_enabled():
             return super().tiled_encode(x, causal=causal)
 
