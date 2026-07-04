@@ -1124,9 +1124,21 @@ class AsyncOmniEngine:
         cache_backend = kwargs.get("cache_backend")
         if cache_backend is None or cache_backend == "none":
             return
-        if getattr(cfg.engine_args, "cache_backend", None) in (None, "none"):
+        stage_backend = getattr(cfg.engine_args, "cache_backend", None)
+        injected = stage_backend in (None, "none")
+        if injected:
             cfg.engine_args.cache_backend = cache_backend
-        cache_config = kwargs.get("cache_config")
+        # Only propagate the top-level cache_config to a stage that will actually
+        # use the top-level backend: either we just injected it, or the stage
+        # already selected the same backend. Otherwise a config meant for the
+        # top-level backend would be attached to a different per-stage backend.
+        if not injected and stage_backend != cache_backend:
+            return
+        # On the deploy-YAML path ``kwargs["cache_config"]`` is the raw CLI JSON
+        # string; normalize it (parse + apply defaults) so the stage receives a
+        # dict, matching the single-engine path. Otherwise OmniDiffusionConfig
+        # drops a str config back to its defaults and the value is lost.
+        cache_config = AsyncOmniEngine._normalize_cache_config(cache_backend, kwargs.get("cache_config"))
         if cache_config is not None and getattr(cfg.engine_args, "cache_config", None) in (None, {}):
             cfg.engine_args.cache_config = cache_config
 
