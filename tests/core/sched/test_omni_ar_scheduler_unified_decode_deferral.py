@@ -100,7 +100,7 @@ def test_unified_decode_graph_deferral_restores_waiting_queue(monkeypatch) -> No
 
     monkeypatch.setattr(scheduler_mod, "create_request_queue", lambda _policy: _MockQueue())
 
-    def fake_upstream_schedule(self):
+    def fake_upstream_schedule(self, throttle_prefills: bool = False):
         assert self.waiting is not original_waiting
         assert not self.waiting
         self.waiting.add_request(deferred_by_upstream)
