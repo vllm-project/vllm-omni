@@ -3513,11 +3513,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # apply uploaded speakers inside validate(), which sets request.ref_audio
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
+        model_type: str | None = None
         has_inline_ref_audio = request.ref_audio is not None
         if self._tts_model_type == "ming_flash_omni_tts":
             # ming_flash_omni is intentionally NOT migrated onto the adapter
             # framework in this PR (it has no registered adapter); keep it on the
             # legacy inline dispatch so serving still works.
+            model_type = "ming_flash_omni_tts"
             validation_error = self._validate_ming_flash_omni_tts_request(request)
             if validation_error:
                 raise ValueError(validation_error)
@@ -3531,6 +3533,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
             prompt = prepared.prompt
             tts_params = prepared.tts_params
+            model_type = prepared.model_type
             qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
@@ -3554,36 +3557,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = {}
             prompt = {"prompt": request.input}
 
-        if self._tts_model_type == "step_audio2":
-            model_type = "step_audio2"
-        elif self._is_fish_speech:
-            model_type = "fish_speech"
-        elif self._tts_model_type == "covo_audio":
-            model_type = "covo_audio"
-        elif self._tts_model_type == "voxtral_tts":
-            model_type = "voxtral_tts"
-        elif self._tts_model_type == "cosyvoice3":
-            model_type = "cosyvoice3"
-        elif self._tts_model_type == "voxcpm2":
-            model_type = "voxcpm2"
-        elif self._tts_model_type == "ming_flash_omni_tts":
-            model_type = "ming_flash_omni_tts"
-        elif self._tts_model_type == "ming_tts":
-            model_type = "ming_tts"
-        elif self._tts_model_type == "moss_tts_nano":
-            model_type = "moss_tts_nano"
-        elif self._tts_model_type == "moss_tts":
-            model_type = "moss_tts"
-        elif self._tts_model_type == "higgs_audio_v2":
-            model_type = "higgs_audio_v2"
-        elif self._tts_model_type == "glm_tts":
-            model_type = "glm_tts"
-        elif self._tts_model_type == "indextts2":
-            model_type = "indextts2"
-        elif self._is_tts:
-            model_type = tts_params.get("task_type", ["unknown"])[0]
-        else:
-            model_type = "generic"
+        if model_type is None:
+            if self._is_tts:
+                model_type = tts_params.get("task_type", ["unknown"])[0]
+            else:
+                model_type = "generic"
         logger.info(
             "TTS speech request %s: text=%r, model=%s",
             request_id,
