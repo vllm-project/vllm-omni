@@ -28,20 +28,21 @@ stages:
     max_num_batched_tokens: 4096
     max_model_len: 4096
     devices: "0"
-    hf_overrides:
-      voxcpm2_runtime_config:
-        audio_emit_every: 1
-        vae_decode_every: 3
-        enable_batched_cfm: true
-        enable_batched_vae_decode: true
-        coalesce_audio_d2h: true
-        enable_loc_dit_fused_qkv: true
-        enable_loc_dit_fused_mlp: true
-        enable_loc_dit_zero_dt_cache: true
-        enable_loc_dit_skip_qkv_contig: true
-        enable_loc_dit_reduce_overhead_no_cg: true
-        enable_unified_decode_graph: true
-        unified_decode_graph_max_batch_size: 8
+    engine_extras:
+      hf_overrides:
+        voxcpm2_runtime_config:
+          audio_emit_every: 1
+          vae_decode_every: 3
+          enable_batched_cfm: true
+          enable_batched_vae_decode: true
+          coalesce_audio_d2h: true
+          enable_loc_dit_fused_qkv: true
+          enable_loc_dit_fused_mlp: true
+          enable_loc_dit_zero_dt_cache: true
+          enable_loc_dit_skip_qkv_contig: true
+          enable_loc_dit_reduce_overhead_no_cg: true
+          enable_unified_decode_graph: true
+          unified_decode_graph_max_batch_size: 8
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
