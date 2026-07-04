@@ -571,6 +571,7 @@ class TestStagePipelineConfig:
         assert s.final_output is False
         assert s.sampling_constraints == {}
         assert s.engine_output_type is None
+        assert s.scheduler_cls is None
 
 
 class TestPipelineConfigNew:
@@ -808,6 +809,26 @@ stages:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert stages[0].yaml_runtime["requires_multimodal_data"] is True
+
+    def test_merge_pipeline_deploy_preserves_pipeline_scheduler_cls(self):
+        scheduler_cls = "tests.fake.CustomScheduler"
+        pipeline = PipelineConfig(
+            model_type="test_scheduler",
+            model_arch="TestModel",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                    scheduler_cls=scheduler_cls,
+                ),
+            ),
+        )
+        deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
+
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert stages[0].scheduler_cls == scheduler_cls
 
     def test_mixed_schema_preserves_flat_fields(self):
         """Ensure flat fields are not dropped when engine_args are present."""

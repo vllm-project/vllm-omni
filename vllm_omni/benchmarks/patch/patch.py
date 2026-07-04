@@ -1264,7 +1264,7 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
-from vllm.benchmarks.serve import TaskType, _merge_overrides, calculate_metrics_for_embeddings, get_request
+from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request
 
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
@@ -1274,6 +1274,19 @@ from vllm_omni.benchmarks.metrics.metrics import (
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
+    """Merge benchmark extra_body with per-request overrides.
+
+    vLLM 0.24 removed the private helper from ``vllm.benchmarks.serve``.
+    Keep the same shallow-merge behavior here, with request overrides winning.
+    """
+    if not base and not overrides:
+        return None
+    merged = dict(base or {})
+    merged.update(overrides or {})
+    return merged
 
 
 async def benchmark(
