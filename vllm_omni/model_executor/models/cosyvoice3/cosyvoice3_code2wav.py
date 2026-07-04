@@ -11,6 +11,8 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -159,6 +161,9 @@ class CosyVoice3Code2Wav(nn.Module):
         token_offset_tokens: int = 0,
         streaming: bool = True,
         finalize: bool = False,
+        token_lens: torch.Tensor | None = None,
+        prompt_token_lens: torch.Tensor | None = None,
+        prompt_feat_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate mel features via the upstream flow-model inference path."""
         flow_weight = next(self.flow_model.parameters())
@@ -169,9 +174,22 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_token = prompt_token.to(device=device, dtype=torch.int32)
         prompt_feat = prompt_feat.to(device=device, dtype=dtype)
         embedding = embedding.to(device=device, dtype=dtype)
-        token_len = torch.tensor([token.shape[1]], device=device, dtype=torch.int32)
-        prompt_token_len = torch.tensor([prompt_token.shape[1]], device=device, dtype=torch.int32)
-        prompt_feat_len = torch.tensor([prompt_feat.shape[1]], device=device, dtype=torch.int32)
+        batch_size = int(token.shape[0])
+        token_len = (
+            token_lens.to(device=device, dtype=torch.int32)
+            if token_lens is not None
+            else torch.full((batch_size,), token.shape[1], device=device, dtype=torch.int32)
+        )
+        prompt_token_len = (
+            prompt_token_lens.to(device=device, dtype=torch.int32)
+            if prompt_token_lens is not None
+            else torch.full((batch_size,), prompt_token.shape[1], device=device, dtype=torch.int32)
+        )
+        prompt_feat_len = (
+            prompt_feat_lens.to(device=device, dtype=torch.int32)
+            if prompt_feat_lens is not None
+            else torch.full((batch_size,), prompt_feat.shape[1], device=device, dtype=torch.int32)
+        )
 
         feat, _ = self.flow_model.inference(
             token=token,
@@ -192,37 +210,13 @@ class CosyVoice3Code2Wav(nn.Module):
 
         return feat
 
-    @torch.inference_mode()
-    def forward_streaming(
+    def _stream_hift_from_feat(
         self,
-        token: torch.Tensor,
-        prompt_token: torch.Tensor,
-        prompt_feat: torch.Tensor,
-        embedding: torch.Tensor,
+        feat: torch.Tensor,
         *,
         cache_state: dict[str, torch.Tensor] | None = None,
-        n_timesteps: int = 10,
-        token_offset_tokens: int = 0,
         finalize: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Decode streaming audio using cumulative mel + emitted-speech offset.
-
-        This mirrors upstream CosyVoice3 streaming semantics more closely than
-        waveform-domain overlap-add: keep a cumulative mel history per request,
-        re-run causal HiFT on the history, and emit only the newly grown speech
-        suffix. That preserves causal look-right handling without double
-        trimming or duplicated overlap at chunk boundaries.
-        """
-        feat = self._forward_mel(
-            token=token,
-            prompt_token=prompt_token,
-            prompt_feat=prompt_feat,
-            embedding=embedding,
-            n_timesteps=n_timesteps,
-            token_offset_tokens=token_offset_tokens,
-            streaming=True,
-            finalize=finalize,
-        )
         hift_weight = self.hift.m_source.l_linear.weight
         chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
 
@@ -256,6 +250,154 @@ class CosyVoice3Code2Wav(nn.Module):
             "speech_offset": int(tts_speech.shape[-1]),
         }
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
+
+    @torch.inference_mode()
+    def forward_streaming_batch(
+        self,
+        items: list[dict[str, object]],
+        *,
+        n_timesteps: int = 10,
+    ) -> list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]]:
+        """Batch the flow-matching mel path, then run HiFT per request.
+
+        Items are grouped by prompt condition shape and finalization state.
+        Codec tokens may have different lengths; those are padded within the
+        group and passed to the flow as per-row token lengths.
+        """
+        results: list[tuple[torch.Tensor, dict[str, torch.Tensor] | None] | None] = [None] * len(items)
+        groups: dict[tuple[int, int, int, bool], list[tuple[int, dict[str, object]]]] = {}
+        for index, item in enumerate(items):
+            token = item["token"]
+            prompt_token = item["prompt_token"]
+            prompt_feat = item["prompt_feat"]
+            embedding = item["embedding"]
+            assert isinstance(token, torch.Tensor)
+            assert isinstance(prompt_token, torch.Tensor)
+            assert isinstance(prompt_feat, torch.Tensor)
+            assert isinstance(embedding, torch.Tensor)
+            key = (
+                int(prompt_token.shape[1]),
+                int(prompt_feat.shape[1]),
+                int(embedding.shape[1]),
+                bool(item.get("finalize", False)),
+            )
+            groups.setdefault(key, []).append((index, item))
+
+        if os.environ.get("COSYVOICE3_BATCH_FLOW_DEBUG", "0") not in ("0", "false", "False", ""):
+            group_summary = {key: len(group) for key, group in groups.items()}
+            logger.info(
+                "CosyVoice3 code2wav debug: forward_streaming_batch items=%d groups=%s",
+                len(items),
+                group_summary,
+            )
+
+        for _key, group in groups.items():
+            if len(group) == 1:
+                index, item = group[0]
+                result = self.forward_streaming(
+                    token=item["token"],  # type: ignore[arg-type]
+                    prompt_token=item["prompt_token"],  # type: ignore[arg-type]
+                    prompt_feat=item["prompt_feat"],  # type: ignore[arg-type]
+                    embedding=item["embedding"],  # type: ignore[arg-type]
+                    cache_state=item.get("cache_state"),  # type: ignore[arg-type]
+                    n_timesteps=n_timesteps,
+                    token_offset_tokens=int(item.get("token_offset_tokens", 0)),
+                    finalize=bool(item.get("finalize", False)),
+                )
+                results[index] = result
+                continue
+
+            token_tensors = [item["token"] for _, item in group]
+            assert all(isinstance(token, torch.Tensor) for token in token_tensors)
+            token_lens = torch.tensor(
+                [int(token.shape[1]) for token in token_tensors],  # type: ignore[union-attr]
+                dtype=torch.int32,
+            )
+            max_token_len = int(token_lens.max().item())
+            padded_tokens = []
+            for token in token_tensors:
+                assert isinstance(token, torch.Tensor)
+                if int(token.shape[1]) == max_token_len:
+                    padded_tokens.append(token)
+                else:
+                    pad = torch.zeros(
+                        (token.shape[0], max_token_len - int(token.shape[1])),
+                        device=token.device,
+                        dtype=token.dtype,
+                    )
+                    padded_tokens.append(torch.cat([token, pad], dim=1))
+            tokens = torch.cat(padded_tokens, dim=0)
+            prompt_tokens = torch.cat([item["prompt_token"] for _, item in group], dim=0)  # type: ignore[list-item]
+            prompt_feats = torch.cat([item["prompt_feat"] for _, item in group], dim=0)  # type: ignore[list-item]
+            embeddings = torch.cat([item["embedding"] for _, item in group], dim=0)  # type: ignore[list-item]
+            prompt_token_lens = torch.full((len(group),), prompt_tokens.shape[1], dtype=torch.int32)
+            prompt_feat_lens = torch.full((len(group),), prompt_feats.shape[1], dtype=torch.int32)
+            finalize = bool(group[0][1].get("finalize", False))
+
+            with torch.profiler.record_function(f"cosyvoice3_flow_batch_b{len(group)}_t{tokens.shape[1]}"):
+                feat = self._forward_mel(
+                    token=tokens,
+                    prompt_token=prompt_tokens,
+                    prompt_feat=prompt_feats,
+                    embedding=embeddings,
+                    n_timesteps=n_timesteps,
+                    token_offset_tokens=0,
+                    streaming=True,
+                    finalize=finalize,
+                    token_lens=token_lens,
+                    prompt_token_lens=prompt_token_lens,
+                    prompt_feat_lens=prompt_feat_lens,
+                )
+
+            for row, (index, item) in enumerate(group):
+                trim_mel = max(0, int(item.get("token_offset_tokens", 0))) * int(self.token_mel_ratio)
+                valid_tokens = int(token_lens[row].item())
+                if not finalize:
+                    valid_tokens = max(0, valid_tokens - int(self.flow_model.pre_lookahead_len))
+                valid_mel = valid_tokens * int(self.token_mel_ratio)
+                row_feat = feat[row : row + 1, :, :valid_mel]
+                if trim_mel > 0:
+                    row_feat = row_feat[:, :, trim_mel:]
+                results[index] = self._stream_hift_from_feat(
+                    row_feat,
+                    cache_state=item.get("cache_state"),  # type: ignore[arg-type]
+                    finalize=finalize,
+                )
+
+        return [result for result in results if result is not None]
+
+    @torch.inference_mode()
+    def forward_streaming(
+        self,
+        token: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        embedding: torch.Tensor,
+        *,
+        cache_state: dict[str, torch.Tensor] | None = None,
+        n_timesteps: int = 10,
+        token_offset_tokens: int = 0,
+        finalize: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Decode streaming audio using cumulative mel + emitted-speech offset.
+
+        This mirrors upstream CosyVoice3 streaming semantics more closely than
+        waveform-domain overlap-add: keep a cumulative mel history per request,
+        re-run causal HiFT on the history, and emit only the newly grown speech
+        suffix. That preserves causal look-right handling without double
+        trimming or duplicated overlap at chunk boundaries.
+        """
+        feat = self._forward_mel(
+            token=token,
+            prompt_token=prompt_token,
+            prompt_feat=prompt_feat,
+            embedding=embedding,
+            n_timesteps=n_timesteps,
+            token_offset_tokens=token_offset_tokens,
+            streaming=True,
+            finalize=finalize,
+        )
+        return self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
 
     @torch.inference_mode()
     def forward(

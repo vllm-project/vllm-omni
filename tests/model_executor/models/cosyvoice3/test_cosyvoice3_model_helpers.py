@@ -42,6 +42,7 @@ class _DummyCode2Wav:
         self.outputs = list(outputs or [])
         self.forward_calls: list[dict[str, object]] = []
         self.forward_streaming_calls: list[dict[str, object]] = []
+        self.forward_streaming_batch_calls: list[list[dict[str, object]]] = []
 
     def forward(self, **kwargs):
         self.forward_calls.append(kwargs)
@@ -64,6 +65,22 @@ class _DummyCode2Wav:
                 "speech_offset": audio.shape[-1],
             }
         return audio, new_state
+
+    def forward_streaming_batch(self, items, *, n_timesteps: int = 10):
+        self.forward_streaming_batch_calls.append(items)
+        return [
+            self.forward_streaming(
+                token=item["token"],
+                prompt_token=item["prompt_token"],
+                prompt_feat=item["prompt_feat"],
+                embedding=item["embedding"],
+                cache_state=item.get("cache_state"),
+                n_timesteps=n_timesteps,
+                token_offset_tokens=int(item.get("token_offset_tokens", 0)),
+                finalize=bool(item.get("finalize", False)),
+            )
+            for item in items
+        ]
 
 
 def _make_code2wav_model(
@@ -371,6 +388,52 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
     )
     assert out.multimodal_outputs["audio"][0].tolist() == [7.0]
     assert "rid-stream" not in model._stream_vocoder_cache_by_req
+
+
+def test_forward_batches_streaming_flow_items():
+    model = _make_code2wav_model()
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {
+                "req_id": ["rid-a"],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 0,
+            },
+        },
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.7, 0.8]], dtype=torch.float32),
+            },
+            "meta": {
+                "req_id": ["rid-b"],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 1,
+            },
+        },
+    ]
+
+    out = model.forward(
+        input_ids=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.long),
+        positions=torch.arange(6, dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[3, 3],
+    )
+
+    assert len(out.multimodal_outputs["audio"]) == 2
+    assert len(model.code2wav.forward_streaming_batch_calls) == 1
+    batch_items = model.code2wav.forward_streaming_batch_calls[0]
+    assert [item["index"] for item in batch_items] == [0, 1]
+    assert torch.equal(batch_items[0]["token"], torch.tensor([[0, 1, 2]]))
+    assert batch_items[1]["token_offset_tokens"] == 1
+    assert "rid-a" in model._stream_vocoder_cache_by_req
+    assert "rid-b" in model._stream_vocoder_cache_by_req
 
 
 def test_sample_uses_ras_rejection_for_recent_repetition():
