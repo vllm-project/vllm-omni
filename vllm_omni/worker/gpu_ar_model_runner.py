@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -1459,7 +1460,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     multimodal_outputs=multimodal_outputs,
                 ),
                 copy_stream=self._get_or_create_omni_payload_copy_stream(),
-                pin_memory=bool(getattr(self, "pin_memory", False)),
+                # NOTE: vLLM v0.24.0's GPUModelRunner no longer exposes a
+                # ``self.pin_memory`` attribute (it uses a module-level
+                # ``PIN_MEMORY`` constant instead), so the old
+                # ``getattr(self, "pin_memory", False)`` silently fell back to
+                # False. That allocated the async D2H snapshot destination in
+                # *pageable* host memory, which turns ``copy_(non_blocking=True)``
+                # into a fully synchronous, stream-stalling copy (~240 ms/step
+                # on the 17.5k-token Thinker prefill). Resolve pinning from the
+                # platform helper so the copy is a true async cudaMemcpyAsync.
+                pin_memory=is_pin_memory_available(),
             )
 
         payload = async_payload_snapshot.payload

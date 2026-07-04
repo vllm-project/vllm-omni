@@ -2620,15 +2620,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request,
         *,
-        include_language=False,
         include_voice=False,
         plain_text_passthrough=False,
     ):
         instruction_text = request.instructions.strip() if isinstance(request.instructions, str) else None
         instruction_dict: dict[str, Any] = {}
-
-        if include_language and request.language not in (None, "", "Auto"):
-            instruction_dict["方言"] = request.language
 
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
         if include_voice and request.voice and not (voice_lower and voice_lower in self.uploaded_speakers):
@@ -2652,7 +2648,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Build a Ming instruction payload from OpenAI speech fields."""
         return self._parse_ming_instruction_fields(
             request,
-            include_language=True,
             include_voice=True,
             plain_text_passthrough=True,
         )
@@ -3705,15 +3700,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
 
         if request.seed is not None and sampling_params_list:
-            if sampling_params_list is self.engine_client.default_sampling_params_list:
-                import copy
+            import copy
 
-                sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].seed = request.seed
-            if self._tts_model_type == "qwen3_tts":
-                if sampling_params_list[0].extra_args is None:
-                    sampling_params_list[0].extra_args = {}
-                sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            stage0_params = sampling_params_list[0]
+            stage0_params.seed = request.seed
+            if stage0_params.extra_args is None:
+                stage0_params.extra_args = {}
+            stage0_params.extra_args["tts_local_seed"] = request.seed
 
         generator = self.engine_client.generate(
             prompt=prompt,
