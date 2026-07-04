@@ -2439,14 +2439,31 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
+    @staticmethod
+    def _get_ref_audio_cache_key(ref_audio_str: str) -> str:
+        """Compute the cache key hash for a given ref_audio string, incorporating file metadata for local files."""
+        cache_key_source = ref_audio_str
+        if not ref_audio_str.startswith(("http://", "https://", "data:")):
+            try:
+                path = ref_audio_str[7:] if ref_audio_str.startswith("file://") else ref_audio_str
+                st = os.stat(path)
+                cache_key_source = f"{ref_audio_str}:{st.st_mtime}:{st.st_size}"
+            except Exception:
+                pass
+        return hashlib.sha1(cache_key_source.encode("utf-8")).hexdigest()
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
+
+        Local file references incorporate mtime and size into the cache key
+        so that modified files are automatically reloaded without a server
+        restart. Remote URLs remain cached by their original string locator.
         """
-        cache_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        cache_key = self._get_ref_audio_cache_key(ref_audio_str)
         cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is not None:
             self._ref_audio_resolve_cache.move_to_end(cache_key)
@@ -2511,7 +2528,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return h.hexdigest()
 
     def _get_resolved_ref_audio_artifact_key(self, ref_audio_str: str) -> str | None:
-        source_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        source_key = self._get_ref_audio_cache_key(ref_audio_str)
         cached = self._ref_audio_resolve_cache.get(source_key)
         if cached is None:
             return None
