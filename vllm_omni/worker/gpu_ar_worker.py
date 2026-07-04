@@ -12,6 +12,7 @@ from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.memory_utils import request_memory_tolerant
@@ -49,16 +50,32 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
+
+            # Publish the logical-to-physical mapping for topology queries
+            # such as NIC affinity and P2P checks (upstream PR #45026).
+            assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
+            if assigned_physical_gpu_ids is not None:
+                from vllm.platforms.interface import set_assigned_physical_gpu_ids
+
+                set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)
+                assert self.local_rank < len(assigned_physical_gpu_ids), (
+                    f"local_rank {self.local_rank} is out of bounds for "
+                    f"assigned_physical_gpu_ids {assigned_physical_gpu_ids}"
+                )
+                if parallel_config.distributed_executor_backend not in ("ray", "external_launcher"):
+                    assert self.parallel_config.local_world_size <= len(assigned_physical_gpu_ids), (
+                        f"local_world_size ({self.parallel_config.local_world_size}) "
+                        "exceeds assigned_physical_gpu_ids count "
+                        f"({len(assigned_physical_gpu_ids)})"
+                    )
+            else:
                 assert self.local_rank < torch.accelerator.device_count(), (
-                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                    f"DP adjusted local rank {self.local_rank} is out of "
+                    f"bounds for {torch.accelerator.device_count()} devices."
                 )
-                visible_device_count = torch.accelerator.device_count()
-                assert self.parallel_config.local_world_size <= visible_device_count, (
-                    f"local_world_size ({self.parallel_config.local_world_size}) must "
-                    f"be less than or equal to the number of visible devices "
-                    f"({visible_device_count})."
-                )
-            self.device = torch.device(f"cuda:{self.local_rank}")
+
+            visible_device_index = current_platform.logical_device_id_to_visible_device_id(self.local_rank)
+            self.device = current_omni_platform.get_torch_device(visible_device_index)
             torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)

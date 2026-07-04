@@ -201,6 +201,7 @@ def run_pre_test_cleanup() -> None:
             wait_for_gpu_memory_to_clear(
                 devices=list(range(num_gpus)),
                 threshold_ratio=0.05,
+                timeout_s=60,
             )
         except Exception as e:
             print(f"Pre-test cleanup note: {e}")

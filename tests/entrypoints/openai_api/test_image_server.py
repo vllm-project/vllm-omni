@@ -1244,7 +1244,7 @@ def test_parameter_validation():
 
     # Invalid layers for layered models (must stay within the backend-supported range)
     with pytest.raises(ValueError):
-        ImageGenerationRequest(prompt="test", layers=2)
+        ImageGenerationRequest(prompt="test", layers=1)
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
@@ -1299,6 +1299,58 @@ def test_generate_images_rejects_model_mismatch(test_client):
     )
     assert response.status_code == 400
     assert "model mismatch" in response.json()["detail"].lower()
+
+
+def test_image_file_response_format_multiple(test_client):
+    """Test response_format=file with n>1 returns ZIP archive"""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": 3,
+            "response_format": "file",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert ".zip" in response.headers.get("content-disposition", "")
+
+    # Verify it's a valid ZIP with 3 PNG files
+    import zipfile
+
+    zip_buffer = io.BytesIO(response.content)
+    with zipfile.ZipFile(zip_buffer, "r") as zf:
+        files = zf.namelist()
+        assert len(files) == 3
+        assert all(f.endswith(".png") for f in files)
+
+        # Verify each file is a valid PNG
+        for filename in files:
+            img_bytes = zf.read(filename)
+            img = Image.open(io.BytesIO(img_bytes))
+            assert img.format == "PNG"
+
+
+def test_image_file_response_format_single(test_client):
+    """Test response_format=file with n=1 returns a single image file."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": 1,
+            "response_format": "file",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert ".png" in response.headers.get("content-disposition", "")
+
+    img = Image.open(io.BytesIO(response.content))
+    assert img.format == "PNG"
 
 
 def make_test_image_bytes(size=(64, 64)) -> bytes:
@@ -1611,13 +1663,13 @@ def test_image_edit_invalid_layers(async_omni_test_client):
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": 2,
+            "layers": 1,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
     # Test layers above the supported range
     response = async_omni_test_client.post(
@@ -1631,7 +1683,7 @@ def test_image_edit_invalid_layers(async_omni_test_client):
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
 
 def test_image_edit_resolution_and_size_conflict(async_omni_test_client):

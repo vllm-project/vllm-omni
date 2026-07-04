@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -96,10 +96,42 @@ class CaptureTalkerMTP(torch.nn.Module):
         return req_embeds, codes
 
 
+class StrictMRoPEModel:
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        raise NotImplementedError
+
+
+class FlexibleMRoPEModel:
+    def get_mrope_input_positions(self, input_tokens, mm_features=None, **kwargs):
+        raise NotImplementedError
+
+
 @contextmanager
 def _noop_forward_context(*args, **kwargs):
     """A no-op context manager to replace vLLM forward context in CPU tests."""
     yield
+
+
+def test_filter_mrope_kwargs_for_strict_model_signature():
+    kwargs = {
+        "mm_features": ["audio"],
+        "hf_config": object(),
+        "image_grid_thw": [],
+    }
+
+    assert _filter_mrope_kwargs_for_model(StrictMRoPEModel(), kwargs) == {
+        "mm_features": ["audio"],
+    }
+
+
+def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
+    kwargs = {
+        "mm_features": ["video"],
+        "hf_config": object(),
+        "video_grid_thw": [[1, 2, 3]],
+    }
+
+    assert _filter_mrope_kwargs_for_model(FlexibleMRoPEModel(), kwargs) is kwargs
 
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
@@ -243,7 +275,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
         seed=42,
-        extra_args={"qwen3_tts_request_seed": 42},
+        extra_args={"tts_local_seed": 42},
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(
@@ -287,11 +319,11 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(
         seed=11,
-        extra_args={"qwen3_tts_request_seed": 11},
+        extra_args={"tts_local_seed": 11},
     )
     runner.requests["r2"].sampling_params = SimpleNamespace(
         seed=22,
-        extra_args={"qwen3_tts_request_seed": 22},
+        extra_args={"tts_local_seed": 22},
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))

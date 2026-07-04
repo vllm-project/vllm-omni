@@ -20,6 +20,7 @@ import janus
 import torch
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
+from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
@@ -43,6 +44,7 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
 )
+from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -50,6 +52,68 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _build_terminal_empty_output(
+    request_id: str,
+    *,
+    final_output_type: str | None,
+    audio_sample_rate: int = 24000,
+) -> RequestOutput:
+    """Build a terminal empty output when no downstream stage input exists."""
+    completion = CompletionOutput(
+        index=0,
+        text="",
+        token_ids=[],
+        cumulative_logprob=None,
+        logprobs=None,
+        finish_reason="stop",
+        stop_reason=None,
+    )
+    if final_output_type == "audio":
+        completion.multimodal_output = {
+            "audio": torch.zeros((0,), dtype=torch.float32),
+            "sr": audio_sample_rate,
+        }
+    return RequestOutput(
+        request_id=request_id,
+        prompt=None,
+        prompt_token_ids=[],
+        prompt_logprobs=None,
+        outputs=[completion],
+        finished=True,
+    )
+
+
+def _coerce_int_scalar(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = _coerce_int_scalar(item)
+            if coerced > 0:
+                return coerced
+        return 0
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return coerced if coerced > 0 else 0
+
+
+def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) -> int:
+    """Infer the final audio stage sample rate from stage metadata when possible."""
+    sample_rate_attrs = ("audio_sample_rate", "sample_rate", "sampling_rate", "output_sample_rate", "sr")
+    stage_client = getattr(stage_pool, "stage_client", None)
+    stage_config = getattr(stage_pool, "_stage_vllm_config", None)
+    for source in (stage_client, stage_config):
+        for attr in sample_rate_attrs:
+            sample_rate = _coerce_int_scalar(getattr(source, attr, None))
+            if sample_rate > 0:
+                return sample_rate
+    return default
 
 
 def build_engine_core_request_from_tokens(
@@ -158,6 +222,7 @@ class Orchestrator:
         running_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         log_stats: bool = False,
+        enable_orch_monitor: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -166,6 +231,13 @@ class Orchestrator:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self._orch_monitor = create_orch_monitor(
+            enabled=enable_orch_monitor,
+            replica_sampler=self._sample_replica_metrics,
+        )
+        for stage_id, pool in enumerate(self.stage_pools):
+            for replica_id in pool.live_replica_ids():
+                self._orch_monitor.register_replica(stage_id, replica_id)
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -180,6 +252,7 @@ class Orchestrator:
         self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
 
         self._cfg_tracker = CfgCompanionTracker()
+        self._stage_input_processors: dict[int, Any] = {}
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
@@ -308,6 +381,7 @@ class Orchestrator:
                 await self._membership.drain_tasks(timeout=10.0)
                 self._membership.shutdown()
 
+            self._orch_monitor.flush()
             self._shutdown_stages()
 
             loop = asyncio.get_running_loop()
@@ -338,6 +412,7 @@ class Orchestrator:
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
+                    self._orch_monitor.register_replica(msg.stage_id, msg.replica_id)
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
@@ -565,6 +640,14 @@ class Orchestrator:
 
     # ---- Orchestration loop ----
 
+    def _sample_replica_metrics(self) -> dict[str, tuple[int, int]]:
+        samples: dict[str, tuple[int, int]] = {}
+        for stage_id, pool in enumerate(self.stage_pools):
+            for replica_id in pool.live_replica_ids():
+                key = replica_key(stage_id, replica_id)
+                samples[key] = pool.replica_monitor_sample(replica_id)
+        return samples
+
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
         try:
@@ -673,6 +756,7 @@ class Orchestrator:
                         await self._handle_processed_outputs(stage_id, replica_id, raw_output)
                         idle = False
 
+            self._orch_monitor.note_loop(idle=idle)
             if idle:
                 await asyncio.sleep(0.001)
             else:
@@ -884,6 +968,77 @@ class Orchestrator:
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
 
+    def _get_stage_input_processor(self, stage_id: int) -> Any:
+        processor = self._stage_input_processors.get(stage_id)
+        if processor is None:
+            from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
+
+            processor = build_stage0_input_processor(self.stage_pools[stage_id].stage_vllm_config)
+            self._stage_input_processors[stage_id] = processor
+        return processor
+
+    def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
+        prompt_embeds = getattr(request, "prompt_embeds", None)
+        additional_information = None
+
+        if isinstance(raw_prompt, dict):
+            if prompt_embeds is None:
+                raw_prompt_embeds = raw_prompt.get("prompt_embeds")
+                if isinstance(raw_prompt_embeds, torch.Tensor):
+                    prompt_embeds = raw_prompt_embeds
+            additional_information = serialize_additional_information(
+                raw_prompt.get("additional_information"),
+                log_prefix="Orchestrator stage input",
+            )
+
+        if prompt_embeds is None and additional_information is None:
+            return request
+
+        return OmniEngineCoreRequest.from_request(
+            request,
+            prompt_embeds=prompt_embeds,
+            additional_information=additional_information,
+        )
+
+    def _next_stage_input_is_tokens(self, next_input: Any) -> bool:
+        return isinstance(next_input, dict) and "prompt_token_ids" in next_input
+
+    def _build_next_stage_request(
+        self,
+        req_id: str,
+        next_stage_id: int,
+        next_input: Any,
+        params: SamplingParams | PoolingParams,
+        *,
+        mm_features: list | None = None,
+        resumable: bool = False,
+    ) -> Any:
+        next_pool = self.stage_pools[next_stage_id]
+        if self._next_stage_input_is_tokens(next_input):
+            request = build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=next_input,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                mm_features=mm_features,
+                resumable=resumable,
+            )
+            request.external_req_id = request.request_id
+            return request
+
+        processor = self._get_stage_input_processor(next_stage_id)
+        request = processor.process_inputs(
+            request_id=req_id,
+            prompt=next_input,
+            params=params,
+            supported_tasks=("generate",),
+            arrival_time=_time.time(),
+            resumable=resumable,
+        )
+        request = self._upgrade_processed_stage_request(request, next_input)
+        request.external_req_id = req_id
+        return request
+
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
         parent_id = self._cfg_tracker.on_companion_completed(req_id)
@@ -1081,6 +1236,31 @@ class Orchestrator:
                     src_stage_id,
                     next_logical,
                 )
+                if diffusion_prompt is None:
+                    error_output = OmniRequestOutput.from_error(
+                        req_id,
+                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
+                    )
+                    logger.warning(
+                        "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                        "routing terminal error output",
+                        req_id,
+                        src_stage_id,
+                        next_logical,
+                    )
+                    await self.output_async_queue.put(
+                        OutputMessage(
+                            request_id=req_id,
+                            stage_id=next_logical,
+                            engine_outputs=error_output,
+                            metrics=None,
+                            finished=True,
+                        )
+                    )
+                    await self._cleanup_request_ids(
+                        [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                    )
+                    return
                 if isinstance(diffusion_prompt, list):
                     if not diffusion_prompt:
                         error_output = OmniRequestOutput.from_error(
@@ -1107,7 +1287,7 @@ class Orchestrator:
                             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
                         )
                         return
-                    if already_submitted and len(diffusion_prompt) == 1:
+                    if len(diffusion_prompt) == 1:
                         diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
@@ -1207,22 +1387,64 @@ class Orchestrator:
             )
             raise
 
+        if not next_inputs:
+            if not getattr(output, "finished", False):
+                logger.debug(
+                    "[Orchestrator] req=%s stage-%s produced no inputs for stage-%s; waiting for more outputs",
+                    req_id,
+                    src_stage_id,
+                    next_logical,
+                )
+                return
+
+            final_stage_id = req_state.final_stage_id
+            final_pool = self.stage_pools[final_stage_id]
+            final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
+            terminal_output = _build_terminal_empty_output(
+                req_id,
+                final_output_type=final_output_type,
+                audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
+            )
+            submit_ts = _time.time()
+            req_state.stage_submit_ts[final_stage_id] = submit_ts
+            logger.info(
+                "[Orchestrator] req=%s stage-%s produced no terminal inputs for stage-%s; "
+                "returning empty %s output from final stage-%s",
+                req_id,
+                src_stage_id,
+                next_logical,
+                final_output_type or "text",
+                final_stage_id,
+            )
+            await self.output_async_queue.put(
+                OutputMessage(
+                    request_id=req_id,
+                    stage_id=final_stage_id,
+                    replica_id=0,
+                    engine_outputs=terminal_output,
+                    metrics=None,
+                    finished=True,
+                    stage_submit_ts=submit_ts,
+                )
+            )
+            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            return
+
         # Build and submit requests for each input
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
-            request = build_engine_core_request_from_tokens(
-                request_id=req_id,
-                prompt=next_input,
+            request = self._build_next_stage_request(
+                req_id,
+                next_logical,
+                next_input,
                 params=params,
-                model_config=next_pool.stage_vllm_config.model_config,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
             )
 
-            request.external_req_id = request.request_id
             if already_submitted:
                 await next_pool.submit_update(req_id, req_state, request)
             else:

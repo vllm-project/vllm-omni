@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import queue
 import threading
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _make_request(req_id: str) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[f"prompt_{req_id}"],
+        prompt=f"prompt_{req_id}",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         request_id=req_id,
     )
@@ -66,7 +67,7 @@ def _make_step_request(
     sampling_params: OmniDiffusionSamplingParams | None = None,
 ) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[f"prompt_{req_id}"],
+        prompt=f"prompt_{req_id}",
         sampling_params=sampling_params
         or OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
@@ -127,6 +128,12 @@ class _StubScheduler(SchedulerInterface):
     def has_requests(self) -> bool:
         return not self._scheduled
 
+    def num_waiting_requests(self) -> int:
+        return 0 if self._scheduled else 1
+
+    def num_running_requests(self) -> int:
+        return 1 if self._scheduled else 0
+
     def get_request_state(self, request_id: str):
         del request_id
         return self._state
@@ -163,7 +170,7 @@ class TestGetSamplingParamsKey:
             )
         sp.lora_scale = lora_scale
         return OmniDiffusionRequest(
-            prompts=["prompt"],
+            prompt="prompt",
             sampling_params=sp,
             request_id=f"req-{lora_int_id}-{lora_scale}",
         )
@@ -193,6 +200,41 @@ class TestGetSamplingParamsKey:
         a = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         b = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         assert a == b
+
+
+class TestGetRequestBatchSamplingParamsKey:
+    """Pure-function tests for the request-batch compatibility key builder."""
+
+    @staticmethod
+    def _make(
+        *,
+        num_inference_steps: int = 2,
+        seed: int | None = 123,
+        generator: torch.Generator | None = None,
+    ) -> OmniDiffusionRequest:
+        sp = OmniDiffusionSamplingParams(
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+            generator=generator,
+        )
+        return OmniDiffusionRequest(prompt="prompt", sampling_params=sp, request_id=f"req-{num_inference_steps}")
+
+    def test_distinguishes_num_inference_steps(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_request_batch_sampling_params_key
+
+        assert get_request_batch_sampling_params_key(
+            self._make(num_inference_steps=2)
+        ) != get_request_batch_sampling_params_key(self._make(num_inference_steps=4))
+
+    def test_ignores_seed_and_generator(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import get_request_batch_sampling_params_key
+
+        gen_a = torch.Generator(device="cpu").manual_seed(1)
+        gen_b = torch.Generator(device="cpu").manual_seed(2)
+
+        assert get_request_batch_sampling_params_key(
+            self._make(seed=1, generator=gen_a)
+        ) == get_request_batch_sampling_params_key(self._make(seed=2, generator=gen_b))
 
 
 class TestRequestScheduler:
@@ -238,6 +280,35 @@ class TestRequestScheduler:
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
 
+    def test_streaming_output_keeps_request_running_until_final_chunk(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace())
+        req_id = scheduler.add_request(_make_request("stream"))
+
+        sched_output = scheduler.schedule()
+        chunk = RunnerOutput(
+            request_id=req_id,
+            step_index=1,
+            finished=False,
+            result=DiffusionOutput(output="chunk-0", finished=False, chunk_index=0, total_chunks=2),
+        )
+        finished = scheduler.update_from_output(sched_output, chunk)
+
+        assert finished == set()
+        assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.RUNNING
+        assert scheduler.has_requests() is True
+
+        final_chunk = RunnerOutput(
+            request_id=req_id,
+            step_index=2,
+            finished=True,
+            result=DiffusionOutput(output="chunk-1", finished=True, chunk_index=1, total_chunks=2),
+        )
+        finished = scheduler.update_from_output(sched_output, final_chunk)
+
+        assert finished == {req_id}
+        assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+
     def test_fifo_single_request_scheduling(self) -> None:
         req_id_a = self.scheduler.add_request(_make_request("a"))
         req_id_b = self.scheduler.add_request(_make_request("b"))
@@ -267,14 +338,68 @@ class TestRequestScheduler:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
 
-        req_id_a = scheduler.add_request(_make_request("a"))
-        req_id_b = scheduler.add_request(_make_request("b"))
+        req_id_a = scheduler.add_request(
+            _make_step_request(
+                "a",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, seed=123),
+            )
+        )
+        req_id_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, seed=123),
+            )
+        )
 
         sched_output = scheduler.schedule()
 
         assert _new_ids(sched_output) == [req_id_a, req_id_b]
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
+
+    def test_batches_incompatible_request_sampling_params_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(
+            _make_step_request(
+                "a", num_inference_steps=2, sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123)
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "b", num_inference_steps=4, sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4, seed=123)
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [req_id_a]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+    def test_batches_different_request_local_seed_together(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(
+            _make_step_request(
+                "a",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123),
+            )
+        )
+        req_id_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=456),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [req_id_a, req_id_b]
+        assert first.num_running_reqs == 2
+        assert first.num_waiting_reqs == 0
 
     def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
         scheduler = RequestScheduler()
@@ -283,7 +408,7 @@ class TestRequestScheduler:
         req_id_a = scheduler.add_request(_make_request("a"))
         req_id_b = scheduler.add_request(
             OmniDiffusionRequest(
-                prompts=["prompt_b"],
+                prompt="prompt_b",
                 sampling_params=OmniDiffusionSamplingParams(width=768),
                 request_id="b",
             )
@@ -344,7 +469,7 @@ class TestRequestScheduler:
 
     def test_request_id_is_scheduler_key(self) -> None:
         request = OmniDiffusionRequest(
-            prompts=["prompt_map_a", "prompt_map_b"],
+            prompt="prompt_map_a",
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
             request_id="map-parent",
         )
@@ -369,6 +494,7 @@ class TestRequestScheduler:
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(streaming_output=False)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
         engine._rpc_lock = threading.RLock()
@@ -391,6 +517,7 @@ class TestDiffusionEngine:
         scheduler = _StubScheduler(request, runner_output)
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(streaming_output=False)
         engine.scheduler = scheduler
         engine._rpc_lock = threading.RLock()
         engine._cv = threading.Condition(engine._rpc_lock)
@@ -410,7 +537,7 @@ class TestDiffusionEngine:
     ) -> None:
         request = _make_request("init")
         scheduler = _StubScheduler(request, DiffusionOutput(output=None))
-        od_config = SimpleNamespace(model_class_name="mock_model")
+        od_config = SimpleNamespace(model_class_name="mock_model", streaming_output=False)
         fake_executor_cls = mocker.Mock(return_value=mocker.Mock())
 
         monkeypatch.setattr(
@@ -472,7 +599,7 @@ class TestDiffusionEngine:
 
     def test_finalize_finished_request_returns_aborted_output(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.scheduler = RequestScheduler()
+        engine.scheduler = StepScheduler()
         engine.scheduler.initialize(SimpleNamespace())
 
         req_id = engine.scheduler.add_request(_make_request("req-finalize"))
@@ -483,12 +610,77 @@ class TestDiffusionEngine:
         assert output.aborted is True
         assert output.abort_message == "Request req-finalize aborted."
 
+    @pytest.mark.asyncio
+    async def test_streaming_runner_output_notifies_each_chunk(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = StepScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._out_queue_streaming = {}
+        engine.main_loop = asyncio.get_running_loop()
+
+        req_id = engine.scheduler.add_request(_make_request("stream-engine"))
+        queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+        engine._out_queue_streaming[req_id] = queue
+        sched_output = engine.scheduler.schedule()
+
+        chunk = RunnerOutput(
+            request_id=req_id,
+            step_index=1,
+            finished=False,
+            result=DiffusionOutput(output="chunk-0", finished=False, chunk_index=0, total_chunks=2),
+        )
+        finished_req_ids = engine.scheduler.update_from_output(sched_output, chunk)
+        engine._handle_step_streaming_runner_output(finished_req_ids, sched_output.scheduled_request_ids, chunk)
+
+        notified_chunk = await asyncio.wait_for(queue.get(), timeout=1)
+        assert notified_chunk.output == "chunk-0"
+        assert notified_chunk.finished is False
+        assert engine.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.RUNNING
+
+        final_chunk = RunnerOutput(
+            request_id=req_id,
+            step_index=2,
+            finished=True,
+            result=DiffusionOutput(output="chunk-1", finished=True, chunk_index=1, total_chunks=2),
+        )
+        finished_req_ids = engine.scheduler.update_from_output(sched_output, final_chunk)
+        engine._handle_step_streaming_runner_output(finished_req_ids, sched_output.scheduled_request_ids, final_chunk)
+
+        notified_final = await asyncio.wait_for(queue.get(), timeout=1)
+        assert notified_final.output == "chunk-1"
+        assert notified_final.finished is True
+        assert engine.scheduler.get_request_state(req_id) is None
+
+    @pytest.mark.asyncio
+    async def test_finished_streaming_request_without_runner_output_notifies_waiter(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = RequestScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._out_queue_streaming = {}
+        engine.main_loop = asyncio.get_running_loop()
+
+        req_id = engine.scheduler.add_request(_make_request("stream-abort"))
+        queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+        engine._out_queue_streaming[req_id] = queue
+        engine.scheduler.finish_requests(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+        engine._handle_empty_streaming_requests({req_id})
+
+        output = await asyncio.wait_for(queue.get(), timeout=1)
+        assert output.aborted is True
+        assert output.finished is True
+        assert engine.scheduler.get_request_state(req_id) is None
+
     def test_initializes_step_scheduler_when_step_execution_enabled(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(model_class_name="mock_model")
+        od_config = SimpleNamespace(model_class_name="mock_model", streaming_output=False)
         od_config.step_execution = True
         fake_executor = mocker.Mock()
         fake_executor_cls = mocker.Mock(return_value=fake_executor)
@@ -520,124 +712,6 @@ class TestDiffusionEngine:
 
         with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
             engine._dummy_run()
-
-    @pytest.mark.asyncio
-    async def test_step_multi_request_reuses_multimodal_slice_logic(self, mocker: MockerFixture) -> None:
-        engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.od_config = SimpleNamespace(
-            model_class_name="mock_model",
-            enable_cpu_offload=False,
-        )
-        engine.pre_process_func = None
-        engine.post_process_func = None
-        engine._check_and_start_background_loop = mocker.AsyncMock()
-        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
-            return_value=DiffusionOutput(
-                output={
-                    "video": ["frame-0", "frame-1"],
-                    "audio": ["audio-0", "audio-1"],
-                    "actions": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-                }
-            )
-        )
-
-        request = OmniDiffusionRequest(
-            prompts=["prompt-0", "prompt-1"],
-            sampling_params=OmniDiffusionSamplingParams(
-                num_inference_steps=1,
-                num_outputs_per_prompt=1,
-            ),
-            request_id="req-batch",
-        )
-
-        mocker.patch("vllm_omni.diffusion.output_formatter.supports_audio_output", return_value=False)
-        outputs = await engine.step(request)
-
-        assert len(outputs) == 2
-        assert outputs[0].images == ["frame-0"]
-        assert outputs[1].images == ["frame-1"]
-        assert outputs[0].multimodal_output["audio"] == "audio-0"
-        assert outputs[1].multimodal_output["audio"] == "audio-1"
-        torch.testing.assert_close(
-            outputs[0].multimodal_output["actions"],
-            torch.tensor([1.0, 2.0]),
-        )
-        torch.testing.assert_close(
-            outputs[1].multimodal_output["actions"],
-            torch.tensor([3.0, 4.0]),
-        )
-
-    @pytest.mark.asyncio
-    async def test_step_empty_dict_output_still_runs_postprocess(self, mocker: MockerFixture) -> None:
-        engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.od_config = SimpleNamespace(
-            model_class_name="mock_model",
-            enable_cpu_offload=False,
-        )
-        engine.pre_process_func = None
-        engine.post_process_func = mocker.Mock(return_value={"video": ["processed"]})
-        engine._post_process_accepts_sampling_params = False
-        engine._check_and_start_background_loop = mocker.AsyncMock()
-        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
-            return_value=DiffusionOutput(
-                output={},
-                custom_output={"actions": torch.tensor([[1.0, 2.0]])},
-            )
-        )
-
-        request = OmniDiffusionRequest(
-            prompts=["prompt"],
-            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-            request_id="req-action",
-        )
-
-        mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)
-        outputs = await engine.step(request)
-
-        engine.post_process_func.assert_called_once_with({})
-        assert outputs[0].images == ["processed"]
-        torch.testing.assert_close(outputs[0].multimodal_output["actions"], torch.tensor([[1.0, 2.0]]))
-
-    @pytest.mark.asyncio
-    async def test_step_action_only_flag_skips_postprocess(self, mocker: MockerFixture) -> None:
-        engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.od_config = SimpleNamespace(
-            model_class_name="mock_model",
-            enable_cpu_offload=False,
-        )
-        engine.pre_process_func = None
-        engine.post_process_func = mocker.Mock(side_effect=AssertionError("postprocess should be skipped"))
-        engine.action_post_process_func = mocker.Mock(return_value=torch.tensor([[3.0, 4.0]]))
-        engine._post_process_accepts_sampling_params = False
-        engine._action_post_process_accepts_custom_output = True
-        engine._action_post_process_accepts_sampling_params = False
-        engine._check_and_start_background_loop = mocker.AsyncMock()
-        raw_action = torch.tensor([[1.0, 2.0]])
-        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
-            return_value=DiffusionOutput(
-                output={},
-                custom_output={
-                    "action": raw_action,
-                    "action_only_output": True,
-                },
-            )
-        )
-
-        request = OmniDiffusionRequest(
-            prompts=["prompt"],
-            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-            request_id="req-action",
-        )
-
-        mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)
-        outputs = await engine.step(request)
-
-        engine.post_process_func.assert_not_called()
-        engine.action_post_process_func.assert_called_once()
-        assert engine.action_post_process_func.call_args.args[0] is raw_action
-        assert "custom_output" in engine.action_post_process_func.call_args.kwargs
-        assert outputs[0].images == []
-        torch.testing.assert_close(outputs[0].multimodal_output["actions"], torch.tensor([[3.0, 4.0]]))
 
 
 class TestStepScheduler:

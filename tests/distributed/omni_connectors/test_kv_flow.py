@@ -1,7 +1,6 @@
 import json
 import struct
 
-import numpy as np
 import pytest
 import torch
 
@@ -206,17 +205,6 @@ def test_update_sender_info_uses_configured_source_stage():
     assert manager.config.connector_config["sender_zmq_port"] == 50152
 
 
-def test_clone_received_payload_tensors_breaks_buffer_alias():
-    payload, key_tensor = _make_serialized_payload()
-    raw = np.frombuffer(bytearray(payload), dtype=np.uint8)
-    data = KVCacheTransferData.from_bytes(memoryview(raw))
-
-    OmniKVTransferManager._clone_received_payload_tensors(data)
-    raw[:] = 0
-
-    assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
-
-
 def test_receive_kv_cache_uses_exponential_backoff(monkeypatch):
     config = OmniKVCacheConfig(
         connector_config={"type": "mock"},
@@ -382,7 +370,7 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     mock_connector.store[store_key] = data_to_receive
 
     req = OmniDiffusionRequest(
-        prompts=["test_recv"],
+        prompt="test_recv",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=req_id,
     )
@@ -426,7 +414,7 @@ def test_manager_reception_prefers_parent_request_id_for_batched_request(kv_conf
     mock_connector.store[store_key] = data_to_receive
 
     req = OmniDiffusionRequest(
-        prompts=["prompt-a", "prompt-b"],
+        prompt="prompt-a",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=parent_req_id,
     )
@@ -451,7 +439,7 @@ def test_receive_multi_kv_cache_uses_parent_request_id_for_cfg_collection(kv_con
         return {"cfg_text_kv_metadata": {"ok": True}}
 
     req = OmniDiffusionRequest(
-        prompts=["prompt-a", "prompt-b"],
+        prompt="prompt-a",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id="req-parent",
     )
@@ -512,7 +500,7 @@ def test_integration_flow(common_constants):
     receiver_manager._connector = connector
 
     req = OmniDiffusionRequest(
-        prompts=["test_integ"],
+        prompt="test_integ",
         sampling_params=OmniDiffusionSamplingParams(),
         request_id=req_id,
     )
@@ -524,6 +512,57 @@ def test_integration_flow(common_constants):
     assert success
     assert req.past_key_values is not None
     assert req.kv_metadata["seq_len"] == 10
+
+
+def test_deferred_release_isolates_data_from_pool_buffer():
+    payload, key_tensor = _make_serialized_payload()
+
+    # ManagedBuffer-like object whose release() zeros storage (simulates reuse).
+    raw_array = bytearray(payload)
+    buf_tensor = torch.frombuffer(raw_array, dtype=torch.uint8)
+
+    class _CorruptingManagedBuffer:
+        def __init__(self, storage, tensor):
+            self._storage = storage
+            self._tensor = tensor
+
+        @property
+        def tensor(self):
+            return self._tensor
+
+        def release(self):
+            for i in range(len(self._storage)):
+                self._storage[i] = 0
+
+    managed_buf = _CorruptingManagedBuffer(raw_array, buf_tensor)
+
+    class _ManagedBufConnector:
+        def __init__(self, buf, from_stage, to_stage, req_id):
+            self._buf = buf
+            self._key = f"{from_stage}->{to_stage}:omni_{from_stage}_to_{to_stage}_kv_cache_{req_id}"
+
+        def get(self, from_stage, to_stage, get_key, metadata=None):
+            if f"{from_stage}->{to_stage}:{get_key}" == self._key:
+                return self._buf, len(self._buf._storage)
+            return None
+
+    config = OmniKVCacheConfig(
+        connector_config={"type": "mock"},
+        from_stage="sender",
+        stage_id="receiver",
+        need_recv_cache=True,
+        recv_timeout=1.0,
+    )
+    manager = OmniKVTransferManager(config)
+    req_id = "req-payload"
+    manager._connector = _ManagedBufConnector(managed_buf, "sender", "receiver", req_id)
+
+    data, size = manager.receive_kv_cache_for_request(req_id, target_device=torch.device("cpu"))
+
+    assert data is not None
+    assert size > 0
+    # Returned data must survive the pool buffer being zeroed by release().
+    assert torch.equal(data["layer_blocks"]["key_cache"][0], key_tensor)
 
 
 def test_manager_extraction_no_connector(kv_config, common_constants):

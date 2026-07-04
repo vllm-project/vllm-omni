@@ -34,19 +34,19 @@ def _make_i2v_pipeline(*, expand_timesteps: bool) -> Wan22I2VPipeline:
 def test_i2v_preprocess_requires_image_and_resizes_to_480p_aspect() -> None:
     preprocess = get_wan22_i2v_pre_process_func(SimpleNamespace())
     request = SimpleNamespace(
-        prompts=[{"prompt": "p", "multi_modal_data": {"image": Image.new("RGB", (320, 160), "red")}}],
+        prompt={"prompt": "p", "multi_modal_data": {"image": Image.new("RGB", (320, 160), "red")}},
         sampling_params=SimpleNamespace(height=None, width=None),
     )
 
     result = preprocess(request)
-    prompt = result.prompts[0]
+    prompt = result.prompt
 
     assert result.sampling_params.height == 432
     assert result.sampling_params.width == 880
     assert prompt["multi_modal_data"]["image"].size == (880, 432)
 
     missing_image = SimpleNamespace(
-        prompts=[{"prompt": "p", "multi_modal_data": {}}],
+        prompt={"prompt": "p", "multi_modal_data": {}},
         sampling_params=SimpleNamespace(height=None, width=None),
     )
     with pytest.raises(ValueError, match="No image is provided"):
@@ -100,7 +100,10 @@ def test_i2v_diffuse_selects_stage_guidance_and_expands_timesteps() -> None:
     timestep_dtype = calls[0]["timestep_values"].dtype
     torch.testing.assert_close(calls[0]["timestep_values"][0, :4], torch.zeros(4, dtype=timestep_dtype))
     torch.testing.assert_close(calls[0]["timestep_values"][0, 4:], torch.full((4,), 900, dtype=timestep_dtype))
-    torch.testing.assert_close(calls[0]["hidden_states"][:, :, 0], torch.ones(1, 4, 4, 4))
+    torch.testing.assert_close(
+        calls[0]["hidden_states"][:, :, 0],
+        torch.ones_like(calls[0]["hidden_states"][:, :, 0]),
+    )
     torch.testing.assert_close(result, torch.full_like(latents, 2.0))
 
 

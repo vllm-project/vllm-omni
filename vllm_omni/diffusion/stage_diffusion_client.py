@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 logger = init_logger(__name__)
+_MISSING_RPC_RESULT = object()
 
 
 def create_diffusion_client(
@@ -354,72 +355,6 @@ class StageDiffusionClient(StageClientBase):
             )
         )
 
-    # TODO(Long): Temporary solution to boost performance of diffusion stages.
-    # Remove this after scheduling algorithm is implemented
-    async def add_batch_request_async(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None:
-        """Submit a list of prompts as a single batched engine call.
-
-        All prompts are processed in one ``DiffusionEngine.step()`` call
-        and the combined result is placed on the output queue with a single
-        *request_id*.
-        """
-        if self._engine_dead:
-            raise EngineDeadError()
-        logger.info(
-            "[StageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
-            self.stage_id,
-            self.replica_id,
-            request_id,
-            len(prompts),
-        )
-        task = asyncio.create_task(
-            self._run_batch(
-                request_id,
-                prompts,
-                sampling_params,
-                kv_sender_info,
-            ),
-            name=f"diffusion-batch-{request_id}",
-        )
-        self._tasks[request_id] = task
-
-    async def _run_batch(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None:
-        try:
-            self._request_socket.send(
-                self._encoder.encode(
-                    {
-                        "type": "add_batch_request",
-                        "request_id": request_id,
-                        "prompts": prompts,
-                        "sampling_params": self._sampling_params_to_dict(sampling_params),
-                        "kv_sender_info": kv_sender_info,
-                    }
-                )
-            )
-        except Exception as e:
-            logger.exception(
-                "[StageDiffusionClient] stage-%s [rep-%s] batch req=%s failed: %s",
-                self.stage_id,
-                self.replica_id,
-                request_id,
-                e,
-            )
-            await self._output_queue.put(OmniRequestOutput.from_error(request_id, str(e)))
-        finally:
-            self._tasks.pop(request_id, None)
-
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
         self._drain_responses()
         try:
@@ -506,8 +441,8 @@ class StageDiffusionClient(StageClientBase):
         try:
             while True:
                 self._drain_responses()
-                result = self._rpc_results.pop(rpc_id, None)
-                if result is not None:
+                result = self._rpc_results.pop(rpc_id, _MISSING_RPC_RESULT)
+                if result is not _MISSING_RPC_RESULT:
                     return result
                 proc = self._proc_manager.proc
                 if self._engine_dead or not proc.is_alive():

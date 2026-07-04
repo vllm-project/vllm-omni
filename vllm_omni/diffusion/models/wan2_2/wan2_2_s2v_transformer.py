@@ -31,6 +31,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid, RotaryEmbeddingWanS2V, WanS2VRotaryPosEmbed
 from vllm_omni.platforms import current_omni_platform
 
@@ -1059,6 +1060,32 @@ def _sample_indices(num_frames, stride, expand_ratio, c):
 
 
 # ---------------------------------------------------------------------------
+# SP helper modules
+# ---------------------------------------------------------------------------
+
+
+class WanS2VBlocksPrepare(nn.Module):
+    """Pass-through module providing SP split hook point before transformer blocks.
+
+    Returns (hidden_states, freqs) unchanged. The SP hook shards both outputs
+    via split_output=True along the sequence dimension.
+    """
+
+    def forward(self, hidden_states: torch.Tensor, freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return hidden_states, freqs
+
+
+class WanS2VBlocksOutputGather(nn.Module):
+    """Pass-through module providing SP gather hook point after transformer blocks.
+
+    Returns hidden_states unchanged. The SP gather hook collects from all ranks.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
+# ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
 
@@ -1086,6 +1113,17 @@ class WanS2VTransformer3DModel(nn.Module):
         return "blocks" in name and name.split(".")[-1].isdigit()
 
     _hsdp_shard_conditions = [_is_transformer_block]
+
+    _sp_plan = {
+        # Shard both hidden_states and freqs via blocks_prepare split_output
+        # hidden_states: [B, seq, dim], freqs: [B, seq, 1, head_dim//2] (complex)
+        "blocks_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
+        },
+        # Gather hidden_states after transformer blocks
+        "blocks_output_gather": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def __init__(
         self,
@@ -1156,6 +1194,10 @@ class WanS2VTransformer3DModel(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+
+        # SP hook modules (pass-through; hooks shard/gather at these boundaries)
+        self.blocks_prepare = WanS2VBlocksPrepare()
+        self.blocks_output_gather = WanS2VBlocksOutputGather()
 
         # Output head
         self.norm_out = FP32LayerNorm(dim, eps, elementwise_affine=False)
@@ -1396,8 +1438,21 @@ class WanS2VTransformer3DModel(nn.Module):
             ]
         return x, seq_lens, rope_embs, mask_input
 
+    def _is_sp_active(self) -> bool:
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+        if not is_forward_context_available():
+            return False
+        return get_forward_context().sp_active
+
     def after_transformer_block(self, block_idx, hidden_states):
         if block_idx in self.audio_injector.injected_block_id.keys():
+            sp_active = self._is_sp_active()
+            if sp_active:
+                from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_shard
+
+                hidden_states = sp_gather(hidden_states, dim=1, validate=False)
+
             audio_attn_id = self.audio_injector.injected_block_id[block_idx]
             audio_emb = self.merged_audio_emb
             num_frames = audio_emb.shape[1]
@@ -1424,6 +1479,9 @@ class WanS2VTransformer3DModel(nn.Module):
             residual_out = rearrange(residual_out, "(b t) n c -> b (t n) c", t=num_frames)
             hidden_states[:, : self.original_seq_len].add_(residual_out)
 
+            if sp_active:
+                hidden_states = sp_shard(hidden_states, dim=1, validate=False)
+
         return hidden_states
 
     # ------------------------------------------------------------------
@@ -1441,18 +1499,27 @@ class WanS2VTransformer3DModel(nn.Module):
             dict with 'audio_emb' (and optionally 'audio_emb_global' when
             enable_adain is True).
         """
-        audio_input = torch.cat(
-            [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
-            dim=-1,
-        )
-        audio_emb_res = self.casual_audio_encoder(audio_input)
-        result = {}
-        if self.enable_adain:
-            audio_emb_global, audio_emb = audio_emb_res
-            result["audio_emb_global"] = audio_emb_global[:, motion_frames[1] :]
-        else:
-            audio_emb = audio_emb_res
-        result["audio_emb"] = audio_emb[:, motion_frames[1] :, :]
+        # Under HSDP, this method is called outside the FSDP forward hook.
+        # Unshard root-managed params so casual_audio_encoder can run.
+        is_fsdp = hasattr(self, "unshard") and hasattr(self, "reshard")
+        if is_fsdp:
+            self.unshard()
+        try:
+            audio_input = torch.cat(
+                [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
+                dim=-1,
+            )
+            audio_emb_res = self.casual_audio_encoder(audio_input)
+            result = {}
+            if self.enable_adain:
+                audio_emb_global, audio_emb = audio_emb_res
+                result["audio_emb_global"] = audio_emb_global[:, motion_frames[1] :]
+            else:
+                audio_emb = audio_emb_res
+            result["audio_emb"] = audio_emb[:, motion_frames[1] :, :]
+        finally:
+            if is_fsdp:
+                self.reshard()
         return result
 
     def forward(
@@ -1574,6 +1641,21 @@ class WanS2VTransformer3DModel(nn.Module):
 
         context_lens = None
 
+        # SP: shard hidden_states and freqs before entering blocks
+        x, self.pre_compute_freqs = self.blocks_prepare(x, self.pre_compute_freqs)
+
+        # SP: adjust segment boundary for the local shard
+        if self._is_sp_active():
+            from vllm_omni.diffusion.distributed.parallel_state import (
+                get_sequence_parallel_rank,
+            )
+
+            sp_rank = get_sequence_parallel_rank()
+            chunk_size = x.shape[1]
+            global_start = sp_rank * chunk_size
+            local_seg_boundary = max(0, min(e0[1] - global_start, chunk_size))
+            e0 = [e0[0], local_seg_boundary]
+
         # Transformer blocks
         kwargs = dict(
             e=e0,
@@ -1587,6 +1669,9 @@ class WanS2VTransformer3DModel(nn.Module):
         for idx, block in enumerate(self.blocks):
             x = block(x, **kwargs)
             x = self.after_transformer_block(idx, x)
+
+        # SP: gather hidden_states from all ranks
+        x = self.blocks_output_gather(x)
 
         # Output norm, projection & unpatchify
         x = x[:, : self.original_seq_len]

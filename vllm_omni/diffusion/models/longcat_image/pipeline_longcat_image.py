@@ -31,7 +31,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -203,6 +203,8 @@ def get_prompt_language(prompt):
 
 
 class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    supports_request_batch = False
+
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -493,66 +495,35 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         noise_pred = comb_pred * scale
         return noise_pred
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 50,
-        sigmas: list[float] | None = None,
-        guidance_scale: float = 4.5,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.FloatTensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        output_type: str | None = "pil",
-        return_dict: bool = True,
-        joint_attention_kwargs: dict[str, Any] | None = None,
-        enable_cfg_renorm: bool | None = True,
-        cfg_renorm_min: float | None = 0.0,
-        enable_prompt_rewrite: bool | None = True,
-    ) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        height = req.sampling_params.height or height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        sigmas = req.sampling_params.sigmas or sigmas
-        generator = req.sampling_params.generator or generator
-        guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
-        )
+        prompt_embeds = None
+        negative_prompt_embeds = None
+
+        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = req.sampling_params.num_inference_steps or 50
+        sigmas = req.sampling_params.sigmas
+        generator = req.sampling_params.generator
+        guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt is not None
-            else num_images_per_prompt
+            req.sampling_params.num_outputs_per_prompt if req.sampling_params.num_outputs_per_prompt > 0 else 1
         )
-        enable_prompt_rewrite = req.sampling_params.extra_args.get("enable_prompt_rewrite", enable_prompt_rewrite)
-        enable_cfg_renorm = req.sampling_params.extra_args.get("enable_cfg_renorm", enable_cfg_renorm)
-        cfg_renorm_min = req.sampling_params.extra_args.get("cfg_renorm_min", cfg_renorm_min)
+        latents = req.sampling_params.latents
 
-        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
-        if any(p is not None for p in req_prompt_embeds):
-            # If at list one prompt is provided as an embedding,
-            # Then assume that the user wants to provide embeddings for all prompts, and enter this if block
-            # If the user in fact provides mixed input format, req_prompt_embeds will have some None's
-            # And `torch.stack` automatically raises an exception for us
-            prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
-
-        req_negative_prompt_embeds = [
-            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
-        ]
-        if any(p is not None for p in req_negative_prompt_embeds):
-            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        enable_prompt_rewrite: bool = extra_args.get("enable_prompt_rewrite", True)
+        enable_cfg_renorm: bool = extra_args.get("enable_cfg_renorm", True)
+        cfg_renorm_min: float = extra_args.get("cfg_renorm_min", 0.0)
+        joint_attention_kwargs: dict[str, Any] | None = None
+        output_type = req.sampling_params.output_type or "pil"
 
         self.check_inputs(
             prompt,
@@ -569,12 +540,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         self._interrupt = False
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
+        batch_size = len(prompt)
 
         device = self.device
         if enable_prompt_rewrite and prompt is not None:
@@ -693,9 +659,8 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
 
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return DiffusionOutput(output=image, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

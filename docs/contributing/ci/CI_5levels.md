@@ -67,7 +67,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L2</strong><br>(E2E across models & GPU-required UT)</td>
       <td>Online (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
-      <td>High-priority models + online basic scenarios + request success validation</td>
+      <td>High-priority models + online basic scenarios; request success, non-empty output, format match (no Whisper/accuracy)</td>
       <td>High-priority features (using random lightweight models)</td>
       <td>High-priority interfaces (using random lightweight models)</td>
       <td><code>core_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
@@ -89,7 +89,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L3</strong><br>(Important Perf & Integration & Accuracy)</td>
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
-      <td>High/medium-priority models with real weights + online/offline key scenarios + basic accuracy validation</td>
+      <td>High/medium-priority models + key online/offline scenarios; real weights, Whisper/similarity, preset voice gender, basic accuracy</td>
       <td>Medium-priority features (using random lightweight models)</td>
       <td>Medium-priority interfaces (using random lightweight models)</td>
       <td><code>advanced_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
@@ -113,9 +113,9 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L4</strong><br>(Perf & Integration & Accuracy)</td>
       <td>Online: full functional scenarios + performance test + doc test + accuracy test</td>
-      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium/low-priority models: function and doc testing</td>
-      <td>Low-priority features (using random lightweight models)</td>
-      <td>Low-priority interfaces (using random lightweight models)</td>
+      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium-priority models: function and doc testing</td>
+      <td>Low-priority features (using real weights)</td>
+      <td>Low-priority interfaces (using real weights)</td>
       <td><code>full_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;3 hour</td>
       <td>
@@ -144,7 +144,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L5</strong><br>(Stability & Reliability)</td>
       <td>Online: long-term stability test + reliability test</td>
-      <td>Long-term stability and reliability testing for high-priority models</td>
+      <td>Long-term stability and reliability testing for high-priority models<br>Low-priority models: function and doc testing</td>
       <td>/</td>
       <td>Invalid-parameter validation for high-priority interfaces</td>
       <td><code>slow and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
@@ -155,7 +155,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         /tests/dfx/stability/tests/test_wan22.json<br>
         <strong>Reliability:</strong><br>
         tests/dfx/reliability/test_reliability_{model_key}.py<br>
-        (e.g. <code>test_reliability_qwen3_omni.py</code>, <code>test_reliability_wan22.py</code>)
+        (e.g. <code>test_reliability_qwen3_omni.py</code>, <code>test_reliability_wan22.py</code>, <code>test_reliability_hunyuan_image.py</code>, <code>test_reliability_voxcpm2.py</code>)
       </td>
       <td>
         <a href="#chapter-4-l5-level-testing-stability-and-reliability-testing">Chapter 4</a><br>
@@ -446,7 +446,11 @@ L2 level testing builds upon L1 by introducing GPU resources and verifying that 
     -   ***Time Cost***: Execution time is controlled within ***15 minutes*** to ensure fast feedback.
 -   ***L2 (Basic End-to-End Testing)***:
 -   -   ***Scope***: Covers two basic deployment scenarios: `online` (serving) and `offline` (inference).
-    -   ***Focus***: Uses `dummy` models or lightweight real models to verify that the entire chain from request input to result output works normally, including output data structure, streaming (stream) support, etc. Also includes some unit tests that require launching independent service instances.
+    -   ***Focus***: Uses `dummy` weights (via deploy YAML patching at `core_model`) or lightweight real models to verify that the entire chain from request input to result output works normally, including output data structure, streaming (stream) support, and **cheap payload checks** at `--run-level core_model` (see below). Also includes some unit tests that require launching independent service instances.
+    -   ***L2 response validation (`core_model`)***: Implemented in `tests/helpers/assertions.py` and invoked by `OpenAIClientHandler` based on `--run-level`. At L2 we require **request success** plus minimal output sanity—not full accuracy:
+        -   **Speech / TTS** (`assert_audio_speech_response`): decoded audio must be present and non-empty (or exceed `min_audio_bytes` when set in `request_config`); `response_format` must match the returned content-type (e.g. `wav`, `pcm`). Whisper transcript similarity, PCM HNR, and preset-voice gender checks run only at L3+.
+        -   **Diffusion** (`assert_diffusion_response`): at least one non-empty image, video, or audio artifact. Resolution/frame-count parity and other deep checks run only at L3+.
+        -   **Omni multimodal** (`assert_omni_response`): L2 asserts successful completion; keyword, transcript, and cross-modal similarity checks run only at L3+.
     -   ***Characteristic***: Requires ***GPU*** resources to perform model computations.
 
 ### 1.3 Test Directory and Execution Files
@@ -555,6 +559,11 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 -   1.  ***Inference Functionality***: Ensures real models can perform forward computation normally and return results.
     2.  ***Accuracy Compliance***: Verifies that the model's evaluation metrics (e.g., accuracy) meet the expected baseline, preventing code changes from introducing accuracy issues.
     3.  ***Important Performance***: Verifies whether performance (e.g., P99 latency, throughput) in core scenarios meets preset thresholds.
+-   ***L3 response validation (`advanced_model`)***: At `--run-level advanced_model`, `tests/helpers/assertions.py` adds semantic checks on top of L2 payload gates (see Chapter 1):
+    -   **Speech / TTS** (`assert_audio_speech_response`): Whisper transcript of returned audio vs `request_config["input"]` (cosine similarity &gt; 0.9 when input text is set); optional `min_audio_bytes` floor; PCM harmonic-to-noise ratio when `response_format` is `pcm`; **preset voice gender** via `_assert_preset_voice_gender_from_audio` when `voice` matches a known preset in `_PRESET_VOICE_GENDER_MAP` (pitch/F0-based classifier; skipped for unknown voices or `pcm` output).
+    -   **Omni multimodal** (`assert_omni_response`): non-empty text/audio outputs; `key_words` in transcript or text; text–audio similarity / containment; preset **`speaker`** gender check (same helper as TTS).
+    -   **Diffusion** (`assert_*_diffusion_response`): image/video dimension and frame-count parity with request parameters where configured.
+    -   **Accuracy suites**: pixel/video similarity and metric baselines under `/tests/e2e/accuracy/` (separate from inline helper assertions).
 
 ### 2.3 Test Directory and Execution Files
 
@@ -582,9 +591,9 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Explanation**:
 
-    @pytest.mark.advanced_model: Marks the test as L3 merge level, indicating deep validation with real models. @pytest.mark.full_model: Marks L4 nightly-only suites (e.g. `test_*_expansion.py`, doc examples).
+    @pytest.mark.advanced_model: Marks the test as L3 merge level (`--run-level advanced_model`): real weights, Whisper/similarity/keyword checks, diffusion deep checks, and **preset voice/speaker gender** validation where applicable. @pytest.mark.full_model: Marks L4 nightly-only suites (e.g. `test_*_expansion.py`, doc examples).
 
-    @pytest.mark.core_model: Marks the test as L1 or L2 level, indicating that this test case validates the basic functionality of the core model. It uses mock weights and only checks if the relevant interface functions correctly.
+    @pytest.mark.core_model: Marks the test as L1 or L2 level. At `--run-level core_model`, validation is limited to request success plus cheap payload checks (e.g. non-empty audio bytes, response format/content-type, non-empty diffusion outputs)—not Whisper, keyword, or accuracy gates. Deploy YAML may use `load_format: dummy` for fast PR feedback.
 
     @pytest.mark.parametrize: A parameterization decorator that allows abstracting test data into parameters, enabling reuse of the same test logic across different data configurations. indirect=True indicates that parameters will be passed to the fixture for processing.
 
@@ -680,7 +689,7 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
-    **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model and full_model perform deep validation.
+    **Implicit Validation**: `send_omni_request`, `send_audio_speech_request`, and `send_diffusion_request` call `assert_*_response` helpers with the session `--run-level`. At `core_model`, checks are limited to success plus cheap payload sanity (non-empty audio/media, format/content-type, optional `min_audio_bytes`). At `advanced_model` and `full_model`, deep validation adds Whisper transcripts, keyword/similarity, diffusion dimension checks, PCM HNR, etc.
 
     **Audio output debugging**: Deep validation may transcribe returned audio via `convert_audio_bytes_to_text` (Whisper). If an audio keyword or text–audio similarity assertion fails, set `VLLM_OMNI_KEEP_REQUEST_MEDIA=1` before running pytest to keep the intermediate WAV files for inspection (see [Test helper environment variables](#test-helper-environment-variables)).
 
@@ -741,14 +750,16 @@ L5 level testing focuses on the performance of model services under ***long-runn
 ### 4.2 Testing Content and Scope
 
 -   ***Long-term Stability (Stability) Testing***: Uses JSON under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` and `test_wan22.json`) to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
--   ***Reliability Testing***: Uses pytest suites under `tests/dfx/reliability/` to inject controlled faults against a **live** `vllm_omni serve` instance (same **`omni_server` / `omni_server_function`** fixture style as E2E). Current suites emphasize **GPU memory pressure** (CUDA sidecar “memory hog”), **worker / runtime process kill** (`SIGKILL` on `VLLM::Worker` for Qwen3-Omni or `multiprocessing.spawn` for Wan2.2 video workers), **large multimodal chat** or **`/v1/videos`** jobs under OOM, **`/health` → 503** and **fast-fail / non-hanging concurrent** requests after kill, and **OpenAI-style 5xx error contracts** (e.g. text vs text+audio under OOM). **Post-fault recovery** checks exist where enabled (some cases may be `skip` while issues are tracked). See the Reliability `<details>` block in Section 4.4 for file-level responsibilities and CI markers (`slow`, `hardware_test`, POSIX-only kill).
+-   ***Reliability Testing***: Uses pytest suites under `tests/dfx/reliability/` to inject controlled faults against a **live** `vllm_omni serve` instance (same **`omni_server` / `omni_server_function`** fixture style as E2E). Current suites emphasize **GPU memory pressure** (CUDA sidecar “memory hog”), **worker / runtime process kill** (`SIGKILL` on `VLLM::Worker` for Qwen3-Omni, `multiprocessing.spawn` for Wan2.2 video workers, or `vLLM-Omni::` for HunyuanImage DiT workers), **large multimodal chat**, **`/v1/videos`**, **`/v1/images/generations`**, or **`/v1/audio/speech`** jobs under OOM, **`/health` → 503** and **fast-fail / non-hanging concurrent** requests after kill, and **OpenAI-style 5xx error contracts** (e.g. text vs text+audio under OOM). **Post-fault recovery** checks exist where enabled (some cases may be `skip` while issues are tracked). See the Reliability `<details>` block in Section 4.4 for file-level responsibilities and CI markers (`slow`, `hardware_test`, POSIX-only kill).
 
 ### 4.3 Test Directory and Execution Files
 
 -   ***Stability Test Configuration***: `tests/dfx/stability/tests/test_qwen3_omni.json`, `tests/dfx/stability/tests/test_wan22.json` (one JSON per model / runner family)
 -   ***Reliability Test Suite*** (`tests/dfx/reliability/`):
     -   `test_reliability_qwen3_omni.py` — Qwen3-Omni chat / multimodal reliability (GPU OOM, process kill, recovery, error contract under `--async-chunk` vs default).
-    -   `test_reliability_wan22.py` — Wan2.2 T2V video API reliability (`/v1/videos` under OOM and process kill, recovery).
+    -   `test_reliability_wan22.py` — Wan2.2 I2V video API reliability (`/v1/videos` under OOM and process kill, recovery).
+    -   `test_reliability_hunyuan_image.py` — HunyuanImage-3.0-Instruct DiT-only reliability (`/v1/images/generations` under OOM and process kill; deploy `hunyuan_image3_dit.yaml`, H100 × 4).
+    -   `test_reliability_voxcpm2.py` — VoxCPM2 TTS reliability (`/v1/audio/speech` under OOM and process kill; deploy `voxcpm2.yaml`, L4 × 1).
     -   `helpers.py` — Shared primitives used by current suites: raw HTTP probes for `/v1/chat/completions` and `/health`, OpenAI-style error parsing, GPU OOM sidecar (`inject_gpu_oom` / `stop_gpu_oom_hogs`), and `pgrep`-based process-kill injector construction (`make_process_kill_fault_injector`).
     -   `conftest.py` — `fault_injector` and `omni_server_after_fault` / `omni_server_after_fault_function` fixtures to run a callable **after** the server is ready.
     -   `README.md` — Short local run commands for this directory.
@@ -846,22 +857,33 @@ Reliability tests are **short fault-injection** integration runs (L5 **(b)** in 
 | `helpers.py` | Shared helpers used by current reliability suites: raw `POST`/`GET` probes (`/v1/chat/completions`, `/health`), OpenAI error parsing (`extract_openai_error_contract_from_bytes`), GPU OOM sidecar lifecycle (`inject_gpu_oom`, `stop_gpu_oom_hogs`), and process-kill injector builder (`make_process_kill_fault_injector`). |
 | `conftest.py` | Pytest fixtures: indirect `fault_injector`, `omni_server_after_fault` / `omni_server_after_fault_function` (run injector after server is ready, then yield server). |
 | `test_reliability_qwen3_omni.py` | Qwen3-Omni: OOM vs **text vs text+audio** error contract, large multimodal chat under OOM, concurrent pressure, **SIGKILL** on `VLLM::Worker`, `/health` → 503 + fast-fail + concurrent chat; optional OOM recovery scenario (may be skipped while tracked in issues). |
-| `test_reliability_wan22.py` | Wan2.2 T2V: large `/v1/videos` under OOM, **SIGKILL** on `multiprocessing.spawn` chain, health / fast-fail / concurrent video requests; optional recovery test (may be skipped). |
+| `test_reliability_wan22.py` | Wan2.2 I2V: large `/v1/videos` under OOM, **SIGKILL** on `multiprocessing.spawn` chain, health / fast-fail / concurrent video requests; optional recovery test (may be skipped). |
+| `test_reliability_hunyuan_image.py` | HunyuanImage DiT-only: large `/v1/images/generations` under OOM, **SIGKILL** on `vLLM-Omni::` workers and serve/tree targets, health / fast-fail / concurrent image requests; some OOM/recovery cases may be skipped while tracked in issues. |
+| `test_reliability_voxcpm2.py` | VoxCPM2: `/v1/audio/speech` under OOM (error contract), **SIGKILL** on `VLLM::` workers and serve/tree targets, health / fast-fail / concurrent speech requests; some OOM cases may be skipped while tracked in issues. |
 | `README.md` | Minimal run / collect examples. |
 
 #### Parametrization and markers
 
 - Each test module defines a **`RELIABILITY_SCENARIOS`** list (`test_name`, `server_params`: model, `stage_config_name` or diffusion `server_args`, etc.). **`create_reliability_omni_server_params()`** in `tests/dfx/conftest.py` resolves stage paths (including XPU substitutions where applicable) and builds **`OmniServerParams`** lists consumed by **`@pytest.mark.parametrize(..., indirect=True)`** on `omni_server` or `omni_server_function`.
-- Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100"}, num_cards=...)`** (Qwen3-Omni paths often require **2** cards; Wan2.2 video paths **1** card).
+- Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100"}, num_cards=...)`** or **`@hardware_test(res={"cuda": "L4"}, num_cards=1)`** (Qwen3-Omni **2**× H100; Wan2.2 **1**× H100; HunyuanImage DiT **4**× H100; VoxCPM2 **1**× L4).
 - **Process-kill** tests use **`@pytest.mark.skipif(os.name == "nt", ...)`** because injection uses POSIX **`pgrep` / `kill`**.
 
 #### CI trigger
 
-Weekly Buildkite (`.buildkite/test-weekly.yml`) runs, for example:
+Weekly Buildkite (`.buildkite/test-weekly.yml`) runs one step per model suite (trigger: `WEEKLY=1` or PR label `weekly-test`), for example:
+
+| Buildkite step | Test file | CI hardware |
+| -------------- | --------- | ----------- |
+| Reliability Test - qwen3-omni | `test_reliability_qwen3_omni.py` | H100 × 2 (`mithril-h100-pool`) |
+| Reliability Test - wan22 | `test_reliability_wan22.py` | H100 × 2 (`mithril-h100-pool`) |
+| Reliability Test - hunyuan-image | `test_reliability_hunyuan_image.py` | H100 × 4 (`mithril-h100-pool`) |
+| Reliability Test - voxcpm2 | `test_reliability_voxcpm2.py` | L4 × 1 (`gpu_1_queue`) |
 
 ```bash
 pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
 pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
+pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
+pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m "slow"
 ```
 
 #### Local commands
@@ -870,6 +892,8 @@ pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
 pytest --collect-only tests/dfx/reliability
 pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m slow
 pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m slow
+pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m slow
+pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m slow
 ```
 
 #### Adding a new model suite
@@ -882,7 +906,7 @@ pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m slow
 </details>
 
 -   -   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
-    -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m slow` and/or `pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m slow` (add `test_reliability_<suite>.py` for new models)
+    -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `voxcpm2`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/test-weekly.yml` for new models)
 
 ## Summary
 

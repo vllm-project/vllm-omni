@@ -38,6 +38,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
@@ -494,7 +495,7 @@ class OmniVoiceModel(
         try:
             device = next(self.parameters()).device
         except StopIteration:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
 
         model_dir = self._resolve_model_dir()
 
