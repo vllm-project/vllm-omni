@@ -39,6 +39,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _create_wav_header,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -3342,6 +3343,40 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_uses_adapter_model_type_label(
+        self,
+        voxtral_server,
+        mocker: MockerFixture,
+    ):
+        """Adapter model_type should replace the legacy _tts_model_type label ladder."""
+        legacy_tts_model_type = "dummy_tts"
+        adapter_model_type = "adapter_dummy_tts"
+
+        class FakeAdapter:
+            def validate(self, request):
+                return None
+
+            async def build(self, request, sampling_params_list, has_inline_ref_audio):
+                return PreparedRequest(
+                    prompt={"prompt": request.input},
+                    tts_params={},
+                    model_type=adapter_model_type,
+                )
+
+        voxtral_server._tts_model_type = legacy_tts_model_type
+        mocker.patch.object(voxtral_server, "_get_tts_adapter", return_value=FakeAdapter())
+        log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
+
+        asyncio.run(voxtral_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
+
+        assert adapter_model_type != legacy_tts_model_type
+        assert any(
+            call.args
+            and call.args[0] == "TTS speech request %s: text=%r, model=%s"
+            and call.args[3] == adapter_model_type
+            for call in log_info.call_args_list
+        )
 
     def test_prepare_speech_generation_treats_sse_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
         """stream_format=sse should request delta-style multimodal outputs."""
