@@ -66,7 +66,7 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 # Keep a fallback for older/newer upstream layouts during rebase windows.
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
-from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
     process_lora_modules,
@@ -751,7 +751,7 @@ async def omni_init_app_state(
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
         # OMNI: tokenization endpoints are not supported in pure diffusion mode.
-        state.openai_serving_tokenization = None
+        state.serving_tokenization = None
 
         # Use for_diffusion method to create chat handler
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
@@ -806,19 +806,6 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
-
-    # Propagate enable_in_reasoning to the API-server process. The engine core
-    # runs in a separate process, so the contextvar that backs
-    # `get_current_vllm_config_or_none()` is None on this stack. Tool parsers
-    # call `get_enable_structured_outputs_in_reasoning()` during request
-    # handling and need to see the real flag, otherwise they silently fall
-    # back to False and mismatch the engine-side bitmask gating.
-    if vllm_config is not None:
-        from vllm.tool_parsers.structural_tag_registry import (
-            set_enable_structured_outputs_in_reasoning,
-        )
-
-        set_enable_structured_outputs_in_reasoning(vllm_config.structured_outputs_config.enable_in_reasoning)
 
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
@@ -900,12 +887,8 @@ async def omni_init_app_state(
     )
     await state.openai_serving_models.init_static_loras()
 
-    # NOTE: kept aligned with vllm 0.20 `init_app_state`:
-    # - dropped the `io_processor` kwarg (no longer accepted by 0.20);
-    #   io_processor stays on `engine_client` and downstream serving classes
-    #   read it from there.
-    # - pass `reasoning_parser` so render-time `adjust_request` runs for
-    #   reasoning models (matches `vllm.entrypoints.openai.api_server`).
+    # NOTE: kept aligned with upstream `init_app_state`:
+    # Use OpenAIServingRender (replaces the old OnlineRenderer + OnlineDerenderer + ServingRender split).
     state.openai_serving_render = OpenAIServingRender(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
@@ -1031,8 +1014,7 @@ async def omni_init_app_state(
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
         else None
     )
-    state.openai_serving_tokenization = OpenAIServingTokenization(
-        engine_client,
+    state.serving_tokenization = ServingTokenization(
         state.openai_serving_models,
         state.openai_serving_render,
         request_logger=request_logger,
@@ -1172,7 +1154,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1263,7 +1245,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1301,7 +1283,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
 async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1344,7 +1326,7 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
 async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
     handler = OmniAudioGenerate(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,

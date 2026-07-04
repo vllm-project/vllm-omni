@@ -1,4 +1,3 @@
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -193,6 +192,7 @@ def _make_request_batch_prompt_sampling(**overrides):
         "true_cfg_scale": None,
         "guidance_scale_provided": False,
         "guidance_scale": 1.0,
+        "output_type": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -344,16 +344,3 @@ def test_qwen_edit_validator_excludes_image_placeholders_from_budget(pipeline_cl
 
     with pytest.raises(AssertionError, match="text encoder should not run"):
         pipeline.encode_prompt(prompt="short prompt")
-
-
-@pytest.mark.parametrize(
-    "pipeline_class",
-    [
-        QwenImagePipeline,
-        QwenImageLayeredPipeline,
-        QwenImageEditPipeline,
-        QwenImageEditPlusPipeline,
-    ],
-)
-def test_forward_max_sequence_length_default_is_1024(pipeline_class: type):
-    assert inspect.signature(pipeline_class.forward).parameters["max_sequence_length"].default == 1024

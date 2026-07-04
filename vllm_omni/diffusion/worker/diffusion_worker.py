@@ -81,6 +81,10 @@ class _DiffusionVllmModelConfig:
     def is_nvfp4_quantized(self) -> bool:
         return self.quantization == "modelopt_fp4"
 
+    @property
+    def is_diffusion(self) -> bool:
+        return False
+
 
 def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
     quant_config = getattr(od_config, "quantization_config", None)
@@ -242,9 +246,18 @@ class DiffusionWorker:
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
         vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
-        vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
-        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
-        vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
+        parallel_config = self.od_config.parallel_config
+        vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
+        vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
+        if parallel_config.enable_expert_parallel and self.od_config.is_moe:
+            # Diffusion uses its own DP/CFG/SP groups normally. vLLM groups are
+            # only remapped for expert-parallel runtimes that consume vLLM's
+            # FusedMoE/EP semantics.
+            vllm_config.parallel_config.data_parallel_size = (
+                parallel_config.data_parallel_size * parallel_config.cfg_parallel_size
+            )
+            vllm_config.parallel_config.prefill_context_parallel_size = parallel_config.sequence_parallel_size
+        vllm_config.parallel_config.enable_expert_parallel = parallel_config.enable_expert_parallel
         vllm_config.profiler_config = self.od_config.profiler_config
         vllm_config.model_config = _make_diffusion_vllm_model_config(self.od_config)  # type: ignore[assignment]
         vllm_config.quant_config = self.od_config.quantization_config

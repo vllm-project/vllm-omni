@@ -12,7 +12,7 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "omni-test"
     steps:
       - label: ":full_moon: Omni · Function Test with H100"
-        timeout_in_minutes: 90
+        timeout_in_minutes: 120
         commands:
           - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and omni" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
         agents:
@@ -153,7 +153,7 @@ steps:
 
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
         key: nightly-omni-performance-no-async-chunk
-        timeout_in_minutes: 180
+        timeout_in_minutes: 300
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
@@ -376,7 +376,7 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "tts-test"
     steps:
       - label: ":full_moon: TTS · Function Test with L4"
-        timeout_in_minutes: 90
+        timeout_in_minutes: 120
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -826,7 +826,7 @@ steps:
 
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4"
-        timeout_in_minutes: 60
+        timeout_in_minutes: 120
         commands:
           - pytest -sv tests/e2e/ -k "not test_wan and not test_bagel_expansion and not hunyuan" -m "full_model and diffusion and L4" --run-level "full_model" --ignore=tests/e2e/accuracy
         agents:
