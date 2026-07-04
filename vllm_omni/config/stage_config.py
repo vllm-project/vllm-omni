@@ -228,6 +228,7 @@ class StagePipelineConfig:
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
+    scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
     # stage's config/tokenizer lives in a subdirectory (e.g. GLM-Image's AR
     # config is in ``vision_language_encoder/``).  Consumed at stage-init time
@@ -896,7 +897,7 @@ def merge_pipeline_deploy(
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
                 worker_type=worker_type,
-                scheduler_cls=_scheduler_path(sched_cls),
+                scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
                 yaml_engine_args=engine_args,

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import gc
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -46,6 +46,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
 logger = init_logger(__name__)
 
@@ -588,6 +589,93 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model = getattr(self, "model", None)
         return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
 
+    def _get_runner_assisted_full_attention_metadata_request(
+        self,
+        *,
+        req_ids: Sequence[str],
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_scheduled_tokens_np: np.ndarray,
+        num_computed_tokens_cpu: torch.Tensor | np.ndarray,
+        max_num_scheduled_tokens: int,
+    ) -> RunnerAssistedFullAttentionMetadataRequest | None:
+        # Models without this hook keep the normal runner path. VoxCPM2 uses
+        # it to ask the runner for padded FULL attention metadata while keeping
+        # graph policy and lifecycle in the model layer.
+        hook = getattr(self.model, "get_runner_assisted_full_attention_metadata_request", None)
+        if not callable(hook):
+            return None
+        num_computed_tokens = num_computed_tokens_cpu
+        if hasattr(num_computed_tokens, "numpy"):
+            num_computed_tokens = num_computed_tokens.numpy()
+        request = hook(
+            req_ids=req_ids,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
+            num_computed_tokens=num_computed_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+        )
+        if request is None:
+            return None
+        if not isinstance(request, RunnerAssistedFullAttentionMetadataRequest):
+            raise TypeError(
+                "runner-assisted full attention metadata hook must return "
+                "RunnerAssistedFullAttentionMetadataRequest or None, got "
+                f"{type(request).__name__}"
+            )
+        padded_num_reqs = max(
+            num_reqs_padded,
+            min(int(request.num_reqs_padded), self.scheduler_config.max_num_seqs),
+        )
+        return RunnerAssistedFullAttentionMetadataRequest(
+            num_reqs_padded=padded_num_reqs,
+            for_cudagraph_capture=bool(request.for_cudagraph_capture),
+        )
+
+    def _refresh_runner_assisted_full_attention_metadata_buffers(
+        self,
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> None:
+        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        if hasattr(num_computed_tokens, "numpy"):
+            num_computed_tokens = num_computed_tokens.numpy()
+        np.add(
+            num_computed_tokens,
+            num_scheduled_tokens_np,
+            out=self.optimistic_seq_lens_cpu[:num_reqs].numpy(),
+        )
+        self.optimistic_seq_lens_cpu[num_reqs:num_reqs_padded].fill_(0)
+        self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
+
+        cum_num_tokens = self._get_cumsum_and_arange(
+            num_scheduled_tokens_np,
+            self.query_pos.np,
+        )
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+        self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(cum_num_tokens[-1])
+        self.query_start_loc.copy_to_gpu()
+
+        self.input_batch.block_table.commit_block_table(num_reqs_padded)
+
+    def _set_runner_assisted_full_attention_metadata_context(
+        self,
+        *,
+        enabled: bool,
+        num_reqs: int = 0,
+    ) -> bool:
+        hook = getattr(self.model, "set_runner_assisted_full_attention_metadata_context", None)
+        if not callable(hook):
+            return False
+        hook(
+            enabled=enabled,
+            num_reqs=num_reqs,
+        )
+        return True
+
     def _deferred_prefix_cache_mm_keys(self) -> set[str]:
         """Model-declared multimodal keys whose prefix-cache writes are deferred."""
         model = getattr(self, "model", None)
@@ -1028,6 +1116,26 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+            num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+
+            runner_assisted_full_attn_request = self._get_runner_assisted_full_attention_metadata_request(
+                req_ids=req_ids[:num_reqs],
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+            )
+            runner_assisted_full_attn_capture = False
+            if runner_assisted_full_attn_request is not None:
+                num_reqs_padded = runner_assisted_full_attn_request.num_reqs_padded
+                runner_assisted_full_attn_capture = runner_assisted_full_attn_request.for_cudagraph_capture
+                num_tokens_padded = max(
+                    num_tokens_padded,
+                    num_reqs_padded * max_num_scheduled_tokens,
+                )
+            runner_assisted_full_attn = runner_assisted_full_attn_request is not None
+
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
                 num_scheduled_tokens_np,
@@ -1035,8 +1143,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
             )
-
-            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+            pad_attn = cudagraph_mode == CUDAGraphMode.FULL or runner_assisted_full_attn
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
@@ -1058,11 +1165,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
+            if runner_assisted_full_attn:
+                self._refresh_runner_assisted_full_attention_metadata_buffers(
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                )
 
+            attn_num_reqs = num_reqs_padded if runner_assisted_full_attn else num_reqs
             attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded if pad_attn else None,
-                num_reqs=num_reqs,
+                num_reqs=attn_num_reqs,
                 num_reqs_padded=num_reqs_padded if pad_attn else None,
                 max_query_len=max_num_scheduled_tokens,
                 ubatch_slices=ubatch_slices_attn,
@@ -1071,6 +1185,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 slot_mappings=slot_mappings_by_group,
+                for_cudagraph_capture=runner_assisted_full_attn_capture,
             )
             self._maybe_attach_attention_metadata_extensions(
                 attn_metadata=attn_metadata,
@@ -1079,6 +1194,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 max_query_len=max_num_scheduled_tokens,
                 pad_attn=pad_attn,
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
+                for_cudagraph_capture=runner_assisted_full_attn_capture,
             )
 
             (
@@ -1092,14 +1208,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
-        if hasattr(self.model, "prepare_runner_inputs"):
-            input_ids, positions = self.model.prepare_runner_inputs(
+        prepare_runner_inputs = getattr(self.model, "prepare_runner_inputs", None)
+        if callable(prepare_runner_inputs):
+            input_ids, positions = prepare_runner_inputs(
                 input_ids=input_ids,
                 positions=positions,
                 inputs_embeds=inputs_embeds,
                 req_ids=req_ids[:num_reqs],
-                num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[i]) for i in range(num_reqs)],
-                num_scheduled_tokens=[int(num_scheduled_tokens_np[i]) for i in range(num_reqs)],
+                num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
                 input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
             )
 
@@ -1108,46 +1225,60 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # with CUDA graph capture.
         if self.calculate_kv_scales:
             cudagraph_mode = CUDAGraphMode.NONE
+            runner_assisted_full_attn = False
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
+
+        runner_assisted_context_enabled = False
+        if runner_assisted_full_attn:
+            runner_assisted_context_enabled = self._set_runner_assisted_full_attention_metadata_context(
+                enabled=True,
+                num_reqs=num_reqs,
+            )
+            runner_assisted_full_attn = runner_assisted_context_enabled
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        with (
-            nullcontext(),
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-                sampling_metadata=self.input_batch.sampling_metadata,
-                logits_index=logits_indices,
-                sampler=self.sampler,
-            )
+        try:
+            with (
+                nullcontext(),
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=(CUDAGraphMode.FULL if runner_assisted_full_attn else cudagraph_mode),
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                    sampling_metadata=self.input_batch.sampling_metadata,
+                    logits_index=logits_indices,
+                    sampler=self.sampler,
+                )
 
-            # [Omni] Map pending ropes metadata to req_ids.
-            if hasattr(self.model, "flush_pending_metadata"):
-                self.model.flush_pending_metadata(list(req_ids))
+                # [Omni] Map pending ropes metadata to req_ids.
+                flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+                if callable(flush_pending_metadata):
+                    flush_pending_metadata(req_ids[:num_reqs])
+        finally:
+            if runner_assisted_context_enabled:
+                self._set_runner_assisted_full_attention_metadata_context(enabled=False)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

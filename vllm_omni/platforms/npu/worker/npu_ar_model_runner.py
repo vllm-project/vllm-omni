@@ -621,8 +621,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     req_ids=req_ids[:num_reqs],
-                    num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[i]) for i in range(num_reqs)],
-                    num_scheduled_tokens=[int(num_scheduled_tokens_np[i]) for i in range(num_reqs)],
+                    num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
                     input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
                 )
             #  -------------------------------------- Omni-new -------------------------------------------------
@@ -690,8 +690,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
         with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             # [Omni] Map pending ropes metadata to req_ids.
-            if hasattr(self.model, "flush_pending_metadata"):
-                self.model.flush_pending_metadata(list(req_ids))
+            flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+            if callable(flush_pending_metadata):
+                flush_pending_metadata(req_ids[:num_reqs])
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
