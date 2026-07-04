@@ -19,7 +19,6 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.experimental.ar_diffusion.engine import (
     AR_DIFFUSION_MODEL_RUNNER_CLS,
     ARDiffusionEngine,
-    apply_ar_diffusion_runner_default,
 )
 
 
@@ -75,23 +74,36 @@ def test_ar_diffusion_model_runner_cls_resolves():
     assert cls.__name__ == "ARDiffusionModelRunner"
 
 
-def test_apply_runner_default_sets_when_unset():
-    cfg = SimpleNamespace(diffusion_model_runner_cls=None)
-    apply_ar_diffusion_runner_default(cfg)
-    assert cfg.diffusion_model_runner_cls == AR_DIFFUSION_MODEL_RUNNER_CLS
+def test_engine_class_declares_its_runner():
+    """Routing lives on the engine class (review: hsliuustc0106) — engines
+    never mutate od_config; the worker resolves the runner off the class."""
+    assert ARDiffusionEngine.default_diffusion_model_runner_cls == AR_DIFFUSION_MODEL_RUNNER_CLS
+    assert DiffusionEngine.default_diffusion_model_runner_cls is None
 
 
-def test_apply_runner_default_respects_explicit_choice():
-    cfg = SimpleNamespace(diffusion_model_runner_cls="my.custom.Runner")
-    apply_ar_diffusion_runner_default(cfg)
-    assert cfg.diffusion_model_runner_cls == "my.custom.Runner"
+def _select_runner(od_config, platform_default="PLATFORM"):
+    """Mirror of the worker's runner-selection chain (override > engine > platform)."""
+    runner_override = getattr(od_config, "diffusion_model_runner_cls", None)
+    if isinstance(runner_override, str) and runner_override:
+        return runner_override
+    engine_cls = DiffusionEngine.resolve_engine_class(od_config)
+    engine_runner = getattr(engine_cls, "default_diffusion_model_runner_cls", None)
+    if isinstance(engine_runner, str) and engine_runner:
+        return engine_runner
+    return platform_default
 
 
-def test_worker_runner_selection_prefers_override():
-    over = SimpleNamespace(diffusion_model_runner_cls=AR_DIFFUSION_MODEL_RUNNER_CLS)
-    assert (getattr(over, "diffusion_model_runner_cls", None) or "PLATFORM") == AR_DIFFUSION_MODEL_RUNNER_CLS
-    unset = SimpleNamespace(diffusion_model_runner_cls=None)
-    assert (getattr(unset, "diffusion_model_runner_cls", None) or "PLATFORM") == "PLATFORM"
+def test_runner_selection_chain():
+    ar = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+    # engine-declared runner wins over platform default
+    assert _select_runner(SimpleNamespace(diffusion_model_runner_cls=None, engine_backend=ar)) == AR_DIFFUSION_MODEL_RUNNER_CLS
+    # explicit override wins over the engine's declaration
+    assert (
+        _select_runner(SimpleNamespace(diffusion_model_runner_cls="my.custom.Runner", engine_backend=ar))
+        == "my.custom.Runner"
+    )
+    # default engine -> platform default
+    assert _select_runner(SimpleNamespace(diffusion_model_runner_cls=None, engine_backend="default")) == "PLATFORM"
 
 
 def test_dreamzero_pipeline_rejects_non_ar_diffusion_engine():

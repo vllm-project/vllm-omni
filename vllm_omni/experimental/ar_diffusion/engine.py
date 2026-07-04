@@ -5,26 +5,12 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-from vllm_omni.diffusion.sched import SchedulerInterface
 
 logger = init_logger(__name__)
 
 #: Import path of the runner the AR-Diffusion engine routes its workers to.
 AR_DIFFUSION_MODEL_RUNNER_CLS = "vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner"
-
-
-def apply_ar_diffusion_runner_default(od_config: OmniDiffusionConfig) -> None:
-    """Route the AR-Diffusion engine's workers to ``ARDiffusionModelRunner``.
-
-    Sets ``od_config.diffusion_model_runner_cls`` in place, unless the caller
-    already chose a runner. The worker (in its own process) reads this off the
-    propagated ``od_config`` and builds the AR-Diffusion runner instead of the platform
-    default, keeping the swap scoped to AR-Diffusion-routed models.
-    """
-    if getattr(od_config, "diffusion_model_runner_cls", None) is None:
-        od_config.diffusion_model_runner_cls = AR_DIFFUSION_MODEL_RUNNER_CLS
 
 
 class ARDiffusionEngine(DiffusionEngine):
@@ -49,12 +35,7 @@ class ARDiffusionEngine(DiffusionEngine):
     so DreamZero's rollout runs against the runner-owned KV cache.
     """
 
-    def __init__(
-        self,
-        od_config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ) -> None:
-        # Route this engine's workers to ARDiffusionModelRunner before the base __init__
-        # builds the executor and spawns workers (od_config is propagated to them).
-        apply_ar_diffusion_runner_default(od_config)
-        super().__init__(od_config, scheduler=scheduler)
+    #: Workers of this engine build the AR-Diffusion runner (unless the config
+    #: sets an explicit ``diffusion_model_runner_cls`` override). Declared on
+    #: the class so routing needs no od_config mutation at engine init.
+    default_diffusion_model_runner_cls = AR_DIFFUSION_MODEL_RUNNER_CLS

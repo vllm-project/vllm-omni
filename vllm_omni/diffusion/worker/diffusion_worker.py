@@ -209,17 +209,32 @@ class DiffusionWorker:
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner. An od_config override (e.g. the AR-Diffusion engine selecting
-        # ARDiffusionModelRunner) takes precedence; unset falls back to the platform default,
-        # so existing models are unaffected. The override must be an explicit import-
-        # path string — guard with isinstance so a non-string (e.g. a Mock od_config
-        # in tests) doesn't shadow the platform hook.
+        # Create model runner — one decision chain, in precedence order:
+        #   1. explicit od_config.diffusion_model_runner_cls (user override),
+        #   2. the runner declared by the engine class that engine_backend
+        #      selects (e.g. ARDiffusionEngine -> ARDiffusionModelRunner),
+        #   3. the platform default.
+        # Routing policy therefore lives on the engine class / config surface;
+        # engines never mutate od_config. Overrides must be import-path
+        # strings — guard with isinstance so a non-string (e.g. a Mock
+        # od_config in tests) doesn't shadow the platform hook.
         runner_override = getattr(self.od_config, "diffusion_model_runner_cls", None)
-        model_runner_cls_path = (
-            runner_override
-            if isinstance(runner_override, str) and runner_override
-            else current_omni_platform.get_diffusion_model_runner_cls()
-        )
+        engine_runner = None
+        if not (isinstance(runner_override, str) and runner_override):
+            try:
+                from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+                engine_cls = DiffusionEngine.resolve_engine_class(self.od_config)
+                engine_runner = getattr(engine_cls, "default_diffusion_model_runner_cls", None)
+            except Exception:
+                logger.warning("Worker %s: engine_backend resolution failed; using platform runner", self.rank)
+                engine_runner = None
+        if isinstance(runner_override, str) and runner_override:
+            model_runner_cls_path = runner_override
+        elif isinstance(engine_runner, str) and engine_runner:
+            model_runner_cls_path = engine_runner
+        else:
+            model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
         model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,

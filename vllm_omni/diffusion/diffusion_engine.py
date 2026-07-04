@@ -102,6 +102,14 @@ class _RpcTask:
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
+    #: Import path of the model runner this engine's workers should build, or
+    #: ``None`` for the platform default. Subclasses declare their runner here
+    #: (e.g. the AR-Diffusion engine), the worker resolves it through
+    #: :meth:`resolve_engine_class` — so engine->runner routing lives on the
+    #: engine class itself, and ``od_config.diffusion_model_runner_cls``
+    #: remains a pure explicit user override (never mutated by engines).
+    default_diffusion_model_runner_cls: str | None = None
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
