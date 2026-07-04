@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
 from vllm_omni.config.stage_config import (
@@ -739,6 +739,15 @@ stages:
         assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
         assert "compilation_config" not in deploy.stages[0].engine_extras
 
+    def test_load_voxcpm2_deploy_config_preserves_engine_extras(self):
+        deploy_path = get_deploy_config_path("voxcpm2.yaml")
+        raw_stage = get_deploy_config_stage("voxcpm2.yaml", 0)
+        expected_runtime_config = raw_stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
+
+        deploy = load_deploy_config(deploy_path)
+        runtime_config = deploy.stages[0].engine_extras["hf_overrides"]["voxcpm2_runtime_config"]
+        assert runtime_config == expected_runtime_config
+
     def test_merge_pipeline_deploy(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
@@ -927,6 +936,54 @@ stages:
         stage = deploy.stages[0]
         assert "foo" in stage.engine_extras
         assert stage.engine_extras["foo"] == {"a": 111, "b": {"d": 9, "e": 199}, "c": 3}
+
+    def test_explicit_engine_extras_merge_with_flat_and_engine_args(self):
+        """Explicit engine_extras should be preserved with existing pass-through styles."""
+        fake_config = {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "engine_extras": {
+                        "hf_overrides": {
+                            "runtime_config": {
+                                "explicit_only": True,
+                                "shared": "explicit",
+                                "nested": {"a": 1},
+                            }
+                        }
+                    },
+                    "hf_overrides": {
+                        "runtime_config": {
+                            "flat_only": True,
+                            "shared": "flat",
+                            "nested": {"b": 2},
+                        }
+                    },
+                    "engine_args": {
+                        "hf_overrides": {
+                            "runtime_config": {
+                                "engine_args_only": True,
+                                "shared": "engine_args",
+                                "nested": {"c": 3},
+                            }
+                        }
+                    },
+                },
+            ]
+        }
+
+        with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
+            deploy = load_deploy_config("dummy.yaml")
+
+        assert deploy.stages[0].engine_extras["hf_overrides"] == {
+            "runtime_config": {
+                "engine_args_only": True,
+                "explicit_only": True,
+                "flat_only": True,
+                "nested": {"a": 1, "b": 2, "c": 3},
+                "shared": "engine_args",
+            }
+        }
 
     def test_deep_merge_does_not_mutate_inputs(self):
         """Merging engine_args must not mutate the base stage dict."""
