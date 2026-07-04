@@ -1588,6 +1588,197 @@ class TestAuraOmniDeploy:
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
 
+class TestDeployCliOverrideFlow:
+    """Test deploy-YAML baselines overridden by CLI runtime overrides."""
+
+    def test_diffusion_deploy_fields_can_be_overridden_by_cli(self, tmp_path):
+        deploy_path = tmp_path / "diffusion_stage.yaml"
+        deploy_path.write_text(
+            """
+async_chunk: false
+stages:
+  - stage_id: 0
+    devices: "4,5"
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    engine_args:
+      cache_backend: cache_dit
+      diffusion_attention_backend: FLASH_ATTN
+      diffusion_kv_cache_dtype: auto
+      step_execution: false
+      vae_use_tiling: false
+      enable_cpu_offload: false
+      max_generated_image_size: 1048576
+      tts_max_instructions_length: 1000
+""",
+            encoding="utf-8",
+        )
+
+        pipeline = PipelineConfig(
+            model_type="test_diffusion",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="dit",
+                    execution_type=StageExecutionType.DIFFUSION,
+                    final_output=True,
+                    final_output_type="image",
+                ),
+            ),
+        )
+        deploy = load_deploy_config(deploy_path)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        stage = stages[0]
+
+        assert stage.yaml_engine_args["parallel_config"]["pipeline_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["data_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["enable_expert_parallel"] is False
+        assert stage.yaml_engine_args["parallel_config"]["sequence_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["ulysses_degree"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["ring_degree"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["cfg_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["vae_patch_parallel_size"] == 1
+        assert stage.yaml_engine_args["cache_backend"] == "cache_dit"
+        assert stage.yaml_engine_args["parallel_config"]["use_hsdp"] is False
+        assert stage.yaml_engine_args["parallel_config"]["hsdp_shard_size"] == -1
+        assert stage.yaml_engine_args["parallel_config"]["hsdp_replicate_size"] == 1
+        assert stage.yaml_engine_args["diffusion_attention_backend"] == "FLASH_ATTN"
+        assert stage.yaml_engine_args["diffusion_kv_cache_dtype"] == "auto"
+        assert stage.yaml_engine_args["step_execution"] is False
+        assert stage.yaml_engine_args["vae_use_tiling"] is False
+        assert stage.yaml_engine_args["enable_cpu_offload"] is False
+        assert stage.yaml_engine_args["max_generated_image_size"] == 1048576
+        assert stage.yaml_engine_args["tts_max_instructions_length"] == 1000
+
+        stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(
+            stage,
+            {
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": True,
+                "sequence_parallel_size": 24,
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "cfg_parallel_size": 2,
+                "vae_patch_parallel_size": 2,
+                "cache_backend": "tea_cache",
+                "use_hsdp": True,
+                "hsdp_shard_size": 8,
+                "hsdp_replicate_size": 2,
+                "diffusion_attention_backend": "SAGE_ATTN",
+                "diffusion_kv_cache_dtype": "fp8",
+                "step_execution": True,
+                "vae_use_tiling": True,
+                "enable_cpu_offload": True,
+                "max_generated_image_size": 2097152,
+                "tts_max_instructions_length": 2000,
+            },
+        )
+
+        omega_config = stage.to_omegaconf()
+
+        assert omega_config.engine_args.cache_backend == "tea_cache"
+        assert omega_config.engine_args.diffusion_attention_backend == "SAGE_ATTN"
+        assert omega_config.engine_args.diffusion_kv_cache_dtype == "fp8"
+        assert omega_config.engine_args.step_execution is True
+        assert omega_config.engine_args.vae_use_tiling is True
+        assert omega_config.engine_args.enable_cpu_offload is True
+        assert omega_config.engine_args.max_generated_image_size == 2097152
+        assert omega_config.engine_args.tts_max_instructions_length == 2000
+        assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.data_parallel_size == 3
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 4
+        assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 24
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.use_hsdp is True
+        assert omega_config.engine_args.parallel_config.hsdp_shard_size == 8
+        assert omega_config.engine_args.parallel_config.hsdp_replicate_size == 2
+
+    def test_llm_deploy_fields_can_be_overridden_by_cli(self, tmp_path):
+        deploy_path = tmp_path / "llm_stage.yaml"
+        deploy_path.write_text(
+            """
+async_chunk: false
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    engine_args:
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      gpu_memory_utilization: 0.5
+      max_num_seqs: 16
+      max_num_batched_tokens: 1024
+      max_model_len: 4096
+      enforce_eager: false
+""",
+            encoding="utf-8",
+        )
+
+        pipeline = PipelineConfig(
+            model_type="test_llm",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="thinker",
+                    execution_type=StageExecutionType.LLM_AR,
+                    final_output=True,
+                    final_output_type="text",
+                ),
+            ),
+        )
+        deploy = load_deploy_config(deploy_path)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        stage = stages[0]
+
+        assert stage.yaml_engine_args["tensor_parallel_size"] == 1
+        assert stage.yaml_engine_args["enable_expert_parallel"] is False
+        assert stage.yaml_engine_args["gpu_memory_utilization"] == 0.5
+        assert stage.yaml_engine_args["max_num_seqs"] == 16
+        assert stage.yaml_engine_args["max_num_batched_tokens"] == 1024
+        assert stage.yaml_engine_args["max_model_len"] == 4096
+        assert stage.yaml_engine_args["enforce_eager"] is False
+
+        stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(
+            stage,
+            {
+                "tensor_parallel_size": 2,
+                "enable_expert_parallel": True,
+                "gpu_memory_utilization": 0.9,
+                "max_num_seqs": 32,
+                "max_num_batched_tokens": 2048,
+                "max_model_len": 8192,
+                "enforce_eager": True,
+            },
+        )
+
+        omega_config = stage.to_omegaconf()
+
+        assert omega_config.engine_args.tensor_parallel_size == 2
+        assert omega_config.engine_args.enable_expert_parallel is True
+        assert omega_config.engine_args.gpu_memory_utilization == 0.9
+        assert omega_config.engine_args.max_num_seqs == 32
+        assert omega_config.engine_args.max_num_batched_tokens == 2048
+        assert omega_config.engine_args.max_model_len == 8192
+        assert omega_config.engine_args.enforce_eager is True
+
+
 class TestSentinelDefaultPrecedence:
     """Caller-typed (non-None) values win over YAML; None values fall through
     to YAML / dataclass defaults (#3035)."""
