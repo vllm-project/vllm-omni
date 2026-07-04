@@ -509,13 +509,28 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         )
 
     @_paged_write_attn_op.register_fake
-    def _(query, k_curr, v_curr, k_act, v_act, layer_idx, video_slots, action_slots,
-          block_table, query_start_loc, seq_lens, max_query_len, max_seq_len, softmax_scale):
+    def _(
+        query,
+        k_curr,
+        v_curr,
+        k_act,
+        v_act,
+        layer_idx,
+        video_slots,
+        action_slots,
+        block_table,
+        query_start_loc,
+        seq_lens,
+        max_query_len,
+        max_seq_len,
+        softmax_scale,
+    ):
         return torch.empty_like(query)
 
 
-def paged_write_attn(inputs: ARDiffusionPagedLayerInputs, query, k_curr, v_curr, k_act, v_act,
-                     softmax_scale: float) -> torch.Tensor:
+def paged_write_attn(
+    inputs: ARDiffusionPagedLayerInputs, query, k_curr, v_curr, k_act, v_act, softmax_scale: float
+) -> torch.Tensor:
     """Model-facing entry: routes through the custom op (traceable in fullgraph)."""
     return torch.ops.vllm_omni.ar_diffusion_paged_write_attn(
         query,

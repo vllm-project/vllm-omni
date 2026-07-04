@@ -1267,12 +1267,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if os.environ.get("DZ_PHASE_TIMING"):
             import time as _time
 
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             _pt = {"time": _time, "t0": _time.perf_counter(), "marks": []}
 
         def _pt_mark(name: str) -> None:
             if _pt is not None:
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 _pt["marks"].append((name, _pt["time"].perf_counter()))
 
         # Prompt embeds are constant within a session (a prompt change triggers a

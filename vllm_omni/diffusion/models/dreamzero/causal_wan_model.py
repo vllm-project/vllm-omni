@@ -1012,8 +1012,7 @@ class CausalWanModel(nn.Module):
             fctx = kv_cache[0].forward_ctx
             if seq_len != fctx.seq_len:
                 raise RuntimeError(
-                    f"AR-Diffusion paged context seq_len={fctx.seq_len} "
-                    f"but current video KV has {seq_len} tokens"
+                    f"AR-Diffusion paged context seq_len={fctx.seq_len} but current video KV has {seq_len} tokens"
                 )
             fctx.prepare(
                 device=x.device,

@@ -27,8 +27,8 @@ from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import MAX_DREAMZER
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
-from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 logger = init_logger(__name__)
 
@@ -193,7 +193,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         chunk_size = frame_seqlen
         window_chunks = self.ar_diffusion_kv_config.window_chunks or (max_attention_size // frame_seqlen)
 
-        self.ar_diffusion_kv_config = dataclasses.replace(self.ar_diffusion_kv_config, chunk_size=chunk_size, window_chunks=window_chunks)
+        self.ar_diffusion_kv_config = dataclasses.replace(
+            self.ar_diffusion_kv_config, chunk_size=chunk_size, window_chunks=window_chunks
+        )
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
         # Under CFG-parallel each rank executes exactly ONE branch (rank0 pos,
         # rank1 neg; the other branch's lazy contexts never allocate on this
@@ -294,7 +296,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         finally:
             self.pipeline._ar_diffusion_kv_state = None
         if self.device is not None and torch.cuda.is_available():
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
         self._perf_e2e_times.append(time.perf_counter() - _e2e_t0)
         return out
 
@@ -310,11 +312,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         cameras, 7/6/1 state vectors) so it survives ``_transform_robot_obs`` exactly
         like a real request. One frame -> ``(H,W,3)``; chunk -> ``(n_frames,H,W,3)``.
         """
-        img = (
-            np.zeros((h, w, 3), dtype=np.uint8)
-            if n_frames == 1
-            else np.zeros((n_frames, h, w, 3), dtype=np.uint8)
-        )
+        img = np.zeros((h, w, 3), dtype=np.uint8) if n_frames == 1 else np.zeros((n_frames, h, w, 3), dtype=np.uint8)
         return {
             "observation/exterior_image_0_left": img,
             "observation/exterior_image_1_left": img,
@@ -356,18 +354,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # every window shape is captured regardless of how many later steps are skipped.
         logger.info(
             "AR-Diffusion cudagraph warm-up: up to %d synthetic forwards (window_chunks=%d, nfpb=%d)",
-            n_forwards, window_chunks, nfpb,
+            n_forwards,
+            window_chunks,
+            nfpb,
         )
         try:
             for i in range(n_forwards):
                 n_frames = 1 if i == 0 else 4  # client convention: 1-frame prefill, 4-frame chunks
                 obs = self._synth_robot_obs(h, w, n_frames)
-                sp = OmniDiffusionSamplingParams(
-                    extra_args={"reset": i == 0, "session_id": sid, "robot_obs": obs}
-                )
-                req = OmniDiffusionRequest(
-                    prompts=["warmup"], sampling_params=sp, request_id=f"ardiffusion-warmup-{i}"
-                )
+                sp = OmniDiffusionSamplingParams(extra_args={"reset": i == 0, "session_id": sid, "robot_obs": obs})
+                req = OmniDiffusionRequest(prompts=["warmup"], sampling_params=sp, request_id=f"ardiffusion-warmup-{i}")
                 self.execute_model(req)
                 # Stop once the resident window is full — the remaining shapes are
                 # already captured (the window caps/resets through the same set).
@@ -398,7 +394,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             if free_after != free_before:
                 logger.warning(
                     "AR-Diffusion warm-up: KV pool not restored (free %d -> %d) — possible leak",
-                    free_before, free_after,
+                    free_before,
+                    free_after,
                 )
             else:
                 logger.info(

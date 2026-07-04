@@ -36,9 +36,7 @@ def test_subclass_type_is_returned():
 
 def test_ar_diffusion_qualname_resolves():
     # How DreamZero's deploy config selects the engine: a full import-path string.
-    cls = DiffusionEngine.resolve_engine_class(
-        _cfg("vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine")
-    )
+    cls = DiffusionEngine.resolve_engine_class(_cfg("vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"))
     assert cls is ARDiffusionEngine
 
 
@@ -96,7 +94,10 @@ def _select_runner(od_config, platform_default="PLATFORM"):
 def test_runner_selection_chain():
     ar = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
     # engine-declared runner wins over platform default
-    assert _select_runner(SimpleNamespace(diffusion_model_runner_cls=None, engine_backend=ar)) == AR_DIFFUSION_MODEL_RUNNER_CLS
+    assert (
+        _select_runner(SimpleNamespace(diffusion_model_runner_cls=None, engine_backend=ar))
+        == AR_DIFFUSION_MODEL_RUNNER_CLS
+    )
     # explicit override wins over the engine's declaration
     assert (
         _select_runner(SimpleNamespace(diffusion_model_runner_cls="my.custom.Runner", engine_backend=ar))

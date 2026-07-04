@@ -137,14 +137,10 @@ class ARDiffusionKVState:
         img_ok = not self.kv_cache._cross_k_img or self._cross_img_populated[is_negative]
         if not (self._cross_text_populated[is_negative] and img_ok and self.kv_cache.cross_attn_length > 0):
             raise RuntimeError(
-                "AR-Diffusion cross-attn read before _kv_populate_cross (neg=%s, cross_attn_length=%d, "
-                "text=%s img=%s) — the engine must own all cross KV"
-                % (
-                    is_negative,
-                    self.kv_cache.cross_attn_length,
-                    self._cross_text_populated[is_negative],
-                    self._cross_img_populated[is_negative],
-                )
+                f"AR-Diffusion cross-attn read before _kv_populate_cross (neg={is_negative}, "
+                f"cross_attn_length={self.kv_cache.cross_attn_length}, "
+                f"text={self._cross_text_populated[is_negative]} "
+                f"img={self._cross_img_populated[is_negative]}) — the engine must own all cross KV"
             )
         return [self.kv_cache.read_cross_kv(i, is_negative) for i in range(self.num_layers)]
 

@@ -387,8 +387,8 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
 
     compiled = torch.compile(fn, backend=counter, fullgraph=True)
 
-    run_one_forward(commit=True)   # history grows between calls ->
-    run_one_forward(commit=True)   # block-table VALUES change, shapes don't
+    run_one_forward(commit=True)  # history grows between calls ->
+    run_one_forward(commit=True)  # block-table VALUES change, shapes don't
     run_one_forward(commit=False)
 
     assert counter.frame_count == 1, f"recompiled: frame_count={counter.frame_count}"
