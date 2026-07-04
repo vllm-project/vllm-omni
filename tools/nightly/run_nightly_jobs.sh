@@ -42,7 +42,7 @@
 #                   whose filename contains the substring (benchmark runner chosen by JSON family).
 #
 #   stability (when included in TEST_TYPE):
-#     From repo root: pytest -s -v tests/dfx/stability/scripts/test_stability_*.py
+#     From repo root: pytest -s -v --run-level full_model tests/dfx/stability/scripts/test_stability_*.py
 #     model_type: omni → qwen3_omni; tts → qwen3_tts + voxcpm2; diffusion → qwen_image + wan22 + hunyuan_image; all → all six
 #     LABEL_SUBSTR: if set, script path / job key / filename must contain it
 #
@@ -789,7 +789,7 @@ def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
         if not rel_path.is_file():
             print(f"# skip (missing file): {rel_path}", file=sys.stderr)
             continue
-        pytest_line = f"pytest -s -v {rel_posix}"
+        pytest_line = f"pytest -s -v --run-level full_model {rel_posix}"
         matched += 1
         script_lines = [
             "#!/usr/bin/env bash",
