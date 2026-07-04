@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +11,7 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
 )
+from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -56,6 +58,101 @@ def test_sparse_mm_req_ids_requires_sparse_audio_marker():
 
     assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"], "sparse_audio": ["1"]}}) == ["r1"]
     assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
+
+
+def test_runner_assisted_full_attention_metadata_request_is_opt_in():
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = object()
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=16)
+
+    request = runner._get_runner_assisted_full_attention_metadata_request(
+        req_ids=["r1", "r2"],
+        num_reqs=2,
+        num_reqs_padded=4,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        num_computed_tokens_cpu=np.array([5, 6], dtype=np.int32),
+        max_num_scheduled_tokens=1,
+    )
+
+    assert request is None
+
+
+def test_runner_assisted_full_attention_metadata_request_and_context_hooks():
+    calls = []
+
+    class Model:
+        def get_runner_assisted_full_attention_metadata_request(
+            self,
+            *,
+            req_ids: Sequence[str],
+            num_reqs: int,
+            num_scheduled_tokens: Sequence[int],
+            num_computed_tokens: Sequence[int],
+            max_num_scheduled_tokens: int,
+        ) -> RunnerAssistedFullAttentionMetadataRequest:
+            calls.append(
+                (
+                    "request",
+                    {
+                        "req_ids": list(req_ids),
+                        "num_reqs": num_reqs,
+                        "num_scheduled_tokens": [int(n) for n in num_scheduled_tokens],
+                        "num_computed_tokens": [int(n) for n in num_computed_tokens],
+                        "max_num_scheduled_tokens": max_num_scheduled_tokens,
+                    },
+                )
+            )
+            return RunnerAssistedFullAttentionMetadataRequest(
+                num_reqs_padded=12,
+                for_cudagraph_capture=True,
+            )
+
+        def set_runner_assisted_full_attention_metadata_context(
+            self,
+            *,
+            enabled: bool,
+            num_reqs: int = 0,
+        ) -> None:
+            calls.append(("context", {"enabled": enabled, "num_reqs": num_reqs}))
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = Model()
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=8)
+
+    request = runner._get_runner_assisted_full_attention_metadata_request(
+        req_ids=["r1", "r2"],
+        num_reqs=2,
+        num_reqs_padded=4,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        num_computed_tokens_cpu=np.array([5, 6], dtype=np.int32),
+        max_num_scheduled_tokens=1,
+    )
+    context_enabled = runner._set_runner_assisted_full_attention_metadata_context(
+        enabled=True,
+        num_reqs=2,
+    )
+    context_disabled = runner._set_runner_assisted_full_attention_metadata_context(enabled=False)
+
+    assert request == RunnerAssistedFullAttentionMetadataRequest(
+        num_reqs_padded=8,
+        for_cudagraph_capture=True,
+    )
+    assert context_enabled
+    assert context_disabled
+    assert calls == [
+        (
+            "request",
+            {
+                "req_ids": ["r1", "r2"],
+                "num_reqs": 2,
+                "num_scheduled_tokens": [1, 1],
+                "num_computed_tokens": [5, 6],
+                "max_num_scheduled_tokens": 1,
+            },
+        ),
+        ("context", {"enabled": True, "num_reqs": 2}),
+        ("context", {"enabled": False, "num_reqs": 0}),
+    ]
 
 
 def test_omni_async_gpu_model_runner_output_builds_lazily_once():
@@ -355,6 +452,47 @@ def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
 
     assert set(payload.keys()) == {"multimodal_outputs"}
     assert payload["multimodal_outputs"]["codes"]["audio"].tolist() == [[1]]
+
+
+def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
+    class QueryStartLoc:
+        def __init__(self):
+            self.np = np.full(5, -1, dtype=np.int32)
+            self.copied = False
+
+        def copy_to_gpu(self):
+            self.copied = True
+
+    class BlockTable:
+        def __init__(self):
+            self.commits = []
+
+        def commit_block_table(self, num_reqs_padded):
+            self.commits.append(num_reqs_padded)
+
+    runner = object.__new__(GPUARModelRunner)
+    block_table = BlockTable()
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=torch.tensor([10, 20, 99, 99], dtype=torch.int32),
+        block_table=block_table,
+    )
+    runner.optimistic_seq_lens_cpu = torch.zeros(4, dtype=torch.int32)
+    runner.seq_lens = torch.empty(4, dtype=torch.int32)
+    runner.query_pos = SimpleNamespace(np=np.empty(4, dtype=np.int32))
+    runner.query_start_loc = QueryStartLoc()
+    runner._get_cumsum_and_arange = lambda scheduled, _query_pos: np.cumsum(scheduled, dtype=np.int32)
+
+    runner._refresh_runner_assisted_full_attention_metadata_buffers(
+        num_reqs=2,
+        num_reqs_padded=4,
+        num_scheduled_tokens_np=np.array([1, 2], dtype=np.int32),
+    )
+
+    assert runner.optimistic_seq_lens_cpu.tolist() == [11, 22, 0, 0]
+    assert runner.seq_lens.tolist() == [11, 22, 0, 0]
+    assert runner.query_start_loc.np.tolist() == [0, 1, 3, 3, 3]
+    assert runner.query_start_loc.copied
+    assert block_table.commits == [4]
 
 
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
