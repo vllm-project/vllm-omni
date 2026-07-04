@@ -180,3 +180,43 @@ def test_prepare_one_branch_allocates_nothing_for_the_other():
     assert pos_ctx._allocated_video
     assert not neg_ctx._allocated_video
     assert kv.window_block_ids(st.neg) == []
+
+
+def test_failed_forward_tears_down_session(monkeypatch):
+    """Review follow-up (hsliuustc0106): a forward that dies partway must not
+    leave allocated-but-uncommitted KV behind — the session is torn down (pool
+    blocks freed, model-local state dropped) and the error propagates."""
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+
+    kv, st = make_state(num_layers=1, window_chunks=4)
+    _prepare_and_commit(st, False, 2)  # session owns pool blocks
+    free_before_failure = kv.manager.block_pool.get_num_free_blocks()
+
+    runner = object.__new__(ARDiffusionModelRunner)
+    runner.kv_cache = kv
+    runner._ar_diffusion_states = __import__("collections").OrderedDict({"s1": st})
+    runner._max_ar_diffusion_states = 4
+    runner.pipeline = SimpleNamespace(_states={"s1": object()}, _ar_diffusion_kv_state=None)
+    runner.device = None
+    runner._perf_e2e_times = []
+
+    def boom(self, req):
+        raise RuntimeError("layer 17 exploded")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", boom)
+    req = SimpleNamespace(
+        request_id="r0",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "s1"}),
+    )
+
+    with pytest.raises(RuntimeError, match="layer 17 exploded"):
+        ARDiffusionModelRunner.execute_model(runner, req)
+
+    assert "s1" not in runner._ar_diffusion_states
+    assert "s1" not in runner.pipeline._states
+    assert runner.pipeline._ar_diffusion_kv_state is None
+    # close() freed the session's resident blocks.
+    assert kv.manager.block_pool.get_num_free_blocks() > free_before_failure

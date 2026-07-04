@@ -272,6 +272,25 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         _e2e_t0 = time.perf_counter()
         try:
             out = super().execute_model(req)
+        except Exception:
+            # Transactional containment: a forward that died partway may have
+            # written some layers' K/V into allocated-but-uncommitted blocks
+            # and advanced model-local state. Tear the whole session down
+            # (engine pool blocks freed via close(); model-local state dropped)
+            # so the next request with this session id starts clean instead of
+            # tripping the pending-commit guard or reading half-written KV.
+            broken = self._ar_diffusion_states.pop(session_id, None)
+            if broken is not None:
+                broken.close()
+            states = getattr(self.pipeline, "_states", None)
+            if states is not None:
+                states.pop(session_id, None)
+            logger.warning(
+                "AR-Diffusion execute_model failed for session=%s; session state torn down "
+                "(pool blocks freed) — the next request starts a fresh session",
+                session_id,
+            )
+            raise
         finally:
             self.pipeline._ar_diffusion_kv_state = None
         if self.device is not None and torch.cuda.is_available():
