@@ -12,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 RUNNER = REPO_ROOT / "vllm_omni" / "worker" / "gpu_ar_model_runner.py"
 RUNNER_ASSISTED_METADATA = REPO_ROOT / "vllm_omni" / "worker" / "runner_assisted_metadata.py"
 TALKER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "voxcpm2_talker.py"
+VOXCPM2_RUNTIME_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "runtime_config.py"
 VOXCPM2_PIPELINE = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "pipeline.py"
 VOXCPM2_SCHEDULER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "scheduler.py"
 OMNI_AR_SCHEDULER = REPO_ROOT / "vllm_omni" / "core" / "sched" / "omni_ar_scheduler.py"
@@ -74,6 +75,7 @@ def test_ar_runner_without_model_hook_stays_on_normal_path():
 
 def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
     source = TALKER.read_text()
+    runtime_config_source = VOXCPM2_RUNTIME_CONFIG.read_text()
     compact_source = "".join(source.split())
 
     assert "_voxcpm2_compile_without_inductor_cudagraphs" in source
@@ -86,8 +88,8 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
     assert '"triton.cudagraphs": False' in compile_source
     assert '"triton.cudagraph_trees": False' in compile_source
 
-    assert "self._enable_unified_decode_graph=(use_cuda_graph" in compact_source
-    assert "andnotself._deterministic_cfm_noise" in compact_source
+    assert "self._enable_unified_decode_graph=self._runtime_config.unified_decode_graph_available(" in compact_source
+    assert "andnotself.deterministic_cfm_noise" in "".join(runtime_config_source.split())
     assert "decode_tail_graph" not in source
 
     unified_source = source[source.index("def _forward_unified_decode") :]
@@ -183,7 +185,9 @@ def test_voxcpm2_scheduler_policy_stays_model_local():
     assert "def _should_defer_waiting_admission(self) -> bool:" in common_source
 
     assert "class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler)" in voxcpm2_scheduler_source
-    assert "voxcpm2_runtime_config" in voxcpm2_scheduler_source
+    assert "from .runtime_config import _VoxCPM2RuntimeConfig" in voxcpm2_scheduler_source
+    assert "_VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)" in voxcpm2_scheduler_source
+    assert "unified_decode_graph_available(use_cuda_graph=current_omni_platform.is_cuda())" in voxcpm2_scheduler_source
     assert "_should_defer_waiting_for_unified_decode_graph" in voxcpm2_scheduler_source
     assert "def schedule(" not in voxcpm2_scheduler_source
     assert "create_request_queue" not in voxcpm2_scheduler_source

@@ -6,6 +6,9 @@ from __future__ import annotations
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm_omni.platforms import current_omni_platform
+
+from .runtime_config import _VoxCPM2RuntimeConfig
 
 
 class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
@@ -19,11 +22,8 @@ class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
     """
 
     def _unified_decode_graph_enabled(self) -> bool:
-        hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
-        runtime_config = getattr(hf_config, "voxcpm2_runtime_config", None)
-        if isinstance(runtime_config, dict):
-            return bool(runtime_config.get("enable_unified_decode_graph", False))
-        return bool(getattr(runtime_config, "enable_unified_decode_graph", False))
+        runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)
+        return runtime_config.unified_decode_graph_available(use_cuda_graph=current_omni_platform.is_cuda())
 
     def _should_defer_waiting_for_unified_decode_graph(self) -> bool:
         if not self._unified_decode_graph_enabled():
