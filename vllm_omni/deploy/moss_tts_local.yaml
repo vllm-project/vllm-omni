@@ -14,8 +14,10 @@ connectors:
       connector_get_sleep_s: 0.005
       connector_get_max_wait_first_chunk: 1000
       connector_get_max_wait: 300
-      codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s chunks
+      initial_codec_chunk_frames: 1   # 1 frame * 80 ms/frame = 80 ms first audio chunk
+      codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
       codec_left_context_frames: 0
+      codec_stream_slots: 8
 
 stages:
   - stage_id: 0
@@ -37,7 +39,7 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    max_num_seqs: 1
+    max_num_seqs: 8
     gpu_memory_utilization: 0.15
     enforce_eager: true
     enable_prefix_caching: false
