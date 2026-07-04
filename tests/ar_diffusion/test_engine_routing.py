@@ -92,3 +92,32 @@ def test_worker_runner_selection_prefers_override():
     assert (getattr(over, "diffusion_model_runner_cls", None) or "PLATFORM") == AR_DIFFUSION_MODEL_RUNNER_CLS
     unset = SimpleNamespace(diffusion_model_runner_cls=None)
     assert (getattr(unset, "diffusion_model_runner_cls", None) or "PLATFORM") == "PLATFORM"
+
+
+def test_dreamzero_pipeline_rejects_non_ar_diffusion_engine():
+    """Review (hsliuustc0106): a stale config with engine_backend='default'
+    must fail at init, not mid-forward on the first KV access."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
+
+    with pytest.raises(ValueError, match="requires the AR-Diffusion engine"):
+        DreamZeroPipeline(od_config=SimpleNamespace(engine_backend="default"))
+    with pytest.raises(ValueError, match="requires the AR-Diffusion engine"):
+        DreamZeroPipeline(od_config=SimpleNamespace())
+
+
+def test_runner_rejects_multi_sequence_config():
+    """Review (hsliuustc0106): the paged path writes batch index 0 only, so
+    max_num_seqs > 1 must be rejected at init."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+
+    fake = SimpleNamespace(od_config=SimpleNamespace(max_num_seqs=4))
+    with pytest.raises(ValueError, match="max_num_seqs=1"):
+        ARDiffusionModelRunner._preallocate_kv_cache(fake)

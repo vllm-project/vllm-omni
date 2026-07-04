@@ -204,6 +204,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """
         super().__init__()
 
+        # DreamZero is engine-only: every KV access in forward() routes through
+        # the AR-Diffusion engine's pool-backed state. Fail fast here — a stale
+        # or programmatic config that leaves engine_backend="default" would
+        # otherwise only crash mid-forward on the first KV access.
+        engine_backend = str(getattr(od_config, "engine_backend", "") or "")
+        if "ar_diffusion" not in engine_backend.lower().replace("-", "_"):
+            raise ValueError(
+                "DreamZeroPipeline requires the AR-Diffusion engine; set "
+                "engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine "
+                f"in the deploy config (got engine_backend={engine_backend!r})."
+            )
+
         model_path = od_config.model
         model_config = od_config.model_config
         local_files_only = os.path.exists(model_path)

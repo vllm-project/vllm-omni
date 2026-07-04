@@ -23,6 +23,15 @@ class ARDiffusionKVState:
     """
 
     def __init__(self, kv_cache, pos_adapter, neg_adapter, num_layers: int) -> None:
+        """One state per DreamZero session, holding BOTH CFG branches' adapters.
+
+        ``pos``/``neg`` are the classifier-free-guidance branches: ``pos`` is
+        the conditional pass (real prompt), ``neg`` the unconditional pass
+        (negative prompt). Each owns an independent request adapter — and
+        therefore independent pool blocks — because the two branches produce
+        different K/V for the same frames. Every ``is_negative`` flag in this
+        module selects between them (``False`` -> ``pos``, ``True`` -> ``neg``).
+        """
         self.kv_cache = kv_cache
         self.pos = pos_adapter
         self.neg = neg_adapter

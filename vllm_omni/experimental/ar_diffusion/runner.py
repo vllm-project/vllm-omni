@@ -147,6 +147,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
     def _preallocate_kv_cache(self) -> None:
         """Build the KV pool once, from the loaded DreamZero transformer geometry."""
+        # The paged self-attention path carries one rollout per request: slot
+        # mappings/adapters are single-sequence and K/V writes address batch
+        # index 0 only. Reject a multi-sequence config at init instead of
+        # failing (or silently dropping sequences) mid-forward.
+        max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
+        if max_num_seqs > 1:
+            raise ValueError(
+                "AR-Diffusion paged KV supports max_num_seqs=1 (single-sequence "
+                f"rollouts); got max_num_seqs={max_num_seqs}. Per-sequence "
+                "adapters/slot maps are not implemented."
+            )
         t = self.pipeline.transformer
         num_layers = int(t.num_layers)
         num_kv_heads = int(getattr(t.blocks[0].self_attn, "tp_num_heads", t.num_heads))
