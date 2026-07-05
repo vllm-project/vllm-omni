@@ -515,3 +515,23 @@ def test_full_payload_emits_empty_finished_payload_on_degenerate_take(pooling_ou
     assert payload is not None
     assert payload["meta"]["finished"].item() is True
     assert payload["codes"]["audio"].numel() == 0
+
+
+def test_full_payload_emits_eof_even_when_request_not_marked_finished():
+    """Flush-time full_payload must not depend on a stale request.is_finished()."""
+    request = SimpleNamespace(
+        request_id="rid-stale",
+        output_token_ids=[1, 2, 3],
+        is_finished=lambda: False,
+    )
+    pooling_output = {"codes.audio": torch.zeros((2, _Q), dtype=torch.long)}
+
+    payload = talker2code2wav_full_payload(
+        transfer_manager=None,
+        pooling_output=pooling_output,
+        request=request,
+    )
+
+    assert payload is not None
+    assert payload["codes"]["audio"].numel() == 0
+    assert payload["meta"]["finished"].item() is True

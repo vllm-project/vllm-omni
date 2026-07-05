@@ -554,6 +554,27 @@ def test_mimo_audio_full_payload_nested_fallback() -> None:
     assert len(payload["codes"]["audio"]) == audio.numel() + int(audio.shape[0]) * 4
 
 
+def test_qwen3_tts_talker2code2wav_token_only_schedules_empty_codec():
+    from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+        talker2code2wav_token_only,
+    )
+
+    class _Out:
+        def __init__(self, mm, tids):
+            self.multimodal_output = mm
+            self.cumulative_token_ids = tids
+
+    class _Wrap:
+        def __init__(self, mm, tids):
+            self.outputs = [_Out(mm, tids)]
+            self.finished = True
+
+    src = [_Wrap({"codes": {"audio": torch.zeros((0,))}}, [1, 2])]
+    out = talker2code2wav_token_only(src)
+    assert len(out) == 1
+    assert len(out[0]["prompt_token_ids"]) == 1
+
+
 def test_qwen3_tts_talker2code2wav_token_only_smoke() -> None:
     """Smoke: qwen3_tts token-only sizes placeholder."""
     import torch

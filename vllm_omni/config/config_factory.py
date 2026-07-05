@@ -63,6 +63,10 @@ class StageConfigFactory:
         if cli_overrides is None:
             cli_overrides = {}
 
+        deploy_stages = cls._stages_from_deploy_pipeline(deploy_config_path, cli_overrides)
+        if deploy_stages is not None:
+            return deploy_stages
+
         trust_remote_code = cli_overrides.get("trust_remote_code", True)
         if trust_remote_code is None:
             trust_remote_code = False
@@ -174,6 +178,49 @@ class StageConfigFactory:
         # Not in the pipeline registry — let the caller fall back to the
         # legacy ``stage_configs/*.yaml`` path (resolve_model_config_path).
         return None
+
+    @classmethod
+    def _stages_from_deploy_pipeline(
+        cls,
+        deploy_config_path: str | None,
+        cli_overrides: dict[str, Any],
+    ) -> list[StageConfig] | None:
+        """Resolve stages from deploy YAML ``pipeline:`` when configured.
+
+        When ``--deploy-config`` is set and the file defines ``pipeline:``, that
+        registry key wins over HF ``model_type`` auto-detection. Some checkpoints
+        report a ``model_type`` that is not an ``OMNI_PIPELINES`` key (e.g. AURA
+        stage weights report ``qwen3_vl`` while the deploy graph is ``aura_omni``).
+
+        Returns ``None`` when there is no deploy path, the file is missing, or
+        ``pipeline:`` is unset — callers should continue HF fallback.
+        """
+        if deploy_config_path is None:
+            return None
+
+        deploy_path = Path(deploy_config_path)
+        if not deploy_path.exists():
+            return None
+
+        deploy_cfg = load_deploy_config(deploy_path)
+        pipeline_name = deploy_cfg.pipeline
+        if not pipeline_name:
+            return None
+
+        pipeline_cfg = cls.resolve_pipeline_config(pipeline_name)
+        if pipeline_cfg is None:
+            raise KeyError(
+                f"Pipeline {pipeline_name!r} from {deploy_path.name!r} "
+                f"not found in OMNI_PIPELINES. Available: "
+                f"{sorted(OMNI_PIPELINES.keys())}"
+            )
+
+        return cls._create_from_registry(
+            pipeline_name,
+            pipeline_cfg,
+            cli_overrides,
+            deploy_config_path,
+        )
 
     @classmethod
     def _create_from_registry(

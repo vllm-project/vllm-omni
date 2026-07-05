@@ -499,6 +499,7 @@ async def test_client_cannot_send_internal_frame_decode_failed_message():
             request_id,
             interrupt_event,
             prewarmed_frames,
+            release_turn_lock=None,
         ):
             captured_frames.append(list(frame_buffer))
 
@@ -592,6 +593,7 @@ async def test_audio_buffer_overflow_clears_buffer_before_query(monkeypatch):
             request_id,
             interrupt_event,
             prewarmed_frames,
+            release_turn_lock=None,
         ):
             captured_audio_lengths.append(len(audio_buffer))
 
@@ -649,3 +651,40 @@ def test_build_messages_keeps_recent_history_text_only():
     assert messages[1] == {"role": "assistant", "content": "recent answer"}
     assert messages[2] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
+
+
+def test_create_streaming_video_handler_routes_aura_pipeline():
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from vllm_omni.entrypoints.openai.serving_video_stream import (
+        AuraStreamingVideoHandler,
+        create_streaming_video_handler,
+    )
+
+    deploy_path = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "aura_omni.yaml"
+    engine = MagicMock(config_path=str(deploy_path), stage_configs=[])
+
+    handler = create_streaming_video_handler(chat_service=object(), engine_client=engine)
+    assert isinstance(handler, AuraStreamingVideoHandler)
+
+
+def test_resolve_deploy_pipeline_from_aura_deploy_yaml():
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from vllm_omni.entrypoints.openai.serving_video_stream import _resolve_deploy_pipeline
+
+    deploy_path = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "aura_omni.yaml"
+    engine = MagicMock(config_path=str(deploy_path))
+    assert _resolve_deploy_pipeline(engine) == "aura_omni"
+
+
+def test_create_streaming_video_handler_defaults_to_qwen():
+    from unittest.mock import MagicMock
+
+    from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
+
+    engine = MagicMock(config_path=None, stage_configs=[MagicMock(model_stage="thinker")])
+    handler = create_streaming_video_handler(chat_service=object(), engine_client=engine)
+    assert isinstance(handler, QwenOmniStreamingVideoHandler)

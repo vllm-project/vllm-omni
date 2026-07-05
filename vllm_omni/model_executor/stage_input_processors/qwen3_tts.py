@@ -407,10 +407,15 @@ def talker2code2wav_token_only(
 
     Sized to the expected codec token count (codebook-major flat:
     Q * (ref_frames + audio_frames)).  Speaker / language metadata are
-    extracted from `prompt` and threaded via `additional_information`
+    extracted from `prompt` and threaded via `additional_information``
     (orchestrator-style; same as the legacy `talker2code2wav` builder).
     Actual codec ids are delivered via the worker connector payload built
     by `talker2code2wav_full_payload`.
+
+    When the talker ``multimodal_output`` is still present on the
+    orchestrator output (typical HTTP / single-turn path), embed the codec
+    directly.  Otherwise emit a non-empty placeholder so Code2Wav is
+    scheduled and the shared-memory connector can deliver ``codes.audio``.
     """
     from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -425,36 +430,51 @@ def talker2code2wav_token_only(
         token_ids = getattr(output, "cumulative_token_ids", []) or []
         seq_len = max(len(token_ids) - 1, 0)
 
+        num_quantizers = _NUM_QUANTIZERS_DEFAULT
+        ref_code_raw = mm_codes.get("ref") if isinstance(mm_codes, dict) else None
+        ref_code_len_raw = mm.get("meta", {}).get("ref_code_len") if isinstance(mm.get("meta"), dict) else None
+        ref_code_len = _coerce_ref_code_len(ref_code_len_raw)
+        ref_code, ref_frames = _normalize_ref_code(ref_code_raw, num_quantizers, ref_code_len)
+
+        prompt_token_ids: list[int] | None = None
+        left_context = ref_frames
         audio = mm_codes.get("audio") if isinstance(mm_codes, dict) else None
         if isinstance(audio, torch.Tensor) and audio.numel() > 0:
             audio = audio.to(torch.long)
             audio = _filter_audio_codes_qwen3_tts(audio)
             if seq_len > 0 and audio.ndim == 2 and int(audio.shape[0]) > seq_len:
                 audio = audio[-seq_len:]
-            num_audio_frames = int(audio.shape[0]) if audio.ndim == 2 else 0
-            num_quantizers = int(audio.shape[1]) if audio.ndim == 2 and audio.shape[1] > 0 else _NUM_QUANTIZERS_DEFAULT
-        else:
+            if audio.numel() > 0 and audio.ndim == 2:
+                num_quantizers = int(audio.shape[1]) if audio.shape[1] > 0 else _NUM_QUANTIZERS_DEFAULT
+                ref_code, ref_frames = _normalize_ref_code(ref_code_raw, num_quantizers, ref_code_len)
+                if ref_code is not None:
+                    audio = torch.cat([ref_code.to(audio.device), audio], dim=0)
+                    left_context = ref_frames
+                prompt_token_ids = (
+                    audio.transpose(0, 1).to(device="cpu", dtype=torch.long).reshape(-1).tolist()
+                )
+
+        if not prompt_token_ids:
             num_audio_frames = 0
-            num_quantizers = _NUM_QUANTIZERS_DEFAULT
-
-        ref_code_raw = mm_codes.get("ref") if isinstance(mm_codes, dict) else None
-        ref_code_len_raw = mm.get("meta", {}).get("ref_code_len") if isinstance(mm.get("meta"), dict) else None
-        ref_code_len = _coerce_ref_code_len(ref_code_len_raw)
-        _, ref_frames = _normalize_ref_code(ref_code_raw, num_quantizers, ref_code_len)
-
-        # Codebook-major flat: Q * (ref_frames + audio_frames)
-        prompt_len = num_quantizers * (ref_frames + num_audio_frames)
+            if isinstance(audio, torch.Tensor) and audio.ndim == 2 and audio.numel() > 0:
+                num_audio_frames = int(audio.shape[0])
+            prompt_len = num_quantizers * (ref_frames + num_audio_frames)
+            if prompt_len <= 0:
+                # Connector bootstrap: scheduler waits for worker ``codes.audio``.
+                prompt_len = 1
+            prompt_token_ids = [0] * prompt_len
+            left_context = ref_frames
 
         additional_info = to_dict(
             OmniPayloadStruct(
-                meta=MetaStruct(left_context_size=ref_frames) if ref_frames > 0 else None,
+                meta=MetaStruct(left_context_size=left_context) if left_context > 0 else None,
                 speaker=extract_speaker_from_prompt(prompt, index=i),
                 language=extract_language_from_prompt(prompt, index=i),
             )
         )
         code2wav_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0] * prompt_len,
+                prompt_token_ids=prompt_token_ids,
                 additional_information=additional_info if additional_info else None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,

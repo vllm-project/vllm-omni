@@ -1636,7 +1636,7 @@ class TestCLIOverrideFlow:
 
 
 class TestAuraOmniDeploy:
-    def test_aura_omni_deploy_forces_pipeline_override(self):
+    def test_aura_omni_deploy_pipeline(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"
         deploy = load_deploy_config(deploy_path)
 
@@ -1664,6 +1664,11 @@ class TestAuraOmniDeploy:
         assert stages[1].yaml_engine_args["model_arch"] == "AuraQwen3VLForConditionalGeneration"
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
+        assert stages[1].custom_process_input_func.endswith("asr2aura")
+
+    def test_aura_omni_merge_wires_asr2aura_processor(self):
+        stages = merge_pipeline_deploy(OMNI_PIPELINES["aura_omni"], DeployConfig())
+        assert stages[1].custom_process_input_func.endswith("asr2aura")
 
 
 class TestDeployCliOverrideFlow:
