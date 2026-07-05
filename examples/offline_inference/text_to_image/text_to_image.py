@@ -522,8 +522,8 @@ def main():
         diffusion_params.extra_args.update({k: v for k, v in user_extra.items() if v is not None})
 
     if lora_request:
-        diffusion_params.extra_args["lora_request"] = lora_request
-        diffusion_params.extra_args["lora_scale"] = args.lora_scale
+        diffusion_params.lora_request = lora_request
+        diffusion_params.lora_scale = args.lora_scale
 
     # Build per-stage sampling params for multi-stage models (e.g. BAGEL),
     # or wrap single diffusion params for single-stage models.
