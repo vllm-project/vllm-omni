@@ -266,7 +266,6 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=["r2"],
-        seq_len=3,
         num_scheduled_tokens_np=torch.tensor([1, 2], dtype=torch.int32).numpy(),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
     )
@@ -312,7 +311,6 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=None,
-        seq_len=6,
         num_scheduled_tokens_np=np.array([1, 2, 3], dtype=np.int32),
         query_start_loc_cpu=torch.tensor([0, 1, 3], dtype=torch.long),
     )
@@ -366,7 +364,6 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch)
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=None,
-        seq_len=3,
         num_scheduled_tokens_np=torch.tensor([1, 2], dtype=torch.int32).numpy(),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
     )
@@ -427,7 +424,6 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=None,
-        seq_len=2,
         num_scheduled_tokens_np=np.array([2], dtype=np.int32),
         query_start_loc_cpu=torch.tensor([0], dtype=torch.long),
     )
@@ -437,6 +433,51 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     assert "hidden" not in output.inter_stage_outputs[0]
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], torch.tensor([[7, 8], [9, 10]], dtype=torch.long))
     assert output.multimodal_outputs is None
+
+
+def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_only(monkeypatch):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.model.omni_pooler_payload_include_hidden = False
+    runner._async_chunk = False
+    runner.requests = {"r1": object(), "r2": object(), "r3": object()}
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    codes = torch.arange(48, dtype=torch.long).reshape(3, 16)
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
+        ),
+        hidden_states=torch.tensor([[1.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"codes": {"audio": codes}},
+        req_ids_output_copy=["r1", "r2", "r3"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
+        valid_sampled_token_ids=[[101], [102], [103]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.long),
+    )
+
+    assert output.inter_stage_outputs is not None
+    assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], codes[0:1])
+    assert torch.equal(output.inter_stage_outputs[1]["codes.audio"], codes[1:2])
+    assert torch.equal(output.inter_stage_outputs[2]["codes.audio"], codes[2:3])
 
 
 def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
@@ -627,7 +668,6 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=None,
-        seq_len=2,
         num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
     )
