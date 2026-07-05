@@ -39,9 +39,9 @@ steps:
       grade: Blocking
       commands:
         - export VLLM_ROCM_USE_AITER=0
-        # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
-        # that is not supported on CPU
-        - "timeout 40m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+        # tests/diffusion and tests/model_executor are covered by the (1/2) and (2/2)
+        # steps above; run the remaining tests here, same as the non-AMD pipeline.
+        - "timeout 40m pytest -sv -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
 
 - group: ":card_index_dividers: Diffusion Test"
   steps:
