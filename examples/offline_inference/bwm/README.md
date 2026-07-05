@@ -62,3 +62,7 @@ omni.generate(
 
 Actions are one-per-pixel-frame, `1 + 4 * (latent_frames - 1)` per chunk,
 normalized to [-1, 1] with the dataset's p01/p99 bounds client-side.
+If `num_frames` is omitted, the chunk length is derived from the action
+trajectory length. History frames are resized to `height`/`width` when
+they differ. The pipeline is single-device (no CFG by design; parallel
+configs are rejected at startup).

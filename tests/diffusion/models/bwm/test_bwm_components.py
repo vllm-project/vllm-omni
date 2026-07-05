@@ -12,10 +12,12 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
 from vllm_omni.diffusion.models.bwm.bwm_action_encoder import BWMActionEncoder
+from vllm_omni.diffusion.models.bwm.pipeline_bwm import BoundlessWorldModelPipeline, resolve_num_frames
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -76,6 +78,48 @@ class TestWeightConversion:
         }
         for src, expected in cases.items():
             assert m.convert_dit_key(src) == expected, src
+
+
+class TestResolveNumFrames:
+    def test_derives_from_action_length_when_unset(self):
+        # OmniDiffusionSamplingParams.num_frames defaults to 1 (image-model
+        # default); both None and 1 must fall back to the action trajectory.
+        assert resolve_num_frames(57, None) == 57
+        assert resolve_num_frames(57, 1) == 57
+        assert resolve_num_frames(59, None) == 57  # snapped to the 4n+1 grid
+
+    def test_honors_explicit_request(self):
+        assert resolve_num_frames(100, 57) == 57
+        assert resolve_num_frames(100, 58) == 57  # snapped down
+
+    def test_rejects_empty_action(self):
+        with pytest.raises(ValueError):
+            resolve_num_frames(0, None)
+
+
+class TestHistoryFrames:
+    to_tensor = staticmethod(BoundlessWorldModelPipeline._history_frames_to_tensor)
+
+    def test_uint8_scaled_to_minus_one_one(self):
+        frames = np.full((2, 32, 48, 3), 255, dtype=np.uint8)
+        video = self.to_tensor(frames)
+        assert video.shape == (1, 3, 2, 32, 48)
+        assert torch.allclose(video, torch.ones_like(video))
+
+    def test_unit_float_rescaled(self):
+        frames = np.zeros((1, 32, 48, 3), dtype=np.float32)  # [0, 1] range
+        video = self.to_tensor(frames)
+        assert torch.allclose(video, -torch.ones_like(video))
+
+    def test_signed_float_passthrough(self):
+        frames = -np.ones((1, 32, 48, 3), dtype=np.float32)  # already [-1, 1]
+        video = self.to_tensor(frames)
+        assert torch.allclose(video, -torch.ones_like(video))
+
+    def test_resize_to_requested_resolution(self):
+        frames = np.random.randint(0, 255, (2, 32, 48, 3), dtype=np.uint8)
+        video = self.to_tensor(frames, height=64, width=96)
+        assert video.shape == (1, 3, 2, 64, 96)
 
 
 class TestConditionEmbedder:

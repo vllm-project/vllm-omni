@@ -67,11 +67,45 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 logger = logging.getLogger(__name__)
 
 # BWM release defaults (configs/infer/infer.yaml in the reference repo).
-DEFAULT_NUM_FRAMES = 57
-DEFAULT_NUM_HISTORY_FRAMES = 9
+# Release defaults are 57-frame chunks with 9 history frames; the chunk
+# length is derived from the action trajectory (see resolve_num_frames).
 DEFAULT_NUM_INFERENCE_STEPS = 50
 DEFAULT_FLOW_SHIFT = 5.0
 DEFAULT_ACTION_DIM = 14
+
+
+def resolve_num_frames(action_frames: int, requested: int | None) -> int:
+    """Resolve the chunk length in pixel frames.
+
+    ``OmniDiffusionSamplingParams.num_frames`` defaults to 1 (an image-model
+    default), so a value of ``None`` or ``<= 1`` means the caller did not ask
+    for a specific length; in that case derive it from the action trajectory
+    (one action per pixel frame, ``1 + 4 * (T_latent - 1)`` alignment).
+    Explicit requests are snapped down to the 4n+1 frame grid.
+    """
+    if requested is None or requested <= 1:
+        if action_frames < 1:
+            raise ValueError("Action trajectory must contain at least one frame")
+        return 1 + 4 * ((action_frames - 1) // 4)
+    return 1 + 4 * ((requested - 1) // 4)
+
+
+def _reject_parallel_config(od_config: OmniDiffusionConfig) -> None:
+    """BWM runs single-device only.
+
+    CFG parallel is inapplicable (the model runs without classifier-free
+    guidance), and pipeline/sequence/tensor parallel are unsupported because
+    the action modulation reaches the condition embedder through module
+    state rather than a forward argument, which does not propagate across
+    stages the way real inputs do.
+    """
+    parallel = getattr(od_config, "parallel_config", None)
+    if parallel is None:
+        return
+    for field in ("tensor_parallel_size", "sequence_parallel_size", "pipeline_parallel_size", "cfg_parallel_size"):
+        size = int(getattr(parallel, field, 1) or 1)
+        if size > 1:
+            raise ValueError(f"BoundlessWorldModelPipeline is single-device only; got {field}={size}")
 
 
 def get_bwm_post_process_func(od_config: OmniDiffusionConfig):
@@ -109,6 +143,7 @@ class BoundlessWorldModelPipeline(
         self.od_config = od_config
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
+        _reject_parallel_config(od_config)
 
         model = od_config.model
         local_files_only = os.path.exists(model)
@@ -153,12 +188,15 @@ class BoundlessWorldModelPipeline(
 
         model_config = getattr(od_config, "model_config", None) or {}
         action_dim = int(model_config.get("action_dim", DEFAULT_ACTION_DIM))
+        # Explicit dtype cast (mirrors the VAE): the loader constructs the
+        # pipeline under set_default_torch_dtype(od_config.dtype), but the
+        # encoder must match the transformer even without that context.
         self.action_encoder = BWMActionEncoder(
             action_dim=action_dim,
             dim=int(
                 transformer_config.get("num_attention_heads", 24) * transformer_config.get("attention_head_dim", 128)
             ),
-        )
+        ).to(dtype)
 
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else DEFAULT_FLOW_SHIFT
         self.scheduler = build_wan_scheduler("euler", self._flow_shift)
@@ -172,8 +210,16 @@ class BoundlessWorldModelPipeline(
     # ------------------------------------------------------------ inputs
 
     @staticmethod
-    def _history_frames_to_tensor(raw: Any) -> torch.Tensor:
-        """Return ``(1, C, T, H, W)`` float tensor in [-1, 1]."""
+    def _history_frames_to_tensor(raw: Any, height: int | None = None, width: int | None = None) -> torch.Tensor:
+        """Return ``(1, C, T, H, W)`` float tensor in [-1, 1].
+
+        Value contract by input dtype: integer arrays are treated as
+        [0, 255]; float arrays with values in [0, 1] are rescaled to
+        [-1, 1]; other float arrays are assumed to already be in [-1, 1].
+        When ``height``/``width`` differ from the frame size, frames are
+        resized (bilinear, antialiased), mirroring the reference repo's
+        resize-to-render-resolution step.
+        """
         if isinstance(raw, PIL.Image.Image):
             raw = [raw]
         if isinstance(raw, (list, tuple)):
@@ -185,9 +231,20 @@ class BoundlessWorldModelPipeline(
             raise TypeError(f"Unsupported history video type {type(raw)}")
         if raw.ndim != 4:
             raise ValueError(f"History video must be (T, H, W, C), got shape {tuple(raw.shape)}")
+
+        is_integer = not raw.is_floating_point()
         video = raw.permute(3, 0, 1, 2).unsqueeze(0).float()  # (1, C, T, H, W)
-        if video.max() > 1.5:
+        if is_integer:
             video = video / 127.5 - 1.0
+        elif video.min() >= 0.0 and video.max() <= 1.0:
+            video = video * 2.0 - 1.0
+
+        if height is not None and width is not None and video.shape[-2:] != (height, width):
+            frames_2d = video.squeeze(0).permute(1, 0, 2, 3)  # (T, C, H, W)
+            frames_2d = torch.nn.functional.interpolate(
+                frames_2d, size=(height, width), mode="bilinear", align_corners=False, antialias=True
+            )
+            video = frames_2d.permute(1, 0, 2, 3).unsqueeze(0)
         return video
 
     # ------------------------------------------------------------ latents
@@ -223,10 +280,10 @@ class BoundlessWorldModelPipeline(
             .view(1, self.vae.config.z_dim, 1, 1, 1)
             .to(latent_condition.device, latent_condition.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+        latents_std_inv = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
             latent_condition.device, latent_condition.dtype
         )
-        latent_condition = ((latent_condition - latents_mean) * latents_std).to(dtype)
+        latent_condition = ((latent_condition - latents_mean) * latents_std_inv).to(dtype)
 
         history_t = min(int(latent_condition.shape[2]), num_latent_frames)
         condition = torch.zeros_like(latents)
@@ -260,7 +317,6 @@ class BoundlessWorldModelPipeline(
                 '`"multi_modal_data": {"action": <(frames, action_dim) array>, ...}`'
             )
 
-        history_video = self._history_frames_to_tensor(raw_video)
         action = torch.as_tensor(np.asarray(raw_action), dtype=torch.float32)
         if action.ndim == 2:
             action = action.unsqueeze(0)  # (1, frames, action_dim)
@@ -269,17 +325,19 @@ class BoundlessWorldModelPipeline(
                 f"Action must be (frames, {self.action_encoder.action_dim}), got shape {tuple(action.shape)}"
             )
 
+        history_video = self._history_frames_to_tensor(raw_video)
         height = req.sampling_params.height or history_video.shape[-2]
         width = req.sampling_params.width or history_video.shape[-1]
-        num_frames = req.sampling_params.num_frames or DEFAULT_NUM_FRAMES
         num_steps = req.sampling_params.num_inference_steps or DEFAULT_NUM_INFERENCE_STEPS
         output_type = req.sampling_params.output_type or "np"
 
         mod_value = self.vae_scale_factor_spatial * 2  # spatial compression x patch size
         if height % mod_value != 0 or width % mod_value != 0:
             raise ValueError(f"height/width must be divisible by {mod_value}, got {height}x{width}")
-        if num_frames % self.vae_scale_factor_temporal != 1:
-            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+        if history_video.shape[-2:] != (height, width):
+            history_video = self._history_frames_to_tensor(raw_video, height=height, width=width)
+
+        num_frames = resolve_num_frames(int(action.shape[1]), req.sampling_params.num_frames)
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
         # One action per pixel frame, aligned to the latent grouping.
@@ -352,10 +410,10 @@ class BoundlessWorldModelPipeline(
             .view(1, self.vae.config.z_dim, 1, 1, 1)
             .to(latents.device, latents.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+        latents_std_inv = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
             latents.device, latents.dtype
         )
-        latents = latents / latents_std + latents_mean
+        latents = latents / latents_std_inv + latents_mean
         output = self.vae.decode(latents, return_dict=False)[0]
         return DiffusionOutput(output=output)
 
