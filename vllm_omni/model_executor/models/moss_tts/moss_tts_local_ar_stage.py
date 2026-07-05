@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.profiler import record_function
+from transformers.models.qwen3 import Qwen3Config
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models import SupportsPP
@@ -421,6 +422,8 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         #     self.audio_start_token_id, self.gen_slot_id, self.audio_end_id,
         # )
         lang_cfg = cfg.language_config # Qwen3Config
+        if isinstance(lang_cfg, dict):
+            lang_cfg = Qwen3Config(**lang_cfg)
         self.hidden_size: int = lang_cfg.hidden_size
 
         # Global Qwen3 backbone
@@ -452,11 +455,27 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
                 )
             )
 
-        # Local Transformer - built using the local Qwen3 sub-config (4 blocks, 1536 hidden).
+        gpt2_cfg = getattr(cfg, "gpt2_config", None)
+        local_num_layers = getattr(cfg, "local_num_layers", None)
+        if local_num_layers is None and gpt2_cfg is not None:
+            local_num_layers = getattr(gpt2_cfg, "n_layer", None)
+        local_hidden_size = getattr(cfg, "local_hidden_size", None)
+        if local_hidden_size is None and gpt2_cfg is not None:
+            local_hidden_size = getattr(gpt2_cfg, "n_embd", None)
+        local_ffn_hidden_size = getattr(cfg, "local_ffn_hidden_size", None)
+        if local_ffn_hidden_size is None and gpt2_cfg is not None:
+            local_ffn_hidden_size = getattr(gpt2_cfg, "n_inner", None)
+        additional_mlp_ffn_hidden_size = getattr(cfg, "additional_mlp_ffn_hidden_size", None)
+        if additional_mlp_ffn_hidden_size is None:
+            additional_mlp_ffn_hidden_size = local_ffn_hidden_size or self.hidden_size
+        if local_num_layers is None or local_hidden_size is None or local_ffn_hidden_size is None:
+            raise ValueError("MOSS-TTS Local config is missing local transformer dimensions.")
+
+        # Local Transformer - built using the local Qwen3 sub-config.
         local_cfg = copy.deepcopy(lang_cfg)
-        local_cfg.num_hidden_layers = cfg.local_num_layers
-        local_cfg.hidden_size       = cfg.local_hidden_size
-        local_cfg.intermediate_size = cfg.local_ffn_hidden_size
+        local_cfg.num_hidden_layers = local_num_layers
+        local_cfg.hidden_size = local_hidden_size
+        local_cfg.intermediate_size = local_ffn_hidden_size
         local_cfg.max_local_cache_len = self.channels
         self.local_transformer = MossTTSLocalTransformerWrapper(
             local_cfg, model_path=vllm_config.model_config.model
@@ -465,15 +484,15 @@ class MossTTSARStageModel(nn.Module, SupportsPP):
         # Projection: global hidden to local hidden
         self.speech_embedding_to_local_mlp = MossTTSMLP(
             input_size=self.hidden_size,
-            ffn_hidden_size=cfg.additional_mlp_ffn_hidden_size,
-            output_size=cfg.local_hidden_size,
+            ffn_hidden_size=additional_mlp_ffn_hidden_size,
+            output_size=local_hidden_size,
         )
 
         # local hidden to global hidden
         self.local_to_speech_embedding_mlps = nn.ModuleList([
             MossTTSMLP(
-                input_size=cfg.local_hidden_size,
-                ffn_hidden_size=cfg.additional_mlp_ffn_hidden_size,
+                input_size=local_hidden_size,
+                ffn_hidden_size=additional_mlp_ffn_hidden_size,
                 output_size=self.hidden_size,
             )
             for _ in range(self.channels)

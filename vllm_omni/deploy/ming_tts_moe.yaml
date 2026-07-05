@@ -1,0 +1,66 @@
+# Ming-omni-tts-16.8B-A3B (MoE) deploy: stage-0 bailing_moe LLM+flow -> stage-1 audio VAE.
+# Same two-stage pipeline as the dense ming_tts.yaml; the Stage-0 backbone is the
+# 16.8B-A3B bailing_moe MoE (~31GB bf16).
+#
+# pipeline: HF config reports model_type="bailingmm", which is not a registry key,
+# already declared by MING_TTS_MOE_PIPELINE for auto-detection.
+#
+# NOTE: ~31GB bf16 + the tiny audio VAE fit one 80GB+ GPU, so both stages colocate
+# on GPU0 (Stage-0 0.60 util ≈ 58GB + Stage-1 0.25 util ≈ 24GB ≈ 0.85, fits 97GB
+# H20). For smaller cards raise Stage-0 tensor_parallel_size or split the stages
+# onto separate devices. Multi-request batching is not yet validated (max_num_seqs: 1).
+pipeline: ming_tts_moe
+async_chunk: true
+# The MoE ships a custom tokenizer (tokenization_bailing.BailingTokenizer) that
+# must be executed to load. The model config still resolves to the registered
+# MingMoeConfig (vLLM _CONFIG_REGISTRY precedence over the repo auto_map).
+trust_remote_code: true
+dtype: bfloat16
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      latent_chunk_size: 25
+      latent_left_context: 0
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.60
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    # Pin the unquantized MoE kernel (wer diff between vllm 0.22 vs 0.23)
+    moe_backend: triton
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 512
+      detokenize: true
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      detokenize: false

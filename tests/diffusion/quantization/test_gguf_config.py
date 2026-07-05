@@ -8,11 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization.gguf import UNQUANTIZED_TYPES, UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.gguf_config import (
+    UNQUANTIZED_TYPES,
     DiffusionGGUFConfig,
     DiffusionGGUFLinearMethod,
     dequant_gemm_gguf,

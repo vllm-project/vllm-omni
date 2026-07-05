@@ -3,6 +3,7 @@
 # Adapted from Helios (https://github.com/BestWishYsh/Helios)
 
 import math
+from collections import OrderedDict
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
@@ -24,6 +26,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelL
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -62,10 +65,16 @@ def apply_rotary_emb_helios(
     """
     x_1, x_2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos, sin = freqs_cis.unsqueeze(-2).chunk(2, dim=-1)
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x_1 * cos[..., 0::2] - x_2 * sin[..., 1::2]
-    out[..., 1::2] = x_1 * sin[..., 1::2] + x_2 * cos[..., 0::2]
-    return out.type_as(hidden_states)
+    # Use stack+flatten instead of strided slice assignment for contiguous
+    # memory layout and better performance on GPU/NPU (#2436, cf. PR #2393).
+    rotated = torch.stack(
+        (
+            x_1 * cos[..., 0::2] - x_2 * sin[..., 1::2],
+            x_1 * sin[..., 1::2] + x_2 * cos[..., 0::2],
+        ),
+        dim=-1,
+    )
+    return rotated.flatten(-2, -1).type_as(hidden_states)
 
 
 class DistributedRMSNorm(nn.Module):
@@ -441,21 +450,32 @@ class HeliosCrossAttention(nn.Module):
             causal=False,
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        query = self.to_q(hidden_states)
-        query = self.norm_q(query)
-
+    def project_kv(self, encoder_hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)
         key = self.norm_k(key)
 
-        query = query.unflatten(2, (self.num_heads, self.head_dim))
         key = key.unflatten(2, (self.num_heads, self.head_dim))
         value = value.unflatten(2, (self.num_heads, self.head_dim))
+        return key, value
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        query = self.to_q(hidden_states)
+        query = self.norm_q(query)
+
+        if encoder_key_value is None:
+            if encoder_hidden_states is None:
+                raise ValueError("encoder_hidden_states is required when encoder_key_value is not provided.")
+            key, value = self.project_kv(encoder_hidden_states)
+        else:
+            key, value = encoder_key_value
+
+        query = query.unflatten(2, (self.num_heads, self.head_dim))
 
         hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
@@ -520,6 +540,7 @@ class HeliosTransformerBlock(nn.Module):
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
         original_context_length: int | None = None,
+        cross_attn_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -550,12 +571,20 @@ class HeliosTransformerBlock(nn.Module):
                 hidden_states[:, history_seq_len:],
             )
             norm_hidden_states = self.norm2(current_hidden_states.float()).type_as(current_hidden_states)
-            attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
+            attn_output = self.attn2(
+                norm_hidden_states,
+                encoder_hidden_states,
+                encoder_key_value=cross_attn_key_value,
+            )
             current_hidden_states = current_hidden_states + attn_output
             hidden_states = torch.cat([history_hidden_states, current_hidden_states], dim=1)
         else:
             norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-            attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
+            attn_output = self.attn2(
+                norm_hidden_states,
+                encoder_hidden_states,
+                encoder_key_value=cross_attn_key_value,
+            )
             hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -575,8 +604,15 @@ class HeliosTransformer3DModel(nn.Module):
     guidance cross-attention, and chunked video generation support.
     """
 
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "blocks": ForwardPattern.Pattern_2,
+        },
+        has_separate_cfg=True,
+    )
+
     _repeated_blocks = ["HeliosTransformerBlock"]
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
@@ -717,10 +753,79 @@ class HeliosTransformer3DModel(nn.Module):
         # 5. Output norm & projection
         self.norm_out = HeliosOutputNorm(inner_dim, eps)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
+        self._projected_encoder_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+        self._cross_attn_kv_cache: OrderedDict[tuple, list[tuple[torch.Tensor, torch.Tensor]]] = OrderedDict()
+        self._cross_attn_cache_size = 2
 
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
+
+    @staticmethod
+    def _tensor_cache_key(tensor: torch.Tensor) -> tuple:
+        try:
+            version = tensor._version
+        except RuntimeError:
+            version = None
+
+        return (
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.device.type,
+            tensor.device.index,
+            version,
+        )
+
+    @staticmethod
+    def _get_from_lru(cache: OrderedDict, key: tuple):
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+    def _put_lru(self, cache: OrderedDict, key: tuple, value) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > self._cross_attn_cache_size:
+            cache.popitem(last=False)
+
+    def clear_cross_attention_cache(self) -> None:
+        self._projected_encoder_cache.clear()
+        self._cross_attn_kv_cache.clear()
+
+    def _cache_enabled(self) -> bool:
+        return not self.training and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+
+    def _project_encoder_hidden_states(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._cache_enabled():
+            return self.condition_embedder.text_embedder(encoder_hidden_states)
+
+        cache_key = self._tensor_cache_key(encoder_hidden_states)
+        cached = self._get_from_lru(self._projected_encoder_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        projected = self.condition_embedder.text_embedder(encoder_hidden_states)
+        self._put_lru(self._projected_encoder_cache, cache_key, projected)
+        return projected
+
+    def _get_cross_attn_key_values(
+        self,
+        encoder_hidden_states: torch.Tensor,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+        if not self._cache_enabled():
+            return None
+
+        cache_key = self._tensor_cache_key(encoder_hidden_states)
+        cached = self._get_from_lru(self._cross_attn_kv_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        key_values = [block.attn2.project_kv(encoder_hidden_states) for block in self.blocks]
+        self._put_lru(self._cross_attn_kv_cache, cache_key, key_values)
+        return key_values
 
     def forward(
         self,
@@ -830,7 +935,12 @@ class HeliosTransformer3DModel(nn.Module):
                 .expand(batch_size, -1, history_context_length, -1)
             )
 
-        temb, timestep_proj, encoder_hidden_states = self.condition_embedder(timestep, encoder_hidden_states)
+        temb, timestep_proj, _ = self.condition_embedder(
+            timestep,
+            encoder_hidden_states,
+            is_return_encoder_hidden_states=False,
+        )
+        encoder_hidden_states = self._project_encoder_hidden_states(encoder_hidden_states)
         timestep_proj = timestep_proj.unflatten(-1, (6, -1))
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
@@ -851,14 +961,17 @@ class HeliosTransformer3DModel(nn.Module):
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
         rotary_emb = rotary_emb.contiguous()
+        cross_attn_key_values = self._get_cross_attn_key_values(encoder_hidden_states)
 
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
+            cross_attn_key_value = None if cross_attn_key_values is None else cross_attn_key_values[block_idx]
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
                 timestep_proj,
                 rotary_emb,
                 original_context_length,
+                cross_attn_key_value,
             )
 
         # 7. Output normalization

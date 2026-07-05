@@ -38,10 +38,7 @@ def _encode_plain_text(tokenizer: Any, text: str) -> list[int]:
 
 
 def _encode_control_token(tokenizer: Any, token: str) -> list[int]:
-    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
-    token_id = vocab.get(token)
-    if token_id is None:
-        token_id = tokenizer.convert_tokens_to_ids(token)
+    token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is None or token_id == getattr(tokenizer, "unk_token_id", None):
         raise ValueError(f"Fish Speech tokenizer is missing required control token: {token}")
     return [int(token_id)]
@@ -135,13 +132,3 @@ def estimate_fish_voice_clone_prompt_len_from_normalized(
         [0] * semantic_len,
     )
     return len(prompt_ids)
-
-
-def estimate_fish_voice_clone_prompt_len(tokenizer: Any, text: str, ref_text: str, semantic_len: int) -> int:
-    normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(text, ref_text)
-    return estimate_fish_voice_clone_prompt_len_from_normalized(
-        tokenizer,
-        normalized_text,
-        normalized_ref_text,
-        semantic_len,
-    )

@@ -414,10 +414,6 @@ class UlyssesParallelAttention:
     def post_attention(self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None) -> torch.Tensor:
         assert isinstance(ctx, _UlyssesCtx), f"Unexpected ctx type: {type(ctx)!r}"
 
-        # If we have joint tensors (Text), they were Head-Sliced.
-        # The main sequence (Image) was Sequence-Sliced.
-        # attn_output contains [Joint_Sliced | Image_Sliced] (if strategy='front').
-
         if ctx.joint_len > 0:
             joint_len = ctx.joint_len
 

@@ -7,11 +7,10 @@ import logging
 import os
 import re
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKLHunyuanVideo15
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -20,13 +19,20 @@ from transformers import AutoConfig, ByT5Tokenizer, Qwen2_5_VLTextModel, Qwen2To
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan_video_15 import (
+    DistributedAutoencoderKLHunyuanVideo15,
+)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -81,7 +87,13 @@ def get_hunyuan_video_15_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
+class HunyuanVideo15Pipeline(
+    nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,
@@ -97,9 +109,20 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
         model = od_config.model
         local_files_only = os.path.exists(model)
 
+        # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
+        # race; prefetch the whole component set before any from_pretrained so
+        # peer workers load from a warm, complete cache.
+        hv_subfolders = ["tokenizer", "text_encoder", "tokenizer_2", "text_encoder_2", "vae", "scheduler"]
+        prefetch_subfolders(model, hv_subfolders, local_files_only=local_files_only)
+
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.text_encoder = Qwen2_5_VLTextModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen2_5_VLTextModel.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=hv_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         self.tokenizer_2 = ByT5Tokenizer.from_pretrained(
@@ -108,8 +131,13 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
         t5_config = AutoConfig.from_pretrained(model, subfolder="text_encoder_2", local_files_only=local_files_only)
         self.text_encoder_2 = T5EncoderModel(t5_config, prefix="text_encoder_2").to(dtype=dtype, device=self.device)
 
-        self.vae = AutoencoderKLHunyuanVideo15.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKLHunyuanVideo15.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=hv_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=torch.float32,
         ).to(self.device)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -122,7 +150,9 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
             self.scheduler._shift = od_config.flow_shift
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
-        self.transformer = HunyuanVideo15Transformer3DModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = HunyuanVideo15Transformer3DModel(
+            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+        )
 
         # Check if model uses meanflow (distilled variants)
         self.use_meanflow = getattr(od_config.tf_model_config, "use_meanflow", False)
@@ -172,6 +202,10 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):
@@ -360,7 +394,7 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         num_inference_steps: int = 50,
         guidance_scale: float = 6.0,
         height: int = 480,
@@ -445,60 +479,63 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
-        for i, t in enumerate(timesteps):
-            self._current_timestep = t
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                self._current_timestep = t
 
-            latent_model_input = torch.cat([latents, cond_latents, mask], dim=1)
-            timestep = t.expand(latent_model_input.shape[0]).to(latent_model_input.dtype)
+                latent_model_input = torch.cat([latents, cond_latents, mask], dim=1)
+                timestep = t.expand(latent_model_input.shape[0]).to(latent_model_input.dtype)
 
-            timestep_r = None
-            if self.use_meanflow:
-                if i == len(timesteps) - 1:
-                    timestep_r = torch.tensor([0.0], device=device)
-                else:
-                    timestep_r = timesteps[i + 1]
-                timestep_r = timestep_r.expand(latents.shape[0]).to(latents.dtype)
+                timestep_r = None
+                if self.use_meanflow:
+                    if i == len(timesteps) - 1:
+                        timestep_r = torch.tensor([0.0], device=device)
+                    else:
+                        timestep_r = timesteps[i + 1]
+                    timestep_r = timestep_r.expand(latents.shape[0]).to(latents.dtype)
 
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep,
-                "timestep_r": timestep_r,
-                "encoder_hidden_states": prompt_embeds,
-                "encoder_attention_mask": prompt_embeds_mask,
-                "encoder_hidden_states_2": prompt_embeds_2,
-                "encoder_attention_mask_2": prompt_embeds_mask_2,
-                "image_embeds": image_embeds,
-                "return_dict": False,
-            }
-
-            negative_kwargs = None
-            if do_cfg and negative_prompt_embeds is not None:
-                negative_kwargs = {
+                positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
                     "timestep_r": timestep_r,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "encoder_attention_mask": negative_prompt_embeds_mask,
-                    "encoder_hidden_states_2": negative_prompt_embeds_2,
-                    "encoder_attention_mask_2": negative_prompt_embeds_mask_2,
+                    "encoder_hidden_states": prompt_embeds,
+                    "encoder_attention_mask": prompt_embeds_mask,
+                    "encoder_hidden_states_2": prompt_embeds_2,
+                    "encoder_attention_mask_2": prompt_embeds_mask_2,
                     "image_embeds": image_embeds,
                     "return_dict": False,
                 }
 
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_cfg and negative_kwargs is not None,
-                true_cfg_scale=guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=req.sampling_params.cfg_normalize,
-            )
+                negative_kwargs = None
+                if do_cfg and negative_prompt_embeds is not None:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "timestep_r": timestep_r,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_attention_mask": negative_prompt_embeds_mask,
+                        "encoder_hidden_states_2": negative_prompt_embeds_2,
+                        "encoder_attention_mask_2": negative_prompt_embeds_mask_2,
+                        "image_embeds": image_embeds,
+                        "return_dict": False,
+                    }
 
-            latents = self.scheduler_step_maybe_with_cfg(
-                noise_pred,
-                t,
-                latents,
-                do_true_cfg=do_cfg and negative_kwargs is not None,
-            )
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_cfg and negative_kwargs is not None,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=req.sampling_params.cfg_normalize,
+                )
+
+                latents = self.scheduler_step_maybe_with_cfg(
+                    noise_pred,
+                    t,
+                    latents,
+                    do_true_cfg=do_cfg and negative_kwargs is not None,
+                )
+
+                pbar.update()
 
         self._current_timestep = None
 

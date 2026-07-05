@@ -12,7 +12,7 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 import torch
@@ -46,12 +46,14 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder.t5_gemma_encoder import T5GemmaEncoderModelTP
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .magi_human_dit import (
     DiTModel,
@@ -1624,7 +1626,12 @@ def get_magi_human_post_process_func(*args, **kwargs):
     def post_process(output):
         if isinstance(output, tuple) and len(output) == 2:
             video, audio = output
-            return {"video": video, "audio": audio}
+            return {
+                "video": video,
+                "audio": audio,
+                "audio_sample_rate": 44100,
+                "fps": 25,
+            }
         return output
 
     return post_process
@@ -1674,12 +1681,16 @@ def _resolve_subdir(
 # ===========================================================================
 # Main Pipeline
 # ===========================================================================
-class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMixin):
+class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+    _dit_modules: ClassVar[list[str]] = ["dit", "sr_dit"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+
     def __init__(self, od_config: OmniDiffusionConfig, **kwargs):
         super().__init__()
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
-        device = f"cuda:{torch.cuda.current_device()}"
+        device = f"cuda:{torch.accelerator.current_device_index()}"
         self.device_str = device
         self.dtype = od_config.dtype or torch.bfloat16
 
@@ -2125,10 +2136,32 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
 
         return resample(audio_np, target_len)
 
+    def encode_prompt(
+        self,
+        prompt: str,
+        target_length: int | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        """Encode *prompt* with the T5-Gemma text encoder and pad to fixed length.
+
+        This is the single text-encoder entrypoint so the runner-level
+        prompt-embedding cache (see
+        ``vllm_omni/diffusion/cache/prompt_embed_cache.py``) can transparently
+        memoize results when the same prompt is submitted repeatedly.
+
+        Returns:
+            ``(context, original_context_len)`` matching
+            :func:`_get_padded_t5_gemma_embedding`.
+        """
+        return _get_padded_t5_gemma_embedding(
+            prompt,
+            self.text_encoder,
+            target_length if target_length is not None else self.t5_gemma_target_length,
+        )
+
     @torch.inference_mode()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         height: int = 256,
         width: int = 448,
@@ -2195,11 +2228,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             device=device,
         )
 
-        context, original_context_len = _get_padded_t5_gemma_embedding(
-            prompt,
-            self.text_encoder,
-            self.t5_gemma_target_length,
-        )
+        context, original_context_len = self.encode_prompt(prompt)
 
         if image_path is not None:
             br_image = self._encode_image(load_image(image_path), br_height, br_width)
@@ -2250,7 +2279,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                 1 - self.sr_audio_noise_scale
             )
 
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             sr_steps = sr_num_steps or self.sr_num_inference_steps_default
             final_latent_video, _ = self._evaluate_with_latent(
                 context,
@@ -2269,9 +2298,9 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             final_latent_video = br_latent_video
             final_latent_audio = br_latent_audio
 
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         videos_np = self._decode_video(final_latent_video)
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         audio_np = self._decode_audio(final_latent_audio)
 
         return DiffusionOutput(output=(videos_np, audio_np))

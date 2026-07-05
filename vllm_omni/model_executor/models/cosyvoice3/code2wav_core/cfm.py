@@ -141,24 +141,37 @@ class ConditionalCFM(BASECFM):
         if isinstance(self.estimator, torch.nn.Module):
             return self.estimator(x, mask, mu, t, spks, cond)
         else:
+            # TensorRT estimator: bind raw device pointers. The flow runs in
+            # fp32 but the engine may have fp16 I/O (strongly-typed fp16 engine),
+            # so cast inputs/output to the engine's dtype at the boundary. Keep
+            # references to the cast buffers alive until execute completes (a bare
+            # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
+            io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
             [estimator, stream], trt_engine = self.estimator.acquire_estimator()
             # NOTE need to synchronize when switching stream
             torch.cuda.current_stream().synchronize()
             with stream:
-                estimator.set_input_shape("x", (2, 80, x.size(2)))
-                estimator.set_input_shape("mask", (2, 1, x.size(2)))
-                estimator.set_input_shape("mu", (2, 80, x.size(2)))
+                x_e = x.to(io_dtype).contiguous()
+                mask_e = mask.to(io_dtype).contiguous()
+                mu_e = mu.to(io_dtype).contiguous()
+                t_e = t.to(io_dtype).contiguous()
+                spks_e = spks.to(io_dtype).contiguous()
+                cond_e = cond.to(io_dtype).contiguous()
+                out_e = torch.empty_like(x_e)
+                estimator.set_input_shape("x", (2, 80, x_e.size(2)))
+                estimator.set_input_shape("mask", (2, 1, x_e.size(2)))
+                estimator.set_input_shape("mu", (2, 80, x_e.size(2)))
                 estimator.set_input_shape("t", (2,))
                 estimator.set_input_shape("spks", (2, 80))
-                estimator.set_input_shape("cond", (2, 80, x.size(2)))
+                estimator.set_input_shape("cond", (2, 80, x_e.size(2)))
                 data_ptrs = [
-                    x.contiguous().data_ptr(),
-                    mask.contiguous().data_ptr(),
-                    mu.contiguous().data_ptr(),
-                    t.contiguous().data_ptr(),
-                    spks.contiguous().data_ptr(),
-                    cond.contiguous().data_ptr(),
-                    x.data_ptr(),
+                    x_e.data_ptr(),
+                    mask_e.data_ptr(),
+                    mu_e.data_ptr(),
+                    t_e.data_ptr(),
+                    spks_e.data_ptr(),
+                    cond_e.data_ptr(),
+                    out_e.data_ptr(),
                 ]
                 for i, j in enumerate(data_ptrs):
                     estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
@@ -166,7 +179,7 @@ class ConditionalCFM(BASECFM):
                 assert estimator.execute_async_v3(torch.cuda.current_stream().cuda_stream) is True
                 torch.cuda.current_stream().synchronize()
             self.estimator.release_estimator(estimator, stream)
-            return x
+            return out_e.to(x.dtype)
 
 
 class CausalConditionalCFM(ConditionalCFM):
@@ -174,7 +187,7 @@ class CausalConditionalCFM(ConditionalCFM):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming: bool = False):
         """Forward diffusion
 
         Args:
@@ -277,7 +290,9 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         prompt_feat,
         prompt_feat_len,
         embedding,
-        finalize,
+        streaming: bool = True,
+        finalize: bool = False,
+        n_timesteps: int = 10,
     ):
         assert token.shape[0] == 1
         # xvec projection
@@ -314,7 +329,8 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=max(1, int(n_timesteps)),
+            streaming=streaming,
         )
 
         feat = feat[:, :, mel_len1:]

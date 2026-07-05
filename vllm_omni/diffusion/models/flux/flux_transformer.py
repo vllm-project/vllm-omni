@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
@@ -25,9 +26,12 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.quantization.component_config import safe_quant_config
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -381,7 +385,7 @@ class FluxSingleTransformerBlock(nn.Module):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.norm = AdaLayerNormZeroSingle(dim, quant_config=quant_config, prefix=f"{prefix}.norm")
+        self.norm = AdaLayerNormZeroSingle(dim, quant_config=safe_quant_config(quant_config), prefix=f"{prefix}.norm")
         self.proj_mlp = ReplicatedLinear(
             dim,
             self.mlp_hidden_dim,
@@ -506,10 +510,18 @@ class FluxTransformer2DModel(nn.Module):
             The dimensions to use for the rotary positional embeddings.
     """
 
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_1,
+            "single_transformer_blocks": ForwardPattern.Pattern_1,
+        }
+    )
+
     # the small and frequently-repeated block(s) of a model
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["FluxTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -523,10 +535,10 @@ class FluxTransformer2DModel(nn.Module):
 
     def __init__(
         self,
-        od_config: OmniDiffusionConfig = None,
+        od_config: OmniDiffusionConfig | None = None,
         patch_size: int = 1,
         in_channels: int = 64,
-        out_channels: int = None,
+        out_channels: int | None = None,
         num_layers: int = 19,
         num_single_layers: int = 38,
         attention_head_dim: int = 128,
@@ -568,7 +580,7 @@ class FluxTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
-                    quant_config=quant_config,
+                    quant_config=safe_quant_config(quant_config),
                     prefix=f"transformer_blocks.{i}",
                 )
                 for i in range(num_layers)
@@ -593,7 +605,7 @@ class FluxTransformer2DModel(nn.Module):
             self.inner_dim,
             elementwise_affine=False,
             eps=1e-6,
-            quant_config=quant_config,
+            quant_config=safe_quant_config(quant_config),
             prefix="norm_out",
         )
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)

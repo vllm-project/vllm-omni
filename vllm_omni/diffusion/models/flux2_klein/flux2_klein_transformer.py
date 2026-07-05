@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import (
     TimestepEmbedding,
     Timesteps,
@@ -40,6 +41,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -51,6 +53,10 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+
+def _join_prefix(prefix: str, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
 
 
 class Flux2SwiGLU(nn.Module):
@@ -74,6 +80,7 @@ class Flux2FeedForward(nn.Module):
         inner_dim: int | None = None,
         bias: bool = False,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         if inner_dim is None:
@@ -86,6 +93,7 @@ class Flux2FeedForward(nn.Module):
             bias=bias,
             return_bias=False,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "linear_in"),
         )
         self.act_fn = Flux2SwiGLU()
         self.linear_out = RowParallelLinear(
@@ -95,6 +103,7 @@ class Flux2FeedForward(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "linear_out"),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -119,6 +128,7 @@ class Flux2Attention(nn.Module):
         out_dim: int = None,
         elementwise_affine: bool = True,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.parallel_config = parallel_config
@@ -136,6 +146,7 @@ class Flux2Attention(nn.Module):
             total_num_heads=self.heads,
             bias=bias,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_qkv"),
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -152,6 +163,7 @@ class Flux2Attention(nn.Module):
                     input_is_parallel=True,
                     return_bias=False,
                     quant_config=quant_config,
+                    prefix=_join_prefix(prefix, "to_out.0"),
                 ),
                 nn.Dropout(dropout),
             ]
@@ -166,6 +178,7 @@ class Flux2Attention(nn.Module):
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
                 quant_config=quant_config,
+                prefix=_join_prefix(prefix, "add_kv_proj"),
             )
             self.add_query_num_heads = self.add_kv_proj.num_heads
             self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
@@ -176,6 +189,7 @@ class Flux2Attention(nn.Module):
                 input_is_parallel=True,
                 return_bias=False,
                 quant_config=quant_config,
+                prefix=_join_prefix(prefix, "to_add_out"),
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -330,6 +344,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.parallel_config = parallel_config
@@ -350,6 +365,7 @@ class Flux2ParallelSelfAttention(nn.Module):
             bias=bias,
             gather_output=True,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_qkv_mlp_proj"),
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
@@ -362,6 +378,7 @@ class Flux2ParallelSelfAttention(nn.Module):
             bias=out_bias,
             gather_output=True,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_out"),
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
@@ -463,6 +480,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         eps: float = 1e-6,
         bias: bool = False,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -478,6 +496,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "attn"),
         )
 
     def forward(
@@ -534,6 +553,7 @@ class Flux2TransformerBlock(nn.Module):
         eps: float = 1e-6,
         bias: bool = False,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -551,10 +571,18 @@ class Flux2TransformerBlock(nn.Module):
             out_bias=bias,
             eps=eps,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "attn"),
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config)
+        self.ff = Flux2FeedForward(
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "ff"),
+        )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff_context = Flux2FeedForward(
@@ -563,6 +591,7 @@ class Flux2TransformerBlock(nn.Module):
             mult=mlp_ratio,
             bias=bias,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "ff_context"),
         )
 
     def forward(
@@ -741,7 +770,15 @@ class Flux2Transformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_1,
+            "single_transformer_blocks": ForwardPattern.Pattern_2,
+        }
+    )
+
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -834,8 +871,9 @@ class Flux2Transformer2DModel(nn.Module):
                     eps=eps,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -850,8 +888,9 @@ class Flux2Transformer2DModel(nn.Module):
                     eps=eps,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"single_transformer_blocks.{i}",
                 )
-                for _ in range(num_single_layers)
+                for i in range(num_single_layers)
             ]
         )
 

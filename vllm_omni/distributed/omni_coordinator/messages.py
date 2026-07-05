@@ -7,55 +7,55 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-class StageStatus(str, Enum):
-    """Enumeration for stage instance status."""
+class ReplicaStatus(str, Enum):
+    """Enumeration for stage replica status."""
 
-    UP = "up"  # Instance is ready and available
-    DOWN = "down"  # Instance is shutdown gracefully
-    ERROR = "error"  # Instance encountered an error or timeout
+    UP = "up"  # Replica is ready and available
+    DOWN = "down"  # Replica is shutdown gracefully
+    ERROR = "error"  # Replica encountered an error or timeout
 
 
 @dataclass
-class InstanceEvent:
+class ReplicaEvent:
     """Wire payload from OmniCoordClientForStage to OmniCoordinator.
 
     Schema for Stage → Coordinator events over ZMQ:
     input_addr, output_addr, stage_id, status, queue_length, event_type.
     """
 
-    input_addr: str  # Stage instance input ZMQ address (e.g., "tcp://host:port")
-    output_addr: str  # Stage instance output ZMQ address (e.g., "tcp://host:port")
+    input_addr: str  # Stage replica input ZMQ address (e.g., "tcp://host:port")
+    output_addr: str  # Stage replica output ZMQ address (e.g., "tcp://host:port")
     stage_id: int  # Stage ID
     event_type: str  # "update" | "heartbeat"
-    status: StageStatus  # Current status
+    status: ReplicaStatus  # Current status
     queue_length: int  # Current queue length
 
 
 @dataclass
-class InstanceInfo:
-    """Metadata for a single stage instance.
+class ReplicaInfo:
+    """Metadata for a single stage replica.
 
     This type is stored in OmniCoordinator's internal registry and is also
-    published to hubs via :class:`InstanceList`.
+    published to hubs via :class:`ReplicaList`.
     """
 
-    input_addr: str  # Stage instance input ZMQ address (e.g., "tcp://host:port")
-    output_addr: str  # Stage instance output ZMQ address (e.g., "tcp://host:port")
-    stage_id: int  # Stage ID of this instance
-    status: StageStatus  # Current status of the instance
-    queue_length: int  # Current queue length of this instance
+    input_addr: str  # Stage replica input ZMQ address (e.g., "tcp://host:port")
+    output_addr: str  # Stage replica output ZMQ address (e.g., "tcp://host:port")
+    stage_id: int  # Stage ID of this replica
+    status: ReplicaStatus  # Current status of the replica
+    queue_length: int  # Current queue length of this replica
     last_heartbeat: float  # Timestamp of the last heartbeat received (seconds)
-    registered_at: float  # Timestamp when the instance was registered (seconds)
+    registered_at: float  # Timestamp when the replica was registered (seconds)
 
 
 @dataclass
-class InstanceList:
-    """Container for instance list updates.
+class ReplicaList:
+    """Container for replica list updates.
 
-    OmniCoordinator publishes an :class:`InstanceList` whenever its view of
-    active instances changes. OmniCoordClientForHub caches the latest value
+    OmniCoordinator publishes a :class:`ReplicaList` whenever its view of
+    active replicas changes. OmniCoordClientForHub caches the latest value
     and exposes it to AsyncOmni and the load balancer.
     """
 
-    instances: list[InstanceInfo]
+    replicas: list[ReplicaInfo]
     timestamp: float  # Time when the list was last updated (seconds)

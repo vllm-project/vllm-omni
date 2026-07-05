@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for LayerwiseOffloadHook."""
+"""Unit tests for LayerwiseOffloadHook and LayerWiseOffloadBackend utilities."""
 
 import gc
 import os
@@ -15,7 +15,7 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
-from vllm_omni.diffusion.offloader.layerwise_backend import LayerwiseOffloadHook
+from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend, LayerwiseOffloadHook
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -127,3 +127,116 @@ class TestLayerwiseOffloadHook:
         assert current_block.weight.to_local().is_meta
         assert current_block.weight.to_local().shape == torch.Size([4])
         assert not hook.is_materialized
+
+
+class _DummyBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(10, 10))
+
+
+class _SingleBlockModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["blocks"]
+
+    def __init__(self, num_blocks: int = 3):
+        super().__init__()
+        self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
+
+
+class _MultiBlockModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
+
+    def __init__(self, num_transformer: int = 2, num_single: int = 2):
+        super().__init__()
+        self.transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(num_transformer)])
+        self.single_transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(num_single)])
+
+
+class _EmptyBlocksModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["blocks"]
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([])
+
+
+class _InvalidAttrModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["nonexistent_blocks", "blocks"]
+
+    def __init__(self, num_blocks: int = 2):
+        super().__init__()
+        self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
+
+
+class _DeprecatedSingleAttrModel(nn.Module):
+    _layerwise_offload_blocks_attr = "blocks"
+
+    def __init__(self, num_blocks: int = 2):
+        super().__init__()
+        self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
+
+
+class _NoAttrsModel(nn.Module):
+    def __init__(self, num_blocks: int = 2):
+        super().__init__()
+        self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
+
+
+class TestGetBlocksFromDit:
+    def test_get_blocks_from_dit_single_block_attr(self):
+        model = _SingleBlockModel(num_blocks=3)
+        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert attr_names == ["blocks"]
+        assert len(blocks) == 3
+        assert all(isinstance(b, _DummyBlock) for b in blocks)
+
+    def test_get_blocks_from_dit_multi_block_attrs(self):
+        model = _MultiBlockModel(num_transformer=2, num_single=3)
+        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert set(attr_names) == {"transformer_blocks", "single_transformer_blocks"}
+        assert len(blocks) == 5
+        assert all(isinstance(b, _DummyBlock) for b in blocks)
+
+    def test_get_blocks_from_dit_empty_blocks(self):
+        model = _EmptyBlocksModel()
+        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert attr_names == []
+        assert blocks == []
+
+    def test_get_blocks_from_dit_invalid_attr_name(self):
+        model = _InvalidAttrModel(num_blocks=2)
+        with pytest.raises(
+            AttributeError,
+            match="Attribute 'nonexistent_blocks' declared in _layerwise_offload_blocks_attrs does not exist",
+        ):
+            LayerWiseOffloadBackend.get_blocks_from_dit(model)
+
+    def test_get_blocks_from_dit_no_attrs_defined(self):
+        model = _NoAttrsModel(num_blocks=3)
+        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert attr_names == []
+        assert blocks == []
+
+    def test_get_blocks_from_dit_deprecated_single_attr(self):
+        model = _DeprecatedSingleAttrModel(num_blocks=2)
+        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert attr_names == ["blocks"]
+        assert len(blocks) == 2
+
+
+class TestGetBlocksAttrNames:
+    def test_get_blocks_attr_names_new_format(self):
+        model = _MultiBlockModel()
+        attrs = LayerWiseOffloadBackend.get_blocks_attr_names(model)
+        assert attrs == ["transformer_blocks", "single_transformer_blocks"]
+
+    def test_get_blocks_attr_names_no_attrs(self):
+        model = _NoAttrsModel()
+        attrs = LayerWiseOffloadBackend.get_blocks_attr_names(model)
+        assert attrs == []
+
+    def test_set_blocks_attr_names(self):
+        model = _NoAttrsModel()
+        LayerWiseOffloadBackend.set_blocks_attr_names(model, ["new_blocks"])
+        assert hasattr(model.__class__, "_layerwise_offload_blocks_attrs")
+        assert model.__class__._layerwise_offload_blocks_attrs == ["new_blocks"]

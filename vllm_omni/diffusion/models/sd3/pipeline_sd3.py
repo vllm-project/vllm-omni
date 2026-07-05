@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from collections.abc import Iterable
+from typing import ClassVar
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
@@ -19,11 +20,13 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import Distribu
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -128,7 +131,13 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
+class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    supports_request_batch = True
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2", "text_encoder_3"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,
@@ -152,6 +161,42 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         # Check if model is a local path
         local_files_only = os.path.exists(model)
 
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        # SD3.5 loads six subfolders in a row, each with multi-shard
+        # safetensors - it is the worst-case fan-out for the race window.
+        sd3_subfolders = [
+            "scheduler",
+            "tokenizer",
+            "tokenizer_2",
+            "tokenizer_3",
+            "text_encoder",
+            "text_encoder_2",
+            "text_encoder_3",
+            "vae",
+        ]
+        prefetch_subfolders(
+            model,
+            sd3_subfolders,
+            local_files_only=local_files_only,
+        )
+
+        # ``transformers`` v5 changed ``from_pretrained``'s default
+        # ``torch_dtype`` from fp32 to whatever ``config.torch_dtype`` is
+        # baked into the checkpoint (fp16 for ``stabilityai/stable-
+        # diffusion-3.5-medium``). Without an explicit override the text
+        # encoders + VAE end up in fp16 while the rest of the pipeline
+        # (transformer, ``CombinedTimestepTextProjEmbeddings``,
+        # ``PatchEmbed``) is materialised in ``od_config.dtype`` (bf16
+        # by default). The first time latents flow through the
+        # transformer this surfaces as ``RuntimeError: Input type
+        # (c10::Half) and bias type (c10::BFloat16) should be the same``
+        # inside ``SD3Transformer2DModel.pos_embed`` (Buildkite #8418
+        # ``test_sd3_medium``). Pin every weight-loading
+        # ``from_pretrained`` to ``od_config.dtype`` so the whole
+        # pipeline is dtype-consistent. Tokenizers and the scheduler
+        # don't carry weights and therefore don't take ``torch_dtype``.
+        dtype = od_config.dtype
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
@@ -162,21 +207,43 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self.tokenizer_3 = T5Tokenizer.from_pretrained(
             model, subfolder="tokenizer_3", local_files_only=local_files_only
         )
-        self.text_encoder = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+        # ``from_pretrained_with_prefetch`` re-prefetches and retries if a
+        # peer worker left the cache half-written (missing-shard ``OSError`` or
+        # the default-config size-mismatch ``RuntimeError``) instead of
+        # crashing the worker - critical here given the six-subfolder fan-out.
+        self.text_encoder = from_pretrained_with_prefetch(
+            CLIPTextModelWithProjection.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=sd3_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
-        self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            model, subfolder="text_encoder_2", local_files_only=local_files_only
+        self.text_encoder_2 = from_pretrained_with_prefetch(
+            CLIPTextModelWithProjection.from_pretrained,
+            model,
+            subfolder="text_encoder_2",
+            prefetch_list=sd3_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
-        self.text_encoder_3 = T5EncoderModel.from_pretrained(
+        self.text_encoder_3 = from_pretrained_with_prefetch(
+            T5EncoderModel.from_pretrained,
             model,
             subfolder="text_encoder_3",
+            prefetch_list=sd3_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=dtype,
         )
         self.transformer = SD3Transformer2DModel(od_config=od_config)
 
-        self.vae = DistributedAutoencoderKL.from_pretrained(
-            model, subfolder="vae", local_files_only=local_files_only
+        self.vae = from_pretrained_with_prefetch(
+            DistributedAutoencoderKL.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=sd3_subfolders,
+            local_files_only=local_files_only,
+            torch_dtype=dtype,
         ).to(self.device)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
@@ -275,10 +342,8 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self,
         prompt: str | list[str] = "",
         num_images_per_prompt: int = 1,
-        dtype: torch.dtype | None = None,
         clip_model_index: int = 0,
     ):
-        dtype = dtype or self.text_encoder.dtype
         clip_tokenizers = [self.tokenizer, self.tokenizer_2]
         clip_text_encoders = [self.text_encoder, self.text_encoder_2]
 
@@ -305,11 +370,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 f" {self.tokenizer_max_length} tokens: {removed_text}"
             )
         prompt_embeds = text_encoder(text_input_ids.to(self.device), output_hidden_states=True)
-        pooled_prompt_embeds = prompt_embeds[0]
+        pooled_prompt_embeds = prompt_embeds[0].to(dtype=self.od_config.dtype, device=self.device)
 
         prompt_embeds = prompt_embeds.hidden_states[-2]
 
-        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=self.device)
+        prompt_embeds = prompt_embeds.to(dtype=self.od_config.dtype, device=self.device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
@@ -323,10 +388,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         prompt: str | list[str] = "",
         num_images_per_prompt: int = 1,
         max_sequence_length: int = 256,
-        dtype: torch.dtype | None = None,
-    ):
-        dtype = dtype or self.text_encoder_3.dtype
-
+    ) -> torch.Tensor:
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -338,7 +400,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                     self.transformer.joint_attention_dim,
                 ),
                 device=self.device,
-                dtype=dtype,
+                dtype=self.od_config.dtype,
             )
 
         text_inputs = self.tokenizer_3(
@@ -348,12 +410,12 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             truncation=True,
             add_special_tokens=True,
             return_tensors="pt",
-        ).to(self.device)
+        )
         text_input_ids = text_inputs.input_ids
         untruncated_ids = self.tokenizer_3(prompt, padding="longest", return_tensors="pt").input_ids
 
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.tokenizer_3.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+            removed_text = self.tokenizer_3.batch_decode(untruncated_ids[:, max_sequence_length - 1 : -1])
             logger.warning(
                 "The following part of your input was truncated because `max_sequence_length` is set to "
                 f" {max_sequence_length} tokens: {removed_text}"
@@ -361,8 +423,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         prompt_embeds = self.text_encoder_3(text_input_ids.to(self.device))[0]
 
-        dtype = self.text_encoder_3.dtype
-        prompt_embeds = prompt_embeds.to(dtype=dtype, device=self.device)
+        prompt_embeds = prompt_embeds.to(dtype=self.od_config.dtype, device=self.device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
@@ -375,6 +436,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         prompt_2: str | list[str],
         prompt_3: str | list[str],
         prompt_embeds: torch.Tensor | None = None,
+        pooled_prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 256,
         num_images_per_prompt: int = 1,
     ):
@@ -398,7 +460,6 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
-        pooled_prompt_embeds = None
         if prompt_embeds is None:
             prompt_2 = prompt_2 or prompt
             prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
@@ -439,13 +500,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         num_channels_latents,
         height,
         width,
-        dtype,
-        device,
         generator,
         latents=None,
     ) -> torch.Tensor:
         if latents is not None:
-            return latents.to(device=device, dtype=dtype)
+            return latents.to(device=self.device, dtype=self.od_config.dtype)
 
         shape = (
             batch_size,
@@ -460,7 +519,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.od_config.dtype)
 
         return latents
 
@@ -504,9 +563,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         latents: torch.Tensor,
         timesteps: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        pooled_prompt_embeds: torch.Tensor,
-        negative_prompt_embeds: torch.Tensor,
-        negative_pooled_prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_pooled_prompt_embeds: torch.Tensor | None,
         do_true_cfg: bool,
         guidance_scale: float,
         cfg_normalize: bool = False,
@@ -536,8 +595,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             self._current_timestep = t
 
             # Broadcast timestep to match batch size
-            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-
+            timestep = t.expand(latents.shape[0]).to(device=self.device, dtype=self.od_config.dtype)
             positive_kwargs = {
                 "hidden_states": latents,
                 "timestep": timestep,
@@ -570,46 +628,53 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         return latents
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | list[str] = "",
-        prompt_2: str | list[str] = "",
-        prompt_3: str | list[str] = "",
-        negative_prompt: str | list[str] = "",
-        negative_prompt_2: str | list[str] = "",
-        negative_prompt_3: str | list[str] = "",
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 28,
-        sigmas: list[float] | None = None,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        pooled_prompt_embeds: torch.Tensor | None = None,
-        negative_pooled_prompt_embeds: torch.Tensor | None = None,
-        max_sequence_length: int = 256,
-    ) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        negative_prompt = [
-            "" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts
-        ] or negative_prompt
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
+        negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+        prompt_2 = ""
+        prompt_3 = ""
+        negative_prompt_2 = ""
+        negative_prompt_3 = ""
+        prompt_embeds = None
+        negative_prompt_embeds = None
 
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        generator = req.sampling_params.generator or generator
+        height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        sigmas = common_sampling_params.sigmas
+        max_sequence_length = common_sampling_params.max_sequence_length or 256
+        num_inference_steps = common_sampling_params.num_inference_steps or 28
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
+            common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        latents = req.collate_request_tensors("latents", None)
+        output_type = common_sampling_params.output_type or "pil"
+
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "pooled_prompt_embeds": None,
+                "negative_pooled_prompt_embeds": None,
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
+        pooled_prompt_embeds = prompt_fields["pooled_prompt_embeds"]
+        negative_pooled_prompt_embeds = prompt_fields["negative_pooled_prompt_embeds"]
+        if prompt_embeds is not None:
+            prompt = None
+            prompt_2 = None
+            prompt_3 = None
+        if negative_prompt_embeds is not None:
+            negative_prompt = None
+            negative_prompt_2 = None
+            negative_prompt_3 = None
         # 1. check inputs
         # 2. encode prompts
         # 3. prepare latents and timesteps
@@ -630,13 +695,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             max_sequence_length=max_sequence_length,
         )
 
-        self._guidance_scale = req.sampling_params.guidance_scale
+        self._guidance_scale = common_sampling_params.guidance_scale
         self._current_timestep = None
         self._interrupt = False
 
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
+        if prompt is not None:
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
@@ -646,6 +709,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             prompt_2=prompt_2,
             prompt_3=prompt_3,
             prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
             max_sequence_length=max_sequence_length,
         )
 
@@ -656,6 +720,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 prompt_2=negative_prompt_2,
                 prompt_3=negative_prompt_3,
                 prompt_embeds=negative_prompt_embeds,
+                pooled_prompt_embeds=negative_pooled_prompt_embeds,
                 max_sequence_length=max_sequence_length,
             )
 
@@ -665,8 +730,6 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             num_channels_latents,
             height,
             width,
-            prompt_embeds.dtype,
-            self.device,
             generator,
             latents,
         )
@@ -688,16 +751,22 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         )
 
         self._current_timestep = None
-        if self.output_type == "latent":
+        if output_type == "latent":
             image = latents
         else:
+            # Ensure the latents are the same dtype as the VAE for decode
             latents = latents.to(self.vae.dtype)
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(
-            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        return split_diffusion_output_by_request(
+            DiffusionOutput(
+                output=image,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            ),
+            req,
+            num_outputs_per_prompt=num_images_per_prompt,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

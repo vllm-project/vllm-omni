@@ -33,8 +33,8 @@ runtime:
         zmq_port: 50051               # ZMQ base port (see "Port Offset Scheme" below)
         protocol: "rdma"              # "rdma" or "tcp"
         device_name: ""               # RDMA device (e.g., "mlx5_0"), empty for auto-detect
-        memory_pool_size: 2147483648  # 2GB memory pool
-        memory_pool_device: "cpu"     # "cpu" for pinned memory, "cuda" for GPUDirect RDMA
+        memory_pool_size: 4294967296  # 4 GB (CPU); use 2147483648 (2 GB) for GPU
+        memory_pool_device: "cpu"     # "cpu" for pinned memory (recommended), "cuda" for GPUDirect RDMA
 ```
 
 Wire stages to the connector:
@@ -64,8 +64,8 @@ stage_args:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `memory_pool_size` | 1 GB | Total size of the RDMA-registered memory pool in bytes. |
-| `memory_pool_device` | `"cpu"` | `"cpu"`: pinned host memory (recommended). `"cuda"`: GPU VRAM for GPUDirect RDMA (requires NIC-GPU direct PCIe connectivity). |
+| `memory_pool_size` | 4 GB (CPU) / 2 GB (GPU) | Total size of the RDMA-registered memory pool in bytes. Recommended 4 GB for CPU pinned memory; 2 GB for GPU VRAM to conserve device memory. |
+| `memory_pool_device` | `"cpu"` | `"cpu"`: pinned host memory (recommended, works on all topologies). `"cuda"`: GPU VRAM for GPUDirect RDMA (requires NIC-GPU direct PCIe connectivity, PIX topology). |
 
 ### Networking
 
@@ -107,10 +107,10 @@ receiver_connect  = remote_side_channel_port + tp_rank
 
 ## Memory Pool Modes
 
-| Mode | Config | Data Flow | Best For |
-|---|---|---|---|
-| CPU Pinned | `memory_pool_device: "cpu"` | GPU → CPU pool → RDMA → CPU pool → GPU | Most hardware topologies (recommended) |
-| GPUDirect | `memory_pool_device: "cuda"` | GPU → GPU pool → RDMA (NIC reads GPU BAR1) → GPU pool | NIC-GPU direct PCIe (PIX topology) |
+| Mode | Config | Recommended Pool Size | Data Flow | Best For |
+|---|---|---|---|---|
+| CPU Pinned | `memory_pool_device: "cpu"` | 4 GB | GPU → CPU pool → RDMA → CPU pool → GPU | Most hardware topologies (recommended) |
+| GPUDirect | `memory_pool_device: "cuda"` | 2 GB | GPU → GPU pool → RDMA (NIC reads GPU BAR1) → GPU pool | NIC-GPU direct PCIe (PIX topology) |
 
 > **Note**: GPUDirect RDMA requires the NIC and GPU to share a direct PCIe
 > switch (PIX topology). On systems where they are connected via PXB or NODE,

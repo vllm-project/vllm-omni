@@ -14,7 +14,7 @@ import io
 import PIL.Image
 
 SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
-SUPPORTED_LAYERED_LAYERS_RANGE = range(3, 11)
+SUPPORTED_LAYERED_LAYERS_RANGE = range(2, 11)
 
 
 def parse_size(size_str: str) -> tuple[int, int]:
@@ -64,6 +64,50 @@ def encode_image_base64(image: PIL.Image.Image) -> str:
     """
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode("utf-8")
+
+
+def prepare_image_for_output_format(image: PIL.Image.Image, format: str) -> PIL.Image.Image:
+    fmt = format.lower()
+    if fmt not in {"jpg", "jpeg"}:
+        return image
+
+    if image.mode == "RGB":
+        return image
+
+    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+        alpha_image = image.convert("RGBA")
+        flattened = PIL.Image.new("RGB", alpha_image.size, (255, 255, 255))
+        flattened.paste(alpha_image, mask=alpha_image.getchannel("A"))
+        return flattened
+
+    return image.convert("RGB")
+
+
+def encode_image_base64_with_compression(
+    image: PIL.Image.Image, format: str = "png", output_compression: int = 100
+) -> str:
+    """Encode a PIL image to a base64 image string.
+
+    Args:
+        image: PIL Image object.
+        format: Output image format, such as "png", "jpeg", or "webp".
+        output_compression: Compression level (0-100), where 100 keeps the
+            best quality for lossy formats and uses the lowest PNG compression.
+
+    Returns:
+        Base64-encoded image string.
+    """
+    buffer = io.BytesIO()
+    image = prepare_image_for_output_format(image, format)
+    save_kwargs = {}
+    if format in ("jpg", "jpeg", "webp"):
+        save_kwargs["quality"] = output_compression
+    elif format == "png":
+        save_kwargs["compress_level"] = max(0, min(9, 9 - output_compression // 11))
+
+    image.save(buffer, format=format, **save_kwargs)
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
 

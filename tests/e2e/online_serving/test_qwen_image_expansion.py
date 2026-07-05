@@ -12,13 +12,10 @@ See docs/user_guide/diffusion_acceleration.md.
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
@@ -28,6 +25,14 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 def _get_diffusion_feature_cases(model: str):
     return [
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=["--enable-cpu-offload"],
+            ),
+            id="cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
         pytest.param(
             OmniServerParams(model=model, server_args=["--step-execution"]),
             id="step_execution",
@@ -100,7 +105,7 @@ def _get_diffusion_feature_cases(model: str):
                     "--vae-patch-parallel-size",
                     "2",
                     "--vae-use-tiling",
-                    "--quantization-config",
+                    "--diffusion-quantization-config",
                     '{"method":"fp8"}',
                 ],
             ),
@@ -122,8 +127,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Qwen/Qwen-Image"),
@@ -147,8 +150,6 @@ def test_qwen_image(omni_server: OmniServer, openai_client: OpenAIClientHandler)
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Qwen/Qwen-Image-2512"),

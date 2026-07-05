@@ -29,10 +29,13 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `AIDC-AI/Ovis-Image-7B` | 1024 x 1024 | 71.8 | 17.1 |
 | `OmniGen2/OmniGen2` |  1024 x 1024 | 20.1 | 14.7 |
 | `stabilityai/stable-diffusion-3.5-medium` | 1024 x 1024 | 20.1 | 15.6 |
-| `black-forest-labs/FLUX.1-dev` | 1024 x 1024 | 77.6 | 31.4 |
+| `black-forest-labs/FLUX.1-dev` | 1024 x 1024 | 33.9 | 31.4 |
+| `black-forest-labs/FLUX.1-schnell` | 1024 x 1024 | 33.9 | 31.4 |
 | `black-forest-labs/FLUX.2-klein-4B` | 1024 x 1024 | 72.7 | 14.9 |
 | `black-forest-labs/FLUX.2-klein-9B` | 1024 x 1024 | 37.1 | 32.3 |
 | `black-forest-labs/FLUX.2-dev` | 1024 x 1024 | 65.7 | >80 (CPU offload required) |
+| `HunyuanImage-3.0` | 1024 x 1024 | 80.0 (TP≥3)  | 160 |
+| `HiDream-I1-Full` | 1024 x 1024 | 63.7  | 57.7 |
 
 !!! info
 *Peak VRAM:  based on basic single-card usage, batch size =1, without any acceleration/optimization features. FLUX.2-dev requires `--enable-cpu-offload` on a single 80 GiB GPU.
@@ -90,6 +93,9 @@ python text_to_image.py \
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
 | `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
 | `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
+| `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
+| `--auxiliary-text-encoder` | str | `None` | Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full). |
 
 **NextStep-1.1 specific arguments:**
 
@@ -173,9 +179,28 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output flux2-dev.png
 ```
 
+### HiDream-I1-Full Models
+
+The `--auxiliary-text-encoder` parameter is required when running HiDream‑I1‑Full:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model HiDream-ai/HiDream-I1-Full \
+  --prompt "The setting sun of late autumn dyes the riverside with a warm orange hue" \
+  --seed 42 \
+  --guidance-scale 5.0 \
+  --tensor-parallel-size 1 \
+  --num-images-per-prompt 1 \
+  --num-inference-steps 50 \
+  --auxiliary-text-encoder meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --output /output.png
+```
+
 ### Batch Requests (Multiple Prompts)
 
-You can pass multiple prompts in a single `generate` call.
+You can pass multiple prompts in a single `Omni.generate` call. `Omni`
+submits each prompt as an independent request and returns one output per
+prompt.
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -200,11 +225,10 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by
-    default, and the input list is sliced into single-item requests before feeding into the diffusion
-    pipeline. For models that do internally support batched inputs, you can
-    [modify this configuration](../../../configuration/stage_configs.md) to let the model accept a
-    longer batch of prompts.
+    For diffusion pipelines, the input list is sliced into single-item requests
+    before feeding into the diffusion pipeline. For request-level batching
+    controls such as `max_num_seqs`, see
+    [Request-Level Batching](../../../docs/user_guide/diffusion/request_batching.md).
 
 ### Negative Prompts
 
@@ -244,7 +268,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 #### CFG Parallel
 
 Set `--cfg-parallel-size 2` to enable CFG Parallel for faster inference on multi-GPU setups.
-See more examples in the [diffusion acceleration user guide](../../../docs/user_guide/diffusion_acceleration.md#using-cfg-parallel).
+See more examples in the [cfg_parallel user guide](../../../docs/user_guide/parallelism/cfg_parallel.md#using-cfg-parallel).
 
 #### LoRA
 

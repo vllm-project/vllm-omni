@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from enum import Enum
 from typing import Any
 
 import torch
+import torch.nn as nn
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import BatchDescriptor
+from vllm.logger import init_logger
 from vllm.platforms import Platform
+from vllm.platforms.interface import PlatformEnum
+
+logger = init_logger(__name__)
 
 
 class OmniPlatformEnum(Enum):
@@ -16,6 +24,7 @@ class OmniPlatformEnum(Enum):
     NPU = "npu"
     XPU = "xpu"
     MUSA = "musa"
+    OOT = "oot"
     UNSPECIFIED = "unspecified"
 
 
@@ -45,6 +54,9 @@ class OmniPlatform(Platform):
     def is_musa(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.MUSA
 
+    def is_out_of_tree(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.OOT
+
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         raise NotImplementedError
@@ -60,11 +72,18 @@ class OmniPlatform(Platform):
     @classmethod
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
         if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
+            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
         raise NotImplementedError(f"Unsupported diffusion model op: {op_name}")
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
+
+    @classmethod
+    def get_diffusion_packed_modules_mapping(
+        cls,
+        model_class: type[nn.Module],
+    ) -> dict[str, list[str]] | None:
         return None
 
     @classmethod
@@ -94,6 +113,35 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def has_flash_attn_package(cls) -> bool:
+        """Check if a Flash Attention package is available and usable on this platform."""
+        return False
+
+    @classmethod
+    def get_diffusion_worker_cls(cls) -> str:
+        """Get the diffusion worker class path for this platform.
+
+        Returns a fully qualified class path string that will be resolved
+        and instantiated by WorkerWrapperBase. The class must be compatible
+        with the DiffusionWorker interface.
+        """
+        return "vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker"
+
+    @classmethod
+    def get_diffusion_model_runner_cls(cls) -> str:
+        """Get the diffusion model runner class path for this platform.
+
+        Returns a fully qualified class path string. The class must be
+        compatible with the DiffusionModelRunner interface.
+        """
+        return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
+
+    @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+        """Initialize platform-specific state for diffusion worker VllmConfig."""
+        return None
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         raise NotImplementedError
 
@@ -114,7 +162,32 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        raise NotImplementedError
+
+    @classmethod
+    def create_autocast_context(
+        cls,
+        *,
+        device_type: str,
+        dtype: torch.dtype,
+        enabled: bool = True,
+    ):
+        if not enabled:
+            return nullcontext()
+
+        try:
+            return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("autocast unavailable for device_type=%s dtype=%s: %s", device_type, dtype, exc)
+            return nullcontext()
+
+    @classmethod
     def supports_cpu_offload(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_float64(cls) -> bool:
         return True
 
     @classmethod
@@ -139,7 +212,50 @@ class OmniPlatform(Platform):
         """
         return "vllm_omni.profiler.omni_torch_profiler.OmniTorchProfilerWrapper"
 
+    @classmethod
+    def get_graph_wrapper_cls(cls) -> type:
+        """Return the platform's full-graph wrapper class.
+
+        Defaults to vLLM's CUDAGraphWrapper; NPU overrides with ACLGraphWrapper.
+        """
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        return CUDAGraphWrapper
+
+    @classmethod
+    def set_forward_context(
+        cls,
+        attn_metadata: Any,
+        vllm_config: VllmConfig,
+        *,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        batch_descriptor: BatchDescriptor,
+    ):
+        """Platform-neutral wrapper around the device's set_forward_context.
+
+        Defaults to vLLM's ``set_forward_context``; NPU overrides to dispatch
+        to ``set_ascend_forward_context`` (renaming ``cudagraph_runtime_mode``
+        to ``aclgraph_runtime_mode``).
+        """
+        from vllm.forward_context import set_forward_context
+
+        return set_forward_context(
+            attn_metadata,
+            vllm_config,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+        )
+
 
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
-    device_type = ""
+    _enum = PlatformEnum.UNSPECIFIED
+    device_type = "cpu"
+
+    @classmethod
+    def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
+        return torch.device("cpu")
+
+    @classmethod
+    def get_device_count(cls) -> int:
+        return 0

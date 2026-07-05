@@ -14,10 +14,12 @@ from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from benchmarks.diffusion.backends import normalize_endpoint
+
 LOGGER = logging.getLogger(__name__)
 
 _RESULT_JSON_PREFIX = "result_test_"
-_DIFFUSION_JSON_PREFIX = "diffusion_perf_"
+_DIFFUSION_JSON_PREFIXES = ("diffusion_perf_", "diffusion_result_")
 DEFAULT_INPUT_DIR = os.getenv("DEFAULT_INPUT_DIR") or "tests"
 DEFAULT_OUTPUT_DIR = os.getenv("DEFAULT_OUTPUT_DIR") or "tests"
 DEFAULT_DIFFUSION_INPUT_DIR = os.getenv("DIFFUSION_BENCHMARK_DIR")
@@ -51,7 +53,7 @@ def _default_diffusion_input_dir(input_dir: str) -> str:
     return DEFAULT_DIFFUSION_INPUT_DIR if DEFAULT_DIFFUSION_INPUT_DIR else input_dir
 
 
-def _load_json_file(path: str) -> dict[str, Any] | None:
+def _load_json_file(path: str) -> dict[str, Any] | list[Any] | None:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -59,14 +61,15 @@ def _load_json_file(path: str) -> dict[str, Any] | None:
         LOGGER.warning("failed to load json '%s': %s", path, exc)
         return None
 
-    if not isinstance(data, dict):
-        LOGGER.warning("json root in '%s' is not an object, skip", path)
+    if not isinstance(data, (dict, list)):
+        LOGGER.warning("json root in '%s' is not an object or list, skip", path)
         return None
 
     return data
 
 
 def _parse_from_filename(filename: str) -> dict[str, Any]:
+    """Parse ``result_test_*.json`` filenames; same rules as ``generate_nightly_perf_excel``."""
     name, ext = os.path.splitext(filename)
     if ext != ".json" or not name.startswith(_RESULT_JSON_PREFIX):
         return {}
@@ -75,32 +78,58 @@ def _parse_from_filename(filename: str) -> dict[str, Any]:
     parts = core.split("_")
     if len(parts) < 5:
         LOGGER.warning(
-            "filename '%s' does not match expected pattern, skip parsing test metadata",
+            "filename '%s' does not match expected pattern (need >= 5 segments), skip parsing",
             filename,
         )
         return {}
 
-    timestamp = parts[-1]
-    num_prompts_str = parts[-2]
-    max_concurrency_str = parts[-3]
-    dataset_name = parts[-4]
-    test_name = "_".join(parts[:-4]) if parts[:-4] else ""
+    idx = len(parts) - 1
+    timestamp = parts[idx]
+    idx -= 1
 
     parsed: dict[str, Any] = {}
     if len(timestamp) >= 15:
         parsed["date"] = timestamp
-    if dataset_name in ("random", "random-mm"):
-        parsed["dataset_name"] = dataset_name
+
+    if idx >= 0 and parts[idx].startswith("out"):
+        parsed["random_output_len"] = parts[idx][3:]
+        idx -= 1
+    if idx >= 0 and parts[idx].startswith("in"):
+        parsed["random_input_len"] = parts[idx][2:]
+        idx -= 1
+
+    if idx < 3:
+        LOGGER.warning(
+            "filename '%s' has too few segments after timestamp / optional in-out (idx=%s)",
+            filename,
+            idx,
+        )
+        return parsed
+
+    num_prompts_str = parts[idx]
+    idx -= 1
+    flow_str = parts[idx]
+    idx -= 1
+    dataset_name = parts[idx]
+    idx -= 1
+    test_name = "_".join(parts[: idx + 1]) if idx >= 0 else ""
+
     try:
         parsed["num_prompts"] = int(num_prompts_str)
     except (TypeError, ValueError):
         pass
+
     try:
-        parsed["max_concurrency"] = int(max_concurrency_str)
+        parsed["max_concurrency"] = int(flow_str)
     except (TypeError, ValueError):
         pass
+
     if test_name:
         parsed["test_name"] = test_name
+
+    if dataset_name in ("random", "random-mm"):
+        parsed["dataset_name"] = dataset_name
+
     return parsed
 
 
@@ -143,9 +172,10 @@ def _iter_omni_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
 
 def _parse_diffusion_from_filename(filename: str) -> dict[str, Any]:
     name, ext = os.path.splitext(filename)
-    if ext != ".json" or not name.startswith(_DIFFUSION_JSON_PREFIX):
+    if ext != ".json" or not any(name.startswith(prefix) for prefix in _DIFFUSION_JSON_PREFIXES):
         return {}
-    core = name[len(_DIFFUSION_JSON_PREFIX) :]
+    matched_prefix = next(prefix for prefix in _DIFFUSION_JSON_PREFIXES if name.startswith(prefix))
+    core = name[len(matched_prefix) :]
     parts = core.split("_")
     if len(parts) < 2:
         return {}
@@ -168,7 +198,7 @@ def _iter_diffusion_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
         return
 
     for entry in sorted(os.listdir(input_dir)):
-        if not entry.endswith(".json") or not entry.startswith(_DIFFUSION_JSON_PREFIX):
+        if not entry.endswith(".json") or not any(entry.startswith(prefix) for prefix in _DIFFUSION_JSON_PREFIXES):
             continue
         full_path = os.path.join(input_dir, entry)
         if not os.path.isfile(full_path):
@@ -177,17 +207,38 @@ def _iter_diffusion_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
         if data is None:
             continue
 
-        record: dict[str, Any] = dict(data)
         filename_meta = _parse_diffusion_from_filename(os.path.basename(full_path))
-        if "date" not in record or not record.get("date"):
-            record["date"] = filename_meta.get("date") or datetime.now(
-                timezone.utc,
-            ).strftime("%Y%m%d-%H%M%S")
-        if "test_name" not in record or not record.get("test_name"):
-            if "test_name" in filename_meta:
-                record["test_name"] = filename_meta["test_name"]
-        record["source_file"] = os.path.basename(full_path)
-        yield record
+        if isinstance(data, dict):
+            records = [data]
+        elif isinstance(data, list):
+            records = [r for r in data if isinstance(r, dict)]
+        else:
+            records = []
+
+        if not records:
+            LOGGER.warning("diffusion json '%s' has no valid records, skip", full_path)
+            continue
+
+        for record in records:
+            flat: dict[str, Any] = dict(record)
+            result = flat.pop("result", None)
+            if isinstance(result, dict):
+                flat.update(result)
+            if flat.get("endpoint"):
+                flat["endpoint"] = normalize_endpoint(flat["endpoint"])
+            elif flat.get("backend"):
+                flat["endpoint"] = normalize_endpoint(flat["backend"])
+            flat.pop("backend", None)
+            flat.pop("API Backend", None)
+            if "date" not in flat or not flat.get("date"):
+                flat["date"] = filename_meta.get("date") or datetime.now(
+                    timezone.utc,
+                ).strftime("%Y%m%d-%H%M%S")
+            if "test_name" not in flat or not flat.get("test_name"):
+                if "test_name" in filename_meta:
+                    flat["test_name"] = filename_meta["test_name"]
+            flat["source_file"] = os.path.basename(full_path)
+            yield flat
 
 
 def _collect_omni_records(input_dir: str) -> list[dict[str, Any]]:
@@ -199,7 +250,7 @@ def _collect_diffusion_records(input_dir: str) -> list[dict[str, Any]]:
 
 
 def _sort_omni_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
     return sorted(
         by_date_desc,
         key=lambda r: (
@@ -213,8 +264,8 @@ def _sort_omni_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _sort_diffusion_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
-    return sorted(by_date_desc, key=lambda r: (r.get("test_name") or ""))
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
+    return sorted(by_date_desc, key=lambda r: r.get("test_name") or "")
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -1140,7 +1191,7 @@ function filterRows(rows, filters) {{
     ) {{
       return false;
     }}
-    if (filters.backend && String(row.backend || "") !== filters.backend) return false;
+    if (filters.backend && String(row[filters.backendKey] || "") !== filters.backend) return false;
     if (
       filters.extraKey &&
       filters.extraValue &&
@@ -1180,12 +1231,14 @@ function initSection(prefix, columns, data, numericCols, groups) {{
 
   const modelKey = prefix === "diff" ? "model" : "model_id";
   const datasetKey = prefix === "diff" ? "dataset" : "dataset_name";
+  const backendKey = prefix === "diff" ? "endpoint" : "backend";
+  const backendLabel = prefix === "diff" ? "Endpoint" : "Backend";
   const extraKey = prefix === "diff" ? "" : "tokenizer_id";
   const metaKeys = prefix === "diff"
     ? ["test_name"]
     : ["test_name", "max_concurrency", "num_prompts"];
   const configFields = prefix === "diff"
-    ? ["test_name", "model", "backend", "dataset"]
+    ? ["test_name", "model", "endpoint", "dataset"]
     : [
         "endpoint_type",
         "backend",
@@ -1222,6 +1275,7 @@ function initSection(prefix, columns, data, numericCols, groups) {{
       extraKey,
       modelKey,
       datasetKey,
+      backendKey,
     }};
   }}
 
@@ -1253,7 +1307,7 @@ function initSection(prefix, columns, data, numericCols, groups) {{
     }}
     fillSelect(
       backendList,
-      uniqSorted(baseRows.map((row) => row.backend)),
+      uniqSorted(baseRows.map((row) => row[backendKey])),
       backendInput.value,
     );
     if (extraList) {{
@@ -1335,7 +1389,7 @@ function initSection(prefix, columns, data, numericCols, groups) {{
     }});
 
     if (!backendInput.value.trim()) {{
-      backendInput.value = firstValue(rows, "backend");
+      backendInput.value = firstValue(rows, backendKey);
     }}
     rows = filterRows(data, {{
       ...currentFilters(),
@@ -1422,7 +1476,7 @@ function initSection(prefix, columns, data, numericCols, groups) {{
               `<div class="kv-value"><code>${{escapeHtml(filters.numPrompts || "All")}}</code></div></div>`
             )
         }}
-        <div class="kv-row"><div class="kv-label">Backend</div><div class="kv-value"><code>${{escapeHtml(
+        <div class="kv-row"><div class="kv-label">${{backendLabel}}</div><div class="kv-value"><code>${{escapeHtml(
           filters.backend || "All",
         )}}</code></div></div>
         ${{
@@ -1664,7 +1718,7 @@ window.addEventListener("load", () => {{
                 'Diffusion</h2><div class="section-subtitle">Image generation '
                 "benchmark history with throughput and latency trend views.</div>"
                 '</div><div class="section-pills"><div class="pill"><strong>'
-                "Grouping</strong> test_name + model + backend + dataset</div>"
+                "Grouping</strong> test_name + model + endpoint + dataset</div>"
                 '<div class="pill"><strong>Snapshots</strong> single-point series '
                 "stay readable</div></div></div>"
             ),
@@ -1693,7 +1747,7 @@ window.addEventListener("load", () => {{
             "        </div>",
             '        <div class="toolbar-row secondary">',
             (
-                '        <div class="filter-field compact"><label>backend</label>'
+                '        <div class="filter-field compact"><label>endpoint</label>'
                 '<select class="filter-select" id="diff-backend"></select></div>'
             ),
             (
@@ -1760,7 +1814,7 @@ def generate_html_report(input_dir: str, diffusion_input_dir: str, output_file: 
         "date",
         "test_name",
         "model",
-        "backend",
+        "endpoint",
         "dataset",
         "task",
         "duration",

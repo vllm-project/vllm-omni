@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from typing import Any
 
 import torch
@@ -12,6 +11,7 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CHUNK_FRAMES = 3
+
 
 def _is_codes_empty(codes: Any) -> bool:
     if codes is None:
@@ -38,6 +38,74 @@ def _make_finished_sentinel(
 
 # batch mode
 def llm2decoder(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[OmniTokensPrompt]:
+    if not source_outputs:
+        raise ValueError("[MossTTS processor] source_outputs cannot be empty.")
+
+    decoder_inputs: list[OmniTokensPrompt] = []
+
+    for req_idx, source_output in enumerate(source_outputs):
+        req_outputs = getattr(source_output, "engine_outputs", None)
+        if req_outputs is None:
+            req_outputs = [getattr(source_output, "request_output", source_output)]
+
+        for req_output in req_outputs:
+            output = req_output.outputs[0] if getattr(req_output, "outputs", None) else req_output
+            mm_out = getattr(output, "multimodal_output", None) or getattr(output, "multimodal_outputs", None) or {}
+
+            codes_raw = mm_out.get("code_predictor_codes")
+            if _is_codes_empty(codes_raw):
+                codes_dict = mm_out.get("codes") or {}
+                codes_raw = codes_dict.get("audio") if isinstance(codes_dict, dict) else None
+
+            if _is_codes_empty(codes_raw):
+                logger.warning(
+                    "[MossTTS processor] Request %s: empty code_predictor_codes — "
+                    "skipping (model may not have generated audio).",
+                    getattr(req_output, "request_id", req_idx),
+                )
+                continue
+
+            if isinstance(codes_raw, torch.Tensor):
+                codes = codes_raw.to(torch.long)
+            else:
+                codes = torch.tensor(codes_raw, dtype=torch.long)
+
+            # Normalize to [T, n_vq]
+            if codes.ndim == 4:
+                codes = codes.squeeze(1).squeeze(-1)
+            elif codes.ndim == 3:
+                codes = codes.squeeze(-1)
+            elif codes.ndim == 2:
+                pass
+            else:
+                logger.warning(
+                    "[MossTTS processor] Unexpected codes ndim=%d for request %s — skipping.",
+                    codes.ndim,
+                    req_idx,
+                )
+                continue
+
+            # Flatten in row-major order (frame-first) since the decoder expects
+            # codes grouped by frame.
+            flat = codes.reshape(-1).tolist()
+
+            decoder_inputs.append(
+                OmniTokensPrompt(
+                    prompt_token_ids=flat,
+                    multi_modal_data=None,
+                    mm_processor_kwargs=None,
+                )
+            )
+
+    return decoder_inputs
+
+
+def _legacy_llm2decoder(
     stage_list: list[Any],
     engine_input_source: list[int],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
@@ -59,7 +127,7 @@ def llm2decoder(
             f"[MossTTS processor] Stage {src_stage_id} has no outputs yet."
         )
 
-    ar_outputs = stage.engine_outputs 
+    ar_outputs = stage.engine_outputs
     decoder_inputs: list[OmniTokensPrompt] = []
 
     for req_idx, req_output in enumerate(ar_outputs):
@@ -93,8 +161,6 @@ def llm2decoder(
                 req_idx,
             )
             continue
-
-        n_vq = codes.shape[1]
 
         # flatten in row-major order (frame-first) since the decoder expects codes grouped by frame
         flat = codes.reshape(-1).tolist()

@@ -1,0 +1,123 @@
+# Universal TTS benchmark model registry.
+# Maps HuggingFace model ID → supported tasks + per-task extra body fields.
+# To add a new TTS model: add an entry here. No code changes required.
+#
+# The server auto-loads its Deploy YAML from vllm_omni/deploy/<model>.yaml via
+# the Pipeline + Deploy schema introduced in #2383, so no stage_config path
+# is tracked here.
+
+models:
+  # -CustomVoice checkpoints lack speaker_encoder weights, so voice_clone is
+  # NOT supported (an attempt raises ValueError from _extract_speaker_embedding
+  # at model runtime).  Use -Base for voice_clone.
+  Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice:
+    supported_tasks: [default_voice, voice_design]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice:
+        voice: Vivian
+        language: English
+        task_type: CustomVoice
+      voice_design:
+        task_type: VoiceDesign
+        language: English
+
+  Qwen/Qwen3-TTS-12Hz-1.7B-Base:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      voice_clone:
+        task_type: Base
+
+  bosonai/higgs-audio-v3-tts-4b:
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice: {}
+      voice_clone: {}
+
+  openbmb/VoxCPM2:
+    supported_tasks: [voice_clone, default_voice]
+    trust_remote_code: true
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      voice_clone: {}
+      default_voice:
+        voice: default
+
+  # MOSS-TTS family. After the serving_speech.py variant-detection refactor
+  # all five variants now go through OpenAI /v1/audio/speech with the
+  # variant-specific request fields (ambient_sound, ref_audio_2, instructions).
+  OpenMOSS-Team/MOSS-TTS:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
+  # MOSS-TTS-v1.5: continued-training upgrade of MOSS-TTS 1.0 — same
+  # MossTTSDelay-8B architecture and API, so identical wiring. Adds 31-language
+  # synthesis via the `language` field and inline `[pause Xs]` markers.
+  OpenMOSS-Team/MOSS-TTS-v1.5:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
+  OpenMOSS-Team/MOSS-TTS-Realtime:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
+  # MOSS-TTS-Local-Transformer-v1.5: Qwen3 backbone + 1-layer GPT2-style local
+  # depth transformer (n_vq=12), paired with the 48 kHz stereo
+  # MOSS-Audio-Tokenizer-v2 codec. Same voice-clone request shape as the
+  # other MOSS-TTS variants.
+  OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
+  # MOSS-TTSD synthesizes [S1]/[S2] dialogue. The seed-tts voice_clone dataset
+  # has single-speaker rows; bench piggybacks on it (both speakers share the
+  # same ref_audio). For real dialogue evaluation use the ttsd dataset.
+  OpenMOSS-Team/MOSS-TTSD-v1.0:
+    supported_tasks: [voice_clone, dialogue]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+      dialogue: {}
+
+  # MOSS-SoundEffect ignores text/ref_audio; expects ambient_sound +
+  # duration_seconds. The sound_effect dataset module emits those.
+  OpenMOSS-Team/MOSS-SoundEffect:
+    supported_tasks: [sound_effect]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      sound_effect:
+        duration_seconds: 10
+
+  # MOSS-VoiceGenerator: instructions-driven (no ref_audio). seed-tts-design
+  # dataset already emits {instructions, target_text}, so voice_design works
+  # out of the box once the serving validator accepts instructions.
+  OpenMOSS-Team/MOSS-VoiceGenerator:
+    supported_tasks: [voice_design]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_design: {}

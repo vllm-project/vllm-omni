@@ -1,0 +1,223 @@
+pull_request_rules:
+- name: label-documentation
+  description: Automatically apply documentation label
+  conditions:
+    - label != stale
+    - or:
+      - files~=^[^/]+\.md$
+      - files~=^docs/
+      - files~=^examples/
+  actions:
+    label:
+      add:
+        - documentation
+    comment:
+      message: "Documentation preview: https://vllm--{{number}}.org.readthedocs.build/en/{{number}}/"
+
+- name: comment-pre-commit-failure
+  description: Comment on PR when pre-commit check fails
+  conditions:
+    - status-failure=pre-commit
+    - -closed
+    - -draft
+  actions:
+    comment:
+      message: |
+        Hi @{{author}}, the pre-commit checks have failed. Please run:
+
+        ```bash
+        uv pip install pre-commit
+        pre-commit install
+        pre-commit run --all-files
+        ```
+
+        Then, commit the changes and push to your branch.
+
+        For future commits, `pre-commit` will run automatically on changed files before each commit.
+
+        > [!TIP]
+        > <details>
+        > <summary>Is <code>mypy</code> or <code>markdownlint</code> failing?</summary>
+        > <br/>
+        > <code>mypy</code> and <code>markdownlint</code> are run differently in CI. If the failure is related to either of these checks, please use the following commands to run them locally:
+        >
+        > ```bash
+        > # For mypy (substitute "3.10" with the failing version if needed)
+        > pre-commit run --hook-stage manual mypy-3.10
+        > # For markdownlint
+        > pre-commit run --hook-stage manual markdownlint
+        > ```
+        > </details>
+
+- name: comment-dco-failure
+  description: Comment on PR when DCO check fails
+  conditions:
+    - status-failure=dco
+    - -closed
+    - -draft
+  actions:
+    comment:
+      message: |
+        Hi @{{author}}, the DCO check has failed. Please click on DCO in the Checks section for instructions on how to resolve this.
+
+- name: label-ci-build
+  description: Automatically apply ci/build label
+  conditions:
+    - label != stale
+    - or:
+      - files~=^\.github/
+      - files~=\.buildkite/
+      - files~=^cmake/
+      - files=CMakeLists.txt
+      - files~=^docker/Dockerfile
+      - files~=^requirements.*\.txt
+      - files=setup.py
+  actions:
+    label:
+      add:
+        - ci/build
+
+- name: label-frontend
+  description: Automatically apply frontend label
+  conditions:
+    - label != stale
+    - files~=^vllm_omni/entrypoints/
+  actions:
+    label:
+      add:
+        - frontend
+
+- name: label-diffusion
+  description: Automatically apply diffusion label
+  conditions:
+    - label != stale
+    - files~=^vllm_omni/diffusion/
+  actions:
+    label:
+      add:
+        - diffusion
+
+- name: label-new-model
+  description: Automatically apply new-model label
+  conditions:
+    - label != stale
+    - or:
+        - files=vllm_omni/model_executor/models/registry.py
+        - files=vllm_omni/diffusion/registry.py
+  actions:
+    label:
+      add:
+        - new-model
+
+- name: label-npu
+  description: Automatically apply npu label
+  conditions:
+    - label != stale
+    - or:
+      - files~=^vllm_omni/platforms/npu/
+      - title~=(?i)NPU
+      - title~=(?i)Ascend
+  actions:
+    label:
+      add:
+        - npu
+    assign:
+      users:
+        - "gcanlin"
+
+- name: label-rocm
+  description: Automatically apply rocm label
+  conditions:
+    - label != stale
+    - or:
+      - files~=^vllm_omni/platforms/rocm/
+      - title~=(?i)AMD
+      - title~=(?i)ROCm
+  actions:
+    label:
+      add:
+        - rocm
+    assign:
+      users:
+        - "tjtanaa"
+
+- name: label-xpu
+  description: Automatically apply xpu label
+  conditions:
+    - label != stale
+    - or:
+      - files~=^vllm_omni/platforms/xpu/
+      - title~=(?i)Intel
+      - title~=(?i)XPU
+  actions:
+    label:
+      add:
+        - xpu
+    assign:
+      users:
+        - "yma11"
+
+- name: label-modelrunner
+  description: Automatically apply modelrunner label
+  conditions:
+    - label != stale
+    - or:
+      - files~=^vllm_omni/worker/
+      - title~=(?i)ModelRunner
+      - title~=(?i)worker
+  actions:
+    label:
+      add:
+        - ModelRunner
+    assign:
+      users:
+        - "gcanlin" # To check whether need to sync to NPU
+
+- name: auto-rebase if approved, ready, and 30 commits behind main
+  conditions:
+    - base = main
+    - label=ready
+    - "#approved-reviews-by >= 1"
+    - "#commits-behind >= 30"
+    - -closed
+    - -draft
+    - -conflict
+  actions:
+    rebase: {}
+
+- name: ping author on conflicts and add 'needs-rebase' label
+  conditions:
+    - label != stale
+    - conflict
+    - -closed
+  actions:
+    label:
+      add:
+        - needs-rebase
+    comment:
+      message: |
+       This pull request has merge conflicts that must be resolved before it can be
+       merged. Please rebase the PR, @{{author}}.
+
+       https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork
+
+- name: remove 'needs-rebase' label when conflict is resolved
+  conditions:
+    - -conflict
+    - -closed
+  actions:
+    label:
+      remove:
+        - needs-rebase
+
+- name: label-bug
+  description: Automatically apply bug label
+  conditions:
+    - label != stale
+    - or:
+      - title~=(?i)\bbug\b
+      - title~=(?i)\bbugfix\b
+  actions:
+    label:
+      add:
+        - bug

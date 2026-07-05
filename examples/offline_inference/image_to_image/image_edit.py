@@ -87,18 +87,37 @@ For more options, run:
 """
 
 import argparse
+import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from PIL import Image
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.model_extras import (
+    build_image_to_image_prompt,
+    get_extra_body_params,
+    get_model_class_name,
+    should_init_extra_args_for_non_diffusion_stages,
+)
 from vllm_omni.platforms import current_omni_platform
+
+
+def parse_profiler_config(value: str) -> dict[str, Any]:
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+    return config
 
 
 def parse_args() -> argparse.Namespace:
@@ -132,6 +151,20 @@ def parse_args() -> argparse.Namespace:
         required=False,
     )
     parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        metavar="W",
+        help="Output image width in pixels. Default: None (pipeline's default).",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        metavar="H",
+        help="Output image height in pixels. Default: None (pipeline's default).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -160,6 +193,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--guidance-scale-2", type=float, default=None, help="image guidance scale for image-to-image generation."
+    )
+    parser.add_argument(
+        "--extra-args",
+        type=parse_profiler_config,
+        default=None,
+        help="JSON object copied to OmniDiffusionSamplingParams.extra_args, e.g. '{\"cfg_text_scale\": 4.0}'.",
     )
     parser.add_argument(
         "--output",
@@ -197,6 +236,13 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
+        "--ulysses-mode",
+        type=str,
+        default="strict",
+        choices=["strict", "advanced_uaa"],
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+    )
+    parser.add_argument(
         "--ring-degree",
         type=int,
         default=1,
@@ -217,8 +263,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resolution",
         type=int,
-        default=640,
-        help="Bucket in (640, 1024) to determine the condition and output resolution",
+        default=None,
+        help="Bucket in (640, 1024) to determine the condition and output resolution. If width and height are not provided, this will be set to default 640.",
     )
 
     parser.add_argument(
@@ -297,8 +343,8 @@ def parse_args() -> argparse.Namespace:
         "--cfg-parallel-size",
         type=int,
         default=1,
-        choices=[1, 2],
-        help="Number of GPUs used for classifier free guidance parallel size.",
+        choices=[1, 2, 3],
+        help="Number of GPUs used for classifier free guidance parallel size (max 3 branches).",
     )
     parser.add_argument(
         "--enforce-eager",
@@ -326,15 +372,53 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
+    )
+    parser.add_argument(
+        "--use-hsdp",
+        action="store_true",
+        help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models.",
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=1,
+        help="Number of GPUs to shard weights across for HSDP.",
+    )
+    parser.add_argument(
+        "--hsdp-replicate-size",
+        type=int,
+        default=1,
+        help="Number of HSDP replica groups.",
+    )
+    parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.resolution and (args.width or args.height):
+        raise ValueError("--resolution and --width/--height cannot be specified together")
+    if args.width is not None and args.width <= 0:
+        raise ValueError("--width must be a positive integer")
+    if args.height is not None and args.height <= 0:
+        raise ValueError("--height must be a positive integer")
+    if not args.width and not args.height and not args.resolution:
+        args.resolution = 640
 
     # Validate input images exist and load them
     input_images = []
@@ -395,11 +479,13 @@ def main():
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        profiler_config=args.profiler_config,
     )
+    model_class_name = get_model_class_name(omni)
+    declared_extra_body_params = get_extra_body_params(model_class_name)
     print("Pipeline loaded")
 
-    # Check if profiling is requested via environment variable
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_enabled = args.profiler_config is not None
 
     # Time profiling for generation
     print(f"\n{'=' * 60}")
@@ -407,6 +493,8 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    if args.height is not None or args.width is not None:
+        print(f"  Output size: {args.width or 'auto'}x{args.height or 'auto'}")
     if isinstance(input_image, list):
         print(f"  Number of input images: {len(input_image)}")
         for idx, img in enumerate(input_image):
@@ -424,24 +512,65 @@ def main():
         print("[Profiler] Starting profiling...")
         omni.start_profile()
 
-    # Generate edited image
-    outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-            "multi_modal_data": {"image": input_image},
-        },
-        OmniDiffusionSamplingParams(
-            generator=generator,
-            true_cfg_scale=args.cfg_scale,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_2,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_outputs_per_prompt,
-            layers=args.layers,
-            resolution=args.resolution,
-        ),
+    prompt_dict = build_image_to_image_prompt(
+        model_class_name=model_class_name,
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        input_image=input_image,
+        height=args.height,
+        width=args.width,
     )
+
+    extra_args_from_cli = dict(args.extra_args or {})
+    if args.negative_prompt is not None:
+        extra_args_from_cli.setdefault("negative_prompt", args.negative_prompt)
+
+    diffusion_params = OmniDiffusionSamplingParams(
+        generator=generator,
+        true_cfg_scale=args.cfg_scale,
+        guidance_scale=args.guidance_scale,
+        guidance_scale_2=args.guidance_scale_2,
+        num_inference_steps=args.num_inference_steps,
+        num_outputs_per_prompt=args.num_outputs_per_prompt,
+        layers=args.layers,
+        resolution=args.resolution,
+        height=args.height,
+        width=args.width,
+    )
+    if declared_extra_body_params:
+        apply_declared_extra_args(
+            diffusion_params,
+            declared_extra_body_params,
+            extra_args_from_cli,
+        )
+    else:
+        diffusion_params.extra_args.update({k: v for k, v in extra_args_from_cli.items() if v is not None})
+
+    # Build per-stage sampling params for multi-stage models
+    init_non_diffusion = should_init_extra_args_for_non_diffusion_stages(
+        model_class_name,
+    )
+    defaults = list(omni.default_sampling_params_list or [])
+    sampling_params_list = [clone_sampling_params(p) for p in defaults]
+    if not sampling_params_list:
+        sampling_params_list = [diffusion_params]
+
+    diffusion_replaced = False
+    for idx, params in enumerate(sampling_params_list):
+        if isinstance(params, OmniDiffusionSamplingParams):
+            merged_extra = dict(getattr(params, "extra_args", {}) or {})
+            merged_extra.update(diffusion_params.extra_args)
+            diffusion_params.extra_args = merged_extra
+            sampling_params_list[idx] = diffusion_params
+            diffusion_replaced = True
+        elif init_non_diffusion and hasattr(params, "extra_args"):
+            if params.extra_args is None:
+                params.extra_args = {}
+
+    if not diffusion_replaced and len(sampling_params_list) == 1:
+        sampling_params_list = [diffusion_params]
+
+    outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
@@ -468,17 +597,16 @@ def main():
     if not outputs:
         raise ValueError("No output generated from omni.generate()")
 
-    # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from request_output.images
-    first_output = outputs[0]
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
+    images = None
+    for output in outputs:
+        images = getattr(output, "images", None)
+        if images:
+            break
+        req_out = getattr(output, "request_output", None)
+        images = getattr(req_out, "images", None) if req_out is not None else None
+        if images:
+            break
 
-    req_out = first_output.request_output
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images' key")
-
-    images = req_out.images
     if not images:
         raise ValueError("No images found in request_output")
 

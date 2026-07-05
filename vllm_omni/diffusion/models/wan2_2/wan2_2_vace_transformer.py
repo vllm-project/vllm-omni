@@ -10,6 +10,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
@@ -19,6 +21,8 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanTransformer3DModel,
     WanTransformerBlock,
 )
+
+logger = init_logger(__name__)
 
 
 class VaceWanTransformerBlock(WanTransformerBlock):
@@ -33,8 +37,19 @@ class VaceWanTransformerBlock(WanTransformerBlock):
         added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
         block_id: int = 0,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
-        super().__init__(dim, ffn_dim, num_heads, eps, added_kv_proj_dim, cross_attn_norm)
+        super().__init__(
+            dim,
+            ffn_dim,
+            num_heads,
+            eps,
+            added_kv_proj_dim,
+            cross_attn_norm,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
         self.proj_in = nn.Linear(dim, dim) if block_id == 0 else None
         self.proj_out = nn.Linear(dim, dim)
 
@@ -66,9 +81,7 @@ class VaceWanTransformerBlock(WanTransformerBlock):
 class WanVACETransformer3DModel(WanTransformer3DModel):
     """VACE-extended WAN Transformer with conditioning blocks for video editing."""
 
-    # TODO: `vace_blocks` are not layerwise-offloaded yet. The current offloader only
-    # supports a single block group (`blocks`); extend it to support both
-    # `vace_blocks` and `blocks`.
+    _layerwise_offload_blocks_attrs = ["vace_blocks", "blocks"]
 
     # Shard hidden_states before VACE blocks (replaces parent's blocks.0)
     _sp_plan = {
@@ -83,9 +96,10 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         *,
         vace_layers: list[int] | None = None,
         vace_in_channels: int | None = None,
+        quant_config: QuantizationConfig | None = None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(quant_config=quant_config, **kwargs)
 
         self.vace_blocks = None
         self.vace_patch_embedding = None
@@ -118,10 +132,16 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                         self.config.added_kv_proj_dim,
                         self.config.cross_attn_norm,
                         block_id=i,
+                        quant_config=quant_config,
+                        prefix=f"vace_blocks.{i}",
                     )
                     for i in range(len(vace_layers))
                 ]
             )
+
+        # ROPE helper
+        self._cached_rope_emb = None
+        self._cached_rope_resolution = None
 
     def embed_vace_context(
         self,
@@ -165,7 +185,14 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         post_patch_width = width // p_w
 
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
-        rotary_emb = self.rope(hidden_states)
+        current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)
+        if self._cached_rope_resolution == current_rope_resolution and self._cached_rope_emb is not None:
+            rotary_emb = self._cached_rope_emb
+        else:
+            freqs_cos, freqs_sin = self.rope(hidden_states)
+            rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
+            self._hidden_states_shape = hidden_states.shape
+            self._cached_rope_emb = rotary_emb
 
         # Patch embedding and flatten to sequence
         hidden_states = self.patch_embedding(hidden_states)
@@ -188,12 +215,16 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         # Shard hidden_states via _sp_plan hook (before VACE, not at blocks.0)
         hidden_states = self._sp_shard_point(hidden_states)
 
-        # SP state and attention mask for padding
         hidden_states_mask = None
         ctx = get_forward_context()
         parallel_config = ctx.omni_diffusion_config.parallel_config
         sp_size = parallel_config.sequence_parallel_size if parallel_config is not None else 1
-        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        if (
+            parallel_config is not None
+            and parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
             padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
             hidden_states_mask = torch.ones(
                 batch_size,
@@ -202,6 +233,21 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                 device=hidden_states.device,
             )
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+        elif (
+            parallel_config is not None
+            and not parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                sp_size,
+            )
 
         # VACE: embed context and run conditioning blocks
         vace_hints = None
@@ -209,7 +255,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
             full_seq_len = hidden_states.shape[1] * sp_size
             control_hidden_states = self.embed_vace_context(vace_context.to(hidden_states.dtype), full_seq_len, sp_size)
             vace_hints = []
-            for block in self.vace_blocks:
+            for i, block in enumerate(self.vace_blocks):
                 conditioning_states, control_hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,
@@ -226,7 +272,13 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
 
         # Transformer blocks with VACE hint application
         for i, block in enumerate(self.blocks):
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+            )
             if vace_hints is not None and self.vace_layers_mapping is not None and i in self.vace_layers_mapping:
                 vace_idx = self.vace_layers_mapping[i]
                 hidden_states = hidden_states + vace_hints[vace_idx] * vace_context_scale[vace_idx]
@@ -239,7 +291,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
             shift = shift.unsqueeze(1)
             scale = scale.unsqueeze(1)
 
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = self.norm_out(hidden_states, scale, shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(

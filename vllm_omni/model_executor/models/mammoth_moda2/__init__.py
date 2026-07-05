@@ -1,17 +1,8 @@
-from transformers import AutoTokenizer
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm_omni.tokenizers.mammoth_moda2_tokenizer import MammothUTokenizer
-from vllm_omni.transformers_utils.configs.mammoth_moda2 import (  # noqa: F401 registers AutoConfig
-    Mammothmoda2Config,
-    Mammothmoda2Qwen2_5_VLConfig,
-)
-
-from .mammoth_moda2 import MammothModa2ARForConditionalGeneration
-
-# AutoConfig.register is done inside transformers_utils/configs/mammoth_moda2.py
-AutoTokenizer.register(config_class=Mammothmoda2Config, slow_tokenizer_class=MammothUTokenizer)
-AutoTokenizer.register(config_class=Mammothmoda2Qwen2_5_VLConfig, slow_tokenizer_class=MammothUTokenizer)
-
-__all__ = [
-    "MammothModa2ARForConditionalGeneration",
-]
+# NOTE: Do not import model classes in this file. Importing any
+# submodule in this package triggers __init__.py execution, and
+# both the model registry and pipeline registry import submodules
+# directly — heavy imports here would be loaded as a side effect
+# even though nothing depends on these re-exports.
