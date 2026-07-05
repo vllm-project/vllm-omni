@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from inspect import signature
 from time import time
 from typing import Any
 
@@ -34,6 +35,21 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+
+_ENGINE_CORE_OUTPUT_FIELDS = set(signature(EngineCoreOutput).parameters)
+
+
+def _engine_core_output_cache_kwargs(request: Request, req_id: str) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if "num_cached_tokens" in _ENGINE_CORE_OUTPUT_FIELDS:
+        num_cached = getattr(request, "num_cached_tokens", request.num_computed_tokens)
+        if num_cached < 0:
+            logger.warning("Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, req_id)
+            num_cached = 0
+        kwargs["num_cached_tokens"] = num_cached
+    if "num_external_computed_tokens" in _ENGINE_CORE_OUTPUT_FIELDS:
+        kwargs["num_external_computed_tokens"] = getattr(request, "num_external_computed_tokens", 0)
+    return kwargs
 
 
 @dataclass
@@ -501,6 +517,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                         is_segment_finished=is_segment_finished,
                         new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
+                        **_engine_core_output_cache_kwargs(request, req_id),
                     )
                 )
             else:
@@ -534,6 +551,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
+                        **_engine_core_output_cache_kwargs(request, request.request_id),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:

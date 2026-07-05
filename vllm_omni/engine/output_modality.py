@@ -8,8 +8,13 @@ for type-safe multimodal output routing and tensor merging.
 from __future__ import annotations
 
 import re
-from enum import Enum, Flag, StrEnum, auto
+from enum import Enum, Flag, auto
 from typing import Literal, TypeAlias
+
+try:
+    from enum import StrEnum
+except ImportError:
+    from backports.strenum import StrEnum
 
 FinalOutputModalityType: TypeAlias = Literal["text", "image", "audio", "video"]
 

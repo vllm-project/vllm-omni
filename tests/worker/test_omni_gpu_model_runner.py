@@ -628,6 +628,64 @@ def test_sync_local_stage_payloads_retains_payload_until_request_is_active():
     assert runner.requests["late"].additional_information_cpu == payload
 
 
+def test_update_states_notifies_model_finished_request_aliases(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(
+        mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    runner = object.__new__(OmniGPUModelRunner)
+    finished_calls = []
+    runner.model = SimpleNamespace(
+        on_requests_finished=lambda request_ids: finished_calls.append(list(request_ids))
+    )
+    runner.requests = {"internal": object()}
+    runner.model_intermediate_buffer = {
+        "internal": {
+            "request_id": "external",
+            "global_request_id": [b"global"],
+            "req_id": "internal",
+        }
+    }
+    runner.num_prompt_logprobs = {}
+    runner.omni_prefix_cache = None
+    runner.input_batch = SimpleNamespace(
+        remove_request=lambda _req_id: None,
+        req_id_to_index={},
+        condense=lambda: None,
+        refresh_metadata=lambda: None,
+    )
+    runner.encoder_cache = {}
+    runner.use_async_spec_decode = False
+    runner.is_pooling_model = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner.use_async_scheduling = False
+    runner.speculative_config = None
+    runner._may_reorder_batch = lambda _scheduler_output: None
+
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=["internal"],
+        new_block_ids_to_zero=[],
+        free_encoder_mm_hashes=[],
+        num_scheduled_tokens={},
+        scheduled_cached_reqs=SimpleNamespace(
+            resumed_req_ids=set(),
+            req_ids=[],
+        ),
+        scheduled_new_reqs=[],
+        scheduled_spec_decode_tokens={},
+    )
+
+    OmniGPUModelRunner._update_states(runner, scheduler_output)
+
+    assert finished_calls == [["internal", "external", "global"]]
+    assert "internal" not in runner.model_intermediate_buffer
+
+
 def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
     runner = _make_runner_for_mimo()
     req_id = "r_mimo"

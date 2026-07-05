@@ -211,9 +211,11 @@ def run_tts(args: argparse.Namespace) -> None:
         "OpenMOSS-Team/MOSS-SoundEffect": "moss_sound_effect",
         "OpenMOSS-Team/MOSS-TTS-Realtime": "moss_tts_realtime",
         "OpenMOSS-Team/MOSS-VoiceGenerator": "moss_voice_generator",
+        "OpenMOSS-Team/MOSS-TTS-Local-Transformer": "moss_tts_local",
         "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5": "moss_tts_local",
     }
-    deploy_config = deploy_map.get(args.model, "moss_tts")
+    model_key = args.model.lower()
+    deploy_config = deploy_map.get(args.model, "moss_tts_local" if "moss-tts-local-transformer" in model_key else "moss_tts")
 
     is_sound_effect = "SoundEffect" in args.model
     is_voice_gen = "VoiceGenerator" in args.model
@@ -221,7 +223,7 @@ def run_tts(args: argparse.Namespace) -> None:
     # Local-v1.5 ships its own AutoProcessor (processor_config.json +
     # processing_moss_tts.py), so it reuses the same _build_unified_codes
     # path as the Delay variants below — just a different n_vq/codec.
-    is_local = "Local" in args.model
+    is_local = "moss-tts-local-transformer" in model_key
     output_sr = 48000 if is_local else 24000
 
     ref_audio = None
@@ -269,7 +271,12 @@ def run_tts(args: argparse.Namespace) -> None:
         text_ids, audio_codes, n_vq = _build_unified_codes(args.model, text, ref_audio, **builder_kwargs)
         print(f"Prefill prompt: {len(text_ids)} tokens, {n_vq}-quantizer audio block")
 
-    omni = Omni(model=args.model, deploy_config=deploy_config, stage_init_timeout=600)
+    omni_kwargs: dict[str, object] = {"stage_init_timeout": 600}
+    if deploy_config == "moss_tts_local":
+        omni_kwargs["stage_configs_path"] = "vllm_omni/model_executor/stage_configs/moss_tts_local.yaml"
+    else:
+        omni_kwargs["deploy_config"] = deploy_config
+    omni = Omni(model=args.model, **omni_kwargs)
 
     talker_sp = SamplingParams(
         temperature=1.7,
@@ -295,6 +302,8 @@ def run_tts(args: argparse.Namespace) -> None:
         # exactly this kind of conditioning input.
         "codes": {"ref": audio_codes},
     }
+    if args.max_frames is not None:
+        additional_info["max_new_frames"] = args.max_frames
     if remaining_text_ids:
         # Realtime variant: feed the remaining text tokens (everything past
         # the first ``PREFILL_MAX_TEXT``) one-per-step during decode via the
@@ -382,6 +391,12 @@ def main() -> None:
         help="Voice description for MOSS-VoiceGenerator (e.g. 'a young woman with a clear voice')",
     )
     parser.add_argument("--output", default="output.wav", help="Output WAV path")
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Optional cap on generated audio frames for smoke tests",
+    )
     args = parser.parse_args()
     run_tts(args)
 

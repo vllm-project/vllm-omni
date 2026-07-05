@@ -1,0 +1,77 @@
+# Stage config for MOSS-TTS-Local (Batch Mode)
+
+async_chunk: false
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+
+    engine_args:
+      dtype: bfloat16
+      max_num_seqs: 32
+      model_stage: ar_stage
+      model_arch: MossTTSForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      tensor_parallel_size: 1 # scale up for multi-GPU
+      gpu_memory_utilization: 0.3
+      enforce_eager: true
+
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      max_model_len: 4096
+      max_num_batched_tokens: 4096
+      async_scheduling: false
+
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 300
+      seed: 42
+      detokenize: true
+      stop_token_ids: [151653, 151645, 151643]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+
+    engine_args:
+      model_stage: decoder
+      max_num_seqs: 32
+      model_arch: MossTTSForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.25
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      max_model_len: 18192
+      max_num_batched_tokens: 18192
+      async_scheduling: false
+
+    engine_input_source: [0]
+    is_comprehension: false
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.moss_tts_local.llm2decoder
+    final_output: true
+    final_output_type: audio
+
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 18192
+      seed: 42
+      detokenize: false

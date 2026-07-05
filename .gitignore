@@ -267,6 +267,7 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+weights/
 # Vendored test reference audio (small, intentionally checked in)
 !tests/assets/**/*.wav
 .worktrees/

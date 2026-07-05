@@ -25,6 +25,11 @@ _MOSS_AUDIO_PAD_CODE = 1024
 # ---------------------------------------------------------------------------
 
 
+def _source_indices(engine_input_source: Any) -> list[int]:
+    sources = engine_input_source.keys() if isinstance(engine_input_source, Mapping) else engine_input_source
+    return [int(src) for src in sources]
+
+
 def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
     """Pull audio codes from a Stage-0 OmniOutput or raw tensor."""
     if stage_output is None:
@@ -62,7 +67,7 @@ def talker2codec(
     """
     results: list[Any] = []
 
-    for src_idx in engine_input_source:
+    for src_idx in _source_indices(engine_input_source):
         if src_idx >= len(stage_list):
             results.append(OmniTokensPrompt(prompt_token_ids=[]))
             continue

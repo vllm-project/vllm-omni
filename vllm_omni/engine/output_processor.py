@@ -1,4 +1,5 @@
 from dataclasses import fields as dataclass_fields
+from inspect import signature
 from typing import Any
 
 import torch
@@ -27,6 +28,8 @@ from vllm_omni.engine.output_modality import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+_BASE_NEW_COMPLETION_OUTPUT_PARAMS = set(signature(RequestState._new_completion_output).parameters)
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +362,10 @@ class OmniRequestState(RequestState):
                 routed_experts=routed_experts,
             )
         else:
-            base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
+            args = [token_ids, finish_reason, stop_reason]
+            if "routed_experts" in _BASE_NEW_COMPLETION_OUTPUT_PARAMS:
+                args.append(routed_experts)
+            base_output = super()._new_completion_output(*args)
 
         # Always provide cumulative token IDs for inter-stage processors.
         if self.detokenizer is not None:

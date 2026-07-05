@@ -461,6 +461,20 @@ class OmniGPUModelRunner(GPUModelRunner):
         if self.omni_prefix_cache is not None:
             self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
 
+        model_finished_req_ids: list[str] = []
+        if (
+            scheduler_output.finished_req_ids
+            and hasattr(self, "model")
+            and hasattr(self.model, "on_requests_finished")
+        ):
+            seen_finished_req_ids: set[str] = set()
+            for req_id in scheduler_output.finished_req_ids:
+                for candidate in (req_id, *self._model_state_request_aliases(req_id)):
+                    candidate = str(candidate)
+                    if candidate not in seen_finished_req_ids:
+                        seen_finished_req_ids.add(candidate)
+                        model_finished_req_ids.append(candidate)
+
         # Remove finished requests from the cached states.
         # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
         # is only safe to call once init_omni_connectors() has finished
@@ -486,7 +500,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             if cleanup_finished_request is not None:
                 cleanup_finished_request(req_id)
 
-        self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
+        if model_finished_req_ids:
+            self.model.on_requests_finished(model_finished_req_ids)
+        if hasattr(self, "late_interaction_runner"):
+            self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -826,6 +843,26 @@ class OmniGPUModelRunner(GPUModelRunner):
             return correct_spec_decode_token_counts
         else:
             return None
+
+    def _model_state_request_aliases(self, req_id: str) -> tuple[str, ...]:
+        info = self.model_intermediate_buffer.get(req_id)
+        if not isinstance(info, dict):
+            return ()
+
+        aliases: list[str] = []
+        for key in ("request_id", "global_request_id", "req_id"):
+            value = info.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, set)):
+                values = value
+            else:
+                values = (value,)
+            for item in values:
+                if isinstance(item, bytes):
+                    item = item.decode("utf-8", errors="ignore")
+                aliases.append(str(item))
+        return tuple(alias for alias in aliases if alias and alias != req_id)
 
     @torch.inference_mode()
     def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
