@@ -12,7 +12,7 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
 import torch
@@ -62,6 +62,11 @@ from .magi_human_dit import (
     Modality,
     VarlenHandler,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1702,8 +1707,9 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
 
         dit_json = _load_json(model_path, f"{dit_subfolder}/config.json", local_files_only)
         dit_model_config = MagiHumanDiTConfig(**dit_json)
+        quant_config: QuantizationConfig | None = od_config.quantization_config
 
-        self.dit = DiTModel(dit_model_config)
+        self.dit = DiTModel(dit_model_config, quant_config=quant_config)
         self.dit.eval()
 
         self.vae = DistributedAutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
@@ -1791,7 +1797,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
         sr_dit_subfolder = "sr"
         sr_dit_json = _load_json(model_path, f"{sr_dit_subfolder}/config.json", local_files_only)
         sr_dit_model_config = MagiHumanDiTConfig(**sr_dit_json)
-        self.sr_dit = DiTModel(sr_dit_model_config)
+        self.sr_dit = DiTModel(sr_dit_model_config, quant_config=quant_config)
         self.sr_dit.eval()
 
         self.weights_sources = [

@@ -26,6 +26,11 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.vllm_flash_attn import flash_attn_varlen_func as _vllm_fa_varlen
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
+
 try:
     from magi_compiler.api import magi_register_custom_op
     from magi_compiler.config import CompileConfig
@@ -385,6 +390,7 @@ class MoEQKVParallelLinear(nn.Module):
         total_num_kv_heads: int,
         num_experts: int,
         bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -397,6 +403,7 @@ class MoEQKVParallelLinear(nn.Module):
                     total_num_kv_heads=total_num_kv_heads,
                     bias=bias,
                     return_bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_experts)
             ]
@@ -432,6 +439,7 @@ class MoEColumnParallelLinear(nn.Module):
         output_size: int,
         num_experts: int,
         bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -443,6 +451,7 @@ class MoEColumnParallelLinear(nn.Module):
                     bias=bias,
                     gather_output=False,
                     return_bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_experts)
             ]
@@ -474,6 +483,7 @@ class MoERowParallelLinear(nn.Module):
         output_size: int,
         num_experts: int,
         bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -485,6 +495,7 @@ class MoERowParallelLinear(nn.Module):
                     bias=bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_experts)
             ]
@@ -702,7 +713,11 @@ class AttentionConfig:
 class Attention(torch.nn.Module):
     config: AttentionConfig
 
-    def __init__(self, config: AttentionConfig):
+    def __init__(
+        self,
+        config: AttentionConfig,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.config = config
         self.pre_norm = MultiModalityRMSNorm(config.hidden_size, eps=1e-6, num_modality=config.num_modality)
@@ -722,6 +737,7 @@ class Attention(torch.nn.Module):
                 total_num_kv_heads=config.num_heads_kv,
                 bias=False,
                 return_bias=False,
+                quant_config=quant_config,
             )
             self.linear_proj = RowParallelLinear(
                 input_size=config.num_heads_q * config.head_dim,
@@ -729,6 +745,7 @@ class Attention(torch.nn.Module):
                 bias=False,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
             )
             if config.enable_attn_gating:
                 self.linear_gating = ColumnParallelLinear(
@@ -737,6 +754,7 @@ class Attention(torch.nn.Module):
                     bias=False,
                     gather_output=False,
                     return_bias=False,
+                    quant_config=quant_config,
                 )
             else:
                 self.linear_gating = None
@@ -749,12 +767,14 @@ class Attention(torch.nn.Module):
                 total_num_kv_heads=config.num_heads_kv,
                 num_experts=config.num_modality,
                 bias=False,
+                quant_config=quant_config,
             )
             self.linear_proj = MoERowParallelLinear(
                 input_size=config.num_heads_q * config.head_dim,
                 output_size=config.hidden_size,
                 num_experts=config.num_modality,
                 bias=False,
+                quant_config=quant_config,
             )
             if config.enable_attn_gating:
                 self.linear_gating = MoEColumnParallelLinear(
@@ -762,6 +782,7 @@ class Attention(torch.nn.Module):
                     output_size=config.num_heads_q,
                     num_experts=config.num_modality,
                     bias=False,
+                    quant_config=quant_config,
                 )
             else:
                 self.linear_gating = None
@@ -859,7 +880,11 @@ class MLPConfig:
 class MLP(torch.nn.Module):
     config: MLPConfig
 
-    def __init__(self, config: MLPConfig):
+    def __init__(
+        self,
+        config: MLPConfig,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         num_experts = config.num_modality
         self.pre_norm = MultiModalityRMSNorm(config.hidden_size, num_modality=config.num_modality)
@@ -878,6 +903,7 @@ class MLP(torch.nn.Module):
                 bias=False,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
             )
             self.down_proj = RowParallelLinear(
                 input_size=config.intermediate_size,
@@ -885,6 +911,7 @@ class MLP(torch.nn.Module):
                 bias=False,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
             )
         else:
             # MoE blocks: per-expert TP-sharded parallel layers.
@@ -893,12 +920,14 @@ class MLP(torch.nn.Module):
                 output_size=intermediate_size_up,
                 num_experts=num_experts,
                 bias=False,
+                quant_config=quant_config,
             )
             self.down_proj = MoERowParallelLinear(
                 input_size=config.intermediate_size,
                 output_size=config.hidden_size,
                 num_experts=num_experts,
                 bias=False,
+                quant_config=quant_config,
             )
         self.activation_func = create_activation_func(config.activation_type)
 
@@ -963,7 +992,12 @@ class Adapter(torch.nn.Module):
 # Transformer layer (no CP)
 # ---------------------------------------------------------------------------
 class TransFormerLayer(torch.nn.Module):
-    def __init__(self, config: Any, layer_idx: int):
+    def __init__(
+        self,
+        config: Any,
+        layer_idx: int,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         num_modality = 3 if layer_idx in config.mm_layers else 1
         use_local_attn = layer_idx in config.local_attn_layers
@@ -980,7 +1014,7 @@ class TransFormerLayer(torch.nn.Module):
             use_local_attn=use_local_attn,
             enable_attn_gating=config.enable_attn_gating,
         )
-        self.attention: Attention = Attention(attention_config)
+        self.attention: Attention = Attention(attention_config, quant_config=quant_config)
 
         activation_type = MLPActivationType.GELU7 if layer_idx in config.gelu7_layers else MLPActivationType.SWIGLU7
         if activation_type == MLPActivationType.SWIGLU7:
@@ -998,7 +1032,7 @@ class TransFormerLayer(torch.nn.Module):
             num_layers=config.num_layers,
             gated_act=gated_act,
         )
-        self.mlp: MLP = MLP(mlp_config)
+        self.mlp: MLP = MLP(mlp_config, quant_config=quant_config)
         if self.post_norm:
             self.attn_post_norm = MultiModalityRMSNorm(config.hidden_size, num_modality=num_modality)
             self.mlp_post_norm = MultiModalityRMSNorm(config.hidden_size, num_modality=num_modality)
@@ -1052,11 +1086,15 @@ def config_patch(compile_config: CompileConfig) -> CompileConfig:
     config_patch=config_patch, dynamic_arg_dims={"x": 0, "rope": 0, "permute_mapping": 0, "inv_permute_mapping": 0}
 )
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, model_config: Any):
+    def __init__(
+        self,
+        model_config: Any,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.layers: list[TransFormerLayer] = nn.ModuleList()
         for layer_idx in range(model_config.num_layers):
-            self.layers.append(TransFormerLayer(model_config, layer_idx))
+            self.layers.append(TransFormerLayer(model_config, layer_idx, quant_config=quant_config))
 
     def forward(
         self,
@@ -1099,7 +1137,11 @@ class DiTModel(torch.nn.Module):
     def blocks(self) -> nn.ModuleList:
         return self.block.layers
 
-    def __init__(self, model_config: Any):
+    def __init__(
+        self,
+        model_config: Any,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         validate_magi_human_tp_constraints(
             hidden_size=model_config.hidden_size,
@@ -1124,7 +1166,7 @@ class DiTModel(torch.nn.Module):
             params_dtype=torch.float32,
         )
         self.adapter: Adapter = Adapter(adapter_config)
-        self.block: TransformerBlock = TransformerBlock(model_config=model_config)
+        self.block: TransformerBlock = TransformerBlock(model_config=model_config, quant_config=quant_config)
         self.final_norm_video = MultiModalityRMSNorm(self.config.hidden_size)
         self.final_norm_audio = MultiModalityRMSNorm(self.config.hidden_size)
         self.final_linear_video = nn.Linear(
