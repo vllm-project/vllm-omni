@@ -3344,6 +3344,27 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
 
+    def test_prepare_speech_generation_qwen3_default_seed_sets_tts_local_seed(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """Deploy default seed should seed Qwen3 TTS residual MTP sampling."""
+        qwen3_tts_server.engine_client.default_sampling_params_list = [
+            SimpleNamespace(max_tokens=2048, seed=42, extra_args=None)
+        ]
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        request = OpenAICreateSpeechRequest(input="hello")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        stage0_params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert qwen3_tts_server.engine_client.default_sampling_params_list[0].extra_args is None
+
     def test_prepare_speech_generation_uses_adapter_model_type_label(
         self,
         voxtral_server,
@@ -3428,6 +3449,48 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 
         mock_coerce.assert_called_once_with(qwen3_tts_server.engine_client.default_sampling_params_list, True)
+
+    def test_prepare_speech_generation_no_async_chunk_stream_uses_final_only(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """Full-payload TTS streaming should not request delta multimodal outputs."""
+        qwen3_tts_server.engine_client.model_config.async_chunk = False
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        mock_coerce = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
+        )
+        request = OpenAICreateSpeechRequest(input="hello", stream_format="audio", response_format="pcm")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        mock_coerce.assert_called_once_with(qwen3_tts_server.engine_client.default_sampling_params_list, False)
+
+    def test_prepare_speech_generation_no_async_chunk_stream_keeps_delta_for_non_qwen3(
+        self, voxtral_server, mocker: MockerFixture
+    ):
+        """FINAL_ONLY streaming for async_chunk=False is scoped to qwen3_tts only."""
+        voxtral_server.engine_client.model_config.async_chunk = False
+        mocker.patch.object(voxtral_server._get_tts_adapter(), "validate", return_value=None)
+        voxtral_server._build_voxtral_prompt_async = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        mock_coerce = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            return_value=voxtral_server.engine_client.default_sampling_params_list,
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", stream_format="audio", response_format="pcm")
+
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+
+        mock_coerce.assert_called_once_with(voxtral_server.engine_client.default_sampling_params_list, True)
 
     def test_prepare_speech_generation_qwen3_voicedesign_non_streaming_mode_false(
         self, qwen3_tts_server, mocker: MockerFixture

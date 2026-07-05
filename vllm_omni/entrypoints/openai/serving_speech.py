@@ -3495,12 +3495,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = request_id or f"speech-{random_uuid()}"
         qwen3_ref_audio_warmup_artifact_key: str | None = None
 
-        # If this is a streaming request, we need to coerce
-        # cumulative outputs to delta outputs; this ensures
-        # we don't emit redundant MM data & drain after emitting.
+        # If this is a streaming request with real async chunks, we need to
+        # coerce cumulative outputs to delta outputs; this ensures we don't
+        # emit redundant MM data & drain after emitting. Qwen3-TTS full-payload
+        # (async_chunk=False) has no incremental audio chunks, so keep
+        # FINAL_ONLY semantics and let the streaming response send the final
+        # waveform once. Scoped to qwen3_tts: other async_chunk=False models
+        # keep the DELTA coercion they stream with today.
         # list() makes a copy to avoid mutating the params.
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
-        is_streaming_request = request.is_streaming()
+        async_chunk = getattr(self.model_config, "async_chunk", True)
+        qwen3_full_payload = self._tts_model_type == "qwen3_tts" and not bool(async_chunk)
+        is_streaming_request = request.is_streaming() and not qwen3_full_payload
         sampling_params_list = coerce_param_message_types(sampling_params_list, is_streaming_request)
 
         # Build prompt + tts_params via the per-model adapter (RFC #4327). Every
@@ -3686,6 +3692,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if stage0_params.extra_args is None:
                 stage0_params.extra_args = {}
             stage0_params.extra_args["tts_local_seed"] = request.seed
+
+        if self._tts_model_type == "qwen3_tts" and sampling_params_list:
+            stage0_params = sampling_params_list[0]
+            default_seed = getattr(stage0_params, "seed", None)
+            if default_seed is not None:
+                import copy
+
+                sampling_params_list = copy.deepcopy(sampling_params_list)
+                stage0_params = sampling_params_list[0]
+                if stage0_params.extra_args is None:
+                    stage0_params.extra_args = {}
+                stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
 
         generator = self.engine_client.generate(
             prompt=prompt,
