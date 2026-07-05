@@ -479,7 +479,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     logits_indices,
                     spec_decode_metadata,
                     total_num_scheduled_tokens,
-                    num_scheduled_tokens_compressed_list,
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
@@ -576,7 +575,12 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
                     # but this scope is way too big and the consequences are unpredictable
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
-                        num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_mode, batch_desc.num_reqs
+                        self.query_start_loc,
+                        num_tokens_padded,
+                        num_reqs_padded,
+                        num_reqs,
+                        cudagraph_mode,
+                        batch_desc.num_reqs,
                     )
 
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
@@ -617,8 +621,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     req_ids=req_ids[:num_reqs],
-                    num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[i]) for i in range(num_reqs)],
-                    num_scheduled_tokens=[int(num_scheduled_tokens_np[i]) for i in range(num_reqs)],
+                    num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
                     input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
                 )
             #  -------------------------------------- Omni-new -------------------------------------------------
@@ -686,8 +690,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
         with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             # [Omni] Map pending ropes metadata to req_ids.
-            if hasattr(self.model, "flush_pending_metadata"):
-                self.model.flush_pending_metadata(list(req_ids))
+            flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+            if callable(flush_pending_metadata):
+                flush_pending_metadata(req_ids[:num_reqs])
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 

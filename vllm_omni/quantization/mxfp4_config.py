@@ -7,6 +7,8 @@ Architecture mirrors mxfp8_config.py:
   MXFPLinearMethodBase                    – platform-agnostic skeleton (imported from mxfp8_config)
     NPUMxfp4LinearMethod                  – NPU single-scale offline (W4A4 MXFP4)
       NPUMxfp4OnlineLinearMethod          – NPU single-scale online (BF16 → FP4)
+    ROCmMxfp4LinearMethod                 – ROCm base class (AITER quant + shuffle; online-only)
+      ROCmMxfp4OnlineLinearMethod         – ROCm online (BF16 → FP4 via AITER)
     NPUMxfp4DualScaleLinearMethod         – NPU dual-scale offline (W4A4 MXFP4 DualScale)
       NPUMxfp4DualScaleOnlineLinearMethod – NPU dual-scale online (BF16 → FP4)
 
@@ -153,9 +155,16 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 if self.is_checkpoint_mxfp4_serialized:
                     return NPUMxfp4LinearMethod(self)
                 return NPUMxfp4OnlineLinearMethod(self)
+            if current_omni_platform.is_rocm():
+                gcn_arch = torch.cuda.get_device_properties(torch.accelerator.current_device_index()).gcnArchName
+                if "gfx950" not in gcn_arch:
+                    raise NotImplementedError(f"MXFP4 on ROCm requires gfx950 (MI355X). Detected: {gcn_arch}")
+                if self.is_checkpoint_mxfp4_serialized:
+                    raise NotImplementedError("Pre-quantized MXFP4 checkpoints are not yet supported on ROCm.")
+                return ROCmMxfp4OnlineLinearMethod(self)
             raise NotImplementedError(
                 "DiffusionMXFP4Config (W4A4 MXFP4) is currently only supported "
-                "on NPU (Ascend) platforms. CUDA support is not yet implemented."
+                "on NPU (Ascend) and ROCm (AMD, gfx950) platforms."
             )
         return None
 
@@ -330,6 +339,151 @@ class NPUMxfp4OnlineLinearMethod(_LazyWeightMixin, NPUMxfp4LinearMethod):
         replace_parameter(layer, "weight", weight_fp4)
         replace_parameter(layer, "weight_scale", weight_scale)
         layer._already_called_process_weights_after_loading = True
+
+
+# ---------------------------------------------------------------------------
+# ROCm MXFP4 base method (AITER) — used as base class for the online subclass.
+# Online-only for now; offline (pre-quantized checkpoint) not yet supported.
+# ---------------------------------------------------------------------------
+
+
+def _register_rocm_mxfp4_op() -> None:
+    """Register the vllm_omni::rocm_mxfp4_gemm custom op for torch.compile.
+
+    Wraps activation quantization + GEMM in a single opaque op so that
+    torch.compile/inductor doesn't try to trace through AITER internals.
+    """
+    import aiter
+
+    @torch.library.custom_op("vllm_omni::rocm_mxfp4_gemm", mutates_args=())
+    def _rocm_mxfp4_gemm(
+        a: torch.Tensor,
+        w_quant: torch.Tensor,
+        w_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
+        a_quant, a_scale = quant_func(a, shuffle=True)
+        return aiter.gemm_a4w4(
+            a_quant,
+            w_quant,
+            a_scale,
+            w_scale,
+            bpreshuffle=True,
+            bias=bias,
+        )
+
+    @_rocm_mxfp4_gemm.register_fake
+    def _rocm_mxfp4_gemm_fake(
+        a: torch.Tensor,
+        w_quant: torch.Tensor,
+        w_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        M, _ = a.shape
+        N, _ = w_quant.shape
+        return torch.empty(M, N, dtype=a.dtype, device=a.device)
+
+
+class ROCmMxfp4LinearMethod(MXFPLinearMethodBase):
+    """ROCm W4A4 MXFP4 linear method using AITER (gemm_a4w4).
+
+    Weight buffers after process_weights_after_loading:
+      weight_shuffle : FP4 quantized + shuffled via shuffle_weight(layout=(16,16))
+      weight_scale   : per-group-of-32 scales from AITER per_1x32
+
+    Forward path:
+      _quantize_activation: pass-through (activation quant is inside the custom op)
+      _quant_matmul: torch.ops.vllm_omni.rocm_mxfp4_gemm wraps activation quant
+                     then gemm_a4w4 in one custom op
+    """
+
+    def __init__(self, quant_config: DiffusionMXFP4Config) -> None:
+        self.quant_config = quant_config
+        self.out_dtype = torch.get_default_dtype()
+        if not hasattr(torch.ops.vllm_omni, "rocm_mxfp4_gemm"):
+            _register_rocm_mxfp4_op()
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        import aiter
+        from aiter.ops.shuffle import shuffle_weight
+
+        quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
+        weight_quant, weight_scale = quant_func(layer.weight.data, shuffle=True)
+        weight_shuffled = shuffle_weight(weight_quant, layout=(16, 16))
+
+        # Store quantized tensors as non-parameter buffers; delete original weight.
+        layer.register_buffer("weight_shuffle", weight_shuffled, persistent=True)
+        layer.register_buffer("weight_scale", weight_scale, persistent=True)
+
+        # Remove the original weight parameter to free memory.
+        if hasattr(layer, "weight") and isinstance(layer.weight, torch.nn.Parameter):
+            delattr(layer, "weight")
+            layer.register_parameter("weight", None)
+
+        layer._already_called_process_weights_after_loading = True
+
+    def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Activation quantization is inside the custom op called by _quant_matmul,
+        # so pass through the raw activation here.
+        return x, None
+
+    def _quant_matmul(
+        self,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        layer: torch.nn.Module,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        output = torch.ops.vllm_omni.rocm_mxfp4_gemm(
+            x_q,
+            layer.weight_shuffle,
+            layer.weight_scale,
+            bias,
+        )
+        if output.dtype != ori_dtype:
+            output = output.to(ori_dtype)
+        return output
+
+
+# ---------------------------------------------------------------------------
+# ROCm MXFP4 online method (BF16 checkpoint → quantize at load time)
+# ---------------------------------------------------------------------------
+
+
+class ROCmMxfp4OnlineLinearMethod(_LazyWeightMixin, ROCmMxfp4LinearMethod):
+    """ROCm W4A4 MXFP4 online linear method using AITER.
+
+    MRO: ROCmMxfp4OnlineLinearMethod → _LazyWeightMixin → ROCmMxfp4LinearMethod
+         → MXFPLinearMethodBase → LinearMethodBase
+
+      create_weights  : _LazyWeightMixin          (meta device + patched loader)
+      process_weights : ROCmMxfp4OnlineLinearMethod  (meta → materialize, then AITER quant + shuffle)
+      apply / ops     : ROCmMxfp4LinearMethod / MXFPLinearMethodBase (shared)
+    """
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        # Materialise from meta device if needed (same pattern as NPU online).
+        if layer.weight is not None and layer.weight.device == torch.device("meta"):
+            weight = ModelWeightParameter(
+                data=torch.empty_like(layer.weight, device=layer._load_device),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=layer.weight.weight_loader,
+            )
+            _copy_missing_attrs(layer.weight, weight)
+            layer.register_parameter("weight", weight)
+            initialize_single_dummy_weight(layer.weight)
+
+        # Delegate to the base class which does AITER quant + shuffle.
+        ROCmMxfp4LinearMethod.process_weights_after_loading(self, layer)
 
 
 # ---------------------------------------------------------------------------

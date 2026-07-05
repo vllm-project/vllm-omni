@@ -21,6 +21,7 @@ def _make_sd3_sampling(**overrides):
         "generator": None,
         "latents": None,
         "guidance_scale": 4.0,
+        "output_type": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
