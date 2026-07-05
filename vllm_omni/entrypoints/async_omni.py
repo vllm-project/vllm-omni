@@ -209,9 +209,12 @@ class AsyncOmni(EngineClient, OmniBase):
 
     def get_diffusion_od_config(self) -> Any | None:
         """Return the diffusion-stage config when the pipeline has one."""
+        saw_diffusion_stage = False
         for stage_client in self.engine.stage_clients:
             if getattr(stage_client, "stage_type", None) != "diffusion":
                 continue
+
+            saw_diffusion_stage = True
 
             od_config = getattr(stage_client, "od_config", None)
             if od_config is not None:
@@ -221,6 +224,11 @@ class AsyncOmni(EngineClient, OmniBase):
             od_config = getattr(inner_engine, "od_config", None)
             if od_config is not None:
                 return od_config
+
+        # Out-of-process diffusion clients don't carry od_config (it lives in the
+        # worker); fall back to the engine's model_class_name resolution.
+        if saw_diffusion_stage:
+            return self.engine.get_diffusion_od_config()
 
         return None
 
