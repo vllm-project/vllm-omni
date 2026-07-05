@@ -633,6 +633,18 @@ def get_deploy_config_path(rel_path: str) -> str:
     return str(_DEPLOY_DIR / rel_path)
 
 
+def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
+    """Return one stage entry from a deploy yaml by ``stage_id``."""
+    with open(get_deploy_config_path(rel_path), encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    stage_key = "stages" if "stages" in cfg else "stage_args"
+    for stage in cfg.get(stage_key, []):
+        if stage.get("stage_id") == stage_id:
+            return stage
+    raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
+
+
 def _get_config_value_by_path(config_dict: dict, path: str) -> Any:
     """Read a dot-separated path from a nested dict (e.g. ``engine_args.load_format``)."""
     current: Any = config_dict
@@ -707,6 +719,7 @@ def stage_config_path_for_run_level(stage_config_path: str | None, run_level: st
 
 __all__ = [
     "get_deploy_config_path",
+    "get_deploy_config_stage",
     "modify_stage_config",
     "stage_config_path_for_run_level",
 ]

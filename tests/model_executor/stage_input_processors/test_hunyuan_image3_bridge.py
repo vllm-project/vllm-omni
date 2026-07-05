@@ -45,6 +45,33 @@ def test_truncate_at_cot_end_strips_tail_after_recaption_marker():
     assert text == "body text</recaption>"
 
 
+def test_ar2diffusion_returns_one_request_payload_for_request_level_batching():
+    result = ar2diffusion(
+        [_source_output([100], text="thought")],
+        prompt={"prompt": "edit"},
+    )
+
+    assert isinstance(result, dict)
+    assert result["prompt"] == "edit"
+
+
+def test_ar2diffusion_uses_parent_output_when_companions_are_present():
+    result = ar2diffusion(
+        [
+            _source_output([100], text="parent thought"),
+            _source_output([200], text="companion thought"),
+        ],
+        prompt={"prompt": "edit"},
+    )
+
+    assert result is not None
+    assert result["extra"]["ar_generated_text"] == "parent thought"
+
+
+def test_ar2diffusion_returns_none_without_parent_output():
+    assert ar2diffusion([], prompt={"prompt": "edit"}) is None
+
+
 def test_ar2diffusion_applies_ratio_and_truncates_tail_without_tokenizer(monkeypatch: pytest.MonkeyPatch):
     real_import = builtins.__import__
 
@@ -67,10 +94,10 @@ def test_ar2diffusion_applies_ratio_and_truncates_tail_without_tokenizer(monkeyp
         prompt=[{"prompt": "edit", "height": 64, "width": 64}],
     )
 
-    assert len(result) == 1
-    assert (result[0]["height"], result[0]["width"]) == (512, 2048)
-    assert result[0]["extra"]["ar_generated_text"] == "decoded without special tokens"
-    assert "ar_token_ids" not in result[0]["extra"]
+    assert result is not None
+    assert (result["height"], result["width"]) == (512, 2048)
+    assert result["extra"]["ar_generated_text"] == "decoded without special tokens"
+    assert "ar_token_ids" not in result["extra"]
 
 
 def test_ar2diffusion_forwards_custom_system_prompt_body():
@@ -88,5 +115,6 @@ def test_ar2diffusion_forwards_custom_system_prompt_body():
         ],
     )
 
-    assert result[0]["use_system_prompt"] == "custom"
-    assert result[0]["system_prompt"] == marker
+    assert result is not None
+    assert result["use_system_prompt"] == "custom"
+    assert result["system_prompt"] == marker

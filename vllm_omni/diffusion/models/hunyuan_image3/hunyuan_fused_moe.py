@@ -3,6 +3,8 @@
 
 from typing import Any
 
+import torch
+import vllm.distributed.parallel_state as _vllm_ps
 import vllm.forward_context as _vllm_fc
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
@@ -22,6 +24,30 @@ def _set_forward_context_num_tokens(num_tokens: int) -> None:
     forward_context.num_tokens = num_tokens
     if not hasattr(forward_context, "in_profile_run"):
         forward_context.in_profile_run = False
+
+
+def _set_forward_context_dp_metadata(num_tokens: int) -> None:
+    """Populate vLLM MoE DP token metadata for diffusion-only DP mappings."""
+    if not _vllm_fc.is_forward_context_available():
+        return
+    forward_context = _vllm_fc.get_forward_context()
+    if getattr(forward_context, "dp_metadata", None) is not None:
+        return
+
+    dp_group = getattr(_vllm_ps, "_DP", None)
+    if dp_group is None or getattr(dp_group, "world_size", 1) <= 1:
+        return
+
+    gathered_num_tokens: list[int | None] = [None] * dp_group.world_size
+    torch.distributed.all_gather_object(
+        gathered_num_tokens,
+        int(num_tokens),
+        group=dp_group.cpu_group,
+    )
+    if any(count is None for count in gathered_num_tokens):
+        raise RuntimeError(f"Failed to gather MoE DP token counts: {gathered_num_tokens}")
+
+    forward_context.dp_metadata = _vllm_fc.DPMetadata(torch.tensor(gathered_num_tokens, dtype=torch.int64))
 
 
 class HunyuanFusedMoEDefault:
@@ -62,6 +88,7 @@ class HunyuanFusedMoEDefault:
                 hidden_states = args[0]
             if hidden_states is not None:
                 _set_forward_context_num_tokens(hidden_states.shape[0])
+                _set_forward_context_dp_metadata(hidden_states.shape[0])
 
         moe_runner.register_forward_pre_hook(_num_tokens_pre_hook, with_kwargs=True)
 

@@ -50,6 +50,48 @@ class TestSetForwardContextNumTokens:
         mock_get.assert_not_called()
 
 
+class TestSetForwardContextDPMetadata:
+    """Test diffusion MoE DP metadata setup for vLLM 0.24 all2all dispatch."""
+
+    def test_sets_dp_metadata_from_vllm_dp_group(self, mocker):
+        import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe as hunyuan_moe
+
+        mock_ctx = mocker.MagicMock()
+        mock_ctx.dp_metadata = None
+        fake_group = mocker.MagicMock()
+        fake_group.world_size = 2
+        fake_group.cpu_group = object()
+
+        def _all_gather_object(output, obj, group):
+            assert group is fake_group.cpu_group
+            output[:] = [obj, obj + 1]
+
+        mocker.patch.object(hunyuan_moe._vllm_fc, "is_forward_context_available", return_value=True)
+        mocker.patch.object(hunyuan_moe._vllm_fc, "get_forward_context", return_value=mock_ctx)
+        mocker.patch.object(hunyuan_moe._vllm_ps, "_DP", fake_group, create=True)
+        mocker.patch.object(hunyuan_moe.torch.distributed, "all_gather_object", side_effect=_all_gather_object)
+
+        hunyuan_moe._set_forward_context_dp_metadata(1024)
+
+        assert mock_ctx.dp_metadata is not None
+        assert mock_ctx.dp_metadata.num_tokens_across_dp_cpu.tolist() == [1024, 1025]
+
+    def test_keeps_existing_dp_metadata(self, mocker):
+        import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe as hunyuan_moe
+
+        existing_metadata = object()
+        mock_ctx = mocker.MagicMock()
+        mock_ctx.dp_metadata = existing_metadata
+        mocker.patch.object(hunyuan_moe._vllm_fc, "is_forward_context_available", return_value=True)
+        mocker.patch.object(hunyuan_moe._vllm_fc, "get_forward_context", return_value=mock_ctx)
+        mock_all_gather = mocker.patch.object(hunyuan_moe.torch.distributed, "all_gather_object")
+
+        hunyuan_moe._set_forward_context_dp_metadata(1024)
+
+        assert mock_ctx.dp_metadata is existing_metadata
+        mock_all_gather.assert_not_called()
+
+
 class TestHunyuanFusedMoEPlatformDispatch:
     """Test platform dispatch via platform qualname hooks."""
 
