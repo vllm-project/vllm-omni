@@ -6,6 +6,7 @@ import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import diffusers
@@ -1486,6 +1487,13 @@ class OmniWakeTask:
 
     task_id: str
     tags: list[str] | None = None
+
+
+class CuMemTag(str, Enum):
+    """Tags representing specific CuMem allocations for sleep/wake state tracking."""
+
+    WEIGHTS = "weights"
+    KV_CACHE = "kv_cache"
 
 
 # Special message broadcast via scheduler queues to signal worker shutdown.
