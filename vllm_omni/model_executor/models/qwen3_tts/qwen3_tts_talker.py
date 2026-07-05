@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -318,6 +318,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
+        # talker_mtp samples with per-row generators, so explicitly-seeded
+        # requests stay batched instead of one scalar forward per row (#4883).
+        # Only valid while talker_mtp receives the unpadded active batch (this
+        # talker is not graph-wrapped); a padded batch would need the runner to
+        # pad the generators list as well.
+        self.talker_mtp_accepts_per_row_generators = True
 
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
@@ -1056,6 +1062,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         top_k: int | None = None,
         top_p: float | None = None,
         generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
@@ -1095,6 +1102,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             top_k=top_k,
             top_p=top_p,
             generator=generator,
+            generators=generators,
         )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.
