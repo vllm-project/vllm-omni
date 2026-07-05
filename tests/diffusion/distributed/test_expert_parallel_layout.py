@@ -19,6 +19,10 @@ class _FakeGroup:
         self.group_ranks = group_ranks
         self.parallel_mode = parallel_mode
         self.device_group = object()
+        self.device_communicator = kwargs.get("device_communicator")
+        reduce_scatter = kwargs.get("reduce_scatter")
+        if reduce_scatter is not None:
+            self.reduce_scatter = reduce_scatter
         self.ulysses_group = kwargs.get("ulysses_group")
         self.ring_group = kwargs.get("ring_group")
         self.local_group = next(group for group in group_ranks if local_rank in group)
@@ -55,6 +59,23 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
         created_groups.append(group)
         return group
 
+    def fake_init_vllm_model_parallel_group(
+        group_ranks,
+        local_rank,
+        backend,
+        group_name,
+    ):
+        del backend
+        group = _FakeGroup(
+            [list(ranks) for ranks in group_ranks],
+            local_rank,
+            f"vllm_{group_name}",
+            device_communicator=object(),
+            reduce_scatter=lambda tensor, **kwargs: tensor,
+        )
+        created_groups.append(group)
+        return group
+
     fake_world_group = SimpleNamespace(
         rank_in_group=local_rank,
         local_rank=local_rank,
@@ -68,6 +89,7 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
     monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
+    monkeypatch.setattr(parallel_state, "init_vllm_model_parallel_group", fake_init_vllm_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
     for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
@@ -87,7 +109,7 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
         backend="gloo",
     )
 
-    assert parallel_state.vllm_parallel_state._PCP is parallel_state._SP
+    assert parallel_state.vllm_parallel_state._PCP is not parallel_state._SP
     assert parallel_state.vllm_parallel_state._PCP.world_size == 2
     assert parallel_state._DP.world_size == 2
     assert parallel_state.vllm_parallel_state._DP is not parallel_state._DP
@@ -95,6 +117,13 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     assert parallel_state.vllm_parallel_state._EP.world_size == 16
     assert parallel_state.vllm_parallel_state._TP.world_size == 2
     assert parallel_state._PP.world_size == 2
+
+    assert parallel_state.vllm_parallel_state._PCP.device_communicator is not None
+    assert parallel_state.vllm_parallel_state._DP.device_communicator is not None
+    assert parallel_state.vllm_parallel_state._EP.device_communicator is not None
+    assert hasattr(parallel_state.vllm_parallel_state._PCP, "reduce_scatter")
+    assert hasattr(parallel_state.vllm_parallel_state._DP, "reduce_scatter")
+    assert hasattr(parallel_state.vllm_parallel_state._EP, "reduce_scatter")
 
     assert parallel_state.vllm_parallel_state._PCP.local_group == [0, 2]
     assert parallel_state.vllm_parallel_state._DP.local_group == [0, 8, 16, 24]
@@ -155,7 +184,9 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
         ],
     ]
 
-    ep_groups = [group.local_group for group in created_groups if group.parallel_mode == "expert"]
+    vllm_group_names = [group.parallel_mode for group in created_groups if group.parallel_mode.startswith("vllm_")]
+    assert vllm_group_names == ["vllm_pcp", "vllm_tp", "vllm_dp", "vllm_ep"]
+    ep_groups = [group.local_group for group in created_groups if group.parallel_mode == "vllm_ep"]
     assert ep_groups == [parallel_state.vllm_parallel_state._EP.local_group]
 
 
