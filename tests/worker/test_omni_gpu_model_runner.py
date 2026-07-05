@@ -81,6 +81,7 @@ class CaptureTalkerMTP(torch.nn.Module):
         top_k=None,
         top_p=None,
         generator=None,
+        generators=None,
     ):
         self.calls.append(
             {
@@ -90,6 +91,7 @@ class CaptureTalkerMTP(torch.nn.Module):
                 "top_k": top_k,
                 "top_p": top_p,
                 "generator": generator,
+                "generators": generators,
             }
         )
         codes = torch.zeros((req_embeds.shape[0], 1), dtype=torch.int64)
@@ -306,6 +308,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
             "top_k": 9,
             "top_p": 0.55,
             "generator": runner.talker_mtp.calls[0]["generator"],
+            "generators": None,
         }
     ]
     assert runner.talker_mtp.calls[0]["generator"] is not None
@@ -348,6 +351,57 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
     assert runner.talker_mtp.calls[0]["generator"] is not runner.talker_mtp.calls[1]["generator"]
     assert torch.equal(runner.talker_mtp_input_ids.gpu, saved_input_ids)
     assert torch.equal(runner.talker_mtp_inputs_embeds.gpu, saved_embeds)
+
+
+def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypatch):
+    """Models with talker_mtp_accepts_per_row_generators get one batched call (#4883)."""
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=11,
+        extra_args={"tts_local_seed": 11},
+    )
+    runner.requests["r2"].sampling_params = SimpleNamespace(
+        seed=22,
+        extra_args={"tts_local_seed": 22},
+    )
+    runner.talker_mtp = CaptureTalkerMTP()
+    runner.model = SimpleNamespace(
+        talker_mtp_output_key=("codes", "audio"),
+        talker_mtp_accepts_per_row_generators=True,
+    )
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    # One batched call with distinct per-row generators, not two scalar calls.
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    row_generators = runner.talker_mtp.calls[0]["generators"]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    assert len(row_generators) == 2
+    assert all(generator is not None for generator in row_generators)
+    assert row_generators[0] is not row_generators[1]
+
+    # The per-request generator stream persists across steps...
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+    assert runner.talker_mtp.calls[1]["generators"][0] is row_generators[0]
+    assert runner.talker_mtp.calls[1]["generators"][1] is row_generators[1]
+
+    # ...and is evicted once its request finishes.
+    del runner.requests["r2"]
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], inputs_embeds)
+    assert set(runner._talker_mtp_generators) == {"r1"}
+    assert runner.talker_mtp.calls[2]["generator"] is row_generators[0]
 
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):
