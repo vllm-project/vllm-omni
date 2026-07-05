@@ -66,6 +66,12 @@ logger = init_logger(__name__)
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
 
+# janus raises different, unrelated classes on the two sides of a shut-down
+# queue: ``ShutDown`` from the sync side (``sync_q.get``) and ``QueueShutDown``
+# from the async side (``async_q.get``). Catch both so a shut-down queue maps to
+# RuntimeError regardless of which side reads it.
+_QUEUE_SHUTDOWN_ERRORS = (janus.ShutDown, janus.QueueShutDown)
+
 
 # ============================================================================
 # Parent-EngineArgs field-routing contracts (consumed by
@@ -433,6 +439,9 @@ class AsyncOmniEngine:
                 startup_future.set_result(asyncio.get_running_loop())
             await orchestrator.run()
 
+        # Set only on a crash (in ``except``); read by ``finally`` so the fatal
+        # error is delivered to a parked reader before the queue is shut down.
+        error_text: str | None = None
         try:
             loop.run_until_complete(_run_orchestrator())
         except Exception as e:
@@ -442,19 +451,20 @@ class AsyncOmniEngine:
                 startup_future.set_exception(wrapped)
             logger.exception("[AsyncOmniEngine] Orchestrator thread crashed")
             error_text = str(e) or "Orchestrator thread crashed"
-            # On crash, wake any parked reader on each queue: enqueue the fatal
-            # message, then shutdown() (see try_get_output_async). Isolated per
-            # queue so a failure on one does not skip the other.
+            raise
+        finally:
+            # shutdown() wakes a parked ``await async_q.get()`` on ANY thread
+            # exit -- Exception, BaseException, or clean return. On a crash the
+            # fatal message is enqueued first so the caller still sees the error.
             for q in (self.output_queue, self.rpc_output_queue):
                 if q is None:
                     continue
                 try:
-                    q.sync_q.put_nowait(ErrorMessage(error=error_text, fatal=True))
+                    if error_text is not None:
+                        q.sync_q.put_nowait(ErrorMessage(error=error_text, fatal=True))
                     q.shutdown()
                 except Exception:
                     pass
-            raise
-        finally:
             try:
                 pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
                 for task in pending:
@@ -1386,7 +1396,7 @@ class AsyncOmniEngine:
         """Read one output message from the Orchestrator output queue."""
         try:
             return self.output_queue.sync_q.get(timeout=timeout)
-        except janus.QueueShutDown:
+        except _QUEUE_SHUTDOWN_ERRORS:
             # Queue shut down by a crashing orchestrator (see
             # ``_bootstrap_orchestrator``); the engine is gone.
             raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
@@ -1407,7 +1417,7 @@ class AsyncOmniEngine:
         """
         try:
             return await self.output_queue.async_q.get()
-        except janus.QueueShutDown:
+        except _QUEUE_SHUTDOWN_ERRORS:
             raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
@@ -1455,7 +1465,7 @@ class AsyncOmniEngine:
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
                 try:
                     result_msg = self.rpc_output_queue.sync_q.get(timeout=remaining)
-                except janus.QueueShutDown as exc:
+                except _QUEUE_SHUTDOWN_ERRORS as exc:
                     raise RuntimeError("Orchestrator died unexpectedly. See logs above.") from exc
                 except queue.Empty as exc:
                     raise TimeoutError(f"collective_rpc timed out after {timeout} seconds") from exc
