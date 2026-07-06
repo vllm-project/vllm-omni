@@ -902,7 +902,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
-        seq_len = hidden_states.shape[0]
+        hidden_seq_len = int(hidden_states.shape[0])
+        scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -1141,7 +1142,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                                 start=start,
                                 end=end,
                                 pass_lists_through=False,
-                                seq_len=seq_len,
+                                seq_len=hidden_seq_len,
+                                scheduled_seq_len=scheduled_seq_len,
                             )
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
