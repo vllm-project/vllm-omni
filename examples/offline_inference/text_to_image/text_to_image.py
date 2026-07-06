@@ -230,6 +230,11 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
+        "--static-eplb",
+        action="store_true",
+        help="Enable static expert parallelism loadbalance for MoE.",
+    )
+    parser.add_argument(
         "--lora-path",
         type=str,
         default=None,
@@ -413,6 +418,7 @@ def main():
         "tensor_parallel_size": args.tensor_parallel_size,
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
+        "enable_static_eplb": args.static_eplb,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",

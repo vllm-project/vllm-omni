@@ -383,7 +383,11 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
+        self.model = HunyuanImage3Model(
+            self.hf_config,
+            od_config.parallel_config.enable_static_eplb,
+            quant_config=quant_config,
+        )
         self.transformer = self.model
         # Lazy import to break circular dependency:
         # autoencoder_kl_hunyuan -> hunyuan_image3/__init__ -> pipeline_hunyuan_image3 -> autoencoder_kl_hunyuan

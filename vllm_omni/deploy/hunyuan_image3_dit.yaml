@@ -21,6 +21,7 @@ stages:
       data_parallel_size: 1
       tensor_parallel_size: 4
       enable_expert_parallel: true
+      enable_static_eplb: false
       sequence_parallel_size: 1
       ulysses_degree: 1
       ring_degree: 1
