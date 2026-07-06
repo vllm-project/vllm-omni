@@ -144,6 +144,32 @@ class ARDiffusionKVState:
             )
         return [self.kv_cache.read_cross_kv(i, is_negative) for i in range(self.num_layers)]
 
+    def fork(self, pos_request_id: str, neg_request_id: str) -> ARDiffusionKVState:
+        """Fork this session's KV state at its last committed chunk.
+
+        Forks BOTH classifier-free-guidance streams (each owns independent
+        pool blocks, so a session fork that captured only one would produce
+        a branch whose positive and negative passes disagree about history).
+        Copy-on-write at the block table: no KV bytes move. The cross-attn
+        pool state is conditioning, shared by construction; the populated
+        flags are inherited. Raises mid-chunk (uncommitted context pending).
+        """
+        for is_negative, ctx in self._paged_pending.items():
+            if ctx is not None and ctx.commit_current and ctx._allocated_video and not ctx._committed:
+                branch = "neg" if is_negative else "pos"
+                raise RuntimeError(f"cannot fork mid-chunk: uncommitted paged context pending on {branch}")
+        child_pos = self.kv_cache.fork_at_last_commit(self.pos, pos_request_id)
+        try:
+            child_neg = self.kv_cache.fork_at_last_commit(self.neg, neg_request_id)
+        except Exception:
+            self.kv_cache.end_request(child_pos)
+            raise
+        child = ARDiffusionKVState(self.kv_cache, child_pos, child_neg, self.num_layers)
+        child._committed = dict(self._committed)
+        child._cross_text_populated = dict(self._cross_text_populated)
+        child._cross_img_populated = dict(self._cross_img_populated)
+        return child
+
     def close(self) -> None:
         """Final teardown: free both branches' resident pool blocks."""
         self.kv_cache.end_request(self.pos)
