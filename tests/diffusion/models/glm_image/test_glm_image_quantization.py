@@ -569,6 +569,43 @@ class TestGlmImageTransformer2DModelQuantization:
             assert block.attn1.to_qkv.quant_config is mock_quant_config
             assert block.ff.net[0].proj.quant_config is mock_quant_config
 
+    def test_component_prefix_propagates_to_quantized_linears(self, mocker: MockerFixture):
+        """Verify component quantization can match transformer-scoped linears."""
+        from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+        mock_quant_config = mocker.MagicMock()
+        parallel_config = DiffusionParallelConfig(
+            tensor_parallel_size=1,
+            sequence_parallel_size=1,
+        )
+
+        mock_tf_config = mocker.MagicMock()
+        mock_tf_config.patch_size = 2
+        mock_tf_config.in_channels = 16
+        mock_tf_config.out_channels = 16
+        mock_tf_config.num_attention_heads = 64
+        mock_tf_config.attention_head_dim = 40
+        mock_tf_config.time_embed_dim = 512
+        mock_tf_config.condition_dim = 256
+        mock_tf_config.prior_vq_quantizer_codebook_size = 16384
+        mock_tf_config.text_embed_dim = 1024
+        mock_tf_config.num_layers = 1
+
+        mock_od_config = mocker.MagicMock(spec=OmniDiffusionConfig)
+        mock_od_config.tf_model_config = mock_tf_config
+        mock_od_config.parallel_config = parallel_config
+
+        GlmImageTransformer2DModel(
+            od_config=mock_od_config,
+            quant_config=mock_quant_config,
+            prefix="transformer",
+        )
+
+        prefixes = {call.kwargs["prefix"] for call in mock_quant_config.get_quant_method.call_args_list}
+        assert "transformer.glyph_projector.net.0.proj" in prefixes
+        assert "transformer.prior_projector.net.0.proj" in prefixes
+        assert "transformer.transformer_blocks.0.attn1.to_qkv" in prefixes
+
     def test_accepts_none_quant_config(self, mocker: MockerFixture):
         """Verify quant_config=None is accepted."""
         from vllm_omni.diffusion.data import OmniDiffusionConfig

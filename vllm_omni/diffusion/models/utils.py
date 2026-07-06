@@ -103,14 +103,16 @@ def init_parameters(
 ):
     for name, param in module.named_parameters(recurse=False):
         if param.device == torch.device("meta"):
-            new_param = nn.Parameter(
-                torch.empty_like(
-                    param.data,
-                    dtype=dtype,
-                    device=device,
-                ),
+            new_param = torch.empty_strided(
+                size=tuple(param.size()),
+                stride=tuple(param.stride()),
+                dtype=dtype or param.dtype,
+                device=device,
                 requires_grad=param.requires_grad,
             )
+            # Preserve vLLM Parameter subclasses that provide custom weight loaders.
+            new_param.__class__ = param.__class__
+            new_param.__dict__ = getattr(param, "__dict__", {}).copy()
             setattr(module, name, new_param)
     for child in module.children():
         init_parameters(child, dtype, device)

@@ -29,10 +29,8 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import (
-    ByT5Tokenizer,
-    T5EncoderModel,
-)
+from transformers import AutoConfig, ByT5Tokenizer
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -47,6 +45,8 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.utils import init_parameters
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -283,12 +283,14 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
 
         # Load text encoder (T5 for glyph embeddings)
         logger.info("Loading T5EncoderModel (glyph encoder)...")
-        self.text_encoder = T5EncoderModel.from_pretrained(
-            model_path,
-            subfolder="text_encoder",
-            local_files_only=True,
-            torch_dtype=torch.bfloat16,
-        ).to(self.device)
+        text_encoder_config = AutoConfig.from_pretrained(model_path, subfolder="text_encoder", local_files_only=True)
+        self.text_encoder = T5EncoderModel(
+            text_encoder_config,
+            prefix="text_encoder",
+            quant_config=od_config.quantization_config,
+        )
+        init_parameters(self.text_encoder, dtype=torch.bfloat16, device=self.device)
+        self.text_encoder = self.text_encoder.to(dtype=torch.bfloat16, device=self.device)
         self.text_encoder.eval()
 
         # Load tokenizer for glyph encoding
@@ -303,17 +305,28 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
 
         # Load transformer (DiT)
         logger.info("Loading GlmImageTransformer2DModel (DiT)...")
-        self.transformer = GlmImageTransformer2DModel(od_config=od_config, quant_config=od_config.quantization_config)
+        self.transformer = GlmImageTransformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+            prefix="transformer",
+        )
 
-        # Weight sources for DiT loading
+        # Weight sources for native loader-backed components.
         self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=od_config.revision,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
+            ),
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder="transformer",
                 revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            )
+            ),
         ]
 
         # Configure scale factors
@@ -407,7 +420,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         )
 
         outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
-        glyph_embeds = outputs.last_hidden_state[attention_mask.bool()].unsqueeze(0)
+        last_hidden_state = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+        glyph_embeds = last_hidden_state[attention_mask.bool()].unsqueeze(0)
 
         return glyph_embeds.to(device=device, dtype=dtype)
 
@@ -905,9 +919,5 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load transformer weights."""
-        transformer_weights = (
-            (name.replace("transformer.", "", 1), weight) for name, weight in weights if name.startswith("transformer.")
-        )
-        loaded = self.transformer.load_weights(transformer_weights)
-        return {f"transformer.{name}" for name in loaded}
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
