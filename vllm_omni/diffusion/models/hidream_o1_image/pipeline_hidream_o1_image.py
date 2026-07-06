@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HiDream-O1-Image pipeline — Phase 2 (text-to-image + image editing +
-multi-reference personalization, single GPU, no Cache-DiT / TP / SP yet).
+"""HiDream-O1-Image pipeline — Phase 3 (text-to-image + image editing +
+multi-reference personalization + layout-bbox conditioning, single GPU,
+no Cache-DiT / TP / SP yet).
 
-Phase 1 added text-to-image. Phase 2 extends it with reference-image
-conditioning via HiDream-O1's dual-pathway: semantic conditioning through the
-Qwen3-VL vision tower (with DeepStack intermediate feature injection) and
-pixel-level conditioning through raw pixel patches appended to the noise
-latent.
+Phase 1 added text-to-image. Phase 2 added reference-image conditioning
+(dual-pathway: Qwen3-VL vision tower + pixel patches). Phase 3 adds
+layout-bbox conditioning: bounding boxes are rendered as a synthetic layout
+image and appended to the ref-image list, reusing the Phase 2 path unchanged.
 """
 
 from __future__ import annotations
@@ -35,9 +35,11 @@ from vllm_omni.diffusion.models.hidream_o1_image.utils_hidream_o1 import (
     adaptive_ref_max_size,
     build_packed_attention_metadata,
     calculate_dimensions,
+    create_layout_reference_images,
     depatchify,
     find_closest_resolution,
     get_rope_index_fix_point,
+    load_layout_bboxes,
     patchify,
     preprocess_ref_patches,
     resize_pilimage,
@@ -590,6 +592,14 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
         scheduler_name = sp.extra_args.get("scheduler_name", "default")
         noise_scale = sp.extra_args.get("noise_scale", DEFAULT_NOISE_SCALE)
         seed = sp.seed if sp.seed is not None else 42
+
+        # Layout-bbox conditioning (Phase 3): if layout_bboxes are provided,
+        # augment ref_pils with bordered versions + a layout image.  The
+        # augmented list is then handled identically to regular multi-ref input.
+        raw_layout = mm_data.get("layout_bboxes")
+        if raw_layout is not None and ref_pils is not None:
+            layout_data = load_layout_bboxes(raw_layout) if isinstance(raw_layout, str) else raw_layout
+            ref_pils = create_layout_reference_images(ref_pils, layout_data, width, height)
 
         latents = self.diffuse(
             prompt=prompt,
