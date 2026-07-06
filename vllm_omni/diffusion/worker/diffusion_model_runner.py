@@ -392,7 +392,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
-            is_dummy = "dummy" in req.request_ids[0] if req.request_ids else False
+            is_dummy = req.is_dummy_run
 
             if isinstance(self.cache_backend, InterRequestCacheBackend) and self.cache_backend.is_enabled():
                 self.cache_backend.before_forward(is_dummy=is_dummy)
