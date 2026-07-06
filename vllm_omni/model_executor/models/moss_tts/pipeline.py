@@ -31,7 +31,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_async_chunk"),
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_delay_async_chunk"),
             sampling_constraints={
                 "detokenize": False,
             },
@@ -62,7 +62,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_async_chunk"),
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(
@@ -91,8 +91,11 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_async_chunk"),
-            sampling_constraints={"detokenize": False},
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [151645],
+            },
         ),
         StagePipelineConfig(
             stage_id=1,
