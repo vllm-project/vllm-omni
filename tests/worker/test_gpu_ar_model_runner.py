@@ -480,6 +480,52 @@ def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_onl
     assert torch.equal(output.inter_stage_outputs[2]["codes.audio"], codes[2:3])
 
 
+def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monkeypatch):
+    """Thinker mm rows align to hidden_states.shape[0], not padded scheduled count."""
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.model.omni_pooler_payload_include_hidden = False
+    runner._async_chunk = False
+    runner.requests = {"r1": object(), "r2": object(), "r3": object()}
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    layers = torch.arange(96, dtype=torch.long).reshape(3, 32)
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=5,
+            num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
+        ),
+        hidden_states=torch.randn(3, 4),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"hidden_states": {"layers": {0: layers}}},
+        req_ids_output_copy=["r1", "r2", "r3"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
+        valid_sampled_token_ids=[[101], [102], [103]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.long),
+    )
+
+    assert output.inter_stage_outputs is not None
+    assert torch.equal(output.inter_stage_outputs[0]["hidden_states.layer_0"], layers[0:1])
+    assert torch.equal(output.inter_stage_outputs[1]["hidden_states.layer_0"], layers[1:2])
+    assert torch.equal(output.inter_stage_outputs[2]["hidden_states.layer_0"], layers[2:3])
+
+
 def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
     runner = _make_async_output_runner()
     runner.model.omni_pooler_payload_include_hidden = False
