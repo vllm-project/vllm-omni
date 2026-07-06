@@ -31,6 +31,11 @@ _SKIP_SECTIONS = {
     "Prerequisites",
     "Advanced Features",
     "FAQ",
+    # VACE conditional tasks are covered by test_vace_video_generation.py, which
+    # runs the same README snippets with synthetic assets and smoke settings. The
+    # prep block here downloads inputs via wget (not portable, not collected), so
+    # exercising this section from the shared runner would only duplicate and fail.
+    "Wan2.1 VACE Conditional Tasks",
 }
 
 
