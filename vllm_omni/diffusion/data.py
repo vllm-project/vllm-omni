@@ -961,6 +961,10 @@ class OmniDiffusionConfig:
                 "valid together with diffusion_load_format=diffusers"
             )
 
+    @property
+    def is_single_file(self) -> bool:
+        return isinstance(self.model, str) and os.path.isfile(self.model)
+
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
         if tf_config.quant_config is None:
             return
@@ -1049,9 +1053,19 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
+        from vllm_omni.diffusion.registry import resolve_native_single_file
+
         # Default model_class_name for diffusers adapter
         if self.model_class_name is None and self.diffusion_load_format == "diffusers":
             self.model_class_name = "DiffusersAdapterPipeline"
+
+        native_single_file_model = resolve_native_single_file(self.model_class_name)
+        if self.is_single_file and native_single_file_model is not None:
+            self.diffusion_load_format = "default"
+            self.model_class_name = native_single_file_model
+            self.diffusers_pipeline_cls = None
+            self.set_tf_model_config(TransformerConfig())
+            return
 
         try:
             config_dict = get_hf_file_to_dict("model_index.json", self.model)

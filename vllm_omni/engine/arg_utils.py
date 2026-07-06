@@ -145,9 +145,9 @@ class OmniEngineArgs(EngineArgs):
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
         log_stats: Whether to log engine statistics. Defaults to False.
-        custom_pipeline_args: Dictionary of arguments for custom pipeline
-            initialization (e.g., ``{"pipeline_class": "my.Module"}``).
-            Passed through to the diffusion stage engine.
+        custom_pipeline_args: Dictionary of arguments passed through to the
+            diffusion pipeline. When it contains ``pipeline_class``, it triggers
+            custom pipeline initialization.
     """
 
     stage_id: int = 0

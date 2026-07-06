@@ -99,6 +99,28 @@ class TestWorkerWrapperBaseInitialization:
             skip_load_model=False,
         )
 
+    def test_custom_pipeline_args_without_pipeline_class_loads_normally(self, mocker: MockerFixture, mock_od_config):
+        """Test native pipeline args do not trigger custom pipeline re-initialization."""
+        custom_args = {"components_path": "/tmp/anima-components"}
+        mock_worker_init = mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
+
+        wrapper = WorkerWrapperBase(
+            gpu_id=0,
+            od_config=mock_od_config,
+            base_worker_class=DiffusionWorker,
+            custom_pipeline_args=custom_args,
+        )
+
+        assert wrapper.worker_extension_cls is None
+        assert CustomPipelineWorkerExtension not in wrapper.worker.__class__.__bases__
+        assert not hasattr(wrapper.worker, "re_init_pipeline")
+        mock_worker_init.assert_called_once_with(
+            local_rank=0,
+            rank=0,
+            od_config=mock_od_config,
+            skip_load_model=False,
+        )
+
 
 # -------------------------------------------------------------------------
 # Tests: Worker Extension Functionality
@@ -480,6 +502,12 @@ class TestCustomPipelineWorkerExtension:
             custom_pipeline_args=custom_args,
         )
 
+        mock_worker_class.assert_called_once_with(
+            local_rank=0,
+            rank=0,
+            od_config=mock_od_config,
+            skip_load_model=True,
+        )
         # Verify re_init_pipeline was called with custom_pipeline_args
         mock_worker_instance.re_init_pipeline.assert_called_once_with(custom_args)
 

@@ -29,6 +29,21 @@ _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
 }
 
 
+def _should_use_default_stage_for_native_single_file(
+    model: str,
+    kwargs: dict | None,
+    default_stage_cfg_factory: Any,
+) -> bool:
+    if default_stage_cfg_factory is None or not isinstance(model, str):
+        return False
+    if not isinstance(kwargs, dict):
+        return False
+
+    from vllm_omni.diffusion.registry import resolve_native_single_file
+
+    return resolve_native_single_file(kwargs.get("model_class_name")) is not None and os.path.isfile(model)
+
+
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
     """Inject connector configuration into stage engine arguments."""
     # Prepare omni_kv_config dict
@@ -565,18 +580,23 @@ def load_and_resolve_stage_configs(
             else:
                 stage_configs = []
     elif stage_configs_path is None:
-        config_path = resolve_model_config_path(model)
-        stage_configs = load_stage_configs_from_model(
-            model,
-            base_engine_args=kwargs,
-            stage_overrides=stage_overrides,
-        )
-        if not stage_configs:
-            if default_stage_cfg_factory is not None:
-                default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
-            else:
-                stage_configs = []
+        if _should_use_default_stage_for_native_single_file(model, kwargs, default_stage_cfg_factory):
+            config_path = None
+            default_stage_cfg = default_stage_cfg_factory()
+            stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
+        else:
+            config_path = resolve_model_config_path(model)
+            stage_configs = load_stage_configs_from_model(
+                model,
+                base_engine_args=kwargs,
+                stage_overrides=stage_overrides,
+            )
+            if not stage_configs:
+                if default_stage_cfg_factory is not None:
+                    default_stage_cfg = default_stage_cfg_factory()
+                    stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
+                else:
+                    stage_configs = []
     else:
         config_path = stage_configs_path
         stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)

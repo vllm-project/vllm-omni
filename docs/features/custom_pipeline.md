@@ -21,7 +21,7 @@ Three main features enable custom pipeline extension:
 
 **Key capabilities:**
 - Dynamic worker class extension via `worker_extension_cls`
-- Support for custom pipeline initialization via `custom_pipeline_args`
+- Support for custom pipeline initialization via `custom_pipeline_args["pipeline_class"]`
 - Method delegation to underlying worker
 - Attribute access forwarding
 
@@ -150,6 +150,7 @@ omni = Omni(
     },
     worker_extension_cls=MyCustomExtension,
     # Note: worker_extension_cls is an internal parameter
-    # CustomPipelineWorkerExtension will automatically init pipeline when custom_pipeline_args is provided
+    # CustomPipelineWorkerExtension will automatically init pipeline when
+    # custom_pipeline_args includes "pipeline_class".
 )
 ```

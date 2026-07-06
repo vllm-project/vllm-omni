@@ -328,6 +328,42 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
 
+    @pytest.mark.parametrize("model_class_name", ["AnimaPipeline", "AnimaModularPipeline"])
+    def test_native_anima_checkpoint_uses_default_diffusion_stage_without_model_config(
+        self, tmp_path, mocker: MockerFixture, model_class_name: str
+    ):
+        checkpoint = tmp_path / "anima-base-v1.0.safetensors"
+        checkpoint.write_text("dummy")
+        model_path = str(checkpoint)
+        kwargs = {
+            "model_class_name": model_class_name,
+            "custom_pipeline_args": {"components_path": "/tmp/anima-components"},
+        }
+
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.resolve_model_config_path",
+            side_effect=AssertionError("native Anima checkpoints should not require model config discovery"),
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+            side_effect=AssertionError("native Anima checkpoints should use the default stage factory"),
+        )
+
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model=model_path,
+            stage_configs_path=None,
+            kwargs=kwargs,
+            default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
+        )
+
+        engine_args = stage_configs[0]["engine_args"]
+        assert config_path is None
+        assert len(stage_configs) == 1
+        assert engine_args["model_stage"] == "diffusion"
+        assert engine_args["model_class_name"] == model_class_name
+        assert engine_args["diffusion_load_format"] == "default"
+        assert engine_args["custom_pipeline_args"] == kwargs["custom_pipeline_args"]
+
     def test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas(
         self, tmp_path, mocker: MockerFixture
     ):

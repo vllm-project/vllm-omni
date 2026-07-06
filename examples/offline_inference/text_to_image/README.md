@@ -195,6 +195,23 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --auxiliary-text-encoder meta-llama/Meta-Llama-3.1-8B-Instruct \
   --output /output.png
 ```
+### Anima Single-File Checkpoints
+
+To load Anima, point `--model` to the single-file checkpoint path, pass the native pipeline class name using `--model-class-name`, and supply the converted components directory using `--custom-pipeline-args`:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model /path/to/models/anima-official/split_files/diffusion_models/anima-base-v1.0.safetensors \
+  --model-class-name AnimaPipeline \
+  --custom-pipeline-args '{"components_path": "/path/to/models/anima-components"}' \
+  --prompt "A cinematic close-up of a glass teapot on a wooden table." \
+  --seed 42 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --height 1024 \
+  --width 1024 \
+  --output anima_output.png
+```
 
 ### Batch Requests (Multiple Prompts)
 
