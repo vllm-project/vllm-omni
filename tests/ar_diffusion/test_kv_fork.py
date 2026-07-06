@@ -152,9 +152,7 @@ class TestForkWriteIsolationGPU:
     def test_child_divergence_does_not_touch_parent_bytes(self):
         device = torch.device("cuda")
         cfg = ARDiffusionKVConfig(enable=True, chunk_size=16, window_chunks=4)
-        kv = ARDiffusionKVCache(
-            cfg, max_model_len=4096, available_bytes=1 << 24, device=device, **DIMS
-        )
+        kv = ARDiffusionKVCache(cfg, max_model_len=4096, available_bytes=1 << 24, device=device, **DIMS)
         chunk_kv_shape = (1, cfg.chunk_size, DIMS["num_kv_heads"], DIMS["head_size"])
 
         def write_chunk(adapter, fill):
