@@ -150,9 +150,19 @@ class ARDiffusionKVState:
         Forks BOTH classifier-free-guidance streams (each owns independent
         pool blocks, so a session fork that captured only one would produce
         a branch whose positive and negative passes disagree about history).
-        Copy-on-write at the block table: no KV bytes move. The cross-attn
-        pool state is conditioning, shared by construction; the populated
-        flags are inherited. Raises mid-chunk (uncommitted context pending).
+        Copy-on-write at the block table: no KV bytes move. Raises mid-chunk
+        (uncommitted context pending).
+
+        Cross-attention handling: the cross-attn pool is a single engine-wide
+        buffer, not per session. The TEXT half is prompt-derived and identical
+        across a session's branches, so its populated flags are inherited.
+        The IMAGE half (I2V) is observation-derived and diverges after a
+        fork, so its flags are invalidated on BOTH the child and the parent:
+        each branch re-projects image conditioning from its own next
+        observation before reading. This makes fork safe under a
+        run-one-branch-at-a-time execution contract; INTERLEAVING sibling
+        forwards with I2V conditioning still contends on the shared pool and
+        needs per-session cross buffers (session-memory manager territory).
         """
         for is_negative, ctx in self._paged_pending.items():
             if ctx is not None and ctx.commit_current and ctx._allocated_video and not ctx._committed:
@@ -167,7 +177,8 @@ class ARDiffusionKVState:
         child = ARDiffusionKVState(self.kv_cache, child_pos, child_neg, self.num_layers)
         child._committed = dict(self._committed)
         child._cross_text_populated = dict(self._cross_text_populated)
-        child._cross_img_populated = dict(self._cross_img_populated)
+        child._cross_img_populated = {False: False, True: False}
+        self._cross_img_populated = {False: False, True: False}
         return child
 
     def close(self) -> None:

@@ -210,7 +210,28 @@ class TestSessionFork:
         child = state.fork("pos.b0", "neg.b0")
         assert resident(kv, child.pos) == resident(kv, state.pos)
         assert resident(kv, child.neg) == resident(kv, state.neg)
+        # Text conditioning is prompt-derived and branch-invariant: inherited.
         assert child._cross_text_populated == state._cross_text_populated
+
+        child.close()
+        state.close()
+
+    def test_fork_invalidates_image_conditioning_on_both_branches(self):
+        # The image cross-attn pool is engine-wide, not per session. If a
+        # forked branch kept _cross_img_populated=True, it would skip
+        # repopulation and silently read whichever branch last wrote the
+        # shared pool. Fork must force BOTH branches to re-project image
+        # conditioning from their own next observation.
+        kv = make_cache()
+        state = ARDiffusionKVState(kv, kv.begin_request("pos"), kv.begin_request("neg"), num_layers=2)
+        run_chunks(kv, state.pos, 1)
+        run_chunks(kv, state.neg, 1)
+        state._cross_text_populated = {False: True, True: True}
+        state._cross_img_populated = {False: True, True: True}
+
+        child = state.fork("pos.b0", "neg.b0")
+        assert child._cross_img_populated == {False: False, True: False}
+        assert state._cross_img_populated == {False: False, True: False}
 
         child.close()
         state.close()
