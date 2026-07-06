@@ -1323,7 +1323,7 @@ steps:
                   - name: hf-cache
                     hostPath:
                       path: /mnt/hf-cache
-                      type: DirectoryOrCreate        
+                      type: DirectoryOrCreate
 
       - label: ":full_moon: Diffusion X2V · Other Function Test"
         timeout_in_minutes: 90
