@@ -512,6 +512,21 @@ def init_model_parallel_group(
         )
 
 
+def init_vllm_model_parallel_group(
+    group_ranks: list[list[int]],
+    local_rank: int,
+    backend: str,
+    group_name: str,
+) -> vllm_parallel_state.GroupCoordinator:
+    return vllm_parallel_state.init_model_parallel_group(
+        group_ranks=group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        group_name=group_name,
+        use_device_communicator=True,
+    )
+
+
 def init_dit_group(
     dit_parallel_size: int,
     backend: str,
@@ -838,23 +853,40 @@ def initialize_model_parallel(
     if use_moe_parallel_mapping:
         # Diffusion normally uses its own SP group. Map it to vLLM PCP only for
         # expert-parallel runtimes that rely on vLLM FusedMoE group semantics.
-        vllm_parallel_state._PCP = _SP
+        # vLLM 0.24 MoE kernels require GroupCoordinator.device_communicator
+        # and reduce_scatter(), which the diffusion SP coordinator intentionally
+        # does not own. Keep the rank layout but build a vLLM coordinator.
+        vllm_parallel_state._PCP = init_vllm_model_parallel_group(
+            group_ranks=sp_group_ranks,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            group_name="pcp",
+        )
 
     assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
-    vllm_parallel_state._TP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("tp"),
-        local_rank=get_world_group().local_rank,
-        backend=backend,
-        parallel_mode="tensor",
-    )
-    if use_moe_parallel_mapping and cfg_parallel_size > 1:
+    tp_group_ranks = rank_generator.get_ranks("tp")
+    if use_moe_parallel_mapping:
+        vllm_parallel_state._TP = init_vllm_model_parallel_group(
+            group_ranks=tp_group_ranks,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            group_name="tp",
+        )
+    else:
+        vllm_parallel_state._TP = init_model_parallel_group(
+            group_ranks=tp_group_ranks,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="tensor",
+        )
+    if use_moe_parallel_mapping:
         # CFG is a diffusion-specific replica dimension. Fold it into vLLM DP
         # only when constructing the vLLM EP layout for expert-parallel paths.
-        vllm_parallel_state._DP = init_model_parallel_group(
+        vllm_parallel_state._DP = init_vllm_model_parallel_group(
             group_ranks=rank_generator.get_ranks("cfg-dp"),
             local_rank=get_world_group().local_rank,
             backend=backend,
-            parallel_mode="data",
+            group_name="dp",
         )
 
     global _FS, _EXPERT_PARALLEL_GROUP_RANKS
@@ -869,11 +901,11 @@ def initialize_model_parallel(
     _EXPERT_PARALLEL_GROUP_RANKS = None
     if use_moe_parallel_mapping:
         ep_group_ranks = rank_generator.get_ranks("tp-sp-cfg-dp")
-        vllm_parallel_state._EP = init_model_parallel_group(
+        vllm_parallel_state._EP = init_vllm_model_parallel_group(
             group_ranks=ep_group_ranks,
             local_rank=get_world_group().local_rank,
             backend=backend,
-            parallel_mode="expert",
+            group_name="ep",
         )
         _EXPERT_PARALLEL_GROUP_RANKS = ep_group_ranks
 
