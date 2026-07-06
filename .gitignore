@@ -208,6 +208,7 @@ cache/
 .cache/
 diffusion_cache/
 kv_cache/
+!vllm_omni/experimental/ar_diffusion/kv_cache/
 
 # Logs
 logs/

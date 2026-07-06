@@ -3,6 +3,9 @@
 # Real-time streaming TTS with TTFB ~180 ms and LLM+TTS first-sentence ~377 ms.
 # Uses local depth transformer (no delay warm-up) — lowest latency variant.
 async_chunk: true
+# OpenMOSS-Team/MOSS-TTS-Realtime ships custom modeling code; the newer vLLM
+# ModelConfig hard-rejects it at validation without this (was lenient before).
+trust_remote_code: true
 
 connectors:
   shm:

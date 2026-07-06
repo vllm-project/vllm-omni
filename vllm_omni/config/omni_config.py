@@ -180,15 +180,17 @@ def _first_defined(*values: Any) -> Any:
 
 
 def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
-    if deploy.async_chunk and not any(
-        stage.async_chunk_process_next_stage_input_func or stage.custom_process_next_stage_input_func
-        for stage in pipeline.stages
+    has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
+    if (
+        deploy.async_chunk
+        and has_inter_stage_edges
+        and not any(stage.async_chunk_process_next_stage_input_func for stage in pipeline.stages)
     ):
         raise ValueError(
             f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a next-stage input processor "
-            "(``async_chunk_process_next_stage_input_func`` or ``custom_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk processor on the pipeline."
+            "declares a dedicated async-chunk next-stage processor "
+            "(``async_chunk_process_next_stage_input_func``). "
+            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
         )
 
 
@@ -353,6 +355,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
+    vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
@@ -362,6 +365,11 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
         self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
+        if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:
+            raise ValueError(
+                "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+                f"but got {self.vae_parallel_mode!r}."
+            )
 
         other_parallel_world_size = (
             self.pipeline_parallel_size

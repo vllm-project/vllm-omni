@@ -407,6 +407,47 @@ class TestOmniSleepMode:
             diffusion_engine.shutdown()
             await asyncio.sleep(1)
 
+    @pytest.mark.asyncio
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    async def test_level2_sleep_wake_raises(self, llm_engine: AsyncOmni):
+        """Regression for #4473 Repro A: wake_up() after sleep(level=2) must raise
+        NotImplementedError instead of silently producing corrupted output."""
+        try:
+            await llm_engine.sleep(stage_ids=[0], level=2)
+            with pytest.raises(NotImplementedError, match="sleep\\(level=2\\)"):
+                await llm_engine.wake_up(stage_ids=[0])
+        finally:
+            llm_engine.shutdown()
+
+    @pytest.mark.asyncio
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    async def test_partial_wake_blocks_generate(self, llm_engine: AsyncOmni):
+        """Regression for #4473 Repro B: generate() must be rejected if kv_cache
+        is still asleep after wake_up(tags=["weights"]), instead of crashing with
+        CUDA illegal memory access."""
+        try:
+            await llm_engine.sleep(stage_ids=[0], level=1)
+            await llm_engine.wake_up(stage_ids=[0], tags=["weights"])
+            with pytest.raises(RuntimeError, match="partially or fully asleep"):
+                async for _ in llm_engine.generate("test", sampling_params=SamplingParams(max_tokens=4)):
+                    pass
+        finally:
+            llm_engine.shutdown()
+
+    @pytest.mark.asyncio
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    async def test_duplicate_wake_is_idempotent(self, llm_engine: AsyncOmni):
+        """Regression for #4473 Repro C: duplicate wake_up(tags=None) must be a
+        safe no-op instead of raising a cumem CUDA invalid argument error."""
+        try:
+            await llm_engine.sleep(stage_ids=[0], level=1)
+            first_acks = await llm_engine.wake_up(stage_ids=[0])
+            assert len(first_acks) > 0, "First wake_up() should return ACKs"
+            second_acks = await llm_engine.wake_up(stage_ids=[0])
+            assert second_acks == [], f"Duplicate wake_up() should return [] but got {second_acks}"
+        finally:
+            llm_engine.shutdown()
+
 
 # ---------------------------------------------------------------------------
 # H100 (or MI325) e2e: BAGEL / pure diffusion, multi-TP

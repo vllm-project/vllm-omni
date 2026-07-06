@@ -172,6 +172,8 @@ class OmniEngineArgs(EngineArgs):
     # in __post_init__ based on worker_type (ar/generation), so None is safe here.
     enable_sleep_mode: bool = False
     omni: bool = False
+    # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
+    request_batch_max_wait_ms: float = 0.0
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -438,6 +440,7 @@ class OrchestratorArgs:
 
     # === Observability ===
     log_stats: bool = False
+    enable_orch_monitor: bool = False
 
     # === Headless Mode (also forwarded to engine — see SHARED_FIELDS) ===
     stage_id: int | None = None
@@ -477,6 +480,7 @@ class OrchestratorArgs:
     diffusion_kv_cache_skip_layers: str | None = None
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
+    vae_parallel_mode: str = "tile"
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

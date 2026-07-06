@@ -208,6 +208,7 @@ def _test_cfg_parallel_worker(
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             cfg_normalize=test_config["cfg_normalize"],
+            kwargs=test_config["kwargs"],
         )
 
     # CFG parallel returns the combined prediction on every rank.
@@ -284,6 +285,7 @@ def _test_cfg_sequential_worker(
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             cfg_normalize=test_config["cfg_normalize"],
+            kwargs=test_config["kwargs"],
         )
 
     # Sequential CFG always returns output
@@ -297,7 +299,10 @@ def _test_cfg_sequential_worker(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype, batch_size: int, cfg_normalize: bool):
+@pytest.mark.parametrize("kwargs", [None, {"step_i": 1}])
+def test_predict_noise_maybe_with_cfg(
+    cfg_parallel_size: int, dtype: torch.dtype, batch_size: int, cfg_normalize: bool, kwargs: dict | None
+):
     """
     Test that predict_noise_maybe_with_cfg produces identical results
     with and without CFG parallel.
@@ -322,6 +327,7 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
         "cfg_normalize": cfg_normalize,
         "model_seed": 42,  # Fixed seed for model initialization
         "input_seed": 123,  # Fixed seed for input generation
+        "kwargs": kwargs,  # Additional kwargs to test passing through CFG parallel
     }
 
     mp_context = torch.multiprocessing.get_context("spawn")

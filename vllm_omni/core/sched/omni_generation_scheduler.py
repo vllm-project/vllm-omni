@@ -56,7 +56,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """Diffusion fast path:
         - Feed all input tokens of the request at once
           (if 0, allocate 1 placeholder token).
@@ -217,7 +217,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     scheduler_requests=self.requests,
                 )
             else:
-                res = super().schedule()
+                res = super().schedule(throttle_prefills)
                 if self.input_coordinator:
                     self.input_coordinator.restore_queues(self.waiting, self.running)
                 return self._wrap_omni_scheduler_output(res)
