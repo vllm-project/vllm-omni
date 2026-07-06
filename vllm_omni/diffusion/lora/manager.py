@@ -298,10 +298,13 @@ class DiffusionLoRAManager:
                 "Detected single-file (non-PEFT) LoRA at %s; converting to PEFT layout in memory",
                 single_file,
             )
+            raw_tensors = load_file(single_file)
             peft_config, single_file_tensors = convert_single_file_lora(
-                load_file(single_file),
+                raw_tensors,
                 self._expected_lora_modules,
             )
+            # Release the unconverted state dict early to reduce peak memory.
+            del raw_tensors
             peft_helper = PEFTHelper.from_dict(peft_config)
         else:
             peft_helper = PEFTHelper.from_local_dir(

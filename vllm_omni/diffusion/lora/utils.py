@@ -8,6 +8,7 @@ import os
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
+from vllm.logger import init_logger
 
 from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.layers import (
@@ -18,6 +19,8 @@ from vllm_omni.diffusion.lora.layers import (
     DiffusionReplicatedLinearWithLoRA,
     DiffusionRowParallelLinearWithLoRA,
 )
+
+logger = init_logger(__name__)
 
 
 def _match_target_modules(module_name: str, target_modules: list[str]) -> bool:
@@ -78,12 +81,12 @@ def find_single_file_lora(lora_path: str) -> str | None:
     ``adapter_config.json`` (i.e. not a PEFT adapter directory).
     Returns None when the path should be handled by the PEFT loader.
     """
-    if os.path.isfile(lora_path) and lora_path.endswith(".safetensors"):
+    if os.path.isfile(lora_path) and lora_path.lower().endswith(".safetensors"):
         return lora_path
     if os.path.isdir(lora_path):
         if os.path.isfile(os.path.join(lora_path, "adapter_config.json")):
             return None
-        candidates = [f for f in os.listdir(lora_path) if f.endswith(".safetensors")]
+        candidates = [f for f in os.listdir(lora_path) if f.lower().endswith(".safetensors")]
         if len(candidates) == 1:
             return os.path.join(lora_path, candidates[0])
     return None
@@ -166,6 +169,7 @@ def convert_single_file_lora(
     converted: dict[str, torch.Tensor] = {}
     target_modules: set[str] = set()
     unmatched: list[str] = []
+    ranks: set[int] = set()
     max_rank = 0
     for path, parts in sorted(modules.items()):
         if "lora_A" not in parts or "lora_B" not in parts:
@@ -175,6 +179,7 @@ def convert_single_file_lora(
             unmatched.append(path)
             continue
         rank = parts["lora_A"].shape[0]
+        ranks.add(rank)
         max_rank = max(max_rank, rank)
         lora_b = parts["lora_B"]
         alpha = parts.get("alpha")
@@ -192,6 +197,13 @@ def convert_single_file_lora(
         )
     if not converted:
         raise ValueError("Single-file LoRA checkpoint contains no LoRA modules.")
+    if len(ranks) > 1:
+        logger.warning(
+            "Single-file LoRA has mixed ranks %s; using r=%d (max) in the synthesized "
+            "PEFT config. Per-module scaling stays exact because alpha is folded per module.",
+            sorted(ranks),
+            max_rank,
+        )
 
     peft_config = {
         "r": max_rank,

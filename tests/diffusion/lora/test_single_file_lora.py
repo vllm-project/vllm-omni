@@ -113,3 +113,34 @@ def test_find_single_file_lora(tmp_path):
     (tmp_path / "adapter_config.json").unlink()
     save_file({"x": torch.zeros(1)}, str(tmp_path / "other.safetensors"))
     assert find_single_file_lora(str(tmp_path)) is None
+
+
+def test_find_single_file_lora_case_insensitive(tmp_path):
+    ckpt = tmp_path / "ADAPTER.SAFETENSORS"
+    save_file({"x": torch.zeros(1)}, str(ckpt))
+    assert find_single_file_lora(str(ckpt)) == str(ckpt)
+    assert find_single_file_lora(str(tmp_path)) == str(ckpt)
+
+
+def test_convert_mixed_ranks_uses_max_and_keeps_per_module_scale():
+    sd = {
+        "transformer_blocks.0.attn.to_q.lora_down.weight": torch.randn(4, _DIM),
+        "transformer_blocks.0.attn.to_q.lora_up.weight": torch.randn(_DIM, 4),
+        "transformer_blocks.0.attn.to_q.alpha": torch.tensor(2.0),
+        "transformer_blocks.0.attn.to_k.lora_down.weight": torch.randn(8, _DIM),
+        "transformer_blocks.0.attn.to_k.lora_up.weight": torch.randn(_DIM, 8),
+        "transformer_blocks.0.attn.to_k.alpha": torch.tensor(2.0),
+    }
+    config, tensors = convert_single_file_lora(sd, _EXPECTED_MODULES | {"to_k"})
+    # The synthesized config advertises the max rank...
+    assert config["r"] == 8
+    assert config["lora_alpha"] == 8
+    # ...while each module keeps its exact alpha/rank scaling folded into lora_B.
+    torch.testing.assert_close(
+        tensors["base_model.model.transformer_blocks.0.attn.to_q.lora_B.weight"],
+        sd["transformer_blocks.0.attn.to_q.lora_up.weight"] * (2.0 / 4),
+    )
+    torch.testing.assert_close(
+        tensors["base_model.model.transformer_blocks.0.attn.to_k.lora_B.weight"],
+        sd["transformer_blocks.0.attn.to_k.lora_up.weight"] * (2.0 / 8),
+    )
