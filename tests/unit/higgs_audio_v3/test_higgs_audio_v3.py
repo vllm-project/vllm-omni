@@ -1342,9 +1342,7 @@ class TestVoiceCloneReferenceCache:
             "try_to_load_from_cache",
             lambda **_: str(subdir / "config.json"),
         )
-        monkeypatch.setattr(
-            hub_constants, "HF_HUB_CACHE", str(tmp_path / "empty_cache")
-        )
+        monkeypatch.setattr(hub_constants, "HF_HUB_CACHE", str(tmp_path / "empty_cache"))
 
         assert tok._normalize_audio_tokenizer_dir(str(parent)) is None
         assert tok._resolve_audio_tokenizer_dir() is None

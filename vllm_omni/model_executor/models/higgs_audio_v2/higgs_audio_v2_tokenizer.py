@@ -256,9 +256,7 @@ def _load_audio_tokenizer():
         )
         audio_tokenizer_dir = _normalize_audio_tokenizer_dir(repo_path)
         if audio_tokenizer_dir is None:
-            raise RuntimeError(
-                f"Downloaded {_K2_OMNIVOICE_REPO} does not contain a valid Higgs audio tokenizer"
-            )
+            raise RuntimeError(f"Downloaded {_K2_OMNIVOICE_REPO} does not contain a valid Higgs audio tokenizer")
     device = current_omni_platform.get_torch_device()
     model = HiggsAudioV2TokenizerModel.from_pretrained(audio_tokenizer_dir).to(device)
     return model.eval()
