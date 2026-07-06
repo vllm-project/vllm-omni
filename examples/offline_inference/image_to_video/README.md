@@ -25,7 +25,7 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | ----- | ------------------ | -------------- | ------------- | -------- | ---------- |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 480 x 832 | 81 | 50 | 5.0 | Around 60 GiB BF16 for basic single-card usage |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
-| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Plan for an 80 GiB GPU for conservative single-card usage |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
 | LTX2 (local path + `--model-class-name LTX2ImageToVideoPipeline`) | 512 x 768 | 121 | 40 | 4.0 | Memory use depends on frame count and tensor parallelism |
 
 !!! info
@@ -189,6 +189,9 @@ python image_to_video.py \
   --flow-shift 5.0 \
   --num-inference-steps 50 \
   --fps 24 \
+  --enable-cpu-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
   --output hunyuan_i2v.mp4
 ```
 
