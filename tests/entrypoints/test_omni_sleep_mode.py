@@ -179,7 +179,7 @@ class TestOmniSleepMode:
         try:
             device_id = 0
             used_before = get_device_global_memory_used_gib(device_id)
-            acks = await llm_engine.sleep(stage_ids=[0], level=2)
+            acks = await llm_engine.sleep(stage_ids=[0], level=1)
             await asyncio.sleep(1.5)
             used_after = get_device_global_memory_used_gib(device_id)
             drop_gib = used_before - used_after
@@ -209,7 +209,7 @@ class TestOmniSleepMode:
         """Diffusion Worker stage signal loop"""
         try:
             logger.info("Starting Diffusion Worker Handshake Test")
-            acks = await diffusion_engine.sleep(stage_ids=[0], level=2)
+            acks = await diffusion_engine.sleep(stage_ids=[0], level=1)
 
             def _get_status(ack):
                 return ack.status if hasattr(ack, "status") else ack.get("status")
@@ -264,9 +264,9 @@ class TestOmniSleepMode:
                 base_output = output
             assert base_output is not None and len(base_output.images) > 0
             logger.info("Baseline Generation successful.")
-            # Sleep Level 2
+            # Sleep Level 1
             logger.info("Entering Deep Sleep (VRAM Scavenging)...")
-            await diffusion_engine.sleep(stage_ids=[0], level=2)
+            await diffusion_engine.sleep(stage_ids=[0], level=1)
             # Wake-up
             logger.info("Waking up (Reloading Weights)...")
             await diffusion_engine.wake_up(stage_ids=[0])
@@ -353,8 +353,8 @@ class TestOmniSleepMode:
             logger.info(f"Diffusion Initial VRAM: {vram_initial:.2f} GiB")
 
             # Sleep
-            logger.info("Triggering Level 2 Deep Sleep (Full Weight Offloading)...")
-            acks = await diffusion_engine.sleep(stage_ids=[0], level=2)
+            logger.info("Triggering Level 1 Deep Sleep (Partial Weight Offloading)...")
+            acks = await diffusion_engine.sleep(stage_ids=[0], level=1)
 
             reported_freed_bytes = sum(getattr(ack, "freed_bytes", 0) for ack in acks)
             reported_freed_gib = reported_freed_bytes / 1024**3
@@ -485,7 +485,7 @@ async def test_diffusion_model_sleep_tp(tp_size: int):
         async for _ in engine.generate("test", sampling_params_list=[llm_sp, diff_sp]):
             pass
 
-        acks = await engine.sleep(level=2)
+        acks = await engine.sleep(level=1)
         statuses = [get_ack_info(ack, "status") for ack in acks]
         assert all(s == "SUCCESS" for s in statuses), f"Sleep failed. Statuses: {statuses}"
 
@@ -541,7 +541,7 @@ async def test_multistage_sleep_h100(tp_size: int):
         async for _ in engine.generate("warmup", sampling_params_list=[SamplingParams(), sp]):
             pass
 
-        acks = await engine.sleep(stage_ids=[0, 1], level=2)
+        acks = await engine.sleep(stage_ids=[0, 1], level=1)
         assert len(acks) == 2
 
         await engine.wake_up(stage_ids=[0, 1])
