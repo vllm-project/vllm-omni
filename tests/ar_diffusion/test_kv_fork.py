@@ -140,6 +140,67 @@ class TestForkAtLastCommit:
                 assert tails[i].isdisjoint(tails[j])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="write-isolation test needs GPU-backed pools")
+class TestForkWriteIsolationGPU:
+    """Tensor-level check of the commit-once assumption the fork relies on.
+
+    The CPU tests verify the bookkeeping; this verifies the memory: after a
+    fork, the shared physical slots hold identical bytes for both sessions,
+    and a diverging child never rewrites the parent's committed K/V.
+    """
+
+    def test_child_divergence_does_not_touch_parent_bytes(self):
+        device = torch.device("cuda")
+        cfg = ARDiffusionKVConfig(enable=True, chunk_size=16, window_chunks=4)
+        kv = ARDiffusionKVCache(
+            cfg, max_model_len=4096, available_bytes=1 << 24, device=device, **DIMS
+        )
+        chunk_kv_shape = (1, cfg.chunk_size, DIMS["num_kv_heads"], DIMS["head_size"])
+
+        def write_chunk(adapter, fill):
+            kv.allocate_chunk(adapter)
+            slots = kv.chunk_write_slots(adapter)
+            for layer in range(DIMS["num_layers"]):
+                k = torch.full(chunk_kv_shape, fill, dtype=DIMS["dtype"], device=device)
+                v = torch.full(chunk_kv_shape, -fill, dtype=DIMS["dtype"], device=device)
+                kv.write_chunk_kv(layer, k, v, adapter)
+            kv.commit_chunk(adapter)
+            return slots
+
+        parent = kv.begin_request("parent")
+        parent_slots = [write_chunk(parent, fill=float(i + 1)) for i in range(2)]
+
+        def read_bytes(slot_list):
+            return [
+                (kv._k_pools[layer][slots].clone(), kv._v_pools[layer][slots].clone())
+                for layer in range(DIMS["num_layers"])
+                for slots in slot_list
+            ]
+
+        before = read_bytes(parent_slots)
+        child = kv.fork_at_last_commit(parent, "child")
+
+        # Shared prefix resolves to the same physical slots for the child.
+        assert kv.window_block_ids(child) == kv.window_block_ids(parent)
+
+        # The child diverges with different values; the parent's committed
+        # bytes must be bit-identical afterwards.
+        write_chunk(child, fill=99.0)
+        after = read_bytes(parent_slots)
+        for (k0, v0), (k1, v1) in zip(before, after):
+            assert torch.equal(k0, k1)
+            assert torch.equal(v0, v1)
+
+        # And symmetrically: the parent rolling forward does not disturb the
+        # child's shared view of the prefix.
+        child_prefix_before = read_bytes(parent_slots)
+        write_chunk(parent, fill=77.0)
+        child_prefix_after = read_bytes(parent_slots)
+        for (k0, v0), (k1, v1) in zip(child_prefix_before, child_prefix_after):
+            assert torch.equal(k0, k1)
+            assert torch.equal(v0, v1)
+
+
 class TestSessionFork:
     def test_forks_both_cfg_streams(self):
         kv = make_cache()
