@@ -132,9 +132,7 @@ class StageConfigFactory:
         deploy_config_path: str | None,
     ) -> PipelineResolution | None:
         """Resolve a model/deploy pair once for structured and legacy consumers."""
-        model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
-        if model_type == "vla" and _looks_like_dreamzero(model):
-            model_type = "dreamzero"
+        model_type, hf_config = cls._detect_registry_model_type(model, trust_remote_code=trust_remote_code)
 
         explicit_pipeline = cls._get_deploy_pipeline(deploy_config_path)
         pipeline_cfg = cls.resolve_pipeline_config(explicit_pipeline, hf_config)
@@ -182,6 +180,19 @@ class StageConfigFactory:
                     ):
                         return PipelineResolution(registered_key, pipeline_cfg, hf_config)
         return None
+
+    @classmethod
+    def _detect_registry_model_type(cls, model: str, trust_remote_code: bool = True) -> tuple[str | None, Any]:
+        """Detect the vllm-omni registry key for a model."""
+        model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
+        return cls._normalize_model_type_for_registry(model, model_type), hf_config
+
+    @staticmethod
+    def _normalize_model_type_for_registry(model: str, model_type: str | None) -> str | None:
+        """Map generic HF model_type values to vllm-omni registry keys."""
+        if model_type == "vla" and _looks_like_dreamzero(model):
+            return "dreamzero"
+        return model_type
 
     @staticmethod
     def _get_trust_remote_code(cli_overrides: dict[str, Any]) -> bool:
