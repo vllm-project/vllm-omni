@@ -13,7 +13,7 @@ import torch
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
 
 import vllm_omni.diffusion.cache.cache_dit_backend as cd_backend
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig, CacheDiTBackend
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig, CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
@@ -193,3 +193,12 @@ def test_ltx2_cache_dit_receives_audio_as_encoder(init_fake_tp_group):
     # Pattern_0 maps (hidden_states, encoder_hidden_states) to (video, audio)
     assert torch.equal(captured["hidden_states"], video_in)
     assert torch.equal(captured["encoder_hidden_states"], audio_in)
+
+
+def test_summary_with_no_transformer_is_nonfatal():
+    """Regression test for https://github.com/vllm-project/vllm-omni/issues/4325."""
+
+    class FakePipeline:
+        pass
+
+    cache_summary(pipeline=FakePipeline())

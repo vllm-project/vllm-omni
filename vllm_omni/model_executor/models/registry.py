@@ -281,6 +281,27 @@ _OMNI_MODELS = {
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
     ),
+    ## Miso TTS (MisoLabs/MisoTTS, Sesame-style CSM + Mimi)
+    "MisoTTSTalkerForConditionalGeneration": (
+        "miso_tts",
+        "miso_tts_talker",
+        "MisoTTSTalkerForConditionalGeneration",
+    ),
+    "MisoTTSMimiDecoder": (
+        "miso_tts",
+        "miso_tts_mimi",
+        "MisoTTSMimiDecoder",
+    ),
+    "MisoTTSForCausalLM": (
+        "miso_tts",
+        "miso_tts_talker",
+        "MisoTTSTalkerForConditionalGeneration",
+    ),
+    "MisoTTSSingleStageForVLLM": (
+        "miso_tts",
+        "miso_tts_vllm_wrapper",
+        "MisoTTSSingleStageForVLLM",
+    ),
     ## MOSS-TTS (full variants: Delay + Realtime)
     # MossTTSDelayModel: MOSS-TTS (8B), MOSS-TTSD (8B), MOSS-SoundEffect (8B), MOSS-VoiceGenerator (1.7B)
     "MossTTSDelayModel": (
@@ -293,12 +314,6 @@ _OMNI_MODELS = {
         "moss_tts",
         "modeling_moss_tts_talker",
         "MossTTSRealtimeTalkerForGeneration",
-    ),
-    # MossTTSLocalModel: MOSS-TTS-Local-Transformer-v1.5
-    "MossTTSLocalModel": (
-        "moss_tts",
-        "modeling_moss_tts_talker",
-        "MossTTSLocalTalkerForGeneration",
     ),
     # Stage-1 codec decoder (shared by all 5 variants)
     "MossTTSCodecDecoder": (
