@@ -34,7 +34,6 @@ classifiers = [
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
 
 [project.optional-dependencies]
-
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -97,6 +96,11 @@ local = [
 # who only need other models; opt in with `pip install vllm-omni[minicpmo]`.
 minicpmo = [
     "stepaudio2-minicpmo",
+]
+
+# Optional runtime dependencies for the Irodori TTS pipeline.
+irodori-tts = [
+    "dacvae @ git+https://github.com/facebookresearch/dacvae"
 ]
 
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported

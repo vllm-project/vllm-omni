@@ -3942,7 +3942,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("TTS model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            sr_raw = audio_output.get("sr", 24000)
+            sr_raw = audio_output.get("sr", audio_output.get("audio_sample_rate", 24000))
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 

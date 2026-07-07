@@ -1,0 +1,30 @@
+# Stage config for running Irodori TTS v3 DiT.
+# Single GPU (GPU 1 is targeted at runtime using CUDA_VISIBLE_DEVICES=1).
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      model_class_name: IrodoriTTSPipeline
+      max_num_seqs: 1
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      parallel_config:
+        tensor_parallel_size: 1
+
+    final_output: true
+    final_output_type: audio
+    is_comprehension: false
+    default_sampling_params:
+      seed: 42
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
