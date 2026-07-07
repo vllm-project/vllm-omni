@@ -14,7 +14,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PerForwardState
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -92,6 +92,11 @@ class Attention(nn.Module):
 
         self.attn_backend = attn_backend_cls
         self.attn_impl_cls = self.attn_backend.get_impl_cls()
+        # Only build per-forward state (step / geometry tensors) when the selected
+        # backend actually reads it. Dense backends ignore per_forward, so this
+        # gate keeps the default inference path free of per-layer, per-step
+        # allocations (the geometry pre-hook publishes geometry unconditionally).
+        self._consumes_per_forward = getattr(self.attn_impl_cls, "consumes_per_forward", False)
         self.attention = self.attn_impl_cls(
             num_heads=num_heads,
             head_size=head_size,
@@ -135,6 +140,22 @@ class Attention(nn.Module):
                 except Exception:
                     self.use_ring = False
                     self.ring_runner = None
+
+        # Fail fast on sparse + ring SP (ring bypasses the sparse plugin).
+        self._assert_ring_backend_supported(self.attn_backend.get_name(), self.use_ring, role)
+
+        # Sparse + torch.compile: the per-forward bridge reads the Python-int
+        # denoise_step_idx inside compiled transformer blocks, so Dynamo guards
+        # on its value and recompiles every denoise step (until cache_size_limit
+        # demotes the blocks to eager). Perf-only, but warn so users know to run
+        # sparse with enforce_eager until step state is tensorized.
+        if self._consumes_per_forward and config is not None and not getattr(config, "enforce_eager", True):
+            logger.warning_once(
+                "Attention backend %s reads per-step state inside torch.compile'd "
+                "regions, which triggers a recompile on every denoise step. For "
+                "stable performance run with enforce_eager=True.",
+                self.attn_backend.get_name(),
+            )
 
         self.parallel_strategy = build_parallel_attention_strategy(
             scatter_idx=scatter_idx,
@@ -224,6 +245,80 @@ class Attention(nn.Module):
         extra["kv_cache_dtype"] = kv_cache_dtype
         return replace(attn_metadata, extra=extra)
 
+    @staticmethod
+    def _assert_ring_backend_supported(backend_name: str, use_ring: bool, role: str) -> None:
+        """Refuse SPARSE_ATTN under ring sequence parallelism.
+
+        Ring SP routes attention through ``RingParallelAttention``, which runs its
+        own dense (SDPA/flash) kernels and never calls ``self.attention``. A
+        configured sparse plugin would be silently bypassed, so fail at init
+        instead of running dense attention under the hood. No-op for any other
+        backend or when ring is not active.
+        """
+        if use_ring and backend_name == "SPARSE_ATTN":
+            raise ValueError(
+                f"Attention(role={role}): the SPARSE_ATTN backend is not supported "
+                "with ring sequence parallelism (ring_degree > 1). Ring attention "
+                "runs its own dense kernels and would silently bypass the sparse "
+                "plugin. Disable ring SP for this run, or select a ring-compatible "
+                "attention backend."
+            )
+
+    @staticmethod
+    def _with_per_forward_state(
+        attn_metadata: AttentionMetadata | None, query: torch.Tensor
+    ) -> AttentionMetadata | None:
+        """Surface framework step state from ForwardContext onto attn_metadata.
+
+        Reads ``denoise_step_idx`` / ``total_denoise_steps`` (set by the pipeline
+        per denoise step) and the raw video-geometry primitives ``latent_shape`` /
+        ``patch_size`` (published generically by the transformer forward pre-hook),
+        and exposes them as per-sample tensors on
+        :attr:`AttentionMetadata.per_forward`, so any backend can read step state
+        and geometry without reaching into the global ForwardContext. No-op when
+        nothing is set or no ForwardContext is active.
+
+        Source-isolated: this is the only place that reads ForwardContext for
+        per-forward state. A future continuous-batching runner would change only
+        this method (per-request step values) without touching
+        the PerForwardState contract or any backend consumer.
+        """
+        if not is_forward_context_available():
+            return attn_metadata
+        ctx = get_forward_context()
+        step_idx = ctx.denoise_step_idx
+        total = ctx.total_denoise_steps
+        latent_shape = ctx.latent_shape
+        patch_size = ctx.patch_size
+        if step_idx is None and total is None and latent_shape is None and patch_size is None:
+            return attn_metadata
+
+        # Per-sample tensors on the sample axis. Layout is BSND, so query.shape[0]
+        # is the number of samples; a homogeneous batch yields equal entries.
+        num_samples = query.shape[0]
+
+        def _per_sample(v: int | None) -> torch.Tensor | None:
+            if v is None:
+                return None
+            return torch.full((num_samples,), v, dtype=torch.long, device=query.device)
+
+        def _per_sample_vec(v: tuple[int, int, int] | None) -> torch.Tensor | None:
+            # A (T, H, W) / (p_t, p_h, p_w) triple -> [num_samples, 3] on the
+            # sample axis (geometry is homogeneous across a batch, so rows are equal).
+            if v is None:
+                return None
+            return torch.tensor([list(v)] * num_samples, dtype=torch.long, device=query.device)
+
+        state = PerForwardState(
+            denoise_step_idx=_per_sample(step_idx),
+            total_denoise_steps=_per_sample(total),
+            latent_shape=_per_sample_vec(latent_shape),
+            patch_size=_per_sample_vec(patch_size),
+        )
+        if attn_metadata is None:
+            return AttentionMetadata(per_forward=state)
+        return replace(attn_metadata, per_forward=state)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -268,6 +363,8 @@ class Attention(nn.Module):
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        if self._consumes_per_forward:
+            attn_metadata = self._with_per_forward_state(attn_metadata, query)
 
         # 2. Kernel Execution (Computation)
         if self.use_ring and strategy is not self._no_parallel_strategy:
@@ -283,6 +380,16 @@ class Attention(nn.Module):
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if query.dtype == torch.float32:
+            # The fp32 override silently rerouting a configured sparse plugin to
+            # dense SDPA would contradict the fail-loud plugin contract (same
+            # rationale as the ring guard), so refuse instead.
+            if self.attn_backend.get_name() == "SPARSE_ATTN":
+                raise ValueError(
+                    f"Attention(role={self.role}): the SPARSE_ATTN backend does not "
+                    f"support float32 inputs (the fp32 path only runs SDPA, which "
+                    f"would silently bypass the sparse plugin). Run the model in "
+                    f"bf16/fp16, or select a dense attention backend."
+                )
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
                 f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."

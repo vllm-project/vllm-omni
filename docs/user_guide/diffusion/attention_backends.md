@@ -20,6 +20,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
 | `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
+| `SPARSE_ATTN` | In-tree dispatcher to **external** sparse-attention kernels registered via the `vllm_omni.sparse_attn` entry-point group (no kernels are vendored). Opt-in per role; self-attention, maskless unless the plugin advertises `supports_attention_mask`. See [Sparse attention (plugin)](#sparse-attention-plugin). |
 
 
 ## Configuration
@@ -92,6 +93,163 @@ config = OmniDiffusionConfig(
 ```
 
 A plain dict is also accepted and normalized to `AttentionConfig`.
+
+## Sparse attention (plugin)
+
+`SPARSE_ATTN` is an in-tree *dispatcher*: vLLM-Omni owns only the slot, while
+the actual sparse kernels ship as **external, pip-installable packages**. A kernel
+package registers a callable via the `vllm_omni.sparse_attn` entry-point group
+(`dummy_sparse` below is a placeholder name — use your kernel's):
+
+```toml
+# pyproject.toml of the external kernel package
+[project.entry-points."vllm_omni.sparse_attn"]
+dummy_sparse = "dummy_sparse_attn:attn_fn"
+```
+
+Plugin contract (a callable; device-agnostic self-attention):
+
+```python
+def attn_fn(query, key, value, params: dict, is_causal: bool, softmax_scale: float) -> torch.Tensor: ...
+```
+
+`query`/`key`/`value` use the **BSND** layout `[batch, seq_len, num_heads, head_dim]`,
+and the callable returns the same layout. `is_causal` and `softmax_scale` are the
+standard attention scalars set by the framework (`softmax_scale` defaults to
+`head_dim ** -0.5`); kernel-specific knobs and per-forward state arrive in `params`.
+
+### Selecting a sparse kernel
+
+Opt-in per role. The shorthand routes the plugin name through the dispatcher:
+
+```bash
+# Shorthand: backend = <plugin name>
+vllm-omni serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --diffusion-attention-config.per_role.self.backend dummy_sparse \
+    --diffusion-attention-config.per_role.self.extra.topk 0.3
+
+# Explicit dispatcher form (equivalent)
+vllm-omni serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --diffusion-attention-config '{"per_role":{"self":{"backend":"SPARSE_ATTN","extra":{"backend":"dummy_sparse","params":{"topk":0.3}}}}}'
+```
+
+Target `self` only — cross-attention keeps its dense default (sparsifying text
+cross-attention degrades quality).
+
+Shorthand `extra.*` keys are **flat kernel params** (a lone nested
+`extra.params` is also accepted and hoisted); use the explicit dispatcher form
+for anything more structured.
+
+Two runtime constraints:
+
+- **Run with `--enforce-eager` for now.** The dispatcher reads the per-step
+  state (a Python int that changes every denoise step) inside the
+  `torch.compile`'d transformer blocks, so each step triggers a Dynamo guard
+  miss and a recompile until the compile cache demotes those blocks to eager.
+  Correctness is unaffected, but compiled runs pay heavy recompile churn; a
+  startup warning is emitted. This will be lifted once step state is published
+  as tensors. Plugin authors: a kernel with data-dependent Python control flow
+  (per-frame loops, metadata caches, JIT'd sub-kernels) should decorate its
+  callable with `@torch.compiler.disable(recursive=True)` so compiled
+  transformers graph-break cleanly around it instead of Dynamo tracing into it.
+- **bf16/fp16 only.** For dense backends, float32 inputs silently reroute to
+  SDPA; for `SPARSE_ATTN` that would silently bypass the plugin, so fp32 raises
+  at the first forward instead (same fail-loud rationale as the ring-SP guard).
+
+### The `params` dict
+
+The dispatcher hands the kernel one flat `params` dict, merged from three tiers
+(later wins, `None` dropped, so use `params.get(key, default)`):
+
+1. **static** — the kernel's configured params (`extra.params`, or flat `extra` keys).
+2. **per-forward** — canonical framework fields (`PerForwardState`): `denoise_step_idx`
+   / `total_denoise_steps` as per-sample `[num_samples]` tensors (e.g.
+   `progress = denoise_step_idx / total_denoise_steps`), plus **raw video-geometry
+   primitives** `latent_shape` `(T, H, W)` and `patch_size` `(p_t, p_h, p_w)` as
+   per-sample `[num_samples, 3]` tensors. The geometry primitives are published
+   **generically by the framework** (a forward pre-hook on the transformer) for any
+   `(B, C, T, H, W)` video model — **no per-model code**. All `PerForwardState`
+   fields are **optional by contract**; step fields are currently set by the
+   Wan2.2 t2v/i2v/vace pipelines only (e.g. HunyuanVideo-1.5 publishes geometry
+   but no step state), so plugins must handle their absence.
+3. **dynamic** — the opaque `AttentionMetadata.extra`.
+
+vLLM-Omni interprets no kernel-level parameter; the plugin reads what it needs.
+
+#### Video geometry: default resolver and `geometry_fn`
+
+For structure-aware kernels that map the flat sequence to (frame, patch)
+coordinates, the dispatcher derives the post-patch grid from the raw primitives
+and injects it into `params`:
+
+- **default resolver** — fills `total_latent_frames = T // p_t` and
+  `patches_per_frame = (H // p_h) * (W // p_w)` (as Python ints; the same fields
+  arriving via `PerForwardState`/`extra` may be per-sample tensors, so read them
+  type-tolerantly) whenever `latent_shape` and `patch_size` are present and the
+  value isn't already set. So a kernel that just wants frame / patch counts gets
+  them for free, on any video model, with no edits. The derived fields are only
+  injected when `total_latent_frames * patches_per_frame == seq_len` actually
+  holds for the sequence the kernel sees; when it doesn't — e.g. Ulysses SP
+  auto-padding appended pad tokens, or the model mixes non-video tokens into its
+  self-attention sequence — they are dropped with a one-time warning and only
+  the raw primitives are passed.
+- **plugin `geometry_fn`** (optional) — a callable advertised on the kernel
+  (`attn_fn.geometry_fn = fn`) that runs *after* the default resolver and whose
+  non-`None` returns are merged into `params`. Use it for a bespoke layout
+  (block masks, CSR, ring decomposition) computed straight from the raw primitives:
+
+```python
+def geometry_fn(query_shape, params):
+    ls, ps = params.get("latent_shape"), params.get("patch_size")
+    if ls is None or ps is None:
+        return {}                         # no geometry -> let the kernel fall back
+    ...                                   # compute a bespoke representation
+    return {"block_layout": ...}
+
+attn_fn.geometry_fn = geometry_fn
+```
+
+Models that aren't `(B, C, T, H, W)` videos (image / audio, or no `patch_size`)
+simply leave geometry unset; a kernel falls back to its own path — it never breaks.
+
+### Well-known keys and capabilities
+
+Some `params` keys carry attention inputs that change the result and are forwarded
+only when the model sets them:
+
+- `attn_mask` — validity / padding mask.
+- `full_attn_spans` — per-sample `[start, end)` spans using full (bidirectional)
+  attention within an otherwise causal sequence.
+
+A plugin that consumes one of these must advertise it through an optional
+`capabilities` dict on the callable. If a model provides such an input and the
+plugin has not advertised support, the dispatcher raises rather than letting the
+kernel ignore it:
+
+```python
+def attn_fn(query, key, value, params, is_causal, softmax_scale):
+    mask = params.get("attn_mask")   # present only when advertised below
+    ...
+
+attn_fn.capabilities = {"supports_attention_mask": True}
+```
+
+### Writing a plugin
+
+```python
+# dummy_sparse_attn/__init__.py  (external package)
+def attn_fn(query, key, value, params, is_causal, softmax_scale):
+    # query/key/value are BSND: [batch, seq_len, num_heads, head_dim]
+    topk = params.get("topk", 1.0)
+    step = params.get("denoise_step_idx")        # per-sample tensor, or None
+    total = params.get("total_denoise_steps")    # per-sample tensor, or None
+    ...                                          # call the sparse kernel (returns BSND)
+    return out
+```
+
+Install it into the same environment (`pip install dummy-sparse-attn`); the
+dispatcher resolves it eagerly at model init, so a missing or broken plugin fails
+loudly there rather than silently falling back to dense.
 
 ## Platform Defaults
 

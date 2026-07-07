@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Generic, TypeVar
 
 import torch
@@ -51,6 +51,63 @@ class AttentionBackend(ABC):
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
 
+@dataclass(frozen=True)
+class PerForwardState:
+    """Framework-injected, per-forward-pass attention state.
+
+    Carried on :attr:`AttentionMetadata.per_forward` so any attention backend can
+    read step state without reaching into the global ForwardContext, and so the
+    function-plugin path can flatten it into a plain ``params`` dict.
+
+    Fields live on the SAMPLE axis: one entry per sample, shape ``[num_samples]``
+    (homogeneous batch -> all equal; heterogeneous batch -> mixed). Raw sequence
+    length / packing is NOT here — that is the token axis, carried by q/k/v and
+    cu_seqlens. Video *grid* geometry (frame / patch counts) IS provided, as the
+    geometry fields below, so a kernel can map the flat sequence to coordinates.
+
+    All fields are optional; backends MUST ignore fields they don't use. Adding
+    fields later is non-breaking.
+    """
+
+    # Step state, written by the framework (the Attention bridge) from
+    # ForwardContext. Per-sample tensors so the same shape covers homogeneous
+    # and (future) heterogeneous/continuous batching without a contract change.
+    denoise_step_idx: torch.Tensor | None = None
+    total_denoise_steps: torch.Tensor | None = None
+    # Raw, model-agnostic video geometry primitives, published generically by the
+    # framework (a forward pre-hook on the transformer) — NOT by model code. Each
+    # is a per-sample tensor of shape ``[num_samples, 3]``:
+    #   latent_shape -> post-VAE, pre-patch grid ``(T, H, W)``
+    #   patch_size   -> patch dims ``(p_t, p_h, p_w)``
+    # They are enough for any kernel to derive its own layout; the default
+    # resolver in the SPARSE_ATTN dispatcher turns them into the derived fields
+    # below for plugins that just want frame / patch counts.
+    latent_shape: torch.Tensor | None = None
+    patch_size: torch.Tensor | None = None
+    # Derived video geometry (post-patch). No longer written by the bridge;
+    # produced on demand by the dispatcher's default resolver (or a plugin's
+    # ``geometry_fn``) from the raw primitives above, so structure-aware kernels
+    # can split the flat sequence into (frame, patch):
+    # seq_len == total_latent_frames * patches_per_frame (the resolver only
+    # fills them when that product matches the actual sequence length). Kept
+    # optional for back-compat with plugins that read them straight from
+    # ``params`` — note the resolver writes Python ints there, while values set
+    # here are per-sample tensors; plugins should accept either.
+    total_latent_frames: torch.Tensor | None = None
+    patches_per_frame: torch.Tensor | None = None
+
+    def to_dict(self, *, exclude_none: bool = False) -> dict[str, Any]:
+        """Shallow dict of the fields (no deep-copy of tensors).
+
+        With ``exclude_none=True`` only set fields are returned, so consumers
+        can rely on ``params.get(key, default)`` semantics.
+        """
+        out = {f.name: getattr(self, f.name) for f in fields(self)}
+        if exclude_none:
+            return {k: v for k, v in out.items() if v is not None}
+        return out
+
+
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
@@ -76,11 +133,25 @@ class AttentionMetadata:
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
     full_attn_spans: list[list[tuple[int, int]]] | None = None
 
+    # Typed, framework-injected per-forward state.
+    # Distinct from the opaque `extra` dict: `per_forward` holds canonical,
+    # documented fields (step state) populated by the Attention wrapper from
+    # ForwardContext. Backends ignore it if they don't need it.
+    per_forward: PerForwardState | None = None
+
 
 T = TypeVar("T", bound=AttentionMetadata)
 
 
 class AttentionImpl(ABC, Generic[T]):
+    # Whether this backend reads ``AttentionMetadata.per_forward`` (framework
+    # step state / video geometry). Default ``False``: dense backends ignore it,
+    # so the ``Attention`` layer skips building the per-forward tensors entirely
+    # for them — avoiding per-layer, per-step GPU allocations on the default
+    # (non-sparse) inference path. A backend that consumes per_forward (e.g. the
+    # SPARSE_ATTN dispatcher) overrides this to ``True``.
+    consumes_per_forward: bool = False
+
     # Per-platform kv_cache_dtype support. Maps OmniPlatformEnum value
     # (e.g. "cuda", "npu") to the set of quantized dtypes that platform
     # handles.
