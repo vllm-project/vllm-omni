@@ -3,7 +3,7 @@
 Shared by Qwen3-Omni and Qwen3-TTS talker models.
 
 * SDPA attention (F.scaled_dot_product_attention) with native GQA support
-* HF-compatible CPU/CUDA numerics; NPU uses Ascend fused norm/RoPE kernels
+* HF-compatible CPU/CUDA numerics with NPU-only fused norm/RoPE fast paths
 * Per-call embedding buffer to avoid cross-request aliasing
 * Pre-allocated position_ids (read-only, safe to persist)
 * torch.compile (epilogue_fusion=False) on inner transformer by default
@@ -33,22 +33,22 @@ _UNIFORM_EPS = 1e-20
 
 
 # ===================================================================
-# HF-numerics-compatible layers for code predictor
+# Portable layers for code predictor
 # ===================================================================
 #
-# CPU/CUDA uses plain PyTorch ops (nn.Linear, manual RMSNorm in float32,
-# rotate_half RoPE) to match HuggingFace reference numerics.  NPU keeps the
-# same layer structure, but uses Ascend fused norm/RoPE kernels and prepacked
-# linear weights to avoid repeated small kernels and layout conversions.
+# These use plain PyTorch ops (nn.Linear, manual RMSNorm in float32,
+# rotate_half RoPE) to produce outputs numerically identical to the
+# HuggingFace reference on CPU/CUDA. vLLM's fused kernels (RMSNorm,
+# QKVParallel, get_rope) introduce small precision differences that compound
+# across the autoregressive steps of the code predictor, causing severe audio
+# quality degradation. The Ascend fused norm/RoPE kernels and prepacked linear
+# weights below are guarded by NPU tensor/device checks.
 #
 # See: https://github.com/vllm-project/vllm-omni/issues/2274
 
 
 class _RMSNorm(nn.Module):
-    """RMSNorm matching HuggingFace's implementation exactly.
-
-    Computes variance in float32 to avoid bfloat16 precision loss.
-    """
+    """RMSNorm with HuggingFace-compatible CPU/CUDA math and an NPU fast path."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -81,10 +81,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class _RotaryEmbedding(nn.Module):
-    """RoPE matching HuggingFace's implementation exactly.
-
-    Forces float32 computation for cos/sin, matching HF's torch.autocast(enabled=False).
-    """
+    """RoPE with HuggingFace-compatible CPU/CUDA math and cached NPU tables."""
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -980,6 +977,7 @@ class CodePredictorWrapper(nn.Module):
 
         linear_count = 0
         with torch.no_grad():
+            # Pack linear weights once for NPU matmul.
             for module in self.modules():
                 if isinstance(module, nn.Linear):
                     module.weight.data = maybe_trans_nz(module.weight.data)

@@ -590,6 +590,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         linear_count = 0
         conv_count = 0
         with torch.no_grad():
+            # Pack linear and convolution weights once for NPU decode.
             for module in self.decoder.modules():
                 if isinstance(module, nn.Linear):
                     module.weight.data = maybe_trans_nz(module.weight.data)
