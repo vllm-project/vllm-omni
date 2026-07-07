@@ -7,6 +7,7 @@ import os
 from typing import ClassVar, Iterable
 
 import torch
+from einops import rearrange
 from torch import nn
 from vllm.logger import init_logger
 
@@ -21,6 +22,222 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 logger = init_logger(__name__)
 
 
+# upstream: HiDream-O1-Image models/pipeline.py L14-18 @21bcd30471ac
+PATCH_SIZE = 32
+TIMESTEP_TOKEN_NUM = 1
+NOISE_SCALE = 8.0
+T_EPS = 0.001
+
+# upstream: HiDream-O1-Image models/utils.py L7-19 @21bcd30471ac
+PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
+    (2048, 2048), (2304, 1728), (1728, 2304), (2560, 1440), (1440, 2560),
+    (2496, 1664), (1664, 2496), (3104, 1312), (1312, 3104), (2304, 1792), (1792, 2304),
+)
+
+
+def find_closest_resolution(width: int, height: int) -> tuple[int, int]:
+    img_ratio = width / height
+    best_res: tuple[int, int] | None = None
+    min_diff = float("inf")
+    for w, h in PREDEFINED_RESOLUTIONS:
+        diff = abs(w / h - img_ratio)
+        if diff < min_diff:
+            min_diff = diff
+            best_res = (w, h)
+    assert best_res is not None
+    return best_res
+
+
+def get_rope_index_fix_point(
+    *,
+    spatial_merge_size: int,
+    image_token_id: int,
+    video_token_id: int,
+    vision_start_token_id: int,
+    input_ids: torch.Tensor | None = None,
+    image_grid_thw: torch.Tensor | None = None,
+    video_grid_thw: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    skip_vision_start_token: list[int] | None = None,
+    fix_point: int = 4096,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if video_grid_thw is not None:
+        video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+        video_grid_thw[:, 0] = 1
+
+    mrope_position_deltas = []
+    if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+        total_input_ids = input_ids
+        if attention_mask is None:
+            attention_mask = torch.ones_like(total_input_ids)
+        position_ids = torch.ones(
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        image_index, video_index = 0, 0
+        attention_mask = attention_mask.to(total_input_ids.device)
+        for i, input_ids in enumerate(total_input_ids):
+            input_ids = input_ids[attention_mask[i] == 1]
+            image_nums, video_nums = 0, 0
+            vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+            vision_tokens = input_ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum()
+            video_nums = (vision_tokens == video_token_id).sum()
+            input_tokens = input_ids.tolist()
+            llm_pos_ids_list: list = []
+            st = 0
+            remain_images, remain_videos = image_nums, video_nums
+            for _ in range(image_nums + video_nums):
+                if image_token_id in input_tokens and remain_images > 0:
+                    ed_image = input_tokens.index(image_token_id, st)
+                else:
+                    ed_image = len(input_tokens) + 1
+                if video_token_id in input_tokens and remain_videos > 0:
+                    ed_video = input_tokens.index(video_token_id, st)
+                else:
+                    ed_video = len(input_tokens) + 1
+                if ed_image < ed_video:
+                    t, h, w = (
+                        image_grid_thw[image_index][0],
+                        image_grid_thw[image_index][1],
+                        image_grid_thw[image_index][2],
+                    )
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
+                else:
+                    t, h, w = (
+                        video_grid_thw[video_index][0],
+                        video_grid_thw[video_index][1],
+                        video_grid_thw[video_index][2],
+                    )
+                    video_index += 1
+                    remain_videos -= 1
+                    ed = ed_video
+                llm_grid_t, llm_grid_h, llm_grid_w = (
+                    t.item(),
+                    h.item() // spatial_merge_size,
+                    w.item() // spatial_merge_size,
+                )
+                text_len = ed - st
+
+                text_len -= skip_vision_start_token[image_index - 1]
+                text_len = max(0, text_len)
+
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+                t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+
+                if skip_vision_start_token[image_index - 1]:
+                    if fix_point > 0:
+                        fix_point = fix_point - st_idx
+                        llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + fix_point + st_idx)
+                        fix_point = 0
+                else:
+                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+        mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+        return position_ids, mrope_position_deltas
+    else:
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
+            max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+            mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+        else:
+            position_ids = (
+                torch.arange(input_ids.shape[1], device=input_ids.device)
+                .view(1, 1, -1)
+                .expand(3, input_ids.shape[0], -1)
+            )
+            mrope_position_deltas = torch.zeros(
+                [input_ids.shape[0], 1],
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
+        return position_ids, mrope_position_deltas
+
+
+def build_t2i_text_sample(
+    *,
+    prompt: str,
+    height: int,
+    width: int,
+    tokenizer,
+    processor,
+    model_config,
+) -> dict:
+    image_token_id = model_config.image_token_id
+    video_token_id = model_config.video_token_id
+    vision_start_token_id = model_config.vision_start_token_id
+    image_len = (height // PATCH_SIZE) * (width // PATCH_SIZE)
+
+    boi_token = getattr(tokenizer, "boi_token", "<|boi_token|>")
+    tms_token = getattr(tokenizer, "tms_token", "<|tms_token|>")
+
+    messages = [{"role": "user", "content": prompt}]
+    template_caption = (
+        processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        + boi_token
+        + tms_token * TIMESTEP_TOKEN_NUM
+    )
+    input_ids = tokenizer.encode(template_caption, return_tensors="pt", add_special_tokens=False)
+
+    image_grid_thw = torch.tensor(
+        [1, height // PATCH_SIZE, width // PATCH_SIZE], dtype=torch.int64
+    ).unsqueeze(0)
+
+    vision_tokens = torch.zeros((1, image_len), dtype=input_ids.dtype) + image_token_id
+    vision_tokens[0, 0] = vision_start_token_id
+    input_ids_pad = torch.cat([input_ids, vision_tokens], dim=-1)
+
+    position_ids, _ = get_rope_index_fix_point(
+        spatial_merge_size=1,
+        image_token_id=image_token_id,
+        video_token_id=video_token_id,
+        vision_start_token_id=vision_start_token_id,
+        input_ids=input_ids_pad,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        attention_mask=None,
+        skip_vision_start_token=[1],
+    )
+
+    txt_seq_len = input_ids.shape[-1]
+    all_seq_len = position_ids.shape[-1]
+
+    token_types = torch.zeros((1, all_seq_len), dtype=input_ids.dtype)
+    bgn = txt_seq_len - TIMESTEP_TOKEN_NUM
+    token_types[0, bgn: bgn + image_len + TIMESTEP_TOKEN_NUM] = 1
+    token_types[0, txt_seq_len - TIMESTEP_TOKEN_NUM: txt_seq_len] = 3
+
+    vinput_mask = (token_types == 1)
+    token_types_bin = (token_types > 0).to(token_types.dtype)
+
+    return {
+        'input_ids': input_ids,
+        'position_ids': position_ids,
+        'token_types': token_types_bin,
+        'vinput_mask': vinput_mask,
+    }
+
+
 def build_hidream_o1_scheduler(
     *,
     scheduler_name: str = "default",
@@ -29,19 +246,8 @@ def build_hidream_o1_scheduler(
     device: torch.device | str | None = None,
     timesteps_list: list[int] | None = None,
 ) -> FlowUniPCMultistepScheduler:
-    """Build a HiDream-O1 scheduler + set_timesteps in one call.
-
-    Mirrors upstream `models/pipeline.py::build_scheduler` (default branch)
-    @21bcd30471ac; class-vs-upstream numerical parity was validated on H100
-    against a vendored copy of the upstream scheduler. Only
-    scheduler_name='default' is supported today.
-    """
     if scheduler_name != "default":
-        raise NotImplementedError(
-            f"HiDream-O1-Image currently only supports scheduler_name='default'; "
-            f"got {scheduler_name!r}. 'flash' and 'flow_match' are dev-model "
-            f"schedulers and are not yet supported."
-        )
+        raise NotImplementedError(f"unsupported scheduler_name={scheduler_name!r}")
 
     scheduler = FlowUniPCMultistepScheduler(
         num_train_timesteps=1000,
@@ -63,7 +269,6 @@ def build_hidream_o1_scheduler(
 
 
 def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
-    """Identity post-processor; `forward()` already returns a tensor."""
     del od_config
 
     def post_process_func(x):
@@ -73,14 +278,6 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
 
 
 class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
-    """HiDream-O1-Image pixel-DiT unified transformer pipeline.
-
-    Current scope: text-to-image only, single GPU, bfloat16, no CFG.
-    See __init__.py for the full status matrix.
-    """
-
-    # Workaround while forward() is a NotImplementedError stub: 0 makes
-    # DiffusionEngine skip the dummy warmup run. Remove once forward() works.
     dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
@@ -91,12 +288,10 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         custom_args = od_config.custom_pipeline_args or {}
         self.model_type: str = str(custom_args.get("model_type", "full"))
-        assert self.model_type in ("full", "dev"), (
-            f"HiDream-O1-Image model_type must be 'full' or 'dev', got {self.model_type!r}"
-        )
-
         self.dtype = od_config.dtype if od_config.dtype is not None else torch.bfloat16
         self.device = get_local_device()
+
+        self._validate_static_config()
 
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=["forward"],
@@ -104,17 +299,27 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
 
         self.processor = None
+        self.tokenizer = None
         self.model = None
         self._init_processor_and_model()
+        self._validate_tms_token_id()
+
+    def _validate_static_config(self) -> None:
+        if self.model_type not in ("full", "dev"):
+            raise ValueError(f"unsupported model_type={self.model_type!r}")
+        if self.model_type != "full":
+            # dev needs a separate recipe (28 steps, shift=1.0, flash sched,
+            # guidance=0.0, DEFAULT_TIMESTEPS + noise_scale/noise_clip); see
+            # upstream inference.py.
+            raise NotImplementedError(f"model_type={self.model_type!r} not supported yet")
+        if self.dtype != torch.bfloat16:
+            raise NotImplementedError(f"only bfloat16 is supported; got {self.dtype!r}")
+        cfg_parallel_size = int(self.od_config.parallel_config.cfg_parallel_size)
+        if cfg_parallel_size > 1:
+            raise NotImplementedError(f"cfg_parallel_size={cfg_parallel_size} not supported")
 
     def _init_processor_and_model(self) -> None:
-        """Eagerly load AutoProcessor + HiDreamO1ImageTransformer.
-
-        Mirrors upstream inference.py L60-70 (SHA 21bcd30471ac).
-        `HiDreamO1ImageTransformer` is an alias for
-        `Qwen3VLForConditionalGeneration`.
-        """
-        from transformers import AutoProcessor
+        from transformers import AutoProcessor, PreTrainedTokenizerBase
         from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import (
             HiDreamO1ImageTransformer,
         )
@@ -131,23 +336,26 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         ).eval()
 
         self._add_special_tokens(self.processor)
+        self.tokenizer = (
+            self.processor
+            if isinstance(self.processor, PreTrainedTokenizerBase)
+            else self.processor.tokenizer
+        )
         logger.info(
             "HiDreamO1ImagePipeline: ready (model_type=%s, num_params=%.1fB)",
             self.model_type, sum(p.numel() for p in self.model.parameters()) / 1e9,
         )
 
+    def _validate_tms_token_id(self) -> None:
+        actual_tms_ids = self.tokenizer.encode(self.tokenizer.tms_token, add_special_tokens=False)
+        expected_tms_id = int(self.model.model.tms_token_id)
+        if actual_tms_ids != [expected_tms_id]:
+            raise RuntimeError(
+                f"tms_token maps to {actual_tms_ids}, model expects [{expected_tms_id}]"
+            )
+
     @staticmethod
     def _add_special_tokens(processor) -> None:
-        """Attach 5 special-token literal shortcuts on the tokenizer.
-
-        Verbatim port of upstream inference.py::add_special_tokens +
-        get_tokenizer (SHA 21bcd30471ac). Semantic role:
-          - boi_token: image-related sequence marker
-          - bor_token / eor_token: reference region begin/end markers
-          - bot_token: text-related marker
-          - tms_token: timestep embedding replacement marker (denoise loop
-            replaces this token's embedding with the pixel-DiT timestep vector)
-        """
         from transformers import PreTrainedTokenizerBase
 
         tok = (
@@ -161,30 +369,198 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         tok.bot_token = "<|bot_token|>"
         tok.tms_token = "<|tms_token|>"
 
-    @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        """Run one denoising job.
+    def _resolve_generation_params(
+        self, req: OmniDiffusionRequest,
+    ) -> tuple[str, int, int, int, int, float]:
+        sp = req.sampling_params
 
-        Adapts upstream `pipeline.py::generate_image` to vllm-omni's Request
-        contract. Denoise loop + CFG will be landed in follow-up commits.
-        """
-        raise NotImplementedError(
-            "HiDreamO1ImagePipeline.forward is not yet implemented."
+        if sp.generator is not None:
+            raise NotImplementedError("sp.generator not supported; noise seeding is internal")
+        if sp.timesteps is not None:
+            raise NotImplementedError("sp.timesteps not supported")
+        if sp.latents is not None:
+            raise NotImplementedError("sp.latents not supported")
+        if sp.num_outputs_per_prompt != 1:
+            raise NotImplementedError(
+                f"num_outputs_per_prompt={sp.num_outputs_per_prompt} not supported"
+            )
+
+        if not req.prompts:
+            raise ValueError("req.prompts is empty")
+        if len(req.prompts) != 1:
+            raise NotImplementedError(f"only one prompt per request; got {len(req.prompts)}")
+        first_prompt = req.prompts[0]
+        if isinstance(first_prompt, str):
+            prompt = first_prompt
+        elif isinstance(first_prompt, dict):
+            raw_prompt = first_prompt.get("prompt")
+            if not isinstance(raw_prompt, str):
+                raise TypeError(
+                    f"dict prompt must contain a str 'prompt' field; got {type(raw_prompt).__name__}"
+                )
+            prompt = raw_prompt
+        else:
+            raise TypeError(f"prompt must be str or dict; got {type(first_prompt).__name__}")
+
+        raw_h = 2048 if sp.height is None else int(sp.height)
+        raw_w = 2048 if sp.width is None else int(sp.width)
+        if raw_h <= 0 or raw_w <= 0:
+            raise ValueError(f"h/w must be positive, got h={raw_h} w={raw_w}")
+        snapped_w, snapped_h = find_closest_resolution(raw_w, raw_h)
+        if (snapped_w, snapped_h) != (raw_w, raw_h):
+            logger.info(
+                "HiDreamO1: resolution snapped from %dx%d to %dx%d",
+                raw_w, raw_h, snapped_w, snapped_h,
+            )
+
+        steps = 50 if sp.num_inference_steps is None else int(sp.num_inference_steps)
+        if steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {steps}")
+
+        if sp.seed is None:
+            raise RuntimeError("expected request initialization to resolve a concrete seed")
+        seed = int(sp.seed)
+        guidance_scale = float(sp.guidance_scale)
+        return prompt, snapped_h, snapped_w, steps, seed, guidance_scale
+
+    def _prepare_noise_and_patchify(
+        self,
+        height: int,
+        width: int,
+        seed: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        gen = torch.Generator("cpu").manual_seed(seed + 1)
+        noise = NOISE_SCALE * torch.randn((1, 3, height, width), generator=gen)
+        noise = noise.to(device, dtype)
+        return rearrange(
+            noise,
+            "B C (H p1) (W p2) -> B (H W) (C p1 p2)",
+            p1=PATCH_SIZE, p2=PATCH_SIZE,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Return the full param-name set (Path B Pattern 1).
+    def _forward_once(
+        self,
+        sample: dict,
+        z_in: torch.Tensor,
+        t_pixeldit: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.autocast(self.device.type, dtype=self.dtype, cache_enabled=False):
+            outputs = self.model(
+                input_ids=sample["input_ids"],
+                position_ids=sample["position_ids"],
+                vinputs=z_in,
+                timestep=t_pixeldit.reshape(-1).to(self.device),
+                token_types=sample["token_types"],
+                use_flash_attn=False,
+            )
 
-        Model was loaded eagerly in __init__, but `diffusers_loader` runs
-        a strict "all params covered" check that requires the returned set
-        to cover every named parameter.
-        """
+        if outputs.x_pred is None:
+            raise RuntimeError("model returned x_pred=None")
+        if outputs.x_pred.shape[-1] != z_in.shape[-1]:
+            raise RuntimeError(
+                f"x_pred patch_dim {outputs.x_pred.shape[-1]} != z_in {z_in.shape[-1]}"
+            )
+
+        mask = sample["vinput_mask"][0]
+        return outputs.x_pred[0, mask].unsqueeze(0)
+
+    def _build_and_validate_sample(
+        self,
+        prompt: str,
+        height: int,
+        width: int,
+        expected_image_len: int,
+    ) -> dict:
+        sample = build_t2i_text_sample(
+            prompt=prompt,
+            height=height,
+            width=width,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            model_config=self.model.config,
+        )
+        actual_image_len = int(sample["vinput_mask"].sum().item())
+        if actual_image_len != expected_image_len:
+            raise RuntimeError(
+                f"vinput_mask has {actual_image_len} slots, expected {expected_image_len} "
+                f"for {height}x{width}"
+            )
+        return {
+            k: (v.to(self.device) if torch.is_tensor(v) else v)
+            for k, v in sample.items()
+        }
+
+    @torch.inference_mode()
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        prompt, height, width, num_inference_steps, seed, guidance_scale = \
+            self._resolve_generation_params(req)
+
+        expected_image_len = (height // PATCH_SIZE) * (width // PATCH_SIZE)
+        cond_sample = self._build_and_validate_sample(
+            prompt, height, width, expected_image_len,
+        )
+        samples: list[dict] = [cond_sample]
+        if guidance_scale > 1.0:
+            uncond_sample = self._build_and_validate_sample(
+                " ", height, width, expected_image_len,
+            )
+            samples.append(uncond_sample)
+
+        z = self._prepare_noise_and_patchify(
+            height, width, seed, self.dtype, self.device,
+        )
+
+        sched = build_hidream_o1_scheduler(
+            scheduler_name="default",
+            num_inference_steps=num_inference_steps,
+            shift=3.0,
+            device=self.device,
+        )
+
+        # TODO(concurrent-serving): process-global RNG mutation, replace with
+        # explicitly plumbed generators before concurrent serving.
+        torch.manual_seed(seed + 1)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed + 1)
+
+        for _step_idx, step_t in enumerate(sched.timesteps):
+            step_t_f32 = step_t.float()
+            t_pixeldit = 1.0 - step_t_f32 / 1000.0
+            sigma = (step_t_f32 / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
+
+            x_pred_cond = self._forward_once(samples[0], z.clone(), t_pixeldit)
+            v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
+
+            if len(samples) > 1:
+                x_pred_uncond = self._forward_once(
+                    samples[1], z.clone(), t_pixeldit,
+                )
+                v_uncond = (
+                    x_pred_uncond.to(torch.float32) - z.to(torch.float32)
+                ) / sigma
+                v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
+            else:
+                v_guided = v_cond
+
+            model_output = -v_guided
+
+            z = sched.step(
+                model_output,
+                step_t_f32,
+                z.float(),
+                return_dict=False,
+            )[0].to(self.dtype)
+
+        return DiffusionOutput(output=(z, height, width))
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         for _ in weights:
             pass
         return {name for name, _ in self.named_parameters()}
 
     def has_real_checkpoint(self) -> bool:
-        """Check whether the model dir has actual weight shards."""
         if not self.model_dir:
             return False
         return (

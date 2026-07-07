@@ -331,6 +331,9 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
+        if self.original_inv_freq.is_meta and not self.inv_freq.is_meta:
+            self.original_inv_freq = self.inv_freq
+
         # Qwen3VL has different position ids for the grids, so expand inv_freq to shape (3, ...).
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)

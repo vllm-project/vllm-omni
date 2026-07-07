@@ -136,19 +136,22 @@ def main() -> None:
     del pipeline
     torch.cuda.empty_cache()
 
-    # 5c: dummy_run_num_frames = 0 skips DiffusionEngine._dummy_run() warmup
-    # so Omni() init doesn't hit our NotImplementedError forward() stub.
-    # Remove this workaround once forward() is implemented.
+    # 5c: dummy_run_num_frames = 0 skips DiffusionEngine._dummy_run() warmup.
+    # Kept at 0 because default 512x512 dummy would snap to 2048x2048 (only
+    # square in PREDEFINED_RESOLUTIONS), turning warmup into a 4096-token
+    # dense-attention forward; a dedicated dummy path is a follow-up.
     dummy_frames = getattr(HiDreamO1ImagePipeline, "dummy_run_num_frames", None)
     dummy_frames_ok = dummy_frames == 0
-    print(f"5c[dummy_run_num_frames]     : value={dummy_frames} expected=0 ok={dummy_frames_ok} (workaround while forward() is a stub)")
+    print(f"5c[dummy_run_num_frames]     : value={dummy_frames} expected=0 ok={dummy_frames_ok} (skips 2048x2048 warmup)")
     assert dummy_frames_ok, (
-        f"5c: dummy_run_num_frames class attr must be 0 while forward() is a stub; "
-        f"got {dummy_frames!r}. See pipeline_hidream_o1_image.py class-level comment."
+        f"5c: dummy_run_num_frames class attr must be 0 to skip the "
+        f"snap-inflated 2048x2048 warmup; got {dummy_frames!r}. See "
+        f"pipeline_hidream_o1_image.py class-level comment."
     )
 
     # 6: end-to-end Omni(model=...) dispatch (orchestrator + worker).
-    # Skip omni.generate: forward() is still a stub.
+    # Scoped to init only; omni.generate is exercised by
+    # _test_hidream_o1_forward_from_ckpt.py.
     from vllm_omni import Omni
 
     omni = Omni(model=model_dir, dtype=torch.bfloat16)
@@ -159,9 +162,6 @@ def main() -> None:
     print("pass (pipeline init + registry + arch-resolve + weight-load-info + special-token integration all green)")
 
 
-# __main__ guard is REQUIRED here: Omni() spawns worker processes via
-# Python's `spawn` context, which re-imports this module in the child;
-# without the guard, the child would re-execute Omni(...) recursively.
 if __name__ == "__main__":
     main()
 
@@ -179,6 +179,6 @@ if __name__ == "__main__":
 # 4[weight loading_info]       : missing=0 unexpected=0 mismatched=0 n_params=8.80B ok=True
 # 5[pipeline construct]        : processor_ok=True model_ok=True eval_ok=True device_type='cuda'(ok=True) dtype_ok=True 5_special_token_attrs_ok=True has_real_checkpoint=True
 # 5b[load_weights coverage]    : returned=759 expected=759 missing=0 extra=0 ok=True
-# 5c[dummy_run_num_frames]     : value=0 expected=0 ok=True (workaround while forward() is a stub)
+# 5c[dummy_run_num_frames]     : value=0 expected=0 ok=True (skips 2048x2048 warmup)
 # 6[Omni(model=...) init]      : type='Omni' ok=True
 # pass (pipeline init + registry + arch-resolve + weight-load-info + special-token integration all green)
