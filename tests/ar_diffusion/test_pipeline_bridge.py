@@ -203,7 +203,7 @@ def test_failed_forward_tears_down_session(monkeypatch):
     runner.device = None
     runner._perf_e2e_times = []
 
-    def boom(self, req):
+    def boom(self, req, kv_prefetch_jobs=None):
         raise RuntimeError("layer 17 exploded")
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", boom)
