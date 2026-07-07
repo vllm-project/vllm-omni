@@ -612,8 +612,9 @@ class OmniDiffusionConfig:
 
     # Opt-in: route per-session world-model state through the shared
     # SessionMemoryManager (RFC #4480) instead of the model's bespoke cache.
-    # Default off; the bespoke path remains the default. Can also be toggled via
-    # the OMNI_DIFFUSION_SESSION_MEMORY_MANAGER environment variable.
+    # Default off; the bespoke path remains the default. A *set*
+    # OMNI_DIFFUSION_SESSION_MEMORY_MANAGER environment variable overrides this
+    # in both directions. See docs/features/session_memory_manager.md.
     enable_session_memory_manager: bool = False
 
     # Distributed executor backend

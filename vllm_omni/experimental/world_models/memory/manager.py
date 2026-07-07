@@ -15,6 +15,8 @@ import logging
 import os
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Any
 
 from vllm_omni.experimental.world_models.memory.base import MemoryObject
@@ -65,14 +67,26 @@ class SessionMemoryManager:
     whereas ``DiffusionRequestState`` is per-request and transient.
     """
 
-    def __init__(self, max_sessions: int = DEFAULT_MAX_SESSIONS, byte_budget: int | None = None) -> None:
+    def __init__(
+        self,
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
+        byte_budget: int | None = None,
+        lock_factory: Callable[[], AbstractContextManager[Any]] = threading.Lock,
+    ) -> None:
         if max_sessions <= 0:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")
         self.max_sessions = max_sessions
         # Recorded but not enforced yet. See RFC #4480.
         self.byte_budget = byte_budget
         self._sessions: OrderedDict[str, SessionMemory] = OrderedDict()
-        self._lock = threading.Lock()
+        # The locking strategy is injected rather than hard-coded: today's
+        # callers run the manager from worker threads, so the default is a
+        # ``threading.Lock``, but an async or single-threaded owner can pass
+        # e.g. ``contextlib.nullcontext`` (or a custom strategy) without any
+        # call-site change -- the manager only ever does ``with self._lock:``.
+        # Heavier operations planned for later phases (paged allocation,
+        # eviction planning) keep this seam.
+        self._lock = lock_factory()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
@@ -133,6 +147,14 @@ def resolve_session_memory_config(
 
         ``OMNI_DIFFUSION_SESSION_MEMORY_MANAGER`` (``1``/``0``/``true``/``false``)
         ``OMNI_DIFFUSION_SESSION_MEMORY_MANAGER_MAX_SESSIONS`` (positive int)
+
+    Precedence: a *set* environment variable wins over the value passed in
+    (i.e. over ``OmniDiffusionConfig.enable_session_memory_manager``), in both
+    directions -- ``...SESSION_MEMORY_MANAGER=0`` force-disables the manager
+    even when the config enables it. Unset or unparsable values leave the
+    passed-in value untouched (an unparsable ``MAX_SESSIONS`` logs a warning
+    and is ignored). This mirrors how other omni feature toggles allow quick
+    A/B flips on a deployed config.
     """
     env_enable = os.environ.get("OMNI_DIFFUSION_SESSION_MEMORY_MANAGER")
     if env_enable is not None:
