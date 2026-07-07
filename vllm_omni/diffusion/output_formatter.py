@@ -10,6 +10,12 @@ from typing import TypeGuard
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output
 from vllm_omni.diffusion.output_metadata import (
+    DiffusionMetadata,
+    DiffusionMultimodalOutput,
+    DiffusionOutputEnvelope,
+    DiffusionPayload,
+    DiffusionPayloadValue,
+    DiffusionPostprocessRawOutput,
     strip_internal_metadata,
     validate_diffusion_metadata,
     validate_public_diffusion_metadata,

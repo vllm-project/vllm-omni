@@ -15,6 +15,11 @@ from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.output_metadata import (
+    DiffusionMetadataMapping,
+    DiffusionMultimodalOutput,
+    DiffusionPayloadValue,
+)
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
