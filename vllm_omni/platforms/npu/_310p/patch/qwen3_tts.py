@@ -11,7 +11,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_npu
-from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
 from vllm_ascend.sample.sampler import apply_top_k_top_p, random_sample
@@ -29,8 +28,6 @@ _RUNTIME_DTYPE = torch.float16
 _CPU_DEVICE = torch.device("cpu")
 _PATCHED = False
 _CODE2WAV_PATCHED = False
-
-logger = init_logger(__name__)
 
 
 class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration):
@@ -326,38 +323,6 @@ class _Qwen3TTSTalkerCodePredictor310P(
         loaded = super().load_weights(weights)
         self._prepare_static_weights_310p()
         return loaded
-
-    def _setup_compile(self) -> None:
-        if self._compiled_model_fwd is not None:
-            return
-
-        param = next(self.model.parameters())
-        self._model_dtype = param.dtype
-        self.model.rotary_emb.to(device=param.device, dtype=self._model_dtype)
-        self._prepare_static_weights_310p()
-
-        if not qwen3_code_predictor.current_omni_platform.supports_torch_inductor():
-            self._compiled_model_fwd = self.model.forward
-            if qwen3_code_predictor.current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
-                self._warmup_buckets()
-                self._capture_npu_graphs()
-                logger.info("code_predictor: eager mode + NPU graphs")
-            else:
-                logger.warning_once("code_predictor: torch.compile disabled")
-            return
-
-        self._compiled_model_fwd = torch.compile(
-            self.model.forward,
-            dynamic=False,
-            options={"epilogue_fusion": False},
-        )
-        self._warmup_buckets()
-
-        if self._wrapper_config.use_cuda_graphs:
-            self._capture_cuda_graphs()
-            logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
-        else:
-            logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
 
     @torch.inference_mode()
     def forward(
