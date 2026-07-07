@@ -4,6 +4,7 @@
 import copy
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -18,9 +19,15 @@ from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import get_config
+from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pipeline_parallel_world_size,
+    get_pp_group,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -53,6 +60,7 @@ from .hunyuan_image3_transformer import (
 from .system_prompt import get_system_prompt
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.distributed.group_coordinator import PipelineGroupCoordinator
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
@@ -70,6 +78,22 @@ _STEP_OUTPUT_SIZE = "hunyuan_output_size"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
+
+
+@dataclass
+class _StepMicrobatch:
+    """One pipeline microbatch of rows within a grouped denoise step.
+
+    ``row_state_indexes`` / ``row_branches`` index the step's ``states`` and CFG
+    branch (like :meth:`_step_row_order`) for this microbatch's rows; ``global_rows``
+    maps each local row to its position in the canonical full-step order, so outputs
+    reassemble into the canonical branch-major order (rows grouped by CFG branch)
+    before the CFG combine.
+    """
+
+    row_state_indexes: list[int]
+    row_branches: list[int]
+    global_rows: list[int]
 
 
 def default(val, d):
@@ -342,6 +366,8 @@ class HunyuanImage3Pipeline(
 ):
     supports_step_execution: ClassVar[bool] = True
     supports_request_batch = False
+    requires_step_execution_for_pp: ClassVar[bool] = True
+    supported_microbatch_axes: ClassVar[frozenset[str]] = frozenset({"cfg", "requests"})
     support_image_input = True
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
@@ -594,10 +620,27 @@ class HunyuanImage3Pipeline(
             allow_cond_image=False,
         )
 
+    def _owned_layers(self, with_index: bool = False):
+        """Iterate decoder layers present on this pipeline-parallel rank.
+
+        ``self.model.layers`` holds ``PPMissingLayer`` placeholders for layers
+        owned by other stages; those carry no attention/KV state and are
+        skipped. The yielded index is the global layer index, stable across
+        ranks, so per-layer state keyed by it stays consistent.
+        """
+        for layer_idx, layer in enumerate(self.model.layers):
+            if not hasattr(layer, "self_attn"):
+                continue
+            yield (layer_idx, layer) if with_index else layer
+
     def _snapshot_injected_ar_kv(self) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
+        # Indexed by global layer index; placeholder stages contribute None.
         snapshot: list[list[tuple[torch.Tensor, torch.Tensor]] | None] = []
         found = False
         for layer in self.model.layers:
+            if not hasattr(layer, "self_attn"):
+                snapshot.append(None)
+                continue
             mgr = layer.self_attn.image_attn
             injected = mgr._injected_ar_kv
             if injected is None:
@@ -618,11 +661,11 @@ class HunyuanImage3Pipeline(
         if any(snapshot is None for snapshot in snapshots):
             if any(snapshot is not None for snapshot in snapshots):
                 raise ValueError("Cannot mix Hunyuan AR-KV reuse and non-reuse requests in one step batch yet.")
-            for layer in self.model.layers:
+            for layer in self._owned_layers():
                 layer.self_attn.image_attn._injected_ar_kv = None
             return
 
-        for layer_idx, layer in enumerate(self.model.layers):
+        for layer_idx, layer in self._owned_layers(with_index=True):
             injected_rows = []
             for state_idx, branch in zip(row_state_indexes, row_branches):
                 layer_snapshot = snapshots[state_idx][layer_idx]
@@ -769,7 +812,9 @@ class HunyuanImage3Pipeline(
                     f"Missing Hunyuan prompt KV cache for request {states[state_idx].request_id} "
                     "during later denoise step."
                 )
-            prefix_lens.append(int(prompt_kv[0]["lens"][branch].item()))
+            # The prefix length is layer-independent; use any layer this rank owns.
+            any_layer_kv = next(iter(prompt_kv.values()))
+            prefix_lens.append(int(any_layer_kv["lens"][branch].item()))
         return prefix_lens
 
     def _merge_step_model_inputs(
@@ -833,13 +878,13 @@ class HunyuanImage3Pipeline(
         row_branches: list[int],
     ) -> None:
         if states[0].step_index == 0:
-            for layer in self.model.layers:
+            for layer in self._owned_layers():
                 mgr = layer.self_attn.image_attn
                 mgr.image_kv_cache_map = None
                 mgr.image_kv_cache_lens = None
             return
 
-        for layer_idx, layer in enumerate(self.model.layers):
+        for layer_idx, layer in self._owned_layers(with_index=True):
             rows_k, rows_v, lens = [], [], []
             for state_idx, branch in zip(row_state_indexes, row_branches):
                 cache = states[state_idx].extra[_STEP_PROMPT_KV][layer_idx]
@@ -853,34 +898,73 @@ class HunyuanImage3Pipeline(
             )
             mgr.image_kv_cache_lens = torch.cat(lens, dim=0).to(device=mgr.image_kv_cache_map[0].device)
 
+    def _accumulate_prompt_kv_cache(
+        self,
+        states: list["DiffusionRequestState"],
+        row_state_indexes: list[int],
+        row_branches: list[int],
+        accumulator: dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]],
+    ) -> None:
+        """Stash this microbatch's first-step prompt KV into ``accumulator``.
+
+        Captures the per-layer ``image_kv_cache_map`` rows produced by the
+        forward *immediately*, before the next microbatch overwrites the
+        per-layer singleton. Indexed ``accumulator[state][layer][branch]`` so
+        microbatches that each carry only a subset of branches (e.g. the ``cfg``
+        axis) combine correctly. Each row is trimmed to its own prompt length;
+        :meth:`_finalize_prompt_kv_cache` stacks branches and re-pads.
+        """
+        for layer_idx, layer in self._owned_layers(with_index=True):
+            mgr = layer.self_attn.image_attn
+            if mgr.image_kv_cache_map is None or mgr.image_kv_cache_lens is None:
+                raise ValueError("Hunyuan first step did not produce prompt KV cache.")
+            key, value = mgr.image_kv_cache_map
+            lens = mgr.image_kv_cache_lens
+            for row_idx, (state_idx, branch) in enumerate(zip(row_state_indexes, row_branches)):
+                prompt_len = int(lens[row_idx].item())
+                accumulator.setdefault(state_idx, {}).setdefault(layer_idx, {})[branch] = {
+                    "key": key[row_idx : row_idx + 1, :prompt_len].detach().clone(),
+                    "value": value[row_idx : row_idx + 1, :prompt_len].detach().clone(),
+                    "len": lens[row_idx : row_idx + 1].detach().clone(),
+                }
+
+    def _finalize_prompt_kv_cache(
+        self,
+        states: list["DiffusionRequestState"],
+        accumulator: dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]],
+    ) -> None:
+        """Assemble accumulated per-branch prompt KV into per-state caches.
+
+        For each state/layer, stacks the captured rows in branch order and pads
+        them to a common length, producing the same branch-row layout
+        :meth:`_restore_prompt_kv_cache` expects (``[branch:branch+1]`` rows,
+        keyed by global layer index).
+        """
+        for state_idx, layers in accumulator.items():
+            cache: dict[int, dict[str, torch.Tensor]] = {}
+            for layer_idx, branches in layers.items():
+                ordered = [branches[branch] for branch in sorted(branches)]
+                cache[layer_idx] = {
+                    "key": self._pad_tensor_rows([entry["key"] for entry in ordered]),
+                    "value": self._pad_tensor_rows([entry["value"] for entry in ordered]),
+                    "lens": torch.cat([entry["len"] for entry in ordered], dim=0),
+                }
+            states[state_idx].extra[_STEP_PROMPT_KV] = cache
+
     def _capture_prompt_kv_cache(
         self,
         states: list["DiffusionRequestState"],
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
-        by_state: dict[int, list[dict[str, torch.Tensor]]] = {i: [] for i in range(len(states))}
-        for layer in self.model.layers:
-            mgr = layer.self_attn.image_attn
-            if mgr.image_kv_cache_map is None or mgr.image_kv_cache_lens is None:
-                raise ValueError("Hunyuan first step did not produce prompt KV cache.")
-            key, value = mgr.image_kv_cache_map
-            lens = mgr.image_kv_cache_lens
-            for state_idx in by_state:
-                branch_rows = [
-                    row_idx for row_idx, (idx, _) in enumerate(zip(row_state_indexes, row_branches)) if idx == state_idx
-                ]
-                state_lens = lens[branch_rows]
-                max_len = int(state_lens.max().item())
-                by_state[state_idx].append(
-                    {
-                        "key": key[branch_rows, :max_len].detach().clone(),
-                        "value": value[branch_rows, :max_len].detach().clone(),
-                        "lens": state_lens.detach().clone(),
-                    }
-                )
-        for state_idx, cache in by_state.items():
-            states[state_idx].extra[_STEP_PROMPT_KV] = cache
+        """Capture first-step prompt KV for a single (full) microbatch.
+
+        Convenience wrapper over :meth:`_accumulate_prompt_kv_cache` +
+        :meth:`_finalize_prompt_kv_cache` for the one-forward-per-step path.
+        """
+        accumulator: dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]] = {}
+        self._accumulate_prompt_kv_cache(states, row_state_indexes, row_branches, accumulator)
+        self._finalize_prompt_kv_cache(states, accumulator)
 
     @staticmethod
     def get_pos_emb(custom_pos_emb, position_ids):
@@ -1597,7 +1681,8 @@ class HunyuanImage3Pipeline(
                 generator=generator,
                 model_kwargs=kwargs,
             )
-            samples = results[0]
+            # Only the first PP stage decodes the image; later stages return samples=None.
+            samples = results.samples
             return samples
 
         else:
@@ -1641,7 +1726,8 @@ class HunyuanImage3Pipeline(
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
-    ) -> tuple | CausalMMOutputWithPast:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> tuple | CausalMMOutputWithPast | IntermediateTensors:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
         self._check_inputs(
@@ -1679,48 +1765,67 @@ class HunyuanImage3Pipeline(
         )
         custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
 
-        if input_ids is not None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+        # Pipeline parallelism: embedding and placeholder-token instantiation run on the
+        # first stage only (embed_tokens is PPMissingLayer elsewhere). Later stages resume
+        # from intermediate_tensors and recover the shape and token_h/token_w metadata.
+        if get_pp_group().is_first_rank:
+            if input_ids is not None:
+                inputs_embeds = self.model.embed_tokens(input_ids)
+                bsz, seq_len, n_embd = inputs_embeds.shape
+            else:
+                inputs_embeds = None
+                bsz = images.shape[0] if isinstance(images, torch.Tensor) else len(images)
+                seq_len = 0
+                n_embd = self.config.hidden_size
+
+            # Instantiate placeholder tokens: <timestep>, <img> for the gen image
+            if mode == "gen_text":
+                # For gen_text, make sure gen_timestep_scatter_index is None
+                gen_timestep_scatter_index = None
+                token_h, token_w = None, None
+            elif uncond_cfg_prefill:
+                token_h, token_w = None, None
+            else:
+                if first_step:
+                    assert inputs_embeds is not None
+                    inputs_embeds, token_h, token_w = self.instantiate_vae_image_tokens(
+                        inputs_embeds, images, timestep, image_mask
+                    )
+                    inputs_embeds = self.instantiate_timestep_tokens(
+                        inputs_embeds, timestep, gen_timestep_scatter_index
+                    )
+                else:
+                    t_emb = self.time_embed(timestep)
+                    image_emb, token_h, token_w = self.patch_embed(images, t_emb)
+                    timestep_emb = self.timestep_emb(timestep).reshape(bsz, -1, n_embd)
+                    inputs_embeds = torch.cat([timestep_emb, image_emb], dim=1)
+
+            # Instantiate placeholder tokens: <timestep>, <img> for cond images
+            # Should only run once with kv-cache enabled.
+            if cond_vae_images is not None:
+                inputs_embeds, _, _ = self.instantiate_vae_image_tokens(
+                    inputs_embeds, cond_vae_images, cond_timestep, cond_vae_image_mask
+                )
+                inputs_embeds = self.instantiate_timestep_tokens(
+                    inputs_embeds, cond_timestep, cond_timestep_scatter_index
+                )
+            if cond_vit_images is not None:
+                inputs_embeds = self.instantiate_vit_image_tokens(
+                    inputs_embeds, cond_vit_images, cond_vit_image_mask, vit_kwargs
+                )
+            assert inputs_embeds is not None
             bsz, seq_len, n_embd = inputs_embeds.shape
         else:
+            assert intermediate_tensors is not None, "non-first PP stage requires intermediate_tensors"
+            input_ids = None
             inputs_embeds = None
-            bsz = images.shape[0] if isinstance(images, torch.Tensor) else len(images)
-            seq_len = 0
-            n_embd = self.config.hidden_size
-
-        # Instantiate placeholder tokens: <timestep>, <img> for the gen image
-        if mode == "gen_text":
-            # For gen_text, make sure gen_timestep_scatter_index is None
-            gen_timestep_scatter_index = None
-            token_h, token_w = None, None
-        elif uncond_cfg_prefill:
-            token_h, token_w = None, None
-        else:
-            if first_step:
-                assert inputs_embeds is not None
-                inputs_embeds, token_h, token_w = self.instantiate_vae_image_tokens(
-                    inputs_embeds, images, timestep, image_mask
-                )
-                inputs_embeds = self.instantiate_timestep_tokens(inputs_embeds, timestep, gen_timestep_scatter_index)
-            else:
-                t_emb = self.time_embed(timestep)
-                image_emb, token_h, token_w = self.patch_embed(images, t_emb)
-                timestep_emb = self.timestep_emb(timestep).reshape(bsz, -1, n_embd)
-                inputs_embeds = torch.cat([timestep_emb, image_emb], dim=1)
-
-        # Instantiate placeholder tokens: <timestep>, <img> for cond images
-        # Should only run once with kv-cache enabled.
-        if cond_vae_images is not None:
-            inputs_embeds, _, _ = self.instantiate_vae_image_tokens(
-                inputs_embeds, cond_vae_images, cond_timestep, cond_vae_image_mask
-            )
-            inputs_embeds = self.instantiate_timestep_tokens(inputs_embeds, cond_timestep, cond_timestep_scatter_index)
-        if cond_vit_images is not None:
-            inputs_embeds = self.instantiate_vit_image_tokens(
-                inputs_embeds, cond_vit_images, cond_vit_image_mask, vit_kwargs
-            )
-        assert inputs_embeds is not None
-        bsz, seq_len, n_embd = inputs_embeds.shape
+            _hs = intermediate_tensors["hidden_states"]
+            bsz, seq_len, n_embd = _hs.shape
+            try:
+                token_h = int(intermediate_tensors["token_h"].item())
+                token_w = int(intermediate_tensors["token_w"].item())
+            except (KeyError, TypeError, IndexError):
+                token_h, token_w = None, None
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         from vllm.forward_context import set_forward_context
@@ -1746,7 +1851,19 @@ class HunyuanImage3Pipeline(
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 ar_kv_reuse_len=ar_kv_reuse_len,
                 full_attn_spans=full_attn_spans,
+                intermediate_tensors=intermediate_tensors,
             )
+
+        # Non-last PP stage: the transformer returns the token sequence to forward
+        # to the next stage. The diffusion head / lm_head only run on the last stage.
+        if isinstance(outputs, IntermediateTensors):
+            # Pass token_h/token_w to the last stage's diffusion head as 0-d int tensors.
+            if token_h is not None and "token_h" not in outputs.tensors:
+                _dev = outputs.tensors["hidden_states"].device
+                outputs.tensors["token_h"] = torch.tensor(int(token_h), device=_dev)
+                outputs.tensors["token_w"] = torch.tensor(int(token_w), device=_dev)
+            return outputs
+
         hidden_states = outputs[0]
 
         if mode == "gen_text":
@@ -1759,7 +1876,9 @@ class HunyuanImage3Pipeline(
             diffusion_prediction = None
         else:
             logits = None
-            hidden_states = hidden_states.to(inputs_embeds.device)
+            # inputs_embeds is None on non-first PP stages; fall back to hidden_states.
+            _target_device = inputs_embeds.device if inputs_embeds is not None else hidden_states.device
+            hidden_states = hidden_states.to(_target_device)
             assert hidden_states.numel() == bsz * seq_len * n_embd, (
                 f"Shape mismatch: {hidden_states.shape} cannot reshape to ({bsz}, {seq_len}, {n_embd})"
             )
@@ -2005,6 +2124,89 @@ class HunyuanImage3Pipeline(
         row_branches = [branch for branch in range(cfg_factor) for _ in states]
         return row_state_indexes, row_branches
 
+    def _selected_microbatch_axes(self, cfg_factor: int) -> frozenset[str]:
+        """Resolve the active microbatch axes for this grouped step.
+
+        Reads ``parallel_config.microbatch_axes`` (a set of axes drawn from
+        ``cfg`` / ``requests``) and drops the ``cfg`` axis when there is only one
+        CFG branch (``cfg_factor <= 1``, nothing to split). The result drives
+        :meth:`_step_microbatch_plan`.
+        """
+        axes = set(getattr(self.od_config.parallel_config, "microbatch_axes", ()) or ())
+        if cfg_factor <= 1:
+            # Nothing to split with only one CFG branch.
+            axes.discard("cfg")
+        return frozenset(axes)
+
+    def _requests_microbatch_size(self) -> int:
+        """Requests per microbatch for the ``requests`` axis.
+
+        Driven by ``parallel_config.microbatch_requests``. Trades batch
+        efficiency (larger = fewer, fatter forwards) against pipeline fill
+        (smaller = more microbatches); 1 = max pipelining.
+        """
+        return max(1, int(getattr(self.od_config.parallel_config, "microbatch_requests", 1)))
+
+    def _step_microbatch_plan(
+        self,
+        states: list["DiffusionRequestState"],
+        cfg_factor: int,
+        axes: frozenset[str] = frozenset(),
+    ) -> list[_StepMicrobatch]:
+        """Partition a grouped denoise step into pipeline-parallel microbatches.
+
+        Each microbatch's ``global_rows`` index the canonical full-step row order
+        (:meth:`_step_row_order`) so outputs reassemble into the canonical branch-major
+        order before the CFG combine. ``axes`` (a subset of ``cfg`` / ``requests``)
+        selects the split:
+
+        - ``frozenset()``: one microbatch over every row.
+        - ``{"cfg"}``: one microbatch per CFG branch (all requests of that branch), so a
+          later PP stage runs one branch while an earlier stage runs the next.
+        - ``{"requests"}``: one microbatch per chunk of ``c`` requests
+          (:meth:`_requests_microbatch_size`), each carrying all CFG branches; fills
+          the bubble by request count, so it works with CFG off too.
+        - ``{"cfg", "requests"}``: 2-D split, one microbatch per (request-chunk, CFG
+          branch) (``ceil(num_states/c) * cfg_factor`` total); the deepest fill. Reduces
+          to the requests-only split with CFG off.
+        """
+        # Every split is "chunk the requests, then handle the CFG branches":
+        #   - request-chunk width: ``microbatch_requests`` when the ``requests`` axis is
+        #     on, else all requests in a single chunk.
+        #   - branches: one microbatch per CFG branch when the ``cfg`` axis is on (the
+        #     deepest fill; per-state KV assembles across them via _accumulate/_finalize),
+        #     else all branches bundled into each microbatch.
+        # Emission is branch-major so outputs reassemble into the canonical branch order;
+        # the step is lockstep (one batched combine after all microbatches drain), so
+        # microbatch order does not affect the result.
+        num_states = len(states)
+        chunk = self._requests_microbatch_size() if "requests" in axes else num_states
+        plan: list[_StepMicrobatch] = []
+        if "cfg" in axes:
+            for branch in range(cfg_factor):
+                for start in range(0, num_states, chunk):
+                    rows = list(range(start, min(start + chunk, num_states)))
+                    plan.append(
+                        _StepMicrobatch(
+                            row_state_indexes=rows,
+                            row_branches=[branch] * len(rows),
+                            global_rows=[branch * num_states + state_idx for state_idx in rows],
+                        )
+                    )
+        else:
+            for start in range(0, num_states, chunk):
+                rows = list(range(start, min(start + chunk, num_states)))
+                plan.append(
+                    _StepMicrobatch(
+                        row_state_indexes=rows * cfg_factor,
+                        row_branches=[branch for branch in range(cfg_factor) for _ in rows],
+                        global_rows=[
+                            branch * num_states + state_idx for branch in range(cfg_factor) for state_idx in rows
+                        ],
+                    )
+                )
+        return plan
+
     @staticmethod
     def _validate_step_group_states(states: list["DiffusionRequestState"]) -> tuple[bool, int]:
         if not states:
@@ -2064,12 +2266,13 @@ class HunyuanImage3Pipeline(
                     if cache is None:
                         next_kwargs[key] = value[state_rows]
                     else:
+                        any_layer_kv = next(iter(cache.values()))
                         compact_masks = []
                         for row_idx in state_rows:
                             branch = row_branches[row_idx]
                             row_mask = value[row_idx : row_idx + 1]
                             query_len = int(row_mask.shape[-2])
-                            prefix_len = int(cache[0]["lens"][branch].item())
+                            prefix_len = int(any_layer_kv["lens"][branch].item())
                             max_prefix_len = int(row_mask.shape[-1]) - query_len
                             prefix_mask = row_mask[:, :, :, :prefix_len]
                             current_mask = row_mask[:, :, :, max_prefix_len : max_prefix_len + query_len]
@@ -2094,17 +2297,47 @@ class HunyuanImage3Pipeline(
             state.extra[_STEP_MODEL_KWARGS] = next_kwargs
             state.extra[_STEP_INPUT_IDS] = None
 
-    def _denoise_step_group(self, states: list["DiffusionRequestState"]) -> torch.Tensor:
-        first_step, cfg_factor = self._validate_step_group_states(states)
-        row_state_indexes, row_branches = self._step_row_order(states, cfg_factor)
-        latents = torch.cat([state.latents for state in states], dim=0)
-        latent_model_input = torch.cat([latents] * cfg_factor, dim=0)
+    @property
+    def _pp_send_work(self) -> list[torch.distributed.Work]:
+        if not hasattr(self, "_pp_send_work_list"):
+            self._pp_send_work_list: list[torch.distributed.Work] = []
+        return self._pp_send_work_list
+
+    def _sync_pp_send(self) -> None:
+        """Wait on pending non-blocking pipeline-parallel sends from prior steps.
+
+        The forward-chain ``isend`` of one denoise step must complete before the
+        next step reuses the activation buffer or posts new receives.
+        """
+        for handle in self._pp_send_work:
+            handle.wait()
+        self._pp_send_work_list = []
+
+    def _run_step_microbatch(
+        self,
+        states: list["DiffusionRequestState"],
+        microbatch: _StepMicrobatch,
+        first_step: bool,
+        pp_group: "PipelineGroupCoordinator",
+        prompt_kv_accumulator: dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]] | None,
+    ) -> torch.Tensor | None:
+        """Run the forward chain for one pipeline microbatch of a denoise step.
+
+        Builds the merged inputs for the microbatch's rows, restores their
+        per-row KV state, runs the model forward (handing activations downstream
+        under pipeline parallelism), and on the first step stashes the produced
+        prompt KV into ``prompt_kv_accumulator`` before the next microbatch
+        overwrites the per-layer singleton. Returns the microbatch's float32
+        noise prediction (rows in microbatch order) on the last stage, or
+        ``None`` on earlier stages. The next-step kwargs evolution is done once
+        over the full batch by :meth:`_denoise_step_group`, not here.
+        """
+        row_state_indexes = microbatch.row_state_indexes
+        row_branches = microbatch.row_branches
+        device = states[row_state_indexes[0]].latents.device
+        latent_model_input = torch.cat([states[state_idx].latents for state_idx in row_state_indexes], dim=0)
         timestep = torch.cat(
-            [
-                state.current_timestep.reshape(1).to(device=latents.device)
-                for _ in range(cfg_factor)
-                for state in states
-            ],
+            [states[state_idx].current_timestep.reshape(1).to(device=device) for state_idx in row_state_indexes],
             dim=0,
         )
 
@@ -2126,19 +2359,95 @@ class HunyuanImage3Pipeline(
             **model_kwargs,
         )
 
+        intermediate_tensors = None
+        if not pp_group.is_first_rank:
+            intermediate_tensors = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict())
+
         step_indexes = {state.step_index for state in states}
         context_step_index = next(iter(step_indexes)) if len(step_indexes) == 1 else None
         set_forward_context_denoise_step_idx(context_step_index)
         try:
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                model_output = self.forward_call(**model_inputs, first_step=first_step)
-                pred = model_output["diffusion_prediction"]
+                model_output = self.forward_call(
+                    **model_inputs,
+                    first_step=first_step,
+                    intermediate_tensors=intermediate_tensors,
+                )
         finally:
             set_forward_context_denoise_step_idx(None)
-        pred = pred.to(dtype=torch.float32)
+
+        if isinstance(model_output, IntermediateTensors):
+            # Non-last pipeline stage: hand activations to the next stage. The
+            # diffusion head runs only on the last stage, so there is no noise
+            # prediction here.
+            self._pp_send_work.extend(pp_group.isend_tensor_dict(model_output.tensors))
+            pred = None
+        else:
+            pred = model_output["diffusion_prediction"].to(dtype=torch.float32)
 
         if first_step:
-            self._capture_prompt_kv_cache(states, row_state_indexes, row_branches)
+            self._accumulate_prompt_kv_cache(states, row_state_indexes, row_branches, prompt_kv_accumulator)
+        return pred
+
+    def _denoise_step_group(self, states: list["DiffusionRequestState"]) -> torch.Tensor | None:
+        """Run one grouped denoise step.
+
+        The step is partitioned into pipeline microbatches (see
+        :meth:`_step_microbatch_plan`) and each is run through the forward chain
+        in turn; their per-row noise predictions are reassembled into the
+        canonical branch-major order before the CFG combine.
+        Returns the float32 noise prediction on the last pipeline-parallel stage
+        (or when pipeline parallelism is disabled), and ``None`` on earlier
+        stages, which only forward intermediate activations downstream.
+        """
+        first_step, cfg_factor = self._validate_step_group_states(states)
+        axes = self._selected_microbatch_axes(cfg_factor)
+        plan = self._step_microbatch_plan(states, cfg_factor, axes)
+        full_row_state_indexes, full_row_branches = self._step_row_order(states, cfg_factor)
+        pp_group = get_pp_group()
+
+        # Merge the full-batch kwargs up front (before any microbatch overwrites
+        # per-state state) for the next-step evolution below.
+        _, full_model_kwargs = self._merge_step_model_inputs(
+            states, full_row_state_indexes, full_row_branches, first_step
+        )
+
+        # First-step prompt KV is accumulated across microbatches (each may carry
+        # only a subset of branches) and assembled once after the loop.
+        prompt_kv_accumulator: dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]] | None = (
+            {} if first_step else None
+        )
+        microbatch_preds = [
+            self._run_step_microbatch(states, microbatch, first_step, pp_group, prompt_kv_accumulator)
+            for microbatch in plan
+        ]
+        if first_step:
+            self._finalize_prompt_kv_cache(states, prompt_kv_accumulator)
+
+        # Evolve per-request kwargs for the next step on every rank so stage
+        # shapes stay consistent. The gen-image update ignores the model-output
+        # KV cache, so it is output-independent: run it once over the full batch
+        # (independent of the microbatch partition) with a cache-less surrogate,
+        # which also keeps it deterministic across ranks.
+        updated_kwargs = self._update_model_kwargs_for_generation(ModelOutput(), full_model_kwargs)
+        self._split_merged_kwargs_to_states(states, updated_kwargs, full_row_state_indexes, full_row_branches)
+
+        if all(pred is None for pred in microbatch_preds):
+            # Non-last pipeline stage: activations were forwarded downstream.
+            return None
+
+        if len(plan) == 1:
+            # Single microbatch: rows are already in canonical order, so skip the
+            # per-row reassembly copy.
+            pred = microbatch_preds[0]
+        else:
+            total_rows = len(full_row_state_indexes)
+            canonical_rows: list[torch.Tensor | None] = [None] * total_rows
+            for microbatch, mb_pred in zip(plan, microbatch_preds):
+                for local_row, global_row in enumerate(microbatch.global_rows):
+                    canonical_rows[global_row] = mb_pred[local_row : local_row + 1]
+            pred = torch.cat(canonical_rows, dim=0)
+
         if cfg_factor > 1:
             pred_cond, pred_uncond = pred.chunk(2)
             pred = torch.cat(
@@ -2153,9 +2462,6 @@ class HunyuanImage3Pipeline(
                 ],
                 dim=0,
             )
-
-        updated_kwargs = self._update_model_kwargs_for_generation(model_output, model_kwargs)
-        self._split_merged_kwargs_to_states(states, updated_kwargs, row_state_indexes, row_branches)
         return pred
 
     def denoise_step(
@@ -2166,15 +2472,24 @@ class HunyuanImage3Pipeline(
         del kwargs
         if getattr(self, "interrupt", False):
             return None
+        # Drain the previous step's pipeline-parallel sends before posting new
+        # receives / reusing activation buffers.
+        self._sync_pp_send()
         states = list(input_batch.states)
         if not states:
             raise ValueError("HunyuanImage3 denoise_step received an empty batch.")
         self._ensure_grouped_attention_backend_supported(len(states))
+        is_last_stage = get_pp_group().is_last_rank
         outputs: dict[str, torch.Tensor] = {}
+        # Every rank runs the forward chain for every group; only the last stage
+        # yields a noise prediction to feed the scheduler.
         for group in self._split_step_groups(states):
             pred = self._denoise_step_group(group)
-            for state, state_pred in zip(group, pred):
-                outputs[state.request_id] = state_pred.unsqueeze(0)
+            if is_last_stage:
+                for state, state_pred in zip(group, pred):
+                    outputs[state.request_id] = state_pred.unsqueeze(0)
+        if not is_last_stage:
+            return None
         return torch.cat([outputs[state.request_id] for state in states], dim=0)
 
     def step_scheduler(
@@ -2186,16 +2501,32 @@ class HunyuanImage3Pipeline(
         del kwargs
         if getattr(self, "interrupt", False):
             return
-        generator = state.extra.get(_STEP_GENERATOR)
-        step_kwargs = self.pipeline.prepare_extra_func_kwargs(state.scheduler.step, {"generator": generator})
-        latent_dtype = state.latents.dtype
-        state.latents = state.scheduler.step(
-            noise_pred,
-            state.current_timestep,
-            state.latents,
-            **step_kwargs,
-            return_dict=False,
-        )[0].to(dtype=latent_dtype)
+
+        pp_group = get_pp_group()
+        pp_enabled = get_pipeline_parallel_world_size() > 1
+
+        # With pipeline parallelism only the last stage holds the noise
+        # prediction, so only it advances the scheduler. The updated latents are
+        # handed back to the first stage, which starts the next forward and runs
+        # the final decode. Intermediate stages keep stale latents (ignored by
+        # their forward) and only advance the step counter.
+        if not pp_enabled or pp_group.is_last_rank:
+            generator = state.extra.get(_STEP_GENERATOR)
+            step_kwargs = self.pipeline.prepare_extra_func_kwargs(state.scheduler.step, {"generator": generator})
+            latent_dtype = state.latents.dtype
+            state.latents = state.scheduler.step(
+                noise_pred,
+                state.current_timestep,
+                state.latents,
+                **step_kwargs,
+                return_dict=False,
+            )[0].to(dtype=latent_dtype)
+            if pp_enabled and not pp_group.is_first_rank:
+                pp_group.send_tensor_dict({"latents": state.latents.contiguous()}, dst=0)
+        elif pp_group.is_first_rank:
+            received = pp_group.recv_tensor_dict(src=pp_group.world_size - 1)
+            state.latents = received["latents"].to(dtype=state.latents.dtype)
+
         state.step_index += 1
 
     def post_decode(
@@ -2204,6 +2535,16 @@ class HunyuanImage3Pipeline(
         **kwargs: Any,
     ) -> DiffusionOutput:
         output_type = kwargs.get("output_type", "pil")
+        # Under pipeline parallelism the up-to-date latents are handed back to the
+        # first stage each step; only it decodes the final image. Other stages
+        # hold stale latents and produce no output (the worker replies from the
+        # first stage).
+        if get_pipeline_parallel_world_size() > 1 and not get_pp_group().is_first_rank:
+            return DiffusionOutput(
+                output=None,
+                custom_output={},
+                stage_durations=getattr(self, "stage_durations", None),
+            )
         generator = state.extra.get(_STEP_GENERATOR)
         latents = state.latents
         if output_type == "latent":
@@ -2301,7 +2642,8 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
-        image = outputs[0]
+        # Non-first PP stages produce no image (None); the worker replies from rank 0 only.
+        image = outputs[0] if outputs is not None else None
         custom_output = {}
         if any(t is not None for t in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list

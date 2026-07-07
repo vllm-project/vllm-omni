@@ -52,8 +52,10 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -65,9 +67,12 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_pipeline_parallel_world_size,
     get_pp_group,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -2081,6 +2086,11 @@ class HunyuanImage3Model(nn.Module):
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
 
+        # Handoff between PP stages: factory for the receiving stage's empty hidden-state tensors.
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], config.hidden_size
+        )
+
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
         num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
@@ -2353,6 +2363,8 @@ class HunyuanImage3Model(nn.Module):
                     name = "norm.weight"
                 if name == "wte.weight":
                     name = "embed_tokens.weight"
+                if is_pp_missing_parameter(name, self) or name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -2385,7 +2397,8 @@ class HunyuanImage3Model(nn.Module):
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
-    ) -> tuple | BaseModelOutputWithPast:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> tuple | BaseModelOutputWithPast | IntermediateTensors:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -2394,17 +2407,28 @@ class HunyuanImage3Model(nn.Module):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        sp_world_size = get_sequence_parallel_world_size()
+        pp_world_size = get_pipeline_parallel_world_size()
+        if pp_world_size > 1 and sp_world_size > 1:
+            raise NotImplementedError(
+                "Combining pipeline parallelism with sequence parallelism is not supported for HunyuanImage3."
+            )
 
-        # embed positions
-        hidden_states = inputs_embeds
+        if is_pipeline_first_stage():
+            # Build the token embeddings from the prepared inputs.
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            hidden_states = inputs_embeds
+        else:
+            # Resume from the previous stage's hidden states.
+            if intermediate_tensors is None:
+                raise RuntimeError("intermediate_tensors must be provided for non-first PP stages")
+            hidden_states = intermediate_tensors["hidden_states"]
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
-        sp_world_size = get_sequence_parallel_world_size()
         prompt_size = 0
         shard_image_size = 0
         shard_padding_size = 0
@@ -2468,7 +2492,7 @@ class HunyuanImage3Model(nn.Module):
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for decoder_layer in self.layers[self.start_layer : self.end_layer]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -2504,6 +2528,12 @@ class HunyuanImage3Model(nn.Module):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+
+        if not is_pipeline_last_stage():
+            # Hand the token sequence to the caller for the next stage; the final norm /
+            # diffusion head run only on the last stage.
+            return IntermediateTensors({"hidden_states": hidden_states})
+
         if sp_world_size > 1:
             text_output, image_output = self._split_result(hidden_states, prompt_size)
             hidden_states = self.post_processor(image_output)
