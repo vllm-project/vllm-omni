@@ -39,7 +39,7 @@ def _make_minimal_request(
     )
     req = MagicMock()
     req.sampling_params = params
-    req.prompts = [prompt]
+    req.prompt = prompt
     req.multi_modal_data = {}
     return req
 

@@ -20,7 +20,7 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.23.0 --torch-backend=auto
+uv pip install vllm==0.24.0 --torch-backend=auto
 ```
 
 #### Installation of vLLM-Omni
@@ -39,13 +39,13 @@ uv pip install 'vllm-omni[demo]'
 # --8<-- [start:build-wheel-from-source]
 
 #### Installation of vLLM
-If you do not need to modify source code of vLLM, you can directly install the stable 0.23.0 release version of the library
+If you do not need to modify source code of vLLM, you can directly install the stable 0.24.0 release version of the library
 
 ```bash
-uv pip install vllm==0.23.0 --torch-backend=auto
+uv pip install vllm==0.24.0 --torch-backend=auto
 ```
 
-The 0.23.0 release of vLLM ships CUDA 13.0-compatible binaries by default. If you need a different CUDA variant or want to reuse an existing PyTorch installation, build vLLM from source instead.
+The 0.24.0 release of vLLM ships CUDA 13.0-compatible binaries by default. If you need a different CUDA variant or want to reuse an existing PyTorch installation, build vLLM from source instead.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
@@ -66,12 +66,12 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.23.0
+git checkout v0.24.0
 ```
 Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
 ```bash
-#For CUDA 13.0 (the default for v0.23.0; the wheel filename has no `+cu130` suffix)
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.23.0/vllm-0.23.0-cp38-abi3-manylinux_2_28_x86_64.whl
+#For CUDA 13.0 (the default for v0.24.0; the wheel filename has no `+cu130` suffix)
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.24.0/vllm-0.24.0-cp38-abi3-manylinux_2_28_x86_64.whl
 ```
 Install vllm with command below (If you have no existing PyTorch).
 ```bash
@@ -102,7 +102,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.23.0 \
+    vllm/vllm-omni:v0.24.0 \
     vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 

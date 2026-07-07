@@ -9,6 +9,55 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Flat payload keys partitioned at worker output into inter-stage connector
+# payloads vs client-facing multimodal outputs.  Only final output roots are
+# listed here; everything else remains available for stage-to-stage transport.
+_CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
+    {
+        "model_outputs",
+        "sr",
+        "audio",
+        "image",
+        "images",
+        "video",
+        "videos",
+        "trajectory_latents",
+        "latents",
+    }
+)
+
+
+def partition_flat_payload(
+    payload: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Split a flattened per-request payload into inter-stage vs client mm dicts."""
+    if not payload:
+        return {}, {}
+    inter_stage: dict[str, object] = {}
+    client_mm: dict[str, object] = {}
+    for key, value in payload.items():
+        root = key.split(".", 1)[0]
+        if root in _CLIENT_MM_ROOT_KEYS:
+            client_mm[key] = value
+        else:
+            inter_stage[key] = value
+    return inter_stage, client_mm
+
+
+def partition_payload_list(
+    payloads: list[dict[str, object]],
+) -> tuple[list[dict[str, object] | None] | None, list[dict[str, object] | None] | None]:
+    inter_stage_list: list[dict[str, object] | None] = []
+    client_mm_list: list[dict[str, object] | None] = []
+    for payload in payloads:
+        inter_stage, client_mm = partition_flat_payload(payload)
+        inter_stage_list.append(inter_stage or None)
+        client_mm_list.append(client_mm or None)
+    return (
+        None if all(item is None for item in inter_stage_list) else inter_stage_list,
+        None if all(item is None for item in client_mm_list) else client_mm_list,
+    )
+
 
 def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
@@ -57,7 +106,13 @@ def _to_cpu(value):
 
 
 def to_payload_element(
-    element: object, idx: int, start: int, end: int, pass_lists_through: bool = False, seq_len: int | None = None
+    element: object,
+    idx: int,
+    start: int,
+    end: int,
+    pass_lists_through: bool = False,
+    seq_len: int | None = None,
+    scheduled_seq_len: int | None = None,
 ):
     """Build an mm payload element corresponding to one request index
     from an element containing 0 or more CPU tensors.
@@ -71,21 +126,39 @@ def to_payload_element(
             passthrough data; this should be False in normal cases, but True
             if we need to avoid splitting nonempty lists prior to calling
             postprocess, which is the case for prefix cache.
-        seq_len: Optional sequence length (i.e., dim 0 of hidden states).
-            When set, a tensor whose first dimension equals seq_len is
-            sliced per request. The prefix cache passthrough also passes
-            the total scheduled token count here so 1D (seq_len,) metadata
-            that is intentionally not cached is still split per request.
+        seq_len: Optional hidden-aligned batch length (``hidden_states.shape[0]``).
+            When a tensor's first dimension equals this value, it is sliced
+            per request using ``start:end``.
+        scheduled_seq_len: Optional scheduler-aligned batch length
+            (``scheduler_output.total_num_scheduled_tokens``). Some full-payload
+            mm tensors (e.g. batched ``codes.audio`` with tail-only hidden states)
+            are laid out by scheduled tokens instead of the hidden tail shape.
+            When omitted, ``seq_len`` is reused for backward compatibility.
     """
-    # Cached per-token tensors are merged elsewhere; here a first dim
-    # equal to seq_len means a per-request slice is required.
-    if seq_len is not None and isinstance(element, torch.Tensor) and element.shape[0] == seq_len:
+    if scheduled_seq_len is None:
+        scheduled_seq_len = seq_len
+
+    # Cached per-token tensors are merged elsewhere; here a first dim equal to
+    # either the hidden-aligned or scheduler-aligned batch length means a
+    # per-request slice is required.
+    if isinstance(element, torch.Tensor) and (
+        (seq_len is not None and element.shape[0] == seq_len)
+        or (scheduled_seq_len is not None and element.shape[0] == scheduled_seq_len)
+    ):
         return element[start:end].contiguous()
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
     elif isinstance(element, dict):
         return {
-            sk: to_payload_element(sv, idx, start, end, pass_lists_through=pass_lists_through, seq_len=seq_len)
+            sk: to_payload_element(
+                sv,
+                idx,
+                start,
+                end,
+                pass_lists_through=pass_lists_through,
+                seq_len=seq_len,
+                scheduled_seq_len=scheduled_seq_len,
+            )
             for sk, sv in element.items()
         }
     elif isinstance(element, list):

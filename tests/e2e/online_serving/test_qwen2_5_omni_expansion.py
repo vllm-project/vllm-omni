@@ -55,7 +55,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -93,7 +93,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.omni
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:

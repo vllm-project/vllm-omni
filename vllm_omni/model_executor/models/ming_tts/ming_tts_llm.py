@@ -3,6 +3,7 @@
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -51,6 +52,9 @@ from .patch_emission import (
 
 logger = init_logger(__name__)
 
+# CFM ODE integration steps; must match CFM.sample(steps=...) default (10).
+_CFM_STEPS = 10
+
 
 class MingLLMModel(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(
@@ -66,7 +70,16 @@ class MingLLMModel(nn.Module):
         self.vllm_config = vllm_config
         self.prefix = prefix
         self.fm_dtype = _resolve_ming_runtime_dtype(vllm_config)
-        self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        if self.ming_config.model_variant == "moe":
+            from vllm.model_executor.models.bailing_moe import BailingMoeModel
+
+            # BailingMoeModel reads ``vllm_config.model_config.hf_config`` directly
+            # (no get_text_config()), so re-wrap with the nested bailing_moe config.
+            llm_config = vllm_config.model_config.hf_config.get_text_config()
+            llm_vllm_config = vllm_config.with_hf_config(llm_config)
+            self.model = BailingMoeModel(vllm_config=llm_vllm_config, prefix=maybe_prefix(prefix, "model"))
+        else:
+            self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         self.linear_proj_audio = Aggregator(
             in_channels=self.ming_config.latent_dim,
             llm_input_dim=self.ming_config.llm_hidden_size,
@@ -86,6 +99,11 @@ class MingLLMModel(nn.Module):
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids = None
         self._last_text_mode = False
+        # CUDAGraph for the flow-matching (CFM) diffusion head — the TTFP/latency
+        # hot spot. Built lazily on the first batch=1 CUDA decode; set
+        # MING_CFM_CUDAGRAPH=0 to force the eager flow head.
+        self._cfm_graph = None
+        self._cfm_graph_enabled = os.environ.get("MING_CFM_CUDAGRAPH", "1") == "1"
 
     def embed_input_ids(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor | None = None, **_: Any
@@ -118,11 +136,14 @@ class MingLLMModel(nn.Module):
             min_stop_step=int(self.ming_config.stop_head_min_steps),
             default_max_decode_steps=self.ming_config.max_decode_steps,
         )
+        # Positional call: Qwen2Model names the 2nd arg ``positions`` while
+        # BailingMoeModel names it ``position_ids`` — both share the signature
+        # (input_ids, positions, intermediate_tensors, inputs_embeds).
         backbone_out = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
         )
         if isinstance(backbone_out, IntermediateTensors):
             self._last_ming_next_token_ids = None
@@ -294,6 +315,33 @@ class MingLLMModel(nn.Module):
             logprobs_tensors=None,
         )
 
+    def _maybe_build_cfm_graph(self, z_diff_cond: torch.Tensor):
+        """Lazily build the CFM CUDAGraph executor (batch=1, CUDA only)."""
+        if not self._cfm_graph_enabled:
+            return None
+        if z_diff_cond.shape[0] != 1 or not z_diff_cond.is_cuda:
+            return None
+        if self._cfm_graph is not None:
+            return self._cfm_graph
+        try:
+            from .fm.cfm_cudagraph import CFMGraphExecutor, CFMSampler
+
+            sampler = CFMSampler(self.flowloss.cfm.model, steps=_CFM_STEPS)
+            self._cfm_graph = CFMGraphExecutor(
+                sampler,
+                self.linear_proj_audio,
+                self.stop_head,
+                patch_size=self.ming_config.patch_size,
+                latent_dim=self.ming_config.latent_dim,
+                steps=_CFM_STEPS,
+            )
+            logger.info("Ming CFM CUDAGraph enabled (steps=%d, patch=%d).", _CFM_STEPS, self.ming_config.patch_size)
+        except Exception as exc:
+            logger.warning("Ming CFM CUDAGraph unavailable (%s); using eager flow head.", exc)
+            self._cfm_graph_enabled = False
+            return None
+        return self._cfm_graph
+
     def _decode_one_step(
         self,
         *,
@@ -317,23 +365,45 @@ class MingLLMModel(nn.Module):
         z_diff_cond = hidden_states.to(dtype=self.fm_dtype).unsqueeze(1)
         if not torch.isfinite(z_diff_cond).all():
             raise RuntimeError("Non-finite z_diff_cond before FlowLoss.sample().")
-        sampled_token_latent = self.flowloss.sample(
-            z=z_diff_cond,
-            latent_history=latent_history,
-            cfg=cfg_scale,
-            patch_size=self.ming_config.patch_size,
-            sigma=sigma,
-            temperature=temperature,
-        )
+
+        # Fast path: CUDAGraph-captured flow head (CFM sampling + Aggregator +
+        # stop head). Falls back permanently to the eager path on any failure.
+        sampled_token_latent = next_embeds = stop_probs = None
+        # cfg < 1e-5 disables CFG; the eager flow head handles this with a
+        # dedicated unconditional branch (c=zeros) that the captured graph does
+        # not replicate, so fall back to eager there to match FlowLoss.sample.
+        graph_exec = self._maybe_build_cfm_graph(z_diff_cond) if cfg_scale >= 1e-5 else None
+        if graph_exec is not None:
+            try:
+                sampled_token_latent, next_embeds, stop_full = graph_exec.execute(
+                    z_diff_cond, latent_history, cfg_scale, sigma, temperature
+                )
+                stop_probs = stop_full[:, 1]
+            except Exception as exc:
+                logger.warning("Ming CFM CUDAGraph failed (%s); falling back to eager flow head.", exc)
+                self._cfm_graph = None
+                self._cfm_graph_enabled = False
+                sampled_token_latent = next_embeds = stop_probs = None
+
+        if sampled_token_latent is None:
+            sampled_token_latent = self.flowloss.sample(
+                z=z_diff_cond,
+                latent_history=latent_history,
+                cfg=cfg_scale,
+                patch_size=self.ming_config.patch_size,
+                sigma=sigma,
+                temperature=temperature,
+            )
+            # Aggregator expects [Batch, Time, Dimension] = [B, 4, 64] and returns [B, 1, H].
+            next_embeds = self.linear_proj_audio(sampled_token_latent)
+            stop_probs = self.stop_head(hidden_states.to(dtype=self.fm_dtype)).softmax(dim=-1)[:, 1]
+
         expected_shape = (hidden_states.shape[0], self.ming_config.patch_size, self.ming_config.latent_dim)
         if tuple(sampled_token_latent.shape) != expected_shape:
             raise RuntimeError(
                 f"FlowLoss output shape mismatch: got {tuple(sampled_token_latent.shape)}, expected {expected_shape}"
             )
         new_history = torch.cat([latent_history[:, self.ming_config.patch_size :, :], sampled_token_latent], dim=1)
-        # Aggregator expects [Batch, Time, Dimension] = [B, 4, 64] and returns [B, 1, H].
-        next_embeds = self.linear_proj_audio(sampled_token_latent)
-        stop_probs = self.stop_head(hidden_states.to(dtype=self.fm_dtype)).softmax(dim=-1)[:, 1]
         if not torch.isfinite(sampled_token_latent).all():
             raise RuntimeError("Non-finite sampled_token_latent in Ming decode step.")
         if not torch.isfinite(next_embeds).all():

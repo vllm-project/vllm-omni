@@ -10,6 +10,7 @@ from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import (
     build_image_to_image_prompt,
+    build_image_to_video_prompt,
     build_text_to_image_prompt,
     get_extra_body_params,
     get_extra_output_params,
@@ -148,6 +149,47 @@ def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_audiox_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("AudioXPipeline") == frozenset(
+        {
+            "audiox_task",
+            "seconds_start",
+            "seconds_total",
+            "sigma_min",
+            "sigma_max",
+            "cfg_rescale",
+            "video_path",
+            "audio_path",
+        }
+    )
+    assert get_extra_output_params("AudioXPipeline") == frozenset({"audiox_task"})
+    assert should_init_extra_args_for_non_diffusion_stages("AudioXPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_audiox_declared_extra_args_route_into_sampling_params() -> None:
+    params = OmniDiffusionSamplingParams()
+    declared = get_extra_body_params("AudioXPipeline")
+    apply_declared_extra_args(
+        params,
+        declared,
+        {
+            "audiox_task": "t2a",
+            "seconds_total": 10.0,
+            "sigma_min": 0.03,
+            "unknown": "ignored",
+        },
+    )
+    assert params.extra_args == {
+        "audiox_task": "t2a",
+        "seconds_total": 10.0,
+        "sigma_min": 0.03,
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_helios_extra_registry_declares_request_and_response_params() -> None:
     expected_body = frozenset(
         {
@@ -174,6 +216,14 @@ def test_helios_extra_registry_declares_request_and_response_params() -> None:
         assert get_extra_body_params(cls) == expected_body
         assert get_extra_output_params(cls) == frozenset()
         assert should_init_extra_args_for_non_diffusion_stages(cls) is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_vace_extra_registry_has_no_pipeline_params() -> None:
+    assert get_extra_body_params("WanVACEPipeline") == frozenset()
+    assert get_extra_output_params("WanVACEPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("WanVACEPipeline") is False
 
 
 @pytest.mark.core_model
@@ -253,6 +303,58 @@ def test_unknown_pipeline_uses_default_image_to_image_prompt() -> None:
     }
 
 
+def _build_vace_prompt(media_inputs: dict[str, object], *, num_frames: int = 5) -> dict:
+    return build_image_to_video_prompt(
+        "WanVACEPipeline",
+        prompt="a bird flying",
+        negative_prompt=None,
+        media_inputs=media_inputs,
+        height=16,
+        width=320,
+        num_frames=num_frames,
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "media_inputs",
+    [
+        {"image": Image.new("RGB", (320, 16), "red")},
+        {"last_image": Image.new("RGB", (320, 16), "blue")},
+        {
+            "image": Image.new("RGB", (320, 16), "red"),
+            "last_image": Image.new("RGB", (320, 16), "blue"),
+        },
+        {"image": Image.new("RGB", (320, 16), "red"), "mask": Image.new("L", (320, 16), 0)},
+        {"reference_images": [Image.new("RGB", (64, 64), "red")]},
+    ],
+    ids=["i2v", "v2lf", "flf2v", "inpaint", "r2v"],
+)
+def test_vace_image_to_video_prompt_builder(media_inputs: dict[str, object]) -> None:
+    result = _build_vace_prompt(media_inputs)
+    mmd = result["multi_modal_data"]
+    if "reference_images" in mmd:
+        assert mmd["reference_images"] is media_inputs["reference_images"]
+    else:
+        assert len(mmd["video"]) == len(mmd["mask"]) == 5
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("media_inputs", "message"),
+    [
+        ({}, "requires a conditioning media input"),
+        ({"mask": Image.new("L", (320, 16))}, "mask input requires an image"),
+        ({"control_image": Image.new("RGB", (320, 16))}, "Unsupported VACE media input"),
+    ],
+)
+def test_vace_rejects_invalid_media_combinations(media_inputs: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _build_vace_prompt(media_inputs)
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
@@ -273,4 +375,46 @@ def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
         "existing": 1,
         "cfg_text_scale": 4.0,
         "think": False,
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("MammothModa2DiTPipeline") == frozenset(
+        {
+            "text_guidance_scale",
+            "cfg_range",
+            "num_inference_steps",
+        }
+    )
+    assert get_extra_output_params("MammothModa2DiTPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("MammothModa2DiTPipeline") is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammothmoda2_text_to_image_prompt_builder() -> None:
+    # Image dims are converted to the AR grid (width/16 x height/16); the negative
+    # prompt is ignored (MammothModa2 t2i uses CFG, not an explicit negative path).
+    assert build_text_to_image_prompt(
+        "MammothModa2DiTPipeline",
+        prompt="a cat",
+        negative_prompt="blurry",
+        height=512,
+        width=768,
+    ) == {
+        "prompt": (
+            "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
+            "<|im_start|>user\na cat<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<|image start|>48*32<|image token|>"
+        ),
+        "additional_information": {
+            "omni_task": ["t2i"],
+            "ar_width": [48],
+            "ar_height": [32],
+            "image_height": [512],
+            "image_width": [768],
+        },
     }

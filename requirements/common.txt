@@ -9,7 +9,7 @@
 # That breakage is now handled in code instead of by pinning:
 # MossTTSNanoForGeneration wraps weight loading in
 # transformers_keys_to_ignore_compat (vllm_omni/model_executor/models/utils.py).
-transformers >= 4.56.0, != 5.0.*, != 5.1.*, != 5.2.*, != 5.3.*, != 5.4.*, != 5.5.0
+transformers >= 5.5.3
 av>=14.0.0
 omegaconf>=2.3.0
 diffusers==0.38.0
@@ -30,3 +30,7 @@ janus>=1.0.0
 msgpack>=1.0.0
 pydantic>=2.1.0
 pydantic-settings>=2.0.0
+# Required for GGUF-quantized diffusion model loading (gguf_adapters). The CI
+# base image does not ship it, so declare it explicitly. The loader also guards
+# this import so a missing gguf no longer breaks all diffusion model loading.
+gguf>=0.10.0

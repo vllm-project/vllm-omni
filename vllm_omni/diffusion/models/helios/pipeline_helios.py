@@ -30,6 +30,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -283,10 +284,17 @@ class HeliosPipeline(
     ) -> DiffusionRequestState:
         """Initialize Helios request state for chunk-wise step execution."""
         del kwargs
-        req = OmniDiffusionRequest(
-            prompts=state.prompts or [],
-            sampling_params=state.sampling,
-            request_id=state.request_id,
+        # Wrap the single request in a DiffusionRequestBatch so the batch
+        # compatibility properties (`prompts`, etc.) used below are available;
+        # OmniDiffusionRequest itself only exposes a singular `prompt`.
+        req = DiffusionRequestBatch(
+            requests=[
+                OmniDiffusionRequest(
+                    prompt=state.prompt,
+                    sampling_params=state.sampling,
+                    request_id=state.request_id,
+                )
+            ]
         )
         extra = getattr(state.sampling, "extra_args", {}) or {}
 
@@ -905,7 +913,7 @@ class HeliosPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         height: int = 384,
