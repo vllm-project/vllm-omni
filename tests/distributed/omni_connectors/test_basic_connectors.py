@@ -9,7 +9,7 @@ from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 
-# pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_basic_serialization():
@@ -31,6 +31,20 @@ def test_tensor_serialization():
     deserialized = OmniSerializer.deserialize(serialized)
 
     assert torch.equal(tensor, deserialized)
+
+
+def test_noncontiguous_tensor_serialization():
+    """Test torch.Tensor serialization for strided views."""
+    import torch
+
+    tensor = torch.arange(40, dtype=torch.long).reshape(4, 10).transpose(0, 1)
+    assert not tensor.is_contiguous()
+    assert tensor.stride(-1) != 1
+
+    serialized = OmniSerializer.serialize({"codes": tensor})
+    deserialized = OmniSerializer.deserialize(serialized)
+
+    assert torch.equal(tensor, deserialized["codes"])
 
 
 def test_ndarray_serialization():
@@ -61,18 +75,21 @@ def test_create_unknown_connector():
 
 @pytest.fixture
 def shm_connector():
-    config = {"shm_threshold_bytes": 100}  # Small threshold for testing
+    config = {"shm_threshold_bytes": 100, "inline_small_payloads": True}
     return SharedMemoryConnector(config)
 
 
 def test_put_get_inline(shm_connector):
-    """Test transfer for small data (currently always uses SHM)."""
+    """Test inline transfer for small data."""
     data = {"small": "data"}
 
     success, size, metadata = shm_connector.put("stage_0", "stage_1", "req_1", data)
     assert success is True
-    assert "shm" in metadata
+    assert "inline_bytes" in metadata
+    assert "shm" not in metadata
     assert "size" in metadata
+    assert shm_connector._metrics["inline_writes"] == 1
+    assert shm_connector._metrics["shm_writes"] == 0
 
     # Retrieve
     retrieved_data, ret_size = shm_connector.get("stage_0", "stage_1", "req_1", metadata)
@@ -120,3 +137,61 @@ def test_get_invalid_metadata(shm_connector):
 
     result = shm_connector.get("stage_0", "stage_1", "req_3", {"unknown": "format"})
     assert result is None
+
+
+def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: pytest.MonkeyPatch):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    class _FakePool:
+        is_cuda = False
+
+        def pin_memory(self):
+            return self
+
+        def data_ptr(self):
+            return 1234
+
+    class _FakeTransferEngine:
+        def initialize(self, host, mode, protocol, device_name):
+            self.host = host
+            self.mode = mode
+            self.protocol = protocol
+            self.device_name = device_name
+            return 0
+
+        def get_rpc_port(self):
+            return 23456
+
+        def register_memory(self, base_ptr, pool_size):
+            del base_ptr, pool_size
+            return 0
+
+        def unregister_memory(self, base_ptr):
+            del base_ptr
+            return 0
+
+    monkeypatch.setattr(mooncake_module, "TransferEngine", _FakeTransferEngine)
+    monkeypatch.setattr(mooncake_module.torch, "empty", lambda *args, **kwargs: _FakePool())
+    monkeypatch.setattr(
+        mooncake_module.MooncakeTransferEngineConnector,
+        "_get_local_ip",
+        lambda self: "10.20.30.40",
+    )
+    monkeypatch.setattr(
+        mooncake_module.MooncakeTransferEngineConnector,
+        "_zmq_listener_loop",
+        lambda self: self._listener_ready.set(),
+    )
+
+    connector = mooncake_module.MooncakeTransferEngineConnector(
+        {
+            "zmq_port": 50051,
+            "memory_pool_size": 4096,
+        }
+    )
+    try:
+        assert connector.host == "10.20.30.40"
+        assert connector.engine.host == "10.20.30.40"
+        assert connector.get_connection_info()["host"] == "10.20.30.40"
+    finally:
+        connector.close()

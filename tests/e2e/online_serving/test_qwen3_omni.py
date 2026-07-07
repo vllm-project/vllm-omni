@@ -3,55 +3,46 @@ E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
 import os
-from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
-from vllm_omni.platforms import current_omni_platform
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
-models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
+# Set VLLM_TEST_PD_MODE=1 to test PD disaggregation (follow-up — deploy overlay not yet migrated).
+_USE_PD = os.environ.get("VLLM_TEST_PD_MODE", "0") == "1"
+
+_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+_CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 
-def get_chunk_config():
-    path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml"),
-        updates={
-            "async_chunk": True,
-            "stage_args": {
-                0: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
-                },
-                1: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
-                },
-            },
-        },
-        deletes={"stage_args": {2: ["custom_process_input_func"]}},
-    )
-    return path
-
-
-if current_omni_platform.is_xpu():
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
-else:  # MI325 GPU should share the same config as H100
-    stage_configs = [get_chunk_config()]
-
-# Create parameter combinations for model and stage config
+# For prefix caching checks against we enable it on the thinker and talker via CLI override
+# and enable prompt token details so that we can determine if any tokens were cached.
+# We also explicitly set block size so that we can make sure the cached token counts are a
+# multiple of the block size.
+BLOCK_SIZE = 16
 test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_CI_DEPLOY,
+            use_stage_cli=True,
+            server_args=[
+                "--no-async-chunk",
+                "--block-size",
+                str(BLOCK_SIZE),
+                "--stage-overrides",
+                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
+                "--enable-prompt-tokens-details",
+            ],
+        ),
+        id="default",
+    )
 ]
 
 
@@ -75,6 +66,7 @@ def get_prompt(prompt_type="text_only"):
     prompts = {
         "text_only": "What is the capital of China? Answer in 20 words.",
         "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
+        "text_image": "What color are the squares in this image?",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -87,7 +79,8 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -120,13 +113,14 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     }
 
     # Test single completion
-    openai_client.send_omni_request(request_config)
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
@@ -147,3 +141,88 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+def _run_prefix_cache_check(openai_client, request_config: dict):
+    """Make two requests given a request config, and validate that:
+    1. The second request actually had cached tokens
+    2. The number of cached tokens is divisible by the block size used in
+    test_params, because currently upstream vLLM does not cache partial
+    blocks.
+    """
+    openai_client.send_omni_request(request_config, request_num=1)[0]
+    cached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
+
+    # Ensure that we have a prefix cache hit on the second request and that only the last
+    # partial block is uncached (since currently we don't cache partial blocks).
+    num_cached_tokens = cached_response.cached_tokens
+    num_prompt_tokens = cached_response.prompt_tokens
+    assert num_cached_tokens is not None and num_prompt_tokens is not None
+    num_uncached_tokens = num_prompt_tokens % BLOCK_SIZE
+    assert num_cached_tokens > 0
+    assert num_cached_tokens % BLOCK_SIZE == 0
+    assert (num_cached_tokens + num_uncached_tokens) == num_prompt_tokens
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
+    """
+    Test thinker prefix caching by sending identical requests with an image (i.e.,
+    a large shared prefix) and verifying that the second request uses cached tokens
+    & produces the same output with greedy decoding.
+
+    NOTE: Checking the output of prefix caching directly can be a bit unstable
+    due to slight numerical differences as a result of running different scheduled
+    sequence lengths. As such, for E2E tests on prefix cache, we only check the cached
+    token count and not the output, since the omni tensor cache has solid unit tests,
+    and the core prefix cache algorithm is largely tested by upstream vLLM.
+    """
+    img_res = generate_synthetic_image(224, 224)
+    image_data_url = f"data:image/jpeg;base64,{img_res['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        image_data_url=image_data_url,
+        content_text=get_prompt("text_image"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+    }
+    _run_prefix_cache_check(openai_client, request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None:
+    """
+    Verify that thinker prefix caching does not hang when the request
+    produces audio output (text + audio modalities).  Sends two identical
+    requests so the second exercises the prefix-cached path through the
+    full thinker -> talker -> code2wav pipeline.
+
+    Regression test for https://github.com/vllm-project/vllm-omni/issues/3510
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt(),
+    )
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {
+            "include_usage": True,
+        },
+    }
+
+    _run_prefix_cache_check(openai_client, request_config)

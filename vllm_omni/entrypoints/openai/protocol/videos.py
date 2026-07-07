@@ -73,6 +73,27 @@ class UrlImageReference(BaseModel):
 ImageReference = UrlImageReference | FileImageReference
 
 
+class FileVideoReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_id: str
+
+
+class UrlVideoReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    video_url: str
+
+
+VideoReference = UrlVideoReference | FileVideoReference
+
+
+class UrlAudioReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    audio_url: str
+
+
+AudioReference = UrlAudioReference
+
+
 class VideoGenerationRequest(BaseModel):
     """
     OpenAI-style video generation request.
@@ -98,6 +119,14 @@ class VideoGenerationRequest(BaseModel):
     image_reference: ImageReference | None = Field(
         default=None,
         description="Optional JSON-safe image reference that guides generation. Provide either image_url or file_id.",
+    )
+    video_reference: VideoReference | None = Field(
+        default=None,
+        description="Optional JSON-safe video reference that guides generation. Provide either video_url or file_id.",
+    )
+    audio_reference: AudioReference | None = Field(
+        default=None,
+        description="Optional audio reference for speech-to-video. Provide audio_url (http(s) or data URL).",
     )
 
     # Video params block for extensibility
@@ -149,6 +178,38 @@ class VideoGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    generate_sound: bool = Field(
+        default=False,
+        description="Request model-generated audio for video models that support sound generation.",
+    )
+    sound_duration: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Duration in seconds for model-generated audio. Defaults to the generated video duration.",
+    )
+
+    # vllm-omni extensions for post-generation frame interpolation.
+    enable_frame_interpolation: bool = Field(
+        default=False,
+        description="Enable post-generation RIFE frame interpolation before MP4 encoding.",
+    )
+    frame_interpolation_exp: int = Field(
+        default=1,
+        ge=1,
+        description="Interpolation exponent: 1=2x temporal resolution, 2=4x, etc.",
+    )
+    frame_interpolation_scale: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="RIFE inference scale. Use 0.5 for high-resolution inputs to save memory.",
+    )
+    frame_interpolation_model_path: str | None = Field(
+        default=None,
+        description=(
+            "Local directory or Hugging Face repo ID containing RIFE flownet.pkl weights. "
+            "Defaults to elfgum/RIFE-4.22.lite."
+        ),
+    )
 
     # vllm-omni extension for per-request LoRA.
     lora: dict[str, Any] | None = Field(
@@ -188,12 +249,24 @@ class VideoGenerationRequest(BaseModel):
         return vp
 
 
+class VideoAction(BaseModel):
+    """Generated action sequence returned by action-capable video models."""
+
+    data: list[Any] = Field(..., description="JSON-serializable nested action values")
+    shape: list[int] = Field(..., description="Shape of the returned action data")
+    dtype: str | None = Field(default=None, description="Source action dtype, if available")
+    raw_action_dim: int | None = Field(default=None, description="Raw action dimension requested by the model")
+    action_mode: str | None = Field(default=None, description="Action generation mode")
+    domain_id: int | None = Field(default=None, description="Action embodiment domain id")
+
+
 class VideoData(BaseModel):
     """Single generated video data."""
 
     b64_json: str | None = Field(default=None, description="Base64-encoded MP4 video")
     url: str | None = Field(default=None, description="Video URL (not implemented)")
     revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
+    action: VideoAction | None = Field(default=None, description="Generated action sequence metadata, if any")
 
 
 class VideoGenerationResponse(BaseModel):
@@ -201,10 +274,18 @@ class VideoGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[VideoData] = Field(..., description="Array of generated videos")
+    stage_durations: dict[str, float] = Field(
+        default_factory=dict,
+        description="Profiler stage durations reported by the diffusion pipeline.",
+    )
+    peak_memory_mb: float = Field(
+        default=0.0,
+        description="Peak device memory usage in MB reported by the diffusion pipeline.",
+    )
 
 
 class VideoError(BaseModel):
-    code: str = Field(..., description="A machine-readable error code that was returned.")
+    code: int | str = Field(..., description="A machine-readable error code that was returned.")
     message: str = Field(..., description="A human-readable description of the error that was returned.")
 
 
@@ -250,6 +331,15 @@ class VideoResponse(BaseModel):
         description="Filename of the saved output video files for this job.",
     )
     inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
+    stage_durations: dict[str, float] = Field(
+        default_factory=dict,
+        description="Profiler stage durations reported by the diffusion pipeline.",
+    )
+    peak_memory_mb: float = Field(
+        default=0.0,
+        description="Peak device memory usage in MB reported by the diffusion pipeline.",
+    )
+    action: VideoAction | None = Field(default=None, description="Generated action sequence metadata, if any")
 
     @property
     def file_extension(self) -> str:

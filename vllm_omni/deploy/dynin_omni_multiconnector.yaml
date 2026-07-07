@@ -1,0 +1,65 @@
+# Dynin-Omni 3-stage deploy with cross-node connectors (Mooncake demo).
+#
+# Topology is frozen in models/dynin_omni/pipeline.py (``pipeline: dynin_omni``).
+# This variant wires a MooncakeConnector for each stage hand-off in place of
+# the default SharedMemoryConnector. Update the ``extra`` host/master/metadata
+# fields to match your Mooncake deployment before use.
+pipeline: dynin_omni
+async_chunk: false
+trust_remote_code: false
+enable_prefix_caching: false
+
+connectors:
+  # Mooncake connector for cross-node/intra-node communication.
+  mooncake_connector:
+    name: MooncakeConnector
+    extra:
+      host: "127.0.0.1"
+      metadata_server: "http://10.90.67.86:8080/metadata"
+      master: "10.90.67.86:50051"
+      segment: 512000000    # 512MB
+      localbuf: 64000000    # 64MB
+      proto: "tcp"
+
+  # Yuanrong connector for cross-node/intra-node communication.
+  yuanrong_connector:
+    name: YuanrongConnector
+    extra:
+      host: "127.0.0.1"
+      port: "35000"
+
+  # Alternative SHM connector with an explicit threshold.
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536    # 64KB threshold
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    max_num_batched_tokens: 32768
+    enforce_eager: true
+    async_scheduling: false
+    output_connectors:
+      to_stage_1: mooncake_connector
+
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 1
+    max_num_batched_tokens: 32768
+    enforce_eager: true
+    async_scheduling: false
+    input_connectors:
+      from_stage_0: mooncake_connector
+    output_connectors:
+      to_stage_2: mooncake_connector
+
+  - stage_id: 2
+    devices: "0"
+    max_num_seqs: 1
+    max_num_batched_tokens: 32768
+    enforce_eager: true
+    async_scheduling: false
+    input_connectors:
+      from_stage_1: mooncake_connector

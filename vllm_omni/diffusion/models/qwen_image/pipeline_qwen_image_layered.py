@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -24,7 +24,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage import (
     AutoencoderKLQwenImage,
 )
@@ -34,9 +35,17 @@ from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.prompt_utils import (
+    validate_prompt_sequence_lengths,
+)
+from vllm_omni.diffusion.utils.size_utils import (
+    normalize_min_aligned_size,
+)
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -72,65 +81,61 @@ def get_qwen_image_layered_pre_process_func(
         request: OmniDiffusionRequest,
     ):
         """Pre-process requests for QwenImageLayeredPipeline."""
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if not raw_image:  # None or empty list
-                raise ValueError("""Received no input image. This model requires one input image to run.""")
-            elif isinstance(raw_image, list):
-                if len(raw_image) > 1:
-                    raise ValueError(
-                        """Received multiple input images. Only a single image is supported by this model."""
-                    )
-                else:
-                    raw_image = raw_image[0]
-
-            if isinstance(raw_image, str):
-                image = PIL.Image.open(raw_image)
+        if not raw_image:  # None or empty list
+            raise ValueError("""Received no input image. This model requires one input image to run.""")
+        elif isinstance(raw_image, list):
+            if len(raw_image) > 1:
+                raise ValueError("""Received multiple input images. Only a single image is supported by this model.""")
             else:
-                image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
+                raw_image = raw_image[0]
 
-            if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
-                image = image.convert("RGBA")
+        if isinstance(raw_image, str):
+            image = PIL.Image.open(raw_image)
+        else:
+            image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
 
-            # 1. calculate dimensions
-            image_size = image.size
-            assert request.sampling_params.resolution in [640, 1024], (
-                f"resolution must be either 640 or 1024, but got {request.sampling_params.resolution}"
-            )
-            calculated_width, calculated_height = calculate_dimensions(
-                request.sampling_params.resolution * request.sampling_params.resolution, image_size[0] / image_size[1]
-            )
-            height = calculated_height
-            width = calculated_width
+        if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
+            image = image.convert("RGBA")
 
-            multiple_of = vae_scale_factor * 2
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
+        # 1. calculate dimensions
+        image_size = image.size
+        assert request.sampling_params.resolution in [640, 1024], (
+            f"resolution must be either 640 or 1024, but got {request.sampling_params.resolution}"
+        )
+        calculated_width, calculated_height = calculate_dimensions(
+            request.sampling_params.resolution * request.sampling_params.resolution, image_size[0] / image_size[1]
+        )
+        height = calculated_height
+        width = calculated_width
 
-            # Store calculated dimensions in request
-            prompt["additional_information"]["calculated_height"] = calculated_height
-            prompt["additional_information"]["calculated_width"] = calculated_width
-            request.sampling_params.height = height
-            request.sampling_params.width = width
+        height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
 
-            # 2. Preprocess image
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
-                image = image_processor.resize(image, calculated_height, calculated_width)
-                prompt_image = image
-                image = image_processor.preprocess(image, calculated_height, calculated_width)
-                image = image.unsqueeze(2)
-                # image = image.to(dtype=self.text_encoder.dtype)  # do it later
+        # Store calculated dimensions in request
+        prompt["additional_information"]["calculated_height"] = calculated_height
+        prompt["additional_information"]["calculated_width"] = calculated_width
+        request.sampling_params.height = height
+        request.sampling_params.width = width
 
-                # Store preprocessed image and prompt image in request
-                prompt["additional_information"]["preprocessed_image"] = image
-                prompt["additional_information"]["prompt_image"] = prompt_image
-            request.prompts[i] = prompt
+        # 2. Preprocess image
+        if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
+            image = image_processor.resize(image, calculated_height, calculated_width)
+            prompt_image = image
+            image = image_processor.preprocess(image, calculated_height, calculated_width)
+            image = image.unsqueeze(2)
+            # image = image.to(dtype=self.text_encoder.dtype)  # do it later
+
+            # Store preprocessed image and prompt image in request
+            prompt["additional_information"]["preprocessed_image"] = image
+            prompt["additional_information"]["prompt_image"] = prompt_image
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -197,7 +202,13 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
+class QwenImageLayeredPipeline(
+    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     color_format = "RGBA"
 
     def __init__(
@@ -211,21 +222,45 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         self.device = get_local_device()
         model = od_config.model
         # Check if model is a local path
-        local_files_only = os.path.exists(model)
+        local_files_only = os.path.isdir(model)
+
+        # See pipeline_qwen_image_edit_plus: guard against transformers v5
+        # multi-worker race on partial subfolder shard sets (Buildkite #1043).
+        qwen_subfolders = ["scheduler", "text_encoder", "vae", "tokenizer", "processor"]
+        prefetch_subfolders(
+            model,
+            qwen_subfolders,
+        )
 
         # modules keep same as transformers & diffusers
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
-        )
-        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
+        # half-written cache (missing-shard ``OSError`` *and* the default
+        # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
+        # could not recover) instead of crashing the worker.
+        self.text_encoder = from_pretrained_with_prefetch(
+            Qwen2_5_VLForConditionalGeneration.from_pretrained,
+            model,
+            subfolder="text_encoder",
+            prefetch_list=qwen_subfolders,
+            local_files_only=local_files_only,
+        ).to(self.device)
+        self.vae = from_pretrained_with_prefetch(
+            AutoencoderKLQwenImage.from_pretrained,
+            model,
+            subfolder="vae",
+            prefetch_list=qwen_subfolders,
+            local_files_only=local_files_only,
+        ).to(self.device)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.processor = Qwen2VLProcessor.from_pretrained(
-            model, subfolder="processor", local_files_only=local_files_only
+        self.processor = from_pretrained_with_prefetch(
+            Qwen2VLProcessor.from_pretrained,
+            model,
+            subfolder="processor",
+            prefetch_list=qwen_subfolders,
+            local_files_only=local_files_only,
         )
 
         # modules re-implemented for vLLM-Omni
@@ -240,7 +275,11 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         ]
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
-        self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = QwenImageTransformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+            **transformer_kwargs,
+        )
 
         # Pipeline configuration & processing parameters
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
@@ -339,8 +378,10 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 "generate `negative_prompt_embeds`."
             )
 
-        if max_sequence_length is not None and max_sequence_length > 1024:
-            raise ValueError(f"`max_sequence_length` cannot be greater than 1024 but is {max_sequence_length}")
+        if max_sequence_length is not None and max_sequence_length > self.tokenizer_max_length:
+            raise ValueError(
+                f"`max_sequence_length` cannot be greater than {self.tokenizer_max_length} but is {max_sequence_length}"
+            )
 
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
         bool_mask = mask.bool()
@@ -355,6 +396,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         prompt: str | list[str] | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        max_sequence_length: int | None = None,
+        prompt_name: str = "prompt",
     ):
         device = device or self.device
         dtype = dtype or self.text_encoder.dtype
@@ -367,8 +410,26 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         txt_tokens = self.tokenizer(
             txt,
             padding=True,
+            truncation=False,
             return_tensors="pt",
         ).to(device)
+        # The layered template also appends fixed non-user tokens after the
+        # editable text, so use the empty-template tokenized baseline instead of
+        # counting everything after prompt_template_encode_start_idx.
+        template_tokens = self.tokenizer(
+            [template.format("")],
+            padding=True,
+            truncation=False,
+            return_tensors="pt",
+        ).to(device)
+        validate_prompt_sequence_lengths(
+            txt_tokens.attention_mask,
+            max_sequence_length=max_sequence_length or self.tokenizer_max_length,
+            supported_max_sequence_length=self.tokenizer_max_length,
+            prompt_name=prompt_name,
+            baseline_attention_mask=template_tokens.attention_mask,
+            error_context="after applying the Qwen prompt template",
+        )
         encoder_hidden_states = self.text_encoder(
             input_ids=txt_tokens.input_ids,
             attention_mask=txt_tokens.attention_mask,
@@ -398,6 +459,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
         max_sequence_length: int = 1024,
+        prompt_name: str = "prompt",
     ):
         r"""
 
@@ -418,7 +480,11 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         batch_size = len(prompt) if prompt_embeds is None else prompt_embeds.shape[0]
 
         if prompt_embeds is None:
-            prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(prompt)
+            prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
+                prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name=prompt_name,
+            )
 
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
@@ -582,31 +648,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
     def interrupt(self):
         return self._interrupt
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        image: PIL.Image.Image | torch.Tensor | None = None,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        true_cfg_scale: float = 4.0,
-        layers: int | None = 4,
-        num_inference_steps: int = 50,
-        sigmas: list[float] | None = None,
-        guidance_scale: float | None = None,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        prompt_embeds_mask: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds_mask: torch.Tensor | None = None,
-        output_type: str | None = "pil",
-        attention_kwargs: dict[str, Any] | None = None,
-        max_sequence_length: int = 512,
-        resolution: int = 640,
-        cfg_normalize: bool = False,
-        use_en_prompt: bool = False,
-    ) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Forward pass for image layered."""
 
         # 1. Get preprocessed image from request (pre-processing is done in DiffusionEngine)
@@ -622,26 +664,27 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
         negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
 
-        layers = req.sampling_params.layers if req.sampling_params.layers is not None else layers
-        resolution = req.sampling_params.resolution if req.sampling_params.resolution is not None else resolution
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        cfg_normalize = (
-            req.sampling_params.cfg_normalize if req.sampling_params.cfg_normalize is not None else cfg_normalize
-        )
-        use_en_prompt = (
-            req.sampling_params.use_en_prompt if req.sampling_params.use_en_prompt is not None else use_en_prompt
-        )
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        sigmas = req.sampling_params.sigmas or sigmas
-        generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        layers = req.sampling_params.layers
+        max_sequence_length = req.sampling_params.max_sequence_length or 1024
+        cfg_normalize = req.sampling_params.cfg_normalize
+        use_en_prompt = req.sampling_params.use_en_prompt
+        num_inference_steps = req.sampling_params.num_inference_steps or 50
+        sigmas = req.sampling_params.sigmas
+        generator = req.sampling_params.generator
+        true_cfg_scale = req.sampling_params.true_cfg_scale or 4.0
+        guidance_scale = None
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
+            req.sampling_params.num_outputs_per_prompt if req.sampling_params.num_outputs_per_prompt > 0 else 1
         )
+        latents = req.sampling_params.latents
+        prompt_embeds = None
+        negative_prompt_embeds = None
+        prompt_embeds_mask = None
+        negative_prompt_embeds_mask = None
+        output_type = req.sampling_params.output_type or "pil"
+        attention_kwargs = None
 
         if not isinstance(first_prompt, str) and "preprocessed_image" in (
             additional_information := first_prompt.get("additional_information", {})
@@ -654,27 +697,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             height = req.sampling_params.height
             width = req.sampling_params.width
         else:
-            # fallback to run pre-processing in pipeline (debug only)
-            if isinstance(image, PIL.Image.Image) and image.mode != "RGBA":
-                image = image.convert("RGBA")
-            image_size = image[0].size if isinstance(image, list) else image.size
-            assert resolution in [640, 1024], f"resolution must be either 640 or 1024, but got {resolution}"
-            calculated_width, calculated_height = calculate_dimensions(
-                resolution * resolution, image_size[0] / image_size[1]
-            )
-            height = calculated_height
-            width = calculated_width
-
-            multiple_of = self.vae_scale_factor * 2
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
-
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
-                image = self.image_processor.resize(image, calculated_height, calculated_width)
-                prompt_image = image
-                image = self.image_processor.preprocess(image, calculated_height, calculated_width)
-                image = image.unsqueeze(2)
-                image = image.to(dtype=self.text_encoder.dtype)
+            raise RuntimeError("Missing preprocess image that should have been created by the preprocess function.")
 
         # 2. check inputs
         self.check_inputs(
@@ -697,16 +720,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         # 3. encode prompot & negative prompt
         if prompt is None or prompt == "" or prompt == " ":
             prompt = self.get_image_caption(prompt_image, use_en_prompt=use_en_prompt, device=self.device)
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
+        batch_size = 1
 
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
-        )
+        has_neg_prompt = negative_prompt is not None
 
         if true_cfg_scale > 1 and not has_neg_prompt:
             logger.warning(
@@ -737,6 +753,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 device=self.device,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
+                prompt_name="negative_prompt",
             )
 
         # 4. Prepare latent variables
@@ -793,10 +810,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
-        )
+        txt_seq_lens = txt_seq_lens_from_embeds(prompt_embeds)
+        negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
         is_rgb = torch.tensor([0] * batch_size).to(device=self.device, dtype=torch.long)
 
         latents = self.diffuse(

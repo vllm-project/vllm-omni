@@ -483,17 +483,13 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+        if self.quant_config is not None:
+            cache_scale_mapper = self.quant_config.get_cache_scale_mapper()
+            if cache_scale_mapper is not None:
+                weights = cache_scale_mapper.apply(weights)
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
-                continue
-
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -608,16 +604,17 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         num_reqs = int(logits.shape[0])
         for i in range(num_reqs):
             runtime_info = runtime_infos[i] if isinstance(runtime_infos[i], dict) else {}
-            omni_task = runtime_info.get("omni_task")
+            meta = runtime_info.get("meta", {})
+            omni_task = meta.get("omni_task")
             if not isinstance(omni_task, list) or not omni_task or omni_task[0] != "t2i":
                 # Text/understanding/chat: forbid sampling from the extra gen vocab.
                 logits[i, self.language_model.base_vocab_size :] = neg_inf
                 continue
 
-            ar_width = runtime_info["ar_width"][0]
-            eol_token_id = runtime_info["eol_token_id"][0]
-            visual_start = runtime_info["visual_token_start_id"][0]
-            visual_end = runtime_info["visual_token_end_id"][0]
+            ar_width = meta["ar_width"][0]
+            eol_token_id = meta["eol_token_id"][0]
+            visual_start = meta["visual_token_start_id"][0]
+            visual_end = meta["visual_token_end_id"][0]
             generated_len = runtime_info["generated_len"]
 
             row = logits[i]

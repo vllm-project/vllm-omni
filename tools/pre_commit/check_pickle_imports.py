@@ -16,8 +16,7 @@ import regex as re
 #  alternatives like msgpack or pydantic that are already in use in vLLM. Only
 #  add to this list if absolutely necessary and after careful security review.
 ALLOWED_FILES = {
-    "tests/e2e/offline_inference/utils.py",
-    "tests/utils.py",
+    "tests/helpers/process.py",
     "vllm_omni/diffusion/distributed/group_coordinator.py",
     "tests/diffusion/attention/test_attention_sp.py",
 }

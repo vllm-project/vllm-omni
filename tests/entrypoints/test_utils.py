@@ -1,17 +1,27 @@
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
+import os
 from collections import Counter
 from dataclasses import dataclass
 
 import pytest
+import torch
 from pytest_mock import MockerFixture
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
+    coerce_param_message_types,
     filter_dataclass_kwargs,
+    filter_stages,
+    load_and_resolve_stage_configs,
+    load_stage_configs_from_yaml,
+    resolve_model_config_path,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -269,3 +279,238 @@ class TestFilterDataclassKwargs:
         assert "unknown_top" not in result
         assert result["cache_config"]["rel_l1_thresh"] == 0.3
         assert "extra_param" not in result["cache_config"]
+
+
+class TestResolveModelConfigPath:
+    """Test suite for resolve_model_config_path function with diffusers format models."""
+
+    def test_glm_image_diffusers_format_resolution(self, mocker: MockerFixture):
+        """Test GlmImagePipeline diffusers class resolves to glm_image config."""
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.file_or_path_exists",
+            return_value=True,
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils._try_get_class_name_from_diffusers_config",
+            return_value="GlmImagePipeline",
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
+            return_value="vllm_omni/model_executor/stage_configs",
+        )
+
+        original_exists = os.path.exists
+
+        def mock_exists(path):
+            if "glm_image.yaml" in str(path):
+                return True
+            return original_exists(path)
+
+        mocker.patch("os.path.exists", side_effect=mock_exists)
+
+        result = resolve_model_config_path("zai-org/GLM-Image")
+
+        assert result is not None
+        assert "glm_image.yaml" in result
+
+
+class TestLoadAndResolveStageConfigs:
+    def test_load_and_resolve_with_kwargs(self):
+        """Ensure that dtype survives default stage creation."""
+        kwargs = {"dtype": torch.float32}
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model="black-forest-labs/FLUX.2-klein-4B",
+            stage_configs_path=None,
+            kwargs=kwargs,
+            default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
+        )
+        assert config_path is None
+        assert len(stage_configs) == 1
+        assert "dtype" in stage_configs[0]["engine_args"]
+
+    def test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas(
+        self, tmp_path, mocker: MockerFixture
+    ):
+        deploy_path = tmp_path / "qwen3_multi.yaml"
+        deploy_path.write_text(
+            'stages:\n  - stage_id: 0\n    devices: "0"\n  - stage_id: 1\n    devices: "1,2,3"\n    num_replicas: 3\n',
+            encoding="utf-8",
+        )
+
+        returned_stage_configs = [
+            create_config({"stage_id": 0, "runtime": {"devices": "0"}, "engine_args": {"model": "dummy"}}),
+            create_config(
+                {
+                    "stage_id": 1,
+                    "runtime": {"devices": "1,2,3", "num_replicas": 3},
+                    "engine_args": {"model": "dummy"},
+                }
+            ),
+        ]
+        load_stage_configs = mocker.patch(
+            "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+            return_value=returned_stage_configs,
+        )
+
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model="dummy-model",
+            stage_configs_path=str(deploy_path),
+            kwargs={},
+        )
+
+        load_stage_configs.assert_called_once_with(
+            "dummy-model",
+            base_engine_args={},
+            deploy_config_path=str(deploy_path),
+            stage_overrides=None,
+        )
+        assert config_path == str(deploy_path)
+        assert len(stage_configs) == 2
+        assert stage_configs[1].runtime.num_replicas == 3
+        assert stage_configs[1].runtime.devices == "1,2,3"
+
+    def test_filter_stages_selects_mode_stages_without_mutating_stage_config(self, tmp_path):
+        config_path = tmp_path / "deploy.yaml"
+        config_path.write_text(
+            """modes:
+  - mode: text-to-text
+    stages: [0]
+  - mode: text-to-image
+    stages: [0, 1]
+""",
+            encoding="utf-8",
+        )
+        stages = [
+            create_config(
+                {
+                    "stage_id": 0,
+                    "runtime": {"requires_multimodal_data": True},
+                    "final_output": False,
+                    "final_output_type": None,
+                }
+            ),
+            create_config(
+                {
+                    "stage_id": 1,
+                    "runtime": {"requires_multimodal_data": True},
+                    "final_output": True,
+                    "final_output_type": "image",
+                }
+            ),
+        ]
+
+        filtered = filter_stages(str(config_path), stages, {"mode": "text-to-text"})
+
+        assert len(filtered) == 1
+        assert filtered[0].stage_id == 0
+        assert filtered[0].runtime.requires_multimodal_data is True
+        assert filtered[0].final_output is False
+        assert filtered[0].final_output_type is None
+
+
+class TestLoadStageConfigsFromYaml:
+    """Regression tests for stage-config loading and merging."""
+
+    def test_deep_merges_stage_engine_args(self, mocker: MockerFixture):
+        yaml_config = create_config(
+            {
+                "async_chunk": True,
+                "stage_args": [
+                    {
+                        "stage_id": 0,
+                        "runtime": {"device": 0},
+                        "engine_args": {
+                            "parallel_config": {"tensor_parallel_size": 4},
+                        },
+                    }
+                ],
+            }
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            return_value=yaml_config,
+        )
+
+        stages = load_stage_configs_from_yaml(
+            "fake.yaml",
+            base_engine_args={
+                "parallel_config": {
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 2,
+                },
+                "model": "base-model",
+            },
+        )
+
+        merged_engine_args = stages[0]["engine_args"]
+        assert merged_engine_args["parallel_config"]["tensor_parallel_size"] == 4
+        assert merged_engine_args["parallel_config"]["pipeline_parallel_size"] == 2
+        assert merged_engine_args["model"] == "base-model"
+        assert merged_engine_args["async_chunk"] is True
+
+    def test_merges_nested_stage_engine_args(self, mocker: MockerFixture):
+        yaml_config = create_config(
+            {
+                "stage_args": [
+                    {
+                        "stage_id": 0,
+                        "engine_args": {
+                            "nested": {"override": 2},
+                        },
+                    }
+                ],
+            }
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            return_value=yaml_config,
+        )
+
+        stages = load_stage_configs_from_yaml(
+            "fake.yaml",
+            base_engine_args={"nested": {"base": 1}},
+        )
+
+        assert stages[0]["engine_args"]["nested"]["base"] == 1
+        assert stages[0]["engine_args"]["nested"]["override"] == 2
+
+
+class TestCumulativeStreamingCoercion:
+    @pytest.mark.parametrize("skip_clone", [True, False])
+    def test_cumulative_default_becomes_delta_if_stream(self, skip_clone):
+        """Ensure cumulative messages are coercible to delta if streaming."""
+        sp = SamplingParams(output_kind=RequestOutputKind.CUMULATIVE)
+        sp.skip_clone = skip_clone
+        result = coerce_param_message_types([sp], is_streaming=True)[0]
+        assert isinstance(result, SamplingParams)
+        assert result.output_kind == RequestOutputKind.DELTA
+        assert (skip_clone and sp is result) or (not skip_clone and sp is not result)
+
+    @pytest.mark.parametrize("skip_clone", [True, False])
+    def test_cumulative_default_becomes_final_only_if_not_stream(self, skip_clone):
+        """Ensure cumulative messages are coercible to final only if not streaming."""
+        sp = SamplingParams(output_kind=RequestOutputKind.CUMULATIVE)
+        sp.skip_clone = skip_clone
+        result = coerce_param_message_types([sp], is_streaming=False)[0]
+        assert isinstance(result, SamplingParams)
+        assert result.output_kind == RequestOutputKind.FINAL_ONLY
+        assert (skip_clone and sp is result) or (not skip_clone and sp is not result)
+
+    @pytest.mark.parametrize("is_streaming", [True, False])
+    @pytest.mark.parametrize("output_kind", [RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY])
+    def test_non_cumulative_are_coerced(self, output_kind, is_streaming):
+        """Ensure non-cumulative params are coerced to the target type."""
+        sp = SamplingParams(output_kind=output_kind)
+        expected = RequestOutputKind.DELTA if is_streaming else RequestOutputKind.FINAL_ONLY
+        result = coerce_param_message_types([sp], is_streaming=is_streaming)[0]
+        assert isinstance(result, SamplingParams)
+        assert result.output_kind == expected
+
+    def test_coercion_applies_to_all_stages(self):
+        """Ensure all stages are coerced to DELTA for streaming."""
+        sp0 = SamplingParams(output_kind=RequestOutputKind.CUMULATIVE)
+        sp1 = SamplingParams(output_kind=RequestOutputKind.CUMULATIVE)
+        result = coerce_param_message_types([sp0, sp1], is_streaming=True)
+        assert all([isinstance(r, SamplingParams) for r in result])
+        assert result[0].output_kind == RequestOutputKind.DELTA
+        assert result[1].output_kind == RequestOutputKind.DELTA

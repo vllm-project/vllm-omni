@@ -1,20 +1,31 @@
+from __future__ import annotations
+
 import multiprocessing as mp
+import multiprocessing.connection
+import threading
 import time
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
-from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.worker import WorkerProc
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
 logger = init_logger(__name__)
+
+_DEQUEUE_TIMEOUT_S = 5.0
 
 
 @dataclass
@@ -30,10 +41,14 @@ class BackgroundResources:
 
     def __call__(self):
         """Clean up background resources."""
+        if hasattr(self, "wake_events") and self.wake_events:
+            for ev in self.wake_events:
+                ev.set()
+
         if self.broadcast_mq is not None:
             try:
                 for _ in range(self.num_workers):
-                    self.broadcast_mq.enqueue(SHUTDOWN_MESSAGE)
+                    self.broadcast_mq.enqueue(SHUTDOWN_MESSAGE, timeout=1.0)
 
                 self.broadcast_mq = None
                 self.result_mq = None
@@ -44,11 +59,11 @@ class BackgroundResources:
             for proc in self.processes:
                 if not proc.is_alive():
                     continue
-                proc.join(30)
+                proc.join(5)
                 if proc.is_alive():
                     logger.warning("Terminating diffusion worker %s after timeout", proc.name)
                     proc.terminate()
-                    proc.join(30)
+                    proc.join(5)
 
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
@@ -57,13 +72,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
         self._closed = False
+        self.is_failed = False
+        self._failure_callbacks: list[Callable[[], None]] = []
 
         num_workers = self.od_config.num_gpus
+        self.wake_events = [mp.Event() for _ in range(num_workers)]
+
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
 
         # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle)
+        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
         self._result_mq = self._init_result_queue(result_handle)
         self._processes = processes
 
@@ -74,6 +93,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             processes=self._processes,
         )
         self._finalizer = weakref.finalize(self, self.resources)
+
+        self.start_worker_monitor()
 
     def _init_broadcast_queue(self, num_workers: int) -> MessageQueue:
         return MessageQueue(
@@ -94,7 +115,75 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if self._result_mq is None:
             raise RuntimeError("Result queue not initialized")
 
-    def _launch_workers(self, broadcast_handle):
+    def _dequeue_one_with_failure_polling(self, deadline: float | None, method: str) -> Any:
+        """Block until one result message, polling ``is_failed`` between chunk timeouts."""
+        while True:
+            if deadline is None:
+                chunk_timeout = _DEQUEUE_TIMEOUT_S
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"RPC call to {method} timed out.")
+                chunk_timeout = min(_DEQUEUE_TIMEOUT_S, remaining)
+            try:
+                return self._result_mq.dequeue(timeout=chunk_timeout)
+            except (TimeoutError, zmq.error.Again):
+                if self.is_failed:
+                    raise EngineDeadError()
+                continue
+
+    @staticmethod
+    def _raise_for_rpc_error_dict(response: Any) -> None:
+        if isinstance(response, dict) and response.get("status") == "error":
+            raise RuntimeError(
+                f"Worker failed with error '{response.get('error')}', "
+                "please check the stack trace above for the root cause"
+            )
+
+    @staticmethod
+    def _unwrap_rpc_result_envelope(response: Any) -> Any:
+        if not (isinstance(response, dict) and response.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE):
+            return response
+
+        rank_statuses = response.get("rank_statuses") or []
+        failed = [status for status in rank_statuses if not status.get("ok", False)]
+        if failed:
+            details = "; ".join(
+                f"rank {status.get('rank')}: {status.get('error_type') or 'Error'}: {status.get('error')}"
+                for status in failed
+            )
+            tracebacks = "\n\n".join(
+                f"rank {status.get('rank')} traceback:\n{status['traceback']}"
+                for status in failed
+                if status.get("traceback")
+            )
+            if tracebacks:
+                details = f"{details}\n\n{tracebacks}"
+            method = response.get("method", "<unknown>")
+            raise RuntimeError(f"RPC '{method}' failed on worker rank(s): {details}")
+
+        result = response.get("result")
+        if isinstance(result, bool):
+            # Only bool-returning RPCs participate in the all-rank AND.
+            # Non-bool results leave bool_result unset and are ignored here.
+            bool_results = [
+                status.get("bool_result") for status in rank_statuses if status.get("bool_result") is not None
+            ]
+            if bool_results and not all(bool_results):
+                return False
+        return result
+
+    @staticmethod
+    def _handle_rpc_response(response: Any) -> Any:
+        MultiprocDiffusionExecutor._raise_for_rpc_error_dict(response)
+        response = MultiprocDiffusionExecutor._unwrap_rpc_result_envelope(response)
+        # After unwrapping, a worker method result may itself be the same
+        # {"status": "error"} shape produced by worker_busy_loop transport
+        # failures. Preserve the pre-envelope error handling for that case.
+        MultiprocDiffusionExecutor._raise_for_rpc_error_dict(response)
+        return response
+
+    def _launch_workers(self, broadcast_handle, wake_events):
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -120,6 +209,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     od_config,
                     writer,
                     broadcast_handle,
+                    wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
@@ -158,37 +248,140 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return processes, result_handle
 
-    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        self._ensure_open()
-        rpc_request = {
-            "type": "rpc",
-            "method": "generate",
-            "args": (request,),
-            "kwargs": {},
-            "output_rank": 0,
-            "exec_all_ranks": True,
-        }
+    def start_worker_monitor(self) -> None:
+        # Monitors worker process liveness. If any die unexpectedly,
+        # logs an error, shuts down the executor and invokes the failure
+        # callback to inform the engine.
+        sentinels = [p.sentinel for p in self._processes]
+        if not sentinels:
+            return
 
-        try:
-            self._broadcast_mq.enqueue(rpc_request)
-            response = self._result_mq.dequeue()
-
+        def _monitor() -> None:
             try:
-                unpack_diffusion_output_shm(response)
-            except Exception as e:
-                logger.warning("SHM unpack failed (data may already be inline): %s", e)
+                finished = multiprocessing.connection.wait(sentinels)
+            except OSError:
+                return
 
-            if isinstance(response, dict) and response.get("status") == "error":
-                raise RuntimeError(
-                    f"Worker failed with error '{response.get('error')}', "
-                    "please check the stack trace above for the root cause"
+            if self._closed:
+                return
+
+            dead = [p for p in self._processes if p.sentinel in finished]
+            if dead:
+                details = []
+                for p in dead:
+                    code = p.exitcode
+                    # Negative exitcode == killed by signal N (-9 = SIGKILL/OOM,
+                    # -11 = SIGSEGV). Surface this so callers don't only see
+                    # "died unexpectedly" with no root cause.
+                    if code is not None and code < 0:
+                        try:
+                            import signal as _signal
+
+                            sig = _signal.Signals(-code).name
+                        except (ValueError, ImportError):
+                            sig = f"signal {-code}"
+                        details.append(f"{p.name}(exitcode={code}, {sig})")
+                    else:
+                        details.append(f"{p.name}(exitcode={code})")
+                logger.error(
+                    "Diffusion worker(s) died unexpectedly: %s",
+                    details,
                 )
-            if not isinstance(response, DiffusionOutput):
-                raise RuntimeError(f"Unexpected response type for generate: {type(response)!r}")
-            return response
-        except Exception as e:
-            logger.error(f"Generate call failed: {e}")
-            raise
+                self.is_failed = True
+
+            self.shutdown()
+
+            for cb in self._failure_callbacks:
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("failure_callback raised")
+
+        t = threading.Thread(target=_monitor, daemon=True, name="diffusion-worker-monitor")
+        t.start()
+
+    def register_failure_callback(
+        self,
+        callback: Callable[[], None],
+    ) -> None:
+        """Register a callback invoked when a worker process dies."""
+        self._failure_callbacks.append(callback)
+
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Adapt request-mode scheduler output to worker execute_model RPCs.
+
+        Returns a BatchRunnerOutput with one RunnerOutput per scheduled request.
+        """
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+        self._ensure_open()
+        runner_outputs: list[RunnerOutput] = []
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req = new_req.req
+            try:
+                result = self.collective_rpc(
+                    "execute_model",
+                    args=(req, self.od_config, scheduler_output.kv_prefetch_jobs),
+                    unique_reply_rank=0,
+                    exec_all_ranks=True,
+                )
+                if not isinstance(result, DiffusionOutput):
+                    raise RuntimeError(f"Unexpected response type: {type(result)!r}")
+                runner_outputs.append(
+                    RunnerOutput(
+                        request_id=new_req.request_id,
+                        step_index=None,
+                        finished=True,
+                        result=result,
+                    )
+                )
+            except Exception as exc:
+                runner_outputs.append(
+                    RunnerOutput(
+                        request_id=new_req.request_id,
+                        step_index=None,
+                        finished=True,
+                        result=DiffusionOutput(error=str(exc)),
+                    )
+                )
+
+        return BatchRunnerOutput.from_list(runner_outputs)
+
+    def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Execute request-mode work through a single batched worker RPC.
+
+        The worker builds DiffusionRequestBatch from scheduler output and returns
+        BatchRunnerOutput with one RunnerOutput per scheduled request.
+        """
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+
+        self._ensure_open()
+        result = self.collective_rpc(
+            "execute_model_batch",
+            args=(scheduler_output, self.od_config),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, BatchRunnerOutput):
+            raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
+        return result
+
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Forward step-mode scheduler output to worker execute_stepwise RPC."""
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+
+        self._ensure_open()
+        result = self.collective_rpc(
+            "execute_stepwise",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+
+        if isinstance(result, BaseRunnerOutput):
+            return result
+        raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
     def collective_rpc(
         self,
@@ -197,46 +390,49 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         self._ensure_open()
 
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
-        # Prepare RPC request message
+        # Prepare RPC request message. When unique_reply_rank is None, all
+        # workers must execute the RPC but only rank 0 can reply (it's the
+        # only one with a result_mq). Collect detailed rank statuses only for
+        # this control-plane all-rank path; forward-path exec_all_ranks RPCs
+        # avoid the per-step host object gather.
+        execute_all_ranks = unique_reply_rank is None or exec_all_ranks
+        collect_rank_status = unique_reply_rank is None
         rpc_request = {
             "type": "rpc",
             "method": method,
             "args": args,
             "kwargs": kwargs,
-            "output_rank": unique_reply_rank,
+            "output_rank": unique_reply_rank if unique_reply_rank is not None else 0,
+            "exec_all_ranks": execute_all_ranks,
+            "collect_rank_status": collect_rank_status,
         }
 
         try:
             # Broadcast RPC request to all workers via unified message queue
             self._broadcast_mq.enqueue(rpc_request)
 
-            # Determine which workers we expect responses from
-            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
+            # Only rank 0 has a result_mq, so we always expect exactly 1 response
+            num_responses = 1
 
             responses = []
             for _ in range(num_responses):
-                dequeue_timeout = None if deadline is None else max(0, deadline - time.monotonic())
+                response = self._dequeue_one_with_failure_polling(deadline, method)
+
                 try:
-                    response = self._result_mq.dequeue(timeout=dequeue_timeout)
+                    unpack_diffusion_output_shm(response)
+                except Exception as e:
+                    logger.warning("SHM unpack failed (data may already be inline): %s", e)
 
-                    # Check if response indicates an error
-                    if isinstance(response, dict) and response.get("status") == "error":
-                        raise RuntimeError(
-                            f"Worker failed with error '{response.get('error')}', "
-                            "please check the stack trace above for the root cause"
-                        )
+                response = MultiprocDiffusionExecutor._handle_rpc_response(response)
 
-                    responses.append(response)
-                except zmq.error.Again as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+                responses.append(response)
 
             return responses[0] if unique_reply_rank is not None else responses
         except Exception as e:
@@ -244,10 +440,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
 
     def check_health(self) -> None:
-        # Simple check if processes are alive
+        if self.is_failed:
+            raise EngineDeadError()
+        self._ensure_open()
         for p in self._processes:
             if not p.is_alive():
-                raise RuntimeError(f"Worker process {p.name} is dead")
+                self.is_failed = True
+                raise EngineDeadError(f"Worker process {p.name} is dead")
 
     def shutdown(self) -> None:
         self._closed = True

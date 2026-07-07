@@ -33,17 +33,15 @@
 
 import random
 import typing as tp
-from math import ceil
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import nn
+from vllm.logger import init_logger
 
-
-def round_up_multiple(num, mult):
-    return ceil(num / mult) * mult
+logger = init_logger(__name__)
 
 
 def default(val: tp.Any, d: tp.Any) -> tp.Any:
@@ -175,7 +173,7 @@ class EuclideanCodebook(nn.Module):
         if not torch.any(expired_codes):
             return
         else:
-            print(f"VQ expire infos: num_expire={sum(expired_codes)}, cluster_size[:5]={cluster_size[:5]}")
+            logger.info("VQ expire infos: num_expire=%s, cluster_size[:5]=%s", sum(expired_codes), cluster_size[:5])
 
         batch_samples = rearrange(batch_samples, "... d -> (...) d")
         self.replace_(batch_samples, mask=expired_codes)

@@ -17,7 +17,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -46,8 +46,10 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageKVCache,
     GlmImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -80,58 +82,54 @@ def get_glm_image_pre_process_func(od_config: OmniDiffusionConfig):
 
     def pre_process_func(request: OmniDiffusionRequest):
         """Pre-process condition images for Image Edit mode."""
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if raw_image is None:
-                # Text-to-image mode, no preprocessing needed
-                continue
+        if raw_image is None:
+            # Text-to-image mode, no preprocessing needed
+            return request
 
-            if not isinstance(raw_image, list):
-                raw_image = [raw_image]
-            images = [
-                PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
-                for im in raw_image
-            ]
+        if not isinstance(raw_image, list):
+            raw_image = [raw_image]
+        images = [
+            PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
+            for im in raw_image
+        ]
 
-            preprocessed = []
-            height, width = None, None
+        preprocessed = []
+        height, width = None, None
 
-            for img in images:
-                if isinstance(img, PIL.Image.Image):
-                    img_h, img_w = img.size[::-1]  # PIL is (width, height)
-                else:
-                    img_h, img_w = img.shape[:2]
+        for img in images:
+            if isinstance(img, PIL.Image.Image):
+                img_h, img_w = img.size[::-1]  # PIL is (width, height)
+            else:
+                img_h, img_w = img.shape[:2]
 
-                # Align to multiple of vae_scale_factor * patch_size
-                multiple_of = vae_scale_factor * patch_size
-                img_h = (img_h // multiple_of) * multiple_of
-                img_w = (img_w // multiple_of) * multiple_of
+            # Align to multiple of vae_scale_factor * patch_size
+            multiple_of = vae_scale_factor * patch_size
+            img_h = (img_h // multiple_of) * multiple_of
+            img_w = (img_w // multiple_of) * multiple_of
 
-                processed = image_processor.preprocess(img, height=img_h, width=img_w)
-                preprocessed.append(processed)
+            processed = image_processor.preprocess(img, height=img_h, width=img_w)
+            preprocessed.append(processed)
 
-                # Use first image dimensions as default
-                if height is None:
-                    height, width = img_h, img_w
+            # Use first image dimensions as default
+            if height is None:
+                height, width = img_h, img_w
 
-            # Store in request
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt, additional_information={})
-            elif "additional_information" not in prompt:
-                prompt["additional_information"] = {}
-            prompt["additional_information"]["preprocessed_image"] = processed  # type: ignore
-            prompt["additional_information"]["prompt_image"] = images  # type: ignore
-            request.prompts[i] = prompt
-            if request.sampling_params.height is None:
-                request.sampling_params.height = height
-            if request.sampling_params.width is None:
-                request.sampling_params.width = width
+        # Store in request
+        prompt["additional_information"]["preprocessed_image"] = processed  # type: ignore
+        prompt["additional_information"]["prompt_image"] = images  # type: ignore
+        request.prompt = prompt
+        if request.sampling_params.height is None:
+            request.sampling_params.height = height
+        if request.sampling_params.width is None:
+            request.sampling_params.width = width
 
         return request
 
@@ -238,7 +236,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     """
     GLM-Image Pipeline for text-to-image and image-to-image generation.
 
@@ -254,6 +252,10 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     3. DiT performs iterative denoising conditioned on prior tokens
     4. VAE decodes final latents to image
     """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,
@@ -301,7 +303,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Load transformer (DiT)
         logger.info("Loading GlmImageTransformer2DModel (DiT)...")
-        self.transformer = GlmImageTransformer2DModel(od_config=od_config)
+        self.transformer = GlmImageTransformer2DModel(od_config=od_config, quant_config=od_config.quantization_config)
 
         # Weight sources for DiT loading
         self.weights_sources = [
@@ -555,6 +557,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     # Scheduler step
                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    # Re-cast to transformer_dtype before cfg_group.broadcast to avoid dtype mismatches across ranks
+                    latents = latents.to(transformer_dtype)
 
                 # Broadcast updated latents to all ranks
                 cfg_group.broadcast(latents, src=0)
@@ -667,7 +671,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         return kv_caches
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """
         Main generation forward pass.
 
@@ -686,15 +690,11 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
 
         # NOTE: DiffusionEngine does an internal warmup "dummy run" during
-        # initialization. That request has no request_id and does not carry
+        # initialization. That request carries the fixed dummy request_id and does not carry
         # Stage-0 (AR) outputs via req.extra. For GLM-Image, we allow that
         # specific warmup request to proceed by synthesizing minimal prior
         # tokens, while still raising a clear error for real requests.
-        is_dummy_warmup = (
-            not getattr(req, "request_id", None)
-            and prompt == "dummy run"
-            and (req.sampling_params.num_inference_steps == 1)
-        )
+        is_dummy_warmup = req.is_dummy_run()
 
         # Get pre-computed prompt embeddings if provided
         if isinstance(first_prompt, str):
@@ -712,6 +712,14 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             if img is not None:
                 preprocessed_images = [img]
 
+        # Priority: prompt dict (from ar2diffusion) > sampling_params
+        # ar2diffusion returns adjusted height/width that matches prior_token_ids
+        if not isinstance(first_prompt, str):
+            ar_height = first_prompt.get("height")
+            ar_width = first_prompt.get("width")
+        else:
+            ar_height = ar_width = None
+
         img_height = req.sampling_params.height
         img_width = req.sampling_params.width
 
@@ -719,11 +727,18 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # Treat that as t2i warmup to avoid requiring i2i-only KV-cache inputs.
         is_image_edit = (preprocessed_images is not None) and (not is_dummy_warmup)
 
-        # Use image dimensions as default if available
-        height = req.sampling_params.height or img_height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or img_width or self.default_sample_size * self.vae_scale_factor
+        # Use prompt dict dimensions (from ar2diffusion) as priority, then sampling_params
+        height = (
+            ar_height or req.sampling_params.height or img_height or self.default_sample_size * self.vae_scale_factor
+        )
+        width = ar_width or req.sampling_params.width or img_width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = req.sampling_params.num_inference_steps or 50
         guidance_scale = req.sampling_params.guidance_scale or 1.5
+
+        # Ensure dimensions are multiples of vae_scale_factor * patch_size
+        multiple_of = self.vae_scale_factor * self._patch_size
+        height = height // multiple_of * multiple_of
+        width = width // multiple_of * multiple_of
 
         self.check_inputs(prompt=prompt, height=height, width=width, prompt_embeds=prompt_embeds)
 
@@ -753,6 +768,20 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 prior_token_id = prior_token_id.to(device=self.device, dtype=torch.long)
             if prior_token_id.dim() == 1:
                 prior_token_id = prior_token_id.unsqueeze(0)
+
+            # Validate that prior_token_id seq_len matches dimensions
+            prior_seq_len = prior_token_id.shape[1]
+            expected_seq_len = (height // self.vae_scale_factor // self._patch_size) * (
+                width // self.vae_scale_factor // self._patch_size
+            )
+            if prior_seq_len != expected_seq_len:
+                raise ValueError(
+                    f"prior_token_ids seq_len ({prior_seq_len}) doesn't match dimensions "
+                    f"({height}x{width}, expected seq_len={expected_seq_len}). "
+                    f"This indicates a mismatch between AR output and Diffusion input. "
+                    f"Please ensure ar2diffusion returns correct height/width."
+                )
+
             prior_token_image_ids = None
             if external_prior_image_ids is not None:
                 if isinstance(external_prior_image_ids, torch.Tensor):

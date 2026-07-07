@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.logger import init_logger
 from vllm_ascend.platform import NPUPlatform
 
@@ -11,6 +13,12 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
+
+_DIFFUSION_PACKED_MODULES_MAPPING = {
+    "HunyuanImage3Pipeline": {
+        "experts": ["experts.0.gate_up_proj", "experts.0.down_proj"],
+    },
+}
 
 
 class NPUOmniPlatform(OmniPlatform, NPUPlatform):
@@ -23,6 +31,30 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     _omni_enum = OmniPlatformEnum.NPU
     dist_backend: str = "hccl"
 
+    # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
+    def __init__(self) -> None:
+        from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
+            apply_qwen3_tts_code2wav_patch,
+        )
+
+        apply_qwen3_tts_code2wav_patch()
+        apply_310p_patches()
+
+    @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        super().set_device(device)
+
+        # Register vllm_ascend custom ops (torch.ops._C_ascend.*).
+        from vllm_ascend.utils import enable_custom_op
+
+        enable_custom_op()
+
+        # Ascend quantized weights are converted from ND to FRACTAL_NZ
+        # after loading. Enable internal format so the NZ storage layout
+        # is preserved for fused NPU kernels.
+        torch.npu.config.allow_internal_format = True
+
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker"
@@ -30,6 +62,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker"
+
+    @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+        from vllm_ascend.ascend_config import init_ascend_config
+
+        init_ascend_config(vllm_config)
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
@@ -53,6 +91,13 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         prepare_hunyuan_fused_moe_runtime()
 
     @classmethod
+    def get_diffusion_packed_modules_mapping(
+        cls,
+        model_class: type[nn.Module],
+    ) -> dict[str, list[str]] | None:
+        return _DIFFUSION_PACKED_MODULES_MAPPING.get(model_class.__name__, None)
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,
@@ -63,15 +108,18 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
         # Try FLASH_ATTN if mindiesd is available, otherwise fall back to SDPA
         if find_spec("mindiesd"):
-            logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
+            # Configure ASCEND_CUSTOM_OPP_PATH for mindiesd custom ops upon import
+            import mindiesd  # noqa: F401
+
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
-        logger.info("Falling back to diffusion attention backend SDPA")
+        logger.debug("Falling back to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
@@ -102,6 +150,57 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return free
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.npu.mem_get_info(device)
+        return free, total
+
+    @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory
+
+    @classmethod
+    def create_autocast_context(cls, *, device_type, dtype, enabled=True):
+        if device_type != "npu":
+            return super().create_autocast_context(
+                device_type=device_type,
+                dtype=dtype,
+                enabled=enabled,
+            )
+        if not enabled:
+            return nullcontext()
+
+        # NPU-specific fallback
+        try:
+            return torch.npu.amp.autocast(dtype=dtype)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("autocast unavailable for device_type=%s dtype=%s: %s", device_type, dtype, exc)
+        return nullcontext()
+
+    @classmethod
+    def get_profiler_cls(cls) -> str:
+        return "vllm_omni.platforms.npu.profiler.NPUTorchProfilerWrapper"
+
+    @classmethod
+    def get_graph_wrapper_cls(cls) -> type:
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+
+        return ACLGraphWrapper
+
+    @classmethod
+    def set_forward_context(
+        cls,
+        attn_metadata,
+        vllm_config,
+        *,
+        cudagraph_runtime_mode,
+        batch_descriptor,
+    ):
+        from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+
+        return set_ascend_forward_context(
+            attn_metadata,
+            vllm_config,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+        )

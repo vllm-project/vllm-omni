@@ -30,7 +30,7 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 **Notes**
 
-- The benchmark talks to `http://<host>:<port>/v1/chat/completions`.
+- By default, image tasks talk to `http://<host>:<port>/v1/chat/completions`; video tasks talk to `/v1/videos`.
 - If you run the server on another host or port, pass `--base-url` accordingly.
 
 ## 2. Supported Datasets
@@ -95,8 +95,9 @@ You can point to your own trace using `--dataset-path`.
 
 ### Basic flags
 
-- `--base-url`: Server address (the script calls `.../v1/chat/completions`).
+- `--base-url`: Server address; `--endpoint` selects the path appended to this base URL.
 - `--model`: The OpenAI-compatible `model` field.
+- `--endpoint`: API endpoint path. Leading `/` is optional, e.g. `/v1/videos` or `v1/videos`.
 - `--task`: Task type (e.g., `t2i`, `t2v`, `i2i`, `i2v`).
 - `--dataset`: Dataset mode (`vbench` / `trace` / `random`).
 - `--num-prompts`: Number of requests to send.
@@ -130,9 +131,21 @@ Warmup flags:
 
 - `--warmup-requests`: Number of warmup requests.
 - `--warmup-num-inference-steps`: Steps used during warmup.
+- `--warmup-concurrency`: Maximum concurrent warmup requests. Use this to warm
+  the same batch shape as the measured run instead of warming only batch=`1`.
 - For `--task t2v`: warmup requests are forced to use `num_frames=1` to make warmup faster and less noisy.
 
 Traffic / concurrency flags:
 
 - `--request-rate`: Target request rate (requests/second). If set to `inf`, the script sends all requests immediately.
 - `--max-concurrency`: Max number of in-flight requests (default: `1`). This can hard-cap the achieved QPS: if it is too small, requests will queue behind the semaphore, and both achieved throughput and observed SLO attainment can be skewed.
+
+### Batched warmup note
+
+For batched serving runs, warm the same in-flight shape you plan to measure.
+For example, a run with `--max-concurrency 8` should usually also use
+`--warmup-requests 8 --warmup-concurrency 8`; otherwise the first measured
+batch may still pay compile or CUDA-graph capture cost.
+
+For a Qwen-Image continuous-batching replay example, see
+[`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).

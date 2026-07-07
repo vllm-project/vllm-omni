@@ -1,0 +1,292 @@
+"""Inline Stage Diffusion Client for vLLM-Omni multi-stage runtime.
+
+Runs DiffusionEngine in a ThreadPoolExecutor inside the Orchestrator process
+instead of spawning a separate StageDiffusionProc subprocess, eliminating ZMQ
+IPC overhead. Used when there is only a single diffusion stage.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any
+
+from vllm.logger import init_logger
+from vllm.v1.engine.exceptions import EngineDeadError
+
+from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.engine.stage_client import StageClientBase
+from vllm_omni.engine.stage_init_utils import StageMetadata
+from vllm_omni.errors import client_error_metadata
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.inputs.data import OmniPromptType
+
+logger = init_logger(__name__)
+
+
+class InlineStageDiffusionClient(StageClientBase):
+    """Runs DiffusionEngine in a thread executor inside the Orchestrator."""
+
+    stage_type: str = "diffusion"
+    replica_id: int = 0
+    is_comprehension: bool = False
+
+    def __init__(
+        self,
+        model: str,
+        od_config: OmniDiffusionConfig,
+        metadata: StageMetadata,
+        batch_size: int = 1,
+    ) -> None:
+        self.model = model
+        self.od_config = od_config
+        self.stage_id = metadata.stage_id
+        self.replica_id = metadata.replica_id
+        self.final_output = metadata.final_output
+        self.final_output_type = metadata.final_output_type
+        self.model_stage = getattr(metadata, "model_stage", None)
+        self.default_sampling_params = metadata.default_sampling_params
+        self.requires_multimodal_data = metadata.requires_multimodal_data
+        self.custom_process_input_func = metadata.custom_process_input_func
+        self.engine_input_source = metadata.engine_input_source
+        self.batch_size = batch_size
+
+        self._enrich_config()
+        self._engine = DiffusionEngine.make_engine(self.od_config)
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inline-diffusion")
+
+        self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._engine_dead = False
+        self._shutting_down = False
+
+        self._engine.executor.register_failure_callback(self._mark_engine_dead)
+
+        logger.info(
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (batch_size=%d)",
+            self.stage_id,
+            self.replica_id,
+            self.batch_size,
+        )
+
+    def _enrich_config(self) -> None:
+        """Load model metadata from HuggingFace and populate od_config fields."""
+        self.od_config.enrich_config()
+
+    def _mark_engine_dead(self) -> None:
+        if self._engine_dead:
+            return
+        self._engine_dead = True
+        logger.error(
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] diffusion executor died unexpectedly.",
+            self.stage_id,
+            self.replica_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Request processing
+    # ------------------------------------------------------------------
+
+    async def add_request_async(
+        self,
+        request_id: str,
+        prompt: OmniPromptType,
+        sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+    ) -> None:
+        logger.debug(
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
+            self.stage_id,
+            self.replica_id,
+            request_id,
+        )
+        task = asyncio.create_task(
+            self._dispatch_request(
+                request_id,
+                prompt,
+                sampling_params,
+                kv_sender_info,
+            )
+        )
+        self._tasks[request_id] = task
+
+    async def _dispatch_request(
+        self,
+        request_id: str,
+        prompt: Any,
+        sampling_params: OmniDiffusionSamplingParams,
+        kv_sender_info: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            request = OmniDiffusionRequest(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                kv_sender_info=kv_sender_info,
+            )
+
+            if self.od_config.streaming_output:
+                async for results in self._engine.step_streaming(request):
+                    result = results[0]
+                    if not result.request_id:
+                        result.request_id = request_id
+                    self._output_queue.put_nowait(result)
+            else:
+                results = await self._engine.step(request)
+                result = results[0]
+                if not result.request_id:
+                    result.request_id = request_id
+                self._output_queue.put_nowait(result)
+        except DiffusionRequestAbortedError as e:
+            logger.info("request_id: %s aborted: %s", request_id, str(e))
+        except Exception as e:
+            logger.exception("Diffusion request %s failed: %s", request_id, e)
+            status_code, error_type = client_error_metadata(e)
+            error_output = OmniRequestOutput.from_error(
+                request_id=request_id,
+                error_message=str(e),
+                status_code=status_code,
+                error_type=error_type,
+            )
+            self._output_queue.put_nowait(error_output)
+        finally:
+            self._tasks.pop(request_id, None)
+
+    def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
+        try:
+            return self._output_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            if self._engine_dead:
+                raise EngineDeadError(f"Stage-{self.stage_id} inline diffusion engine is dead")
+            return None
+
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        for rid in request_ids:
+            task = self._tasks.pop(rid, None)
+            if task:
+                task.cancel()
+            self._engine.abort(rid)
+
+    async def collective_rpc_async(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        loop = asyncio.get_running_loop()
+
+        if method == "profile":
+            is_start = args[0] if args else True
+            profile_prefix = args[1] if len(args) > 1 else None
+            if is_start and profile_prefix is None:
+                profile_prefix = f"stage_{self.stage_id}_rep_{self.replica_id}_diffusion_{int(time.time())}"
+            return await loop.run_in_executor(
+                self._executor,
+                self._engine.profile,
+                is_start,
+                profile_prefix,
+            )
+
+        kwargs = kwargs or {}
+
+        # LoRA methods
+        if method == "add_lora":
+            lora_request = args[0] if args else kwargs.get("lora_request")
+            results = await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                "add_lora",
+                timeout,
+                (),
+                {"lora_request": lora_request},
+                None,
+            )
+            return all(results) if isinstance(results, list) else results
+
+        if method == "remove_lora":
+            results = await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                "remove_lora",
+                timeout,
+                args,
+                kwargs,
+                None,
+            )
+            return all(results) if isinstance(results, list) else results
+
+        if method == "list_loras":
+            results = await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                "list_loras",
+                timeout,
+                (),
+                {},
+                None,
+            )
+            if not isinstance(results, list):
+                return results or []
+            merged: set[int] = set()
+            for part in results:
+                merged.update(part or [])
+            return sorted(merged)
+
+        if method == "pin_lora":
+            lora_id = args[0] if args else kwargs.get("adapter_id")
+            results = await loop.run_in_executor(
+                self._executor,
+                self._engine.collective_rpc,
+                "pin_lora",
+                timeout,
+                (),
+                {"adapter_id": lora_id},
+                None,
+            )
+            return all(results) if isinstance(results, list) else results
+
+        return await loop.run_in_executor(
+            self._executor,
+            self._engine.collective_rpc,
+            method,
+            timeout,
+            args,
+            kwargs,
+            None,
+        )
+
+    def check_health(self) -> None:
+        """Check if the inline diffusion engine and its workers are healthy."""
+        if self._shutting_down:
+            raise EngineDeadError("InlineStageDiffusionClient is shutting down")
+        try:
+            self._engine.executor.check_health()
+        except EngineDeadError:
+            self._mark_engine_dead()
+            raise
+
+    def shutdown(self) -> None:
+        self._shutting_down = True
+
+        # Cancel all pending tasks
+        for task in self._tasks.values():
+            task.cancel()
+
+        try:
+            # Cancel queued futures and wait for the running one to complete deterministically
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            pass
+
+        try:
+            self._engine.close()
+        except Exception:
+            pass

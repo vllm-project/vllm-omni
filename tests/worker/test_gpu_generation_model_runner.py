@@ -1,7 +1,10 @@
 import pytest
 import torch
 
-from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
+from vllm_omni.worker.gpu_generation_model_runner import (
+    ExecuteModelState,
+    GPUGenerationModelRunner,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -16,7 +19,8 @@ class _DummyInputBatch:
 
 def _make_runner(multimodal_outputs):
     runner = object.__new__(GPUGenerationModelRunner)
-    runner.execute_model_state = (
+    runner.execute_model_state = ExecuteModelState(
+        None,
         None,
         None,
         None,
@@ -35,6 +39,8 @@ def _make_runner(multimodal_outputs):
     runner.device = torch.device("cpu")
     runner.supports_mm_inputs = False
     runner.speculative_config = None
+    runner.routed_experts_initialized = False
+    runner._async_chunk = False
     return runner
 
 
@@ -44,8 +50,8 @@ def test_sample_tokens_tensor_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert len(output.pooler_output) == 1
-    assert output.pooler_output[0]["model_outputs"].shape == (2, 3)
+    assert len(output.multimodal_outputs) == 1
+    assert output.multimodal_outputs[0]["model_outputs"].shape == (2, 3)
 
 
 def test_sample_tokens_list_output():
@@ -54,8 +60,8 @@ def test_sample_tokens_list_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert len(output.pooler_output) == 1
-    assert output.pooler_output[0]["model_outputs"].shape == (2, 1)
+    assert len(output.multimodal_outputs) == 1
+    assert output.multimodal_outputs[0]["model_outputs"].shape == (2, 1)
 
 
 def test_sample_tokens_list_allows_none_output():
@@ -64,8 +70,8 @@ def test_sample_tokens_list_allows_none_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert len(output.pooler_output) == 1
-    assert output.pooler_output[0]["model_outputs"] is None
+    assert len(output.multimodal_outputs) == 1
+    assert output.multimodal_outputs[0]["model_outputs"] is None
 
 
 def test_sample_tokens_dict_output():
@@ -74,7 +80,7 @@ def test_sample_tokens_dict_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert len(output.pooler_output) == 1
-    assert "audio" in output.pooler_output[0]
-    assert "unused" not in output.pooler_output[0]
-    assert output.pooler_output[0]["audio"].shape == (1, 4)
+    assert len(output.multimodal_outputs) == 1
+    assert "audio" in output.multimodal_outputs[0]
+    assert "unused" not in output.multimodal_outputs[0]
+    assert output.multimodal_outputs[0]["audio"].shape == (1, 4)

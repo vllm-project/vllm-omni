@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
+import logging
 from functools import cache, lru_cache
 
 import numpy as np
@@ -8,9 +8,10 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from librosa.filters import mel as librosa_mel_fn
 
-IGNORE_ID = -1
+from vllm_omni.utils.audio import mel_filter_bank
+
+logger = logging.getLogger(__name__)
 
 
 def dynamic_range_compression_torch(x, c=1, clip_val=1e-5):
@@ -31,8 +32,13 @@ def _get_mel_basis(
     fmax: float | None,
     device_str: str,
 ) -> torch.Tensor:
-    mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
-    return torch.from_numpy(mel).float().to(torch.device(device_str))
+    return mel_filter_bank(
+        sr=sampling_rate,
+        n_fft=n_fft,
+        n_mels=num_mels,
+        fmin=fmin,
+        fmax=fmax,
+    ).to(torch.device(device_str))
 
 
 @lru_cache
@@ -119,33 +125,8 @@ def exact_div(x, y):
 
 @cache
 def mel_filters(device, n_mels: int) -> torch.Tensor:
-    """
-    load the mel filterbank matrix for projecting STFT into a Mel spectrogram.
-    Allows decoupling librosa dependency; saved using:
-
-        np.savez_compressed(
-            "mel_filters.npz",
-            mel_80=librosa.filters.mel(sr=16000, n_fft=400, n_mels=80),
-            mel_128=librosa.filters.mel(sr=16000, n_fft=400, n_mels=128),
-        )
-    """
-    assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
-
-    filters_path = os.path.join(os.path.dirname(__file__), "assets", "mel_filters.npz")
-    if not os.path.exists(filters_path):
-        source_url = "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
-        raise FileNotFoundError(
-            "Missing CosyVoice3 mel filter asset:\n"
-            f"  {filters_path}\n"
-            "Download it manually from:\n"
-            f"  {source_url}\n"
-            "Example:\n"
-            f"  mkdir -p {os.path.dirname(filters_path)} && "
-            f"curl -L {source_url} -o {filters_path}"
-        )
-
-    with np.load(filters_path, allow_pickle=False) as f:
-        return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
+    """Compute mel filterbank matrix for projecting STFT into a Mel spectrogram."""
+    return mel_filter_bank(sr=16000, n_fft=400, n_mels=n_mels).to(device)
 
 
 def log_mel_spectrogram(
@@ -180,7 +161,7 @@ def log_mel_spectrogram(
     HOP_LENGTH = 160
 
     if not torch.is_tensor(audio):
-        raise Exception(f"audio is not tensor {type(audio)}")
+        raise TypeError(f"audio is not tensor {type(audio)}")
 
     if device is not None:
         audio = audio.to(device)
@@ -199,26 +180,6 @@ def log_mel_spectrogram(
     return log_spec
 
 
-def extract_speech_token(prompt_wav, speech_tokenizer_session, device):
-    speech = load_wav(prompt_wav, 16000)
-    assert speech.shape[1] / 16000 <= 30, "do not support extract speech token for audio longer than 30s"
-    feat = log_mel_spectrogram(speech, n_mels=128)
-    speech_token = (
-        speech_tokenizer_session.run(
-            None,
-            {
-                speech_tokenizer_session.get_inputs()[0].name: feat.detach().cpu().numpy(),
-                speech_tokenizer_session.get_inputs()[1].name: np.array([feat.shape[2]], dtype=np.int32),
-            },
-        )[0]
-        .flatten()
-        .tolist()
-    )
-    speech_token = torch.tensor([speech_token], dtype=torch.int32).to(device)
-    speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(device)
-    return speech_token, speech_token_len
-
-
 def extract_spk_embedding(prompt_wav, campplus_session, device):
     speech = load_wav(prompt_wav, 16000)
     feat = kaldi.fbank(speech, num_mel_bins=80, dither=0, sample_frequency=16000)
@@ -230,6 +191,44 @@ def extract_spk_embedding(prompt_wav, campplus_session, device):
     )
     embedding = torch.tensor([embedding]).to(device)
     return embedding
+
+
+def unpad_prompt_conditioning(speech_token, speech_feat, speech_token_len):
+    """Drop right-padding from per-request prompt conditioning.
+
+    The talker emits ``speech_token`` ``[1, T]`` possibly right-padded to the
+    batch max, plus the true ``speech_token_len``; ``speech_feat`` is at the 2:1
+    mel:token ratio (``[1, 2T, F]``). This trims both to the real length. Called
+    in the (eager) code2wav stage where a host read of the length is allowed.
+    Returns ``(speech_token, speech_feat)`` unchanged when length is unavailable.
+    """
+    if not isinstance(speech_token, torch.Tensor) or speech_token_len is None:
+        return speech_token, speech_feat
+    try:
+        token_len = int(torch.as_tensor(speech_token_len).reshape(-1)[0].item())
+    except (RuntimeError, ValueError, IndexError):
+        return speech_token, speech_feat
+    if token_len <= 0 or speech_token.dim() < 2:
+        return speech_token, speech_feat
+    token_len = min(token_len, int(speech_token.shape[1]))
+    speech_token = speech_token[:, :token_len]
+    if isinstance(speech_feat, torch.Tensor) and speech_feat.dim() >= 2:
+        speech_feat = speech_feat[:, : 2 * token_len]
+    return speech_token, speech_feat
+
+
+def extract_spk_embedding_trt(prompt_wav, campplus_trt, device):
+    """TensorRT counterpart of ``extract_spk_embedding``.
+
+    Identical fbank front-end; the campplus forward runs on a prebuilt
+    TensorRT engine (GPU) instead of the CPU ONNX-Runtime session. Returns the
+    same ``[1, 192]`` embedding tensor on ``device``.
+    """
+    speech = load_wav(prompt_wav, 16000)
+    feat = kaldi.fbank(speech, num_mel_bins=80, dither=0, sample_frequency=16000)
+    feat = feat - feat.mean(dim=0, keepdim=True)
+    embedding = campplus_trt(feat)
+    return embedding.to(device)
 
 
 def extract_text_token(text, tokenizer, allowed_special):

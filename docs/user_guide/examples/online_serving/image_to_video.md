@@ -37,26 +37,72 @@ artifact, poll the job status and then download the completed file from the
 content endpoint.
 
 The main endpoints are:
-- `POST /v1/videos`: create a video generation job
+- `POST /v1/videos`: create a video generation job (async)
+- `POST /v1/videos/sync`: generate a video and return raw bytes (sync, for benchmarks)
 - `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
 - `GET /v1/videos`: list stored video jobs
 - `GET /v1/videos/{video_id}/content`: download the generated video file
 - `DELETE /v1/videos/{video_id}`: delete the job and any stored output
+
+## Sync API (Benchmark / Testing)
+
+`POST /v1/videos/sync` is a synchronous alternative that blocks until generation
+completes and returns the raw video bytes (`video/mp4`) directly in the response
+body. It is designed for benchmark and testing scenarios where one-shot
+request/response latency measurement is needed.
+
+The sync endpoint accepts the same form parameters as `POST /v1/videos`. It does
+not create any stored job record — the response is purely the generated video
+file. Metadata is returned via response headers:
+
+- `X-Request-Id`: unique identifier for this generation request
+- `X-Model`: model name used for generation
+- `X-Inference-Time-S`: wall-clock inference time in seconds
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A bear playing with yarn, smooth motion" \
+  -F "input_reference=@/path/to/input.png" \
+  -F "size=832x480" \
+  -F "num_frames=33" \
+  -F "fps=16" \
+  -F "negative_prompt=low quality, blurry, static" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=1.0" \
+  -F "guidance_scale_2=1.0" \
+  -F "boundary_ratio=0.875" \
+  -F "flow_shift=12.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
+  -F "seed=42" \
+  -o sync_i2v_output.mp4
+```
 
 ## Storage
 
 Generated video files are stored on local disk by the async video API.
 Local file storage behavior can be controlled via the following environment variables:
 
-- `VLLM_OMNI_STORAGE_PATH`: directory used for generated files (default: `/tmp/storage`)
-- `VLLM_OMNI_STORAGE_MAX_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__PATH`: directory used for generated files
+  (default: `/tmp/storage`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`: max concurrent save/delete/open
+  operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_TTL`: optional TTL for generated files in
+  seconds
+- `VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL`: optional sweep interval in
+  seconds for enforcing file TTL; defaults to `300` when TTL is set
 
 Example:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
-export VLLM_OMNI_STORAGE_MAX_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__FILE_TTL=86400
+export VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL=300
 ```
+
+See also: [Configuration Options](../../../configuration/README.md)
 
 ## API Calls
 
@@ -81,6 +127,9 @@ create_response=$(curl -s http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
   -F "seed=42")
 
 video_id=$(echo "$create_response" | jq -r '.id')
@@ -139,7 +188,33 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
   -F "seed=42"
+```
+
+Frame interpolation is also available for supported Wan2.2 I2V requests. See
+[Frame Interpolation](../../diffusion/frame_interpolation.md) for worker-side
+execution details and feature constraints.
+
+### Frame Interpolation Example
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A bear playing with yarn, smooth motion" \
+  -F "input_reference=@/path/to/qwen-bear.png" \
+  -F "width=832" \
+  -F "height=480" \
+  -F "num_frames=33" \
+  -F "fps=16" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=1.0" \
+  -F "guidance_scale_2=1.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
+  -o sync_i2v_interpolated.mp4
 ```
 
 ## Create Response Format

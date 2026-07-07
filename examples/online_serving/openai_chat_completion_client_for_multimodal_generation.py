@@ -6,7 +6,8 @@ from typing import NamedTuple
 import requests
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
-from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
 
@@ -197,7 +198,14 @@ def _build_prompt_for_query_type(
         return query_func(custom_prompt=custom_prompt)
     if query_type == "use_audio_in_video":
         return query_func(video_path=video_path, custom_prompt=custom_prompt)
-    # use_mixed_modalities / use_multi_audios
+    if query_type == "use_mixed_modalities":
+        return query_func(
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+            custom_prompt=custom_prompt,
+        )
+    # use_multi_audios
     return query_func(custom_prompt=custom_prompt)
 
 
@@ -370,44 +378,6 @@ query_map = {
 
 def run_multimodal_generation(args, client: OpenAI) -> None:
     model_name = args.model
-    thinker_sampling_params = {
-        "temperature": 0.4,  # Deterministic
-        "top_p": 0.9,
-        "top_k": 1,
-        "max_tokens": 16384,
-        "repetition_penalty": 1.05,
-        "stop_token_ids": [151645],  # Qwen EOS token <|im_end|>
-        "seed": SEED,
-    }
-
-    # Sampling parameters for Talker stage (codec generation)
-    # Stop at codec EOS token
-    talker_sampling_params = {
-        "temperature": 0.9,
-        "top_k": 50,
-        "max_tokens": 4096,
-        "seed": SEED,
-        "detokenize": False,
-        "repetition_penalty": 1.05,
-        "stop_token_ids": [2150],  # TALKER_CODEC_EOS_TOKEN_ID
-    }
-
-    # # Sampling parameters for Code2Wav stage (audio generation)
-    code2wav_sampling_params = {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": -1,
-        "max_tokens": 4096 * 16,
-        "seed": SEED,
-        "detokenize": True,
-        "repetition_penalty": 1.1,
-    }
-
-    sampling_params_list = [
-        thinker_sampling_params,
-        talker_sampling_params,
-        code2wav_sampling_params,
-    ]
 
     # Get paths and custom prompt from args
     video_path = getattr(args, "video_path", None)
@@ -445,8 +415,7 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
             audio_path=audio_path,
         )
         extra_body = {
-            # Optional, it has default settings in stage configs.
-            "sampling_params_list": sampling_params_list
+            # Optional, it has default settings in stage configs. you can override them here.
         }
         if args.query_type == "use_audio_in_video":
             extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
@@ -517,7 +486,7 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = TrackingArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
     parser.add_argument(
         "--query-type",
         "-q",

@@ -1,8 +1,11 @@
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
@@ -27,15 +30,16 @@ class OmniRequest(Request):
 
     def __init__(
         self,
+        *args,
         prompt_embeds: PromptEmbedsPayload | torch.Tensor | None = None,
         # Optional external request ID for tracking
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
-        *args,
         **kwargs,
     ):
-        prompt_embeds_tensor = self._maybe_decode_prompt_embeds(prompt_embeds)
-        super().__init__(prompt_embeds=prompt_embeds_tensor, *args, **kwargs)
+        if prompt_embeds is not None:
+            kwargs["prompt_embeds"] = self._maybe_decode_prompt_embeds(prompt_embeds)
+        super().__init__(*args, **kwargs)
         # Preserve serialized prompt embeddings payload (optional)
         self.prompt_embeds_payload: PromptEmbedsPayload | None = (
             prompt_embeds if isinstance(prompt_embeds, PromptEmbedsPayload) else None
@@ -79,6 +83,7 @@ class OmniRequest(Request):
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
+            prompt_is_token_ids=request.prompt_is_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
@@ -91,4 +96,37 @@ class OmniRequest(Request):
             additional_information=request.additional_information,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+            abort_immediately=request.abort_immediately,
+        )
+
+
+@dataclass
+class OmniStreamingUpdate:
+    """
+    Override: add additional information
+    Lightweight data for streaming session continuation.
+
+    Contains only the fields needed to update an existing streaming session
+    with new input data.
+    """
+
+    mm_features: list[MultiModalFeatureSpec] | None
+    prompt_token_ids: list[int] | None
+    max_tokens: int
+    arrival_time: float
+    sampling_params: SamplingParams | None
+    additional_information: AdditionalInformationPayload | None = None
+
+    @classmethod
+    def from_request(cls, request: "Request") -> "OmniStreamingUpdate | None":
+        if not request.resumable:
+            return None
+        return cls(
+            mm_features=request.mm_features,
+            prompt_token_ids=request.prompt_token_ids,
+            max_tokens=request.max_tokens,
+            arrival_time=request.arrival_time,
+            sampling_params=request.sampling_params,
+            additional_information=request.additional_information,
         )

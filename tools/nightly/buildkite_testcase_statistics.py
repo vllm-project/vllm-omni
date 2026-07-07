@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Parse pytest commands from Buildkite test-ready.yml, test-merge.yml, test-nightly.yml;
-collect test cases (including parametrized) via pytest --collect-only -q and produce an HTML report.
+Parse pytest commands from Buildkite test-ready.yml, test-merge.yml, test-nightly.yml,
+and test-weekly.yml; collect test cases (including parametrized) via pytest --collect-only -q
+and produce an HTML report.
+
+Leaf steps may live under ``group:`` blocks (nested ``steps``); those are flattened with the
+group title carried into the report.
 
 Usage (run from repo root):
-  python scripts/buildkite_testcase_statistics.py -o buildkite_testcase_statistics.html
+  python tools/nightly/buildkite_testcase_statistics.py -o buildkite_testcase_statistics.html
+  python tools/nightly/buildkite_testcase_statistics.py --sample-preview -o buildkite_testcase_statistics_preview.html
+
+``--sample-preview`` emits placeholder rows only (no pytest / no real counts).
 
 Requires: PyYAML (pip install pyyaml)
 """
@@ -24,12 +31,36 @@ import yaml
 # Repo root (parent of the directory containing this script)
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDKITE_DIR = REPO_ROOT / ".buildkite"
-PIPELINE_FILES = ["test-ready.yml", "test-merge.yml", "test-nightly.yml"]
+PIPELINE_FILES = ["test-ready.yml", "test-merge.yml", "test-nightly.yml", "test-weekly.yml"]
 
 
 def load_yaml(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def iter_pytest_leaf_steps(steps: list, *, group: str | None = None) -> list[tuple[dict, str | None]]:
+    """
+    Flatten Buildkite YAML steps, expanding ``group`` blocks that contain nested ``steps``.
+
+    Returns ``(leaf_step_dict, group_title)`` for each leaf step that has non-empty ``commands``.
+    ``group_title`` is ``None`` for top-level steps outside any ``group:`` block.
+    """
+    out: list[tuple[dict, str | None]] = []
+    for raw in steps or []:
+        if not isinstance(raw, dict):
+            continue
+        nested = raw.get("steps")
+        if isinstance(nested, list) and nested:
+            next_group = group
+            if "group" in raw:
+                g = raw.get("group")
+                next_group = g if isinstance(g, str) else (str(g) if g is not None else group)
+            out.extend(iter_pytest_leaf_steps(nested, group=next_group))
+            continue
+        if raw.get("commands"):
+            out.append((raw, group))
+    return out
 
 
 PYTEST_CMD_RE = re.compile(r"(?:timeout\s+\S+\s+)?(?:python3? -m\s+)?pytest\s+[^\n&|;]*")
@@ -55,10 +86,10 @@ def normalize_commands(step: dict) -> list[str]:
 
 def extract_pytest_targets_from_line(line: str) -> list[str]:
     """
-    Parse pytest test targets (file path or marker expression) from a single command line.
-    Returns e.g. ['tests/xxx.py'].
-    When there is no explicit test file but only -m/--run-level, returns
-    ['-m expr'] or ['-m expr --run-level level'] with the full marker args.
+    Parse pytest test targets (file path, directory under tests/, or marker expression) from a single command line.
+    Returns e.g. ['tests/xxx.py'] or ['tests/e2e'].
+    When there is no explicit path but markers/options apply to the whole tree, returns
+    a synthetic token built from sidecar args (``--ignore``, ``-m``, ``-k``, ``--run-level``).
     """
     if "pytest" not in line:
         return []
@@ -74,17 +105,33 @@ def extract_pytest_targets_from_line(line: str) -> list[str]:
     args = parts[1].strip() if len(parts) > 1 else ""
     if not args:
         return []
-    targets = []
+    targets: list[str] = []
+    # Omit paths that only appear as --ignore / --test-config-file values when discovering roots.
+    sanitized_for_roots = _strip_test_config_file_clauses_from_args_fragment(
+        _strip_ignore_clauses_from_args_fragment(args)
+    )
     # Match tests/.../*.py
-    for m in re.finditer(r"tests/[^\s'\"#]+\.py", args):
+    for m in re.finditer(r"tests/[^\s'\"#]+\.py", sanitized_for_roots):
         path = m.group(0)
         if path not in targets:
             targets.append(path)
+    # Directory / namespace roots: tests/e2e, tests/e2e/, tests/foo/bar (no .py suffix)
+    for m in re.finditer(r"\s(tests/[a-zA-Z0-9_./\-]+)(?=\s|$|[\"'])", " " + sanitized_for_roots):
+        tok = m.group(1).rstrip("/")
+        if tok.endswith(".py"):
+            continue
+        if tok not in targets:
+            targets.append(tok)
+    for m in re.finditer(r"['\"](tests/[a-zA-Z0-9_./\-]+)['\"]", sanitized_for_roots):
+        tok = m.group(1).rstrip("/")
+        if tok.endswith(".py"):
+            continue
+        if tok not in targets:
+            targets.append(tok)
     if not targets:
-        # May be -m/--run-level only; record full marker arguments instead of a generic marker.
-        extra = _parse_extra_args_from_line(line)
+        # Marker-only / option-driven selection relative to tests/
+        extra = _pytest_collect_sidecar_args(line)
         if extra:
-            # Join into a single string, e.g. "-m core and cpu --run-level nightly"
             targets.append(" ".join(extra))
     return targets
 
@@ -93,38 +140,75 @@ def get_pytest_targets_from_step(step: dict) -> list[tuple[str, str]]:
     """
     Extract all pytest-related targets from a step.
     Returns [(target, raw_line), ...] where target is tests/xxx.py or '(marker/run-level)'.
+
+    Deduplication uses ``(target, raw_line)`` so the same script path with different options
+    (e.g. ``--test-config-file …``) stays distinct across Buildkite jobs.
     """
     lines = normalize_commands(step)
     out = []
     seen = set()
     for line in lines:
         for t in extract_pytest_targets_from_line(line):
-            if t not in seen:
-                seen.add(t)
+            key = (t, line)
+            if key not in seen:
+                seen.add(key)
                 out.append((t, line))
     return out
 
 
-def _parse_extra_args_from_line(raw_line: str) -> list[str]:
-    """Extract -m and --run-level args from a raw pytest command line. Strips extra spaces and quotes.
-    Correctly handles quoted expressions with spaces, e.g. -m 'core_model and cpu'.
+def _strip_ignore_clauses_from_args_fragment(fragment: str) -> str:
+    """Replace ``--ignore=…`` / ``--ignore …`` spans so path discovery does not treat ignores as roots."""
+    return re.sub(r"--ignore(?:=\S+|\s+\S+)", " ", fragment)
+
+
+def _strip_test_config_file_clauses_from_args_fragment(fragment: str) -> str:
+    """Replace ``--test-config-file`` spans so JSON paths under ``tests/`` are not mistaken for collection roots."""
+    return re.sub(r"--test-config-file(?:=\S+|\s+\S+)", " ", fragment)
+
+
+def _pytest_collect_sidecar_args(raw_line: str) -> list[str]:
+    """Extract pytest args that affect collection: ``--ignore``, ``--test-config-file``, ``-m``,
+    ``--run-level``, ``-k``.
+
+    Order matches typical CI lines (ignores / perf driver config, then markers / run-level / keyword).
+    Correctly handles quoted ``-m`` / ``-k`` / ``--run-level`` values with spaces.
     """
     extra: list[str] = []
 
-    # -m: match -m followed by '...', "..." or a single token (so -m expression is one argv)
-    m = re.search(r"-m\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
-    if m:
-        value = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+    for m in re.finditer(r"--ignore(?:=(\S+)|\s+(\S+))", raw_line):
+        path = (m.group(1) or m.group(2) or "").strip()
+        if path:
+            extra.extend(["--ignore", path])
+
+    for m in re.finditer(r"--test-config-file(?:=(\S+)|\s+(\S+))", raw_line):
+        path = (m.group(1) or m.group(2) or "").strip()
+        if path:
+            extra.extend(["--test-config-file", path])
+
+    marker = re.search(r"-m\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
+    if marker:
+        value = (marker.group(1) or marker.group(2) or marker.group(3) or "").strip()
         if value:
             extra.extend(["-m", value])
 
-    r = re.search(r"--run-level\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
-    if r:
-        value = (r.group(1) or r.group(2) or r.group(3) or "").strip()
+    runlvl = re.search(r"--run-level\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
+    if runlvl:
+        value = (runlvl.group(1) or runlvl.group(2) or runlvl.group(3) or "").strip()
         if value:
             extra.extend(["--run-level", value])
 
+    kw = re.search(r"-k\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
+    if kw:
+        value = (kw.group(1) or kw.group(2) or kw.group(3) or "").strip()
+        if value:
+            extra.extend(["-k", value])
+
     return extra
+
+
+def _parse_extra_args_from_line(raw_line: str) -> list[str]:
+    """Backward-compatible alias for :func:`_pytest_collect_sidecar_args`."""
+    return _pytest_collect_sidecar_args(raw_line)
 
 
 def _parse_collect_only_stdout(stdout: str, *, raise_on_empty: bool = True, stderr: str = "") -> list[str]:
@@ -167,8 +251,15 @@ def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_l
         if not path.exists():
             raise FileNotFoundError(f"Pytest target path does not exist: {path}")
         return [str(path)], target.replace("\\", "/"), 60
+
+    if " " not in target and not target.startswith("-") and target.startswith("tests/"):
+        rel_dir = Path(target.rstrip("/"))
+        dir_path = (repo_root / rel_dir).resolve()
+        if dir_path.exists() and dir_path.is_dir():
+            return [str(dir_path)], target.replace("\\", "/").rstrip("/"), 120
+
     if not extra:
-        raise RuntimeError(f"Failed to parse -m/--run-level from pytest line: {raw_line!r}")
+        raise RuntimeError(f"Failed to parse pytest sidecar args from line: {raw_line!r}")
     if not (repo_root / "tests").exists():
         raise FileNotFoundError("tests/ directory not found under repo root")
     return ["tests/"], "tests/", 120
@@ -177,9 +268,13 @@ def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_l
 def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]:
     """
     Run pytest --collect-only -q for a target and return test node id list (incl. parametrized).
-    target: path like tests/foo.py or marker string (e.g. "-m expr"). raw_line used for -m/--run-level.
+
+    ``path_args`` come from ``target`` (file, dir under ``tests/``, or fallback ``tests/``). Sidecar
+    flags ``--ignore``, ``--test-config-file``, ``-m``, ``-k``, ``--run-level`` are taken from the
+    full ``raw_line`` and appended to the same invocation so collection matches CI (perf scripts
+    parametrize from ``--test-config-file`` at import time).
     """
-    extra = _parse_extra_args_from_line(raw_line)
+    extra = _pytest_collect_sidecar_args(raw_line)
     path_args, _fallback, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
 
     cmd_quiet = [sys.executable, "-m", "pytest", *path_args, "--collect-only", "-q"]
@@ -210,6 +305,15 @@ def _extra_with_skip_marker(extra: list[str]) -> list[str]:
         elif extra[i] == "--run-level" and i + 1 < len(extra):
             out.extend(["--run-level", extra[i + 1]])
             i += 2
+        elif extra[i] == "-k" and i + 1 < len(extra):
+            out.extend(["-k", extra[i + 1]])
+            i += 2
+        elif extra[i] == "--ignore" and i + 1 < len(extra):
+            out.extend(["--ignore", extra[i + 1]])
+            i += 2
+        elif extra[i] == "--test-config-file" and i + 1 < len(extra):
+            out.extend(["--test-config-file", extra[i + 1]])
+            i += 2
         else:
             i += 1
     if not has_m:
@@ -222,7 +326,7 @@ def get_skip_status(target: str, raw_line: str, repo_root: Path) -> set[str]:
     Use pytest -m skip --collect-only -q to collect tests marked with skip; return their node ids.
     Does not run tests; only collects. Supports both pytest xxx.py and pytest -m "marker".
     """
-    extra = _parse_extra_args_from_line(raw_line)
+    extra = _pytest_collect_sidecar_args(raw_line)
     try:
         path_args, _, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
     except (FileNotFoundError, RuntimeError):
@@ -308,6 +412,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         "test-ready": "ready",
         "test-merge": "merge",
         "test-nightly": "nightly",
+        "test-weekly": "weekly",
     }
 
     def esc(s: str) -> str:
@@ -318,7 +423,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
 
     pipeline_totals: dict[str, int] = {}
     for item in all_stats:
-        _, pipeline_name, _, _, _, _, count, _, _, _ = item
+        _, pipeline_name, _, _, _, _, _, count, _, _, _ = item
         pipeline_totals[pipeline_name] = pipeline_totals.get(pipeline_name, 0) + count
     pipeline_summary_rows = []
     for idx, (pipeline_name, pipeline_count) in enumerate(sorted(pipeline_totals.items())):
@@ -331,7 +436,8 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     # Summary rows by module (item: ..., names, docstrings, skipped_ids)
     summary_rows = []
     for i, item in enumerate(all_stats):
-        _, pipeline_name, label, test_files, _, marker_targets, count, _, _, _ = item
+        _, pipeline_name, group, label, test_files, _, marker_targets, count, _, _, _ = item
+        group_cell = esc(group) if group else "—"
         if test_files:
             files_html = "<br>".join(esc(f) for f in test_files)
         elif marker_targets:
@@ -343,14 +449,15 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
         summary_rows.append(
             f'<tr class="{tr_class(i)}">'
-            f'<td>{badge_span}</td><td>{esc(label)}</td><td class="num">{count}</td>'
+            f'<td>{badge_span}</td><td>{group_cell}</td><td>{esc(label)}</td><td class="num">{count}</td>'
             f'<td class="files">{files_html}</td></tr>'
         )
 
-    # Detail rows grouped by Pipeline, then by Test Suite (two-level collapsible)
+    # Detail rows grouped by Pipeline -> Buildkite group -> Test Suite -> files
     case_details_thead = """
             <tr>
               <th>Pipeline</th>
+              <th>Group</th>
               <th>Test Suite</th>
               <th>Test File</th>
               <th>No.</th>
@@ -358,18 +465,19 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
               <th>Status</th>
               <th>Description</th>
             </tr>"""
-    # Per-item: (pipeline_name, label, count, badge_span, suite_rows_html)
-    pipeline_suites: dict[str, list[tuple[str, int, str, str]]] = {}  # pipeline -> [(label, count, summary, body)]
+    # pipeline -> group_title -> [(label, count, suite_summary, body)]
+    pipeline_group_suites: dict[str, dict[str | None, list[tuple[str, int, str, str]]]] = {}
     for item in all_stats:
-        _, pipeline_name, label, _, _, _, count, names, docstrings, skipped_ids = item
+        _, pipeline_name, group, label, _, _, _, count, names, docstrings, skipped_ids = item
+        group_cell = esc(group) if group else "—"
         badge = pipeline_badges.get(pipeline_name, "")
         badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
         suite_summary = f"{esc(label)} ({count} cases)"
         file_sections: list[str] = []
         if not names:
             suite_rows = [
-                f'<tr class="{tr_class(0)}">'
-                f"<td>{badge_span}</td><td>{esc(label)}</td>"
+                f'<tr class="{tr_class(0)}" data-case-skipped="0">'
+                f"<td>{badge_span}</td><td>{group_cell}</td><td>{esc(label)}</td>"
                 f'<td class="files"><em>(marker-only / no collection)</em></td><td class="num">0</td>'
                 f'<td class="name"><em>No collection or only -m/--run-level</em></td>'
                 f'<td class="status"></td><td class="desc"></td></tr>'
@@ -394,9 +502,11 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
                 for i, (name, desc, is_skipped) in enumerate(file_groups[file_name], 1):
                     desc_html = esc(desc).replace("\n", "<br>") if desc else ""
                     status_html = '<span class="badge skip">Skipped</span>' if is_skipped else "—"
+                    skip_attr = ' data-case-skipped="1"' if is_skipped else ' data-case-skipped="0"'
                     suite_rows.append(
-                        f'<tr class="{tr_class(i - 1)}">'
-                        f'<td>{badge_span}</td><td>{esc(label)}</td><td class="files">{esc(file_name)}</td>'
+                        f'<tr class="{tr_class(i - 1)}"{skip_attr}>'
+                        f"<td>{badge_span}</td><td>{group_cell}</td><td>{esc(label)}</td>"
+                        f'<td class="files">{esc(file_name)}</td>'
                         f'<td class="num">{i}</td>'
                         f'<td class="name"><code>{esc(name)}</code></td>'
                         f'<td class="status">{status_html}</td><td class="desc">{desc_html}</td></tr>'
@@ -408,44 +518,40 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
                     f"<tbody>{''.join(suite_rows)}</tbody></table></div></details>"
                 )
         body = "".join(file_sections)
-        if pipeline_name not in pipeline_suites:
-            pipeline_suites[pipeline_name] = []
-        pipeline_suites[pipeline_name].append((label, count, suite_summary, body))
+        pipeline_group_suites.setdefault(pipeline_name, {}).setdefault(group, []).append(
+            (label, count, suite_summary, body)
+        )
 
-    # Build two-level HTML: Pipeline (outer) -> Test Suite (inner) -> table
-    detail_sections_html_parts = []
-    for pipeline_name in sorted(pipeline_badges.keys()):
-        if pipeline_name not in pipeline_suites:
+    def _group_sort_key(k: str | None) -> tuple[bool, str]:
+        return (k is None, (k or "").lower())
+
+    detail_sections_html_parts: list[str] = []
+    all_pipeline_keys = sorted(set(pipeline_badges.keys()) | set(pipeline_group_suites.keys()))
+    for pipeline_name in all_pipeline_keys:
+        if pipeline_name not in pipeline_group_suites:
             continue
-        suites = pipeline_suites[pipeline_name]
-        pipeline_total = sum(c for _, c, _, _ in suites)
+        groups_dict = pipeline_group_suites[pipeline_name]
+        pipeline_total = sum(c for suites in groups_dict.values() for (_, c, _, _) in suites)
         badge = pipeline_badges.get(pipeline_name, "")
         badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
         pipeline_summary = f"{badge_span} ({pipeline_total} cases)"
-        inner_html = "".join(
-            f'<details class="suite-details"><summary>{suite_summary}</summary>'
-            f'<div class="case-files-inner">{body}</div></details>'
-            for _, _, suite_summary, body in suites
-        )
+        group_sections: list[str] = []
+        for g_key in sorted(groups_dict.keys(), key=_group_sort_key):
+            suites = groups_dict[g_key]
+            group_total = sum(c for _, c, _, _ in suites)
+            display_g = "—" if g_key is None else g_key
+            inner_html = "".join(
+                f'<details class="suite-details"><summary>{suite_summary}</summary>'
+                f'<div class="case-files-inner">{body}</div></details>'
+                for _, _, suite_summary, body in suites
+            )
+            group_sections.append(
+                f'<details class="group-details"><summary>{esc(display_g)} ({group_total} cases)</summary>'
+                f'<div class="group-details-inner">{inner_html}</div></details>'
+            )
         detail_sections_html_parts.append(
             f'<details class="pipeline-details"><summary>{pipeline_summary}</summary>'
-            f'<div class="case-details-inner">{inner_html}</div></details>'
-        )
-    # Include pipelines that might be in all_stats but not in pipeline_badges (e.g. custom names)
-    for pipeline_name in sorted(pipeline_suites.keys()):
-        if pipeline_name in pipeline_badges:
-            continue
-        suites = pipeline_suites[pipeline_name]
-        pipeline_total = sum(c for _, c, _, _ in suites)
-        pipeline_summary = f"{esc(pipeline_name)} ({pipeline_total} cases)"
-        inner_html = "".join(
-            f'<details class="suite-details"><summary>{suite_summary}</summary>'
-            f'<div class="case-files-inner">{body}</div></details>'
-            for _, _, suite_summary, body in suites
-        )
-        detail_sections_html_parts.append(
-            f'<details class="pipeline-details"><summary>{pipeline_summary}</summary>'
-            f'<div class="case-details-inner">{inner_html}</div></details>'
+            f'<div class="case-details-inner">{"".join(group_sections)}</div></details>'
         )
     detail_sections_html = "".join(detail_sections_html_parts)
 
@@ -466,6 +572,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       --ready: #3fb950;
       --merge: #a371f7;
       --nightly: #f0883e;
+      --weekly: #79c0ff;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -524,6 +631,20 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       border-color: var(--accent);
       box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.18);
     }}
+    .filter-select {{
+      min-width: 180px;
+      padding: 0.65rem 0.85rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      outline: none;
+      font-size: 0.9rem;
+    }}
+    .filter-select:focus {{
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.18);
+    }}
     .filter-hint {{
       color: var(--muted);
       font-size: 0.82rem;
@@ -566,6 +687,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     .badge.ready {{ background: rgba(63, 185, 80, 0.2); color: var(--ready); }}
     .badge.merge {{ background: rgba(163, 113, 247, 0.2); color: var(--merge); }}
     .badge.nightly {{ background: rgba(240, 136, 62, 0.2); color: var(--nightly); }}
+    .badge.weekly {{ background: rgba(121, 192, 255, 0.2); color: var(--weekly); }}
     .badge.skip {{ background: rgba(139, 148, 158, 0.25); color: var(--muted); }}
     td.status {{ color: var(--muted); font-size: 0.85rem; }}
     .case-details details {{
@@ -595,6 +717,12 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     .case-details details th {{ border-top: 0; }}
     .case-details .pipeline-details {{ margin-bottom: 0.5rem; }}
     .case-details .pipeline-details .case-details-inner {{ padding-left: 0.5rem; margin-top: 0.25rem; }}
+    .case-details .group-details {{ margin-bottom: 0.35rem; margin-left: 0.35rem; }}
+    .case-details .group-details summary::before {{
+      content: "▶ "; font-size: 0.7rem; color: var(--muted); margin-right: 0.35rem;
+    }}
+    .case-details .group-details[open] summary::before {{ content: "▼ "; }}
+    .case-details .group-details .group-details-inner {{ padding-left: 0.35rem; margin-top: 0.25rem; }}
     .case-details .suite-details {{ margin-bottom: 0.35rem; margin-left: 0.5rem; }}
     .case-details .suite-details summary::before {{
       content: "▶ "; font-size: 0.7rem; color: var(--muted); margin-right: 0.35rem;
@@ -663,7 +791,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>Pipeline</th><th>Test Suite</th><th>Cases</th><th>Test Files</th></tr>
+            <tr><th>Pipeline</th><th>Group</th><th>Test Suite</th><th>Cases</th><th>Test Files</th></tr>
           </thead>
           <tbody>
             {"".join(summary_rows)}
@@ -674,7 +802,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
 
     <section class="case-details">
       <h2>Case Details</h2>
-      <p class="meta">Expand by Pipeline, then by Test Suite, then by Test File.</p>
+      <p class="meta">Expand by Pipeline, then Buildkite group, then Test Suite, then by Test File.</p>
       <div class="filter-bar">
         <label for="test-file-filter">Filter by Test File</label>
         <input
@@ -683,7 +811,12 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
           type="text"
           placeholder="Type part of a test file path, e.g. tests/e2e/online_serving"
         />
-        <span class="filter-hint">Filter applies to the Test File fold sections below.</span>
+        <label for="case-status-filter">Case status</label>
+        <select id="case-status-filter" class="filter-select" aria-label="Filter by case status">
+          <option value="all" selected>All cases</option>
+          <option value="skipped">Skipped only</option>
+        </select>
+        <span class="filter-hint">Path filter applies to file sections; status hides non-matching rows.</span>
       </div>
       {detail_sections_html}
     </section>
@@ -692,28 +825,48 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
   <script>
     (() => {{
       const input = document.getElementById("test-file-filter");
-      if (!input) return;
+      const statusSel = document.getElementById("case-status-filter");
+      if (!input || !statusSel) return;
 
       const applyFilter = () => {{
         const query = input.value.trim().toLowerCase();
+        const statusFilter = statusSel.value;
+
+        document.querySelectorAll(".case-details tbody tr[data-case-skipped]").forEach((tr) => {{
+          const isSkipped = tr.dataset.caseSkipped === "1";
+          const statusOk = statusFilter === "all" || (statusFilter === "skipped" && isSkipped);
+          tr.style.display = statusOk ? "" : "none";
+        }});
+
         document.querySelectorAll(".pipeline-details").forEach((pipeline) => {{
           let pipelineVisible = false;
-          pipeline.querySelectorAll(".suite-details").forEach((suite) => {{
-            let suiteVisible = false;
-            suite.querySelectorAll(".file-details").forEach((fileDetail) => {{
-              const fileName = (fileDetail.dataset.testFile || fileDetail.textContent || "").toLowerCase();
-              const matched = !query || fileName.includes(query);
-              fileDetail.style.display = matched ? "" : "none";
-              if (matched) suiteVisible = true;
+          pipeline.querySelectorAll(".group-details").forEach((group) => {{
+            let groupVisible = false;
+            group.querySelectorAll(".suite-details").forEach((suite) => {{
+              let suiteVisible = false;
+              suite.querySelectorAll(".file-details").forEach((fileDetail) => {{
+                const fileName = (fileDetail.dataset.testFile || fileDetail.textContent || "").toLowerCase();
+                const pathOk = !query || fileName.includes(query);
+                const rows = fileDetail.querySelectorAll("tbody tr[data-case-skipped]");
+                const anyRowVisible =
+                  rows.length === 0 ||
+                  Array.from(rows).some((tr) => tr.style.display !== "none");
+                const matched = pathOk && anyRowVisible;
+                fileDetail.style.display = matched ? "" : "none";
+                if (matched) suiteVisible = true;
+              }});
+              suite.style.display = suiteVisible ? "" : "none";
+              if (suiteVisible) groupVisible = true;
             }});
-            suite.style.display = suiteVisible ? "" : "none";
-            if (suiteVisible) pipelineVisible = true;
+            group.style.display = groupVisible ? "" : "none";
+            if (groupVisible) pipelineVisible = true;
           }});
           pipeline.style.display = pipelineVisible ? "" : "none";
         }});
       }};
 
       input.addEventListener("input", applyFilter);
+      statusSel.addEventListener("change", applyFilter);
       applyFilter();
     }})();
   </script>
@@ -721,6 +874,86 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
 </html>
 """
     out_path.write_text(html_content, encoding="utf-8")
+
+
+def _sample_preview_stats() -> list[tuple]:
+    """Synthetic stats tuples matching ``main()`` layout — UI demo only."""
+    names_a = [
+        "tests/e2e/demo/test_alpha.py::test_smoke",
+        "tests/e2e/demo/test_alpha.py::test_params[x0]",
+        "tests/e2e/demo/test_beta.py::test_widgets",
+    ]
+    skipped_a = {"tests/e2e/demo/test_alpha.py::test_smoke"}
+    return [
+        (
+            "test-ready / :card_index_dividers: Simple Test / Simple · Diffusion",
+            "test-ready",
+            ":card_index_dividers: Simple Test",
+            "Simple · Diffusion & Model Executor Test",
+            ["tests/diffusion/test_dummy.py", "tests/model_executor/test_dummy.py"],
+            False,
+            [],
+            len(names_a) - len(skipped_a),
+            names_a,
+            ["Alpha smoke.", "", "Widgets."],
+            skipped_a,
+        ),
+        (
+            "test-ready / Custom Pipeline Test",
+            "test-ready",
+            None,
+            "Custom Pipeline Test",
+            ["tests/e2e/offline_inference/custom_pipeline/test_cp.py"],
+            False,
+            [],
+            1,
+            ["tests/e2e/offline_inference/custom_pipeline/test_cp.py::test_cp_one"],
+            [""],
+            set(),
+        ),
+        (
+            "test-merge / :card_index_dividers: Diffusion Test / LoRA",
+            "test-merge",
+            ":card_index_dividers: Diffusion Test",
+            "Diffusion · LoRA Test",
+            ["tests/diffusion/lora/test_lora.py"],
+            False,
+            [],
+            2,
+            [
+                "tests/diffusion/lora/test_lora.py::test_load",
+                "tests/diffusion/lora/test_lora.py::test_infer[a]",
+            ],
+            ["", ""],
+            set(),
+        ),
+        (
+            "test-nightly / Omni marker-only (sample)",
+            "test-nightly",
+            ":card_index_dividers: Omni Model Test",
+            "Omni · marker-only step (sample)",
+            [],
+            True,
+            ["-m full_model and omni and H100", "--run-level full_model"],
+            0,
+            [],
+            [],
+            set(),
+        ),
+        (
+            "test-weekly / Reliability (sample)",
+            "test-weekly",
+            None,
+            "Reliability Test - qwen3-omni",
+            ["tests/dfx/reliability/test_reliability_qwen3_omni.py"],
+            False,
+            [],
+            1,
+            ["tests/dfx/reliability/test_reliability_qwen3_omni.py::test_placeholder"],
+            ["Weekly reliability placeholder."],
+            set(),
+        ),
+    ]
 
 
 def main() -> None:
@@ -739,7 +972,22 @@ def main() -> None:
         default=default_out,
         help=f"Output HTML file path (default: {default_out})",
     )
+    parser.add_argument(
+        "--sample-preview",
+        action="store_true",
+        help="Write HTML using placeholder pipelines/groups/cases only (no pytest, no YAML-driven counts).",
+    )
     args = parser.parse_args()
+
+    if args.sample_preview:
+        all_stats = _sample_preview_stats()
+        out_path = args.output.resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        total = sum(item[7] for item in all_stats)
+        write_html(all_stats, out_path, total, REPO_ROOT)
+        print(f"Written (sample preview): {out_path}")
+        print(f"Test Suites: {len(all_stats)}, total placeholder cases: {total}")
+        return
 
     all_stats = []
 
@@ -752,11 +1000,10 @@ def main() -> None:
         steps = data.get("steps") or []
         pipeline_name = filename.replace(".yml", "")
 
-        for step in steps:
+        for step, group in iter_pytest_leaf_steps(steps):
             if not isinstance(step, dict):
                 continue
             label = step.get("label") or "(no label)"
-            # Skip commented-out steps (usually no label or commands)
             if not step.get("commands"):
                 continue
             targets = get_pytest_targets_from_step(step)
@@ -764,6 +1011,8 @@ def main() -> None:
                 continue
 
             module_key = f"{pipeline_name} / {label}"
+            if group:
+                module_key = f"{pipeline_name} / {group} / {label}"
             # test_files: only real .py files; marker-only steps will have an empty list.
             test_files = [t for t, _ in targets if t.endswith(".py")]
             # marker_targets: synthetic marker targets (e.g. "-m expr", "-m expr --run-level level").
@@ -785,6 +1034,7 @@ def main() -> None:
                 (
                     module_key,
                     pipeline_name,
+                    group,
                     label,
                     test_files,
                     marker_only,
@@ -798,7 +1048,7 @@ def main() -> None:
 
     out_path = args.output.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    total = sum(item[6] for item in all_stats)
+    total = sum(item[7] for item in all_stats)
     write_html(all_stats, out_path, total, REPO_ROOT)
     print(f"Written: {out_path}")
     print(f"Test Suites: {len(all_stats)}, total cases (sum of steps): {total}")

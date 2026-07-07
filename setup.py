@@ -3,7 +3,7 @@ Setup script for vLLM-Omni with hardware-dependent installation.
 
 This setup.py implements platform-aware dependency routing so users can run
 `pip install vllm-omni` and automatically receive the correct platform-specific
-dependencies (CUDA/ROCm/CPU/XPU/NPU) without requiring extras like `[cuda]`.
+dependencies (CUDA/ROCm/CPU/XPU/NPU/MUSA) without requiring extras like `[cuda]`.
 """
 
 import os
@@ -46,21 +46,27 @@ def detect_target_device() -> str:
 
     Priority order:
     1. VLLM_OMNI_TARGET_DEVICE environment variable (highest priority)
-    2. Torch backend detection (cuda, rocm, npu, xpu)
+    2. Torch backend detection (cuda, rocm, npu, xpu, musa)
     3. CPU fallback (default)
 
     Returns:
-        str: Device name ('cuda', 'rocm', 'npu', 'xpu', or 'cpu')
+        str: Device name ('cuda', 'rocm', 'npu', 'xpu', 'musa', or 'cpu')
     """
     # Priority 1: Explicit override via environment variable
     target_device = os.environ.get("VLLM_OMNI_TARGET_DEVICE")
     if target_device:
-        valid_devices = ["cuda", "rocm", "npu", "xpu", "cpu"]
+        valid_devices = ["cuda", "rocm", "npu", "xpu", "musa", "cpu"]
         if target_device.lower() in valid_devices:
             print(f"Using target device from VLLM_OMNI_TARGET_DEVICE: {target_device.lower()}")
             return target_device.lower()
         else:
             print(f"Warning: Invalid VLLM_OMNI_TARGET_DEVICE '{target_device}', falling back to auto-detection")
+
+    # Priority 1.5: ReadTheDocs builds use CPU requirements (no GPU, 1 GB RAM cap).
+    # Avoids pulling ~2 GB of CUDA libs that push the mkdocs build into swap.
+    if os.environ.get("READTHEDOCS"):
+        print("Detected READTHEDOCS=1; using cpu requirements for docs build")
+        return "cpu"
 
     # Priority 2: Torch backend detection
     # This is a code path for when user is using
@@ -94,6 +100,15 @@ def detect_target_device() -> str:
                 if torch.xpu.is_available():
                     print("Detected XPU backend from torch")
                     return "xpu"
+            except Exception:
+                pass
+
+        # Check for MUSA (Moore Threads)
+        if hasattr(torch, "musa"):
+            try:
+                if torch.musa.is_available():
+                    print("Detected MUSA backend from torch")
+                    return "musa"
             except Exception:
                 pass
 
@@ -152,6 +167,8 @@ def get_vllm_omni_version() -> str:
             version += f"{sep}npu"
         elif device == "xpu":
             version += f"{sep}xpu"
+        elif device == "musa":
+            version += f"{sep}musa"
         elif device == "cpu":
             version += f"{sep}cpu"
         else:

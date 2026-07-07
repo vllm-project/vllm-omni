@@ -256,7 +256,7 @@ cache_config={
 }
 ```
 
-Check the [user guide for cache_dit](../../user_guide/diffusion/cache_dit_acceleration.md) for more adjustable parameters.
+Check the [user guide for cache_dit](../../user_guide/diffusion/cache_acceleration/cache_dit.md) for more adjustable parameters.
 
 ---
 

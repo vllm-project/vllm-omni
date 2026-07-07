@@ -43,9 +43,17 @@ class SequentialOffloadHook(ModelHook):
         module: nn.Module,
         target_device: torch.device,
         *,
-        non_blocking: bool = True,
+        non_blocking: bool = False,
         pin_memory: bool = False,
     ) -> None:
+        """Move module parameters and buffers to device.
+
+        This cls method specifically prevents recursion device movement,
+        E.g., Cache-DiT CachedBlocks has attr `transformer` as a ref to original
+        transformer blocks, thus `module.to(device)` will fail for recursion calling,
+        refer to
+        https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
+        """
         for p in module.parameters():
             if p.data.device != target_device:
                 data = p.data.to(target_device, non_blocking=non_blocking)
@@ -68,10 +76,14 @@ class SequentialOffloadHook(ModelHook):
         if param.device.type == "cpu":
             return
 
+        # XPU's allocator doesn't respect stream dependencies in empty_cache,
+        # so non-blocking copies can race with cache eviction. Use blocking
+        # copies on XPU to avoid NULL pointer errors during DMA.
+        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
         self._move_params(
             module,
             torch.device("cpu"),
-            non_blocking=not self.use_hsdp,
+            non_blocking=non_blocking,
             pin_memory=self.pin_memory,
         )
         current_omni_platform.empty_cache()
@@ -83,7 +95,7 @@ class SequentialOffloadHook(ModelHook):
         except StopIteration:
             return
 
-        self._move_params(module, self.device)
+        self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU
@@ -133,11 +145,12 @@ def apply_sequential_offload(
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
-    # Register hooks on DiT modules (offload encoders when DiT runs)
-    for dit_mod in dit_modules:
+    # Register hooks on DiT modules (offload encoders AND other DiTs when a DiT runs)
+    for i, dit_mod in enumerate(dit_modules):
+        other_dits = [d for j, d in enumerate(dit_modules) if j != i]
         registry = HookRegistry.get_or_create(dit_mod)
         hook = SequentialOffloadHook(
-            offload_targets=encoder_modules,
+            offload_targets=encoder_modules + other_dits,
             device=device,
             pin_memory=pin_memory,
             use_hsdp=use_hsdp,
@@ -191,23 +204,35 @@ class ModelLevelOffloadBackend(OffloadBackend):
             return
 
         modules = ModuleDiscovery.discover(pipeline)
-        if not modules.dits:
-            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
-            return
-        if not modules.encoders:
-            logger.warning("No encoder modules found, skipping model-level offloading")
-            return
 
         # Move encoders to GPU
         for enc in modules.encoders:
             enc.to(self.device)
 
-        # Move VAE to GPU if available
-        if modules.vae is not None:
+        # Move VAE(s) to GPU if available
+        for vae in modules.vaes:
             try:
-                modules.vae.to(self.device, non_blocking=True)
+                vae.to(self.device, non_blocking=True)
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
+
+        # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
+        for res, name in zip(modules.resident_modules, modules.resident_names):
+            try:
+                res.to(self.device)
+            except Exception as exc:
+                logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
+
+        if not modules.dits:
+            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
+            return
+
+        if not modules.encoders:
+            # Nothing to swap against — move DiTs to GPU and skip hooks.
+            for dit in modules.dits:
+                dit.to(self.device)
+            logger.warning("No encoder modules found, skipping model-level offloading")
+            return
 
         # Apply sequential offloading hooks
         apply_sequential_offload(
@@ -224,9 +249,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
         self.enabled = True
 
         logger.info(
-            "Model-level offloading enabled: %s <-> %s (mutual exclusion)",
+            "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
             ", ".join(modules.dit_names),
             ", ".join(modules.encoder_names),
+            f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
         )
 
     def disable(self) -> None:

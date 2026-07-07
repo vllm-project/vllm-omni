@@ -1,154 +1,87 @@
-# GLM-Image Multistage End-to-End Inference
+# GLM-Image Offline Inference
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/glm_image>.
-
-
-This example demonstrates how to run GLM-Image with the vLLM-Omni multistage architecture.
+GLM-Image is a 2-stage image generation model (AR + Diffusion) supported by vLLM-Omni's
+declarative config system. The pipeline topology and stage structure are declared in
+`vllm_omni/model_executor/models/glm_image/pipeline.py`; deployment knobs live in
+`vllm_omni/deploy/glm_image.yaml`.
 
 ## Architecture
 
-GLM-Image uses a 2-stage pipeline:
-
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     GLM-Image Pipeline                       │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Stage 0 (AR Model)              Stage 1 (Diffusion)        │
-│  ┌─────────────────┐            ┌─────────────────────┐     │
-│  │ vLLM-optimized  │            │  GlmImagePipeline   │     │
-│  │ GlmImageFor     │  prior     │  ┌───────────────┐  │     │
-│  │ Conditional     │──tokens───►│  │ DiT Denoiser  │  │     │
-│  │ Generation      │            │  └───────────────┘  │     │
-│  │ (9B AR model)   │            │         │          │     │
-│  └─────────────────┘            │         ▼          │     │
-│         ▲                       │  ┌───────────────┐  │     │
-│         │                       │  │  VAE Decode   │──┼──► Image
-│    Text/Image                   │  └───────────────┘  │     │
-│      Input                      └─────────────────────┘     │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+Stage 0 (AR Model)                Stage 1 (Diffusion)
+┌───────────────────┐            ┌─────────────────────┐
+│ vLLM-optimized    │  prior     │  GlmImagePipeline   │
+│ GlmImageFor       │──tokens──►│  ┌───────────────┐  │
+│ Conditional       │            │  │ DiT Denoiser  │  │
+│ Generation        │            │  └───────┬───────┘  │
+│ (9B AR model)     │            │          ▼          │
+└───────────────────┘            │  ┌───────────────┐  │
+        ▲                        │  │  VAE Decode   │──┼──► Image
+        │                        │  └───────────────┘  │
+   Text / Image                  └─────────────────────┘
+     Input
 ```
 
-## Features
+## Text-to-Image
 
-- **vLLM-optimized AR**: Uses PagedAttention and tensor parallelism for faster prior token generation
-- **Flexible deployment**: AR and Diffusion stages can run on different GPUs
-- **Text-to-Image**: Generate images from text descriptions
-- **Image-to-Image**: Edit existing images with text prompts
+```python
+from vllm_omni.entrypoints.omni import Omni
 
-## Usage
-
-### Text-to-Image
-
-```bash
-python end2end.py \
-    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
-    --prompt "A beautiful sunset over the ocean with sailing boats" \
-    --height 1024 \
-    --width 1024 \
-    --output output_t2i.png
+if __name__ == "__main__":
+    omni = Omni(model="zai-org/GLM-Image")
+    outputs = omni.generate(
+        "A photorealistic mountain landscape at sunset",
+        sampling_params={
+            "height": 1024,
+            "width": 1024,
+            "num_inference_steps": 50,
+            "guidance_scale": 1.5,
+            "seed": 42,
+        },
+    )
+    outputs[0].request_output.images[0].save("output.png")
 ```
 
-### Image-to-Image (Image Editing)
+## Image-to-Image (Image Editing)
 
-```bash
-python end2end.py \
-    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
-    --prompt "Transform this scene into a winter wonderland" \
-    --image input.png \
-    --output output_i2i.png
+```python
+from vllm_omni.entrypoints.omni import Omni
+
+if __name__ == "__main__":
+    omni = Omni(model="zai-org/GLM-Image")
+    outputs = omni.generate(
+        {
+            "prompt": "Convert this image to watercolor style",
+            "multi_modal_data": {
+                "image": "input.png",
+            },
+        },
+        sampling_params={
+            "height": 1024,
+            "width": 1024,
+            "num_inference_steps": 50,
+            "guidance_scale": 1.5,
+            "seed": 42,
+        },
+    )
+    outputs[0].request_output.images[0].save("output.png")
 ```
 
-### With Custom Parameters
+## Generation Parameters
 
-```bash
-python end2end.py \
-    --model-path /path/to/glm-image \
-    --config-path ../../../vllm_omni/model_executor/stage_configs/glm_image.yaml \
-    --prompt "A photorealistic cat sitting on a window sill" \
-    --height 1024 \
-    --width 1024 \
-    --num-inference-steps 50 \
-    --guidance-scale 1.5 \
-    --seed 42 \
-    --output output.png
-```
+| Parameter             | Type  | Default | Description                         |
+| --------------------- | ----- | ------- | ----------------------------------- |
+| `height`              | int   | 1024    | Image height in pixels              |
+| `width`               | int   | 1024    | Image width in pixels               |
+| `num_inference_steps` | int   | 50      | Number of diffusion denoising steps |
+| `guidance_scale`      | float | 1.5     | Classifier-free guidance scale      |
+| `seed`                | int   | None    | Optional random seed                |
+| `negative_prompt`     | str   | None    | Negative prompt                     |
 
-## Shell Scripts
+## VRAM Requirements
 
-### Run Text-to-Image
-
-```bash
-./run_t2i.sh
-```
-
-### Run Image-to-Image
-
-```bash
-./run_i2i.sh --image /path/to/input.png
-```
-
-## Stage Configuration
-
-The stage config (`glm_image.yaml`) defines:
-
-- **Stage 0 (AR)**: Uses `GPUARWorker` with vLLM engine
-
-  - Model: `GlmImageForConditionalGeneration`
-  - Output: `token_ids` (prior tokens)
-
-- **Stage 1 (Diffusion)**: Uses diffusion engine
-  - Model: `GlmImagePipeline`
-  - Output: Generated image
-
-See `vllm_omni/model_executor/stage_configs/glm_image.yaml` for full configuration.
-
-## Comparison with Single-Stage
-
-| Aspect      | Single-Stage (transformers) | Multistage (vLLM)   |
-| ----------- | --------------------------- | ------------------- |
-| AR Model    | transformers native         | vLLM PagedAttention |
-| Memory      | Higher (no KV cache opt)    | Lower (optimized)   |
-| Throughput  | Lower                       | Higher              |
-| Flexibility | Single GPU                  | Multi-GPU support   |
-
-## Troubleshooting
-
-### OOM Error
-
-Try reducing memory usage:
-
-```bash
-# In glm_image.yaml, adjust:
-gpu_memory_utilization: 0.5  # Reduce from 0.6
-```
-
-### Slow Initialization
-
-The first run loads model weights. Subsequent runs are faster:
-
-```bash
---stage-init-timeout 900  # Increase timeout for slow storage
-```
-
-## Requirements
-
-- vLLM-Omni with GLM-Image support
-- CUDA-capable GPU (recommended: H100/A100 with 80GB)
-- GLM-Image model weights
-
-## Example materials
-
-??? abstract "end2end.py"
-    ``````py
-    --8<-- "examples/offline_inference/glm_image/end2end.py"
-    ``````
-??? abstract "run_i2i.sh"
-    ``````sh
-    --8<-- "examples/offline_inference/glm_image/run_i2i.sh"
-    ``````
-??? abstract "run_t2i.sh"
-    ``````sh
-    --8<-- "examples/offline_inference/glm_image/run_t2i.sh"
-    ``````
+| Stage             | VRAM                   |
+| :---------------- | :--------------------- |
+| Stage-0 (AR)      | **~18 GiB + KV Cache** |
+| Stage-1 (DiT+VAE) | **~20 GiB**            |
+| Total             | **~38 GiB + KV Cache** |

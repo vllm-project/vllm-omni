@@ -25,7 +25,6 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -33,6 +32,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.layers.norm import RMSNorm
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -50,6 +51,7 @@ from vllm_omni.diffusion.forward_context import (
     is_forward_context_available,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -207,6 +209,18 @@ def validate_zimage_tp_constraints(
     return ffn_hidden_dim, final_out_dims, supported_tp_candidates
 
 
+def _join_prefix(prefix: str, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
+
+
+def _restore_linear_output_shape(output: torch.Tensor, input_: torch.Tensor) -> torch.Tensor:
+    if input_.dim() > 2 and output.dim() == 2:
+        token_count = math.prod(input_.shape[:-1])
+        if output.shape[0] == token_count:
+            return output.reshape(*input_.shape[:-1], output.shape[-1])
+    return output
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(
         self, out_size, mid_size=None, frequency_embedding_size=256, quant_config: "QuantizationConfig | None" = None
@@ -214,12 +228,14 @@ class TimestepEmbedder(nn.Module):
         super().__init__()
         if mid_size is None:
             mid_size = out_size
+        # Time embedding MLP is kept full precision (quant_config=None) —
+        # small layers that feed adaLN; precision-sensitive (see #2728).
         self.mlp = nn.Sequential(
             ReplicatedLinear(
                 frequency_embedding_size,
                 mid_size,
                 bias=True,
-                quant_config=quant_config,
+                quant_config=None,
                 return_bias=False,
             ),
             nn.SiLU(),
@@ -227,27 +243,15 @@ class TimestepEmbedder(nn.Module):
                 mid_size,
                 out_size,
                 bias=True,
-                quant_config=quant_config,
+                quant_config=None,
                 return_bias=False,
             ),
         )
 
         self.frequency_embedding_size = frequency_embedding_size
 
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = timestep_embedding(t, self.frequency_embedding_size)
         weight_dtype = self.mlp[0].bias.dtype
         if weight_dtype.is_floating_point:
             t_freq = t_freq.to(weight_dtype)
@@ -264,6 +268,7 @@ class ZImageAttention(nn.Module):
         qk_norm: bool = True,
         eps: float = 1e-6,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -279,7 +284,7 @@ class ZImageAttention(nn.Module):
             total_num_kv_heads=num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix="to_qkv",
+            prefix=_join_prefix(prefix, "to_qkv"),
         )
 
         assert qk_norm is True
@@ -298,7 +303,7 @@ class ZImageAttention(nn.Module):
                     input_is_parallel=True,
                     return_bias=False,
                     quant_config=quant_config,
-                    prefix="to_out",
+                    prefix=_join_prefix(prefix, "to_out.0"),
                 )
             ]
         )
@@ -320,6 +325,7 @@ class ZImageAttention(nn.Module):
         sin: torch.Tensor,
     ):
         qkv, _ = self.to_qkv(hidden_states)
+        qkv = _restore_linear_output_shape(qkv, hidden_states)
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -352,7 +358,9 @@ class ZImageAttention(nn.Module):
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(dtype)
 
+        to_out_input = hidden_states
         hidden_states = self.to_out[0](hidden_states)
+        hidden_states = _restore_linear_output_shape(hidden_states, to_out_input)
 
         return hidden_states
 
@@ -372,7 +380,7 @@ class FeedForward(nn.Module):
             bias=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=prefix,
+            prefix=_join_prefix(prefix, "w13"),
         )
         self.act = SiluAndMul()
         self.w2 = RowParallelLinear(
@@ -382,11 +390,15 @@ class FeedForward(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=prefix,
+            prefix=_join_prefix(prefix, "w2"),
         )
 
     def forward(self, x):
-        return self.w2(self.act(self.w13(x)))
+        hidden_states = self.w13(x)
+        hidden_states = _restore_linear_output_shape(hidden_states, x)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.w2(hidden_states)
+        return _restore_linear_output_shape(hidden_states, x)
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -400,6 +412,7 @@ class ZImageTransformerBlock(nn.Module):
         qk_norm: bool,
         modulation=True,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -411,10 +424,14 @@ class ZImageTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             eps=1e-5,
             quant_config=quant_config,
+            prefix=_join_prefix(prefix, "attention"),
         )
 
         self.feed_forward = FeedForward(
-            dim=dim, hidden_dim=int(dim / 3 * 8), quant_config=quant_config, prefix="feed_forward"
+            dim=dim,
+            hidden_dim=int(dim / 3 * 8),
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "feed_forward"),
         )
         self.layer_id = layer_id
 
@@ -426,9 +443,16 @@ class ZImageTransformerBlock(nn.Module):
 
         self.modulation = modulation
         if modulation:
+            # Modulation linear is kept at full precision (quant_config=None)
+            # — it produces scale/gate values that are precision-sensitive
+            # (see #2728, mirrors OmniGen2 fix).
             self.adaLN_modulation = nn.Sequential(
                 ReplicatedLinear(
-                    min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True, return_bias=False, quant_config=quant_config
+                    min(dim, ADALN_EMBED_DIM),
+                    4 * dim,
+                    bias=True,
+                    quant_config=None,
+                    return_bias=False,
                 ),
             )
 
@@ -485,14 +509,24 @@ class FinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels, quant_config: "QuantizationConfig | None" = None):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        # Final output projection and its modulation are precision-sensitive
+        # (produce the output latent); keep at full precision (see #2728).
         self.linear = ReplicatedLinear(
-            hidden_size, out_channels, bias=True, quant_config=quant_config, return_bias=False
+            hidden_size,
+            out_channels,
+            bias=True,
+            quant_config=None,
+            return_bias=False,
         )
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             ReplicatedLinear(
-                min(hidden_size, ADALN_EMBED_DIM), hidden_size, bias=True, quant_config=quant_config, return_bias=False
+                min(hidden_size, ADALN_EMBED_DIM),
+                hidden_size,
+                bias=True,
+                quant_config=None,
+                return_bias=False,
             ),
         )
 
@@ -579,6 +613,13 @@ class ZImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["layers"]
+
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return "layers" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
 
     # Sequence Parallelism for Z-Image (following diffusers' _cp_plan pattern)
     # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,
@@ -666,11 +707,13 @@ class ZImageTransformer2DModel(CachedTransformer):
         all_x_embedder = {}
         all_final_layer = {}
         for patch_idx, (patch_size, f_patch_size) in enumerate(zip(all_patch_size, all_f_patch_size)):
+            # x_embedder (patch embed) is a small precision-sensitive entry
+            # layer; keep full precision (see #2728).
             x_embedder = ReplicatedLinear(
                 f_patch_size * patch_size * patch_size * in_channels,
                 dim,
                 bias=True,
-                quant_config=quant_config,
+                quant_config=None,
                 return_bias=False,
             )
             all_x_embedder[f"{patch_size}-{f_patch_size}"] = x_embedder
@@ -693,6 +736,7 @@ class ZImageTransformer2DModel(CachedTransformer):
                     qk_norm,
                     modulation=True,
                     quant_config=quant_config,
+                    prefix=f"noise_refiner.{layer_id}",
                 )
                 for layer_id in range(n_refiner_layers)
             ]
@@ -708,14 +752,23 @@ class ZImageTransformer2DModel(CachedTransformer):
                     qk_norm,
                     modulation=False,
                     quant_config=quant_config,
+                    prefix=f"context_refiner.{layer_id}",
                 )
                 for layer_id in range(n_refiner_layers)
             ]
         )
         self.t_embedder = TimestepEmbedder(min(dim, ADALN_EMBED_DIM), mid_size=1024, quant_config=quant_config)
+        # Caption embedder maps text features -> hidden; keep full precision
+        # (see #2728).
         self.cap_embedder = nn.Sequential(
             RMSNorm(cap_feat_dim, eps=norm_eps),
-            ReplicatedLinear(cap_feat_dim, dim, bias=True, return_bias=False, quant_config=quant_config),
+            ReplicatedLinear(
+                cap_feat_dim,
+                dim,
+                bias=True,
+                quant_config=None,
+                return_bias=False,
+            ),
         )
 
         self.x_pad_token = nn.Parameter(torch.empty((1, dim)))
@@ -731,6 +784,7 @@ class ZImageTransformer2DModel(CachedTransformer):
                     norm_eps,
                     qk_norm,
                     quant_config=quant_config,
+                    prefix=f"layers.{layer_id}",
                 )
                 for layer_id in range(n_layers)
             ]

@@ -26,6 +26,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.quantization.component_config import safe_quant_config
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
@@ -37,6 +39,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -46,6 +49,25 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+def _normalize_qwen_image_weight_name(name: str) -> str:
+    name = name.removeprefix("transformer.")
+    if ".to_out.0." in name:
+        name = name.replace(".to_out.0.", ".to_out.")
+    return name
+
+
+def _resolve_qwen_image_lookup_name(
+    name: str,
+    stacked_params_mapping: list[tuple[str, str, str]],
+) -> tuple[str, str | None]:
+    lookup_name = _normalize_qwen_image_weight_name(name)
+    for param_name, weight_name, shard_id in stacked_params_mapping:
+        if weight_name not in lookup_name or param_name in lookup_name:
+            continue
+        return lookup_name.replace(weight_name, param_name), shard_id
+    return lookup_name, None
 
 
 class ImageRopePrepare(nn.Module):
@@ -168,12 +190,15 @@ class QwenTimestepProjEmbeddings(nn.Module):
 
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        # Time embedding MLP is kept full precision (quant_config=None) —
+        # small layers that feed per-block modulation; precision-sensitive
+        # (see #2728).
         self.timestep_embedder.linear_1 = ReplicatedLinear(
             256,
             embedding_dim,
             bias=True,
             return_bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix="timestep_embedder.linear_1",
         )
         self.timestep_embedder.linear_2 = ReplicatedLinear(
@@ -181,7 +206,7 @@ class QwenTimestepProjEmbeddings(nn.Module):
             embedding_dim,
             bias=True,
             return_bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix="timestep_embedder.linear_2",
         )
         self.use_additional_t_cond = use_additional_t_cond
@@ -437,7 +462,7 @@ class ColumnParallelApproxGELU(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=prefix,
+            prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.approximate = approximate
 
@@ -467,7 +492,12 @@ class FeedForward(nn.Module):
 
         layers: list[nn.Module] = [
             ColumnParallelApproxGELU(
-                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=prefix
+                dim,
+                inner_dim,
+                approximate="tanh",
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.0",
             ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
@@ -476,7 +506,7 @@ class FeedForward(nn.Module):
                 input_is_parallel=True,
                 return_bias=False,
                 quant_config=quant_config,
-                prefix=prefix,
+                prefix=f"{prefix}.net.2",
             ),
         ]
 
@@ -503,6 +533,7 @@ class QwenImageCrossAttention(nn.Module):
         context_pre_only: bool = False,
         out_dim: int | None = None,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0
@@ -519,7 +550,7 @@ class QwenImageCrossAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             quant_config=quant_config,
-            prefix="to_qkv",
+            prefix=f"{prefix}.to_qkv",
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -535,7 +566,7 @@ class QwenImageCrossAttention(nn.Module):
             head_size=head_dim,
             total_num_heads=num_heads,
             quant_config=quant_config,
-            prefix="add_kv_proj",
+            prefix=f"{prefix}.add_kv_proj",
         )
         self.add_query_num_heads = self.add_kv_proj.num_heads
         self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
@@ -548,7 +579,7 @@ class QwenImageCrossAttention(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix="to_add_out",
+            prefix=f"{prefix}.to_add_out",
         )
 
         assert not pre_only
@@ -559,7 +590,7 @@ class QwenImageCrossAttention(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix="to_out",
+            prefix=f"{prefix}.to_out.0",
         )
 
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
@@ -693,14 +724,17 @@ class QwenImageTransformerBlock(nn.Module):
         eps: float = 1e-6,
         zero_cond_t: bool = False,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
+        txt_mod_quant_config = safe_quant_config(quant_config)
 
-        # Image processing modules
+        # Image processing modules.
+        # The re-quantized W4A16 checkpoint keeps img_mod.1 in full precision.
         self.img_mod = nn.Sequential(
             nn.SiLU(),
             ReplicatedLinear(
@@ -708,8 +742,8 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 return_bias=False,
-                quant_config=quant_config,
-                prefix="img_mod.1",
+                quant_config=None,
+                prefix=f"{prefix}.img_mod.1",
             ),
         )
         self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -720,11 +754,18 @@ class QwenImageTransformerBlock(nn.Module):
             context_pre_only=False,
             head_dim=attention_head_dim,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
         self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="img_mlp")
+        self.img_mlp = FeedForward(
+            dim=dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.img_mlp",
+        )
 
-        # Text processing modules
+        # Text processing modules.
+        # AutoRound keeps txt_mod.1 quantized inside transformer_blocks.
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
             ReplicatedLinear(
@@ -732,20 +773,25 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 return_bias=False,
-                quant_config=quant_config,
-                prefix="txt_mod.1",
+                quant_config=txt_mod_quant_config,
+                prefix=f"{prefix}.txt_mod.1",
             ),
         )
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="txt_mlp")
+        self.txt_mlp = FeedForward(
+            dim=dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.txt_mlp",
+        )
 
         self.zero_cond_t = zero_cond_t
 
-    def _modulate(self, x, mod_params, index=None):
+    def _modulate(self, mod_params, index=None):
         """Apply modulation to input tensor"""
-        # x: b l d, shift: b d, scale: b d, gate: b d
+        # shift: b d, scale: b d, gate: b d
         shift, scale, gate = mod_params.chunk(3, dim=-1)
 
         if index is not None:
@@ -777,7 +823,7 @@ class QwenImageTransformerBlock(nn.Module):
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
 
-        return x * (1 + scale_result) + shift_result, gate_result
+        return scale_result, shift_result, gate_result
 
     def forward(
         self,
@@ -803,10 +849,12 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_modulated, img_gate1 = self.img_norm1(hidden_states, img_mod1, modulate_index)
+        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
+        img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
 
         # Process text stream - norm1 + modulation
-        txt_modulated, txt_gate1 = self.txt_norm1(encoder_hidden_states, txt_mod1)
+        txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
+        txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -831,13 +879,16 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2, modulate_index)
+        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
+        img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
 
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
         # Process text stream - norm2 + MLP
-        txt_modulated2, txt_gate2 = self.txt_norm2(encoder_hidden_states, txt_mod2)
+        txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2)
+        txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
+
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 
@@ -881,11 +932,13 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["QwenImageTransformerBlock"]
-    _layerwise_offload_blocks_attr = "transformer_blocks"
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
     }
+
+    _hsdp_shard_conditions = [is_transformer_block_module]
 
     # Sequence Parallelism plan (following diffusers' _cp_plan pattern)
     # Similar to Z-Image's UnifiedPrepare, we use ImageRopePrepare to create
@@ -941,6 +994,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.guidance_embeds = guidance_embeds
+        self.quant_config = quant_config
 
         if not use_layer3d_rope:
             self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
@@ -955,12 +1009,14 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
 
+        # Entry projections (image/text) are kept full precision —
+        # small sensitive layers at the network boundary (see #2728).
         self.img_in = ReplicatedLinear(
             in_channels,
             self.inner_dim,
             bias=True,
             return_bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix="img_in",
         )
         self.txt_in = ReplicatedLinear(
@@ -968,7 +1024,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             self.inner_dim,
             bias=True,
             return_bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix="txt_in",
         )
 
@@ -980,18 +1036,22 @@ class QwenImageTransformer2DModel(CachedTransformer):
                     attention_head_dim=attention_head_dim,
                     zero_cond_t=zero_cond_t,
                     quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
+        # Final modulation and output projection are kept full precision —
+        # they produce the output latent and are precision-sensitive
+        # (see #2728).
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.norm_out.linear = ReplicatedLinear(
             self.inner_dim,
             2 * self.inner_dim,
             bias=True,
             return_bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix="norm_out.linear",
         )
         self.proj_out = ReplicatedLinear(
@@ -999,7 +1059,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             patch_size * patch_size * self.out_channels,
             bias=True,
             return_bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix="proj_out",
         )
 
@@ -1093,24 +1153,44 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Check for SP auto_pad: create attention mask dynamically if padding was applied
         # In Ulysses mode, attention is computed on the FULL sequence (after All-to-All)
         hidden_states_mask = None  # default
-        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
-            ctx = get_forward_context()
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                # Create mask for the full (padded) sequence
-                # valid positions = True, padding positions = False
-                batch_size = hidden_states.shape[0]
-                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                hidden_states_mask = torch.ones(
-                    batch_size,
-                    padded_seq_len,
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
-                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+        ctx = get_forward_context()
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            # Create mask for the full (padded) sequence
+            # valid positions = True, padding positions = False
+            batch_size = hidden_states.shape[0]
+            padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+            hidden_states_mask = torch.ones(
+                batch_size,
+                padded_seq_len,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+            if hidden_states_mask.all():
+                hidden_states_mask = None
+        elif (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                self.parallel_config.sequence_parallel_size,
+            )
 
-        # if mask is all true, set it to None
-        if hidden_states_mask is not None and hidden_states_mask.all():
-            hidden_states_mask = None
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 
@@ -1161,22 +1241,26 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            original_name = name
-            lookup_name = name
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name or param_name in original_name:
-                    continue
-                lookup_name = original_name.replace(weight_name, param_name)
-                param = params_dict[lookup_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if lookup_name not in params_dict and ".to_out.0." in lookup_name:
-                    lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
-                param = params_dict[lookup_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            original_name = name.removeprefix("transformer.")
+            lookup_name, shard_id = _resolve_qwen_image_lookup_name(
+                original_name,
+                stacked_params_mapping,
+            )
+
+            if lookup_name.endswith(".bias") and lookup_name not in params_dict:
+                continue
+
+            param = params_dict.get(lookup_name)
+            if param is None:
+                logger.debug("Skipping unexpected Qwen-Image transformer weight %s", original_name)
+                continue
+
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if shard_id is None:
                 weight_loader(param, loaded_weight)
+            else:
+                weight_loader(param, loaded_weight, shard_id)
+
             loaded_params.add(original_name)
             loaded_params.add(lookup_name)
         return loaded_params

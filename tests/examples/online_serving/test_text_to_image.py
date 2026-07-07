@@ -13,11 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import OmniServer, OmniServerParams, assert_image_valid
-from tests.examples.conftest import EXAMPLES, OUTPUT_DIR, run_cmd, write_zimage_lora
-from tests.utils import hardware_marks
+from tests.examples.helpers import EXAMPLES, OUTPUT_DIR, run_cmd, write_zimage_lora
+from tests.helpers.assertions import assert_image_valid
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.example, *hardware_marks(res={"cuda": "H100"})]
+pytestmark = [pytest.mark.full_model, pytest.mark.example, *hardware_marks(res={"cuda": "H100"})]
 
 T2I_ONLINE_CLIENT = EXAMPLES / "online_serving" / "text_to_image" / "openai_chat_client.py"
 EXAMPLE_OUTPUT_SUBFOLDER = "example_online_t2i"
@@ -132,5 +133,5 @@ def test_lora_001(omni_server: OmniServer, example_output_dir: Path, tmp_path: P
 # --- ### Using curl with LoRA (Images API) ---
 
 
-@pytest.mark.skip(reason="Covered by tests/e2e/online_serving/test_images_generations_lora.py")
+@pytest.mark.skip(reason="Covered by tests/diffusion/lora/test_images_generations_lora.py")
 def test_lora_002(): ...

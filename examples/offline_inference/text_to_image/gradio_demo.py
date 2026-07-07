@@ -1,7 +1,10 @@
 import argparse
 from functools import lru_cache
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    raise ImportError("gradio is required to run this demo. Install it with: pip install 'vllm-omni[demo]'") from None
 import torch
 
 from vllm_omni.entrypoints.omni import Omni

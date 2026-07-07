@@ -1,4 +1,5 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from functools import cached_property
 from pathlib import Path
 
@@ -126,18 +127,27 @@ class VoxtralTTSForConditionalGeneration(
             tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
             self._audio_token_id = tokenizer.instruct.audio_encoder.special_ids.audio
             speaker_id = config.audio_config.get("speaker_id", None)
-            if speaker_id and self.is_hf_model:
-                self.voice_to_embedding = {
-                    sid: torch.load(hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt"))
-                    for sid in speaker_id
-                }
+            if speaker_id:
+                self.voice_to_embedding = {}
+                for sid in speaker_id:
+                    if self.is_hf_model:
+                        path = hf_hub_download(repo_id=self.repo_id, filename=f"voice_embedding/{sid}.pt")
+                    else:
+                        path = Path(self.repo_id) / "voice_embedding" / f"{sid}.pt"
+                    if Path(path).exists():
+                        self.voice_to_embedding[sid] = torch.load(path, map_location="cpu")
+                    else:
+                        logger.warning("Voice embedding not found: %s", path)
                 logger.info("Available voice embeddings: %s", list(self.voice_to_embedding.keys()))
             else:
                 self.voice_to_embedding = {}
-                logger.warning("No speaker_id configured in audio_config.No voice embeddings will be available.")
+                logger.warning("No speaker_id configured in audio_config. No voice embeddings will be available.")
         elif self.model_stage == "audio_tokenizer":
             self.requires_raw_input_tokens = True
             self.audio_generation = None
+            if vllm_config.quant_config is not None:
+                vllm_config = replace(vllm_config, quant_config=None)
+                logger.info("Voxtral TTS FP8 routing: stage-1 audio_tokenizer=bf16")
             self.audio_tokenizer = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 hf_config=config,
@@ -149,6 +159,13 @@ class VoxtralTTSForConditionalGeneration(
             raise ValueError("Invalid model stage")
 
     # -------------------- CUDA Graph for acoustic transformer --------------------
+
+    def get_language_model(self) -> "nn.Module":
+        """Return the language model for upstream MoE detection."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def _enable_acoustic_transformer_cudagraph(self):
         """Initialize and capture CUDA graphs for compute_mm_logits."""
         if self.model_stage != "audio_generation" or not hasattr(self, "_vllm_config"):
@@ -180,6 +197,16 @@ class VoxtralTTSForConditionalGeneration(
             return self.model.sampler
         return Sampler()
 
+    @staticmethod
+    def _is_prefill_step(info_dict: Mapping[str, object], input_ids: torch.Tensor) -> bool:
+        is_prefill_raw = info_dict.get("_omni_is_prefill")
+        if isinstance(is_prefill_raw, bool):
+            return is_prefill_raw
+        try:
+            return int(info_dict["_omni_num_computed_tokens"]) < int(info_dict["_omni_prompt_len"])
+        except (KeyError, TypeError, ValueError):
+            return input_ids.shape[0] > 1
+
     def tts_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict | None):
         self.post_process_idx = 0
         audio_tokens = info_dict.pop("audio", None)
@@ -189,8 +216,9 @@ class VoxtralTTSForConditionalGeneration(
             if input_ids[0] == self._audio_token_id:
                 input_embeds = multimodal_embeddings[0]
             return input_ids, input_embeds, info_dict
-        voice = info_dict.pop("voice", None)
-        if voice is not None:
+        voice = info_dict.get("voice")
+        if voice is not None and self._is_prefill_step(info_dict, input_ids):
+            voice = info_dict.pop("voice")
             if isinstance(voice, list):
                 voice = voice[0]
             multimodal_embeddings = self.voice_to_embedding[voice].to(input_ids.device).clone().detach()
@@ -203,12 +231,15 @@ class VoxtralTTSForConditionalGeneration(
 
     def tts_postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None):
         update_dict = {}
-        if isinstance(multimodal_outputs, dict) and "audio" in multimodal_outputs:
-            assert self.post_process_idx < len(multimodal_outputs["audio"]), (
-                f"Expect {self.post_process_idx=} < {len(multimodal_outputs['audio'])=}"
-            )
-            update_dict["audio"] = multimodal_outputs["audio"][self.post_process_idx]
-            self.post_process_idx += 1
+        if isinstance(multimodal_outputs, Mapping):
+            codes = multimodal_outputs.get("codes")
+            if isinstance(codes, Mapping) and "audio" in codes:
+                audio_frames = codes["audio"]
+                assert self.post_process_idx < len(audio_frames), (
+                    f"Expect {self.post_process_idx=} < {len(audio_frames)=}"
+                )
+                update_dict["codes"] = {"audio": audio_frames[self.post_process_idx]}
+                self.post_process_idx += 1
         return update_dict
 
     def embed_input_ids(
@@ -226,9 +257,6 @@ class VoxtralTTSForConditionalGeneration(
     def embed_multimodal(self, **kwargs):
         # Delegate to generation model for multimodal processing
         return self.model.embed_multimodal(**kwargs)
-
-    def last_index_of(self, list, value):
-        return len(list) - 1 - list[::-1].index(value)
 
     def forward(
         self,
@@ -277,6 +305,30 @@ class VoxtralTTSForConditionalGeneration(
                 multimodal_outputs={"audio": batch_audio_arrays},
             )
 
+    _DEFAULT_CFG_ALPHA = 1.2
+
+    def _extract_cfg_alpha(self, input_hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Extract per-request cfg_alpha from sampling_extra_args.
+
+        Returns a 1-D tensor of shape (B,) with per-request cfg_alpha values.
+        Falls back to default if sampling_extra_args is missing or incomplete.
+        """
+        B = input_hidden_states.shape[0]
+        sampling_extra_args = kwargs.get("sampling_extra_args")
+        if sampling_extra_args is None:
+            return torch.full(
+                (B,),
+                self._DEFAULT_CFG_ALPHA,
+                device=input_hidden_states.device,
+                dtype=input_hidden_states.dtype,
+            )
+        cfg_alpha_values = [ea.get("cfg_alpha", self._DEFAULT_CFG_ALPHA) for ea in sampling_extra_args]
+        return torch.tensor(
+            cfg_alpha_values,
+            device=input_hidden_states.device,
+            dtype=input_hidden_states.dtype,
+        )
+
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput | tuple, logits_index: int | None = None, **kwargs
     ) -> OmniOutput:
@@ -285,10 +337,15 @@ class VoxtralTTSForConditionalGeneration(
                 hidden_states = model_outputs
                 assert logits_index is not None
                 input_hidden_states = hidden_states[logits_index]
+                cfg_alpha = self._extract_cfg_alpha(input_hidden_states, **kwargs)
                 if self._cudagraph_acoustic_transformer is not None:
-                    fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(input_hidden_states)
+                    fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
+                        input_hidden_states, cfg_alpha=cfg_alpha
+                    )
                 else:
-                    fake_eos, multimodal_outputs = self.model.compute_mm_logits(input_hidden_states)
+                    fake_eos, multimodal_outputs = self.model.compute_mm_logits(
+                        input_hidden_states, cfg_alpha=cfg_alpha
+                    )
                 hidden_states[logits_index, 0] = fake_eos
                 return OmniOutput(
                     text_hidden_states=hidden_states,
