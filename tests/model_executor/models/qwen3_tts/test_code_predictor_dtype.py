@@ -339,6 +339,91 @@ class TestCodePredictorDtypeAlignment:
         assert not torch.equal(first[:, 1:], different[:, 1:])
 
 
+class TestCodePredictorPerRowGenerators:
+    """Seeded requests must stay deterministic inside a multi-row batch (#4883)."""
+
+    def _make_predictor(self, mocker: MockerFixture, loaded_target_classes):
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=4)
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+        predictor._wrapper_config.use_cuda_graphs = False
+        return predictor, talker_config
+
+    def test_multinomial_per_row_matches_single_row_draws(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        multinomial = common_mod.CodePredictorWrapper._multinomial
+        torch.manual_seed(7)
+        probs = torch.softmax(torch.randn(3, 64), dim=-1)
+
+        def seeded(seed: int) -> torch.Generator:
+            generator = torch.Generator(device=probs.device)
+            generator.manual_seed(seed)
+            return generator
+
+        batched = multinomial(probs, None, [seeded(11), None, seeded(22)])
+        assert batched.shape == (3, 1)
+        # Each seeded row must reproduce a standalone draw from the same seed,
+        # independent of what the other rows in the batch consume.
+        assert torch.equal(batched[0:1], torch.multinomial(probs[0:1], num_samples=1, generator=seeded(11)))
+        assert torch.equal(batched[2:3], torch.multinomial(probs[2:3], num_samples=1, generator=seeded(22)))
+
+    def test_forward_per_row_generators_are_row_independent(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        predictor, talker_config = self._make_predictor(mocker, loaded_target_classes)
+        hidden = talker_config.hidden_size
+        torch.manual_seed(123)
+        row_embed = torch.randn(1, hidden)
+        row_hidden = torch.randn(1, hidden)
+        # Three identical rows: two share a seed, one differs.
+        layer0_code = torch.zeros(3, dtype=torch.long)
+        layer0_embed = row_embed.expand(3, hidden).contiguous()
+        last_talker_hidden = row_hidden.expand(3, hidden).contiguous()
+
+        def seeded(seed: int) -> torch.Generator:
+            generator = torch.Generator(device=layer0_code.device)
+            generator.manual_seed(seed)
+            return generator
+
+        def run(generators):
+            return predictor(
+                layer0_code=layer0_code,
+                layer0_embed=layer0_embed,
+                last_talker_hidden=last_talker_hidden,
+                do_sample=True,
+                temperature=0.9,
+                top_k=50,
+                top_p=1.0,
+                generators=generators,
+            )
+
+        first = run([seeded(1234), seeded(1234), seeded(4321)])
+        second = run([seeded(1234), seeded(1234), seeded(4321)])
+
+        # Same per-row seeds -> the whole batch reproduces across calls.
+        assert torch.equal(first, second)
+        # Identical inputs + identical seeds -> identical rows within a call.
+        assert torch.equal(first[0], first[1])
+        # A different seed on the same inputs must diverge in the residual layers.
+        assert not torch.equal(first[0, 1:], first[2, 1:])
+
+    def test_forward_rejects_mismatched_generators_length(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        predictor, talker_config = self._make_predictor(mocker, loaded_target_classes)
+        hidden = talker_config.hidden_size
+        with pytest.raises(ValueError, match="one entry per row"):
+            predictor(
+                layer0_code=torch.zeros(2, dtype=torch.long),
+                layer0_embed=torch.randn(2, hidden),
+                last_talker_hidden=torch.randn(2, hidden),
+                generators=[torch.Generator()],
+            )
+
+
 class TestCodePredictorModelDtype:
     """Test the inner model forward with different dtypes."""
 

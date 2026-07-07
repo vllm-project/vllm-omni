@@ -6,9 +6,17 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import gguf
 import numpy as np
 import torch
+
+try:
+    import gguf
+except ImportError:
+    # Optional dependency: only required for GGUF-quantized diffusion models.
+    # Keep this import lazy so a missing ``gguf`` does not break importing the
+    # diffusion model loader (and thus inspection/loading of every other
+    # diffusion model that imports through this package).
+    gguf = None
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -65,6 +73,11 @@ def gguf_quant_weights_iterator(gguf_file: str) -> Generator[tuple[str, torch.Te
     layer with different quant types.
     """
 
+    if gguf is None:
+        raise ImportError(
+            "The 'gguf' package is required to load GGUF-quantized diffusion models. "
+            "Install it with `pip install gguf`."
+        )
     reader = gguf.GGUFReader(gguf_file)
 
     for tensor in reader.tensors:

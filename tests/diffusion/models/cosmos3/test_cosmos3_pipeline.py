@@ -916,6 +916,49 @@ def test_prepare_latents_i2v_encodes_only_conditioning_frame(make_cosmos3_pipeli
     assert velocity_mask.tolist() == [[[[[0.0]], [[1.0]], [[1.0]]]]]
 
 
+@pytest.mark.parametrize("mode", ["policy", "forward_dynamics"])
+def test_prepare_action_video_latents_encodes_only_conditioning_frame(make_cosmos3_pipeline, mode: str) -> None:
+    pipeline = make_cosmos3_pipeline()
+    video = torch.zeros(1, 3, 9, 24, 32)
+
+    latents, velocity_mask, condition_latents = pipeline._prepare_latents_action_video(
+        video,
+        mode,
+        24,
+        32,
+        9,
+        torch.Generator(device="cpu").manual_seed(0),
+        image_size=torch.tensor([1, 3, 16, 24]),
+    )
+
+    assert pipeline.vae.encode_input_shapes == [(1, 3, 1, 24, 32)]
+    assert latents.shape == (1, 2, 3, 2, 3)
+    assert condition_latents.shape == latents.shape
+    torch.testing.assert_close(condition_latents[:, :, 0], torch.ones(1, 2, 2, 3))
+    assert torch.count_nonzero(condition_latents[:, :, 1:]) == 0
+    torch.testing.assert_close(latents[:, :, 0:1], condition_latents[:, :, 0:1])
+    assert velocity_mask.tolist() == [[[[[0.0]], [[1.0]], [[1.0]]]]]
+
+
+def test_prepare_inverse_dynamics_latents_encodes_full_video(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    video = torch.zeros(1, 3, 9, 16, 24)
+
+    latents, velocity_mask, condition_latents = pipeline._prepare_latents_action_video(
+        video,
+        "inverse_dynamics",
+        16,
+        24,
+        9,
+        torch.Generator(device="cpu").manual_seed(0),
+    )
+
+    assert pipeline.vae.encode_input_shapes == [(1, 3, 9, 16, 24)]
+    assert condition_latents.shape == (1, 2, 3, 2, 3)
+    torch.testing.assert_close(latents, condition_latents)
+    assert torch.count_nonzero(velocity_mask) == 0
+
+
 def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
@@ -1422,7 +1465,7 @@ class TestForwardRouting:
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
         sound_latents = torch.zeros(1, 3, 4)
         pipeline._resolve_sound_target_samples = lambda *args: (20, 2.0, 10)
-        pipeline._prepare_sound_latents = lambda *args: (sound_latents, 4)
+        pipeline._prepare_sound_latents = lambda *args, **kwargs: (sound_latents, 4)
         pipeline._decode_sound_latents = lambda *args: torch.ones(1, 2, 20)
         output = pipeline.forward(
             make_request_batch(

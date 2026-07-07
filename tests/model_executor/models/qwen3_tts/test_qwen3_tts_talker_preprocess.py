@@ -34,6 +34,7 @@ def _make_minimal_talker(
     """
     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16)
+    model._embedding_dtype = torch.bfloat16
     if tts_pad_embed is None:
         tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
     model._tts_pad_embed = tts_pad_embed
@@ -41,6 +42,7 @@ def _make_minimal_talker(
     def _default_raise(**_kwargs):
         raise AssertionError("build_prompt_embeds was not stubbed in this test")
 
+    model._embedding_dtype = torch.bfloat16
     model._prompt_builder = SimpleNamespace(
         build_prompt_embeds=build_prompt_embeds if build_prompt_embeds is not None else _default_raise,
     )
@@ -81,6 +83,7 @@ def _make_minimal_builder(
     builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
     builder._residual_code_embeddings = lambda: []
     builder._speaker_encoder = None
+    builder._embedding_dtype = torch.bfloat16
     builder._tts_pad_embed_buffer = (
         tts_pad_embed if tts_pad_embed is not None else torch.zeros((1, 4), dtype=torch.bfloat16)
     )
@@ -89,6 +92,7 @@ def _make_minimal_builder(
     )
     builder._speaker_cache = None
     builder._text_tokenizer = None
+    builder._embedding_dtype = torch.bfloat16
     builder._ref_audio_artifact_cache_max_entries = 256
     builder._ref_audio_artifact_cache = OrderedDict()
     builder._resampler_cache = OrderedDict()
@@ -250,6 +254,36 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
     assert torch.equal(update["mtp_inputs"][1].cpu(), trailing_text[64:65].to(torch.bfloat16))
     assert update["meta"]["talker_text_offset"] == 0
     assert torch.equal(update["hidden_states"]["trailing_text"], trailing_text[65:])
+
+
+def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
+    model = _make_minimal_talker()
+
+    def fake_embed_input_ids(input_ids):
+        return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+
+    model.embed_input_ids = fake_embed_input_ids
+    trailing_text = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    last_hidden = torch.full((4,), 2.0, dtype=torch.float32)
+
+    out_ids, out_embeds, update = model.preprocess(
+        input_ids=torch.tensor([101, 202, 303], dtype=torch.long),
+        input_embeds=None,
+        text=["hello"],
+        task_type=["Base"],
+        hidden_states={"trailing_text": trailing_text, "last": last_hidden},
+        meta={"talker_text_offset": 1, "codec_streaming": True},
+        _omni_is_prefill=False,
+        _omni_num_computed_tokens=2400,
+        _omni_prompt_len=213,
+    )
+
+    assert out_ids.tolist() == [101, 202, 303]
+    assert torch.equal(
+        out_embeds.cpu(),
+        torch.tensor([[101.0] * 4, [202.0] * 4, [303.0] * 4], dtype=torch.bfloat16),
+    )
+    assert update == {"meta": {"codec_streaming": True}}
 
 
 def test_decode_batch_preprocess_matches_decode_state_updates():

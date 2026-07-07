@@ -72,6 +72,10 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                # whisper-small mishears this short clip ~0.5% of the time; on a
+                # failed match re-verify with this stronger ASR before failing so
+                # the gate is not flaky. Local-only key (not forwarded to server).
+                "transcript_escalation_model": "large-v3",
             }
         )
 
@@ -123,7 +127,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
 
-        NOTE: ``min_hnr_db=0.0`` sits below the typical speech-noise floor so the
+        NOTE: ``min_hnr_db=0.0`` sit below the typical speech-noise floor so the
         check still catches catastrophic codec failure (silence, white noise, sample
         scramble all give HNR << 0) while allowing for the sliding-window codec's
         slightly-noisier-than-sync output. The default 1.0 dB threshold has only

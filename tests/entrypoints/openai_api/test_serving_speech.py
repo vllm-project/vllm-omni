@@ -39,6 +39,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _create_wav_header,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -2530,7 +2531,7 @@ def test_api_server_delete_voice_exception_returns_500(mocker: MockerFixture):
 def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixture):
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/speech")
-    raw_request.app.state.openai_serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = fake_base
     request = OpenAICreateSpeechRequest(input="Hello")
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
@@ -2543,7 +2544,7 @@ def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixt
 def test_api_server_create_speech_batch_without_handler_returns_404(mocker: MockerFixture):
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/speech/batch")
-    raw_request.app.state.openai_serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = fake_base
     request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
 
     response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
@@ -2612,7 +2613,7 @@ def test_api_server_create_audio_generate_without_handler_returns_404(mocker: Mo
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/generate")
     raw_request.app.state.openai_serving_audio_generate = None
-    raw_request.app.state.openai_serving_tokenization = fake_base
+    raw_request.app.state.serving_tokenization = fake_base
     request = OpenAICreateAudioGenerateRequest(input="a bird singing")
 
     response = asyncio.run(api_server_module.create_audio_generate(request, raw_request))
@@ -3343,6 +3344,61 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
 
+    def test_prepare_speech_generation_qwen3_default_seed_sets_tts_local_seed(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """Deploy default seed should seed Qwen3 TTS residual MTP sampling."""
+        qwen3_tts_server.engine_client.default_sampling_params_list = [
+            SimpleNamespace(max_tokens=2048, seed=42, extra_args=None)
+        ]
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        request = OpenAICreateSpeechRequest(input="hello")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        stage0_params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert qwen3_tts_server.engine_client.default_sampling_params_list[0].extra_args is None
+
+    def test_prepare_speech_generation_uses_adapter_model_type_label(
+        self,
+        voxtral_server,
+        mocker: MockerFixture,
+    ):
+        """Adapter model_type should replace the legacy _tts_model_type label ladder."""
+        legacy_tts_model_type = "dummy_tts"
+        adapter_model_type = "adapter_dummy_tts"
+
+        class FakeAdapter:
+            def validate(self, request):
+                return None
+
+            async def build(self, request, sampling_params_list, has_inline_ref_audio):
+                return PreparedRequest(
+                    prompt={"prompt": request.input},
+                    tts_params={},
+                    model_type=adapter_model_type,
+                )
+
+        voxtral_server._tts_model_type = legacy_tts_model_type
+        mocker.patch.object(voxtral_server, "_get_tts_adapter", return_value=FakeAdapter())
+        log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
+
+        asyncio.run(voxtral_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
+
+        assert adapter_model_type != legacy_tts_model_type
+        assert any(
+            call.args
+            and call.args[0] == "TTS speech request %s: text=%r, model=%s"
+            and call.args[3] == adapter_model_type
+            for call in log_info.call_args_list
+        )
+
     def test_prepare_speech_generation_treats_sse_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
         """stream_format=sse should request delta-style multimodal outputs."""
         qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
@@ -3393,6 +3449,48 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 
         mock_coerce.assert_called_once_with(qwen3_tts_server.engine_client.default_sampling_params_list, True)
+
+    def test_prepare_speech_generation_no_async_chunk_stream_uses_final_only(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        """Full-payload TTS streaming should not request delta multimodal outputs."""
+        qwen3_tts_server.engine_client.model_config.async_chunk = False
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        mock_coerce = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
+        )
+        request = OpenAICreateSpeechRequest(input="hello", stream_format="audio", response_format="pcm")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        mock_coerce.assert_called_once_with(qwen3_tts_server.engine_client.default_sampling_params_list, False)
+
+    def test_prepare_speech_generation_no_async_chunk_stream_keeps_delta_for_non_qwen3(
+        self, voxtral_server, mocker: MockerFixture
+    ):
+        """FINAL_ONLY streaming for async_chunk=False is scoped to qwen3_tts only."""
+        voxtral_server.engine_client.model_config.async_chunk = False
+        mocker.patch.object(voxtral_server._get_tts_adapter(), "validate", return_value=None)
+        voxtral_server._build_voxtral_prompt_async = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        mock_coerce = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            return_value=voxtral_server.engine_client.default_sampling_params_list,
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", stream_format="audio", response_format="pcm")
+
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+
+        mock_coerce.assert_called_once_with(voxtral_server.engine_client.default_sampling_params_list, True)
 
     def test_prepare_speech_generation_qwen3_voicedesign_non_streaming_mode_false(
         self, qwen3_tts_server, mocker: MockerFixture

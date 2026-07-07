@@ -11,11 +11,14 @@ time-bearing metrics use the ``_s`` suffix (values in seconds), counters use
 ``_total`` (auto-suffixed by the prometheus client), sizes use ``_bytes``.
 """
 
+import logging
+import os
 from typing import Any
 
 # vllm_omni: namespace for omni-specific Prometheus families, distinct from
 # the upstream vllm:* families.
 METRIC_PREFIX = "vllm_omni:"
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -76,10 +79,8 @@ VLLM_TTFTS = "vllm_ttfts"
 VLLM_TPOTS = "vllm_tpots"
 VLLM_ITLS = "vllm_itls"
 AUDIO_TTFPS = "audio_ttfps"
-AUDIO_RTFS = "audio_rtfs"
 AUDIO_DURATIONS = "audio_durations"
 MISSING_AUDIO_DURATION_COUNT = "missing_audio_duration_count"
-MISSING_AUDIO_RTF_COUNT = "missing_audio_rtf_count"
 STAGE_GEN_TIME = "stage_gen_time"
 STAGE_GEN_TIME_MS = f"{STAGE_GEN_TIME}_ms"
 STAGE_GEN_TIMES_MS = f"{STAGE_GEN_TIME}s_ms"
@@ -282,6 +283,9 @@ def compute_denoise_step_latency(stage_gen_time: float, num_inference_steps: int
 # ming_flash 16000 — these models populate multimodal_output["audio_sample_rate"]
 # at runtime so this default only kicks in when the field is missing.
 DEFAULT_AUDIO_SAMPLE_RATE = 24000
+DEFAULT_AUDIO_CHANNELS = 1
+AUDIO_SAMPLE_RATE_ENV = "VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE"
+AUDIO_CHANNELS_ENV = "VLLM_OMNI_BENCH_AUDIO_CHANNELS"
 
 _SAMPLE_RATE_KEYS = ("output_sample_rate", "audio_sample_rate", "sample_rate", "sampling_rate", "sr")
 
@@ -308,3 +312,26 @@ def resolve_audio_sample_rate(source: dict[str, Any] | Any | None) -> int:
         if value > 0:
             return value
     return DEFAULT_AUDIO_SAMPLE_RATE
+
+
+def stream_pcm_format_from_env(
+    *,
+    default_sample_rate: int = DEFAULT_AUDIO_SAMPLE_RATE,
+    default_channels: int = DEFAULT_AUDIO_CHANNELS,
+) -> tuple[int, int]:
+    """Return the sample rate and channel count for streamed raw PCM."""
+    sample_rate = default_sample_rate
+    channels = default_channels
+    raw_sr = os.environ.get(AUDIO_SAMPLE_RATE_ENV)
+    if raw_sr:
+        try:
+            sample_rate = int(raw_sr)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %d", AUDIO_SAMPLE_RATE_ENV, raw_sr, sample_rate)
+    raw_ch = os.environ.get(AUDIO_CHANNELS_ENV)
+    if raw_ch:
+        try:
+            channels = int(raw_ch)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %d", AUDIO_CHANNELS_ENV, raw_ch, channels)
+    return max(sample_rate, 1), max(channels, 1)
