@@ -15,9 +15,10 @@ extracts it into a shared, typed contract:
 - `MemoryObject` — one typed unit of session memory (e.g. `LatentBuffer` for
   accumulated latents, `EncodeOnceKV` for write-once conditioning K/V), with a
   uniform lifecycle (`allocate` / `commit` / `view` / `reset` / `nbytes`).
-- `SessionMemoryManager` — maps `session_id -> {name: MemoryObject}`, owns the
-  session LRU (count-based, matching the bespoke caches it replaces), and
-  reports byte usage via `stats()` for observability.
+- `SessionMemoryManager` — maps `session_id -> {name: MemoryObject}`, caps the
+  number of retained sessions by evicting the least recently used one first
+  (matching the bespoke caches it replaces), and reports byte usage via
+  `stats()` for observability.
 
 Attention KV is *not* managed here: for DreamZero it is owned by the
 AR-Diffusion engine's paged KV pool (PR
@@ -47,8 +48,21 @@ export OMNI_DIFFUSION_SESSION_MEMORY_MANAGER_MAX_SESSIONS=64   # optional, posit
 both directions — `OMNI_DIFFUSION_SESSION_MEMORY_MANAGER=0` force-disables the
 manager even if the config enables it. Unset or unparsable values fall back
 to the config (an unparsable `MAX_SESSIONS` logs a warning and is ignored).
-This allows quick A/B comparisons against the bespoke path on a deployed
-config.
+
+**Why both a config field and an environment variable?** The config field is
+the API. The environment override exists for A/B equivalence validation: the
+manager-backed path must be bit-identical to the bespoke path, and the way to
+verify that is to run the *same* deploy config twice with only the flag
+flipped per process — no config-file edits, so the two runs cannot drift
+apart. (Same pattern as the `DIFFUSION_CACHE_BACKEND` fallback.)
+
+**Why is `MAX_SESSIONS` not a config field?** The retained-session cap is not
+a public tuning knob: it mirrors the bespoke `MAX_DREAMZERO_SESSIONS = 64`
+constant (which is not configurable either), so the manager-backed path evicts
+exactly like the path it replaces. The environment variable exists only to
+stress eviction in tests and experiments. It is deliberately not promoted to
+the config, because RFC #4480 Phase 1 replaces count-based capping with a byte
+budget — that budget, not this cap, is the knob that deserves a config field.
 
 ## Scope and guarantees
 
