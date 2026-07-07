@@ -203,23 +203,17 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
 
 
 class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDecoderLayer):
-    """Decoder layer override with fused residual RMSNorm.
-
-    Profiling indicates the residual add followed by RMSNorm as a cluster of small
-    kernels on 310P.  ``npu_add_rms_norm`` matches this pattern directly and
-    reduces graph-captured launch work in each CodePredictor layer.
-    """
+    """Decoder layer override that passes the 310P attention mask."""
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask=attention_mask)
-        # Fuse the residual add and post-attention RMSNorm for 310P.
         hidden_states, _, residual = torch_npu.npu_add_rms_norm(
             hidden_states,
             residual,
@@ -312,6 +306,22 @@ class _Qwen3TTSTalkerCodePredictor310P(
 
         self._static_310p_ready = True
 
+    def _write_projected_codec_embed(
+        self,
+        proj_buf: torch.Tensor,
+        bsz: int,
+        step: int,
+        code: torch.Tensor,
+    ) -> None:
+        if self._projected_codec_embed_weight is not None:
+            proj_buf[:bsz, step + 1, :].copy_(
+                F.embedding(code.reshape(-1), self._projected_codec_embed_weight[step - 1])
+            )
+            return
+
+        new_embed = self._codec_embeds_list[step - 1](code)
+        proj_buf[:bsz, step + 1, :].copy_(self.small_to_mtp_projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1))
+
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
         self._prepare_static_weights_310p()
@@ -392,8 +402,6 @@ class _Qwen3TTSTalkerCodePredictor310P(
         projection = self.small_to_mtp_projection
         model_fwd = self._compiled_model_fwd
         lm_heads = self._lm_heads_list
-        codec_embeds = self._codec_embeds_list
-        projected_codec_embed_weight = self._projected_codec_embed_weight
         if generators is not None:
             npu_generators = {i: row_generator for i, row_generator in enumerate(generators) if row_generator}
         elif generator is not None:
@@ -497,13 +505,7 @@ class _Qwen3TTSTalkerCodePredictor310P(
                 all_codes[:, step] = code.reshape(bsz)
 
             if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
-                if projected_codec_embed_weight is not None:
-                    proj_buf[:bsz, step + 1, :].copy_(
-                        F.embedding(code.reshape(-1), projected_codec_embed_weight[step - 1])
-                    )
-                else:
-                    new_embed = codec_embeds[step - 1](code)
-                    proj_buf[:bsz, step + 1, :].copy_(projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1))
+                self._write_projected_codec_embed(proj_buf, bsz, step, code)
 
         if self._wrapper_config.return_proj_buf:
             return all_codes, proj_buf[:bsz].clone()
