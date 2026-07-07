@@ -21,7 +21,6 @@ from vllm_omni.experimental.world_models.memory.manager import (
 from vllm_omni.experimental.world_models.memory.objects import (
     EncodeOnceKV,
     LatentBuffer,
-    PagedKV,
 )
 
 __all__ = [
@@ -29,7 +28,6 @@ __all__ = [
     "EncodeOnceKV",
     "LatentBuffer",
     "MemoryObject",
-    "PagedKV",
     "SessionMemory",
     "SessionMemoryManager",
     "resolve_session_memory_config",

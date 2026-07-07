@@ -6,6 +6,10 @@ These drive both state objects directly with tiny CPU tensors -- no model, no
 GPU -- and assert the adapter (backed by the SessionMemoryManager) stores and
 returns exactly what the bespoke DreamZeroState does. This gates routing
 DreamZero through the shared session memory manager (RFC #4480).
+
+DreamZero's attention KV is engine-owned (AR-Diffusion paged pool, PR #4534)
+and out of the adapter's scope; the state surface tested here is the model's
+non-KV session state.
 """
 
 from __future__ import annotations
@@ -23,85 +27,9 @@ from vllm_omni.experimental.world_models.memory import SessionMemoryManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-BATCH, LAYERS, HEADS, HEAD_DIM = 1, 2, 2, 4
-DTYPE, DEVICE = torch.float32, torch.device("cpu")
-
-
-def _adapter() -> DreamZeroStateAdapter:
-    return DreamZeroStateAdapter("session-0", SessionMemoryManager())
-
 
 def _create_both() -> tuple[DreamZeroState, DreamZeroStateAdapter]:
-    bespoke = DreamZeroState()
-    adapter = _adapter()
-    for state in (bespoke, adapter):
-        state.create_kv_caches(BATCH, DTYPE, DEVICE, LAYERS, HEADS, HEAD_DIM)
-    return bespoke, adapter
-
-
-def _assert_kv_equal(bespoke: DreamZeroState, adapter: DreamZeroStateAdapter, is_negative: bool) -> None:
-    expected = bespoke.get_kv_caches(is_negative)
-    actual = adapter.get_kv_caches(is_negative)
-    assert len(expected) == len(actual) == LAYERS
-    for exp, act in zip(expected, actual):
-        torch.testing.assert_close(exp, act)
-
-
-def test_create_kv_caches_shapes_match() -> None:
-    bespoke, adapter = _create_both()
-    for is_negative in (False, True):
-        for tensor in adapter.get_kv_caches(is_negative):
-            assert tensor.shape == (2, BATCH, 0, HEADS, HEAD_DIM)
-        _assert_kv_equal(bespoke, adapter, is_negative)
-
-
-def test_update_kv_cache_equivalent_pos_and_neg() -> None:
-    bespoke, adapter = _create_both()
-    for seq in (3, 7):
-        for is_negative in (False, True):
-            for layer in range(LAYERS):
-                kv = torch.randn(2, BATCH, seq, HEADS, HEAD_DIM)
-                # Same tensor object into both paths.
-                bespoke.update_kv_cache(layer, kv, is_negative=is_negative)
-                adapter.update_kv_cache(layer, kv, is_negative=is_negative)
-            _assert_kv_equal(bespoke, adapter, is_negative)
-
-
-def test_update_kv_cache_clones_source() -> None:
-    # Both paths must clone on store so a later mutation of the source tensor
-    # does not corrupt the cache.
-    bespoke, adapter = _create_both()
-    kv = torch.randn(2, BATCH, 5, HEADS, HEAD_DIM)
-    bespoke.update_kv_cache(0, kv, is_negative=False)
-    adapter.update_kv_cache(0, kv, is_negative=False)
-    kv.add_(1.0)  # mutate source in place
-    torch.testing.assert_close(bespoke.get_kv_caches(False)[0], adapter.get_kv_caches(False)[0])
-    # And neither should equal the mutated source.
-    assert not torch.allclose(adapter.get_kv_caches(False)[0], kv)
-
-
-def test_crossattn_caches_equivalent() -> None:
-    bespoke, adapter = _create_both()
-    for is_negative in (False, True):
-        b_caches = bespoke.get_crossattn_caches(is_negative)
-        a_caches = adapter.get_crossattn_caches(is_negative)
-        assert len(b_caches) == len(a_caches) == LAYERS
-        for layer in range(LAYERS):
-            assert b_caches[layer]["is_init"] is False
-            assert a_caches[layer]["is_init"] is False
-            # Populate in place (as the model does on first forward).
-            k, v = torch.randn(2, 3), torch.randn(2, 3)
-            for caches in (b_caches, a_caches):
-                caches[layer]["is_init"] = True
-                caches[layer]["k"] = k
-                caches[layer]["v"] = v
-        # Re-fetch and confirm the mutation persisted identically.
-        for layer in range(LAYERS):
-            a_again = adapter.get_crossattn_caches(is_negative)[layer]
-            b_again = bespoke.get_crossattn_caches(is_negative)[layer]
-            assert a_again["is_init"] == b_again["is_init"] is True
-            torch.testing.assert_close(a_again["k"], b_again["k"])
-            torch.testing.assert_close(a_again["v"], b_again["v"])
+    return DreamZeroState(), DreamZeroStateAdapter("session-0", SessionMemoryManager())
 
 
 def test_accumulate_frames_and_call_count_match() -> None:
@@ -125,6 +53,58 @@ def test_accumulate_frames_4d_extend_matches() -> None:
     assert len(bespoke.stitched_buffer) == len(adapter.stitched_buffer)
 
 
+def test_video_latents_roundtrip_matches() -> None:
+    bespoke, adapter = _create_both()
+    assert bespoke.get_concatenated_video_latents() is None
+    assert adapter.get_concatenated_video_latents() is None
+
+    rng = torch.Generator().manual_seed(0)
+    for _ in range(3):
+        # (B, T, C, H, W) as returned by the denoise loop.
+        chunk = torch.randn(1, 2, 3, 4, 4, generator=rng)
+        bespoke.append_video_latents(chunk)
+        adapter.append_video_latents(chunk)
+        torch.testing.assert_close(
+            bespoke.get_concatenated_video_latents(),
+            adapter.get_concatenated_video_latents(),
+        )
+
+    bespoke.clear_video_latents()
+    adapter.clear_video_latents()
+    assert bespoke.get_concatenated_video_latents() is None
+    assert adapter.get_concatenated_video_latents() is None
+
+
+def test_vae_stream_fields_match_bespoke() -> None:
+    bespoke, adapter = _create_both()
+    for state in (bespoke, adapter):
+        assert state.vae_stream_initialized is False
+        assert state.vae_enc_feat_map is None
+        assert state.vae_encoder_out is None
+        assert state.vae_pending_body_frames is None
+
+    feat_map: list[torch.Tensor | None] = [torch.ones(1, 2), None]
+    encoder_out = torch.randn(1, 4, 2, 3, 3)
+    pending = torch.randn(1, 3, 2, 8, 8)
+    for state in (bespoke, adapter):
+        state.vae_enc_feat_map = feat_map
+        state.vae_encoder_out = encoder_out
+        state.vae_pending_body_frames = pending
+        state.vae_stream_initialized = True
+
+    assert adapter.vae_stream_initialized is bespoke.vae_stream_initialized is True
+    torch.testing.assert_close(adapter.vae_encoder_out, bespoke.vae_encoder_out)
+    torch.testing.assert_close(adapter.vae_pending_body_frames, bespoke.vae_pending_body_frames)
+    assert adapter.vae_enc_feat_map is feat_map
+
+    for state in (bespoke, adapter):
+        state.reset_vae_encoder_stream()
+        assert state.vae_stream_initialized is False
+        assert state.vae_enc_feat_map is None
+        assert state.vae_encoder_out is None
+        assert state.vae_pending_body_frames is None
+
+
 def test_reset_clears_state_and_should_reset_matches() -> None:
     bespoke, adapter = _create_both()
     tokens = torch.tensor([1, 2, 3])
@@ -139,15 +119,56 @@ def test_reset_clears_state_and_should_reset_matches() -> None:
     # language change -> reset.
     other = torch.tensor([9, 9])
     assert bespoke.should_reset(other, 4, -1) == adapter.should_reset(other, 4, -1) is True
-    # local_attn_size exceeded -> reset.
-    assert bespoke.should_reset(tokens, 4, 1) == adapter.should_reset(tokens, 4, 1) is True
+    # local_attn_size exceeded -> reset ("inference", not "session").
+    assert bespoke.reset_reason(tokens, 4, 1) == adapter.reset_reason(tokens, 4, 1) == "inference"
 
-    adapter.reset()
-    assert adapter.language is None
-    assert adapter.current_start_frame == 0
-    assert adapter.call_count == 0
-    with pytest.raises(RuntimeError):
-        adapter.get_kv_caches(False)
+    # A session reset clears everything, including the prompt-embed cache and
+    # the VAE encoder stream (mirrors DreamZeroState.reset()).
+    for state in (bespoke, adapter):
+        state.prompt_embeds = torch.ones(1, 2)
+        state.vae_encoder_out = torch.ones(1, 4, 1, 2, 2)
+        state.vae_stream_initialized = True
+        state.reset()
+        assert state.language is None
+        assert state.prompt_embeds is None
+        assert state.current_start_frame == 0
+        assert state.call_count == 0
+        assert state.vae_stream_initialized is False
+        assert state.vae_encoder_out is None
+
+
+def test_window_reset_preserves_latents_prompt_and_vae_stream() -> None:
+    # reset(clear_video_latents=False) is the window ("inference") reset: the
+    # prompt is unchanged and the VAE feat_cache history is independent of the
+    # DiT attention window, so both survive alongside the video latents.
+    bespoke, adapter = _create_both()
+    tokens = torch.tensor([1, 2, 3])
+    embeds = torch.randn(1, 4)
+    encoder_out = torch.randn(1, 4, 2, 3, 3)
+    chunk = torch.randn(1, 2, 3, 4, 4)
+    for state in (bespoke, adapter):
+        state.language = tokens
+        state.prompt_embeds = embeds
+        state.vae_encoder_out = encoder_out
+        state.vae_stream_initialized = True
+        state.current_start_frame = 7
+        state.append_video_latents(chunk)
+
+        state.reset_inference_state()
+
+        assert state.current_start_frame == 0
+        assert state.call_count == 0
+        assert state.clip_feas is None
+        torch.testing.assert_close(state.language, tokens)
+        torch.testing.assert_close(state.prompt_embeds, embeds)
+        assert state.vae_stream_initialized is True
+        torch.testing.assert_close(state.vae_encoder_out, encoder_out)
+        assert state.get_concatenated_video_latents() is not None
+
+    torch.testing.assert_close(
+        bespoke.get_concatenated_video_latents(),
+        adapter.get_concatenated_video_latents(),
+    )
 
 
 def test_metadata_fields_persist_across_adapter_instances() -> None:
@@ -155,15 +176,15 @@ def test_metadata_fields_persist_across_adapter_instances() -> None:
     # is the single source of truth).
     manager = SessionMemoryManager()
     first = DreamZeroStateAdapter("s", manager)
-    first.create_kv_caches(BATCH, DTYPE, DEVICE, LAYERS, HEADS, HEAD_DIM)
     first.current_start_frame = 5
     first.clip_feas = torch.ones(2, 2)
+    first.append_video_latents(torch.ones(1, 2, 3, 4, 4))
 
     second = DreamZeroStateAdapter("s", manager)
     assert second.current_start_frame == 5
     torch.testing.assert_close(second.clip_feas, torch.ones(2, 2))
-    # KV created via `first` is visible via `second`.
-    assert len(second.get_kv_caches(False)) == LAYERS
+    # Video latents appended via `first` are visible via `second`.
+    assert second.get_concatenated_video_latents() is not None
 
 
 def test_session_lru_caps_retained_sessions() -> None:
@@ -178,29 +199,15 @@ def test_session_lru_caps_retained_sessions() -> None:
         assert f"s{i}" in manager
 
 
-def test_cfg_branches_isolated() -> None:
-    _, adapter = _create_both()
-    pos = torch.randn(2, BATCH, 4, HEADS, HEAD_DIM)
-    neg = torch.randn(2, BATCH, 4, HEADS, HEAD_DIM)
-    for layer in range(LAYERS):
-        adapter.update_kv_cache(layer, pos, is_negative=False)
-        adapter.update_kv_cache(layer, neg, is_negative=True)
-    for layer in range(LAYERS):
-        torch.testing.assert_close(adapter.get_kv_caches(False)[layer], pos)
-        torch.testing.assert_close(adapter.get_kv_caches(True)[layer], neg)
-        assert not torch.allclose(pos, neg)
-
-
 def test_adapter_keeps_state_when_its_session_is_evicted() -> None:
     # Regression: an adapter mid-generation must not lose its data when the
     # manager evicts its session to make room for newer ones. The adapter pins
-    # the session, so its stored KV survives eviction from the lookup table.
+    # the session, so its stored latents survive eviction from the lookup table.
     manager = SessionMemoryManager(max_sessions=2)
     adapter = DreamZeroStateAdapter("active", manager)
-    adapter.create_kv_caches(BATCH, DTYPE, DEVICE, LAYERS, HEADS, HEAD_DIM)
-    kv = torch.randn(2, BATCH, 4, HEADS, HEAD_DIM)
-    for layer in range(LAYERS):
-        adapter.update_kv_cache(layer, kv, is_negative=False)
+    chunk = torch.randn(1, 2, 3, 4, 4)
+    adapter.append_video_latents(chunk)
+    adapter.language = torch.tensor([1, 2, 3])
 
     # Push "active" out of the manager's table with newer sessions.
     for i in range(3):
@@ -208,8 +215,8 @@ def test_adapter_keeps_state_when_its_session_is_evicted() -> None:
     assert "active" not in manager
 
     # The in-use adapter still returns its own data.
-    for layer in range(LAYERS):
-        torch.testing.assert_close(adapter.get_kv_caches(False)[layer], kv)
+    assert adapter.get_concatenated_video_latents() is not None
+    torch.testing.assert_close(adapter.language, torch.tensor([1, 2, 3]))
 
 
 def test_session_reset_clears_metadata() -> None:
@@ -217,10 +224,10 @@ def test_session_reset_clears_metadata() -> None:
     # fresh adapter for the same session sees defaults, not the old values.
     manager = SessionMemoryManager()
     adapter = DreamZeroStateAdapter("s", manager)
-    adapter.create_kv_caches(BATCH, DTYPE, DEVICE, LAYERS, HEADS, HEAD_DIM)
     adapter.language = torch.tensor([1, 2, 3])
     adapter.current_start_frame = 5
     adapter.clip_feas = torch.ones(2, 2)
+    adapter.prompt_embeds = torch.ones(1, 2)
 
     adapter.reset()
 
@@ -228,6 +235,7 @@ def test_session_reset_clears_metadata() -> None:
     assert fresh.language is None
     assert fresh.current_start_frame == 0
     assert fresh.clip_feas is None
+    assert fresh.prompt_embeds is None
 
 
 def test_bespoke_path_without_memory_manager() -> None:

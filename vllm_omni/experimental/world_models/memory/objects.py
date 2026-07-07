@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Concrete memory objects (RFC #4480).
 
-All three classes back their storage with plain (monolithic) buffers. The RFC
-names ``PagedKV`` for paged block-table backing; here it is a single contiguous
-tensor and the paged backing is not yet implemented. ``FixedState`` and
-``RetrievalStore`` from the RFC are not implemented here (DreamZero needs
-neither), but the names are reserved.
+Both classes back their storage with plain (monolithic) buffers. Attention KV
+is deliberately absent: for DreamZero it is owned by the AR-Diffusion engine's
+paged pool (PR #4534), and the RFC's ``PagedKV`` arrives in Phase 1 as a
+handle wrapping that engine state rather than a dense buffer here. The RFC's
+``FixedState`` and ``RetrievalStore`` land with their first consumers, but the
+names are reserved.
 """
 
 from __future__ import annotations
@@ -21,65 +22,14 @@ import torch
 from vllm_omni.experimental.world_models.memory.base import MemoryObject
 
 
-class PagedKV(MemoryObject):
-    """Self-attention KV for one layer and one CFG branch.
-
-    RFC name ``PagedKV``; for now it is backed by a single contiguous tensor of
-    shape ``(2, B, seq, H, D)`` -- the exact shape the bespoke ``DreamZeroState``
-    stores. The diffusion loop hands grown KV in via ``commit()`` and reads it
-    back via ``view()``; growth and windowing happen in the model, not here.
-    """
-
-    def __init__(self) -> None:
-        self._buf: torch.Tensor | None = None
-        self._staged: Any = None
-
-    def allocate(  # type: ignore[override]  # explicit shape params; base is **spec
-        self,
-        *,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device | str,
-        num_heads: int,
-        head_dim: int,
-        **_: Any,
-    ) -> None:
-        self._buf = torch.zeros(2, batch_size, 0, num_heads, head_dim, dtype=dtype, device=device)
-
-    def commit(self, payload: torch.Tensor | None = None) -> None:
-        if payload is None:
-            raise ValueError("PagedKV.commit requires a tensor payload.")
-        # Match DreamZeroState.update_kv_cache: store a clone so the caller's
-        # tensor (e.g. the model's torch.stack result) cannot alias and later
-        # mutate the cache.
-        self._buf = payload.clone()
-
-    def view(self, *, include_staged: bool = True) -> torch.Tensor:
-        if self._buf is None:
-            raise RuntimeError("PagedKV is not allocated; call allocate() first.")
-        return self._buf
-
-    def reset(self) -> None:
-        self._buf = None
-        self._staged = None
-
-    @property
-    def nbytes(self) -> int:
-        if self._buf is None:
-            return 0
-        return self._buf.numel() * self._buf.element_size()
-
-    @property
-    def resident(self) -> bool:
-        return self._buf is not None
-
-
 class EncodeOnceKV(MemoryObject):
     """Encode-once cross-attention KV.
 
-    Wraps the ``{"is_init", "k", "v"}`` dict that DreamZero's cross-attention
+    Wraps an ``{"is_init", "k", "v"}`` dict that a model's cross-attention
     layers populate once (on the first forward) and read thereafter. ``view()``
-    returns the live dict so the model mutates it in place, exactly as today.
+    returns the live dict so the model mutates it in place. DreamZero's
+    cross-attn KV moved into the AR-Diffusion engine pool (PR #4534); the
+    in-tree consumer of this class is the Cosmos3 UND text K/V port.
     """
 
     def __init__(self) -> None:

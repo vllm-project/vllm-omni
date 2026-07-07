@@ -5,56 +5,37 @@
 ``DreamZeroStateAdapter`` exposes the exact public methods and attributes that
 ``pipeline_dreamzero.py`` touches on its state object, so the pipeline can use
 it interchangeably with the bespoke ``DreamZeroState`` (behind the opt-in flag).
-Storage is delegated to typed ``MemoryObject`` instances owned by the
-``SessionMemoryManager``:
 
-    * self-attention KV (pos / neg, per layer) -> ``PagedKV``
-    * cross-attention KV (pos / neg, per layer) -> ``EncodeOnceKV``
-    * the stitched frame buffer                 -> ``LatentBuffer``
+DreamZero's attention KV lives in the AR-Diffusion engine's paged pool
+(``self._ar_diffusion_kv_state``, see PR #4534) and is *not* managed here; this
+adapter covers the model's non-KV session state. Storage is delegated to typed
+``MemoryObject`` instances owned by the ``SessionMemoryManager``:
 
-The adapter holds no heavy state itself: scalar/tensor metadata lives in the
-session's ``attrs`` so a freshly constructed adapter for an existing session
-sees the same data (the manager is the single source of truth and the single
-LRU authority).
+    * the stitched frame buffer            -> ``LatentBuffer`` (ring)
+    * accumulated AR video latents         -> ``LatentBuffer`` (append, CPU)
+
+Scalar/tensor metadata (counters, prompt embeds, incremental VAE encoder
+stream) lives in the session's ``attrs`` so a freshly constructed adapter for
+an existing session sees the same data (the manager is the single source of
+truth and the single LRU authority).
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from typing import cast
 
 import numpy as np
 import torch
 
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import FRAMES_PER_CHUNK
-from vllm_omni.experimental.world_models.memory.base import MemoryObject
 from vllm_omni.experimental.world_models.memory.manager import SessionMemoryManager
-from vllm_omni.experimental.world_models.memory.objects import (
-    EncodeOnceKV,
-    LatentBuffer,
-    PagedKV,
-)
+from vllm_omni.experimental.world_models.memory.objects import LatentBuffer
 
 logger = logging.getLogger(__name__)
 
 _FRAMES = "frames"
 _VIDEO_LATENTS = "video_latents"
-_META_DEFAULTS: dict[str, object] = {
-    "call_count": 0,
-    "current_start_frame": 0,
-    "clip_feas": None,
-    "ys": None,
-    "language": None,
-}
-
-
-def _kv_key(layer_index: int, is_negative: bool) -> str:
-    return f"kv_neg/{layer_index}" if is_negative else f"kv/{layer_index}"
-
-
-def _xattn_key(layer_index: int, is_negative: bool) -> str:
-    return f"xattn_neg/{layer_index}" if is_negative else f"xattn/{layer_index}"
 
 
 class DreamZeroStateAdapter:
@@ -99,7 +80,7 @@ class DreamZeroStateAdapter:
     # reset clears attrs; setters write through to the pinned session.
     @property
     def call_count(self) -> int:
-        return int(self._session.attrs.get("call_count", _META_DEFAULTS["call_count"]))
+        return int(cast("int", self._session.attrs.get("call_count", 0)))
 
     @call_count.setter
     def call_count(self, value: int) -> None:
@@ -107,7 +88,7 @@ class DreamZeroStateAdapter:
 
     @property
     def current_start_frame(self) -> int:
-        return int(self._session.attrs.get("current_start_frame", _META_DEFAULTS["current_start_frame"]))
+        return int(cast("int", self._session.attrs.get("current_start_frame", 0)))
 
     @current_start_frame.setter
     def current_start_frame(self, value: int) -> None:
@@ -138,8 +119,57 @@ class DreamZeroStateAdapter:
         self._session.attrs["language"] = value
 
     @property
+    def prompt_embeds(self) -> torch.Tensor | None:
+        return cast("torch.Tensor | None", self._session.attrs.get("prompt_embeds"))
+
+    @prompt_embeds.setter
+    def prompt_embeds(self, value: torch.Tensor | None) -> None:
+        self._session.attrs["prompt_embeds"] = value
+
+    @property
     def stitched_buffer(self) -> LatentBuffer:
         return self._ensure_frame_buffer()
+
+    # -- incremental VAE encoder stream (logic mirrors DreamZeroState) --
+
+    @property
+    def vae_stream_initialized(self) -> bool:
+        return bool(self._session.attrs.get("vae_stream_initialized", False))
+
+    @vae_stream_initialized.setter
+    def vae_stream_initialized(self, value: bool) -> None:
+        self._session.attrs["vae_stream_initialized"] = bool(value)
+
+    @property
+    def vae_enc_feat_map(self) -> list[torch.Tensor | None] | None:
+        return cast("list[torch.Tensor | None] | None", self._session.attrs.get("vae_enc_feat_map"))
+
+    @vae_enc_feat_map.setter
+    def vae_enc_feat_map(self, value: list[torch.Tensor | None] | None) -> None:
+        self._session.attrs["vae_enc_feat_map"] = value
+
+    @property
+    def vae_encoder_out(self) -> torch.Tensor | None:
+        return cast("torch.Tensor | None", self._session.attrs.get("vae_encoder_out"))
+
+    @vae_encoder_out.setter
+    def vae_encoder_out(self, value: torch.Tensor | None) -> None:
+        self._session.attrs["vae_encoder_out"] = value
+
+    @property
+    def vae_pending_body_frames(self) -> torch.Tensor | None:
+        return cast("torch.Tensor | None", self._session.attrs.get("vae_pending_body_frames"))
+
+    @vae_pending_body_frames.setter
+    def vae_pending_body_frames(self, value: torch.Tensor | None) -> None:
+        self._session.attrs["vae_pending_body_frames"] = value
+
+    def reset_vae_encoder_stream(self) -> None:
+        """Clear incremental Wan VAE encoder state used across AR steps."""
+        self.vae_stream_initialized = False
+        self.vae_enc_feat_map = None
+        self.vae_encoder_out = None
+        self.vae_pending_body_frames = None
 
     # -- frame accumulation (logic mirrors DreamZeroState) --------------
 
@@ -199,7 +229,7 @@ class DreamZeroStateAdapter:
         return torch.cat(chunks, dim=2)
 
     def clear_video_latents(self) -> None:
-        """Drop accumulated video latents without resetting KV/frame state."""
+        """Drop accumulated video latents without resetting frame/VAE state."""
         buffer = LatentBuffer()
         buffer.allocate(maxlen=None)
         self._session.put(_VIDEO_LATENTS, buffer)
@@ -209,18 +239,29 @@ class DreamZeroStateAdapter:
     def reset(self, *, clear_video_latents: bool = True) -> None:
         """Clear session state.
 
-        When ``clear_video_latents`` is ``False`` the accumulated video latents
-        and the ``language`` token are preserved across the reset, matching
-        ``DreamZeroState.reset`` -- this is the ``reset_inference_state`` path
-        taken when local attention rolls over but the rollout continues.
+        Mirrors ``DreamZeroState.reset``: a session reset (``True``) drops
+        everything including the prompt-embed cache and the incremental VAE
+        encoder stream; a window ("inference") reset (``False``) keeps the
+        accumulated video latents, ``language``, ``prompt_embeds``, and the
+        VAE encoder stream -- the prompt is unchanged and the Wan feat_cache
+        history is independent of the DiT attention window.
         """
+        saved_attrs: dict[str, object] = {}
         saved_chunks: list[object] = []
-        saved_language: torch.Tensor | None = None
         if not clear_video_latents:
             buffer = self._session.get(_VIDEO_LATENTS)
             if isinstance(buffer, LatentBuffer) and buffer.resident:
                 saved_chunks = list(buffer.view())
-            saved_language = self.language
+            for key in (
+                "language",
+                "prompt_embeds",
+                "vae_stream_initialized",
+                "vae_enc_feat_map",
+                "vae_encoder_out",
+                "vae_pending_body_frames",
+            ):
+                if key in self._session.attrs:
+                    saved_attrs[key] = self._session.attrs[key]
 
         # Canonical reset: drop every typed object and clear session metadata.
         self._session.reset()
@@ -228,14 +269,13 @@ class DreamZeroStateAdapter:
         self._ensure_frame_buffer()
 
         if not clear_video_latents:
-            if saved_language is not None:
-                self.language = saved_language
+            self._session.attrs.update(saved_attrs)
             restored = self._ensure_video_buffer()
             if saved_chunks:
                 restored.extend(saved_chunks)
 
     def reset_inference_state(self) -> None:
-        """Reset KV/frame state after local attention rolls without dropping video latents."""
+        """Reset window/frame state after local attention rolls without dropping video latents."""
         self.reset(clear_video_latents=False)
 
     def reset_reason(
@@ -271,66 +311,3 @@ class DreamZeroStateAdapter:
     def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
         """Determine if state should be reset before this forward()."""
         return self.reset_reason(text_tokens, num_video_frames, local_attn_size) is not None
-
-    # -- KV cache management --------------------------------------------
-
-    def create_kv_caches(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        num_layers: int,
-        num_heads: int,
-        head_dim: int,
-    ) -> None:
-        """Initialize empty KV caches and cross-attention caches."""
-        session = self._session
-        for i in range(num_layers):
-            for is_neg in (False, True):
-                kv = PagedKV()
-                kv.allocate(
-                    batch_size=batch_size,
-                    dtype=dtype,
-                    device=device,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                )
-                session.put(_kv_key(i, is_neg), kv)
-
-                xattn = EncodeOnceKV()
-                xattn.allocate()
-                session.put(_xattn_key(i, is_neg), xattn)
-        session.attrs["_num_layers"] = num_layers
-
-    def update_kv_cache(self, layer_index: int, updated_kv: torch.Tensor, is_negative: bool = False) -> None:
-        """Update a single layer's KV cache after prefill."""
-        obj = self._session.get(_kv_key(layer_index, is_negative))
-        if obj is None:
-            raise RuntimeError("KV caches not initialized, call create_kv_caches first.")
-        obj.commit(updated_kv)
-
-    def get_kv_caches(self, is_negative: bool = False) -> list[torch.Tensor]:
-        """Get KV caches for the specified branch."""
-        return [obj.view() for obj in self._iter_layer_objects(_kv_key, is_negative, "KV caches")]
-
-    def get_crossattn_caches(self, is_negative: bool = False) -> list[dict[str, bool | torch.Tensor | None]]:
-        """Get cross-attention caches for the specified branch."""
-        return [obj.view() for obj in self._iter_layer_objects(_xattn_key, is_negative, "Cross-attn caches")]
-
-    def _iter_layer_objects(
-        self,
-        key_fn: Callable[[int, bool], str],
-        is_negative: bool,
-        what: str,
-    ) -> list[MemoryObject]:
-        session = self._session
-        num_layers = session.attrs.get("_num_layers")
-        if num_layers is None:
-            raise RuntimeError(f"{what} not initialized.")
-        objects: list[MemoryObject] = []
-        for i in range(int(num_layers)):
-            obj = session.get(key_fn(i, is_negative))
-            if obj is None or not obj.resident:
-                raise RuntimeError(f"{what} not initialized.")
-            objects.append(obj)
-        return objects

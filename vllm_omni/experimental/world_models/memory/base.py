@@ -23,7 +23,7 @@ from typing import Any
 class MemoryObject(ABC):
     """One typed unit of session memory with a uniform lifecycle.
 
-    Concrete classes (``PagedKV``, ``EncodeOnceKV``, ``LatentBuffer``) implement
+    Concrete classes (``EncodeOnceKV``, ``LatentBuffer``) implement
     the abstract methods below. The non-abstract methods provide the default
     behaviour described in their docstrings.
     """
