@@ -1309,7 +1309,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # prefix caching but the downstream pooler payload path still
                 # needs a CPU hidden-states view. Materialize it synchronously
                 # in that case; the legacy behavior is preserved.
-                if hs_for_cache is None:
+                if hs_for_cache is None and self._model_omni_pooler_payload_include_hidden():
                     hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
                 slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
                 self.omni_prefix_cache.schedule_async_write(
