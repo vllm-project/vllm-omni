@@ -128,7 +128,7 @@ class AudexCode2Wav(nn.Module):
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        state_dict = {name: tensor for name, tensor in weights}
+        state_dict = dict(weights)
         self.decoder.load_state_dict(state_dict, strict=True)
         device = self.vllm_config.device_config.device
         self.decoder.to(device=device, dtype=torch.float32)
@@ -203,7 +203,6 @@ class AudexCode2Wav(nn.Module):
             num_reqs = len(runtime_infos)
 
         audios: list[torch.Tensor] = []
-        srs: list[torch.Tensor] = []
         sr_tensor = torch.tensor(self._sample_rate, dtype=torch.int32)
         for i in range(num_reqs):
             info = runtime_infos[i] if i < len(runtime_infos) else {}
@@ -219,12 +218,10 @@ class AudexCode2Wav(nn.Module):
                 if codes:
                     raise ValueError("Audex code2wav chunk payload is missing meta.req_id")
                 audios.append(torch.empty(0, dtype=torch.float32))
-                srs.append(sr_tensor)
                 continue
             audios.append(self._decode_request(req_id, codes, finished))
-            srs.append(sr_tensor)
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, "sr": [sr_tensor] * num_reqs},
         )

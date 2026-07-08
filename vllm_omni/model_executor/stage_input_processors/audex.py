@@ -51,6 +51,11 @@ def _connector_extra(transfer_manager: Any) -> dict[str, Any]:
     return {}
 
 
+def _codec_frames(tokens: list[int], codec_offset: int, codec_size: int) -> list[int]:
+    """Map ``<speechcodec_N>`` token ids to codec frame ids, dropping all other tokens."""
+    return [int(t) - codec_offset for t in tokens if codec_offset <= int(t) < codec_offset + codec_size]
+
+
 def _extract_new_codes(
     request: Any,
     state: dict[str, Any],
@@ -59,10 +64,9 @@ def _extract_new_codes(
 ) -> list[int]:
     """Return codec frame ids from tokens sampled since the last call."""
     output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
-    seen_len = int(state.get("seen_len", 0))
-    new_tokens = output_token_ids[seen_len:] if seen_len < len(output_token_ids) else []
+    new_tokens = output_token_ids[int(state.get("seen_len", 0)) :]
     state["seen_len"] = len(output_token_ids)
-    return [int(t) - codec_offset for t in new_tokens if codec_offset <= int(t) < codec_offset + codec_size]
+    return _codec_frames(new_tokens, codec_offset, codec_size)
 
 
 def thinker2code2wav_async_chunk(
@@ -159,7 +163,7 @@ def thinker2code2wav_full_payload(
     codec_size = int(cfg.get("codec_vocab_size", _DEFAULT_CODEC_VOCAB_SIZE))
 
     output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
-    codes = [int(t) - codec_offset for t in output_token_ids if codec_offset <= int(t) < codec_offset + codec_size]
+    codes = _codec_frames(output_token_ids, codec_offset, codec_size)
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     if not codes:
         raise ValueError(f"Audex thinker produced no codec tokens for request {request_id}")
