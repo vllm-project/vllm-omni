@@ -155,13 +155,22 @@ class DiffusionParallelConfig:
     """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
 
     sequence_parallel_size: int | None = None
-    """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
+    """Number of sequence parallel groups.
+    sequence_parallel_size = ulysses_degree * ring_degree * allgather_degree"""
 
     ulysses_degree: int = 1
     """Number of GPUs used for ulysses sequence parallelism."""
 
     ring_degree: int = 1
     """Number of GPUs used for ring sequence parallelism."""
+
+    allgather_degree: int = 1
+    """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only).
+
+    Each rank holds 1/P of the query (sequence-split by the model's pre_processor);
+    an AllGather collects the full K/V on every rank so a single large attention
+    kernel can run as Q_local x K_full. v1 is mutually exclusive with Ulysses
+    and Ring (ulysses_degree==1 and ring_degree==1 when allgather_degree>1)."""
 
     ulysses_mode: str = "strict"
     """Ulysses sequence-parallel mode.
@@ -224,6 +233,7 @@ class DiffusionParallelConfig:
         assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
+        assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.cfg_parallel_size in [1, 2, 3], (
             f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
@@ -233,9 +243,16 @@ class DiffusionParallelConfig:
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
-        assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
-            "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
-            f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        if self.allgather_degree > 1:
+            assert self.ulysses_degree == 1 and self.ring_degree == 1, (
+                "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
+                f"Got ulysses_degree={self.ulysses_degree}, ring_degree={self.ring_degree}, "
+                f"allgather_degree={self.allgather_degree}."
+            )
+        assert self.sequence_parallel_size == (self.ulysses_degree * self.ring_degree * self.allgather_degree), (
+            "Sequence parallel size must equal the product of ulysses degree, ring degree, "
+            f"and allgather degree, but got {self.sequence_parallel_size} != "
+            f"{self.ulysses_degree} * {self.ring_degree} * {self.allgather_degree}"
         )
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
@@ -249,7 +266,7 @@ class DiffusionParallelConfig:
 
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
-            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
 
         # Calculate world_size from other parallelism dimensions
         other_parallel_world_size = (
@@ -258,6 +275,7 @@ class DiffusionParallelConfig:
             * self.tensor_parallel_size
             * self.ulysses_degree
             * self.ring_degree
+            * self.allgather_degree
             * self.cfg_parallel_size
         )
 

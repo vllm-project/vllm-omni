@@ -679,6 +679,7 @@ def initialize_model_parallel(
     sequence_parallel_size: int | None = None,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
+    allgather_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
     fully_shard_degree: int = 1,
@@ -695,9 +696,11 @@ def initialize_model_parallel(
         data_parallel_size: number of data parallelism groups.
         cfg_parallel_size: number of GPUs used for Classifier Free Guidance (CFG) parallelism.
         sequence_parallel_size: number of GPUs used for sequence parallelism.
-            sequence_parallel_size = ulysses_degree * ring_degree
+            sequence_parallel_size = ulysses_degree * ring_degree * allgather_degree
         ulysses_degree: number of GPUs used for ulysses sequence parallelism.
         ring_degree: number of GPUs used for ring sequence parallelism.
+        allgather_degree: number of GPUs used for AllGather-KV sequence parallelism
+            (causal=False only). Mutually exclusive with ulysses/ring in v1.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
         fully_shard_degree: number of GPUs used for fully sharded data parallelism (HSDP shard dimension).
@@ -734,16 +737,26 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    if sequence_parallel_size is None:
-        sequence_parallel_size = ring_degree * ulysses_degree
-        logger.info(
-            f"sequence_parallel_size is not provided, using ring_degree * ulysses_degree = {sequence_parallel_size}"
+    if allgather_degree > 1:
+        assert ulysses_degree == 1 and ring_degree == 1, (
+            "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
+            f"Got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
+            f"allgather_degree={allgather_degree}."
         )
 
-    if sequence_parallel_size != ring_degree * ulysses_degree:
+    if sequence_parallel_size is None:
+        sequence_parallel_size = ring_degree * ulysses_degree * allgather_degree
+        logger.info(
+            f"sequence_parallel_size is not provided, using "
+            f"ring_degree * ulysses_degree * allgather_degree = {sequence_parallel_size}"
+        )
+
+    if sequence_parallel_size != ring_degree * ulysses_degree * allgather_degree:
         raise ValueError(
-            "sequence_parallel_size is not equal to ring_degree * ulysses_degree,"
-            f" but got {sequence_parallel_size} != {ring_degree} * {ulysses_degree}"
+            "sequence_parallel_size is not equal to "
+            "ring_degree * ulysses_degree * allgather_degree,"
+            f" but got {sequence_parallel_size} != "
+            f"{ring_degree} * {ulysses_degree} * {allgather_degree}"
         )
 
     dit_parallel_size = (
@@ -813,9 +826,20 @@ def initialize_model_parallel(
 
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
+    # For AllGather-KV SP (allgather_degree > 1), reuse the ulysses_group slot
+    # to hold the AllGather collective group. Mutual exclusion (checked above)
+    # guarantees ulysses_degree == 1 and ring_degree == 1 in this case, so the
+    # ulysses_group world_size becomes allgather_degree and AllGather-KV
+    # strategy's self._sp_group.all_gather(...) is a no-op-free collective.
+    if allgather_degree > 1:
+        sp_ulysses_degree_for_pg = allgather_degree
+        sp_ring_degree_for_pg = 1
+    else:
+        sp_ulysses_degree_for_pg = ulysses_degree
+        sp_ring_degree_for_pg = ring_degree
     ulysses_pg, ring_pg = set_seq_parallel_pg(
-        sp_ulysses_degree=ulysses_degree,
-        sp_ring_degree=ring_degree,
+        sp_ulysses_degree=sp_ulysses_degree_for_pg,
+        sp_ring_degree=sp_ring_degree_for_pg,
         rank=get_world_group().rank_in_group,
         world_size=dit_parallel_size,
         sp_group_ranks=sp_group_ranks,

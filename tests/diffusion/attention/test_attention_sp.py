@@ -223,6 +223,7 @@ def test_sequence_parallel(
                 use_compile,
                 1,  # ulysses_degree = 1
                 1,  # ring_degree = 1
+                1,  # allgather_degree = 1 (baseline: no AllGather-KV SP)
                 1,  # sequence_parallel_size = 1
                 baseline_output_file,
                 model_state_file,
@@ -250,6 +251,7 @@ def test_sequence_parallel(
                 use_compile,
                 ulysses_degree,
                 ring_degree,
+                1,  # allgather_degree = 1 (Ulysses/Ring test does not use AllGather-KV)
                 sequence_parallel_size,
                 sp_output_file,
                 model_state_file,
@@ -345,6 +347,7 @@ def ulysses_attention_on_test_model(
     use_compile: bool,
     ulysses_degree: int,
     ring_degree: int,
+    allgather_degree: int,
     sequence_parallel_size: int,
     output_file: str,
     model_state_file: str,
@@ -356,7 +359,11 @@ def ulysses_attention_on_test_model(
     RANDOM_SEED = 42
     seed_everything(RANDOM_SEED)
 
-    mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+    if allgather_degree > 1:
+        sp_kind = f"allgather={allgather_degree}"
+    else:
+        sp_kind = f"ulysses={ulysses_degree}, ring={ring_degree}"
+    mode_str = "Baseline (no SP)" if is_baseline else f"SP ({sp_kind})"
     print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
 
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
@@ -384,6 +391,7 @@ def ulysses_attention_on_test_model(
         sequence_parallel_size=sequence_parallel_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
+        allgather_degree=allgather_degree,
         cfg_parallel_size=1,
     )
 
@@ -400,6 +408,7 @@ def ulysses_attention_on_test_model(
         sequence_parallel_size=sequence_parallel_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
+        allgather_degree=allgather_degree,
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
     )
@@ -519,7 +528,11 @@ def ulysses_attention_on_test_model(
             with open(output_file, "wb") as f:
                 pickle.dump(output_np, f)
 
-            mode_str = "baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+            if allgather_degree > 1:
+                sp_kind = f"allgather={allgather_degree}"
+            else:
+                sp_kind = f"ulysses={ulysses_degree}, ring={ring_degree}"
+            mode_str = "baseline (no SP)" if is_baseline else f"SP ({sp_kind})"
             print(
                 f"\n[{mode_str}] ✓ Saved output with shape {full_output.shape}:\n"
                 f"  - batch_size={batch_size}, seq_len={seq_len}\n"
@@ -528,3 +541,193 @@ def ulysses_attention_on_test_model(
             )
 
         destroy_distributed_env()
+
+
+@pytest.mark.parametrize(
+    "test_model_cls",
+    [
+        TestMultiLayerAttentionModel,
+    ],
+)
+@pytest.mark.parametrize("allgather_degree", [2])
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("seq_len", [16])
+@pytest.mark.parametrize("num_heads", [8])
+@pytest.mark.parametrize("head_size", [8])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("use_sync", [False])
+@pytest.mark.parametrize("dynamic", [False])
+@pytest.mark.parametrize("use_compile", [False])
+def test_allgather_kv_sequence_parallel(
+    allgather_degree: int,
+    test_model_cls: type[torch.nn.Module],
+    dtype: torch.dtype,
+    causal: bool,
+    use_sync: bool,
+    dynamic: bool,
+    use_compile: bool,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_size: int,
+):
+    """Test AllGather-KV sequence-parallel attention by comparing with single-rank.
+
+    AllGather-KV SP: each rank holds 1/P of Q (pre_processor sequence-split);
+    AllGather collects full K/V on every rank; a single local attention kernel
+    computes Q_local x K_full. Only valid for causal=False. v1 is mutually
+    exclusive with Ulysses/Ring (ulysses_degree=1, ring_degree=1).
+
+    The test spawns two separate multi-process runs:
+    1. Baseline – world_size=1, allgather_degree=1 (single-rank, no SP).
+    2. SP run  – world_size=allgather_degree, each rank holds a contiguous
+                 slice of the sequence; full K/V is AllGathered on every rank.
+    After both runs, rank-0 outputs are compared element-wise with bfloat16
+    tolerance.
+    """
+    assert causal is False, "AllGather-KV SP is only valid for causal=False"
+    sequence_parallel_size = allgather_degree
+
+    # Skip if not enough GPUs available
+    available_gpus = current_omni_platform.get_device_count()
+    if available_gpus < sequence_parallel_size:
+        pytest.skip(f"Test requires {sequence_parallel_size} GPUs but only {available_gpus} available")
+
+    # Create temporary files to share results between processes
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        baseline_output_file = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        sp_output_file = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        model_state_file = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        input_data_file = f.name
+
+    try:
+        # Step 1: Run without SP (baseline with allgather_degree=1)
+        print("\n[Baseline] Running without SP (allgather_degree=1)...")
+        torch.multiprocessing.spawn(
+            ulysses_attention_on_test_model,
+            args=(
+                1,  # num_processes = 1 for baseline
+                test_model_cls,
+                batch_size,
+                seq_len,
+                num_heads,
+                head_size,
+                dtype,
+                causal,
+                use_sync,
+                dynamic,
+                use_compile,
+                1,  # ulysses_degree = 1
+                1,  # ring_degree = 1
+                1,  # allgather_degree = 1 (baseline: no AllGather-KV SP)
+                1,  # sequence_parallel_size = 1
+                baseline_output_file,
+                model_state_file,
+                input_data_file,
+                True,  # is_baseline
+            ),
+            nprocs=1,
+        )
+
+        # Step 2: Run with AllGather-KV SP enabled
+        print(f"\n[SP Test] Running with AllGather-KV SP (allgather_degree={allgather_degree})...")
+        torch.multiprocessing.spawn(
+            ulysses_attention_on_test_model,
+            args=(
+                sequence_parallel_size,  # num_processes
+                test_model_cls,
+                batch_size,
+                seq_len,
+                num_heads,
+                head_size,
+                dtype,
+                causal,
+                use_sync,
+                dynamic,
+                use_compile,
+                1,  # ulysses_degree = 1 (mutually exclusive with AllGather-KV)
+                1,  # ring_degree = 1 (mutually exclusive with AllGather-KV)
+                allgather_degree,
+                sequence_parallel_size,
+                sp_output_file,
+                model_state_file,
+                input_data_file,
+                False,  # is_baseline
+            ),
+            nprocs=sequence_parallel_size,
+        )
+
+        # Step 3: Verify input consistency and compare outputs
+        print(f"\n{'=' * 80}")
+        print("Verifying input data consistency...")
+        with open(input_data_file, "rb") as f:
+            input_data = pickle.load(f)
+        input_checksum = hash(input_data.tobytes())
+        print(f"  Input data shape: {input_data.shape}")
+        print(f"  Input data checksum: {input_checksum}")
+        print("  ✓ Both baseline and SP used the same input data")
+
+        print(f"\n{'=' * 80}")
+        print("Comparing outputs between baseline and AllGather-KV SP...")
+        with open(baseline_output_file, "rb") as f:
+            baseline_output = pickle.load(f)
+        with open(sp_output_file, "rb") as f:
+            sp_output = pickle.load(f)
+
+        # Convert to tensors for comparison
+        baseline_tensor = torch.tensor(baseline_output)
+        sp_tensor = torch.tensor(sp_output)
+
+        print(f"  Baseline output shape: {baseline_tensor.shape}")
+        print(f"  SP output shape: {sp_tensor.shape}")
+        assert baseline_tensor.shape == sp_tensor.shape, "Output shapes must match!"
+
+        # Calculate differences
+        abs_diff = torch.abs(baseline_tensor - sp_tensor)
+        max_abs_diff = abs_diff.max().item()
+        mean_abs_diff = abs_diff.mean().item()
+
+        # Calculate relative difference (avoid division by zero)
+        baseline_abs = torch.abs(baseline_tensor)
+        relative_diff = abs_diff / (baseline_abs + 1e-8)
+        max_relative_diff = relative_diff.max().item()
+        mean_relative_diff = relative_diff.mean().item()
+
+        print(f"\n{'=' * 80}")
+        print("Output Difference Analysis:")
+        print(f"  - Max absolute difference: {max_abs_diff:.6e}")
+        print(f"  - Mean absolute difference: {mean_abs_diff:.6e}")
+        print(f"  - Max relative difference: {max_relative_diff:.6e}")
+        print(f"  - Mean relative difference: {mean_relative_diff:.6e}")
+        print(f"  - Baseline output range: [{baseline_tensor.min().item():.6e}, {baseline_tensor.max().item():.6e}]")
+        print(f"  - SP output range: [{sp_tensor.min().item():.6e}, {sp_tensor.max().item():.6e}]")
+        print(f"{'=' * 80}\n")
+
+        # Assert that differences are within acceptable tolerance
+        # AllGather-KV computes attention on full K/V on every rank, so the
+        # only numerical difference vs baseline comes from AllGather reordering
+        # and the local FA kernel's reduction order.
+        if dtype == torch.float16:
+            atol, rtol = 5e-2, 5e-2
+        elif dtype == torch.bfloat16:
+            atol, rtol = 5e-2, 5e-2
+        else:
+            atol, rtol = 1e-5, 1e-4
+
+        assert max_abs_diff < atol or max_relative_diff < rtol, (
+            f"Output difference too large: max_abs_diff={max_abs_diff:.6e}, "
+            f"max_relative_diff={max_relative_diff:.6e}, "
+            f"tolerance: atol={atol}, rtol={rtol}"
+        )
+
+        print("✓ Test passed: AllGather-KV SP output matches baseline within tolerance")
+
+    finally:
+        # Clean up temporary files
+        for f in [baseline_output_file, sp_output_file, model_state_file, input_data_file]:
+            if os.path.exists(f):
+                os.remove(f)
