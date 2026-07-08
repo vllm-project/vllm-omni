@@ -2768,6 +2768,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    if self._tts_model_type == "audex" and int(np.size(chunk_np)) == 0:
+                        # Zero-size chunks must not emit a WAV header or count
+                        # as first audio; the post-loop guard below needs to
+                        # see an audio-less stream to fail the request.
+                        continue
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
                         # Assert that sample rate has been set from chunk metadata (not just default)
