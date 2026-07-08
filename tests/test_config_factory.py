@@ -605,6 +605,205 @@ class TestPipelineConfigNew:
 
 
 class TestPipelineRegistration:
+    def test_resolve_pipeline_prefers_deploy_pipeline_key(self, clean_pipeline_registry, tmp_path):
+        deploy_key = "deploy_selected_pipeline"
+        model_type_key = "hf_model_type_pipeline"
+        deploy_pipe = PipelineConfig(model_type=deploy_key)
+        model_type_pipe = PipelineConfig(model_type=model_type_key)
+        register_pipeline(deploy_pipe)
+        register_pipeline(model_type_pipe)
+
+        deploy_path = tmp_path / "deploy.yaml"
+        deploy_path.write_text(f"pipeline: {deploy_key}\n", encoding="utf-8")
+
+        class FakeConfig(PretrainedConfig):
+            model_type = model_type_key
+
+        fake_config = FakeConfig()
+        with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
+            resolution = StageConfigFactory.resolve_pipeline_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                deploy_config_path=str(deploy_path),
+            )
+
+        assert resolution is not None
+        assert resolution.registry_key == deploy_key
+        assert resolution.pipeline_config is deploy_pipe
+        assert resolution.hf_config is fake_config
+
+    def test_resolve_pipeline_falls_back_to_model_type_when_deploy_key_is_invalid(
+        self,
+        clean_pipeline_registry,
+        tmp_path,
+    ):
+        model_type_key = "registered_model_type_pipeline"
+        model_type_pipe = PipelineConfig(model_type=model_type_key)
+        register_pipeline(model_type_pipe)
+
+        deploy_path = tmp_path / "deploy.yaml"
+        deploy_path.write_text("pipeline: missing_pipeline\n", encoding="utf-8")
+
+        class FakeConfig(PretrainedConfig):
+            model_type = model_type_key
+
+        with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
+            resolution = StageConfigFactory.resolve_pipeline_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                deploy_config_path=str(deploy_path),
+            )
+
+        assert resolution is not None
+        assert resolution.registry_key == model_type_key
+        assert resolution.pipeline_config is model_type_pipe
+
+    def test_resolve_pipeline_matches_hf_architecture_fallback(self, clean_pipeline_registry):
+        pipeline_key = "architecture_fallback_pipeline"
+        pipe_cfg = PipelineConfig(
+            model_type=pipeline_key,
+            hf_architectures=("ArchitectureFallbackForTest",),
+        )
+        register_pipeline(pipe_cfg)
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "unregistered_model_type"
+
+        fake_config = FakeConfig()
+        fake_config.architectures = ["ArchitectureFallbackForTest"]
+        with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
+            resolution = StageConfigFactory.resolve_pipeline_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                deploy_config_path=None,
+            )
+
+        assert resolution is not None
+        assert resolution.registry_key == pipeline_key
+        assert resolution.pipeline_config is pipe_cfg
+        assert resolution.hf_config is fake_config
+
+    def test_resolve_pipeline_architecture_fallback_respects_predicates(self, clean_pipeline_registry):
+        shared_arch = "SharedPredicateArchitectureForTest"
+
+        def rejecting_predicate(_hf_config):
+            return False
+
+        def raising_predicate(_hf_config):
+            raise ValueError("predicate failure")
+
+        reject_cfg = PipelineConfig(
+            model_type="rejected_by_predicate",
+            hf_architectures=(shared_arch,),
+            hf_config_predicate=rejecting_predicate,
+        )
+        raises_cfg = PipelineConfig(
+            model_type="raises_in_predicate",
+            hf_architectures=(shared_arch,),
+            hf_config_predicate=raising_predicate,
+        )
+        accept_cfg = PipelineConfig(
+            model_type="accepted_by_predicate",
+            hf_architectures=(shared_arch,),
+        )
+        register_pipeline(reject_cfg)
+        register_pipeline(raises_cfg)
+        register_pipeline(accept_cfg)
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "unregistered_model_type"
+
+        fake_config = FakeConfig()
+        fake_config.architectures = [shared_arch]
+        with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
+            resolution = StageConfigFactory.resolve_pipeline_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                deploy_config_path=None,
+            )
+
+        assert resolution is not None
+        assert resolution.registry_key == "accepted_by_predicate"
+        assert resolution.pipeline_config is accept_cfg
+
+    def test_resolve_pipeline_architecture_fallback_skips_predicate_without_arch_match(
+        self,
+        clean_pipeline_registry,
+    ):
+        predicate_calls = []
+
+        def predicate(_hf_config):
+            predicate_calls.append(_hf_config)
+            return True
+
+        pipe_cfg = PipelineConfig(
+            model_type="predicate_without_arch_match",
+            hf_architectures=("DifferentArchitectureForTest",),
+            hf_config_predicate=predicate,
+        )
+        register_pipeline(pipe_cfg)
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "unregistered_model_type"
+
+        fake_config = FakeConfig()
+        fake_config.architectures = ["RequestedArchitectureForTest"]
+        with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
+            resolution = StageConfigFactory.resolve_pipeline_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                deploy_config_path=None,
+            )
+
+        assert resolution is None
+        assert predicate_calls == []
+
+    def test_resolve_pipeline_architecture_fallback_resolves_callable_pipeline(self, clean_pipeline_registry):
+        pipeline_key = "callable_architecture_fallback"
+        resolved_cfg = PipelineConfig(
+            model_type="callable_resolved_pipeline",
+            hf_architectures=("CallableArchitectureForTest",),
+        )
+        seen_hf_configs = []
+
+        def resolver(hf_config):
+            seen_hf_configs.append(hf_config)
+            return resolved_cfg
+
+        register_pipeline(resolver, model_type=pipeline_key)
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "unregistered_model_type"
+
+        fake_config = FakeConfig()
+        fake_config.architectures = ["CallableArchitectureForTest"]
+        with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
+            resolution = StageConfigFactory.resolve_pipeline_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                deploy_config_path=None,
+            )
+
+        assert resolution is not None
+        assert resolution.registry_key == pipeline_key
+        assert resolution.pipeline_config is resolved_cfg
+        assert seen_hf_configs == [fake_config]
+
+    def test_resolve_pipeline_returns_none_without_registry_or_architecture_match(self, clean_pipeline_registry):
+        class FakeConfig(PretrainedConfig):
+            model_type = "unregistered_model_type"
+
+        fake_config = FakeConfig()
+        fake_config.architectures = ["UnmatchedArchitectureForTest"]
+        with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
+            resolution = StageConfigFactory.resolve_pipeline_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                deploy_config_path=None,
+            )
+
+        assert resolution is None
+
     def test_create_from_model_returns_structured_omni_config(self):
         class FakeConfig(PretrainedConfig):
             model_type = "qwen3_tts"

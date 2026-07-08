@@ -130,6 +130,7 @@ class StageConfigFactory:
         """Resolve a model/deploy pair once for structured and legacy consumers."""
         model_type, hf_config = cls._detect_registry_model_type(model, trust_remote_code=trust_remote_code)
 
+        # 1. Prefer the explicit pipeline key from deploy YAML.
         explicit_pipeline = cls._get_deploy_pipeline(deploy_config_path)
         pipeline_cfg = cls.resolve_pipeline_config(explicit_pipeline, hf_config)
         if pipeline_cfg is not None:
@@ -140,41 +141,56 @@ class StageConfigFactory:
             explicit_pipeline,
         )
 
+        # 2. Next try the registry key inferred from the model itself.
         pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
         if pipeline_cfg is not None:
             return PipelineResolution(model_type, pipeline_cfg, hf_config)
 
+        # 3. Finally match HF architectures against registered pipeline aliases.
         logger.warning("Inferred model type %s is not registered to an Omni pipeline", model_type)
-        if hf_config is not None:
-            hf_archs = set(getattr(hf_config, "architectures", []) or [])
-            if hf_archs:
-                for registered_key, registered in OMNI_PIPELINES.items():
-                    pipeline_cfg = registered if isinstance(registered, PipelineConfig) else registered(hf_config)
-                    if pipeline_cfg is None:
-                        continue
-                    predicate = pipeline_cfg.hf_config_predicate
-                    if predicate is not None:
-                        try:
-                            if not predicate(hf_config):
-                                logger.debug(
-                                    "Pipeline %r matched on architectures %s but its "
-                                    "hf_config_predicate rejected the loaded config; "
-                                    "continuing fallback search.",
-                                    pipeline_cfg.model_type,
-                                    sorted(hf_archs.intersection(pipeline_cfg.hf_architectures)),
-                                )
-                                continue
-                        except Exception:
-                            logger.exception(
-                                "Pipeline %r hf_config_predicate raised; skipping.",
+        return cls._resolve_pipeline_from_hf_architectures(hf_config)
+
+    @classmethod
+    def _resolve_pipeline_from_hf_architectures(cls, hf_config: PretrainedConfig | None) -> PipelineResolution | None:
+        """Resolve a pipeline by matching HF architectures against registry aliases."""
+        if hf_config is None:
+            return None
+
+        hf_archs = set(getattr(hf_config, "architectures", []) or [])
+        if hf_archs:
+            for registered_key in OMNI_PIPELINES.keys():
+                # Check whether this registered pipeline supports the HF config.
+                pipeline_cfg = cls.resolve_pipeline_config(registered_key, hf_config)
+                if pipeline_cfg is None:
+                    continue
+
+                # Match the checkpoint architectures against pipeline aliases.
+                matched_archs = hf_archs.intersection(pipeline_cfg.hf_architectures)
+                if not matched_archs:
+                    continue
+
+                predicate = pipeline_cfg.hf_config_predicate
+                if predicate is not None:
+                    try:
+                        if not predicate(hf_config):
+                            logger.debug(
+                                "Pipeline %r matched on architectures %s but its "
+                                "hf_config_predicate rejected the loaded config; "
+                                "continuing fallback search.",
                                 pipeline_cfg.model_type,
+                                sorted(matched_archs),
                             )
                             continue
+                    except Exception:
+                        logger.exception(
+                            "Pipeline %r hf_config_predicate raised; skipping.",
+                            pipeline_cfg.model_type,
+                        )
+                        continue
 
-                    if isinstance(pipeline_cfg, PipelineConfig) and hf_archs.intersection(
-                        pipeline_cfg.hf_architectures
-                    ):
-                        return PipelineResolution(registered_key, pipeline_cfg, hf_config)
+                return PipelineResolution(registered_key, pipeline_cfg, hf_config)
+
+        # No registered pipeline declares a matching HF architecture.
         return None
 
     @classmethod
