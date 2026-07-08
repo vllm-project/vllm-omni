@@ -10,36 +10,26 @@ inputs. Uses the 14B AdaLN variant; cross-attention has an image branch
 
 Setup
 ─────
-    huggingface-cli download amd/Micro-World-I2W --local-dir ./Micro-World-I2W
-    huggingface-cli download Wan-AI/Wan2.1-I2V-14B-720P-Diffusers --local-dir ./Wan2.1-I2V-Base
-
-    mkdir -p ./Micro-World-I2W-combined
-    ln -s $(pwd)/Micro-World-I2W/transformer   ./Micro-World-I2W-combined/transformer
-    ln -s $(pwd)/Micro-World-I2W/lora_diffusion_pytorch_model.safetensors \
-                                               ./Micro-World-I2W-combined/lora_diffusion_pytorch_model.safetensors
-    ln -s $(pwd)/Wan2.1-I2V-Base/tokenizer         ./Micro-World-I2W-combined/tokenizer
-    ln -s $(pwd)/Wan2.1-I2V-Base/text_encoder      ./Micro-World-I2W-combined/text_encoder
-    ln -s $(pwd)/Wan2.1-I2V-Base/image_processor   ./Micro-World-I2W-combined/image_processor
-    ln -s $(pwd)/Wan2.1-I2V-Base/image_encoder     ./Micro-World-I2W-combined/image_encoder
-    ln -s $(pwd)/Wan2.1-I2V-Base/vae               ./Micro-World-I2W-combined/vae
+    uv pip install -e .
 
 Usage
 ─────
-    # Reproduce the AMD reference example (street_night.jpg + walking-down):
+    # Reproduce the AMD reference example (street_night.jpg + walking-down).
+    # By default, --model resolves AMD/Micro-World and composes the local load
+    # directory with the Wan2.1 I2V base.
     python image_to_world.py \
-        --model ./Micro-World-I2W-combined \
         --image street_night.jpg \
         --output micro_world_i2w_output.mp4
 
     # Custom prompt + action list:
     python image_to_world.py \
-        --model ./Micro-World-I2W-combined \
         --image my_scene.jpg \
         --prompt "First-person walk through a forest path." \
         --action-list '[[40, "1 0 0 0 0 0 0 0 0"], [80, "0 0 1 0 0 0 0 0 0"], "40"]'
 
+
     # Overlay the WASD/cursor HUD (post-processing, same as T2W):
-    python image_to_world.py --model ./Micro-World-I2W-combined --image my_scene.jpg --draw-hud
+    python image_to_world.py --image my_scene.jpg --draw-hud
 """
 
 import argparse
@@ -59,6 +49,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 sys.path.insert(0, str(Path(__file__).parent))
+from _model_resolver import MICRO_WORLD_REPO, resolve_micro_world_model  # noqa: E402
 from text_to_world import build_actions, parse_reference_action_list  # noqa: E402
 
 _DEFAULT_PROMPT = (
@@ -73,7 +64,11 @@ _DEFAULT_ACTION_LIST = '[[20, "0 1 0 1 0 0 0 0 0"], [40, "1 0 0 0 0 0 0 0 0"], [
 
 def parse_args():
     parser = argparse.ArgumentParser(description="AMD Micro-World I2W generation.")
-    parser.add_argument("--model", required=True, help="Combined I2W model directory path.")
+    parser.add_argument(
+        "--model",
+        default=MICRO_WORLD_REPO,
+        help="Consolidated Micro-World repo id. Defaults to AMD/Micro-World.",
+    )
     parser.add_argument("--image", required=True, help="Input image path (jpg/png).")
     parser.add_argument("--prompt", default=_DEFAULT_PROMPT)
     parser.add_argument("--negative-prompt", default="")
@@ -116,7 +111,7 @@ def main():
         Path(__file__).resolve().parents[3] / "vllm_omni" / "model_executor" / "stage_configs" / "micro_world_i2w.yaml"
     )
     omni = Omni(
-        model=args.model,
+        model=resolve_micro_world_model(args.model, "I2W"),
         stage_configs_path=stage_config,
         flow_shift=args.flow_shift,
         stage_init_timeout=args.stage_init_timeout,

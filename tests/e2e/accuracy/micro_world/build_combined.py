@@ -1,7 +1,8 @@
 """Build Micro-World T2W and I2W "combined" model directories.
 
-Downloads the AMD Micro-World transformer+LoRA and the matching Wan2.1 base
-components, then assembles a directory with symlinks and the custom
+Downloads the AMD Micro-World transformer+LoRA from the consolidated
+AMD/Micro-World repository and the matching Wan2.1 base components, then
+assembles a directory with symlinks and the custom
 ``model_index.json`` so that vllm-omni routes to ``MicroWorld{T2W,I2W}Pipeline``
 instead of stock Wan.
 
@@ -51,7 +52,7 @@ class Layout:
     name: str  # e.g. "T2W"
     amd_repo: str
     base_repo: str
-    amd_files: tuple[str, ...]  # files/dirs to symlink from amd snapshot
+    amd_files: tuple[str, ...]  # files/dirs to symlink from the variant snapshot
     model_index: dict
     # Subdirs symlinked from the base snapshot. Drop "scheduler" and `model_index`-
     # only entries; derived automatically from model_index keys minus AMD-provided.
@@ -67,7 +68,7 @@ _AMD_PROVIDED = ("transformer", "lora_diffusion_pytorch_model.safetensors")
 
 T2W = Layout(
     name="T2W",
-    amd_repo="amd/Micro-World-T2W",
+    amd_repo="AMD/Micro-World",
     base_repo="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
     amd_files=_AMD_PROVIDED,
     model_index=_T2W_MODEL_INDEX,
@@ -75,7 +76,7 @@ T2W = Layout(
 )
 I2W = Layout(
     name="I2W",
-    amd_repo="amd/Micro-World-I2W",
+    amd_repo="AMD/Micro-World",
     base_repo="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
     amd_files=_AMD_PROVIDED,
     model_index=_I2W_MODEL_INDEX,
@@ -97,16 +98,24 @@ def _link(target: Path, link: Path) -> None:
 def build(layout: Layout, root: Path) -> Path:
     amd_dir = root / Path(layout.amd_repo).name
     base_dir = root / Path(layout.base_repo).name
-    combined = root / f"{Path(layout.amd_repo).name}-combined"
+    variant_dir = amd_dir / layout.name
+    combined = root / f"Micro-World-{layout.name}-combined"
 
-    if not (amd_dir / "transformer").exists():
-        _hf_download(layout.amd_repo, amd_dir)
+    if not (variant_dir / "transformer").exists():
+        _hf_download(
+            layout.amd_repo,
+            amd_dir,
+            allow_patterns=[
+                f"{layout.name}/transformer/*",
+                f"{layout.name}/lora_diffusion_pytorch_model.safetensors",
+            ],
+        )
     if not all((base_dir / sub).exists() for sub in layout.base_subdirs):
         _hf_download(layout.base_repo, base_dir, allow_patterns=[f"{sub}/*" for sub in layout.base_subdirs])
 
     combined.mkdir(parents=True, exist_ok=True)
     for entry in layout.amd_files:
-        _link(amd_dir / entry, combined / entry)
+        _link(variant_dir / entry, combined / entry)
     for sub in layout.base_subdirs:
         _link(base_dir / sub, combined / sub)
     (combined / "model_index.json").write_text(json.dumps(layout.model_index, indent=2) + "\n")

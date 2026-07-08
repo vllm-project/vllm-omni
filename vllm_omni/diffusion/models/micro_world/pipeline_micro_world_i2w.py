@@ -139,46 +139,46 @@ def get_micro_world_i2w_pre_process_func(od_config: OmniDiffusionConfig):
     video_processor = VideoProcessor(vae_scale_factor=8)
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if raw_image is None:
-                raise ValueError(
-                    "No image provided. This model requires an image for I2W generation. "
-                    'Set "multi_modal_data": {"image": <path_or_PIL_Image>}'
-                )
-            if not isinstance(raw_image, (str, PIL.Image.Image)):
-                raise TypeError(f"Unsupported image format {raw_image.__class__}.")
-
-            image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
-
-            # Calculate dimensions based on aspect ratio if not provided
-            if request.sampling_params.height is None or request.sampling_params.width is None:
-                max_area = 480 * 832
-                aspect_ratio = image.height / image.width
-                mod_value = 16
-                h = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                w = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
-                if request.sampling_params.height is None:
-                    request.sampling_params.height = h
-                if request.sampling_params.width is None:
-                    request.sampling_params.width = w
-
-            image = image.resize(
-                (request.sampling_params.width, request.sampling_params.height),
-                PIL.Image.Resampling.LANCZOS,
+        if raw_image is None:
+            raise ValueError(
+                "No image provided. This model requires an image for I2W generation. "
+                'Set "multi_modal_data": {"image": <path_or_PIL_Image>}'
             )
-            prompt["multi_modal_data"]["image"] = image
+        if not isinstance(raw_image, (str, PIL.Image.Image)):
+            raise TypeError(f"Unsupported image format {raw_image.__class__}.")
 
-            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                image, height=request.sampling_params.height, width=request.sampling_params.width
-            )
-            request.prompts[i] = prompt
+        image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
+
+        # Calculate dimensions based on aspect ratio if not provided
+        if request.sampling_params.height is None or request.sampling_params.width is None:
+            max_area = 480 * 832
+            aspect_ratio = image.height / image.width
+            mod_value = 16
+            h = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+            w = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            if request.sampling_params.height is None:
+                request.sampling_params.height = h
+            if request.sampling_params.width is None:
+                request.sampling_params.width = w
+
+        image = image.resize(
+            (request.sampling_params.width, request.sampling_params.height),
+            PIL.Image.Resampling.LANCZOS,
+        )
+        prompt["multi_modal_data"]["image"] = image
+
+        prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
+            image, height=request.sampling_params.height, width=request.sampling_params.width
+        )
+        request.prompt = prompt
         return request
 
     return pre_process_func

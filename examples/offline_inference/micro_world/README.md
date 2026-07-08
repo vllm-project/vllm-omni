@@ -12,75 +12,44 @@ The keyboard/cursor HUD overlay shown in the AMD reference videos is rendered
 as cv2 post-processing on top of the model output (not by the diffusion model
 itself); pass `--draw-hud` to enable it.
 
-## Why a custom `model_index.json`?
+## Model Layout
 
-Both pipelines need a hand-written `model_index.json` in the combined model
-directory. The `_class_name` field tells vllm-omni which pipeline class to
-instantiate. The Wan-AI base repos ship `model_index.json` with
-`_class_name: "WanPipeline"` (T2V base) or `"WanImageToVideoPipeline"` (I2V
-base) — if you symlink those into the combined dir, vllm routes to the
-diffusers stock pipeline instead of `MicroWorld{T2W,I2W}Pipeline`, the
-custom `load_weights` / Kohya LoRA merger never runs, and weights are
-silently skipped. So always write a fresh `model_index.json` with the right
-`_class_name`.
+The examples default to the consolidated Hugging Face repository
+`AMD/Micro-World`:
+
+```
+python examples/offline_inference/micro_world/text_to_world.py \
+  --output micro_world_t2w_output.mp4
+
+python examples/offline_inference/micro_world/image_to_world.py \
+  --image street_night.jpg \
+  --output micro_world_i2w_output.mp4
+```
+
+`AMD/Micro-World` stores the Micro-World-specific transformer and LoRA weights
+under `T2W/` and `I2W/`. The examples automatically compose a local
+Diffusers-style load directory by downloading those AMD weights and symlinking
+the required Wan2.1 base components:
+
+- T2W base: `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`
+- I2W base: `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers`
+
+The composed directory is an internal implementation detail. It is cached under
+`$VLLM_OMNI_MICRO_WORLD_CACHE` when set, otherwise under the Hugging Face cache
+at `~/.cache/huggingface/vllm-omni/micro_world`.
 
 ## T2W — Text-to-World (1.3B)
-
-### Setup
-
-Install dependencies:
-```
-uv pip install -e .
-```
-
-Download the action-conditioned LoRA + transformer (AMD) and the base Wan2.1
-T2V weights (Wan-AI):
-```
-huggingface-cli download amd/Micro-World-T2W --local-dir ./Micro-World-T2W
-huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B-Diffusers --local-dir ./Wan2.1-T2V-Base
-```
-
-Build the combined directory (transformer + LoRA from AMD, the rest from
-Wan-AI; `model_index.json` is hand-written with the Micro-World pipeline class):
-```
-mkdir -p ./Micro-World-T2W-combined
-ln -s $(pwd)/Micro-World-T2W/transformer   ./Micro-World-T2W-combined/transformer
-ln -s $(pwd)/Micro-World-T2W/lora_diffusion_pytorch_model.safetensors \
-                                           ./Micro-World-T2W-combined/lora_diffusion_pytorch_model.safetensors
-ln -s $(pwd)/Wan2.1-T2V-Base/tokenizer     ./Micro-World-T2W-combined/tokenizer
-ln -s $(pwd)/Wan2.1-T2V-Base/text_encoder  ./Micro-World-T2W-combined/text_encoder
-ln -s $(pwd)/Wan2.1-T2V-Base/vae           ./Micro-World-T2W-combined/vae
-
-cat > ./Micro-World-T2W-combined/model_index.json << 'EOF'
-{
-  "_class_name": "MicroWorldT2WPipeline",
-  "_diffusers_version": "0.34.0",
-  "scheduler": ["diffusers", "UniPCMultistepScheduler"],
-  "text_encoder": ["transformers", "UMT5EncoderModel"],
-  "tokenizer": ["transformers", "T5TokenizerFast"],
-  "transformer": ["diffusers", "MicroWorldControlNetTransformer"],
-  "vae": ["diffusers", "AutoencoderKLWan"]
-}
-EOF
-```
-
-The LoRA is merged into the transformer at pipeline init (look for
-`LoRA merge: 306 layers merged, 0 skipped` in the log).
-
-### Run
 
 The example defaults reproduce the AMD reference run (same prompt, action_list,
 seed=43, 30 steps, guidance=3.0, flow_shift=3.0):
 ```
 python examples/offline_inference/micro_world/text_to_world.py \
-  --model ./Micro-World-T2W-combined \
   --output micro_world_t2w_output.mp4
 ```
 
 Override prompt/actions/seed:
 ```
 python examples/offline_inference/micro_world/text_to_world.py \
-  --model ./Micro-World-T2W-combined \
   --prompt "Exploring an ancient jungle ruin in first person perspective." \
   --actions "strafe_left+look_right" --seed 42
 ```
@@ -89,7 +58,6 @@ Custom action list (Micro-World reference format —
 `[[end_frame, "w s a d shift ctrl _ mouse_y mouse_x"], ..., "space_frames"]`):
 ```
 python examples/offline_inference/micro_world/text_to_world.py \
-  --model ./Micro-World-T2W-combined \
   --action-list '[[20, "1 0 0 0 0 0 0 0 0"], [40, "0 1 0 0 0 0 0 0 5"], "30 60"]'
 ```
 
@@ -98,65 +66,18 @@ Add `--draw-hud` to overlay the WASD + mouse-cursor HUD onto each output frame
 
 ## I2W — Image-to-World (14B)
 
-### Setup
-
-Download the I2W transformer + LoRA (AMD) and the base Wan2.1 I2V weights
-(Wan-AI). The I2W transformer is ~36GB, so consider scoping the I2V base
-download to only the subdirectories the pipeline needs:
-```
-huggingface-cli download amd/Micro-World-I2W --local-dir ./Micro-World-I2W
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-720P-Diffusers --local-dir ./Wan2.1-I2V-Base \
-  --include "tokenizer/*" "text_encoder/*" "image_processor/*" "image_encoder/*" "vae/*"
-```
-
-Build the combined directory (note the extra `image_processor` and
-`image_encoder` symlinks compared to T2W):
-```
-mkdir -p ./Micro-World-I2W-combined
-ln -s $(pwd)/Micro-World-I2W/transformer   ./Micro-World-I2W-combined/transformer
-ln -s $(pwd)/Micro-World-I2W/lora_diffusion_pytorch_model.safetensors \
-                                           ./Micro-World-I2W-combined/lora_diffusion_pytorch_model.safetensors
-ln -s $(pwd)/Wan2.1-I2V-Base/tokenizer        ./Micro-World-I2W-combined/tokenizer
-ln -s $(pwd)/Wan2.1-I2V-Base/text_encoder     ./Micro-World-I2W-combined/text_encoder
-ln -s $(pwd)/Wan2.1-I2V-Base/image_processor  ./Micro-World-I2W-combined/image_processor
-ln -s $(pwd)/Wan2.1-I2V-Base/image_encoder    ./Micro-World-I2W-combined/image_encoder
-ln -s $(pwd)/Wan2.1-I2V-Base/vae              ./Micro-World-I2W-combined/vae
-
-cat > ./Micro-World-I2W-combined/model_index.json << 'EOF'
-{
-  "_class_name": "MicroWorldI2WPipeline",
-  "_diffusers_version": "0.34.0",
-  "scheduler": ["diffusers", "UniPCMultistepScheduler"],
-  "text_encoder": ["transformers", "UMT5EncoderModel"],
-  "tokenizer": ["transformers", "T5TokenizerFast"],
-  "image_encoder": ["transformers", "CLIPVisionModel"],
-  "image_processor": ["transformers", "CLIPImageProcessor"],
-  "transformer": ["diffusers", "MicroWorldAdaLNTransformer"],
-  "vae": ["diffusers", "AutoencoderKLWan"]
-}
-EOF
-```
-
-I2W's LoRA covers 488 sites (vs. T2W's 306 — the extras are the I2V image
-cross-attention `cross_attn_k_img/v_img` and the `img_emb` MLP). Look for
-`LoRA merge: 488 layers merged, 0 skipped` in the log to confirm.
-
-### Run
-
 The example defaults reproduce the AMD reference run for I2W
-(`asset/street_night.jpg` + walk-down action sequence, seed=43, 30 steps,
+(`street_night.jpg` + walk-down action sequence, seed=43, 30 steps,
 guidance=6.0, flow_shift=3.0):
 ```
 python examples/offline_inference/micro_world/image_to_world.py \
-  --model ./Micro-World-I2W-combined \
-  --image ./Micro-World/asset/street_night.jpg \
+  --image street_night.jpg \
   --output micro_world_i2w_output.mp4
 ```
 
 Override image / prompt / actions:
 ```
 python examples/offline_inference/micro_world/image_to_world.py \
-  --model ./Micro-World-I2W-combined \
   --image my_scene.jpg \
   --prompt "First-person walk through a forest path." \
   --action-list '[[40, "1 0 0 0 0 0 0 0 0"], [80, "0 0 1 0 0 0 0 0 0"], "40"]'

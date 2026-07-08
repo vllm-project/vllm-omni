@@ -8,31 +8,23 @@ Generates action-controlled video from a text prompt with keyboard/mouse inputs.
 
 Setup
 ─────
-    huggingface-cli download amd/Micro-World-T2W --local-dir ./Micro-World-T2W
-    huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B-Diffusers --local-dir ./Wan2.1-Base
-
-    mkdir -p ./Micro-World-T2W-combined
-    ln -s $(pwd)/Micro-World-T2W/transformer   ./Micro-World-T2W-combined/transformer
-    ln -s $(pwd)/Micro-World-T2W/lora_diffusion_pytorch_model.safetensors \
-                                               ./Micro-World-T2W-combined/lora_diffusion_pytorch_model.safetensors
-    ln -s $(pwd)/Wan2.1-Base/tokenizer         ./Micro-World-T2W-combined/tokenizer
-    ln -s $(pwd)/Wan2.1-Base/text_encoder      ./Micro-World-T2W-combined/text_encoder
-    ln -s $(pwd)/Wan2.1-Base/vae               ./Micro-World-T2W-combined/vae
+    uv pip install -e .
 
 Usage
 ─────
-    # Reproduce the validated reference run (matches AMD Micro-World example):
-    python text_to_world.py --model ./Micro-World-T2W-combined \
-        --output micro_world_t2w_output.mp4
+    # Reproduce the validated reference run. By default, --model resolves
+    # AMD/Micro-World and composes the local load directory with the Wan2.1 base.
+    python text_to_world.py --output micro_world_t2w_output.mp4
 
     # Override prompt/actions/seed:
-    python text_to_world.py --model ./Micro-World-T2W-combined \
+    python text_to_world.py \
         --prompt "Exploring an ancient jungle ruin in first person perspective." \
         --actions "strafe_left+look_right" --seed 42
 
     # Custom action_list (Micro-World reference format):
-    python text_to_world.py --model ./Micro-World-T2W-combined \
+    python text_to_world.py \
         --action-list '[[20, "1 0 0 0 0 0 0 0 0"], [40, "0 1 0 0 0 0 0 0 5"], "30 60"]'
+
 """
 
 import argparse
@@ -42,6 +34,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from _model_resolver import MICRO_WORLD_REPO, resolve_micro_world_model
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -105,7 +98,11 @@ def parse_reference_action_list(action_list: list) -> tuple[list, list]:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="AMD Micro-World T2W generation.")
-    parser.add_argument("--model", required=True, help="Combined model directory path.")
+    parser.add_argument(
+        "--model",
+        default=MICRO_WORLD_REPO,
+        help="Consolidated Micro-World repo id. Defaults to AMD/Micro-World.",
+    )
     parser.add_argument(
         "--prompt",
         default=(
@@ -171,7 +168,7 @@ def main():
         Path(__file__).resolve().parents[3] / "vllm_omni" / "model_executor" / "stage_configs" / "micro_world_t2w.yaml"
     )
     omni = Omni(
-        model=args.model,
+        model=resolve_micro_world_model(args.model, "T2W"),
         stage_configs_path=stage_config,
         flow_shift=args.flow_shift,
         stage_init_timeout=args.stage_init_timeout,
