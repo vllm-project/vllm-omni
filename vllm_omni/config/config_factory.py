@@ -92,9 +92,8 @@ class StageConfigFactory:
     def create_legacy_stage_configs_from_model(
         cls,
         model: str,
-        cli_overrides: dict[str, Any] | None = None,
-        deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None,
     ) -> list[StageConfig] | None:
         """Resolve current runtime stage configs without consuming VllmOmniConfig.
 
@@ -106,9 +105,6 @@ class StageConfigFactory:
         ``VllmOmniConfig`` access instead of relying on a fake typed-to-legacy
         projection.
         """
-        if cli_overrides is None:
-            cli_overrides = {}
-
         resolution = cls.resolve_pipeline_from_model(
             model=model,
             trust_remote_code=cls._get_trust_remote_code(cli_overrides),
@@ -219,7 +215,6 @@ class StageConfigFactory:
         pipeline_cfg: PipelineConfig,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
     ) -> list[StageConfig]:
         """Create current runtime StageConfigs from registry + deploy YAML.
 
