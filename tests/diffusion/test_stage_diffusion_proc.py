@@ -3,77 +3,15 @@
 
 import asyncio
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-from types import SimpleNamespace
 
 import pytest
 
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
-
-
-def test_process_batch_request_preserves_parent_request_id_and_kv_sender_info():
-    async def run_test():
-        captured = {}
-
-        async def step(request):
-            captured["request"] = request
-            return [
-                SimpleNamespace(
-                    images=["img-1"],
-                    _multimodal_output={},
-                    _custom_output={},
-                    metrics={},
-                    stage_durations={},
-                    peak_memory_mb=0.0,
-                    latents=None,
-                    trajectory_latents=None,
-                    trajectory_timesteps=None,
-                    trajectory_log_probs=None,
-                    trajectory_decoded=None,
-                    final_output_type="image",
-                ),
-                SimpleNamespace(
-                    images=["img-2"],
-                    _multimodal_output={},
-                    _custom_output={},
-                    metrics={},
-                    stage_durations={},
-                    peak_memory_mb=0.0,
-                    latents=None,
-                    trajectory_latents=None,
-                    trajectory_timesteps=None,
-                    trajectory_log_probs=None,
-                    trajectory_decoded=None,
-                    final_output_type="image",
-                ),
-            ]
-
-        proc = object.__new__(StageDiffusionProc)
-        proc._engine = SimpleNamespace(step=step)
-        proc._executor = ThreadPoolExecutor(max_workers=1)
-
-        try:
-            result = await proc._process_batch_request(
-                request_id="req-parent",
-                prompts=["hello", "world"],
-                sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
-                kv_sender_info={0: {"host": "10.0.0.2", "zmq_port": 50151}},
-            )
-        finally:
-            proc._executor.shutdown(wait=True)
-
-        request = captured["request"]
-        assert request.request_id == "req-parent"
-        assert not hasattr(request, "request_ids")
-        assert request.kv_sender_info == {0: {"host": "10.0.0.2", "zmq_port": 50151}}
-        assert result.request_id == "req-parent"
-        assert result.images == ["img-1", "img-2"]
-
-    asyncio.run(run_test())
 
 
 @dataclass
@@ -100,6 +38,40 @@ class MockDiffusionEngine:
         delay = DELAY_BASE + delay_scale * DELAY_BASE
         await asyncio.sleep(delay)
         return [MockOmniRequestOutput(request_id=request.request_id)]
+
+
+@pytest.mark.asyncio
+async def test_proc_streaming_request_yields_each_engine_chunk():
+    """Ensure that the streaming output chunks from DiffusionEngine reaches StageDiffusionProc"""
+    captured = {}
+    chunks = [
+        OmniRequestOutput.from_diffusion(request_id="", images=[], finished=False),
+        OmniRequestOutput.from_diffusion(request_id="", images=[], finished=True),
+    ]
+
+    class _StreamingEngine:
+        async def step_streaming(self, request):
+            captured["request"] = request
+            for chunk in chunks:
+                yield [chunk]
+
+    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc._engine = _StreamingEngine()
+
+    outputs = [
+        output
+        async for output in stage_proc._process_streaming_request(
+            request_id="req-stream",
+            prompt="prompt",
+            sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+            kv_sender_info={0: {"host": "127.0.0.1"}},
+        )
+    ]
+
+    assert outputs == chunks
+    assert [output.request_id for output in outputs] == ["req-stream", "req-stream"]
+    assert [output.finished for output in outputs] == [False, True]
+    assert captured["request"].kv_sender_info == {0: {"host": "127.0.0.1"}}
 
 
 @pytest.mark.asyncio

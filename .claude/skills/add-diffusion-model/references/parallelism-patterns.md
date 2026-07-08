@@ -569,4 +569,4 @@ Check which parallelism methods a model supports:
 | **TP** | Uses `ColumnParallelLinear` / `QKVParallelLinear`. Search: `grep -r 'ParallelLinear\|QKVParallel' vllm_omni/diffusion/models/<model>/` |
 | **HSDP** | Transformer defines `_hsdp_shard_conditions`. Search: `grep -r '_hsdp_shard_conditions' vllm_omni/diffusion/models/` |
 
-The canonical per-model support table is in `docs/user_guide/diffusion/parallelism_acceleration.md`.
+The canonical per-model support overview/table is in `docs/user_guide/diffusion/parallelism/overview.md`.

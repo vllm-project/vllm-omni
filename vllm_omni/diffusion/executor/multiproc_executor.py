@@ -16,8 +16,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
-from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.worker import WorkerProc
 
 if TYPE_CHECKING:
@@ -132,6 +131,57 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 if self.is_failed:
                     raise EngineDeadError()
                 continue
+
+    @staticmethod
+    def _raise_for_rpc_error_dict(response: Any) -> None:
+        if isinstance(response, dict) and response.get("status") == "error":
+            raise RuntimeError(
+                f"Worker failed with error '{response.get('error')}', "
+                "please check the stack trace above for the root cause"
+            )
+
+    @staticmethod
+    def _unwrap_rpc_result_envelope(response: Any) -> Any:
+        if not (isinstance(response, dict) and response.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE):
+            return response
+
+        rank_statuses = response.get("rank_statuses") or []
+        failed = [status for status in rank_statuses if not status.get("ok", False)]
+        if failed:
+            details = "; ".join(
+                f"rank {status.get('rank')}: {status.get('error_type') or 'Error'}: {status.get('error')}"
+                for status in failed
+            )
+            tracebacks = "\n\n".join(
+                f"rank {status.get('rank')} traceback:\n{status['traceback']}"
+                for status in failed
+                if status.get("traceback")
+            )
+            if tracebacks:
+                details = f"{details}\n\n{tracebacks}"
+            method = response.get("method", "<unknown>")
+            raise RuntimeError(f"RPC '{method}' failed on worker rank(s): {details}")
+
+        result = response.get("result")
+        if isinstance(result, bool):
+            # Only bool-returning RPCs participate in the all-rank AND.
+            # Non-bool results leave bool_result unset and are ignored here.
+            bool_results = [
+                status.get("bool_result") for status in rank_statuses if status.get("bool_result") is not None
+            ]
+            if bool_results and not all(bool_results):
+                return False
+        return result
+
+    @staticmethod
+    def _handle_rpc_response(response: Any) -> Any:
+        MultiprocDiffusionExecutor._raise_for_rpc_error_dict(response)
+        response = MultiprocDiffusionExecutor._unwrap_rpc_result_envelope(response)
+        # After unwrapping, a worker method result may itself be the same
+        # {"status": "error"} shape produced by worker_busy_loop transport
+        # failures. Preserve the pre-envelope error handling for that case.
+        MultiprocDiffusionExecutor._raise_for_rpc_error_dict(response)
+        return response
 
     def _launch_workers(self, broadcast_handle, wake_events):
         od_config = self.od_config
@@ -257,69 +307,69 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         """Register a callback invoked when a worker process dies."""
         self._failure_callbacks.append(callback)
 
-    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        self._ensure_open()
-        rpc_request = {
-            "type": "rpc",
-            "method": "generate",
-            "args": (request,),
-            "kwargs": {},
-            "output_rank": 0,
-            "exec_all_ranks": True,
-        }
-
-        try:
-            self._broadcast_mq.enqueue(rpc_request)
-            response = self._result_mq.dequeue()
-
-            try:
-                unpack_diffusion_output_shm(response)
-            except Exception as e:
-                logger.warning("SHM unpack failed (data may already be inline): %s", e)
-
-            if isinstance(response, dict) and response.get("status") == "error":
-                raise RuntimeError(
-                    f"Worker failed with error '{response.get('error')}', "
-                    "please check the stack trace above for the root cause"
-                )
-            if not isinstance(response, DiffusionOutput):
-                raise RuntimeError(f"Unexpected response type for generate: {type(response)!r}")
-            return response
-        except Exception as e:
-            logger.error(f"Generate call failed: {e}")
-            raise
-
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Adapt request-mode scheduler output to worker execute_model RPC."""
-        from vllm_omni.diffusion.worker.utils import RunnerOutput
+        """Adapt request-mode scheduler output to worker execute_model RPCs.
+
+        Returns a BatchRunnerOutput with one RunnerOutput per scheduled request.
+        """
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
         self._ensure_open()
-        if scheduler_output.num_scheduled_reqs != 1:
-            raise ValueError(
-                f"Request mode currently supports batch_size=1, "
-                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
-            )
+        runner_outputs: list[RunnerOutput] = []
 
-        new_req = scheduler_output.scheduled_new_reqs[0]
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req = new_req.req
+            try:
+                result = self.collective_rpc(
+                    "execute_model",
+                    args=(req, self.od_config, scheduler_output.kv_prefetch_jobs),
+                    unique_reply_rank=0,
+                    exec_all_ranks=True,
+                )
+                if not isinstance(result, DiffusionOutput):
+                    raise RuntimeError(f"Unexpected response type: {type(result)!r}")
+                runner_outputs.append(
+                    RunnerOutput(
+                        request_id=new_req.request_id,
+                        step_index=None,
+                        finished=True,
+                        result=result,
+                    )
+                )
+            except Exception as exc:
+                runner_outputs.append(
+                    RunnerOutput(
+                        request_id=new_req.request_id,
+                        step_index=None,
+                        finished=True,
+                        result=DiffusionOutput(error=str(exc)),
+                    )
+                )
+
+        return BatchRunnerOutput.from_list(runner_outputs)
+
+    def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Execute request-mode work through a single batched worker RPC.
+
+        The worker builds DiffusionRequestBatch from scheduler output and returns
+        BatchRunnerOutput with one RunnerOutput per scheduled request.
+        """
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+
+        self._ensure_open()
         result = self.collective_rpc(
-            "execute_model",
-            args=(new_req.req, self.od_config),
+            "execute_model_batch",
+            args=(scheduler_output, self.od_config),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
-        if not isinstance(result, DiffusionOutput):
-            raise RuntimeError(f"Unexpected response type for execute_request: {type(result)!r}")
-
-        return RunnerOutput(
-            request_id=new_req.request_id,
-            step_index=None,
-            finished=True,
-            result=result,
-        )
+        if not isinstance(result, BatchRunnerOutput):
+            raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
+        return result
 
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
-        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, RunnerOutput
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         self._ensure_open()
         result = self.collective_rpc(
@@ -331,18 +381,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         if isinstance(result, BaseRunnerOutput):
             return result
-        # TODO: Remove this fallback; DiffusionOutput cannot faithfully represent
-        # failed multi-request step batches.
-        if isinstance(result, DiffusionOutput):
-            request_id = scheduler_output.scheduled_request_ids[0] if scheduler_output.scheduled_request_ids else ""
-            return RunnerOutput(
-                request_id=request_id,
-                step_index=None,
-                finished=True,
-                result=result,
-            )
-        else:
-            raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+        raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
     def collective_rpc(
         self,
@@ -358,16 +397,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
-        # Prepare RPC request message
-        # When unique_reply_rank is None, all workers must execute the RPC
-        # but only rank 0 can reply (it's the only one with a result_mq).
+        # Prepare RPC request message. When unique_reply_rank is None, all
+        # workers must execute the RPC but only rank 0 can reply (it's the
+        # only one with a result_mq). Collect detailed rank statuses only for
+        # this control-plane all-rank path; forward-path exec_all_ranks RPCs
+        # avoid the per-step host object gather.
+        execute_all_ranks = unique_reply_rank is None or exec_all_ranks
+        collect_rank_status = unique_reply_rank is None
         rpc_request = {
             "type": "rpc",
             "method": method,
             "args": args,
             "kwargs": kwargs,
             "output_rank": unique_reply_rank if unique_reply_rank is not None else 0,
-            "exec_all_ranks": unique_reply_rank is None or exec_all_ranks,
+            "exec_all_ranks": execute_all_ranks,
+            "collect_rank_status": collect_rank_status,
         }
 
         try:
@@ -386,12 +430,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 except Exception as e:
                     logger.warning("SHM unpack failed (data may already be inline): %s", e)
 
-                # Check if response indicates an error
-                if isinstance(response, dict) and response.get("status") == "error":
-                    raise RuntimeError(
-                        f"Worker failed with error '{response.get('error')}', "
-                        "please check the stack trace above for the root cause"
-                    )
+                response = MultiprocDiffusionExecutor._handle_rpc_response(response)
 
                 responses.append(response)
 

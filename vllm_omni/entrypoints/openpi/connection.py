@@ -7,6 +7,16 @@ Protocol (compatible with OpenPI policy clients):
     Connect  -> server sends msgpack(PolicyServerConfig fields)
     Infer    -> client sends msgpack(obs), server sends msgpack(ndarray)
     Reset    -> client sends msgpack({endpoint:reset}), server sends msgpack(status)
+
+NumPy values use msgpack-numpy marker mappings. Outbound payloads follow the
+openpi-client format so official OpenPI clients can decode action responses:
+    ndarray -> {__ndarray__: true, dtype, shape, data}
+    scalar  -> {__npgeneric__: true, dtype, data}
+
+Inbound payloads accept both the openpi-client markers above and the legacy
+vLLM-native markers:
+    ndarray -> {nd: true, type, kind, shape, data}
+    scalar  -> {nd: false, type, kind, data}
 """
 
 from __future__ import annotations
@@ -14,6 +24,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import msgspec
+import numpy as np
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 from vllm.logger import init_logger
@@ -25,26 +37,113 @@ from vllm_omni.entrypoints.openpi.serving import (
 logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
 MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
+_MISSING = object()
 
 
-def _get_msgpack_numpy() -> Any:
-    try:
-        from openpi_client import msgpack_numpy
-    except ImportError as exc:
-        raise ImportError(
-            "The `/v1/realtime/robot/openpi` endpoint requires the optional "
-            "`openpi-client` dependency. Install it with `pip install openpi-client`."
-        ) from exc
+def _pack_numpy(obj: Any) -> Any:
+    if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
+        raise ValueError(f"Unsupported dtype: {obj.dtype}")
+    if isinstance(obj, np.ndarray):
+        if not obj.flags.c_contiguous:
+            obj = np.ascontiguousarray(obj)
+        return {
+            b"__ndarray__": True,
+            b"data": obj.tobytes(),
+            b"dtype": obj.dtype.str,
+            b"shape": obj.shape,
+        }
+    if isinstance(obj, np.generic):
+        return {
+            b"__npgeneric__": True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
+        }
+    raise TypeError(f"Unsupported type: {type(obj)!r}")
 
-    return msgpack_numpy
+
+def _mapping_get(obj: dict[Any, Any], key: str, default: Any = None) -> Any:
+    return obj.get(key, obj.get(key.encode(), default))
+
+
+def _decode_marker_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)
+
+
+def _is_truthy_marker(value: Any) -> bool:
+    return value is True or value == 1
+
+
+def _decode_vllm_numpy_marker(obj: dict[Any, Any]) -> Any:
+    nd = _mapping_get(obj, "nd", _MISSING)
+    dtype = _mapping_get(obj, "type", _MISSING)
+    kind = _mapping_get(obj, "kind", _MISSING)
+    data = _mapping_get(obj, "data", _MISSING)
+    if nd is _MISSING or dtype is _MISSING or kind is _MISSING or data is _MISSING:
+        return _MISSING
+
+    dtype_obj = np.dtype(_decode_marker_text(dtype))
+    kind_text = _decode_marker_text(kind)
+    if dtype_obj.kind != kind_text:
+        raise ValueError(f"NumPy dtype marker kind mismatch: {dtype_obj.kind!r} != {kind_text!r}")
+    if dtype_obj.kind in ("V", "O", "c"):
+        raise ValueError(f"Unsupported dtype: {dtype_obj}")
+
+    array = np.frombuffer(data, dtype=dtype_obj).copy()
+    if nd:
+        shape = _mapping_get(obj, "shape", _MISSING)
+        if shape is _MISSING:
+            raise ValueError("NumPy ndarray marker is missing shape")
+        return array.reshape(tuple(shape))
+    return array[0]
+
+
+def _decode_openpi_numpy_marker(obj: dict[Any, Any]) -> Any:
+    if _is_truthy_marker(_mapping_get(obj, "__ndarray__", False)):
+        data = _mapping_get(obj, "data", _MISSING)
+        dtype = _mapping_get(obj, "dtype", _MISSING)
+        shape = _mapping_get(obj, "shape", _MISSING)
+        if data is _MISSING or dtype is _MISSING or shape is _MISSING:
+            raise ValueError("OpenPI ndarray marker is missing required fields")
+
+        dtype_obj = np.dtype(_decode_marker_text(dtype))
+        if dtype_obj.kind in ("V", "O", "c"):
+            raise ValueError(f"Unsupported dtype: {dtype_obj}")
+        array = np.frombuffer(data, dtype=dtype_obj).copy()
+        return array.reshape(tuple(shape))
+
+    if _is_truthy_marker(_mapping_get(obj, "__npgeneric__", False)):
+        data = _mapping_get(obj, "data", _MISSING)
+        dtype = _mapping_get(obj, "dtype", _MISSING)
+        if data is _MISSING or dtype is _MISSING:
+            raise ValueError("OpenPI scalar marker is missing required fields")
+        dtype_obj = np.dtype(_decode_marker_text(dtype))
+        if dtype_obj.kind in ("V", "O", "c"):
+            raise ValueError(f"Unsupported dtype: {dtype_obj}")
+        return dtype_obj.type(data)
+
+    return _MISSING
+
+
+def _unpack_numpy(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        for decoder in (_decode_vllm_numpy_marker, _decode_openpi_numpy_marker):
+            decoded = decoder(obj)
+            if decoded is not _MISSING:
+                return decoded
+        return {key: _unpack_numpy(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_unpack_numpy(value) for value in obj]
+    return obj
 
 
 def _pack(obj: Any) -> bytes:
-    return _get_msgpack_numpy().packb(obj)
+    return msgspec.msgpack.encode(obj, enc_hook=_pack_numpy)
 
 
 def _unpack(data: bytes) -> Any:
-    return _get_msgpack_numpy().unpackb(data)
+    return _unpack_numpy(msgspec.msgpack.decode(data))
 
 
 class RobotRealtimeConnection:

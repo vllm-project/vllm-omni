@@ -116,8 +116,39 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 !!! note
     If the PR spans more than one category, please include all relevant prefixes.
 
+### Pre-Check Before Submitting
+
+Before submitting a PR, run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-review against project conventions:
+
+The skill offers two modes:
+- **Quick (~3 min):** catches showstoppers — PR title format, missing benchmark claims, rebase status
+- **Full (~10 min):** thorough maintainer-grade review — dead code scan, copy-paste detection, import hygiene
+
+The precheck covers five PR types: Bug Fix, Performance, New Model, Diffusion Model, and General. Each type has a tailored checklist that validates evidence quality (repro steps, A/B benchmarks, registry entries, etc.). See the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) for the full checklist.
+
 ### Local Test
 Please run the L1 and L2 test cases locally first and attach the results before contacting us to add the "ready" label. Please refer to the [test instructions](./ci/test_guide.md) for running the test cases.
+
+### Automatic skip-ci (docs and pytest skip marks)
+
+On pull requests and `main` pushes, the bootstrap step in [`.buildkite/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/pipeline.yml) runs [`.buildkite/scripts/upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/scripts/upload_pipeline.py) against the git diff. When every changed file qualifies, **L2 (`ready`) and L3 (`merge-test`) pipelines are not uploaded**, so the default GPU CI jobs are skipped.
+
+| Change per file | Examples |
+| --- | --- |
+| Documentation | `docs/**`, any `*.md`, `mkdocs.yml` |
+| Pytest skip marks only (under `tests/`) | Add/remove/edit `@pytest.mark.skip`, `@pytest.mark.skipif`, or `pytest.skip(...)`; reformat `pytestmark` only to add a skip/skipif alongside existing `pytest.mark.*` entries |
+| New skipped test module | New `tests/**/*.py` whose `pytestmark` includes unconditional `pytest.mark.skip` |
+
+These PR shapes all trigger skip-ci:
+
+- Documentation only
+- Qualifying skip-mark edits in `tests/**/*.py` only
+- **A mix of documentation and qualifying skip-mark test edits**
+
+Skip-ci does **not** apply when the diff also touches product code (for example `vllm_omni/`), or when test files change assertions, imports, fixtures, or other non-skip logic. If the diff cannot be resolved (non-PR branches outside `main`), CI runs as usual.
+
+!!! note
+    Skipping L2/L3 does **not** disable the Docker image build step. Nightly (L4) upload can still run when the PR has a `nightly-test` label or on scheduled `main` builds with `NIGHTLY=1`. See [CI levels](./ci/CI_5levels.md) for how bootstrap skip-ci relates to diff-gated E2E jobs.
 
 ### Code Quality
 
