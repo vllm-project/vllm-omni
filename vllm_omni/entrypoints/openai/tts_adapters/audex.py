@@ -31,11 +31,16 @@ class AudexAdapter(ARTTSAdapter):
             return "Audex does not support reference audio (no voice cloning)."
         extra = request.extra_params or {}
         cfg_scale = extra.get("cfg_scale")
-        if cfg_scale is not None and float(cfg_scale) != 1.0:
-            return (
-                f"Audex classifier-free guidance is not yet supported; got cfg_scale={cfg_scale}. "
-                "Omit cfg_scale or pass 1.0."
-            )
+        if cfg_scale is not None:
+            try:
+                cfg_value = float(cfg_scale)
+            except (TypeError, ValueError):
+                cfg_value = None
+            if cfg_value != 1.0:
+                return (
+                    f"Audex classifier-free guidance is not yet supported; got cfg_scale={cfg_scale!r}. "
+                    "Omit cfg_scale or pass 1.0."
+                )
         return None
 
     async def build(
