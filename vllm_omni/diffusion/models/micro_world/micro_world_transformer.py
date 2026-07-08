@@ -255,7 +255,10 @@ class MicroWorldControlNetTransformer(WanTransformer3DModel):
         # WanRotaryPosEmbed emits full head_dim via repeat_interleave(2); the
         # pair-rotation kernel expects half head_dim, so take the even slice.
         freqs_cos, freqs_sin = self.rope(hidden_states)
-        rotary_emb = (freqs_cos[..., 0::2], freqs_sin[..., 0::2])
+        rotary_emb = (
+            freqs_cos[..., 0::2].to(dtype=hidden_states.dtype),
+            freqs_sin[..., 0::2].to(dtype=hidden_states.dtype),
+        )
 
         # Patch embedding and flatten to sequence
         hidden_states = self.patch_embedding(hidden_states)
@@ -580,7 +583,10 @@ class MicroWorldAdaLNTransformer(WanTransformer3DModel):
         # WanRotaryPosEmbed emits full head_dim via repeat_interleave(2); the
         # pair-rotation kernel expects half head_dim, so take the even slice.
         freqs_cos, freqs_sin = self.rope(hidden_states)
-        rotary_emb = (freqs_cos[..., 0::2], freqs_sin[..., 0::2])
+        rotary_emb = (
+            freqs_cos[..., 0::2].to(dtype=hidden_states.dtype),
+            freqs_sin[..., 0::2].to(dtype=hidden_states.dtype),
+        )
 
         # Patch embedding and flatten to sequence
         hidden_states = self.patch_embedding(hidden_states)
