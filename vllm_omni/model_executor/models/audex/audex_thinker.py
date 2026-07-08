@@ -396,7 +396,10 @@ class NemotronDenseForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor | IntermediateTensors:
+        # The omni AR runner forwards extra bookkeeping kwargs (e.g.
+        # sampling_metadata); this plain LM ignores them.
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(

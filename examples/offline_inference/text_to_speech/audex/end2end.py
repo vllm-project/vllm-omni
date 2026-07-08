@@ -117,7 +117,7 @@ def _write_outputs(outputs, batch: list[tuple[str, str]], output_dir: Path) -> f
         raise RuntimeError(f"expected {len(batch)} outputs, got {len(ordered)}")
 
     total_dur = 0.0
-    for (utt, _text), req_output in zip(ordered, batch):
+    for (utt, _text), req_output in zip(batch, ordered):
         mm = req_output.outputs[0].multimodal_output
         pcm = _extract_pcm(mm)
         dur = pcm.numel() / SAMPLE_RATE

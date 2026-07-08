@@ -51,6 +51,7 @@ def resolve_adapter(model_type: str | None) -> type[TTSModelAdapter] | None:
 # Import adapter modules for their registration side effects. Keep at the bottom
 # so the registry helpers above are defined first.
 from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
+    audex,
     cosyvoice3,
     covo_audio,
     fish_speech,

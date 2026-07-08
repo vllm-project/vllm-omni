@@ -1,0 +1,284 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CPU unit tests for Audex integration components (no model weights)."""
+
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm_omni.model_executor.models.audex.checkpoint import ensure_audiogen_weights
+from vllm_omni.model_executor.models.audex.pipeline import (
+    AUDEX_PIPELINE,
+    AUDEX_SPEECHGEN_END_TOKEN_ID,
+)
+from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt, build_null_prompt
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+# ---------------------------------------------------------------- prompt
+
+
+def test_cond_prompt_matches_official_format_byte_for_byte():
+    text = "The weather is so good."
+    official = (
+        "<|im_start|>system\n"
+        "You are a helpful and harmless assistant.\n\n"
+        "You are not allowed to use any tools.<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"<|text to speech|> Generate speech for this transcription. {text}<|im_end|>\n"
+        "<|im_start|>assistant\n<think></think><speechgen_start>"
+    )
+    assert build_cond_prompt(text) == official
+
+
+def test_cond_prompt_rejects_empty_text():
+    with pytest.raises(ValueError):
+        build_cond_prompt("   ")
+
+
+def test_null_prompt_is_reserved_for_cfg():
+    with pytest.raises(NotImplementedError):
+        build_null_prompt("prompt", tokenizer=None)
+
+
+# ---------------------------------------------------------------- pipeline / registries
+
+
+def test_pipeline_topology():
+    assert AUDEX_PIPELINE.model_type == "nemotron_labs_audex"
+    stage0, stage1 = AUDEX_PIPELINE.stages
+    assert stage0.model_stage == "audex_thinker"
+    assert stage0.model_subdir == "checkpoint_folder_audiogen"
+    assert stage0.sampling_constraints["stop_token_ids"] == [AUDEX_SPEECHGEN_END_TOKEN_ID]
+    assert stage0.sampling_constraints["detokenize"] is False
+    assert stage1.model_stage == "audex_code2wav"
+    assert stage1.model_arch == "AudexCode2Wav"
+    assert stage1.model_subdir == "audex_causal_speech_decoder"
+    # The decoder folder has no tokenizer files; stage 1 must borrow the thinker's.
+    assert stage1.tokenizer_subdir == "checkpoint_folder_audiogen"
+    assert stage1.final_output_type == "audio"
+
+
+def test_pipeline_registered():
+    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+
+    assert OMNI_PIPELINES["nemotron_labs_audex"] is AUDEX_PIPELINE
+
+
+def test_model_registry_entries():
+    from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+    assert _OMNI_MODELS["NemotronDenseForCausalLM"] == ("audex", "audex_thinker", "NemotronDenseForCausalLM")
+    assert _OMNI_MODELS["AudexCode2Wav"] == ("audex", "audex_code2wav", "AudexCode2Wav")
+
+
+def test_resolve_adapter_audex():
+    from vllm_omni.entrypoints.openai.tts_adapters import resolve_adapter
+
+    adapter_cls = resolve_adapter("audex")
+    assert adapter_cls is not None
+    assert adapter_cls.name == "audex"
+
+
+def test_prompt_construction_not_in_serving_speech():
+    """Guard: Audex prompt building lives in the adapter, never serving_speech."""
+    serving = (_REPO_ROOT / "vllm_omni/entrypoints/openai/serving_speech.py").read_text()
+    assert "<|text to speech|>" not in serving
+
+
+# ---------------------------------------------------------------- adapter policies
+
+
+def _adapter():
+    from vllm_omni.entrypoints.openai.tts_adapters.audex import AudexAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+
+    return AudexAdapter(SpeechServingContext(server=None))
+
+
+def _speech_request(**kwargs):
+    defaults = dict(input="Hello.", voice=None, ref_audio=None, extra_params=None)
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+@pytest.mark.parametrize("voice", [None, "", "default", "Default"])
+def test_adapter_accepts_default_voice(voice):
+    assert _adapter().validate(_speech_request(voice=voice)) is None
+
+
+@pytest.mark.parametrize("voice", ["alloy", "vivian"])
+def test_adapter_rejects_other_voices(voice):
+    err = _adapter().validate(_speech_request(voice=voice))
+    assert err is not None and voice in err
+
+
+def test_adapter_rejects_empty_input():
+    assert _adapter().validate(_speech_request(input="  ")) is not None
+
+
+def test_adapter_rejects_ref_audio():
+    assert _adapter().validate(_speech_request(ref_audio="ref.wav")) is not None
+
+
+def test_adapter_cfg_scale_policy():
+    adapter = _adapter()
+    assert adapter.validate(_speech_request(extra_params={"cfg_scale": 1.0})) is None
+    err = adapter.validate(_speech_request(extra_params={"cfg_scale": 1.5}))
+    assert err is not None and "cfg_scale" in err
+
+
+# ---------------------------------------------------------------- code2wav helpers
+
+
+def test_code2wav_meta_and_codes_helpers():
+    from vllm_omni.model_executor.models.audex.audex_code2wav import (
+        _codes_from_runtime_info,
+        _meta_bool,
+        _meta_str,
+    )
+
+    assert _codes_from_runtime_info({"codes": {"audio": torch.tensor([1, 2])}}) == [1, 2]
+    assert _codes_from_runtime_info({"codes": {"audio": [3, 4]}}) == [3, 4]
+    assert _codes_from_runtime_info({}) == []
+    assert _meta_bool(torch.tensor(True)) is True
+    assert _meta_bool([torch.tensor(False)]) is False
+    assert _meta_str(["req-1"]) == "req-1"
+    assert _meta_str(None) is None
+
+
+def test_code2wav_session_freed_on_finish_and_abort():
+    from vllm_omni.model_executor.models.audex.audex_code2wav import AudexCode2Wav
+
+    model = AudexCode2Wav.__new__(AudexCode2Wav)
+    model._sessions = {}
+    model._emit_chunk_frames = 5
+
+    class _FakeSession:
+        def push(self, frames):
+            yield 16000, torch.zeros(len(frames) * 320)
+
+        def flush(self):
+            yield 16000, torch.zeros(320)
+
+    model.decoder = SimpleNamespace(create_session=lambda **_: _FakeSession())
+
+    audio = model._decode_request("req-a", [1, 2, 3], finished=False)
+    assert "req-a" in model._sessions
+    assert audio.numel() > 0
+
+    audio = model._decode_request("req-a", [4], finished=True)
+    assert "req-a" not in model._sessions
+    assert audio.numel() > 0
+
+    # Abort path: session freed via on_requests_finished.
+    model._decode_request("req-b", [1], finished=False)
+    assert "req-b" in model._sessions
+    model.on_requests_finished(["req-b"])
+    assert "req-b" not in model._sessions
+
+
+# ---------------------------------------------------------------- checkpoint preparation
+
+
+def test_ensure_audiogen_weights_links_missing_shard(tmp_path):
+    root = tmp_path
+    full = root / "checkpoint_folder_full"
+    audiogen = root / "checkpoint_folder_audiogen"
+    full.mkdir()
+    audiogen.mkdir()
+    (full / "model-00001-of-00002.safetensors").write_bytes(b"weights")
+    index = {"weight_map": {"lm_head.weight": "model-00001-of-00002.safetensors"}}
+    (audiogen / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    ensure_audiogen_weights(str(audiogen))
+    linked = audiogen / "model-00001-of-00002.safetensors"
+    assert linked.exists()
+    assert linked.read_bytes() == b"weights"
+
+    # Idempotent.
+    ensure_audiogen_weights(str(audiogen))
+
+
+def test_ensure_audiogen_weights_raises_when_source_missing(tmp_path):
+    audiogen = tmp_path / "checkpoint_folder_audiogen"
+    audiogen.mkdir()
+    index = {"weight_map": {"lm_head.weight": "model-00001-of-00002.safetensors"}}
+    (audiogen / "model.safetensors.index.json").write_text(json.dumps(index))
+    with pytest.raises(FileNotFoundError):
+        ensure_audiogen_weights(str(audiogen))
+
+
+def test_ensure_audiogen_weights_noop_without_index(tmp_path):
+    ensure_audiogen_weights(str(tmp_path))  # must not raise
+
+
+# ---------------------------------------------------------------- path resolution (both config paths)
+
+
+def test_legacy_subdir_resolution(tmp_path):
+    from vllm_omni.engine.stage_init_utils import _resolve_model_tokenizer_paths
+
+    (tmp_path / "checkpoint_folder_audiogen").mkdir()
+    (tmp_path / "audex_causal_speech_decoder").mkdir()
+
+    engine_args = {"model_subdir": "checkpoint_folder_audiogen", "tokenizer_subdir": "checkpoint_folder_audiogen"}
+    model = _resolve_model_tokenizer_paths(str(tmp_path), engine_args)
+    assert model == os.path.join(str(tmp_path), "checkpoint_folder_audiogen")
+    assert engine_args["tokenizer"] == os.path.join(str(tmp_path), "checkpoint_folder_audiogen")
+    # Consumed, not forwarded to the vLLM engine.
+    assert "model_subdir" not in engine_args and "tokenizer_subdir" not in engine_args
+
+
+def test_structured_config_propagates_subdirs():
+    from vllm_omni.config.omni_config import VllmOmniConfig
+
+    config = VllmOmniConfig.from_registry("nemotron_labs_audex")
+    stage0, stage1 = config.stage_configs
+    assert stage0.model_config.model_subdir == "checkpoint_folder_audiogen"
+    assert stage0.model_config.tokenizer_subdir == "checkpoint_folder_audiogen"
+    assert stage1.model_config.model_subdir == "audex_causal_speech_decoder"
+    assert stage1.model_config.tokenizer_subdir == "checkpoint_folder_audiogen"
+
+
+def test_structured_config_unknown_model_type_is_clear_error():
+    from vllm_omni.config.omni_config import VllmOmniConfig
+
+    with pytest.raises(KeyError):
+        VllmOmniConfig.from_registry("no_such_model_type")
+
+
+# ---------------------------------------------------------------- tokenizer pinning (needs local snapshot)
+
+
+def _local_audiogen_dir() -> str | None:
+    try:
+        from huggingface_hub import snapshot_download
+
+        root = snapshot_download("nvidia/Nemotron-Labs-Audex-2B", local_files_only=True)
+        path = os.path.join(root, "checkpoint_folder_audiogen")
+        return path if os.path.isdir(path) else None
+    except Exception:
+        return None
+
+
+@pytest.mark.skipif(_local_audiogen_dir() is None, reason="Audex snapshot not in local HF cache")
+def test_tokenizer_pins_codec_offset_and_markers():
+    from transformers import AutoTokenizer
+
+    from vllm_omni.model_executor.stage_input_processors.audex import (
+        _DEFAULT_CODEC_TOKEN_OFFSET,
+        _DEFAULT_CODEC_VOCAB_SIZE,
+    )
+
+    tok = AutoTokenizer.from_pretrained(_local_audiogen_dir())
+    vocab = tok.get_vocab()
+    assert vocab["<speechcodec_0>"] == _DEFAULT_CODEC_TOKEN_OFFSET
+    assert vocab["<speechcodec_65535>"] == _DEFAULT_CODEC_TOKEN_OFFSET + _DEFAULT_CODEC_VOCAB_SIZE - 1
+    assert vocab["<speechgen_end>"] == AUDEX_SPEECHGEN_END_TOKEN_ID
+    assert vocab["<speechgen_start>"] == AUDEX_SPEECHGEN_END_TOKEN_ID - 1

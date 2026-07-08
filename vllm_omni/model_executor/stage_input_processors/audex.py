@@ -121,8 +121,11 @@ def thinker2code2wav_async_chunk(
 
     state["emitted_chunks"] += 1
     finished_flag = torch.tensor(finished, dtype=torch.bool)
+    # Shape [frames, 1]: 2-D codec payloads ride the connector's payload
+    # channel into ``runtime_additional_information`` (1-D tensors are
+    # rerouted onto the token path and never reach the model's payload view).
     return OmniPayloadStruct(
-        codes=CodesStruct(audio=torch.tensor(emit, dtype=torch.long)),
+        codes=CodesStruct(audio=torch.tensor(emit, dtype=torch.long).reshape(-1, 1)),
         meta=MetaStruct(
             finished=finished_flag,
             # The chunk adapter strips ``meta.finished`` before it reaches the

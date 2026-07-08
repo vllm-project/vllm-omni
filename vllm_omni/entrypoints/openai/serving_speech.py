@@ -99,6 +99,7 @@ _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
 _INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
+_AUDEX_TTS_MODEL_STAGES = {"audex_thinker"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -116,6 +117,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
+    | _AUDEX_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -726,6 +728,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "step_audio2"
         if model_stage in _INDEXTTS2_TTS_MODEL_STAGES:
             return "indextts2"
+        if model_stage in _AUDEX_TTS_MODEL_STAGES:
+            return "audex"
         return None
 
     def _get_custom_voice_dir(self) -> str | None:
