@@ -138,6 +138,25 @@ def is_flash_attn_installed() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def is_flash_attn_4_installed() -> bool:
+    """Return whether FlashAttention-4 (``flash_attn.cute``) is importable.
+
+    Kept separate from the FA2/FA3 chain above: the ``flash-attn-4`` wheel
+    publishes only the ``flash_attn.cute`` namespace (no ``flash_attn.ops`` /
+    ``flash_attn_interface``), and conversely older ``flash-attn`` wheels ship
+    a ``flash_attn/cute`` directory whose imports fail against current
+    ``nvidia-cutlass-dsl`` — so only a real import (not ``find_spec``) is a
+    reliable probe, and any failure means unavailable.
+    """
+    try:
+        from flash_attn.cute import flash_attn_func  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 def _index_first_axis(tensor, indices):
     """
     A local implementation of the PyTorch indexing operation `tensor[indices]` on the first axis,

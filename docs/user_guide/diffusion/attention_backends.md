@@ -10,19 +10,33 @@ This backend is used by diffusion attention layers such as the DiT attention in 
 
 The full set of backends and their platform defaults is in the **Backend Options** and **Platform Defaults** sections below. If no attention backend is configured, vLLM-Omni asks the current platform to choose the default.
 
-## Backend Options
+## Backend Feature Support
 
-| Value | Notes |
+### Legend
+
+| Column | Description |
 |---|---|
-| `FLASH_ATTN` | Wraps FlashAttention 2. Default on Hopper / Ada / Ampere when `flash-attn` is installed. |
-| `CUDNN_ATTN` | Pins `sdpa_kernel([CUDNN_ATTENTION])`. Default on Blackwell (sm_10x / sm_12x) with cuDNN ≥ 9.5. Wins on mask-heavy DiTs (HunyuanVideo-1.5: 2× e2e vs SDPA). |
-| `FLASHINFER_ATTN` | Calls FlashInfer's dense `single_prefill_with_kv_cache` directly with `custom_mask` for non-causal masked attention. Used as Blackwell fallback when cuDNN is unavailable. Requires `flashinfer`. |
-| `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
-| `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
-| `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
+| Requires | Extra package needed beyond a stock vLLM-Omni install |
+| Dtypes | Supported activation data types |
+| Lossless | Bit-accurate attention math at the model dtype (❌ = quantized/lossy kernels) |
+| Masks | Non-causal `attn_mask` / varlen support (needed by mask-heavy DiTs) |
+| Head Sizes | Supported attention head dimensions ("Any" = no backend-side restriction) |
+| Compute Cap. | Required CUDA compute capability |
+
+Symbols: ✅ = supported, ❌ = not supported.
+
+| Backend | Requires | Dtypes | Lossless | Masks | Head Sizes | Compute Cap. | Notes |
+|---|---|---|---|---|---|---|---|
+| `FLASH_ATTN` | `flash-attn` | fp16, bf16 | ✅ | ✅ | 64, 96, 128, 192, 256 | ≥ 8.0 | FlashAttention 2; auto-route default on pre-Blackwell |
+| `FLASH_ATTN_4` | `flash-attn-4` (pre-release) | fp16, bf16 | ✅ | ✅ | 64, 96, 128, 256 | ≥ 8.0 | Opt-in, never auto-routed — see [FlashAttention-4](#flashattention-4-datacenter-blackwell) |
+| `CUDNN_ATTN` | cuDNN ≥ 9.5 (in PyTorch 2.5+ wheels) | fp16, bf16 | ✅ | ✅ | Any (%8, ≤ 256) | Any | Pins `sdpa_kernel([CUDNN_ATTENTION])`; auto-route default on Blackwell; 2× e2e on mask-heavy DiTs (HV-1.5) |
+| `FLASHINFER_ATTN` | `flashinfer` | fp16, bf16 | ✅ | ✅ (`custom_mask`) | 64, 128, 256 | ≥ 8.0 | Dense `single_prefill_with_kv_cache`; Blackwell fallback when cuDNN < 9.5 |
+| `TORCH_SDPA` | — | fp16, bf16, fp32 | ✅ | ✅ | Any | Any | Default dispatcher; most conservative, always available; quality reference |
+| `SAGE_ATTN` | `sageattention` | fp16, bf16 | ❌ (INT8, fp16 accum) | ❌ | 32–256 | ≥ 8.0 | Typically visually indistinguishable on diffusion outputs |
+| `SAGE_ATTN_3` | `sageattn3` | fp16, bf16 | ❌ | ❌ | 64, 128, 256 | ≥ 10.0 | Blackwell only; GQA/MQA requests fall back to `TORCH_SDPA` |
 
 
-## Configuration
+## Setting the Diffusion Attention Backend
 
 Diffusion attention backends can be configured three ways, in priority order:
 
@@ -69,8 +83,8 @@ vllm-omni serve <model> \
 Backends may also accept backend-specific parameters via `extra`:
 
 ```bash
---diffusion-attention-config.per_role.self.backend SPARSE_BLOCK \
---diffusion-attention-config.per_role.self.extra.block_size 128
+--diffusion-attention-config.per_role.self.backend SAGE_ATTN \
+--diffusion-attention-config.per_role.self.extra.some_option value
 ```
 
 ### Programmatic API
@@ -93,29 +107,45 @@ config = OmniDiffusionConfig(
 
 A plain dict is also accepted and normalized to `AttentionConfig`.
 
-## Platform Defaults
+## Backend Selection Behavior
 
-### Blackwell (sm_100 / sm_103 / sm_120 / sm_121)
+### Manual Selection
 
-Auto-route preference, in order:
+When you explicitly set a backend via `--diffusion-attention-backend` or `--diffusion-attention-config`:
 
-1. `CUDNN_ATTN` — when cuDNN ≥ 9.5 is available (ships in PyTorch 2.5+ wheels)
-2. `FLASHINFER_ATTN` — when `flashinfer` is installed but cuDNN < 9.5
-3. `FLASH_ATTN` — when `flash-attn` is installed with the Blackwell CUTE kernel
-4. `TORCH_SDPA` — last resort
+1. The selection is validated against your environment (package installed, compute capability).
+2. If the backend is unavailable or unsupported, vLLM-Omni logs a warning with the specific reason and **falls back to `TORCH_SDPA`** — unlike core vLLM, it does not raise.
+3. If valid, the backend is used and the startup log prints `Using diffusion attention backend '<NAME>'`.
 
-The startup log line `Defaulting to diffusion attention backend CUDNN_ATTN (Blackwell sm_120, cuDNN 91002)` confirms the route.
+### Automatic Selection
+
+When no backend is configured, the platform picks the first compatible backend from the priority tables below. The startup log line `Defaulting to diffusion attention backend CUDNN_ATTN (Blackwell sm_120, cuDNN 91002)` confirms the route. If neither the `Using ...` nor the `Defaulting to ...` line appears, the model didn't reach diffusion stage init — check earlier logs for failures.
+
+`FLASH_ATTN_4`, `SAGE_ATTN`, and `SAGE_ATTN_3` are never auto-routed — they are opt-in only.
+
+## Backend Priority (CUDA)
+
+Priority is 1 = highest (tried first).
+
+**Blackwell (sm_100 / sm_103 / sm_120 / sm_121):**
+
+| Priority | Backend | Condition |
+|---|---|---|
+| 1 | `CUDNN_ATTN` | cuDNN ≥ 9.5 available (ships in PyTorch 2.5+ wheels) |
+| 2 | `FLASHINFER_ATTN` | `flashinfer` installed, cuDNN < 9.5 |
+| 3 | `FLASH_ATTN` | `flash-attn` installed with the Blackwell CUTE kernel |
+| 4 | `TORCH_SDPA` | always available |
 
 **Why CUDNN_ATTN by default**: on mask-heavy diffusion models (HunyuanVideo-1.5, Qwen-Image), cuDNN's pinned FMHA kernel sidesteps a PyTorch SDPA dispatch quirk where the unpinned dispatcher picks `EFFICIENT_ATTENTION` (~25 ms) for masked calls instead of cuDNN (~11 ms). The pin gives 2× e2e on HV-1.5 with no regression on lighter models.
 
-### Hopper (sm_90) / Ada (sm_89) / Ampere (sm_80–sm_86)
+**Hopper (sm_90) / Ada (sm_89) / Ampere (sm_80–sm_86):**
 
-Auto-route preference:
+| Priority | Backend | Condition |
+|---|---|---|
+| 1 | `FLASH_ATTN` | `flash-attn` installed |
+| 2 | `TORCH_SDPA` | always available |
 
-1. `FLASH_ATTN` — when `flash-attn` is installed
-2. `TORCH_SDPA` — fallback
-
-`CUDNN_ATTN` and `FLASHINFER_ATTN` are still selectable via env var on these GPUs but are not in the auto-route — FlashAttention 2 is the well-tuned path on pre-Blackwell hardware.
+`CUDNN_ATTN` and `FLASHINFER_ATTN` are still selectable explicitly on these GPUs but are not in the auto-route — FlashAttention 2 is the well-tuned path on pre-Blackwell hardware.
 
 ## End-to-End Benchmark (BF16, sm_120 RTX Pro 6000 Blackwell)
 
@@ -129,43 +159,6 @@ Same prompt and seed across runs. `Total generation time` from `text_to_video.py
 | FLUX.2-dev (T2I) | 1024² / 50 steps, TP=2 | 53.62 s | **53.30 s** | 54.94 s |
 
 Pattern: mask-heavy DiTs (HV-1.5, Qwen-Image) favor `CUDNN_ATTN`; lighter-mask DiTs and TP-saturated configs (Wan 2.2, FLUX.2 TP=2) tie within noise.
-
-## Known Limitations
-
-### LTX-2.0: `CUDNN_ATTN` crashes under torch.compile
-
-LTX-2's audio attention has a symbolic head_dim under torch.compile tracing. cuDNN's SDPA backend selector rejects symbolic dims and Dynamo aborts compilation. Tracked in [#3121](https://github.com/vllm-project/vllm-omni/issues/3121).
-
-**Workaround**: explicitly select `FLASHINFER_ATTN` or `TORCH_SDPA` for LTX-2.0:
-
-```bash
-DIFFUSION_ATTENTION_BACKEND=FLASHINFER_ATTN python examples/offline_inference/text_to_video/text_to_video.py \
-    --model Lightricks/LTX-2 ...
-```
-
-### FA4 not yet integrated
-
-FlashAttention-4 (released March 2026) targets Blackwell natively and reportedly beats cuDNN by ~20% on B200. As of this writing the `flash-attn-4 4.0.0b10` wheel crashes with `AttributeError: 'NoneType' object has no attribute '_trait'` during JIT on sm_120. Not yet wired into vLLM-Omni; revisit when stable lands.
-
-## Choosing a Backend Manually
-
-### When to override the default
-
-- **Quality validation**: compare a new backend against `TORCH_SDPA` as the reference, since SDPA's default dispatcher is the most extensively tested.
-- **Lossy speedup hunting**: try `SAGE_ATTN` (INT8 quantized) on diffusion outputs — typically indistinguishable visually but always validate.
-- **Workaround for known issues**: see Known Limitations above.
-
-### Verifying which backend is in use
-
-The startup log prints one of:
-
-```
-Using diffusion attention backend 'CUDNN_ATTN'           # explicit override
-Defaulting to diffusion attention backend CUDNN_ATTN ... # auto-route
-Defaulting to diffusion attention backend SDPA           # nothing else available
-```
-
-If you don't see one of these, the model didn't reach diffusion stage init — check earlier logs for failures.
 
 ## SageAttention Installation
 
@@ -236,6 +229,21 @@ DIFFUSION_ATTENTION_BACKEND=FLASHINFER_ATTN python examples/offline_inference/te
     --output ltx2.mp4
 ```
 
+### FlashAttention-4 (datacenter Blackwell)
+
+`FLASH_ATTN_4` is opt-in (never auto-routed). Requires `pip install --pre flash-attn-4` — the wheel publishes only the `flash_attn.cute` namespace; installing it alongside a `flash-attn` FA2 wheel in the same environment is not supported, since both own the `flash_attn` package directory. The backend covers dense, piecewise (mixed causal/full), and masked/varlen calls, works under torch.compile, and on sm_103 (B300) automatically selects the `sm_103a` compile target unless `CUTE_DSL_ARCH` is already set.
+
+BF16 FA4 is a drop-in selection:
+
+```bash
+DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN_4 python examples/offline_inference/text_to_video/text_to_video.py \
+    --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v \
+    --prompt "A dog running across a field of golden wheat." \
+    --height 480 --width 832 --num-frames 33 \
+    --num-inference-steps 50 --seed 42 --guidance-scale 6.0 \
+    --output hv15_fa4.mp4
+```
+
 ### SageAttention (lossy)
 
 ```bash
@@ -299,7 +307,7 @@ python examples/offline_inference/text_to_video/text_to_video.py \
     --height 704 --width 1280 --num-frames 49 \
     --num-inference-steps 30 --seed 42 --guidance-scale 5.0 \
     --tensor-parallel-size 2 \
-    --output outputs/wan22_fa3.mp4
+    --output outputs/wan22_fa2.mp4
 ```
 
 ## Validation Guidance

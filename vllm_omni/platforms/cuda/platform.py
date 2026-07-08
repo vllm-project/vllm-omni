@@ -131,6 +131,23 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                     logger.warning("Flash Attention packages not available. Falling back to TORCH_SDPA backend.")
                 logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+            if backend_upper == "FLASH_ATTN_4":
+                # FA4 (CuTe DSL) ships sm_80/sm_90/sm_100/sm_120 kernel paths;
+                # its Blackwell (sm_10x) kernels are the reason to pick it.
+                if not compute_supported:
+                    logger.warning(
+                        "FlashAttention-4 requires GPU with compute capability >= 8.0. "
+                        "Falling back to TORCH_SDPA backend."
+                    )
+                    return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+                from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_4_installed
+
+                if not is_flash_attn_4_installed():
+                    logger.warning(
+                        "FlashAttention-4 package not available. Install it with "
+                        "`pip install --pre flash-attn-4`. Falling back to TORCH_SDPA backend."
+                    )
+                    return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             if backend_upper == "SAGE_ATTN_3":
                 sage_attn3_supported = compute_capability is not None and compute_capability.major >= 10
                 if not sage_attn3_supported:

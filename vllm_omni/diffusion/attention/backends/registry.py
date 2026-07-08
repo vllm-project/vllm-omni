@@ -57,6 +57,7 @@ class DiffusionAttentionBackendEnum(Enum, metaclass=_DiffusionBackendEnumMeta):
 
     # Common backends (available on most platforms)
     FLASH_ATTN = "vllm_omni.diffusion.attention.backends.flash_attn.FlashAttentionBackend"
+    FLASH_ATTN_4 = "vllm_omni.diffusion.attention.backends.flash_attn4.FlashAttention4Backend"
     TORCH_SDPA = "vllm_omni.diffusion.attention.backends.sdpa.SDPABackend"
     SAGE_ATTN = "vllm_omni.diffusion.attention.backends.sage_attn.SageAttentionBackend"
     SAGE_ATTN_3 = "vllm_omni.diffusion.attention.backends.sage_attn3.SageAttention3Backend"
