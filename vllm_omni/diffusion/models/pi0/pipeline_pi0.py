@@ -57,7 +57,7 @@ def get_pi0_post_process_func(od_config: OmniDiffusionConfig):
 # Single-stage diffusion topology for online OpenPI serving.
 #
 # π0 is one diffusion stage (robot observation -> action chunk via flow
-# matching). It is registered in ``_OMNI_PIPELINES`` (rather than relying on the
+# matching). It is registered in ``OMNI_PIPELINES`` (rather than relying on the
 # default single-stage fallback) because π0 is *online-served* via
 # ``vllm serve --deploy-config pi0.yaml``; that path
 # (``OmniStagePipelineFactory._create_from_registry``) requires a registered
@@ -73,7 +73,7 @@ PI0_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.DIFFUSION,
             input_sources=(),
             final_output=True,
-            final_output_type="image",
+            final_output_type="action",
             model_arch="Pi0Pipeline",
         ),
     ),
@@ -87,9 +87,6 @@ class Pi0Pipeline(nn.Module):
     self-loaded in ``__init__`` from the checkpoint's ``model.safetensors`` via
     the kernel's ``load_weights`` (which handles the LeRobot key remaps).
     """
-
-    # Advertise which extra_body keys the serving layer should forward.
-    EXTRA_BODY_PARAMS = frozenset({"robot_obs", "session_id", "reset", "num_inference_steps", "noise"})
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()

@@ -94,7 +94,7 @@ Camera keys must match the server's `image_feature_keys` (the checkpoint's
 
 π0's flow-matching kernel is bit-for-bit matched to the LeRobot `PI0Policy`
 reference (`max|Δ| = 7.15e-07`, CPU/float32, fixed noise; see
-`tests/pi0/test_pi0_e2e.py::test_pi0_vllm_omni_vs_lerobot`).
+`tests/diffusion/models/pi0/test_pi0_parity.py::test_pi0_vllm_omni_vs_lerobot`).
 
 ## References
 
@@ -103,4 +103,6 @@ reference (`max|Δ| = 7.15e-07`, CPU/float32, fixed noise; see
 - Pipeline: [`vllm_omni/diffusion/models/pi0/pipeline_pi0.py`](../../vllm_omni/diffusion/models/pi0/pipeline_pi0.py)
 - Deploy config: [`vllm_omni/deploy/pi0.yaml`](../../vllm_omni/deploy/pi0.yaml)
 - Example client: [`examples/online_serving/pi0/`](../../examples/online_serving/pi0/)
-- Tests: [`tests/pi0/`](../../tests/pi0/) (CPU units, LeRobot parity, OpenPI websocket e2e)
+- Tests: CPU units + LeRobot parity in [`tests/diffusion/models/pi0/`](../../tests/diffusion/models/pi0/),
+  OpenPI websocket e2e in
+  [`tests/e2e/online_serving/test_pi0_expansion.py`](../../tests/e2e/online_serving/test_pi0_expansion.py)

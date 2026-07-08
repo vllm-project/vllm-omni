@@ -338,6 +338,11 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
+    # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
+    # to it; list it here so a stray cache_backend override disables gracefully
+    # instead of erroring.
+    "Pi0Pipeline",
 }
 
 

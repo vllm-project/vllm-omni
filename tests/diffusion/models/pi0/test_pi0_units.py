@@ -5,9 +5,9 @@
 Deliberately lightweight: pure utility code (config plumbing, mask building,
 sinusoidal embeddings, normalization, image preprocessing, weight-load remap)
 that runs on CPU with no weights and no lerobot. The full LeRobot parity check
-lives in ``test_pi0_e2e.py`` and requires a model download.
+lives in ``tests/diffusion/models/pi0/test_pi0_parity.py`` and requires a model download.
 
-    pytest tests/pi0/test_pi0_units.py -v
+    pytest tests/diffusion/models/pi0/test_pi0_units.py -v
 """
 
 from __future__ import annotations
@@ -485,7 +485,7 @@ def test_build_model_inputs_image_key_map():
 # ----------------------------------------------------------------------------
 # Version-stability / self-consistency (gated on a real pi0_base checkpoint)
 #
-# The LeRobot parity gate (test_pi0_e2e.py) only validates correctness at
+# The LeRobot parity gate (test_pi0_parity.py) only validates correctness at
 # transformers 5.3.0 (where LeRobot loads pi0_base cleanly). Production vllm-omni
 # ships transformers 5.6.2, and LeRobot is not a usable reference there (it
 # incorrectly loads the SigLIP vision tower at >=5.4). So we pin the kernel's deterministic
@@ -494,7 +494,7 @@ def test_build_model_inputs_image_key_map():
 # vision_tower / embed_scale version-robust paths against regressions.
 #
 #   PI0_SELFCONSIST_CKPT=/path/to/pi0_base \
-#       pytest tests/pi0/test_pi0_units.py -k version_stable -v -s
+#       pytest tests/diffusion/models/pi0/test_pi0_units.py -k version_stable -v -s
 # ----------------------------------------------------------------------------
 import os  # noqa: E402
 

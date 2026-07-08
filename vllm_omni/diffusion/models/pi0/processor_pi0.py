@@ -15,7 +15,7 @@ consumes:
   * state        : ``(1, max_state_dim)`` float32, zero-padded
 
 Image/prompt preprocessing matches OpenPI and LeRobot bit-for-bit — see the
-parity test (``test_pi0_e2e.py``). A set of stateless helpers the diffusion
+parity test (``test_pi0_parity.py``). A set of stateless helpers the diffusion
 pipeline calls directly (the DreamZero contract: the pipeline owns its
 preprocessing).
 
