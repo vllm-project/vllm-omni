@@ -63,6 +63,36 @@ def test_audex_tts_stream_audio(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
+def test_audex_tts_max_new_tokens_caps_duration(omni_server, openai_client, run_level) -> None:
+    """max_new_tokens must cap stage-0 generation (review P2 regression)."""
+    import io
+    import wave
+
+    import requests
+
+    if run_level not in {"advanced_model", "full_model"}:
+        pytest.skip("duration cap needs real weights")
+
+    url = f"{openai_client.base_url.rstrip('/')}/v1/audio/speech"
+    resp = requests.post(
+        url,
+        json={
+            "model": omni_server.model,
+            "input": PROMPT,
+            "response_format": "wav",
+            "max_new_tokens": 25,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    with wave.open(io.BytesIO(resp.content)) as wav:
+        duration_s = wav.getnframes() / wav.getframerate()
+    # 25 codec frames at 50 fps = 0.5 s (+ small lookahead tail); the full
+    # sentence would be ~3 s, so a capped result proves the override applied.
+    assert duration_s <= 1.0, f"max_new_tokens ignored: duration={duration_s:.2f}s"
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
 def test_audex_tts_request_policies(omni_server, openai_client) -> None:
     """Unsupported voice / CFG / empty input must be rejected with 400."""
     import requests

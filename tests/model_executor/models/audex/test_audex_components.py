@@ -85,6 +85,14 @@ def test_resolve_adapter_audex():
     assert adapter_cls.name == "audex"
 
 
+def test_audex_in_sampling_max_tokens_override_set():
+    """request.max_new_tokens must cap Audex stage-0 generation like other AR
+    TTS models (review P2 regression)."""
+    from vllm_omni.entrypoints.openai.serving_speech import _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES
+
+    assert "audex" in _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES
+
+
 def test_prompt_construction_not_in_serving_speech():
     """Guard: Audex prompt building lives in the adapter, never serving_speech."""
     serving = (_REPO_ROOT / "vllm_omni/entrypoints/openai/serving_speech.py").read_text()

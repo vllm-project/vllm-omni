@@ -128,6 +128,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
     "indextts2",
+    "audex",
 }
 _TTS_LANGUAGES = frozenset(
     {
