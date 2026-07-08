@@ -18,7 +18,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1805,6 +1805,295 @@ _PERF_TABLE_HEADERS = [
     "vs baseline",
     "Status",
 ]
+_FOCUS_TABLE_HEADERS = (
+    "Source",
+    "Model",
+    "Type",
+    "Config",
+    "Test",
+    "Metric",
+    "latest",
+    "baseline",
+    "vs baseline",
+    "Status",
+    "Days failing",
+)
+_CONSEC_FAIL_DAY_MAX = 3
+_CONSEC_FAIL_THRESHOLD_PCT = 6.0
+_CONSEC_FAIL_LOOKUP_LIMIT_PER_FILE = 5000
+
+
+def _metric_direction_hint(metric: str) -> str:
+    """Mirror of kanban_assets_perf_summary._metric_direction (local-only).
+
+    Keep this list aligned byte-for-byte with
+    kanban_assets_perf_summary.LOWER_BETTER_HINTS / HIGHER_BETTER_HINTS so the
+    consecutive-failure lookup computes the same direction verdict the kanban
+    baseline comparator uses for PerfRow.status.
+
+    If a metric name shows up in the focus table but is not in this list, both
+    local and kanban will treat it as `unknown` → skipped from the streak
+    lookup. (We deliberately do NOT add legacy aliases like `itl`,
+    `response_time`, `elapsed` — they aren't in kanban's source of truth.)
+    """
+    m = (metric or "").lower()
+    higher_hints = ("throughput", "qps", "tps")
+    lower_hints = (
+        "latency",
+        "ttfp",
+        "ttft",
+        "tpot",
+        "rtl",
+        "rtf",
+        "memory",
+        "e2e",
+        "duration",
+    )
+    if any(h in m for h in higher_hints):
+        return "higher_better"
+    if any(h in m for h in lower_hints):
+        return "lower_better"
+    return "unknown"
+
+
+def _iter_metric_pairs_for_history(rec: dict[str, Any]) -> list[tuple[str, float, float]]:
+    """Mirror of kanban_assets_perf_summary._iter_metric_pairs used for the
+    consecutive-failure lookup. Kept local so we don't depend on the private
+    helper.
+    """
+
+    def _to_float(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            txt = value.strip()
+            if not txt:
+                return None
+            try:
+                return float(txt)
+            except ValueError:
+                return None
+        return None
+
+    pairs: list[tuple[str, float, float]] = []
+    if not isinstance(rec, dict):
+        return pairs
+    for key, value in rec.items():
+        if not isinstance(key, str) or not key.startswith("baseline_"):
+            continue
+        metric = key[len("baseline_") :]
+        baseline = _to_float(value)
+        latest = _to_float(rec.get(metric))
+        if baseline is None or latest is None:
+            continue
+        pairs.append((metric, latest, baseline))
+    baseline_obj = rec.get("baseline")
+    if isinstance(baseline_obj, dict):
+        for metric, base_v in baseline_obj.items():
+            if not isinstance(metric, str):
+                continue
+            if any(metric == existing[0] for existing in pairs):
+                continue
+            baseline = _to_float(base_v)
+            latest = _to_float(rec.get(metric))
+            if baseline is None or latest is None:
+                continue
+            pairs.append((metric, latest, baseline))
+    return pairs
+
+
+def _history_records_from_payload(payload: Any) -> list[dict[str, Any]]:
+    """Extract the flat record list from a history JSON payload.
+
+    Supports both top-level ``records: [...]`` and group-based
+    ``groups: [{records: [...]}]`` shapes (matching the kanban
+    ``generate_charts.py`` output).
+    """
+    if not isinstance(payload, dict):
+        return []
+    records = payload.get("records")
+    if isinstance(records, list):
+        return [r for r in records if isinstance(r, dict)]
+    groups = payload.get("groups")
+    if isinstance(groups, list):
+        flat: list[dict[str, Any]] = []
+        for grp in groups:
+            if not isinstance(grp, dict):
+                continue
+            rs = grp.get("records")
+            if isinstance(rs, list):
+                flat.extend(r for r in rs if isinstance(r, dict))
+        return flat
+    return []
+
+
+def _compute_history_fail_lookup(
+    assets_dir: Path | None,
+) -> dict[tuple[str, str, str, str], dict[str, bool]]:
+    """Build ``(model_id, test_name, config_key, metric) -> {date: is_fail}``
+    by scanning the kanban ``*_history.json`` files under ``assets_dir``.
+
+    ``is_fail`` re-applies ``vs_pct < -CONSEC_FAIL_THRESHOLD_PCT`` (matching
+    ``kanban_assets_perf_summary._baseline_compare_status``). When multiple
+    records share the same date for the same key, "fail" wins (most pessimistic).
+    """
+    if assets_dir is None or not assets_dir.is_dir():
+        return {}
+    lookup: dict[tuple[str, str, str, str], dict[str, bool]] = {}
+    for history_path in sorted(assets_dir.glob("*_history.json")):
+        try:
+            payload = json.loads(history_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        records = _history_records_from_payload(payload)
+        per_file = 0
+        for rec in records:
+            per_file += 1
+            if per_file > _CONSEC_FAIL_LOOKUP_LIMIT_PER_FILE:
+                break
+            date_raw = rec.get("date")
+            if not isinstance(date_raw, str):
+                continue
+            date = date_raw.strip()[:10]
+            if len(date) < 10:
+                continue
+            model_id = rec.get("model_id")
+            title = rec.get("title")
+            model = str(model_id or title or "")
+            if not model:
+                continue
+            test_name = str(rec.get("test_name") or "")
+            config_key = str(rec.get("config_key") or rec.get("source_file") or "")
+            for metric, latest, baseline in _iter_metric_pairs_for_history(rec):
+                if abs(baseline) < 1e-12:
+                    continue
+                direction = _metric_direction_hint(metric)
+                if direction == "unknown":
+                    continue
+                raw_pct = (latest - baseline) / baseline * 100.0
+                vs_pct = -raw_pct if direction == "lower_better" else raw_pct
+                is_fail = vs_pct < -_CONSEC_FAIL_THRESHOLD_PCT
+                key = (model, test_name, config_key, metric)
+                slot = lookup.setdefault(key, {})
+                previous = bool(slot.get(date, False))
+                slot[date] = is_fail or previous
+    return lookup
+
+
+def _consec_fail_days_from_history(
+    lookup: dict[tuple[str, str, str, str], dict[str, bool]],
+    *,
+    model: str,
+    test: str,
+    config_key: str,
+    metric: str,
+    max_days: int = _CONSEC_FAIL_DAY_MAX,
+) -> int:
+    """Count how many consecutive days (newest first) the (model, test, config,
+    metric) regressed worse than baseline by more than the threshold.
+
+    Returns 0 when the latest dated record for this key is *not* a failure or
+    when no history exists for that key.
+    """
+    by_date = lookup.get((model, test, config_key, metric))
+    if not by_date:
+        return 0
+    sorted_dates_desc = sorted(by_date.keys(), reverse=True)
+    if not sorted_dates_desc:
+        return 0
+    latest = sorted_dates_desc[0]
+    if not by_date.get(latest):
+        return 0
+    try:
+        cursor = datetime.strptime(latest, "%Y-%m-%d")
+    except ValueError:
+        return 0
+    count = 0
+    cursor_str = latest
+    for _ in range(max_days):
+        if by_date.get(cursor_str):
+            count += 1
+            cursor = cursor - timedelta(days=1)
+            cursor_str = cursor.strftime("%Y-%m-%d")
+        else:
+            break
+    return count
+
+
+def _format_consec_fail_days(days: int) -> str:
+    """Format consecutive-failure count for table cell display."""
+    if days <= 0:
+        return "—"
+    return f"{days} day{'s' if days != 1 else ''}"
+
+
+def _consec_fail_color_class(days: int) -> str:
+    """Map consecutive-failure count to the CSS modifier class."""
+    if days >= 3:
+        return "regression-streak--3d"
+    if days == 2:
+        return "regression-streak--2d"
+    if days == 1:
+        return "regression-streak--1d"
+    return ""
+
+
+def _normalize_focus_key(parts: tuple[str, str, str, str]) -> tuple[str, str, str, str]:
+    """Trim whitespace and normalize empty config_key for lookup matching.
+
+    Focus items have ``config == config_view`` (a human-readable label), while
+    history records key on ``config_key`` (a normalized slug). We collapse
+    whitespace and fall back to an empty string so the lookup hits when these
+    roughly agree.
+    """
+    model, test, config, metric = parts
+    return (
+        (model or "").strip(),
+        (test or "").strip(),
+        (config or "").strip(),
+        (metric or "").strip(),
+    )
+
+
+def _focus_item_consec_fail_days(
+    item: NightlyFocusItem,
+    lookup: dict[tuple[str, str, str, str], dict[str, bool]],
+) -> int:
+    """Compute consecutive-failing-day count for a focus item using the history
+    lookup. Tries the (config_key) path first, then falls back to a wildcard
+    scan across config_key values when the focus item only carries the
+    human-readable config_view.
+    """
+    key_strict = _normalize_focus_key((item.model, item.test, item.config, item.metric))
+    by_date = lookup.get(key_strict)
+    if by_date:
+        return _consec_fail_days_from_history(
+            lookup,
+            model=key_strict[0],
+            test=key_strict[1],
+            config_key=key_strict[2],
+            metric=key_strict[3],
+        )
+    # Fallback: match by (model, test, metric) over any config_key in history.
+    best = 0
+    target_model, target_test, _, target_metric = key_strict
+    for (model, test, config_key, metric), dates in lookup.items():
+        if model != target_model or test != target_test or metric != target_metric:
+            continue
+        count = _consec_fail_days_from_history(
+            lookup,
+            model=model,
+            test=test,
+            config_key=config_key,
+            metric=metric,
+        )
+        if count > best:
+            best = count
+            if best >= _CONSEC_FAIL_DAY_MAX:
+                break
+    return best
 
 
 @dataclass
@@ -1821,6 +2110,7 @@ class NightlyFocusItem:
     baseline: Any
     vs_baseline_pct: Any
     status: str
+    consec_fail_days: int = 0
 
 
 def _job_kind_counts(kinds: list[str]) -> dict[str, int]:
@@ -1851,7 +2141,11 @@ def _perf_counts(summary: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
-def _focus_item_from_perf_row(source: str, row: Any) -> NightlyFocusItem:
+def _focus_item_from_perf_row(
+    source: str,
+    row: Any,
+    history_fail_lookup: dict[tuple[str, str, str, str], dict[str, bool]] | None = None,
+) -> NightlyFocusItem:
     if isinstance(row, dict):
         get_value = row.get
     else:
@@ -1859,7 +2153,7 @@ def _focus_item_from_perf_row(source: str, row: Any) -> NightlyFocusItem:
         def get_value(key, default=None):
             return getattr(row, key, default)
 
-    return NightlyFocusItem(
+    out = NightlyFocusItem(
         source=source,
         model=str(get_value("model", "") or "unknown"),
         model_type=str(get_value("model_type", "") or ""),
@@ -1871,6 +2165,9 @@ def _focus_item_from_perf_row(source: str, row: Any) -> NightlyFocusItem:
         vs_baseline_pct=get_value("vs_baseline_pct"),
         status=str(get_value("status", "") or "n/a"),
     )
+    if history_fail_lookup:
+        out.consec_fail_days = _focus_item_consec_fail_days(out, history_fail_lookup)
+    return out
 
 
 def _focus_item_sort_key(item: NightlyFocusItem) -> tuple[int, float, str, str]:
@@ -1884,12 +2181,13 @@ def _focus_item_sort_key(item: NightlyFocusItem) -> tuple[int, float, str, str]:
 def _focus_perf_items(
     bk_perf_summary: dict[str, Any],
     local_perf_summary: dict[str, Any],
+    history_fail_lookup: dict[tuple[str, str, str, str], dict[str, bool]] | None = None,
 ) -> list[NightlyFocusItem]:
     items: list[NightlyFocusItem] = []
     for row in bk_perf_summary.get("rows", []) or []:
-        items.append(_focus_item_from_perf_row("Buildkite", row))
+        items.append(_focus_item_from_perf_row("Buildkite", row, history_fail_lookup))
     for row in local_perf_summary.get("rows", []) or []:
-        items.append(_focus_item_from_perf_row("Local", row))
+        items.append(_focus_item_from_perf_row("Local", row, history_fail_lookup))
     return items
 
 
@@ -1924,6 +2222,7 @@ def _focus_perf_table_rows(items: list[NightlyFocusItem]) -> list[list[str]]:
                 _perf_num(item.baseline),
                 _perf_pct(item.vs_baseline_pct),
                 _md_cell(item.status),
+                _format_consec_fail_days(item.consec_fail_days),
             ]
         )
     return rows
@@ -1952,16 +2251,45 @@ def _render_focus_perf_table_html(items: list[NightlyFocusItem]) -> str:
         '<table class="summary focus-table">',
         "<thead><tr>",
     ]
-    headers = ["Source", "Model", "Type", "Config", "Test", "Metric", "latest", "baseline", "vs baseline", "Status"]
-    for header in headers:
+    for header in _FOCUS_TABLE_HEADERS:
         parts.append(f"<th>{html.escape(header)}</th>")
     parts.append("</tr></thead><tbody>")
-    for item, row in zip(items, _focus_perf_table_rows(items)):
+    for item in items:
         model = html.escape(item.model, quote=True)
         row_class = "summary-row--fail" if item.status == "fail" else "summary-row--unknown"
-        parts.append(f'<tr class="{row_class}" data-perf-row="1" data-model="{model}">')
-        for cell in row:
-            parts.append(f"<td>{html.escape(cell)}</td>")
+        streak_class = _consec_fail_color_class(item.consec_fail_days)
+        row_classes = [row_class]
+        if streak_class:
+            row_classes.append(streak_class)
+        row_class_attr = " ".join(row_classes)
+        days = item.consec_fail_days
+        days_text = _format_consec_fail_days(days)
+        days_attr = (
+            f' data-consec-days="{days}" data-consec-color="{html.escape(streak_class or "none")}"'
+            if streak_class
+            else f' data-consec-days="{days}"'
+        )
+        parts.append(f'<tr class="{row_class_attr}" data-perf-row="1" data-model="{model}"{days_attr}>')
+        cells = [
+            item.source,
+            item.model,
+            item.model_type,
+            item.config,
+            item.test,
+            item.metric,
+            _perf_num(item.latest),
+            _perf_num(item.baseline),
+            _perf_pct(item.vs_baseline_pct),
+            item.status,
+        ]
+        for cell in cells:
+            parts.append(f"<td>{html.escape(str(cell))}</td>")
+        if streak_class:
+            title = "Consecutive failing days from *_history.json (today + 2 previous days max)."
+            cell_attrs = f' class="{html.escape(streak_class)}" title="{html.escape(title, quote=True)}"'
+        else:
+            cell_attrs = ""
+        parts.append(f"<td{cell_attrs}>{html.escape(days_text)}</td>")
         parts.append("</tr>")
     parts.extend(
         [
@@ -1982,7 +2310,8 @@ def _daily_focus_data(
 ) -> dict[str, Any]:
     bk_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir, exclude_local_overlap=True)
     local_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
-    focus_items = _focus_perf_items(bk_perf_summary, local_perf_summary)
+    history_fail_lookup = _compute_history_fail_lookup(kanban_cfg.assets_dir)
+    focus_items = _focus_perf_items(bk_perf_summary, local_perf_summary, history_fail_lookup)
     focus_kind, top_items = _select_focus_perf_items(focus_items)
     bk_job_counts = _buildkite_job_counts(bk_jobs)
     local_job_counts = _local_job_counts(local_job_rows)
@@ -2123,7 +2452,7 @@ def _append_daily_focus_markdown(lines: list[str], data: dict[str, Any]) -> None
         lines.append("")
         lines.append(
             render_markdown_table(
-                ["Source", "Model", "Type", "Config", "Test", "Metric", "latest", "baseline", "vs baseline", "Status"],
+                list(_FOCUS_TABLE_HEADERS),
                 _focus_perf_table_rows(top_items),
             )
         )

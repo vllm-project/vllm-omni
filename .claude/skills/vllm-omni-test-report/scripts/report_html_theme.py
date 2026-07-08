@@ -508,6 +508,61 @@ table.summary tbody tr.summary-row--fail:hover td {
 table.summary tbody tr.summary-row--unknown:hover td {
   background: var(--dashboard-badge-bg);
 }
+/* Consecutive-failure streak rows (Nightly focus "Days failing" column). */
+/* Row tint applies to every cell; Days-failing chip keeps saturated bg. */
+table.summary tr.regression-streak--1d td {
+  background-color: #fef3c7 !important;
+}
+table.summary tr.regression-streak--1d td.regression-streak--1d {
+  background-color: #fde68a !important;
+  color: #854d0e;
+  font-weight: 650;
+  border-left: 3px solid #facc15;
+}
+table.summary tr.regression-streak--2d td {
+  background-color: #ffedd5 !important;
+}
+table.summary tr.regression-streak--2d td.regression-streak--2d {
+  background-color: #fdba74 !important;
+  color: #7c2d12;
+  font-weight: 650;
+  border-left: 3px solid #fb923c;
+}
+table.summary tr.regression-streak--3d td {
+  background-color: #fee2e2 !important;
+}
+table.summary tr.regression-streak--3d td.regression-streak--3d {
+  background-color: #fca5a5 !important;
+  color: #7f1d1d;
+  font-weight: 700;
+  border-left: 3px solid #ef4444;
+}
+@media (prefers-color-scheme: dark) {
+  table.summary tr.regression-streak--1d td {
+    background-color: rgba(250, 204, 21, 0.18) !important;
+  }
+  table.summary tr.regression-streak--1d td.regression-streak--1d {
+    background-color: rgba(250, 204, 21, 0.5) !important;
+    color: #fde68a;
+    border-left-color: #facc15;
+  }
+  table.summary tr.regression-streak--2d td {
+    background-color: rgba(251, 146, 60, 0.18) !important;
+  }
+  table.summary tr.regression-streak--2d td.regression-streak--2d {
+    background-color: rgba(251, 146, 60, 0.5) !important;
+    color: #fdba74;
+    border-left-color: #fb923c;
+  }
+  table.summary tr.regression-streak--3d td {
+    background-color: rgba(239, 68, 68, 0.18) !important;
+  }
+  table.summary tr.regression-streak--3d td.regression-streak--3d {
+    background-color: rgba(239, 68, 68, 0.5) !important;
+    color: #fecaca;
+    border-left-color: #ef4444;
+  }
+}
 section.job-fail {
   background: var(--surface);
   border-radius: var(--radius);
@@ -1130,7 +1185,7 @@ td.fail-status-cell[data-status="not-issue"] {
 table.focus-table {
   table-layout: fixed;
   font-size: 0.86rem;
-  min-width: 980px;
+  min-width: 1080px;
 }
 table.focus-table th,
 table.focus-table td {
@@ -1177,6 +1232,12 @@ table.focus-table th:nth-child(10),
 table.focus-table td:nth-child(10) {
   width: 5rem;
   white-space: nowrap;
+}
+table.focus-table th:nth-child(11),
+table.focus-table td:nth-child(11) {
+  width: 6.5rem;
+  white-space: nowrap;
+  text-align: center;
 }
 .focus-filter-scope .table-scroll {
   max-height: 13rem;
