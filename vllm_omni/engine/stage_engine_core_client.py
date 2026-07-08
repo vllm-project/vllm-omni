@@ -395,7 +395,20 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         if self.custom_process_input_func is not None:
             signature = inspect.signature(self.custom_process_input_func)
-            if len(signature.parameters) >= 4:
+            n_params = len(signature.parameters)
+            # Functions can opt into receiving the destination stage's
+            # vllm_config (this client's) as a 5th positional arg — useful
+            # when the processor needs scheduler config to drive warnings
+            # / sizing. 3- and 4-param funcs continue to work unchanged.
+            if n_params >= 5:
+                return self.custom_process_input_func(
+                    source_outputs,
+                    prompt,
+                    self.requires_multimodal_data,
+                    streaming_context,
+                    self.vllm_config,
+                )
+            if n_params >= 4:
                 return self.custom_process_input_func(
                     source_outputs,
                     prompt,

@@ -186,16 +186,31 @@ def try_recv_via_connector(
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     """Compute the length of the talker prompt ids.
 
-    Args:
-        prompt_ids: The prompt ids tensor.
+    MUST match the segments that ``_thinker_to_talker_prefill`` actually
+    appends to the talker input — otherwise stage-1 prefill is sized for a
+    longer prompt than it receives and the talker hangs waiting for tokens
+    that never arrive (observed when conversation history contains text-only
+    user transcripts).
 
-    Returns:
-        The length of the talker prompt ids.
+    The prefill skips:
+      - system blocks
+      - text-only user blocks (no audio/image/video tokens)
+      - non-last assistant blocks
+    and consumes:
+      - audio/MM user blocks (full segment)
+      - the last assistant block (fixed 9 tokens for the codec preamble)
     """
     im_start_token_id = 151644
     system_token_id = 8948
     user_token_id = 872
     assistant_token_id = 77091
+    # Multimodal placeholder token IDs that mark a user block as audio /
+    # image / video (matching _thinker_to_talker_prefill's multimodal_mask).
+    audio_pad_token_id = 151675  # <|audio_pad|>
+    image_pad_token_id = 151655  # <|image_pad|>
+    video_pad_token_id = 151656  # <|video_pad|>
+    mm_token_ids = (audio_pad_token_id, image_pad_token_id, video_pad_token_id)
+
     im_start_indexes = [i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id]
     im_start_indexes.append(len(prompt_ids))
     sum_user_len = 0
@@ -207,7 +222,11 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
         if role == system_token_id:
             continue
         elif role == user_token_id:
-            sum_user_len += e - s
+            # Only count user blocks that contain MM tokens — text-only user
+            # blocks (e.g. STT transcripts in conversation history, tool
+            # responses) are skipped by the prefill.
+            if any(tok in mm_token_ids for tok in prompt_ids[s:e]):
+                sum_user_len += e - s
         elif role == assistant_token_id and i == len(im_start_indexes) - 2:
             assistant_len += 9  # 3 + 4 + 1 + 1
         else:

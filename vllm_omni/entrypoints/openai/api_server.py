@@ -509,6 +509,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+        await _warmup_realtime(engine_client, app.state)
 
         # After initializing the app state, shut down any endpoints that are model specific
         if hasattr(engine_client, "endpoint_restrictions"):
@@ -700,6 +701,60 @@ async def build_async_omni_from_stage_config(
     finally:
         if async_omni:
             async_omni.shutdown()
+
+
+async def _warmup_realtime(engine_client: EngineClient, state: State) -> None:
+    """Run a full pipeline warmup pass before accepting requests.
+
+    Eliminates the cold-start latency spike on the first real /v1/realtime
+    request by exercising all three stages (thinker, talker, code2wav) with
+    a short silent audio input.
+
+    Skipped if the realtime serving object is absent (non-omni or
+    pure-diffusion deployments) or if the model class lacks realtime support.
+    """
+    from uuid import uuid4
+
+    from vllm_omni.entrypoints.utils import coerce_param_message_types
+
+    serving = getattr(state, "openai_serving_realtime", None)
+    if serving is None:
+        return
+
+    model_cls = getattr(serving, "model_cls", None)
+    if model_cls is None or not hasattr(model_cls, "build_audio_pass_prompt"):
+        return
+
+    logger.info("[warmup] Running realtime warmup pass (thinker + talker + code2wav)...")
+    try:
+        # 4 s of silence at 16 kHz — sized to roughly match a typical
+        # user-utterance length so the thinker prefill captures CUDA graphs /
+        # MoE expert routing for the sequence-length buckets a real first
+        # turn will hit. Shorter inputs leave kernels JIT-compiling on the
+        # first real request, defeating the purpose of warmup.
+        silence = np.zeros(16000 * 4, dtype=np.float32)
+        # Include a representative system body so the prompt size also matches
+        # what a tools/instructions session produces — a one-line placeholder
+        # is enough to exercise the system-block prefill path.
+        system_body = "You are a helpful assistant."
+        prompt = {
+            "prompt": model_cls.build_audio_pass_prompt(system_body, ""),
+            "multi_modal_data": {"audio": (silence, 16000)},
+        }
+        request_id = f"warmup-{uuid4()}"
+        generator = engine_client.generate(
+            prompt=prompt,
+            request_id=request_id,
+            output_modalities=["audio"],
+            sampling_params_list=coerce_param_message_types(
+                list(engine_client.default_sampling_params_list), is_streaming=True
+            ),
+        )
+        async for _ in generator:
+            pass
+        logger.info("[warmup] Realtime warmup complete (all stages).")
+    except Exception:
+        logger.warning("[warmup] Realtime warmup pass failed (non-fatal).", exc_info=True)
 
 
 async def omni_init_app_state(

@@ -8,10 +8,12 @@ with the Orchestrator (running in a background thread) via janus queues.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
 import dataclasses
 import json
 import queue
+import signal
 import threading
 import time
 import uuid
@@ -449,7 +451,8 @@ class AsyncOmniEngine:
         try:
             loop.run_until_complete(_run_orchestrator())
         except Exception as e:
-            if not startup_future.done():
+            post_startup_crash = startup_future.done()
+            if not post_startup_crash:
                 wrapped = RuntimeError(f"Orchestrator initialization failed: {e}")
                 wrapped.__cause__ = e
                 startup_future.set_exception(wrapped)
@@ -463,6 +466,18 @@ class AsyncOmniEngine:
                     self.rpc_output_queue.sync_q.put_nowait(error_msg)
             except Exception:
                 pass
+            if post_startup_crash:
+                # The orchestrator thread is a daemon; if it crashes after
+                # startup, the main process keeps running in a silently
+                # broken state. Send SIGTERM to ourselves so uvicorn /
+                # asyncio shutdown handlers run (GPU cleanup, log flush,
+                # in-flight request drains). Register an atexit handler
+                # first so that after graceful shutdown completes the
+                # process still exits with code 1, which is what deployment
+                # monitors watch for to detect failure.
+                logger.error("[AsyncOmniEngine] Orchestrator crashed post-startup; triggering graceful shutdown")
+                atexit.register(lambda: os._exit(1))
+                os.kill(os.getpid(), signal.SIGTERM)
             raise
         finally:
             try:
