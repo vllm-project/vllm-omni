@@ -9,14 +9,11 @@ extraction, per-request streaming sessions, and the lookahead flush at EOS.
 
 from __future__ import annotations
 
-import functools
 import os
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
-from huggingface_hub import snapshot_download
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
@@ -33,24 +30,6 @@ SYNTH_TEXTS = (
 )
 
 
-@functools.lru_cache(maxsize=1)
-def _resolve_model_dir() -> Path:
-    override = os.environ.get(MODEL_DIR_ENV)
-    if override:
-        return Path(override).expanduser().resolve()
-    return Path(
-        snapshot_download(
-            MODEL,
-            allow_patterns=[
-                "config.json",
-                "checkpoint_folder_audiogen/*",
-                "checkpoint_folder_full/model-00001-of-00002.safetensors",
-                "audex_causal_speech_decoder/*",
-            ],
-        )
-    )
-
-
 def _concat_audio(audio_val) -> np.ndarray:
     if isinstance(audio_val, list):
         tensors = [t.detach().cpu().float().reshape(-1) for t in audio_val if isinstance(t, torch.Tensor)]
@@ -63,10 +42,13 @@ def _concat_audio(audio_val) -> np.ndarray:
 
 
 _audex_deployment = get_deploy_config_path("nemotron_labs_audex.yaml")
-_audex_model_path = str(_resolve_model_dir())
+# Collection must not download anything: pass the repo id (or a local
+# override) and let the engine's stage-init path resolve/download the
+# required snapshot subset at execution time (ensure_audex_snapshot).
+_audex_model = os.environ.get(MODEL_DIR_ENV) or MODEL
 _OMNI_RUNNER_PARAMS = [
     pytest.param(
-        (_audex_model_path, _audex_deployment, {"async_chunk": True}),
+        (_audex_model, _audex_deployment, {"async_chunk": True}),
         id="async_chunk",
     ),
 ]
