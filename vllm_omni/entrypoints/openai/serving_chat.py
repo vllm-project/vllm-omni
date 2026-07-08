@@ -412,6 +412,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
+        if request.modalities and "audio" in request.modalities:
+            audio_format_check = self._resolve_audio_format(request)
+            if isinstance(audio_format_check, ErrorResponse):
+                return audio_format_check
+
         num_inference_steps = None
         extra_body: dict[str, Any] = {}
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
@@ -1882,8 +1887,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                     role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
-                    if isinstance(choices_data, ErrorResponse):
-                        return
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2156,8 +2159,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     ]
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
-                if isinstance(choices_data, ErrorResponse):
-                    return choices_data
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
