@@ -305,6 +305,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "Qwen3TTSTalkerForConditionalGeneration",
             "Qwen3TTSCode2Wav",
             "CosyVoice3Model",
+            "NemotronDenseForCausalLM",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
         }

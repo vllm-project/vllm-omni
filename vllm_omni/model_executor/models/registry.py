@@ -84,6 +84,16 @@ _OMNI_MODELS = {
         "cosyvoice3",
         "CosyVoice3Model",
     ),
+    "NemotronDenseForCausalLM": (
+        "audex",
+        "audex_thinker",
+        "NemotronDenseForCausalLM",
+    ),
+    "AudexCode2Wav": (
+        "audex",
+        "audex_code2wav",
+        "AudexCode2Wav",
+    ),
     "OmniVoiceModel": (
         "omnivoice",
         "omnivoice",

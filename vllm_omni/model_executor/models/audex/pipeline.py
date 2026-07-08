@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Audex (Nemotron-Labs-Audex-2B) TTS pipeline topology.
+
+Stage 0: Thinker  — ChatML text prompt → <speechcodec_N> tokens (LLM AR).
+Stage 1: Code2Wav — streaming causal speech decoder → 16 kHz waveform.
+
+Users pass the HF repo ROOT (its manifest config.json carries
+``model_type: nemotron_labs_audex``); per-stage checkpoints resolve through
+``model_subdir``/``tokenizer_subdir``. The decoder subfolder has no tokenizer
+files, so stage 1's tokenizer also points at the thinker checkpoint.
+"""
+
+from vllm_omni.config.stage_config import (
+    PipelineConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
+
+_PROC = "vllm_omni.model_executor.stage_input_processors.audex"
+
+# <speechgen_end> token id in checkpoint_folder_audiogen's tokenizer; pinned
+# by a unit test against the real tokenizer fixture.
+AUDEX_SPEECHGEN_END_TOKEN_ID = 131076
+
+AUDEX_PIPELINE = PipelineConfig(
+    model_type="nemotron_labs_audex",
+    model_arch="NemotronDenseForCausalLM",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="audex_thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            engine_output_type="latent",
+            model_subdir="checkpoint_folder_audiogen",
+            tokenizer_subdir="checkpoint_folder_audiogen",
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.thinker2code2wav_async_chunk"),
+            custom_process_next_stage_input_func=f"{_PROC}.thinker2code2wav_full_payload",
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [AUDEX_SPEECHGEN_END_TOKEN_ID],
+            },
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="audex_code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="AudexCode2Wav",
+            model_subdir="audex_causal_speech_decoder",
+            tokenizer_subdir="checkpoint_folder_audiogen",
+            sync_process_input_func=f"{_PROC}.thinker2code2wav_token_only",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)

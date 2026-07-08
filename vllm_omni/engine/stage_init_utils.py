@@ -704,6 +704,12 @@ def build_engine_args_dict(
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
     model = _resolve_model_tokenizer_paths(model, engine_args_dict)
+    if engine_args_dict.get("model_stage") == "audex_thinker":
+        # Audex ships its thinker weights deduplicated into a sibling folder;
+        # replicate the official prepare-script symlink on first use.
+        from vllm_omni.model_executor.models.audex.checkpoint import ensure_audiogen_weights
+
+        ensure_audiogen_weights(model)
     apply_cli_tokenizer(
         engine_args_dict,
         cli_tokenizer=cli_tokenizer,

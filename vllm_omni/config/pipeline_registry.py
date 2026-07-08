@@ -60,6 +60,7 @@ from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
 )
+from vllm_omni.model_executor.models.audex.pipeline import AUDEX_PIPELINE
 from vllm_omni.model_executor.models.mimo_audio.pipeline import MIMO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
     MING_FLASH_OMNI_IMAGE_PIPELINE,
@@ -112,6 +113,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "hunyuan_image3_dit": HUNYUAN_IMAGE3_DIT_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,
+    "nemotron_labs_audex": AUDEX_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,
     "ming_tts": MING_TTS_PIPELINE,
     "ming_tts_moe": MING_TTS_MOE_PIPELINE,
