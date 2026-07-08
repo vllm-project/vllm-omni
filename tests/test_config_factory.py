@@ -749,6 +749,32 @@ stages:
         runtime_config = deploy.stages[0].engine_extras["hf_overrides"]["voxcpm2_runtime_config"]
         assert runtime_config == expected_runtime_config
 
+    @pytest.mark.parametrize(
+        ("deploy_name", "pipeline_name", "stage_count", "final_output_type"),
+        [
+            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image"),
+            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text"),
+            ("omnivoice.yaml", "omnivoice", 1, "audio"),
+        ],
+    )
+    def test_load_new_registry_backed_deploy_configs(
+        self,
+        deploy_name: str,
+        pipeline_name: str,
+        stage_count: int,
+        final_output_type: str,
+    ):
+        deploy_path = Path(get_deploy_config_path(deploy_name))
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.pipeline == pipeline_name
+
+        with patch("vllm_omni.platforms.current_omni_platform") as platform:
+            platform.device_name = "cuda"
+            stages = merge_pipeline_deploy(OMNI_PIPELINES[pipeline_name], deploy)
+        assert len(stages) == stage_count
+        assert stages[-1].final_output is True
+        assert stages[-1].final_output_type == final_output_type
+
     def test_merge_pipeline_deploy(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():
