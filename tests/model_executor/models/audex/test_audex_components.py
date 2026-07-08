@@ -235,6 +235,64 @@ def test_ensure_audiogen_weights_noop_without_index(tmp_path):
     ensure_audiogen_weights(str(tmp_path))  # must not raise
 
 
+def test_ensure_audex_snapshot_local_dir_passthrough(tmp_path):
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+    assert ensure_audex_snapshot(str(tmp_path)) == str(tmp_path)
+
+
+def test_ensure_audex_snapshot_downloads_required_subset(tmp_path, monkeypatch):
+    """A fresh-cache repo id must trigger a download of the needed subset
+    BEFORE subdir joining (review P1: previously the repo-id string itself
+    got the subdirs appended)."""
+    import huggingface_hub
+
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+    calls = []
+
+    def fake_snapshot_download(model, allow_patterns=None, local_files_only=False):
+        calls.append({"model": model, "allow_patterns": allow_patterns, "local_files_only": local_files_only})
+        return str(tmp_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    resolved = ensure_audex_snapshot("nvidia/Nemotron-Labs-Audex-2B")
+    assert resolved == str(tmp_path)
+    assert len(calls) == 1 and calls[0]["local_files_only"] is False
+    patterns = calls[0]["allow_patterns"]
+    assert "checkpoint_folder_audiogen/*" in patterns
+    assert "audex_causal_speech_decoder/*" in patterns
+    assert "checkpoint_folder_full/model-00001-of-00002.safetensors" in patterns
+    assert "config.json" in patterns
+
+
+def test_ensure_audex_snapshot_offline_falls_back_to_cache(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+    def fake_snapshot_download(model, allow_patterns=None, local_files_only=False):
+        if not local_files_only:
+            raise ConnectionError("offline")
+        return str(tmp_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    assert ensure_audex_snapshot("nvidia/Nemotron-Labs-Audex-2B") == str(tmp_path)
+
+
+def test_ensure_audex_snapshot_clear_error_when_unresolvable(monkeypatch):
+    import huggingface_hub
+
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+    def fake_snapshot_download(model, allow_patterns=None, local_files_only=False):
+        raise ConnectionError("offline" if not local_files_only else "not cached")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    with pytest.raises(RuntimeError, match="Could not resolve the Audex repo"):
+        ensure_audex_snapshot("nvidia/Nemotron-Labs-Audex-2B")
+
+
 # ---------------------------------------------------------------- path resolution (both config paths)
 
 

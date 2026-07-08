@@ -703,6 +703,13 @@ def build_engine_args_dict(
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
+    if str(engine_args_dict.get("model_stage") or "").startswith("audex"):
+        # Audex users pass the HF repo ROOT; make sure the required snapshot
+        # subset exists locally BEFORE subdir resolution, otherwise the
+        # subdirs get joined onto the raw repo id on a fresh cache.
+        from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+        model = ensure_audex_snapshot(model)
     model = _resolve_model_tokenizer_paths(model, engine_args_dict)
     if engine_args_dict.get("model_stage") == "audex_thinker":
         # Audex ships its thinker weights deduplicated into a sibling folder;
