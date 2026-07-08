@@ -53,7 +53,10 @@ stages:
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
-    async_scheduling: true
+    # Sync scheduling: with async scheduling the runner builds per-request
+    # payloads against the NEXT step's input batch, tripping the one-entry-
+    # per-request check when chunk arrival staggers requests.
+    async_scheduling: false
     # async_chunk appends codec frames per step; max_model_len must cover the
     # accumulated stream (max_tokens 2048 codes plus prompt headroom).
     max_num_batched_tokens: 8192

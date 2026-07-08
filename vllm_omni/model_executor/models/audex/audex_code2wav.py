@@ -139,9 +139,12 @@ class AudexCode2Wav(nn.Module):
         for req_id in finished_req_ids:
             self._sessions.pop(req_id, None)
 
-    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
+        # The runner may unpack the NamedTuple in transit; rebuild it.
+        if isinstance(model_outputs, tuple) and len(model_outputs) == len(OmniOutput._fields):
+            return OmniOutput(*model_outputs)
         raise TypeError(f"AudexCode2Wav expected OmniOutput, got {type(model_outputs)}")
 
     # -------------------- decoding --------------------
@@ -183,11 +186,21 @@ class AudexCode2Wav(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         runtime_infos = runtime_additional_information or []
+        # One output entry per scheduled request, even on steps where a
+        # request's chunk payload has not arrived yet.
+        seq_token_counts = kwargs.get("seq_token_counts")
+        if seq_token_counts is not None:
+            num_reqs = len(seq_token_counts)
+        elif input_ids is not None and input_ids.numel() > 0 and not runtime_infos:
+            num_reqs = 1
+        else:
+            num_reqs = len(runtime_infos)
 
         audios: list[torch.Tensor] = []
         srs: list[torch.Tensor] = []
         sr_tensor = torch.tensor(self._sample_rate, dtype=torch.int32)
-        for info in runtime_infos:
+        for i in range(num_reqs):
+            info = runtime_infos[i] if i < len(runtime_infos) else {}
             info = info if isinstance(info, dict) else {}
             meta = info.get("meta", {})
             meta = meta if isinstance(meta, dict) else {}
