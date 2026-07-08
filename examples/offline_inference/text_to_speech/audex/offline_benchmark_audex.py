@@ -17,6 +17,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import time
 from pathlib import Path
@@ -29,8 +30,10 @@ from vllm_omni import Omni
 from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
 
 SAMPLE_RATE = 16_000
-_SEEDTTS_EN_META = Path(
-    "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/tts/seedtts_testset/en/meta.lst"
+# seed-tts-eval root; override with --dataset-path or SEEDTTS_TESTSET_DIR.
+_DEFAULT_SEEDTTS_ROOT = os.environ.get(
+    "SEEDTTS_TESTSET_DIR",
+    "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/tts/seedtts_testset",
 )
 
 
@@ -43,6 +46,12 @@ def parse_args():
         default="en",
         help="Text source. Only 'en' (seed-tts English test set) is supported: Audex TTS is English-only.",
     )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=_DEFAULT_SEEDTTS_ROOT,
+        help="seed-tts-eval root directory (containing en/meta.lst).",
+    )
     parser.add_argument("--num-samples", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-warmups", type=int, default=2)
@@ -52,12 +61,18 @@ def parse_args():
     return parser.parse_args()
 
 
-def _load_texts(split: str, limit: int) -> list[tuple[str, str]]:
+def _load_texts(dataset_path: str, split: str, limit: int) -> list[tuple[str, str]]:
     if split != "en":
         print(f"WARNING: Audex TTS is English-only; ignoring split={split!r} and using the seed-tts en set.")
+    meta = Path(dataset_path) / "en" / "meta.lst"
+    if not meta.is_file():
+        raise SystemExit(
+            f"seed-tts corpus not found: {meta}. Pass --dataset-path or set SEEDTTS_TESTSET_DIR "
+            "to a seed-tts-eval checkout."
+        )
     rows: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for line in _SEEDTTS_EN_META.read_text().splitlines():
+    for line in meta.read_text().splitlines():
         parts = line.split("|")
         if len(parts) < 4:
             continue
@@ -90,7 +105,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    corpus = _load_texts(args.split, args.num_samples)
+    corpus = _load_texts(args.dataset_path, args.split, args.num_samples)
     if not corpus:
         raise SystemExit("no benchmark texts loaded")
 

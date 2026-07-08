@@ -94,6 +94,7 @@ def thinker2code2wav_async_chunk(
                 "seen_len": 0,
                 "pending": [],
                 "emitted_chunks": 0,
+                "total_frames": 0,
                 "terminal_sent": False,
             }
         }
@@ -103,7 +104,16 @@ def thinker2code2wav_async_chunk(
         return None
 
     pending: list[int] = state["pending"]
-    pending.extend(_extract_new_codes(request, state, codec_offset, codec_size))
+    new_codes = _extract_new_codes(request, state, codec_offset, codec_size)
+    pending.extend(new_codes)
+    state["total_frames"] = int(state.get("total_frames", 0)) + len(new_codes)
+
+    if finished and state["total_frames"] == 0:
+        # Fail fast: the transfer adapter logs this and still delivers the
+        # terminal marker, and the serving layer turns the audio-less request
+        # into a request-level error instead of a silent empty stream.
+        state["terminal_sent"] = True
+        raise ValueError(f"Audex thinker produced no codec tokens for request {request_id}")
 
     # Hold back at least one frame on non-terminal emissions so the terminal
     # chunk always carries codes: the generation scheduler never runs a final
@@ -152,7 +162,7 @@ def thinker2code2wav_full_payload(
     codes = [int(t) - codec_offset for t in output_token_ids if codec_offset <= int(t) < codec_offset + codec_size]
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     if not codes:
-        logger.warning("audex.thinker2code2wav_full_payload: no codec tokens for req=%s", request_id)
+        raise ValueError(f"Audex thinker produced no codec tokens for request {request_id}")
     return {
         "codes": {"audio": codes},
         "meta": {

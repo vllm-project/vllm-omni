@@ -161,6 +161,12 @@ class AudexCode2Wav(nn.Module):
 
     def _decode_request(self, req_id: str, codes: list[int], finished: bool) -> torch.Tensor:
         """Push new frames into the request's session; return this step's delta audio."""
+        if finished and not codes and req_id not in self._sessions:
+            # Zero codec tokens for the whole request. Do NOT raise: an
+            # exception in forward() kills the engine core for every request.
+            # Returning empty audio lets the serving layer fail this request.
+            logger.error("Audex code2wav: request %s finished with no codec tokens; no audio generated", req_id)
+            return torch.empty(0, dtype=torch.float32)
         chunks: list[torch.Tensor] = []
         session = self._session_for(req_id)
         with torch.inference_mode():

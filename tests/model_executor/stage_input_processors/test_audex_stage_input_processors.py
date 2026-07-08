@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.audex import (
@@ -122,6 +123,24 @@ def test_token_only_strips_prompt_prefix():
     inputs = thinker2code2wav_token_only([source])
     assert len(inputs) == 1
     assert inputs[0]["prompt_token_ids"] == [_OFFSET, _OFFSET + 1]
+
+
+def test_async_chunk_zero_codec_tokens_raises_on_terminal():
+    """A request that finishes without ever producing a codec token must fail
+    fast (the adapter logs it and the serving layer errors the request)."""
+    tm = _transfer_manager(chunk_frames=2, initial_chunk_frames=1)
+    req = _request("r0", [42, 43], finished=True)  # only non-codec tokens
+    with pytest.raises(ValueError, match="no codec tokens"):
+        thinker2code2wav_async_chunk(tm, None, req)
+    # Terminal handling is one-shot: subsequent calls stay silent.
+    assert thinker2code2wav_async_chunk(tm, None, req) is None
+
+
+def test_full_payload_zero_codec_tokens_raises():
+    tm = _transfer_manager()
+    req = _request("r1", [42, 43], finished=True)
+    with pytest.raises(ValueError, match="no codec tokens"):
+        thinker2code2wav_full_payload(tm, None, req)
 
 
 def test_meta_finished_tensor_dtype():

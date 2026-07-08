@@ -2799,6 +2799,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         yield audio_bytes, sample_rate_val
                     else:
                         yield audio_bytes
+            if self._tts_model_type == "audex" and first_audio_chunk_s is None:
+                # Audex contract: zero codec tokens must abort the stream, not
+                # complete it cleanly with zero audio bytes.
+                raise ValueError("Audex produced no audio (the thinker emitted zero codec tokens)")
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
@@ -3843,6 +3847,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             if audio_tensor.ndim > 1:
                 audio_tensor = audio_tensor.squeeze()
+
+            if self._tts_model_type == "audex" and int(np.size(audio_tensor)) == 0:
+                # Audex contract: zero codec tokens must fail the request, not
+                # serialize as an empty-but-successful WAV.
+                raise ValueError("Audex produced no audio (the thinker emitted zero codec tokens)")
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,

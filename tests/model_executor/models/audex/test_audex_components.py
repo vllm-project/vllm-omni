@@ -183,6 +183,23 @@ def test_code2wav_session_freed_on_finish_and_abort():
     assert "req-b" not in model._sessions
 
 
+def test_code2wav_zero_codec_terminal_returns_empty_without_session():
+    """finished=True with no codes and no prior session: no session is created
+    (nothing to leak) and empty audio is returned — the serving layer turns
+    that into a request-level error. forward() must NOT raise (it would kill
+    the engine core for all requests)."""
+    from vllm_omni.model_executor.models.audex.audex_code2wav import AudexCode2Wav
+
+    model = AudexCode2Wav.__new__(AudexCode2Wav)
+    model._sessions = {}
+    model._emit_chunk_frames = 5
+    model.decoder = None  # would explode if a session were created
+
+    audio = model._decode_request("req-empty", [], finished=True)
+    assert audio.numel() == 0
+    assert model._sessions == {}
+
+
 # ---------------------------------------------------------------- checkpoint preparation
 
 
