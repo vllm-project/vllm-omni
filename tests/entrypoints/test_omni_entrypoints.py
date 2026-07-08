@@ -107,6 +107,7 @@ class FakeAsyncOmniEngine:
         self.stage_vllm_configs = [None for _ in range(self.num_stages)]
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
+        self.endpoint_restrictions = ()
 
         self.output_q: queue.Queue[Any] = queue.Queue()
         self.submitted: list[dict[str, Any]] = []
