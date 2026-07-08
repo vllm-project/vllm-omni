@@ -831,10 +831,16 @@ def _upgrade_status_cells_in_failure_tables(html_fragment: str) -> str:
     finds those cells (only inside tables with a ``Status`` column header), and replaces
     each cell with the interactive ``<td class="fail-status-cell">…</td>`` markup that
     the ``fail-status-submit`` script (``nightly_local_log_report._fail_status_submit_script``)
-    handles. A stable ``data-row-id`` is derived from the nearest preceding section
-    heading (h2-h5) — *not* the inline h6 "Failures & errors" label — combined with
+    handles. A stable ``data-row-id`` is derived from the chain of preceding section
+    headings (h2-h5) — *not* the inline h6 "Failures & errors" label — combined with
     the row index within the table so ``localStorage`` keys remain unique across
-    report sections.
+    report sections. The full heading **chain** is used (not only the nearest heading)
+    because the same job name can appear under multiple GPU subsections in the Failure
+    Analysis — e.g. ``Local job: full_moon_TTS_Function_Test_with_L4`` exists in both
+    ``H200 failures`` and ``A100 failures``. Using only the nearest (h5) heading would
+    collapse both rows into the same ``data-row-id`` and ``localStorage`` would apply
+    the user's status choice across machines. By joining the chain
+    ``"<h2>::<h3/h4>::<h5>::row-N"`` each GPU's row gets a unique key.
     """
     try:
         from nightly_local_log_report import _fail_status_cell_html  # local import
@@ -847,22 +853,28 @@ def _upgrade_status_cells_in_failure_tables(html_fragment: str) -> str:
     SECTION_HEADING_RE = re.compile(r"<h([2-5])[^>]*>(.*?)</h\1>", re.DOTALL | re.IGNORECASE)
     _heading_text_re = re.compile(r"<[^>]+>")
 
-    def _table_replace(table_html: str, ctx_label: str) -> str:
+    def _table_replace(table_html: str, ctx_chain: list[str]) -> str:
         if STATUS_HEADER not in table_html:
             return table_html
         row_index = [0]
 
         def _cell_sub(m: re.Match[str]) -> str:
-            row_id = f"{ctx_label}::row-{row_index[0]}"
+            chain_label = "::".join(ctx_chain) if ctx_chain else "report"
+            row_id = f"{chain_label}::row-{row_index[0]}"
             row_index[0] += 1
             return _fail_status_cell_html(row_id)
 
         return STATUS_CELL_RE.sub(_cell_sub, table_html)
 
-    # Pre-compute heading positions (h2-h5 only) so we can pick the nearest preceding one
-    # for each table without re-scanning.
+    # Pre-compute (position, level, text) tuples for h2-h5 headings so we can
+    # rebuild the heading chain (in source order, descending level) that
+    # precedes each table without re-scanning.
     headings = [
-        (m.start(), _heading_text_re.sub("", m.group(2)).strip()[:80] or "report")
+        (
+            m.start(),
+            int(m.group(1)),
+            _heading_text_re.sub("", m.group(2)).strip()[:80] or "report",
+        )
         for m in SECTION_HEADING_RE.finditer(html_fragment)
     ]
 
@@ -870,13 +882,23 @@ def _upgrade_status_cells_in_failure_tables(html_fragment: str) -> str:
     pos = 0
     for tm in TABLE_RE.finditer(html_fragment):
         rebuilt.append(html_fragment[pos : tm.start()])
-        ctx_label = "report"
-        for h_pos, h_text in headings:
-            if h_pos <= tm.start():
-                ctx_label = h_text
-            else:
+        # Build the heading chain for every heading that precedes this
+        # table. We track each entry's level so a shallower heading (e.g.
+        # an h4 "A100 failures" that follows an h5 "Local job: ..." inside
+        # the previous h4 "H200 failures") properly pops the deeper entries
+        # before being added — otherwise the same job name under multiple
+        # GPU subsections would map to the same row-id.
+        chain: list[tuple[int, str]] = []
+        for h_pos, h_level, h_text in headings:
+            if h_pos >= tm.start():
                 break
-        rebuilt.append(_table_replace(tm.group(0), ctx_label))
+            # Pop any deeper-or-equal entries so the chain reflects current
+            # DOM scope, then add the new heading.
+            while chain and chain[-1][0] >= h_level:
+                chain.pop()
+            chain.append((h_level, h_text))
+        chain_texts = [t for _, t in chain]
+        rebuilt.append(_table_replace(tm.group(0), chain_texts))
         pos = tm.end()
     rebuilt.append(html_fragment[pos:])
     return "".join(rebuilt)
@@ -908,13 +930,19 @@ def _upgrade_excerpt_cells_in_failure_tables(html_fragment: str) -> str:
     TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL | re.IGNORECASE)
 
     headings = [
-        (m.start(), _heading_text_re.sub("", m.group(2)).strip()[:80] or "report")
+        (
+            m.start(),
+            int(m.group(1)),
+            _heading_text_re.sub("", m.group(2)).strip()[:80] or "report",
+        )
         for m in SECTION_HEADING_RE.finditer(html_fragment)
     ]
 
-    def _table_replace(table_html: str, ctx_label: str) -> str:
+    def _table_replace(table_html: str, ctx_chain: list[str]) -> str:
         if EXCERPT_HEADER not in table_html:
             return table_html
+
+        ctx_label = "::".join(ctx_chain) if ctx_chain else "report"
 
         rows = list(ROW_RE.finditer(table_html))
         if not rows:
@@ -967,13 +995,17 @@ def _upgrade_excerpt_cells_in_failure_tables(html_fragment: str) -> str:
     pos = 0
     for tm in TABLE_RE.finditer(html_fragment):
         rebuilt.append(html_fragment[pos : tm.start()])
-        ctx_label = "report"
-        for h_pos, h_text in headings:
-            if h_pos <= tm.start():
-                ctx_label = h_text
-            else:
+        # Build heading chain (same GPU-aware scoping logic as the Status
+        # column upgrade above).
+        chain: list[tuple[int, str]] = []
+        for h_pos, h_level, h_text in headings:
+            if h_pos >= tm.start():
                 break
-        rebuilt.append(_table_replace(tm.group(0), ctx_label))
+            while chain and chain[-1][0] >= h_level:
+                chain.pop()
+            chain.append((h_level, h_text))
+        chain_texts = [t for _, t in chain]
+        rebuilt.append(_table_replace(tm.group(0), chain_texts))
         pos = tm.end()
     rebuilt.append(html_fragment[pos:])
     return "".join(rebuilt)
