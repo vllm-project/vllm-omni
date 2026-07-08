@@ -220,6 +220,39 @@ def _pick_latest_records_from_groups(
     return picked
 
 
+def _pick_latest_records_per_test(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pick the latest record per (model_id, test_name) bucket, further
+    deduped by config_key so concurrent runs of the same config don't
+    double-count.
+
+    The day-bounded helpers (``_pick_latest_records_in_day`` /
+    ``_pick_latest_records_from_groups``) assume *one* ``*_history.json``
+    = *one* model whose tests are all re-run on the same day. When a
+    single history file bundles multiple test cases under one model (e.g.
+    ``hunyuan_image3_history.json`` containing ``test_hunyuan_image3_*``,
+    ``test_hunyuan_image_tp2_*``, ``test_hunyuan_image_tp4``) and they
+    have not all been re-run on the same day, the day-bounded helper
+    drops every test whose latest record is older than the file's overall
+    freshest day. This helper generalizes "one file = one latest day" to
+    "one test = one latest record" so each test surfaces its freshest
+    baseline comparison independently.
+    """
+    latest_by_key: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        test_key = (str(r.get("model_id") or ""), str(r.get("test_name") or ""))
+        gk = str(r.get("config_key") or r.get("source_file") or id(r))
+        inner = latest_by_key.setdefault(test_key, {})
+        prev = inner.get(gk)
+        if prev is None or _timestamp_key(r) > _timestamp_key(prev):
+            inner[gk] = r
+    out: list[dict[str, Any]] = []
+    for inner in latest_by_key.values():
+        out.extend(inner.values())
+    return out
+
+
 def _history_summary(metas: list[dict[str, Any]], used_group_payloads: bool) -> dict[str, Any]:
     generated = sorted({str(m.get("generated_at") or "") for m in metas if m.get("generated_at")})
     files = [str(m.get("file") or "") for m in metas if m.get("file")]
@@ -363,10 +396,27 @@ def _config_view(rec: dict[str, Any], model_type: str) -> str:
     return ", ".join(pairs) if pairs else "-"
 
 
-def _build_perf_rows(records: list[dict[str, Any]]) -> list[PerfRow]:
+def _build_perf_rows(records: list[dict[str, Any]]) -> tuple[list[PerfRow], int]:
+    """Build perf rows; skip records lacking both ``model_id`` and ``title``.
+
+    Returns ``(rows, skipped_unidentified_count)``. The skipped count is
+    surfaced as a warning in the rendered report so stale Buildkite perf
+    JSONs (all-null fields) no longer pollute the table with a bogus
+    ``unknown`` model group.
+    """
     rows: list[PerfRow] = []
+    skipped_unidentified = 0
     for rec in records:
-        model = str(rec.get("model_id") or rec.get("title") or "unknown")
+        model_id = rec.get("model_id")
+        title = rec.get("title")
+        # Skip stale records that lack both model_id and title (e.g. an empty
+        # Buildkite perf JSON whose fields are all null/0). These would otherwise
+        # surface in the Buildkite Performance baseline comparison section as a
+        # bogus "unknown" model group.
+        if not model_id and not title:
+            skipped_unidentified += 1
+            continue
+        model = str(model_id or title)
         config_key = str(rec.get("config_key") or rec.get("source_file") or "")
         test_name = str(rec.get("test_name") or "")
         m_type = _model_type(model, test_name)
@@ -400,7 +450,7 @@ def _build_perf_rows(records: list[dict[str, Any]]) -> list[PerfRow]:
                     date=date_value,
                 )
             )
-    return rows
+    return rows, skipped_unidentified
 
 
 def _run_cmd(argv: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -481,7 +531,15 @@ def build_assets_perf_summary(
     expected_remote: str | None = None,
     expected_branch: str | None = None,
 ) -> dict[str, Any]:
-    """Return baseline comparison summary for latest day only."""
+    """Return baseline comparison summary using each history file's own latest day.
+
+    Models on different schedules (e.g. nightly vs weekly) are kept independent:
+    each ``*_history.json`` contributes rows from its own latest dated record,
+    so a model whose freshest record is older than another model's freshest
+    record still appears. ``latest_day`` on the returned summary is the absolute
+    latest day across all files (kept for backward compat); ``latest_day_per_file``
+    exposes the per-file date actually used.
+    """
     src_meta = _check_kanban_source(
         kanban_repo_root,
         expected_remote=expected_remote,
@@ -521,18 +579,51 @@ def build_assets_perf_summary(
             "source": src_meta.__dict__,
         }
 
-    all_records: list[dict[str, Any]] = []
-    record_groups: list[list[dict[str, Any]]] = []
+    parsed_payloads: list[tuple[Path, HistoryPayload]] = []
     history_metas: list[dict[str, Any]] = []
     for path in existing:
         parsed = _parse_history_payload(path)
-        all_records.extend(parsed.records)
-        record_groups.extend(parsed.record_groups)
+        parsed_payloads.append((path, parsed))
         history_metas.append(parsed.meta)
-    used_group_payloads = bool(record_groups)
+    used_group_payloads = any(payload.record_groups for _, payload in parsed_payloads)
     history = _history_summary(history_metas, used_group_payloads)
-    latest_day = _latest_day(all_records)
-    if not latest_day:
+
+    # Pick each history file's own latest day so models on different schedules
+    # (e.g. nightly vs weekly) all surface their latest baseline comparison.
+    # Using a single global latest_day hides every model whose freshest record
+    # is older than the single freshest record in any other file.
+    file_latest_days: dict[str, str] = {}
+    absolute_latest_day = ""
+    all_records: list[dict[str, Any]] = []
+
+    for path, payload in parsed_payloads:
+        if used_group_payloads:
+            if not payload.record_groups:
+                continue
+            file_records = [r for grp in payload.record_groups for r in grp]
+        else:
+            if not payload.records:
+                continue
+            file_records = payload.records
+        file_day = _latest_day(file_records)
+        if file_day:
+            file_latest_days[path.name] = file_day
+            if file_day > absolute_latest_day:
+                absolute_latest_day = file_day
+        all_records.extend(file_records)
+
+    # Pick the latest record per (model_id, test_name) instead of per
+    # *_history.json. A single history file may bundle multiple test cases
+    # under one model; the day-bounded selection would drop any test whose
+    # latest run is older than the file's single freshest day.
+    day_records = _pick_latest_records_per_test(all_records)
+    if not absolute_latest_day and day_records:
+        absolute_latest_day = max(
+            (d for d in (_date_key(r) for r in day_records) if d),
+            default="",
+        )
+
+    if not absolute_latest_day:
         return {
             "status": "empty",
             "assets_dir": str(resolved_assets_dir),
@@ -543,13 +634,16 @@ def build_assets_perf_summary(
             "message": "No dated records found in history files.",
             "warnings": warnings,
             "source": src_meta.__dict__,
+            "latest_day_per_file": file_latest_days,
         }
-
-    if used_group_payloads:
-        day_records = _pick_latest_records_from_groups(record_groups, latest_day)
-    else:
-        day_records = _pick_latest_records_in_day(all_records, latest_day)
-    rows = _build_perf_rows(day_records)
+    rows, skipped_unidentified = _build_perf_rows(day_records)
+    if skipped_unidentified:
+        warnings.append(
+            f"Skipped {skipped_unidentified} stale perf record(s) lacking both "
+            f"`model_id` and `title` (would have surfaced as a bogus 'unknown' "
+            f"model group). Re-run `sync_buildkite_raw_model_results.py` + "
+            f"`generate_charts.py` to refresh `docs/assets/charts/*_history.json`."
+        )
     # Keep only models that have baseline-backed rows.
     rows = [row for row in rows if row.baseline is not None]
     rows.sort(key=lambda x: (x.model, x.config_key, x.metric))
@@ -561,7 +655,8 @@ def build_assets_perf_summary(
     return {
         "status": "ok" if rows else "empty",
         "assets_dir": str(resolved_assets_dir),
-        "latest_day": latest_day,
+        "latest_day": absolute_latest_day,
+        "latest_day_per_file": file_latest_days,
         "rows": [
             {
                 "model": r.model,

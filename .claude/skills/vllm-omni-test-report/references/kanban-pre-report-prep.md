@@ -24,7 +24,7 @@ The script runs this via **`gh auth git-credential`** (same as report archive pu
 
 ### 2. Sync local perf + logs → `data/local_nightly_raw/manual_*`
 
-**Only `nightly_jobs_local_*` perf** goes to kanban. After log sync, **`prepare_kanban_before_report.py`** reads **`$REPO_ROOT/logs/.kanban_perf_source`** (populated from the latest local run during fetch merge). **General `nightly_jobs_YYYYMMDD-*` perf JSON is not copied to kanban** (it may still exist under **`logs/nightly_jobs`** for the HTML report).
+**Only `nightly_jobs_local_*` perf** goes to kanban. After log sync, **`prepare_kanban_before_report.py`** reads **`$REPO_ROOT/logs/.kanban_perf_source`** (populated from the latest local run during fetch merge). **Stability `nightly_jobs_stability_*` and general `nightly_jobs_YYYYMMDD-*` perf JSON are not copied to kanban** (they may still exist under **`logs/nightly_jobs`** for the HTML report).
 
 **When** `.kanban_perf_source` (or a local-only sync) contains perf JSON (`result_test_*.json`, `diffusion_result_*.json`, `benchmark_results_*.json`):
 

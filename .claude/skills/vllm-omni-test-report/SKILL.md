@@ -1,6 +1,6 @@
 ---
 name: vllm-omni-test-report
-description: Two report kinds; **default output is always HTML** unless the user explicitly asks for Markdown (.md). **Release** — `scripts/compose_full_report.py` (**Test conclusion**, Buildkite metrics, **Test Result** = Common stack + optional `--log-dir-h*` nightly-style summaries + H100/CI block, **Issue tracking** = GitHub `ci-failure` + *local test* in:title, Open bugs); use `--format markdown` only when the user wants .md or `patch_report_*.py`. **Nightly** — `scripts/nightly_local_log_report.py` from local `nightly_jobs` (fetch: vllm-omni-local-test) plus optional latest Buildkite scheduled nightly when token is set; use `--markdown-report` / `--to-stdout markdown` only when the user asks for Markdown. **Archive (opt-in)** — when the user asks to archive/commit/push, run **`scripts/push_report_to_kanban.py`** then **`scripts/push_kanban_report.py`** (push only in the second step; **requires [gh CLI](https://cli.github.com/)**; prompt install if missing). Use when generating Buildkite release summaries, parsing local nightly_jobs with CI cross-check, or opening https://buildkite.com/vllm/vllm-omni/builds?branch=main for CI documentation.
+description: Three report kinds; **default output is always HTML** unless the user explicitly asks for Markdown (.md). **Release** — `scripts/compose_full_report.py` (**Test conclusion**, Buildkite metrics, **Test Result** = Common stack + optional `--log-dir-h*` nightly-style summaries + H100/CI block, **Issue tracking** = GitHub `ci-failure` + *local test* in:title, Open bugs); use `--format markdown` only when the user wants .md or `patch_report_*.py`. **Development** — `compose_full_report.py --kind development` — same **Test Result + Open issues (stats window)** layout as release, but **drops Test conclusion + Issue tracking** and replaces **Metrics overview** with a 4-row snapshot (Outstanding DI, Open Critical Issue, merge CI result, Unassigned Open Issue). Each row turns red (`<span class="dev-snapshot-alert">`) when its threshold is breached: DI > 30; open critical issue > 0; merge CI not all passing; unassigned open issue > 0. Each H200/H800/A100 section under Test Result gets a `#### Performance Data Comparison` subsection (reuses nightly Local Test perf comparison logic; read-only against kanban `docs/assets/charts/*_history.json`; no `prepare_kanban_before_report.py` / no push). **Nightly** — `scripts/nightly_local_log_report.py` from local `nightly_jobs` (fetch: vllm-omni-local-test) plus optional latest Buildkite scheduled nightly when token is set; use `--markdown-report` / `--to-stdout markdown` only when the user asks for Markdown. **Archive (opt-in)** — when the user asks to archive/commit/push, run **`scripts/push_report_to_kanban.py`** then **`scripts/push_kanban_report.py`** (push only in the second step; **requires [gh CLI](https://cli.github.com/)**; prompt install if missing). Use when generating Buildkite release summaries, parsing local nightly_jobs with CI cross-check, or opening https://buildkite.com/vllm/vllm-omni/builds?branch=main for CI documentation.
 ---
 
 # vLLM-Omni Test Report
@@ -9,7 +9,8 @@ description: Two report kinds; **default output is always HTML** unless the user
 
 | Kind | Output | When to use |
 |------|--------|-------------|
-| **release** | **HTML** (default): `compose_full_report.py` without `--format markdown` | **Test conclusion** + **Metrics** + **Test Result** (matrix Common stack; H200/H800/A100 optional log roots; H100 = CI nightly) + **Issue tracking** (ci-failure + *local test* in:title) + **Open issues** (bugs in stats window). |
+| **release** | **HTML** (default): `compose_full_report.py` (or `--kind release`) | **Test conclusion** + **Metrics** (UT coverage is **manual-edit**, backed by `localStorage`; same pattern as development) + **Test Result** (matrix Common stack; H200/H800/A100 optional log roots; H100 = CI nightly) + **Failure Analysis** (per-GPU failure detail with interactive **Status** column — Filed / Not an issue) + **Issue tracking** (ci-failure + *local test* in:title) + **Open issues** (bugs in stats window). |
+| **development** | **HTML** (default): `compose_full_report.py --kind development` | Same **Test Result + Open issues (stats window)** layout as release, but **drops** *Test conclusion* + *Issue tracking*; **Metrics overview** is replaced with a 4-row snapshot (Outstanding DI · Open Critical Issue · **merge CI result** · **Unassigned Open Issue**) followed by the full unassigned-open-bug table. Each row turns red when its threshold is breached (see Development Quick Path below). Use when the audience is development rather than release-gating. |
 | **nightly** | **HTML** (default): `nightly_local_log_report.py --html-report …` | **Local** `nightly_jobs` tree (see vllm-omni-local-test) **and** optional **Buildkite** latest scheduled nightly (same log analysis as local; needs token unless `--no-buildkite`). |
 
 ## Default output (HTML)
@@ -28,7 +29,7 @@ description: Two report kinds; **default output is always HTML** unless the user
 
 Shared helpers live in `scripts/report_naming.py`. `push_report_to_kanban.py` archives non-canonical filenames under **today UTC** unless `--date` is set.
 
-**Exception — kanban `manual_*`:** only **`nightly_jobs_local_*`** perf JSON (via **`logs/.kanban_perf_source`**) is copied to kanban; general **`nightly_jobs_YYYYMMDD-*`** perf stays in **`logs/nightly_jobs`** for the report only. See [kanban-pre-report-prep.md](references/kanban-pre-report-prep.md).
+**Exception — kanban `manual_*`:** only **`nightly_jobs_local_*`** perf JSON (via **`logs/.kanban_perf_source`**) is copied to kanban; stability **`nightly_jobs_stability_*`** and general **`nightly_jobs_YYYYMMDD-*`** perf stay in **`logs/nightly_jobs`** for the report only. See [kanban-pre-report-prep.md](references/kanban-pre-report-prep.md).
 
 ## Agent Quick Path
 
@@ -37,6 +38,7 @@ Shared helpers live in `scripts/report_naming.py`. `push_report_to_kanban.py` ar
 **Intent keywords:**
 - **Nightly**: `nightly`, `nightly report`, `nightly_jobs`, `scheduled nightly`, `generate nightly`, `daily report`.
 - **Release**: `release report`, `test report`.
+- **Development**: `development report`, `dev report`, `development test report`. When the user explicitly asks for a *development* variant of the test report, pass `--kind development` to `compose_full_report.py`.
 - **Markdown opt-in only**: `markdown`, `.md`, `generate md`, `generate markdown`.
 - **Archive / push to kanban (opt-in only)**: `archive`, `commit`, `push`, `kanban`, `upload report`. **Do not** push unless the user prompt includes one of these (or an explicit equivalent).
 
@@ -47,6 +49,8 @@ When archive/push intent is present, **after** HTML generation:
 1. Verify **`gh --version`** and **`gh auth status`**; if `gh` is missing, **stop** and tell the user to install [GitHub CLI](https://cli.github.com/) (`winget install --id GitHub.cli` on Windows) then `gh auth login`.
 2. Require local clone of [vllm-omni-kanban](https://github.com/hsliuustc0106/vllm-omni-kanban) — default **`~/vllm-omni-kanban`** ([confirm with user](references/confirm-laptop-path-defaults.md); override via `KANBAN_REPO_ROOT` or `--kanban-repo-root`).
 3. Run **`scripts/push_report_to_kanban.py`** to copy + stage **report HTML** and, when prep wrote `.last_manual_dir`, the matching **`data/local_nightly_raw/manual_*`**. Its stdout includes a **Kanban push preview** block (repo, branch, commit message, staged files, diff stat).
+
+   > ⚠️ **`.last_manual_dir` is a local-only marker file** — written by `prepare_kanban_before_report.py` to record which `manual_*` directory should be included in the next archive push. It is **not** part of the report or raw test data and **must NOT be staged or pushed**. The script stages `manual_<date>/` content directly, so the marker stays untracked. If you (or the agent) accidentally `git add` it, run `git restore --staged data/local_nightly_raw/.last_manual_dir` before committing.
 4. **Paste the full push preview to the user** (do not summarize as “ready to push”). Ask whether to proceed. Then run **`scripts/push_kanban_report.py`** — the only script that commits and pushes. Use **`--preview-only`** to re-print the preview without attempting push. In a terminal it prompts `[y/N]`; in agent/non-interactive mode it exits with code 3 and prints the full preview again — **ask the user in chat**, then re-run with **`--yes`** after they confirm.
 5. Confirm push succeeded; report filenames and paths: [references/kanban-report-archive.md](references/kanban-report-archive.md).
 
@@ -74,11 +78,14 @@ python scripts/push_kanban_report.py \
   --kanban-repo-root "$KANBAN_REPO_ROOT"
 
 # Release: compose_full_report.py --out ... then steps 2–3 with --kind release
+#   → archives to vllm-omni-kanban/data/release_test_report/
+# Development: compose_full_report.py --kind development --out ... then steps 2–3 with --kind development
+#   → archives to vllm-omni-kanban/data/development_test_report/
 ```
 
 Standalone (report already on disk): run `push_report_to_kanban.py` then `push_kanban_report.py` (add `--yes` to the push script only after user confirms).
 
-**Git commit scope:** push the HTML file under `data/nightly_test_report/` or `data/release_test_report/` **and**, when nightly prep created one, the matching **`data/local_nightly_raw/manual_*`** directory (perf JSON + job logs). **`docs/assets/test_reports/` is gitignored** in kanban — MkDocs regenerates it from `data/` at `mkdocs serve` / `mkdocs build`; **never** `git add` that directory. Details: [references/kanban-report-archive.md](references/kanban-report-archive.md).
+**Git commit scope:** push the HTML file under `data/nightly_test_report/`, `data/release_test_report/`, or `data/development_test_report/` (depending on `--kind` flag: `nightly` / `release` / `development`) **and**, when nightly prep created one, the matching **`data/local_nightly_raw/manual_*`** directory (perf JSON + job logs). **`docs/assets/test_reports/` is gitignored** in kanban — MkDocs regenerates it from `data/` at `mkdocs serve` / `mkdocs build`; **never** `git add` that directory. Details: [references/kanban-report-archive.md](references/kanban-report-archive.md).
 
 ### Nightly Quick Path
 
@@ -126,9 +133,77 @@ python scripts/compose_full_report.py \
   --out ./vllm-omni-test-report-YYYY-MM-DD.html
 ```
 
+### Development Quick Path
+
+The **Development** variant shares the **Test Result** layout with `--kind release` but **drops Test conclusion + Issue tracking** and replaces **Metrics overview** with a 4-row snapshot focused on outstanding defect inventory + latest CI verdicts + unassigned-owner triage. Each H200/H800/A100 section in **Test Result** also gains a `#### Performance Data Comparison` subsection (read-only kanban usage — see below).
+
+**Document body layout (Development variant):** The Development HTML/Markdown **starts directly at the `## Metrics overview` section** — there is no leading multi-bullet descriptive preamble (no release/development comparison paragraph, no section-ordering bullet list, no CSS-class explainer). Only a single `* **Report date (UTC):** YYYY-MM-DD*` line sits between the H1 title and the first section so the date is unambiguous in the rendered output. Section ordering remains: Metrics overview → Test Result → Failure Analysis → Performance Data Comparison → Open issues.
+
+Ask for or infer:
+- Buildkite token in the environment (`BUILDKITE_TOKEN` or `BUILDKITE_API_TOKEN`) — required unless using `--preview`.
+- GitHub token (`GITHUB_TOKEN` or `GH_TOKEN`) — recommended for stable issue data.
+- Optional GPU local logs: `--log-dir-h200`, `--log-dir-h800`, `--log-dir-a100` (same as release).
+- Optional kanban assets source for the per-GPU perf subsection: `--kanban-repo-root <vllm-omni-kanban>`. **Resolution order:** (1) explicit `--kanban-repo-root`, (2) `$KANBAN_REPO_ROOT` env var, (3) `$VLLM_OMNI_KANBAN_ROOT` env var, (4) **default `~/vllm-omni-kanban`** (if exists). Alternatively use `--perf-assets-dir <kanban>/docs/assets/charts` to directly specify the assets directory.
+- Optional output path: `--out ./vllm-omni-test-report-development-YYYY-MM-DD.html`.
+
+```bash
+export BUILDKITE_TOKEN=...  # or BUILDKITE_API_TOKEN
+export GITHUB_TOKEN=...     # optional but recommended
+python scripts/compose_full_report.py \
+  --kind development \
+  --out ./vllm-omni-test-report-development-YYYY-MM-DD.html
+```
+
+With optional GPU nightly summaries + perf comparison (Test Result layout is identical to `--kind release`; per-GPU `#### Performance Data Comparison` is added under H200/H800/A100 when both `--log-dir-h*` and a kanban assets source are supplied):
+
+```bash
+python scripts/compose_full_report.py \
+  --kind development \
+  --log-dir-h200 /path/to/nightly_jobs_h200 \
+  --log-dir-h800 /path/to/nightly_jobs_h800 \
+  --log-dir-a100 /path/to/nightly_jobs_a100 \
+  --kanban-repo-root /path/to/vllm-omni-kanban \
+  --out ./vllm-omni-test-report-development-YYYY-MM-DD.html
+```
+
+The 4-row **Metrics overview** snapshot (per spec) is:
+1. **Outstanding DI** — sum of priority-label weights for **all** open `label:bug` issues (`critical=10` / `high priority=3` / `medium priority=1` / `low priority=0.1` / `invalid=0`); no date filter (cumulative snapshot).
+2. **Open Critical Issue** — count of open issues that carry **both** labels `bug` **and** `critical` (AND filter; RFC / Feature tickets tagged only with `critical` are intentionally excluded) + the first 10 issue numbers.
+3. **merge CI result (all pass / fail)** — Buildkite latest finished **merge** build (`buildkite_build_stats.fetch_latest_finished_merge_build`); "✅ All pass" iff every reportable job (excluding `Upload * Pipeline`) is `passed`.
+4. **Unassigned Open Issue** — count of open `label:bug` issues with empty `assignees[]`, followed by the full Markdown table of those issues (Issue · Title · Opened at · Priority · DI · Status).
+
+**Red-alert rules** (each row's cell is wrapped in `<span class="dev-snapshot-alert">…</span>` so it renders red via `.release-doc .dev-snapshot-alert` in `release_html_theme.RELEASE_MARKDOWN_DOC_CSS`):
+
+| Row | Red Threshold |
+|-----|---------|
+| Outstanding DI | DI > 30 (i.e. `total_tenths > BUG_DI_THRESHOLD_TENTHS = 300` tenths) |
+| Open Critical Issue | open `bug` + `critical` count > 0 |
+| merge CI result | latest finished merge build is not all passing |
+| Unassigned Open Issue | count > 0 |
+
+#### Performance Data Comparison — collapsible per-GPU subsections
+
+In `--kind development`, the **`## Performance Data Comparison`** section contains collapsible **`#### H200` / `#### H800` / `#### A100`** subsections whenever:
+
+- The corresponding `--log-dir-h*` is supplied (so the local perf JSON under `nightly_jobs/<result_root>/result_test_*.json` exists), **and**
+- A kanban assets dir is reachable. **Resolution order:** (1) `--kanban-repo-root`, (2) `$KANBAN_REPO_ROOT`, (3) `$VLLM_OMNI_KANBAN_ROOT`, (4) **default `~/vllm-omni-kanban`** (if exists). Assets path resolves to `<repo>/docs/assets/charts/*_history.json`.
+
+Each GPU subsection (e.g., `#### H200`) is rendered as a collapsible `<details>` block in HTML, allowing users to expand/fold the performance baseline comparison table per GPU. **Per-model rows (`##### {model_name}`) render as nested `<details>` inside their parent GPU** — so the structure is `#### H200 → ##### BAGEL → ##### Qwen-Image → ##### ...` rather than flat siblings. Implementation reuses the nightly Local Test perf logic end-to-end (`compose_full_report.render_dev_perf_baseline_local_md` → `nightly_local_log_report._buildkite_perf_rows` → `_filter_perf_summary_for_local`; the perf helper accepts a `model_heading_level=` kwarg so model headings stay one level deeper than their parent) but is **strictly read-only**:
+
+- No `scripts/prepare_kanban_before_report.py` is run.
+- No `mkdocs build` / no staging / no commit.
+- No `push_report_to_kanban.py` / `push_kanban_report.py`.
+- The kanban repo (if supplied) is only used for its on-disk `docs/assets/charts/*_history.json` files; `build_assets_perf_summary(..., kanban_repo_root=None)` skips git inspection entirely.
+
+If a GPU has no `--log-dir-h*` the subsection is omitted entirely (no placeholder). If kanban assets are missing the subsection renders a one-line skip note (`"*--kanban-repo-root / --perf-assets-dir not provided — skipping perf baseline comparison …*"`); it never blocks report generation.
+
+After **Test Result** the report also includes **`## Open issues (stats window)`** (same layout and same data source as the release variant: paginated `GET /repos/vllm-project/vllm-omni/issues?state=open&labels=bug`, filtered to `created_at` UTC date in `--stats-from`..`--stats-to`).
+
+Preview-only (no Buildkite / GitHub / pytest calls): `--preview --kind development` writes `vllm-omni-test-report-development-preview-YYYY-MM-DD.html` (default). The per-GPU subsections are shown as placeholder notes in preview mode; remove `--preview` to populate from real data.
+
 ## Nightly report (local logs + optional Buildkite nightly, HTML)
 
-**Prerequisite:** `LOG_DIR` on disk - paths and pytest rules in [references/nightly-local-log-layout.md](references/nightly-local-log-layout.md). To **produce** logs on cluster, follow [vllm-omni-local-test](../vllm-omni-local-test/SKILL.md) (**H200** or **H800**). To **copy** logs to your laptop, use [../vllm-omni-local-test/references/nightly-local-log-fetch.md](../vllm-omni-local-test/references/nightly-local-log-fetch.md) — **required before each sync:** **`rm -rf` local `$REPO_ROOT/logs`**, then pull per **sync scope** (`local` → latest **`nightly_jobs_local_*` only**; **default** → latest **`nightly_jobs_local_*` + latest `nightly_jobs_YYYYMMDD-*`**) → **merge** into **`logs/nightly_jobs`**.
+**Prerequisite:** `LOG_DIR` on disk - paths and pytest rules in [references/nightly-local-log-layout.md](references/nightly-local-log-layout.md). To **produce** logs on cluster, follow [vllm-omni-local-test](../vllm-omni-local-test/SKILL.md) (**H200** or **H800**). To **copy** logs to your laptop, use [../vllm-omni-local-test/references/nightly-local-log-fetch.md](../vllm-omni-local-test/references/nightly-local-log-fetch.md) — **required before each sync:** **`rm -rf` local `$REPO_ROOT/logs`**, then pull per **sync scope** (`local` → latest **`nightly_jobs_local_*` only**; `stability` → latest **`nightly_jobs_stability_*` only**; `default` → latest **`nightly_jobs_YYYYMMDD-*` only**; `all` → local + stability + general nightly; auto-detected from the run's `--test-type` when the user started by running tests first) → **merge** into **`logs/nightly_jobs`**.
 
 **Daily focus summary:** Nightly HTML and Markdown place **Daily focus** immediately after the title. It summarizes Buildkite / Local job failures and lists all baseline-backed performance regressions whose normalized `Status` is `fail` across Buildkite and Local; the HTML table supports Model checkbox filtering. A **major performance regression** is any baseline comparison row whose normalized `Status` is `fail` (current threshold: worse than baseline by more than 6%, using metric direction from `kanban_assets_perf_summary.py`). If there are no `fail` rows, the summary may show the worst `normal` rows as observation items; if baseline data is missing, it reports that explicitly instead of guessing.
 
@@ -141,7 +216,7 @@ By default the script also pulls **main** latest **scheduled nightly** from Buil
 Optional source checks:
 - `--kanban-expected-remote` / `--kanban-expected-branch` add warnings when current/upstream config differs.
 
-**Kanban raw fallback:** By default the report remains read-only against kanban assets. If `*_history.json` is missing or has no baseline rows, the **performance baseline comparison** section shows diagnostics for `<kanban-repo>/data/buildkite_nightly_raw` (raw perf JSON count, recent build IDs, latest raw/history mtimes) and explains that local `nightly_jobs` is for pass/fail analysis only, not baseline sources. To explicitly regenerate kanban assets from raw perf artifacts before rendering, add `--kanban-refresh-from-raw` with `--kanban-repo-root <vllm-omni-kanban>`; optional `--kanban-raw-root <path>` overrides the raw root. This runs kanban-side `scripts/sync_buildkite_raw_model_results.py` for known model groups and then `scripts/generate_charts.py`, so it mutates the kanban checkout under `data/results/` and `docs/assets/charts/`.
+**Kanban raw fallback:** By default the report remains read-only against kanban assets. The performance baseline comparison block keeps Data source / Local filter / History / generated_at / Raw data fallback diagnostics out of the rendered output and focuses on per-model baseline rows. To explicitly regenerate kanban assets from raw perf artifacts before rendering, add `--kanban-refresh-from-raw` with `--kanban-repo-root <vllm-omni-kanban>`; optional `--kanban-raw-root <path>` overrides the raw root. This runs kanban-side `scripts/sync_buildkite_raw_model_results.py` for known model groups and then `scripts/generate_charts.py`, so it mutates the kanban checkout under `data/results/` and `docs/assets/charts/`.
 
 **Kanban raw model sync mapping:** Keep `KANBAN_RAW_MODEL_SYNCS` in `scripts/nightly_local_log_report.py` aligned with [vllm-omni-kanban `scripts/mkdocs_hooks.py`](https://github.com/hsliuustc0106/vllm-omni-kanban/blob/main/scripts/mkdocs_hooks.py). Current mapping: `qwen3omni -> qwen3_omni`, `qwen3tts -> qwen3_tts`, `qwen_image -> qwen_image`, `qwen_image_edit -> qwen_image_edit`, `qwen_image_edit_2509 -> qwen_image_edit_2509`, `wan22 -> wan22`. When adding a model, update kanban first, then update both the report script constant and this note.
 
@@ -189,10 +264,11 @@ python scripts/compose_full_report.py --format markdown --out ./vllm-omni-test-r
 Generate a **human-readable test report** ordered as:
 
 1. **Test conclusion** — Checklist table: only **UT coverage…**, **requirements**, and **performance** (3 items) are manual **Pass / Fail** in HTML; **Latest L2&L3 pass rate is 100%**, **Remaining DI < 30**, **No remaining critical issues**, and **All remaining bugs have assignees** are **automatic** (Buildkite: same **ready** (non-main) and **merge** (main non-nightly/weekly) latest **finished** builds as Metrics — any `failed`/`broken` job fails the row; GitHub: open **`label:bug`** in stats window weighted by priority labels **DI < 30**; **no** open **`critical`**; open **`label:bug`** all have **assignee**). Archive/plain Markdown matches HTML.
-2. **Metrics overview** — Same as before: `buildkite_build_stats.py --markdown` (**Success rate/UT coverage**, **Bug avg first response**, **ut** / **ut (exclude models)**, aligned with **`--stats-from`..`--stats-to`**).
+2. **Metrics overview** — `buildkite_build_stats.py --markdown` generates the main table (**Success rate**, **Bug avg first response**, aligned with **`--stats-from`..`--stats-to`**). The **UT coverage** rows (`ut` and `ut (exclude models)`) are **manual-edit** cells (click the cell to enter the coverage value; persisted in `localStorage` via the same `ut-coverage-modal` as the Development variant). This replaces the previous auto-computed `ut` / `ut (exclude models)` rows from `buildkite_build_stats.py`.
 3. **Test Result** — `### Common stack (all rows)` from [references/local-test-matrix.md](references/local-test-matrix.md); `### H200` / `### H800` / `### A100` use the same grouped tables as nightly local **Summary** (pass `--log-dir-h200` / `--log-dir-h800` / `--log-dir-a100`; directories must match [references/nightly-local-log-layout.md](references/nightly-local-log-layout.md)); `### H100 (CI — Buildkite scheduled nightly)` includes **Build** (build number/branch/commit), reportable job **Summary**, **Failed test jobs** (**excludes** per-job pytest detail and **Analysis (CI Failure)**; maintain separately via hand edits or `nightly_job_pytest_table.py` / `patch_report_ci_failure.py` when needed).
-4. **Issue tracking** — GitHub Search: `label:ci-failure`, **title** contains **`local test`**, `created` within the stats window (same date range as metrics).
-5. **Open issues (stats window)** — Paginated **`label:bug`**, **open**, `created_at` UTC date in **`--stats-from`..`--stats-to`**; precompute daily DI from the same issues: `critical` = 10, `high priority` = 3, `medium priority` = 1, `low priority` = 0.1, `invalid` = 0 — sum feeds the **Remaining DI < 30** auto row.
+4. **Failure Analysis** — Top-level section with one collapsible subsection per GPU (H200 / H800 / A100 from local nightly logs; H100 from Buildkite scheduled nightly). Each failure table has an interactive **Status** column with two buttons — **Filed** / **Not an issue** — backed by `localStorage`. Clicking **Filed** opens an in-page modal where the user enters the GitHub issue number (and an optional note); the cell renders as `Filed #<n>` with a link to the GitHub issue. Clicking **Not an issue** opens the same modal with the issue-number field hidden so the user can record an optional note. The modal has its own **Save** / **Cancel** / **Reset** buttons; Esc closes it (iframe-safe). State is keyed by the row's `data-row-id` (derived from the nearest preceding section heading + row index) so reloads keep the chosen status. Mirrors the Development variant's Failure Analysis layout.
+5. **Issue tracking** — GitHub Search: `label:ci-failure`, **title** contains **`local test`**, `created` within the stats window (same date range as metrics).
+6. **Open issues (stats window)** — Paginated **`label:bug`**, **open**, `created_at` UTC date in **`--stats-from`..`--stats-to`**; precompute daily DI from the same issues: `critical` = 10, `high priority` = 3, `medium priority` = 1, `low priority` = 0.1, `invalid` = 0 — sum feeds the **Remaining DI < 30** auto row.
 
 ## When to Apply
 
@@ -201,6 +277,7 @@ Generate a **human-readable test report** ordered as:
 - User wants to summarize failures, flaky steps, or duration from Buildkite
 - User needs **Common stack** or optional **H200/H800/A100** nightly log summaries in the **release** report — set **`--log-dir-h*`** on `compose_full_report.py` when logs are available
 - User asks for **nightly** report from **local** `nightly_jobs` — **default to HTML** (`nightly_local_log_report.py --html-report`); Markdown **only** if they explicitly ask (`fetch` in vllm-omni-local-test)
+- User asks for a **development** / **dev** variant of the test report (or wants to skip Test conclusion + Issue tracking and focus on outstanding defects / latest CI verdicts / unassigned owners) — `compose_full_report.py --kind development`; same Test Result layout as release
 - User asks to **archive / commit / push** the report to [vllm-omni-kanban](https://github.com/hsliuustc0106/vllm-omni-kanban) — run [references/kanban-report-archive.md](references/kanban-report-archive.md) **after** HTML is written
 
 ## Definitions
@@ -350,7 +427,7 @@ Hand-authored or review-only; automation emits the same sections in HTML by defa
 
 ## Metrics overview
 
-(`buildkite_build_stats.py --markdown`, aligned with `--stats-from`..`--stats-to`.)
+(`buildkite_build_stats.py --markdown`, aligned with `--stats-from`..`--stats-to`. UT coverage rows are **manual-edit** cells in HTML — click to enter value, persisted via `localStorage`.)
 
 ## Test Result
 
@@ -378,6 +455,22 @@ Hand-authored or review-only; automation emits the same sections in HTML by defa
 …
 #### Failed test jobs (if any)
 …
+
+## Failure Analysis
+
+Per-machine failure detail. Click the *Failed* cell in the Test Result summary table to jump to the matching subsection below.
+
+#### H200 failures
+(Per-job **Failures & errors** table with interactive **Status** column — Filed / Not an issue.)
+
+#### H800 failures
+(Same layout as H200.)
+
+#### A100 failures
+(Same layout as H200.)
+
+#### H100 (CI — Buildkite scheduled nightly) failures
+(Buildkite failed/broken steps with interactive **Status** column.)
 
 ## Issue tracking
 

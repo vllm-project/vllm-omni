@@ -209,6 +209,511 @@ def _table_wrap(table_html: str) -> str:
     return f'<div class="table-scroll">{table_html}</div>'
 
 
+def _fail_status_cell_html(row_id: str, *, label: str = "Status") -> str:
+    """Render a **Status** cell with two interactive buttons for HTML failure tables.
+
+    Initial state shows two buttons:
+      * ``Filed`` (Filed as bug) — opens the in-page modal to enter the GitHub
+        issue number (and optional note). Replaces the old ``window.prompt()``
+        approach so the cell stays editable when the report is embedded via
+        iframe (where ``prompt`` is blocked by ``sandbox``).
+      * ``Not an issue`` (Not an issue) — opens the modal for the user to fill in an
+        optional explanation note before saving.
+
+    State (status + issue number + note) is persisted per ``row_id`` in
+    ``localStorage`` so reloads keep the chosen state.
+    """
+    row_id_attr = html.escape(row_id, quote=True)
+    return (
+        f'<td class="fail-status-cell" data-row-id="{row_id_attr}" data-status="unset">'
+        '<span class="fail-status-buttons">'
+        '<button type="button" class="fail-status-btn fail-status-btn--filed" '
+        'data-status-action="filed">Filed</button>'
+        '<button type="button" class="fail-status-btn fail-status-btn--not-issue" '
+        'data-status-action="not-issue">Not an issue</button>'
+        "</span></td>"
+    )
+
+
+def _fail_status_modal_html() -> str:
+    """In-page modal used by ``_fail_status_submit_script``.
+
+    Replaces the legacy ``window.prompt()`` flow so the cell stays editable when
+    the report is embedded via iframe on the kanban Reports page (where
+    ``prompt`` is blocked by the sandbox). Single modal handles both flows
+    (Filed = enter issue number + note; Not an issue = enter note only).
+    """
+    return """
+<div id="fail-status-modal" class="fail-status-modal" hidden role="dialog"
+     aria-modal="true" aria-labelledby="fail-status-modal-title">
+  <div class="fail-status-modal-backdrop" data-fsm-close aria-hidden="true"></div>
+  <div class="fail-status-modal-panel">
+    <header class="fail-status-modal-header">
+      <h2 id="fail-status-modal-title" data-fsm-title>Mark status</h2>
+      <button type="button" class="fail-status-modal-close"
+              data-fsm-close aria-label="Close">&times;</button>
+    </header>
+    <div class="fail-status-modal-body">
+      <label class="fail-status-modal-field" data-fsm-field-issue>
+        <span class="fail-status-modal-label">GitHub issue number</span>
+        <input type="text" class="fail-status-modal-input"
+               data-fsm-input-issue placeholder="e.g. 123" />
+        <span class="fail-status-modal-hint">
+          ((Leave blank to save note only, no linked issue))
+        </span>
+      </label>
+      <label class="fail-status-modal-field">
+        <span class="fail-status-modal-label">Note (optional)</span>
+        <textarea class="fail-status-modal-textarea"
+                  data-fsm-input-note rows="4"
+                  placeholder="e.g. known flaky, fixed in PR #456 / config issue, will track ..."></textarea>
+      </label>
+    </div>
+    <footer class="fail-status-modal-footer">
+      <button type="button" class="fail-status-modal-cancel"
+              data-fsm-close>Cancel</button>
+      <button type="button" class="fail-status-modal-save"
+              data-fsm-save>Save</button>
+    </footer>
+  </div>
+</div>
+"""
+
+
+def _fail_status_submit_script() -> str:
+    """Client script: handle two-button Status cells in failure-analysis tables.
+
+    Both buttons (``Filed`` / ``Not an issue``) open the in-page modal
+    ``#fail-status-modal``. The modal flow replaces the legacy ``window.prompt()``
+    so the cell stays editable when the report is embedded via iframe on the
+    kanban Reports page (where ``prompt`` is blocked by ``sandbox``).
+
+    Behaviour:
+      * Initial: cell shows two buttons (``Filed`` / ``Not an issue``).
+      * Click ``Filed`` -> opens the modal pre-filled with the saved issue
+        number + note; user can edit the issue number (or leave it blank for
+        note-only) and add a note; clicking Save persists ``status=filed``
+        along with the entered issue number + note.
+      * Click ``Not an issue`` -> opens the modal with the issue number field hidden
+        (note-only); clicking Save persists ``status=not-issue`` + note.
+      * Click on the displayed status link / pill -> re-opens the modal to edit.
+      * Click Reset -> clears localStorage and returns to the two-button state.
+
+    State is keyed by the row's ``data-row-id`` attribute and stored in
+    ``localStorage`` so reloading the report keeps the chosen status.
+    """
+    return """
+<script>
+(function () {
+  function escHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"})[c];
+    });
+  }
+  function escAttr(s) {
+    return String(s).replace(/"/g, "&quot;");
+  }
+  function repoIssueUrl(n) {
+    return "https://github.com/vllm-project/vllm-omni/issues/" + encodeURIComponent(n);
+  }
+  function lsKey(rowId) { return "fail-status:" + rowId; }
+  function saveStatus(rowId, payload) {
+    try {
+      if (payload && (payload.status || payload.issue || payload.note)) {
+        localStorage.setItem(lsKey(rowId), JSON.stringify(payload));
+      } else {
+        localStorage.removeItem(lsKey(rowId));
+      }
+    } catch (e) { /* localStorage unavailable */ }
+  }
+  function loadStatus(rowId) {
+    try {
+      var raw = localStorage.getItem(lsKey(rowId));
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+  function renderUnset(cell) {
+    cell.setAttribute("data-status", "unset");
+    cell.removeAttribute("data-status-issue");
+    cell.removeAttribute("data-status-note");
+    cell.innerHTML =
+      '<span class="fail-status-buttons">' +
+      '<button type="button" class="fail-status-btn fail-status-btn--filed" data-status-action="filed">Filed</button>' +
+      '<button type="button" class="fail-status-btn fail-status-btn--not-issue"'
+      + ' data-status-action="not-issue">Not an issue</button>' +
+      '</span>';
+  }
+  function renderFiled(cell, issue, note) {
+    cell.setAttribute("data-status", "filed");
+    cell.setAttribute("data-status-issue", issue || "");
+    cell.setAttribute("data-status-note", note || "");
+    var issueHtml = issue
+      ? '<a class="fail-status-issue-link" href="' + repoIssueUrl(issue) + '"'
+        + ' target="_blank" rel="noopener">Filed #' + escHtml(issue) + '</a>'
+      : '<span class="fail-status-issue-link">Filed</span>';
+    var noteHtml = note ? '<span class="fail-status-note"> — ' + escHtml(note) + '</span>' : '';
+    cell.innerHTML =
+      '<span class="fail-status-display fail-status-display--filed">' +
+      issueHtml + noteHtml +
+      '</span>' +
+      '<button type="button" class="fail-status-reset" data-status-action="reset">Reset</button>';
+  }
+  function renderNotIssue(cell, note) {
+    cell.setAttribute("data-status", "not-issue");
+    cell.setAttribute("data-status-issue", "");
+    cell.setAttribute("data-status-note", note || "");
+    var noteHtml = note ? '<span class="fail-status-note"> — ' + escHtml(note) + '</span>' : '';
+    cell.innerHTML =
+      '<span class="fail-status-display fail-status-display--not-issue">Not an issue' + noteHtml + '</span>' +
+      '<button type="button" class="fail-status-reset" data-status-action="reset">Reset</button>';
+  }
+
+  var modal = document.getElementById("fail-status-modal");
+  var modalTitle = modal && modal.querySelector("[data-fsm-title]");
+  var modalIssueField = modal && modal.querySelector("[data-fsm-field-issue]");
+  var modalIssueInput = modal && modal.querySelector("[data-fsm-input-issue]");
+  var modalNoteInput = modal && modal.querySelector("[data-fsm-input-note]");
+  var activeCell = null;
+  var activeMode = null;  // "filed" | "not-issue"
+
+  function openModal(cell, mode) {
+    if (!modal) return;
+    activeCell = cell;
+    activeMode = mode;
+    var saved = loadStatus(cell.getAttribute("data-row-id")) || {};
+    if (modalTitle) {
+      modalTitle.textContent = mode === "filed" ? "Mark as filed" : "Mark as not an issue";
+    }
+    if (modalIssueField) {
+      // Hide the issue number field entirely for "not-issue" mode.
+      modalIssueField.style.display = (mode === "filed") ? "" : "none";
+    }
+    if (modalIssueInput) {
+      modalIssueInput.value = (mode === "filed") ? (saved.issue || "") : "";
+    }
+    if (modalNoteInput) {
+      modalNoteInput.value = saved.note || "";
+    }
+    modal.hidden = false;
+    document.body.classList.add("fail-status-modal-open");
+    if (mode === "filed" && modalIssueInput) {
+      modalIssueInput.focus();
+    } else if (modalNoteInput) {
+      modalNoteInput.focus();
+    }
+  }
+  function closeModal() {
+    if (!modal) return;
+    modal.hidden = true;
+    document.body.classList.remove("fail-status-modal-open");
+    activeCell = null;
+    activeMode = null;
+  }
+  function commitModal() {
+    if (!activeCell) return;
+    var issue = activeMode === "filed"
+      ? (modalIssueInput ? String(modalIssueInput.value || "").trim() : "")
+      : "";
+    var note = modalNoteInput ? String(modalNoteInput.value || "").trim() : "";
+    var rowId = activeCell.getAttribute("data-row-id");
+    if (activeMode === "filed") {
+      renderFiled(activeCell, issue, note);
+      saveStatus(rowId, {status: "filed", issue: issue, note: note});
+    } else if (activeMode === "not-issue") {
+      renderNotIssue(activeCell, note);
+      saveStatus(rowId, {status: "not-issue", issue: "", note: note});
+    }
+    closeModal();
+  }
+  if (modal) {
+    modal.addEventListener("click", function (ev) {
+      if (ev.target.closest && ev.target.closest("[data-fsm-close]")) {
+        ev.preventDefault();
+        closeModal();
+      } else if (ev.target.closest && ev.target.closest("[data-fsm-save]")) {
+        ev.preventDefault();
+        commitModal();
+      }
+    });
+  }
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape" && modal && !modal.hidden) {
+      ev.preventDefault();
+      closeModal();
+    } else if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && modal && !modal.hidden) {
+      ev.preventDefault();
+      commitModal();
+    }
+  });
+  document.addEventListener("click", function (ev) {
+    var target = ev.target;
+    if (!target || !target.closest) return;
+    // Reset button
+    var resetBtn = target.closest(".fail-status-reset");
+    if (resetBtn) {
+      var cell = resetBtn.closest(".fail-status-cell");
+      if (!cell) return;
+      var rowId = cell.getAttribute("data-row-id");
+      saveStatus(rowId, null);
+      renderUnset(cell);
+      return;
+    }
+    // Initial two-button row
+    var btn = target.closest(".fail-status-btn");
+    if (!btn) {
+      // Click an existing "filed #N" link — open the modal to edit
+      var linkBtn = target.closest(".fail-status-display--filed");
+      if (linkBtn) {
+        var cell2 = linkBtn.closest(".fail-status-cell");
+        if (cell2) {
+          ev.preventDefault();
+          openModal(cell2, "filed");
+        }
+        return;
+      }
+      var notIssueBtn = target.closest(".fail-status-display--not-issue");
+      if (notIssueBtn) {
+        var cell3 = notIssueBtn.closest(".fail-status-cell");
+        if (cell3) {
+          ev.preventDefault();
+          openModal(cell3, "not-issue");
+        }
+        return;
+      }
+      return;
+    }
+    var cell = btn.closest(".fail-status-cell");
+    if (!cell) return;
+    var action = btn.getAttribute("data-status-action");
+    if (action === "filed") {
+      openModal(cell, "filed");
+    } else if (action === "not-issue") {
+      openModal(cell, "not-issue");
+    }
+  });
+  function restoreSaved() {
+    document.querySelectorAll(".fail-status-cell[data-row-id]").forEach(function (cell) {
+      var rowId = cell.getAttribute("data-row-id");
+      var saved = loadStatus(rowId);
+      if (!saved) return;
+      if (saved.status === "filed") {
+        renderFiled(cell, saved.issue || "", saved.note || "");
+      } else if (saved.status === "not-issue") {
+        renderNotIssue(cell, saved.note || "");
+      }
+    });
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", restoreSaved);
+  } else {
+    restoreSaved();
+  }
+  restoreSaved();
+})();
+</script>"""
+
+
+def _ut_coverage_cell_html(row_id: str, *, initial_value: str = "—") -> str:
+    """Render the UT coverage **Result** cell (inline, click-to-edit via modal).
+
+    The cell renders **only the value** (no inline editor buttons, no saved
+    hint, no reset) so the row reads the same as every other Result cell in
+    the Development Metrics overview snapshot. Clicking the value opens the
+    in-page modal ``#ut-coverage-modal`` (same pattern as the failure-analysis
+    fail-status modal — works in iframes where ``window.prompt`` is blocked).
+    The modal owns Save / Cancel / Reset so the cell stays clean.
+    """
+    row_id_attr = html.escape(row_id, quote=True)
+    init = html.escape(initial_value)
+    return (
+        '<span class="ut-coverage-cell" data-row-id="' + row_id_attr + '" data-original="' + init + '">'
+        '<button type="button" class="ut-coverage-btn" data-ut-action="edit">' + init + "</button>"
+        "</span>"
+    )
+
+
+def _ut_coverage_modal_html() -> str:
+    """In-page modal used by ``_ut_coverage_submit_script``.
+
+    Single ``<input>`` for the coverage value + footer with Reset / Cancel / Save
+    (Reset is moved into the modal so the cell itself stays clean — only the
+    value button is rendered there). Same pattern as the fail-status modal in
+    failure analysis: works in iframe contexts where ``window.prompt`` is
+    blocked by ``sandbox``.
+    """
+    return """
+<div id="ut-coverage-modal" class="ut-coverage-modal" hidden role="dialog"
+     aria-modal="true" aria-labelledby="ut-coverage-modal-title">
+  <div class="ut-coverage-modal-backdrop" data-ucm-close aria-hidden="true"></div>
+  <div class="ut-coverage-modal-panel">
+    <header class="ut-coverage-modal-header">
+      <h2 id="ut-coverage-modal-title">Edit UT coverage</h2>
+      <button type="button" class="ut-coverage-modal-close"
+              data-ucm-close aria-label="Close">&times;</button>
+    </header>
+    <div class="ut-coverage-modal-body">
+      <label class="ut-coverage-modal-field">
+        <span class="ut-coverage-modal-label">Unit Test coverage</span>
+        <input type="text" class="ut-coverage-modal-input"
+               data-ucm-input placeholder="e.g. 84.6%" />
+        <span class="ut-coverage-modal-hint">
+          ((Leave blank to show placeholder "—"; click Reset to clear the saved value))
+        </span>
+      </label>
+    </div>
+    <footer class="ut-coverage-modal-footer">
+      <button type="button" class="ut-coverage-modal-reset"
+              data-ucm-reset>Reset</button>
+      <span class="ut-coverage-modal-footer-spacer"></span>
+      <button type="button" class="ut-coverage-modal-cancel"
+              data-ucm-close>Cancel</button>
+      <button type="button" class="ut-coverage-modal-save"
+              data-ucm-save>Save</button>
+    </footer>
+  </div>
+</div>
+"""
+
+
+def _ut_coverage_submit_script() -> str:
+    """Client script: handle UT coverage cells (edit via in-page modal).
+
+    The cell itself renders **only the value** — no inline Save / Cancel / Reset
+    buttons. Clicking the value opens the modal ``#ut-coverage-modal`` which
+    owns Save / Cancel / Reset (same pattern as the fail-status modal in
+    failure analysis: works in iframes where ``window.prompt`` is blocked by
+    the sandbox).
+
+    Behaviour:
+      * Click value -> opens the modal pre-filled with the saved value (or
+        empty if it is the original placeholder).
+      * Click modal Save (or press Enter) -> persist the new value to
+        ``localStorage[ut-coverage:<row_id>]`` and update the cell.
+      * Click modal Cancel / Esc / backdrop / X -> close without saving.
+      * Click modal Reset -> clear localStorage, revert the cell to the
+        original placeholder, close the modal.
+
+    State is keyed by the row's ``data-row-id`` attribute and stored in
+    ``localStorage`` so reloading the report keeps the saved value.
+    """
+    return """
+<script>
+(function () {
+  function lsKey(rowId) { return "ut-coverage:" + rowId; }
+  function saveValue(rowId, value) {
+    try {
+      if (value) {
+        localStorage.setItem(lsKey(rowId), value);
+      } else {
+        localStorage.removeItem(lsKey(rowId));
+      }
+    } catch (e) { /* localStorage unavailable */ }
+  }
+  function loadValue(rowId) {
+    try {
+      return localStorage.getItem(lsKey(rowId));
+    } catch (e) { return null; }
+  }
+  function setCellValue(cell, value) {
+    var btn = cell.querySelector(".ut-coverage-btn");
+    if (btn) btn.textContent = value;
+  }
+
+  var modal = document.getElementById("ut-coverage-modal");
+  var modalInput = modal && modal.querySelector("[data-ucm-input]");
+  var activeCell = null;
+
+  function openModal(cell) {
+    if (!modal) return;
+    activeCell = cell;
+    var rowId = cell.getAttribute("data-row-id");
+    var saved = loadValue(rowId) || cell.getAttribute("data-original");
+    if (modalInput) {
+      modalInput.value = (saved === cell.getAttribute("data-original") || saved === "—") ? "" : saved;
+    }
+    modal.hidden = false;
+    document.body.classList.add("ut-coverage-modal-open");
+    if (modalInput) {
+      modalInput.focus();
+      modalInput.select();
+    }
+  }
+  function closeModal() {
+    if (!modal) return;
+    modal.hidden = true;
+    document.body.classList.remove("ut-coverage-modal-open");
+    activeCell = null;
+  }
+  function commitModal() {
+    if (!activeCell) return;
+    var v = (modalInput && modalInput.value || "").trim() || "—";
+    var rowId = activeCell.getAttribute("data-row-id");
+    saveValue(rowId, v === "—" ? "" : v);
+    setCellValue(activeCell, v);
+    closeModal();
+  }
+  function resetActive() {
+    if (!activeCell) return;
+    var rowId = activeCell.getAttribute("data-row-id");
+    saveValue(rowId, "");
+    setCellValue(activeCell, activeCell.getAttribute("data-original"));
+    closeModal();
+  }
+  if (modal) {
+    modal.addEventListener("click", function (ev) {
+      if (ev.target.closest && ev.target.closest("[data-ucm-close]")) {
+        ev.preventDefault();
+        closeModal();
+      } else if (ev.target.closest && ev.target.closest("[data-ucm-save]")) {
+        ev.preventDefault();
+        commitModal();
+      } else if (ev.target.closest && ev.target.closest("[data-ucm-reset]")) {
+        ev.preventDefault();
+        resetActive();
+      }
+    });
+  }
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape" && modal && !modal.hidden) {
+      ev.preventDefault();
+      closeModal();
+    } else if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && modal && !modal.hidden) {
+      ev.preventDefault();
+      commitModal();
+    } else if (ev.key === "Enter" && modal && !modal.hidden && ev.target === modalInput) {
+      ev.preventDefault();
+      commitModal();
+    }
+  });
+  document.addEventListener("click", function (ev) {
+    var target = ev.target;
+    if (!target || !target.closest) return;
+    var cell = target.closest(".ut-coverage-cell");
+    if (!cell) return;
+    var action = target.getAttribute("data-ut-action");
+    if (action === "edit") {
+      openModal(cell);
+    }
+  });
+  function restoreSaved() {
+    document.querySelectorAll(".ut-coverage-cell[data-row-id]").forEach(function (cell) {
+      var rowId = cell.getAttribute("data-row-id");
+      var saved = loadValue(rowId);
+      if (saved) {
+        setCellValue(cell, saved);
+      }
+    });
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", restoreSaved);
+  } else {
+    restoreSaved();
+  }
+  restoreSaved();
+})();
+</script>"""
+
+
 def _details_subcard(
     title: str,
     body_html: str,
@@ -718,7 +1223,23 @@ def _classify_local_nightly_job_keywords(job_name: str) -> tuple[str | None, str
     pillar: str | None = None
     best_pi = len(name_lower) + 1
     for pat, plabel in (
+        # Generic / umbrella diffusion tag — must come first so it wins the
+        # leftmost-match race when both ``diffusion`` and a sub-model keyword
+        # are present.
         ("diffusion", "Diffusion"),
+        # Diffusion sub-models whose job names don't carry the ``Diffusion_``
+        # prefix (e.g. ``full_moon_HunyuanImage3-DIT_Accuracy_Test``,
+        # ``nightly-hunyuan-image3-performance``, ``qwen-image``, ``wan22``,
+        # ``bagel``, ``glm-image``, ``longcat``, ``flux``). They all sit under
+        # the Diffusion pillar in the Local Test summary.
+        (r"hunyuan(?:[_]?image)?", "Diffusion"),
+        (r"(?<![a-z0-9])qwen[-_]image(?![a-z0-9])", "Diffusion"),
+        (r"(?<![a-z0-9])wan2\.?2?(?![a-z0-9])", "Diffusion"),
+        (r"(?<![a-z0-9])wan(?![a-z0-9])", "Diffusion"),
+        (r"(?<![a-z0-9])bagel(?![a-z0-9])", "Diffusion"),
+        (r"(?<![a-z0-9])glm[-_]?image(?![a-z0-9])", "Diffusion"),
+        (r"(?<![a-z0-9])longcat(?![a-z0-9])", "Diffusion"),
+        (r"(?<![a-z0-9])flux(?![a-z0-9])", "Diffusion"),
         (r"(?<![a-z0-9])tts(?![a-z0-9])", "TTS"),
         (r"(?<![a-z0-9])omni(?![a-z0-9])", "Omni"),
     ):
@@ -866,7 +1387,7 @@ def _render_local_summary_grouped_html(
         )
 
     tail_hints = [
-        '<p class="hint">If there are failures, click <strong>View error log</strong> in the table '
+        '<p class="hint">If there are failures, click <strong>View full log</strong> in the table '
         "to open logs in a dialog.</p>",
         '<p class="hint summary-legend">Row background: '
         '<strong class="summary-legend--ok">green</strong> = no failures/errors for this job; '
@@ -1777,7 +2298,6 @@ def _filter_perf_summary_exclude_local_overlap(
 
     original_rows = [row for row in summary.get("rows", []) if isinstance(row, dict)]
     filtered = [row for row in original_rows if not perf_row_matches_local_test(row, local_keys)]
-    excluded = len(original_rows) - len(filtered)
 
     out = dict(summary)
     out["rows"] = filtered
@@ -1788,14 +2308,6 @@ def _filter_perf_summary_exclude_local_overlap(
     else:
         out["status"] = "empty"
         out["message"] = "No Buildkite-only baseline rows; cases with local perf JSON are shown under Local Test only."
-    out["buildkite_perf_scope"] = {
-        "excluded_local_overlap": excluded,
-        "local_test_key_count": len(local_keys),
-        "message": (
-            f"Excluded {excluded} row(s) already shown under Local performance baseline comparison "
-            f"({len(local_keys)} local test key(s))."
-        ),
-    }
     return out
 
 
@@ -1899,46 +2411,16 @@ def _render_buildkite_perf_inner_html(
         log_dir=log_dir,
         exclude_local_overlap=exclude_local_overlap,
     )
-    parts: list[str] = [
-        '<p class="meta"><strong>Data source:</strong> '
-        f"<code>{html.escape(str(summary.get('assets_dir') or ''))}</code></p>"
-    ]
-    local_scope = summary.get("local_perf_scope") or {}
-    if local_scope.get("message"):
-        parts.append(f'<p class="meta"><strong>Local filter:</strong> {html.escape(str(local_scope["message"]))}</p>')
-        if local_scope.get("resolved_dir"):
-            parts.append(
-                '<p class="meta"><strong>Perf JSON:</strong> '
-                f"<code>{html.escape(str(local_scope['resolved_dir']))}</code></p>"
-            )
-    bk_scope = summary.get("buildkite_perf_scope") or {}
-    if bk_scope.get("message"):
-        parts.append(f'<p class="meta"><strong>Buildkite filter:</strong> {html.escape(str(bk_scope["message"]))}</p>')
-    history = summary.get("history") or {}
-    if history:
-        file_count = len(history.get("files") or [])
-        parts.append(
-            '<p class="meta"><strong>History:</strong> '
-            f"{file_count} files, "
-            f"{int(history.get('group_count') or 0)} groups, "
-            f"selection={html.escape(str(history.get('selection') or ''))}"
-            + (
-                f", generated_at=<code>{html.escape(str(history.get('generated_at') or ''))}</code>"
-                if history.get("generated_at")
-                else ""
-            )
-            + "</p>"
-        )
+    # Verbose diagnostic lines (Data source / Local filter / History / generated_at /
+    # Raw data fallback diagnostics) were removed: the HTML perf comparison card should
+    # focus on per-model baseline rows. Diagnostics remain available in
+    # `_buildkite_perf_rows` / `_kanban_fallback_items` for tooling.
+    parts: list[str] = []
     warnings = summary.get("warnings") or []
     if warnings:
         warn_html = "".join(f"<li>{html.escape(str(w))}</li>" for w in warnings)
         parts.append(f'<div class="note"><strong>Source config notes:</strong><ul>{warn_html}</ul></div>')
     if summary.get("status") != "ok":
-        msg = summary.get("message") or "No performance rows available."
-        parts.append(f'<p class="note">{html.escape(str(msg))}</p>')
-        fallback_html = _render_kanban_fallback_html(summary)
-        if fallback_html:
-            parts.append(fallback_html)
         return "\n".join(parts)
     parts.append(
         '<p class="hint">'
@@ -1949,8 +2431,9 @@ def _render_buildkite_perf_inner_html(
                 "Showing Buildkite-only baseline rows; cases with local perf JSON appear under Local Test only."
                 if exclude_local_overlap
                 else (
-                    f"Showing latest day ({html.escape(str(summary.get('latest_day') or 'N/A'))}) "
-                    f"model records that include a baseline."
+                    f"Showing each model's latest baseline record "
+                    f"(freshest = {html.escape(str(summary.get('latest_day') or 'N/A'))}; "
+                    "models on different schedules may use different dates)."
                 )
             )
         )
@@ -1992,33 +2475,25 @@ def _append_local_perf_baseline_markdown(
 
 
 def _append_buildkite_perf_markdown(
-    lines: list[str], summary: dict[str, Any], grouped_rows: dict[str, list[list[str]]]
+    lines: list[str],
+    summary: dict[str, Any],
+    grouped_rows: dict[str, list[list[str]]],
+    *,
+    model_heading_level: int = 4,
 ) -> None:
-    lines.append(f"- **Data source:** `{summary.get('assets_dir') or ''}`")
-    local_scope = summary.get("local_perf_scope") or {}
-    if local_scope.get("message"):
-        lines.append(f"- **Local filter:** {_md_cell(str(local_scope['message']))}")
-    bk_scope = summary.get("buildkite_perf_scope") or {}
-    if bk_scope.get("message"):
-        lines.append(f"- **Buildkite filter:** {_md_cell(str(bk_scope['message']))}")
-    history = summary.get("history") or {}
-    if history:
-        lines.append(
-            f"- **History:** `{len(history.get('files') or [])}` files / "
-            f"`{int(history.get('group_count') or 0)}` groups / "
-            f"selection `{history.get('selection') or ''}`"
-        )
-        if history.get("generated_at"):
-            lines.append(f"- **History generated_at:** `{history.get('generated_at')}`")
+    # Verbose diagnostic lines (Data source / Local filter / History / History generated_at /
+    # Description / Raw data fallback diagnostics) were removed: the perf comparison block
+    # should focus on per-model baseline rows, not on data-source plumbing. Diagnostics
+    # remain available in `_buildkite_perf_rows` / `_kanban_fallback_items` for tooling.
     for warning in summary.get("warnings") or []:
         lines.append(f"- **Note:** {_md_cell(str(warning))}")
     if summary.get("status") != "ok":
-        lines.append(f"- **Description:** {_md_cell(str(summary.get('message') or 'No performance rows available.'))}")
-        _append_kanban_fallback_markdown(lines, summary)
         lines.append("")
         return
     stats = summary.get("summary", {})
-    lines.append(f"- **Latest date:** `{summary.get('latest_day')}`")
+    per_file_days = summary.get("latest_day_per_file") or {}
+    per_file_str = ", ".join(f"{k}={v}" for k, v in sorted(per_file_days.items())) if per_file_days else "n/a"
+    lines.append(f"- **Latest date per file:** `{summary.get('latest_day')}` (freshest; per-file = {per_file_str})")
     lines.append(
         f"- **Stats:** pass `{int(stats.get('pass', 0))}` / "
         f"normal `{int(stats.get('normal', 0))}` / "
@@ -2027,8 +2502,9 @@ def _append_buildkite_perf_markdown(
     lines.append("")
     lines.append("*Grouped by model (Markdown has no collapse).*")
     lines.append("")
+    heading_prefix = "#" * model_heading_level
     for model_name in sorted(grouped_rows.keys()):
-        lines.append(f"#### {model_name}")
+        lines.append(f"{heading_prefix} {model_name}")
         lines.append("")
         lines.append(
             render_markdown_table(
@@ -2124,6 +2600,8 @@ def _append_buildkite_markdown(
                     _md_cell(info["failed_reasons"].get(node, "")),
                     _md_cell(info["failure_analyses"].get(node, "")),
                     _excerpt_md_cell(info["failure_excerpts"].get(node, "")),
+                    "Submit issue",
+                    "Filed / Not an issue",
                 ]
             )
         for node in info["error_nodes"]:
@@ -2133,13 +2611,15 @@ def _append_buildkite_markdown(
                     _md_cell(info["error_reasons"].get(node, "")),
                     _md_cell(info["error_analyses"].get(node, "")),
                     _excerpt_md_cell(info["error_excerpts"].get(node, "")),
+                    "Submit issue",
+                    "Filed / Not an issue",
                 ]
             )
         lines.append("#### Failures & errors")
         lines.append("")
         lines.append(
             render_markdown_table(
-                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)"],
+                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)", "Submit Issue", "Status"],
                 fail_rows,
             )
         )
@@ -2147,9 +2627,33 @@ def _append_buildkite_markdown(
 
 
 def _excerpt_md_cell(excerpt: str, limit: int = 900) -> str:
-    t = (excerpt or "").replace("\n", " ").strip()
+    """Render excerpt in Markdown table cell, preserving line breaks.
+
+    Uses HTML-like line break markers since standard Markdown tables don't support
+    multi-line content. The excerpt is truncated if too long, but line breaks
+    are preserved as visible separators for readability.
+    """
+    t = (excerpt or "").strip()
+    if not t:
+        return _md_cell("—")
+    # Truncate if needed but preserve structure
     if len(t) > limit:
-        t = t[: limit - 1] + "…"
+        lines = t.splitlines()
+        # Truncate by lines first for better readability
+        truncated_lines = []
+        total_len = 0
+        for line in lines:
+            if total_len + len(line) + 1 > limit - 3:
+                break
+            truncated_lines.append(line)
+            total_len += len(line) + 1
+        if truncated_lines:
+            t = "\n".join(truncated_lines) + "\n…"
+        else:
+            t = t[: limit - 1] + "…"
+    # Use explicit line break representation for Markdown table cells
+    # Replace newlines with a visible separator that HTML can render
+    t = t.replace("\n", "  \n")  # Two spaces + newline = line break in Markdown
     return _md_cell(t)
 
 
@@ -2250,7 +2754,7 @@ def emit_report(
         lines.append("")
         lines.append(
             render_markdown_table(
-                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)"],
+                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)", "Submit Issue", "Status"],
                 fail_rows,
             )
         )
@@ -2269,20 +2773,30 @@ def _excerpt_cell_html(
     *,
     storage_id: str,
     title: str,
-    max_chars: int = 8000,
+    max_chars: int = 0,
+    button_label: str = "View error log",
 ) -> str:
+    """Render the **Excerpt** cell with a button that opens the in-page log modal.
+
+    By default the **full** log is rendered into the hidden ``<pre>`` store so the
+    modal can show the entire failure context (failure reason, stack trace, full
+    pytest output). Set ``max_chars`` to a non-zero value if a downstream caller
+    really needs to cap the size — left at ``0`` for the failure tables so
+    users no longer hit the legacy ``... [truncated]`` cutoff when triaging.
+    """
     t = (excerpt or "").strip()
     if not t:
         return '<span class="note">—</span>'
-    if len(t) > max_chars:
+    if max_chars and len(t) > max_chars:
         t = t[:max_chars] + "\n... [truncated]"
     safe_id = html.escape(storage_id)
     safe_title = html.escape(title, quote=True)
+    safe_label = html.escape(button_label)
     return (
         '<div class="excerpt-cell-inner">'
         f'<button type="button" class="btn-view-log-excerpt" '
         f'data-modal-target="{safe_id}" data-log-title="{safe_title}">'
-        "View error log</button>"
+        f"{safe_label}</button>"
         f'<pre id="{safe_id}" class="log-excerpt log-excerpt--stored" hidden>'
         f"{html.escape(t)}</pre>"
         "</div>"
@@ -2362,6 +2876,7 @@ def _render_failures_table_html(
     buildkite_build_url: str = "",
     buildkite_step_url: str = "",
     buildkite_step_name: str = "",
+    full_log_text: str = "",  # NEW: complete log for this job/step
 ) -> str:
     ctx_attr = html.escape(report_context, quote=True)
     row_ex = _issue_row_data_attrs(
@@ -2379,40 +2894,52 @@ def _render_failures_table_html(
         _th_labeled(_SVG_CODE, "Test node"),
         _th_labeled(_SVG_MSG, "Log reason"),
         _th_labeled(_SVG_SPARK, "Analysis"),
-        _th_labeled(_SVG_LOG, "Log excerpt", col_class="excerpt-col"),
+        _th_labeled(_SVG_LOG, "Full log", col_class="excerpt-col"),
         _th_labeled(_SVG_PLUS_ISSUE, "GitHub Issue"),
+        '<th class="status-col"><span class="th-lbl">Status</span></th>',
         "</tr></thead>",
         "<tbody>",
     ]
     row_index = 0
     for node in info["failed_nodes"]:
-        excerpt = info["failure_excerpts"].get(node, "")
+        # Use full log instead of excerpt for better debugging
+        log_content = full_log_text if full_log_text else info["failure_excerpts"].get(node, "")
         storage_id = _excerpt_storage_id(report_context, node, row_index)
+        row_id = f"{report_context}::{node}"
         row_index += 1
         parts.extend(
             [
-                f'<tr {row_ex} data-report-context="{ctx_attr}">',
+                f'<tr {row_ex} data-report-context="{ctx_attr}" data-row-id="{html.escape(row_id, quote=True)}">',
                 f'<td class="mono">{html.escape(node)}</td>',
                 f'<td class="reason">{html.escape(info["failed_reasons"].get(node, ""))}</td>',
                 f'<td class="analysis">{html.escape(info["failure_analyses"].get(node, ""))}</td>',
-                f'<td class="excerpt-cell">{_excerpt_cell_html(excerpt, storage_id=storage_id, title=node)}</td>',
+                f'<td class="excerpt-cell">'
+                f"{_excerpt_cell_html(log_content, storage_id=storage_id, title=node, button_label='View full log')}"
+                f"</td>",
                 _github_issue_button_cell(),
+                _fail_status_cell_html(row_id),
                 "</tr>",
             ]
         )
     for node in info["error_nodes"]:
         label = f"{node} (ERROR)"
-        excerpt = info["error_excerpts"].get(node, "")
+        # Use full log instead of excerpt
+        log_content = full_log_text if full_log_text else info["error_excerpts"].get(node, "")
         storage_id = _excerpt_storage_id(report_context, label, row_index)
+        row_id = f"{report_context}::{label}"
         row_index += 1
         parts.extend(
             [
-                f'<tr class="row-error" {row_ex} data-report-context="{ctx_attr}">',
+                f'<tr class="row-error" {row_ex} data-report-context="{ctx_attr}"'
+                f' data-row-id="{html.escape(row_id, quote=True)}">',
                 f'<td class="mono">{html.escape(node)} (ERROR)</td>',
                 f'<td class="reason">{html.escape(info["error_reasons"].get(node, ""))}</td>',
                 f'<td class="analysis">{html.escape(info["error_analyses"].get(node, ""))}</td>',
-                f'<td class="excerpt-cell">{_excerpt_cell_html(excerpt, storage_id=storage_id, title=label)}</td>',
+                f'<td class="excerpt-cell">'
+                f"{_excerpt_cell_html(log_content, storage_id=storage_id, title=label, button_label='View full log')}"
+                f"</td>",
                 _github_issue_button_cell(),
+                _fail_status_cell_html(row_id),
                 "</tr>",
             ]
         )
@@ -2512,6 +3039,7 @@ def _render_buildkite_section_html(
                     buildkite_build_url=build_url,
                     buildkite_step_url=str(rec.get("step_link") or ""),
                     buildkite_step_name=str(rec.get("name") or ""),
+                    full_log_text=(rec.get("raw_log") or ""),  # NEW: pass complete step log
                 ),
                 "</div></details>",
             ]
@@ -2520,7 +3048,8 @@ def _render_buildkite_section_html(
         if fail_blocks:
             fail_inner = (
                 '<p class="hint">Click each step title to expand or collapse failure details. '
-                "Use <strong>View error log</strong> to open logs in a dialog.</p>\n" + "\n".join(fail_blocks)
+                "Use <strong>View full log</strong> to open the complete step log in a dialog.</p>\n"
+                + "\n".join(fail_blocks)
             )
         else:
             fail_inner = '<p class="note">No failed steps currently, or no failure/error excerpts for any job.</p>'
@@ -2657,7 +3186,6 @@ def emit_report_html(
             html.escape("Local Test"),
         ),
     ]
-    job_rows: list[tuple[str, list[Path], dict[str, Any]]] = []
     if not groups:
         summary_body = (
             '<p class="note">No job logs found under this directory. Confirm nightly jobs ran, copy logs '
@@ -2718,6 +3246,7 @@ def emit_report_html(
                     info,
                     report_context=(f"Local nightly_jobs · job: {job_name} · logs: {log_files}"),
                     buildkite_build_url=local_bk_build_url,
+                    full_log_text=read_job_text(paths),  # NEW: pass complete local job log
                 ),
                 "</div></details>",
             ]
@@ -2726,7 +3255,8 @@ def emit_report_html(
     if fail_local_parts:
         fail_inner_loc = (
             '<p class="hint">Click each job title to expand or collapse failed test lists. '
-            "Use <strong>View error log</strong> to open logs in a dialog.</p>\n" + "\n".join(fail_local_parts)
+            "Use <strong>View full log</strong> to open the complete job log in a dialog.</p>\n"
+            + "\n".join(fail_local_parts)
         )
     else:
         fail_inner_loc = '<p class="note">No failures or errors require itemized analysis.</p>'
@@ -2744,6 +3274,8 @@ def emit_report_html(
 
     body_parts.append("</div>")
     body_parts.append(_log_excerpt_modal_html())
+    body_parts.append(_fail_status_modal_html())
+    body_parts.append(_ut_coverage_modal_html())
     doc = _html_document(
         title,
         css,

@@ -45,6 +45,7 @@ docs/assets/test_reports/
 |-------------|------------------------|-------------------|
 | **nightly** | `data/nightly_test_report/nightly-report-buildkite-latest-YYYY-MM-DD.html` **+** optional `data/local_nightly_raw/manual_YYYYMMDD/` when created by [prepare_kanban_before_report.py](../scripts/prepare_kanban_before_report.py) | `docs/assets/test_reports/**`, `data/local_nightly_raw/.last_manual_dir` |
 | **release** | `data/release_test_report/vllm-omni-release-test-report-YYYY-MM-DD.html` (+ same `manual_*` if you ran nightly prep and want raw archived) | `docs/assets/test_reports/**` |
+| **development** | `data/development_test_report/vllm-omni-test-report-development-YYYY-MM-DD.html` (+ same `manual_*` if you ran nightly prep and want raw archived) | `docs/assets/test_reports/**` |
 
 Kanban **MkDocs** (`mkdocs serve` / `mkdocs build`) runs `scripts/mkdocs_hooks.py` → `scripts/sync_test_reports.py`, which **locally** copies `data/*_test_report/` into `docs/assets/test_reports/` for the Reports page ([docs/reports.md](https://github.com/hsliuustc0106/vllm-omni-kanban/blob/main/docs/reports.md)). That output is gitignored and regenerated at build time — **do not** `git add` it during archive push.
 
@@ -72,7 +73,7 @@ Uses **`gh`** for GitHub authentication on `git pull`:
 
 1. Verify **`gh`** is installed; else exit with install instructions.
 2. Verify **`gh auth status`** (or valid `GH_TOKEN` / `GITHUB_TOKEN`).
-3. Copy report HTML into `data/nightly_test_report/` or `data/release_test_report/` (canonical filename).
+3. Copy report HTML into `data/nightly_test_report/`, `data/release_test_report/`, or `data/development_test_report/` (based on `--kind` flag: `nightly` / `release` / `development`; canonical filename).
 4. `git pull --rebase origin <branch>` with `gh auth git-credential` (unless `--skip-pull`).
 5. `git add` the new/updated report HTML under `data/*_test_report/` **and** the **`data/local_nightly_raw/manual_*`** recorded in `.last_manual_dir` (written by `prepare_kanban_before_report.py`; override with `--local-nightly-manual-dir`; skip with `--skip-local-nightly-raw`). **Not** `docs/assets/test_reports/`.
 6. **Print push preview** inline in stdout (repository, remote, branch, commit message, staged file list with sizes, `name-status`, `diff --stat`). Agents must **paste this entire block** to the user — not a one-line summary.
@@ -90,7 +91,7 @@ Use **`--dry-run`** to preview planned steps only; **`--archive-only`** to copy 
    - Interactive terminal: prompt `Proceed with git commit and push to kanban? [y/N]`
    - Non-interactive / agent: exit with code 3 and print the **full preview inline**; **ask the user in chat**, then re-run with **`--yes`**
    - User declines (interactive): unstage and exit without push
-4. Commit: `chore(reports): archive {nightly|release} test report YYYY-MM-DD` (appends `+ manual_YYYYMMDD` when local raw is included)
+4. Commit: `chore(reports): archive {nightly|release|development} test report YYYY-MM-DD` (appends `+ manual_YYYYMMDD` when local raw is included)
 5. `git push origin <branch>` with `gh auth git-credential`
 
 Use **`--dry-run`** to preview commit/push commands; **`--yes`** to push immediately after preview (**only** after explicit user confirmation in chat).

@@ -111,6 +111,13 @@ SKIP_NON_PYTEST_JOB_RES = (
     re.compile(r"^:docker:\s*Build image\s*$", re.IGNORECASE),
     re.compile(r"^:email:\s*Nightly Collection\s*&\s*Email\s*$", re.IGNORECASE),
     re.compile(r"^:pipeline:\s*init\s*$", re.IGNORECASE),
+    # :bar_chart: Testcase Statistics aggregates results from prior jobs and
+    # does not run pytest; its log has no pytest footer so it surfaces as
+    # ``unknown`` in the Daily Focus Buildkite-jobs card.
+    re.compile(r"^:bar_chart:\s*Testcase Statistics\s*$", re.IGNORECASE),
+    # :github: Resolve skip-ci (docs / skip marks) & upload pipeline is a
+    # GitHub pipeline-resolution step that uploads commit statuses; no pytest.
+    re.compile(r"^:github:\s*Resolve skip-ci.*upload pipeline\s*$", re.IGNORECASE),
 )
 
 

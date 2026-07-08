@@ -39,10 +39,13 @@ include:
 - `vllm-omni-local-test`: runs nightly jobs on **H200** or **H800** cluster
   machines — confirm `REPO_ROOT`, `HF_HOME`, and `CUDA_VISIBLE_DEVICES` with the
   user, optional `git pull`, then `tools/nightly/run_nightly_jobs.sh` (full
-  nightly, `--test-type local`, or `--label-substr`); sync logs per scope (`local` → `nightly_jobs_local_*`; default → `nightly_jobs_local_*` + `nightly_jobs_YYYYMMDD-*`)
-  to `logs/nightly_jobs` on the laptop for reporting; see
-  `references/nightly-local-h200.md` / `nightly-local-h800.md` and
-  `nightly-local-log-fetch.md`
+  nightly, `--test-type local` / `--test-type stability` / `--test-type local,stability`,
+  or `--label-substr`); sync logs per scope (`local` → `nightly_jobs_local_*` only;
+  `stability` → `nightly_jobs_stability_*` only; `default` → `nightly_jobs_YYYYMMDD-*` only;
+  `all` → local + stability + general nightly; auto-detected from the run's
+  `--test-type` when the user started by running tests first) to `logs/nightly_jobs`
+  on the laptop for reporting; see `references/nightly-local-h200.md` /
+  `nightly-local-h800.md` and `nightly-local-log-fetch.md`
 - `vllm-omni-test-report`: generates **HTML test reports** (Markdown only when
   explicitly requested) — **release** via `scripts/compose_full_report.py`
   (Buildkite metrics, test matrix, issue tracking) or **nightly** via

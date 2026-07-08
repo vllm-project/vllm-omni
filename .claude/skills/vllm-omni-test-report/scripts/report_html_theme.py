@@ -797,6 +797,130 @@ section.job-fail-bk h2 {
 .btn-github-issue:active { transform: scale(0.98); }
 .btn-issue-ico { stroke: var(--accent); }
 .btn-issue-text { white-space: nowrap; }
+
+/* Status column — two interactive buttons (filed / not-issue) backed by localStorage. */
+th.status-col, td.fail-status-cell {
+  width: 11.5rem;
+  text-align: left;
+  vertical-align: middle !important;
+  background: var(--surface-muted);
+}
+.fail-status-cell {
+  padding: 0.55rem 0.65rem !important;
+}
+.fail-status-label {
+  display: block;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+  font-weight: 650;
+}
+.fail-status-buttons {
+  display: inline-flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+.fail-status-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.32rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--dashboard-panel-strong);
+  color: var(--dashboard-text);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+.fail-status-btn--filed:hover {
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent-tint) 88%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-strong)
+  );
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--dashboard-border));
+  color: var(--accent-hover);
+}
+.fail-status-btn--not-issue:hover {
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--dashboard-warning-bg) 88%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-strong)
+  );
+  border-color: color-mix(in srgb, var(--dashboard-warning) 45%, var(--dashboard-border));
+  color: var(--dashboard-warning);
+}
+.fail-status-btn:active { transform: scale(0.97); }
+.fail-status-display {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+.fail-status-display--filed {
+  color: var(--accent-hover);
+}
+.fail-status-display--not-issue {
+  color: var(--dashboard-warning);
+}
+.fail-status-issue-link {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px dashed currentColor;
+  padding-bottom: 1px;
+}
+.fail-status-issue-link:hover {
+  color: var(--accent);
+  border-bottom-style: solid;
+}
+.fail-status-reset {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.45rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--dashboard-panel-bg);
+  color: var(--muted);
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+.fail-status-reset:hover {
+  background: var(--dashboard-panel-strong);
+  color: var(--dashboard-text);
+}
+
+/* Row-level tinting driven by the Status column. Default (un-confirmed)
+   failure-analysis rows have neutral background by default; rows whose Status
+   has been confirmed (filed / not-issue) are tinted green. The CSS uses :has()
+   so it doesn't require extra markup in the report body. */
+tr:has(td.fail-status-cell[data-status="unset"]) {
+  background: transparent;
+}
+tr:has(td.fail-status-cell[data-status="unset"]):hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+tr:has(td.fail-status-cell[data-status="filed"]),
+tr:has(td.fail-status-cell[data-status="not-issue"]) {
+  background: color-mix(in srgb, #2ea043 12%, transparent);
+}
+tr:has(td.fail-status-cell[data-status="filed"]):hover,
+tr:has(td.fail-status-cell[data-status="not-issue"]):hover {
+  background: color-mix(in srgb, #2ea043 18%, transparent);
+}
+td.fail-status-cell[data-status="unset"] {
+  box-shadow: inset 4px 0 0 0 #6e7681;
+}
+td.fail-status-cell[data-status="filed"],
+td.fail-status-cell[data-status="not-issue"] {
+  box-shadow: inset 4px 0 0 0 #2ea043;
+}
 .gh-modal[hidden] { display: none !important; }
 .gh-modal:not([hidden]) {
   position: fixed;
@@ -1459,12 +1583,22 @@ RELEASE_MARKDOWN_DOC_CSS = """
   );
 }
 .release-doc .release-section-card--metrics {
-  --section-accent: var(--ci);
-  --section-ico-bg: var(--ci-soft);
+  --section-accent: var(--dashboard-healthy);
+  --section-ico-bg: var(--dashboard-healthy-bg);
   border-top: 4px solid var(--section-accent);
   background: linear-gradient(
     180deg,
-    color-mix(in srgb, var(--ci-soft) 34%, var(--dashboard-panel-bg)) 0%,
+    color-mix(in srgb, var(--dashboard-healthy-bg) 52%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-bg) 46%
+  );
+}
+.release-doc .release-section-card--failure {
+  --section-accent: var(--dashboard-warning);
+  --section-ico-bg: var(--dashboard-warning-bg);
+  border-top: 4px solid var(--section-accent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--dashboard-warning-bg) 52%, var(--dashboard-panel-bg)) 0%,
     var(--dashboard-panel-bg) 46%
   );
 }
@@ -1820,5 +1954,327 @@ RELEASE_MARKDOWN_DOC_CSS = """
 .release-verdict {
   font-weight: 800;
   letter-spacing: 0.02em;
+}
+
+/* Development-report Metrics overview: highlight at-risk snapshot rows in red.
+   Used by compose_full_report.py --kind development when the helper wraps an
+   alert-bearing cell in <span class="dev-snapshot-alert">…</span>. */
+.release-doc .dev-snapshot-alert {
+  display: inline-block;
+  padding: 0.05em 0.55em;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--dashboard-alert-bg, rgba(209,67,67,0.11)) 88%,
+    var(--dashboard-panel-bg, #ffffff));
+  color: var(--dashboard-alert, #d14343);
+  font-weight: 700;
+}
+
+/* UT coverage editable cell — sits inline inside the Result column of the
+   Development Metrics overview. The cell renders **only the value** (no
+   inline editor / reset / saved-hint buttons) so the row reads the same
+   as every other Result cell. Clicking the value opens the in-page modal
+   below (works in iframes where ``window.prompt`` is blocked). */
+.ut-coverage-cell {
+  display: inline;
+}
+.ut-coverage-btn {
+  display: inline;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px dashed color-mix(in srgb, var(--dashboard-muted) 65%, transparent);
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ut-coverage-btn:hover {
+  border-bottom-style: solid;
+  color: var(--accent);
+}
+
+/* UT coverage modal — used by the Development Metrics overview snapshot
+   (works in iframe contexts where ``window.prompt`` is blocked). The modal
+   owns Save / Cancel / Reset so the cell itself stays clean. */
+.ut-coverage-modal[hidden] {
+  display: none !important;
+}
+.ut-coverage-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10002;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+}
+.ut-coverage-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--dashboard-text) 42%, transparent);
+  backdrop-filter: blur(2px);
+}
+.ut-coverage-modal-panel {
+  position: relative;
+  z-index: 1;
+  width: min(92vw, 32rem);
+  display: flex;
+  flex-direction: column;
+  background: var(--dashboard-panel-bg);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--dashboard-border);
+  box-shadow: 0 20px 50px color-mix(in srgb, var(--dashboard-text) 22%, transparent);
+  overflow: hidden;
+}
+.ut-coverage-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1.1rem;
+  border-bottom: 1px solid var(--dashboard-border);
+  background: linear-gradient(180deg, var(--dashboard-panel-strong) 0%, var(--dashboard-panel-bg) 100%);
+}
+.ut-coverage-modal-header h2 {
+  margin: 0;
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: var(--dashboard-text);
+}
+.ut-coverage-modal-close {
+  flex-shrink: 0;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--dashboard-border);
+  border-radius: 8px;
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  font-size: 1.35rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.ut-coverage-modal-body {
+  padding: 1rem 1.1rem;
+}
+.ut-coverage-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--dashboard-text);
+}
+.ut-coverage-modal-label {
+  font-weight: 600;
+  color: var(--dashboard-text);
+}
+.ut-coverage-modal-hint {
+  font-size: 0.75rem;
+  color: var(--dashboard-muted);
+}
+.ut-coverage-modal-input {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--dashboard-border);
+  border-radius: 8px;
+  background: var(--dashboard-panel-bg);
+  color: var(--text);
+  width: 100%;
+  box-sizing: border-box;
+}
+.ut-coverage-modal-input:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+.ut-coverage-modal-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.85rem 1.1rem;
+  border-top: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-strong);
+}
+.ut-coverage-modal-footer-spacer {
+  flex: 1 1 auto;
+}
+.ut-coverage-modal-reset,
+.ut-coverage-modal-cancel,
+.ut-coverage-modal-save {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.45rem 0.95rem;
+  border-radius: 8px;
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  cursor: pointer;
+}
+.ut-coverage-modal-save {
+  background: var(--dashboard-healthy);
+  color: #fff;
+  border-color: var(--dashboard-healthy);
+  font-weight: 600;
+}
+.ut-coverage-modal-save:hover {
+  filter: brightness(0.95);
+}
+.ut-coverage-modal-cancel:hover {
+  border-color: var(--dashboard-warning);
+  color: var(--danger-strong);
+}
+.ut-coverage-modal-reset:hover {
+  border-color: var(--dashboard-warning);
+  color: var(--danger-strong);
+}
+.ut-coverage-modal-open {
+  overflow: hidden;
+}
+
+/* Fail-status modal — used by the failure-analysis tables when the report is
+   embedded via iframe (kanban Reports page). The legacy ``window.prompt()``
+   flow is blocked by iframe sandbox lacking ``allow-modals``; this in-page
+   modal works in both standalone and iframe contexts. */
+.fail-status-modal[hidden] {
+  display: none !important;
+}
+.fail-status-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+}
+.fail-status-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--dashboard-text) 42%, transparent);
+  backdrop-filter: blur(2px);
+}
+.fail-status-modal-panel {
+  position: relative;
+  z-index: 1;
+  width: min(92vw, 38rem);
+  display: flex;
+  flex-direction: column;
+  background: var(--dashboard-panel-bg);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--dashboard-border);
+  box-shadow: 0 20px 50px color-mix(in srgb, var(--dashboard-text) 22%, transparent);
+  overflow: hidden;
+}
+.fail-status-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1.1rem;
+  border-bottom: 1px solid var(--dashboard-border);
+  background: linear-gradient(180deg, var(--dashboard-panel-strong) 0%, var(--dashboard-panel-bg) 100%);
+}
+.fail-status-modal-header h2 {
+  margin: 0;
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: var(--dashboard-text);
+}
+.fail-status-modal-close {
+  flex-shrink: 0;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--dashboard-border);
+  border-radius: 8px;
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  font-size: 1.35rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.fail-status-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem 1.1rem;
+}
+.fail-status-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--dashboard-text);
+}
+.fail-status-modal-label {
+  font-weight: 600;
+  color: var(--dashboard-text);
+}
+.fail-status-modal-hint {
+  font-size: 0.75rem;
+  color: var(--dashboard-muted);
+}
+.fail-status-modal-input,
+.fail-status-modal-textarea {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--dashboard-border);
+  border-radius: 8px;
+  background: var(--dashboard-panel-bg);
+  color: var(--text);
+  width: 100%;
+  box-sizing: border-box;
+}
+.fail-status-modal-textarea {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  min-height: 5.5rem;
+  resize: vertical;
+}
+.fail-status-modal-input:focus,
+.fail-status-modal-textarea:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+.fail-status-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.55rem;
+  padding: 0.85rem 1.1rem;
+  border-top: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-strong);
+}
+.fail-status-modal-cancel,
+.fail-status-modal-save {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.45rem 0.95rem;
+  border-radius: 8px;
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  cursor: pointer;
+}
+.fail-status-modal-save {
+  background: var(--dashboard-healthy);
+  color: #fff;
+  border-color: var(--dashboard-healthy);
+  font-weight: 600;
+}
+.fail-status-modal-save:hover {
+  filter: brightness(0.95);
+}
+.fail-status-modal-cancel:hover {
+  border-color: var(--dashboard-warning);
+  color: var(--danger-strong);
+}
+.fail-status-modal-open {
+  overflow: hidden;
+}
+.fail-status-note {
+  color: var(--dashboard-muted);
+  font-style: italic;
 }
 """

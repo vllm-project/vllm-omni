@@ -78,11 +78,15 @@ RELEASE_LOOSE_RE = re.compile(
     r"^vllm-omni-test-report(?:-preview)?-(?P<date>\d{4}-\d{2}-\d{2})\.html$",
     re.IGNORECASE,
 )
+DEVELOPMENT_CANONICAL_RE = re.compile(
+    r"^vllm-omni-test-report-development-(?P<date>\d{4}-\d{2}-\d{2})\.html$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
 class ArchivePlan:
-    kind: str  # "nightly" | "release"
+    kind: str  # "nightly" | "release" | "development"
     report_date: str  # YYYY-MM-DD
     dest_name: str
     dest_rel: Path  # relative to kanban repo root
@@ -216,18 +220,20 @@ def infer_report_kind_and_date(
     if kind is None:
         if NIGHTLY_CANONICAL_RE.match(name) or name.lower().startswith("nightly"):
             kind = "nightly"
+        elif DEVELOPMENT_CANONICAL_RE.match(name) or "-development-" in name.lower():
+            kind = "development"
         elif RELEASE_CANONICAL_RE.match(name) or RELEASE_LOOSE_RE.match(name):
             kind = "release"
         else:
             kind = "nightly" if "nightly" in name.lower() else "release"
     kind = kind.lower()
-    if kind not in ("nightly", "release"):
+    if kind not in ("nightly", "release", "development"):
         raise ValueError(f"Unsupported report kind: {kind!r}")
 
     if report_date:
         return kind, report_date
 
-    for pattern in (NIGHTLY_CANONICAL_RE, RELEASE_CANONICAL_RE, RELEASE_LOOSE_RE):
+    for pattern in (NIGHTLY_CANONICAL_RE, DEVELOPMENT_CANONICAL_RE, RELEASE_CANONICAL_RE, RELEASE_LOOSE_RE):
         match = pattern.match(name)
         if match:
             return kind, match.group("date")
@@ -250,6 +256,9 @@ def build_archive_plan(
     if resolved_kind == "nightly":
         dest_name = f"nightly-report-buildkite-latest-{resolved_date}.html"
         dest_rel = Path("data") / "nightly_test_report" / dest_name
+    elif resolved_kind == "development":
+        dest_name = f"vllm-omni-test-report-development-{resolved_date}.html"
+        dest_rel = Path("data") / "development_test_report" / dest_name
     else:
         dest_name = f"vllm-omni-release-test-report-{resolved_date}.html"
         dest_rel = Path("data") / "release_test_report" / dest_name
@@ -379,7 +388,11 @@ def _staged_report_rel_paths(kanban_repo: Path) -> list[str]:
     paths: list[str] = []
     for raw in (proc.stdout or "").splitlines():
         rel = raw.strip().replace("\\", "/")
-        if rel.startswith("data/nightly_test_report/") or rel.startswith("data/release_test_report/"):
+        if (
+            rel.startswith("data/nightly_test_report/")
+            or rel.startswith("data/release_test_report/")
+            or rel.startswith("data/development_test_report/")
+        ):
             paths.append(rel)
     return paths
 
@@ -405,6 +418,19 @@ def infer_plan_from_staged_rel(rel: str) -> ArchivePlan:
             report_date = utc_report_date_iso()
         return ArchivePlan(
             kind="nightly",
+            report_date=report_date,
+            dest_name=name,
+            dest_rel=Path(rel),
+        )
+
+    if "development_test_report" in rel:
+        match = DEVELOPMENT_CANONICAL_RE.match(name)
+        if match:
+            report_date = match.group("date")
+        else:
+            report_date = utc_report_date_iso()
+        return ArchivePlan(
+            kind="development",
             report_date=report_date,
             dest_name=name,
             dest_rel=Path(rel),
@@ -831,7 +857,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--kind",
-        choices=("nightly", "release"),
+        choices=("nightly", "release", "development"),
         default=None,
         help="Report type (default: infer from filename).",
     )

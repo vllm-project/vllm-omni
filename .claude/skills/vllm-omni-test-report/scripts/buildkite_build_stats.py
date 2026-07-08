@@ -66,8 +66,15 @@ PIPELINE_SLUG = "vllm-omni"
 FINISHED_STATES = {"passed", "failed", "canceled", "blocked", "skipped", "not_run"}
 SUCCESS_STATE = "passed"
 FAIL_STATE = "failed"
-# Step/job states (Buildkite)
-FAIL_JOB_STATES = {"failed", "broken"}
+# Step/job states that count toward a build's "all-pass / some-fail" verdict.
+# Only ``failed`` (a real runtime test failure) counts. ``broken`` is a
+# transient Buildkite pipeline-execution state — e.g. ``:docker: Build image``
+# when the Docker registry is unreachable, or ``:email: Nightly Collection &
+# Email`` when SMTP/kanban is down — and should never be treated as a CI
+# regression. ``skipped`` / ``not_run`` / ``blocked`` / ``canceled`` mean the
+# job never ran and also must not count. Mirrors the Test Result H100 filter
+# in ``compose_full_report.py``.
+FAIL_JOB_STATES = {"failed"}
 
 
 def default_created_range_utc() -> tuple[str, str]:
@@ -813,13 +820,74 @@ def fetch_latest_finished_merge_build(token: str) -> dict | None:
     return None
 
 
+# Names of jobs that should be **excluded** from a build's all-pass / all-fail check (matches
+# ``compose_full_report.py`` ``UPLOAD_PIPELINE_RE``): upload-only steps don't represent real
+# test pass/fail for the Development report's CI-row verdict.
+_UPLOAD_PIPELINE_RE = re.compile(r"^Upload .+ Pipeline$", re.IGNORECASE)
+
+
 def failed_job_names_from_build(build: dict) -> list[str]:
+    """Names of reportable jobs whose state is ``failed`` (a real runtime failure).
+
+    ``Upload * Pipeline`` jobs (e.g. ``Upload Nightly Pipeline``) are excluded
+    because they are pipeline-upload steps — not real tests — and the
+    ``l2_l3_ready_merge_gate`` (Test conclusion "Latest L2&L3 pass rate is
+    100%") was incorrectly counting them as failures when the Buildkite
+    pipeline marked them as skipped/blocked in the finished build.
+
+    ``broken`` is intentionally **not** counted: it's a transient Buildkite
+    pipeline-execution state for orchestration steps like
+    ``:docker: Build image`` (Docker registry hiccup) and
+    ``:email: Nightly Collection & Email`` (SMTP / kanban down). Only an
+    explicit ``failed`` state from the job's own runner is treated as a real
+    CI failure.
+    """
     names: list[str] = []
     for j in build.get("jobs") or []:
         st = (j.get("state") or "").lower()
-        if st in FAIL_JOB_STATES:
-            names.append((j.get("name") or "(unnamed)").replace("|", "/"))
+        if st not in FAIL_JOB_STATES:
+            continue
+        nm = (j.get("name") or "(unnamed)").strip()
+        if _UPLOAD_PIPELINE_RE.match(nm):
+            continue
+        names.append(nm.replace("|", "/"))
     return names
+
+
+def _build_reportable_jobs(build: dict) -> list[dict]:
+    """Jobs that count toward the build's **all-pass / some-fail** verdict (upload steps skipped)."""
+    return [j for j in (build.get("jobs") or []) if not _UPLOAD_PIPELINE_RE.match((j.get("name") or "").strip())]
+
+
+def summarize_build_all_pass(build: dict | None) -> tuple[bool, str, int, int]:
+    """
+    For a (possibly-``None``) build returned by ``fetch_latest_finished_*_build``:
+
+      Returns ``(all_pass, status_label, passed, failed_reportable)``:
+
+      - ``all_pass``: ``True`` iff every **reportable** (non-``Upload * Pipeline``) job's state is
+        ``passed``. ``False`` if any failed/broken job, or the build is missing / has no reportable
+        jobs. ``None``-build also returns ``False``.
+      - ``status_label**: short English text for the Development report's
+        "Latest merge CI / nightly CI result" row, e.g. ``"All pass (passed=12)"`` or
+        ``"Failed (passed=10, failed=2)"``.
+      - ``passed``/``failed_reportable``**: counts of reportable jobs in each terminal state.
+    """
+    if not build:
+        return False, "No latest CI build found (no finished build)", 0, 0
+    jobs = _build_reportable_jobs(build)
+    if not jobs:
+        return False, "No reportable jobs (no reportable jobs)", 0, 0
+    states = [(j.get("state") or "").lower() for j in jobs]
+    passed = sum(1 for s in states if s == SUCCESS_STATE)
+    failed = sum(1 for s in states if s in FAIL_JOB_STATES)
+    if failed == 0 and (passed + failed) == len(jobs):
+        return True, f"All pass (passed={passed})", passed, failed
+    if failed:
+        return False, f"Failed (passed={passed}, failed={failed})", passed, failed
+    # No failed jobs but some non-pass terminal states (canceled / blocked / skipped / etc.)
+    other = sum(1 for s in states if s in FINISHED_STATES and s not in (SUCCESS_STATE, *FAIL_JOB_STATES))
+    return False, f"Not all passing (passed={passed}, other_finished={other})", passed, failed
 
 
 def l2_l3_ready_merge_gate(token: str) -> tuple[bool, str]:
@@ -827,7 +895,9 @@ def l2_l3_ready_merge_gate(token: str) -> tuple[bool, str]:
     **Test conclusion** — "Latest L2&L3 pass rate is 100%".
 
     Pass iff the latest **finished** **ready** (non-main) and **merge** (main non-nightly/weekly)
-    builds each have **no** failed/broken jobs (same bucket names as metrics table).
+    builds each have **no** ``failed`` jobs (``broken`` / ``skipped`` /
+    ``canceled`` / ``blocked`` / ``not_run`` are all excluded — same bucket
+    names as metrics table).
     """
     try:
         rb = fetch_latest_finished_non_main_build(token)

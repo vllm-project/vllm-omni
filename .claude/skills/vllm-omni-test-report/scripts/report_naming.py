@@ -33,6 +33,19 @@ def release_report_preview_basename(date_iso: str | None = None) -> str:
     return f"vllm-omni-test-report-preview-{resolve_report_date_iso(date_iso)}.html"
 
 
+def development_report_basename(date_iso: str | None = None) -> str:
+    """Filename pattern for the **Development** variant (``compose_full_report.py --kind development``).
+
+    Distinct suffix so it does not collide with the default **release** filename when both are
+    generated on the same UTC day.
+    """
+    return f"vllm-omni-test-report-development-{resolve_report_date_iso(date_iso)}.html"
+
+
+def development_report_preview_basename(date_iso: str | None = None) -> str:
+    return f"vllm-omni-test-report-development-preview-{resolve_report_date_iso(date_iso)}.html"
+
+
 def nightly_report_title(date_iso: str | None = None) -> str:
     return f"Nightly Buildkite report - {resolve_report_date_iso(date_iso)}"
 
@@ -43,3 +56,7 @@ def default_nightly_html_path(skill_dir: Path, date_iso: str | None = None) -> P
 
 def default_release_html_path(skill_dir: Path, date_iso: str | None = None) -> Path:
     return skill_dir / release_report_basename(date_iso)
+
+
+def default_development_html_path(skill_dir: Path, date_iso: str | None = None) -> Path:
+    return skill_dir / development_report_basename(date_iso)

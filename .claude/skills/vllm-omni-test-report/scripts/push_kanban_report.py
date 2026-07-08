@@ -107,8 +107,8 @@ def main() -> None:
 
     if preview is None:
         print(
-            "No staged report under data/nightly_test_report/ or "
-            "data/release_test_report/.\n"
+            "No staged report under data/nightly_test_report/, "
+            "data/release_test_report/, or data/development_test_report/.\n"
             "Run push_report_to_kanban.py first to copy and stage the report "
             "(and optional data/local_nightly_raw/manual_*).",
             file=sys.stderr,

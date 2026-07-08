@@ -21,10 +21,12 @@
 
 3. **Hidden** names (leading `.`) are ignored.
 
-4. **HTML Summary grouping** — jobs are placed under **Omni / TTS / Diffusion** × **Perf, Acc, Function, doc, stability** when the name matches either:
+4. **Infrastructure sub-directories are skipped.** `run_nightly_jobs.sh` writes raw nohup output under a sibling `logs/` folder and stores generated `.sh` scripts under `jobs/`, perf JSON under `perf_results/` / `results/`. These folders aren't test jobs and would otherwise surface as a bogus row named `logs` / `jobs` / `perf_results`. The discovery helper (`scripts/nightly_job_log_discovery.py`, `discover_job_logs`) skips any sub-directory whose name (case-insensitive) is in `{logs, jobs, perf_results, perf-results, results, raw, nohup, tmp, __pycache__}`. Flat files at the top level are still picked up by rule (2).
+
+5. **HTML Summary grouping** — jobs are placed under **Omni / TTS / Diffusion** × **Perf, Acc, Function, doc, stability** when the name matches either:
    - **Prefix:** ``<omni|tts|diffusion|diff>_<perf|acc|function|doc|stability>`` (or the same two tokens in reverse order), case-insensitive, with spaces/hyphens like underscores; or
-   - **Keywords** anywhere in the folder / stem: pillar substrings **diffusion**, word **omni**, word **tts**; dimension **accuracy** / **acc**, **performance** / **perf**, **function** / **functional**, **documentation** / **docs** / **doc**, **stability** / **stable** (see ``_classify_local_nightly_job`` in `scripts/nightly_local_log_report.py`).  
-   Example: ``full_moon_Diffusion_X2I_A_T_Accuracy_Test`` → **Diffusion · Acc**. Names that do not resolve to both a pillar and a dimension appear under **Other**.
+   - **Keywords** anywhere in the folder / stem. **Pillar** substrings: ``diffusion``, ``hunyuan``, ``hunyuan_image``, ``qwen-image``/``qwen_image``, ``wan``/``wan2.2``, ``bagel``, ``glm-image``/``glm_image``, ``longcat``, ``flux``, ``tts``, ``omni``. **Dimension** substrings: ``accuracy`` / ``acc``, ``performance`` / ``perf``, ``function`` / ``functional``, ``documentation`` / ``docs`` / ``doc``, ``stability`` / ``stable`` (see ``_classify_local_nightly_job`` in `scripts/nightly_local_log_report.py`).  
+   Examples: ``full_moon_Diffusion_X2I_A_T_Accuracy_Test`` → **Diffusion · Acc**; ``full_moon_HunyuanImage3-DIT_Accuracy_Test`` → **Diffusion · Acc** (sub-model keywords also roll up under Diffusion); ``nightly-hunyuan-image3-performance`` → **Diffusion · Perf**. Names that do not resolve to both a pillar and a dimension appear under **Other**.
 
 ## Perf JSON (under same `LOG_DIR`)
 

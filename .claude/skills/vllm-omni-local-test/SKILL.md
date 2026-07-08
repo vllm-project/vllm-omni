@@ -1,6 +1,6 @@
 ---
 name: vllm-omni-local-test
-description: **H200** or **H800** cluster nightly runs — confirm default **`REPO_ROOT`**, **`HF_HOME`**, **`CUDA_VISIBLE_DEVICES`** with user before run; after connect, **`cd "$REPO_ROOT"`** and **ask whether to `git pull`** before cases; then **`source /rebase/.venv/bin/activate`**, `run_nightly_jobs.sh` (optional **`--test-type local`**, **`--label-substr`**, **`--log-dir logs/nightly_jobs_*`**). **Log sync scope:** user says **local** → latest **`nightly_jobs_local_*` only**; **default** → latest **`nightly_jobs_local_*` + latest `nightly_jobs_YYYYMMDD-*`**. Defaults: **`REPO_ROOT=/rebase/vllm-omni`**; H200 **`HF_HOME=/models/`**, **`CUDA_VISIBLE_DEVICES=0,1,2,3`**; H800 **`HF_HOME=/home/models/`**, GPU via **`nvidia-smi`** or explicit list. Use when user specifies H200/H800, local nightly jobs, or fetching nightly logs.
+description: **H200** or **H800** cluster nightly runs — confirm default **`REPO_ROOT`**, **`HF_HOME`**, **`CUDA_VISIBLE_DEVICES`** with user before run; after connect, **`cd "$REPO_ROOT"`** and **ask whether to `git pull`** before cases; then **`source /rebase/.venv/bin/activate`**, `run_nightly_jobs.sh` (optional **`--test-type local|stability|local,stability`**, **`--label-substr`**, **`--log-dir logs/nightly_jobs_*`**). **Log sync scope:** user says **local** → latest **`nightly_jobs_local_*` only**; **stability** → latest **`nightly_jobs_stability_*` only**; **default** → latest **`nightly_jobs_YYYYMMDD-*` only** (general nightly, not local/stability); when the user **starts the session by running test cases first**, sync scope is auto-detected from the run's effective `--test-type` so all related logs are pulled. Defaults: **`REPO_ROOT=/rebase/vllm-omni`**; H200 **`HF_HOME=/models/`**, **`CUDA_VISIBLE_DEVICES=0,1,2,3`**; H800 **`HF_HOME=/home/models/`**, GPU via **`nvidia-smi`** or explicit list. Use when user specifies H200/H800, local/stability nightly jobs, or fetching nightly logs.
 ---
 
 # vLLM-Omni Local Test (cluster run & log sync)
@@ -62,11 +62,20 @@ Pick the **`run_nightly_jobs.sh`** invocation from user intent (after **`cd "$RE
 
 | User says | Command |
 |-----------|---------|
-| Full / default nightly (no **local** intent) | `bash tools/nightly/run_nightly_jobs.sh` |
+| Full / default nightly (no **local** / **stability** intent) | `bash tools/nightly/run_nightly_jobs.sh` |
 | **local** / **local test cases** / **run local** / **run local cases** | `bash tools/nightly/run_nightly_jobs.sh --test-type local` |
 | **local for `<model>`** / **run local for `<model>`** | `bash tools/nightly/run_nightly_jobs.sh --test-type local --label-substr <model>` |
+| **stability** / **run stability** / **stability tests** | `bash tools/nightly/run_nightly_jobs.sh --test-type stability` |
+| **stability for `<model>`** | `bash tools/nightly/run_nightly_jobs.sh --test-type stability --label-substr <model>` |
+| **local + stability** / **run local and stability** | `bash tools/nightly/run_nightly_jobs.sh --test-type local,stability` |
 
 Examples: **`--label-substr Qwen`**, **`--label-substr Wan`**, **`--label-substr FLUX`** — use the substring the user gives for **`xxxx`**.
+
+> **Log-dir convention (so the sync scope picks the run up):**
+> - Default full nightly → `--log-dir "$REPO_ROOT/logs/nightly_jobs_$(date -u +%Y%m%d-%H%M%S)"`
+> - `--test-type local` → `--log-dir "$REPO_ROOT/logs/nightly_jobs_local_$(date -u +%Y%m%d-%H%M%S)"`
+> - `--test-type stability` → `--log-dir "$REPO_ROOT/logs/nightly_jobs_stability_$(date -u +%Y%m%d-%H%M%S)"`
+> - Combined runs may use either a single timestamped dir or one per kind — keep the `_local` / `_stability` suffix so the auto-detected sync scope matches.
 
 ## Required user inputs
 
@@ -173,20 +182,32 @@ srun --jobid="$JOBID" --overlap docker exec "$CONTAINER_NAME" bash -lc '
 
 **H200 and H800 share the same workflow** — [references/nightly-local-log-fetch.md](references/nightly-local-log-fetch.md) **[Log sync workflow](references/nightly-local-log-fetch.md#log-sync-workflow)** (**required:** clear local **`logs/`** → resolve remote run dir(s) per **sync scope** → tarball → extract → **merge** into **`logs/nightly_jobs`** → report).
 
-**Sync scope:** user explicitly asks for **local** logs → **`SYNC_SCOPE=local`** (latest **`nightly_jobs_local_*` only**). **Default** → **`SYNC_SCOPE=default`** (latest **`nightly_jobs_local_*` + latest `nightly_jobs_YYYYMMDD-*`**).
+**Sync scope** is chosen by the agent from user intent — set **`SYNC_SCOPE`** to one of `local` / `stability` / `default` / `all` before step 2 of the log sync workflow:
+
+| User intent (or auto-detected from the run) | **`SYNC_SCOPE`** | Remote directories pulled |
+|---|---|---|
+| User says **pull local logs** / *local test logs* / *only local nightly* | `local` | latest **`nightly_jobs_local_*`** |
+| User says **pull stability logs** / *stability test logs* / *only stability nightly* | `stability` | latest **`nightly_jobs_stability_*`** |
+| User says **pull nightly logs** / general nightly report / no keyword specified | `default` | latest **`nightly_jobs_YYYYMMDD-*`** (general nightly, **not** local/stability) |
+| Combined `--test-type local,stability` / `--test-type all,local,stability` | `all` | all three: local + stability + general nightly |
+
+**Auto-detect when running tests first:** if the user starts the session by running test cases (rather than calling the log-fetch step alone), **do not ask for the keyword** — record the run's effective `--test-type` and apply the matching scope after the run finishes (mapped per the table above). The user can still override by stating a different keyword (e.g. "pull stability logs only").
 
 ---
 
 ## Agent workflow
 
 1. Detect **H200** vs **H800**; if unclear, ask.
-2. Detect **test run mode**: **local** → **`--test-type local`**; **`<model>` local** → add **`--label-substr <model>`**; else default script with no extra flags.
+2. Detect **test run mode**: **local** → **`--test-type local`**; **`<model>` local** → add **`--label-substr <model>`**; **stability** → **`--test-type stability`**; **local + stability** → **`--test-type local,stability`**; else default script with no extra flags. Pick the matching **`--log-dir`** suffix (`_local` / `_stability` / plain) so the sync scope can find the run.
 3. **Show and confirm run defaults** — display **`REPO_ROOT`**, **`HF_HOME`**, and **`CUDA_VISIBLE_DEVICES`** (or H800 GPU strategy) for the machine type (see [Confirm run defaults](references/nightly-local-environment.md#confirm-run-defaults-with-user)); wait for user **confirm / use defaults** or custom values **before** **`ssh`** or **`run_nightly_jobs.sh`**.
 4. **Connect**, apply env (**`source /rebase/.venv/bin/activate`**, confirmed **`REPO_ROOT`**, **`HF_HOME`**, **`CUDA_VISIBLE_DEVICES`**, **`unset HF_HUB_CACHE`** / **`unset TRANSFORMERS_CACHE`**), **`cd "$REPO_ROOT"`**.
 5. **Ask whether to `git pull`** in **`$REPO_ROOT`** for this run ([git pull before run](references/nightly-local-environment.md#git-pull-before-run-confirm-with-user)); run **`git pull`** only after user confirms.
 6. Run **`run_nightly_jobs.sh`** per [Test run mode](#test-run-mode).
 7. **Confirm laptop path defaults** — show **`REPO_ROOT=~/vllm-omni`** and **`KANBAN_REPO_ROOT=~/vllm-omni-kanban`** ([confirm-laptop-path-defaults](../vllm-omni-test-report/references/confirm-laptop-path-defaults.md)); wait for user **confirm / use defaults** or custom paths **before** sync / kanban prep / report.
-8. After the run finishes: **clear local `$REPO_ROOT/logs`**, then sync per [Log sync workflow](references/nightly-local-log-fetch.md#log-sync-workflow) (**local-only** or **default** scope) into **`logs/nightly_jobs`**; run [kanban prep](../vllm-omni-test-report/references/kanban-pre-report-prep.md) **`prepare_kanban_before_report.py`**, then report via **vllm-omni-test-report**.
+8. After the run finishes: **clear local `$REPO_ROOT/logs`**, then sync per [Log sync workflow](references/nightly-local-log-fetch.md#log-sync-workflow). **Pick `SYNC_SCOPE` from user intent:**
+   - User explicitly said **local** / **stability** / **default (no keyword)** → set `SYNC_SCOPE` to that keyword.
+   - **User started this session by running test cases (no explicit log-fetch keyword)** → set `SYNC_SCOPE` automatically from the run's effective `--test-type`: `--test-type local` → `local`; `--test-type stability` → `stability`; `--test-type local,stability` (or `all,local,stability`) → `all`; default full nightly → `default`. State the chosen scope in chat before tarball.
+   Then sync into **`logs/nightly_jobs`**; run [kanban prep](../vllm-omni-test-report/references/kanban-pre-report-prep.md) **`prepare_kanban_before_report.py`**, then report via **vllm-omni-test-report**.
 
 ## References
 
