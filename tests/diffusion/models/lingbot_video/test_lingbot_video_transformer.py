@@ -58,6 +58,43 @@ def test_tiny_transformer_depth_zero_forward_shape():
     assert torch.isfinite(out).all()
 
 
+def test_packed_attention_uses_sdpa_fallback_without_flash_varlen(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
+
+    monkeypatch.setattr(module, "flash_attn_varlen_func_v3", None)
+    attn = module.LingBotVideoAttention(
+        hidden_size=8,
+        num_heads=2,
+        norm_eps=1e-6,
+        qkv_bias=False,
+        out_bias=False,
+    )
+    captured = {}
+
+    def fake_sdpa_forward(query, key, value, attn_metadata):
+        captured["mask"] = attn_metadata.attn_mask
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(attn.attn.sdpa_fallback, "forward", fake_sdpa_forward)
+    x = torch.randn(1, 5, 8)
+    rotary = torch.ones(1, 5, 2, dtype=torch.complex64)
+    packed_indices = {
+        "cu_seqlens_kv": torch.tensor([0, 2, 5], dtype=torch.int32),
+        "max_seqlen_in_batch_kv": 3,
+        "attention_mask": module._packed_block_attention_mask([2, 3], x.device),
+    }
+
+    out = attn(x, rotary, packed_indices=packed_indices)
+
+    assert out.shape == x.shape
+    mask = captured["mask"]
+    assert mask.shape == (1, 1, 5, 5)
+    assert mask[0, 0, :2, :2].all()
+    assert mask[0, 0, 2:, 2:].all()
+    assert not mask[0, 0, :2, 2:].any()
+    assert not mask[0, 0, 2:, :2].any()
+
+
 def test_tiny_transformer_rejects_invalid_rope_dims():
     from vllm_omni.diffusion.models.lingbot_video import LingBotVideoTransformer3DModel
 

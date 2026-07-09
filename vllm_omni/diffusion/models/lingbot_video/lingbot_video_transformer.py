@@ -15,12 +15,10 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    flash_attn_varlen_func as flash_attn_varlen_func_v3,
+)
 from vllm_omni.diffusion.attention.layer import Attention
-
-try:
-    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3
-except Exception:  # pragma: no cover - optional CUDA kernel.
-    flash_attn_varlen_func_v3 = None
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
@@ -148,6 +146,24 @@ def _cat_interleave(
     return torch.cat(blocks, dim=1)
 
 
+def _packed_block_attention_mask(sample_seq_lens: list[int], device: torch.device) -> torch.Tensor:
+    total_seq_len = sum(sample_seq_lens)
+    mask = torch.zeros(
+        1,
+        1,
+        total_seq_len,
+        total_seq_len,
+        dtype=torch.bool,
+        device=device,
+    )
+    start = 0
+    for seq_len in sample_seq_lens:
+        end = start + seq_len
+        mask[:, :, start:end, start:end] = True
+        start = end
+    return mask
+
+
 class LingBotVideoTextEmbedder(nn.Module):
     """Matches CondProjection: RMSNorm(text_dim, eps=1e-6 fixed) -> Linear-SiLU-Linear."""
 
@@ -212,8 +228,19 @@ class LingBotVideoAttention(nn.Module):
         if packed_indices is None:
             out = self.attn(q, k, v, attn_metadata=AttentionMetadata(attn_mask=attention_mask))
         else:
+            packed_attention_mask = packed_indices.get("attention_mask")
+            if packed_attention_mask is not None and parallel_config is None:
+                out = self.attn.sdpa_fallback.forward(
+                    q,
+                    k,
+                    v,
+                    AttentionMetadata(attn_mask=packed_attention_mask),
+                )
+                return self.to_out(out.flatten(2, 3).type_as(x))
             if flash_attn_varlen_func_v3 is None:
-                raise RuntimeError("flash_attn_interface.flash_attn_varlen_func is required.")
+                raise RuntimeError(
+                    "A flash attention varlen function is required for packed context parallel attention."
+                )
             if parallel_config is None:
                 result = flash_attn_varlen_func_v3(
                     q=q.reshape(-1, self.num_heads, self.head_dim),
@@ -550,6 +577,8 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                 "cu_seqlens_kv": cu_seqlens,
                 "max_seqlen_in_batch_kv": max(sample_seq_lens),
             }
+            if packed_batch and not use_packed_attention:
+                packed_indices["attention_mask"] = _packed_block_attention_mask(sample_seq_lens, device)
             has_padding = False
         if has_padding:
             key_mask = torch.cat(
