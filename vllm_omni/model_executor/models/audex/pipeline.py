@@ -115,7 +115,12 @@ AUDEX_FULL_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             model_arch="AudexCode2Wav",
             model_subdir="audex_causal_speech_decoder",
-            tokenizer_subdir="checkpoint_folder_full",
+            # The decoder folder has no tokenizer files. Borrow the audiogen
+            # tokenizer (not checkpoint_folder_full): this stage resolves its
+            # snapshot with the "tts" download profile, which guarantees
+            # checkpoint_folder_audiogen but not the full folder's tokenizer,
+            # so per-stage / clean-cache launches would otherwise fail.
+            tokenizer_subdir="checkpoint_folder_audiogen",
             sync_process_input_func=f"{_PROC}.thinker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
         ),

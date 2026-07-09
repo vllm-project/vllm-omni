@@ -95,6 +95,19 @@ def test_pipeline_topology():
     assert stage1.final_output_type == "audio"
 
 
+def test_full_pipeline_code2wav_tokenizer_is_profile_downloadable():
+    """The code2wav stage resolves its snapshot with the "tts" profile, so its
+    tokenizer folder must be one that profile downloads (review P2: pointing
+    it at checkpoint_folder_full broke per-stage / clean-cache launches)."""
+    from vllm_omni.model_executor.models.audex.checkpoint import _SNAPSHOT_PROFILE_PATTERNS
+    from vllm_omni.model_executor.models.audex.pipeline import AUDEX_FULL_PIPELINE
+
+    stage1 = AUDEX_FULL_PIPELINE.stages[1]
+    assert stage1.model_stage == "audex_code2wav"
+    assert stage1.tokenizer_subdir == "checkpoint_folder_audiogen"
+    assert f"{stage1.tokenizer_subdir}/*" in _SNAPSHOT_PROFILE_PATTERNS["tts"]
+
+
 def test_pipeline_registered():
     from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 
