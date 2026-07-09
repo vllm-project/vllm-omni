@@ -335,16 +335,60 @@ speech decoder → waveform. We keep that cascade shape.
 - **Env**: vllm024_venv; no new Python deps except whatever XCodec1 loading
   needs (checked at implementation; prefer transformers-native loading).
 
-## 7. Open questions (deferred to implementation planning)
+## 7. Open questions — RESOLVED during implementation
 
-1. Exact hook for `apply_cfg_patches()` in the stage-0 engine-core process
-   (import side effect vs stage-init call) — decide by testing patch/
-   scheduler construction ordering on vLLM 0.24.
-2. `<audiocodec_*>` 8192-vs-4096 vocab layout — pin with a tokenizer unit
-   test before building the RVQ masks.
-3. Whether upstream `Qwen2AudioEncoder` loads NV-Whisper weights directly
-   or the official encoder wrapper must be ported.
-4. Per-request `final_output_stage_ids` availability on the serving path
-   used by the S2S cascade (fallback documented in §5.1).
-5. TTA online surface: ship with the speech endpoint adapter or
-   offline-only first (both acceptable; decide by effort at plan time).
+1. `apply_cfg_patches()` hook: an explicit stage-init call
+   (`maybe_apply_audex_cfg_patches` in `stage_init_utils`, invoked by
+   `StageEngineCoreProc.run_stage_core` before engine construction), gated
+   on the stage's `logits_processors` config, with a startup assertion.
+   Import side effects were rejected as fragile during plan convergence.
+2. `<audiocodec_*>` layout pinned against the real tokenizer: 8192
+   contiguous symbols at offset 196613; only codec ids 0..4095 (4×1024
+   RVQ) are generated — the upper half stays disallowed (matches official
+   `build_tta_phase_token_ids`).
+3. Upstream transformers `Qwen2AudioEncoder` loads NV-Whisper weights
+   directly (the official plugin itself instantiates it from
+   `config.audio_config`); no wrapper port was needed.
+4. S2S routing: per-request output modalities drive `final_stage_id`
+   (`modalities: ["text"]` offline / endpoint-implied online); text passes
+   never traverse stage 1 — no fallback prompt-sniffing needed. Note:
+   audio-modality requests can emit one output record per final-output
+   stage; consumers collect the audio-bearing record.
+5. TTA ships offline-first. The benchmark-skill registration was
+   intentionally dropped: that skill is a Chinese-speech corpus + ASR
+   verification flow, which is semantically wrong for non-speech TTA
+   output (the offline example prints RTF itself).
+
+## 8. Implementation deltas (post-plan findings)
+
+- **Companion payload suppression** needs worker-visible tagging:
+  `_enqueue_cfg_companions` applies `omni_final_stage_id=0` metadata to
+  companion `EngineCoreRequest`s; orchestrator-side registration alone
+  does not stop connector payloads.
+- **Serving CFG injection** happens in `_prepare_speech_generation()`
+  after the final request id exists; the adapter only validates
+  `cfg_scale` (and rejects internal `cfg_role`/`cfg_pair_id`/
+  `cfg_null_prompt` keys from callers).
+- **Null prompt tokenization**: the `<unk>` run is inserted WITHOUT a
+  leading space — space + special token tokenizes as a standalone space
+  token and makes some conditional lengths unreachable.
+- **vLLM 0.24 scheduler deltas** handled in the vendored patch:
+  `skipped_waiting` second queue (pair-hold scans both, and holds a
+  waiting member whose partner is parked there), `schedule(*args)`
+  passthrough, and — from the adversarial review — CFG requests skip
+  prefix-cache reads (asymmetric hits outrun equalization), split pairs
+  deregister and continue unguided, and a 512-step hold budget prevents
+  one-sided-pair hangs. The token-sync patch targets vllm-omni's
+  `GPUARModelRunner._sample` (which overrides the vLLM base).
+- **Sync full-payload consumers** must be whitelisted in
+  `_FULL_PAYLOAD_INPUT_STAGES` (added `AudexXCodec1`/`audex_xcodec` and
+  `AudexCode2Wav`/`audex_code2wav`) or stage 1 schedules before the
+  payload arrives and emits empty audio.
+- **Snapshot profiles** landed as `ensure_audex_snapshot(model, profile)`
+  with `tts` (byte-identical to v1) / `tta` / `full`; XCodec1 resolves via
+  a separate helper (env `XCODEC1_PATH` > stage yaml `model` > default
+  hf-audio repo) and borrows the thinker tokenizer.
+- **User metric decisions** (from plan convergence): CFG CER gate hard;
+  S2T WER trend-only; S2S TTS-pass regression anchored on first
+  measurement then hard at +2 pp; TTA official-script comparison is
+  reference-only (hard gates: RVQ validity + non-silent finite audio).
