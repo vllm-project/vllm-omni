@@ -31,8 +31,10 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
 
     Concrete classes (``EncodeOnceKV``, ``LatentBuffer``) implement
     the abstract methods below and bind ``PayloadT``/``ViewT`` to their real
-    payload and view types. The non-abstract methods provide the default
-    behaviour described in their docstrings.
+    payload and view types. In Phase 1 the RFC's ``PagedKV`` joins them to
+    cover the AR self-attention KV — as a handle wrapping the engine-owned
+    paged state (PR #4534) rather than a plain buffer here. The non-abstract
+    methods provide the default behaviour described in their docstrings.
     """
 
     # The dependency edge: what this object rebuilds from. ``None`` means it is
