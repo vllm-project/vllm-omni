@@ -84,6 +84,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.omni_prefix_cache = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        self._talker_mtp_generators: dict[str, torch.Generator] = {}
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -1785,6 +1786,84 @@ class OmniGPUModelRunner(GPUModelRunner):
             ec_connector_output,
         )
 
+    def _explicit_talker_seed(self, req_id: str) -> int | None:
+        seed_extra_arg = getattr(self.model, "talker_mtp_seed_extra_arg", None)
+        if not seed_extra_arg:
+            return None
+
+        sampling_params = getattr(self.requests[req_id], "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
+        if not isinstance(extra_args, dict):
+            return None
+
+        seed = extra_args.get(seed_extra_arg)
+        return int(seed) if seed is not None else None
+
+    def _resolve_talker_mtp_generators(
+        self,
+        decode_req_ids: list[str],
+        device: torch.device,
+    ) -> list[torch.Generator | None] | None:
+        """Resolve per-row generators aligned to ``decode_req_ids``.
+
+        ``row_generators[i]`` belongs to the batched input row for
+        ``decode_req_ids[i]``. Explicitly seeded rows use cached per-request
+        generators, while unseeded rows stay as ``None`` to keep global RNG
+        semantics. Return ``None`` when the whole batch is unseeded so callers
+        can use the normal batched path without sampling kwargs.
+        """
+        generator_cache = getattr(self, "_talker_mtp_generators", None)
+        if generator_cache is None:
+            generator_cache = {}
+            self._talker_mtp_generators = generator_cache
+
+        row_generators: list[torch.Generator | None] = []
+        any_seeded = False
+        for req_id in decode_req_ids:
+            seed = self._explicit_talker_seed(req_id)
+            if seed is None:
+                row_generators.append(None)
+                continue
+
+            generator = generator_cache.get(req_id)
+            if generator is None or generator.device != device:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
+                generator_cache[req_id] = generator
+            row_generators.append(generator)
+            any_seeded = True
+
+        for stale_id in [rid for rid in generator_cache if rid not in self.requests]:
+            del generator_cache[stale_id]
+
+        return row_generators if any_seeded else None
+
+    def _talker_mtp_forward_row_by_row(
+        self,
+        decode_req_ids: list[str],
+        inputs_embeds: torch.Tensor,
+        start_offsets: list[int] | None = None,
+    ) -> None:
+        """Seeded fallback for models without batched per-row generators."""
+        decode_batch_size = len(decode_req_ids)
+        saved_input_ids = self.talker_mtp_input_ids.gpu[:decode_batch_size].clone()
+        saved_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].clone()
+        saved_hidden = self.last_talker_hidden.gpu[:decode_batch_size].clone()
+        saved_text = self.text_step.gpu[:decode_batch_size].clone()
+        try:
+            for row, req_id in enumerate(decode_req_ids):
+                self.talker_mtp_input_ids.gpu[:1].copy_(saved_input_ids[row : row + 1])
+                self.talker_mtp_inputs_embeds.gpu[:1].copy_(saved_embeds[row : row + 1])
+                self.last_talker_hidden.gpu[:1].copy_(saved_hidden[row : row + 1])
+                self.text_step.gpu[:1].copy_(saved_text[row : row + 1])
+                row_offsets = None if start_offsets is None else [start_offsets[row]]
+                self._talker_mtp_forward([req_id], inputs_embeds, row_offsets)
+        finally:
+            self.talker_mtp_input_ids.gpu[:decode_batch_size].copy_(saved_input_ids)
+            self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].copy_(saved_embeds)
+            self.last_talker_hidden.gpu[:decode_batch_size].copy_(saved_hidden)
+            self.text_step.gpu[:decode_batch_size].copy_(saved_text)
+
     def _talker_mtp_forward(
         self,
         decode_req_ids: list[str],
@@ -1818,62 +1897,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not isinstance(subtalker_params, dict):
             subtalker_params = {}
 
-        def _explicit_talker_seed(req_id: str) -> int | None:
-            sampling_params = getattr(self.requests[req_id], "sampling_params", None)
-            extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
-            seed = None
-            if isinstance(extra_args, dict):
-                seed = extra_args.get("tts_local_seed")
-            return int(seed) if seed is not None else None
-
-        def _row_generator(req_id: str) -> torch.Generator | None:
-            seed = _explicit_talker_seed(req_id)
-            if seed is None:
-                return None
-            cache = getattr(self, "_talker_mtp_generators", None)
-            if cache is None:
-                cache = {}
-                self._talker_mtp_generators = cache
-            generator = cache.get(req_id)
-            if generator is None or generator.device != req_input_ids.device:
-                generator = torch.Generator(device=req_input_ids.device)
-                generator.manual_seed(seed)
-                cache[req_id] = generator
-            return generator
-
-        row_generators = [_row_generator(req_id) for req_id in decode_req_ids]
-        cache = getattr(self, "_talker_mtp_generators", None)
-        if cache:
-            # Generators live as long as their request; drop finished ones.
-            for stale_id in [rid for rid in cache if rid not in self.requests]:
-                del cache[stale_id]
-
-        if (
-            decode_batch_size > 1
-            and any(generator is not None for generator in row_generators)
-            and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
-        ):
-            # A torch.Generator is a single stream. Using one generator for a
-            # multi-row batch would make explicitly-seeded requests depend on
-            # other rows in the same scheduler step, so keep that path scalar.
-            saved_input_ids = self.talker_mtp_input_ids.gpu[:decode_batch_size].clone()
-            saved_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].clone()
-            saved_hidden = self.last_talker_hidden.gpu[:decode_batch_size].clone()
-            saved_text = self.text_step.gpu[:decode_batch_size].clone()
-            try:
-                for row, req_id in enumerate(decode_req_ids):
-                    self.talker_mtp_input_ids.gpu[:1].copy_(saved_input_ids[row : row + 1])
-                    self.talker_mtp_inputs_embeds.gpu[:1].copy_(saved_embeds[row : row + 1])
-                    self.last_talker_hidden.gpu[:1].copy_(saved_hidden[row : row + 1])
-                    self.text_step.gpu[:1].copy_(saved_text[row : row + 1])
-                    row_offsets = None if start_offsets is None else [start_offsets[row]]
-                    self._talker_mtp_forward([req_id], inputs_embeds, row_offsets)
-            finally:
-                self.talker_mtp_input_ids.gpu[:decode_batch_size].copy_(saved_input_ids)
-                self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].copy_(saved_embeds)
-                self.last_talker_hidden.gpu[:decode_batch_size].copy_(saved_hidden)
-                self.text_step.gpu[:decode_batch_size].copy_(saved_text)
-            return
+        row_generators = self._resolve_talker_mtp_generators(
+            decode_req_ids,
+            req_input_ids.device,
+        )
+        generator = None
+        generators = None
+        if row_generators is not None:
+            if decode_batch_size == 1:
+                generator = row_generators[0]
+            elif getattr(self.model, "talker_mtp_accepts_generators", False):
+                # Unseeded rows intentionally keep the default global RNG semantics,
+                # represented by None, even when batched with explicitly seeded rows.
+                generators = row_generators
+            else:
+                self._talker_mtp_forward_row_by_row(decode_req_ids, inputs_embeds, start_offsets)
+                return
 
         talker_kwargs = {
             "do_sample": subtalker_params.get("do_sample"),
@@ -1881,11 +1920,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             "top_k": subtalker_params.get("top_k"),
             "top_p": subtalker_params.get("top_p"),
         }
-        if decode_batch_size == 1:
-            if row_generators[0] is not None:
-                talker_kwargs["generator"] = row_generators[0]
-        elif any(generator is not None for generator in row_generators):
-            talker_kwargs["generators"] = row_generators
+        if generator is not None:
+            talker_kwargs["generator"] = generator
+        if generators is not None:
+            talker_kwargs["generators"] = generators
         if getattr(self.model, "talker_mtp_accepts_req_infos", False):
             talker_kwargs["req_ids"] = decode_req_ids
             talker_kwargs["req_infos"] = [

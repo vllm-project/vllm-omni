@@ -171,6 +171,12 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     return runner
 
 
+def _enable_talker_seed(runner, *, accepts_generators=False):
+    runner.model.talker_mtp_seed_extra_arg = "tts_local_seed"
+    if accepts_generators:
+        runner.model.talker_mtp_accepts_generators = True
+
+
 def _make_runner_for_mimo(req_id="r_mimo"):
     """Create a minimal runner with MiMoAudio-like model and request state."""
     runner = object.__new__(OmniGPUModelRunner)
@@ -255,6 +261,7 @@ def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(seed=42)
     runner.talker_mtp = CaptureTalkerMTP()
+    _enable_talker_seed(runner)
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
 
     def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
@@ -269,6 +276,34 @@ def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker
     assert runner.talker_mtp.calls[0]["generator"] is None
 
 
+def test_talker_mtp_forward_ignores_tts_local_seed_without_model_seed_key(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=42,
+        extra_args={"tts_local_seed": 42},
+    )
+    runner.talker_mtp = CaptureTalkerMTP()
+    runner.model.talker_mtp_accepts_generators = True
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    assert runner.talker_mtp.calls[0]["generators"] is None
+
+
 def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
@@ -280,6 +315,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
         extra_args={"tts_local_seed": 42},
     )
     runner.talker_mtp = CaptureTalkerMTP()
+    _enable_talker_seed(runner)
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             subtalker_sampling_params={
@@ -314,7 +350,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
     assert runner.talker_mtp.calls[0]["generator"] is not None
 
 
-def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
+def test_talker_mtp_forward_keeps_unmarked_models_scalar_for_explicit_seed(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
     monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
@@ -329,6 +365,7 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
         extra_args={"tts_local_seed": 22},
     )
     runner.talker_mtp = CaptureTalkerMTP()
+    _enable_talker_seed(runner)
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
 
     def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
@@ -348,13 +385,13 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
 
     assert [call["batch_size"] for call in runner.talker_mtp.calls] == [1, 1]
     assert all(call["generator"] is not None for call in runner.talker_mtp.calls)
+    assert all(call["generators"] is None for call in runner.talker_mtp.calls)
     assert runner.talker_mtp.calls[0]["generator"] is not runner.talker_mtp.calls[1]["generator"]
     assert torch.equal(runner.talker_mtp_input_ids.gpu, saved_input_ids)
     assert torch.equal(runner.talker_mtp_inputs_embeds.gpu, saved_embeds)
 
 
-def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypatch):
-    """Models with talker_mtp_accepts_per_row_generators get one batched call (#4883)."""
+def test_talker_mtp_forward_keeps_explicit_seeded_requests_batched(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
     monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
@@ -369,10 +406,7 @@ def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypa
         extra_args={"tts_local_seed": 22},
     )
     runner.talker_mtp = CaptureTalkerMTP()
-    runner.model = SimpleNamespace(
-        talker_mtp_output_key=("codes", "audio"),
-        talker_mtp_accepts_per_row_generators=True,
-    )
+    _enable_talker_seed(runner, accepts_generators=True)
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
 
     def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
@@ -386,8 +420,9 @@ def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypa
 
     # One batched call with distinct per-row generators, not two scalar calls.
     assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
-    row_generators = runner.talker_mtp.calls[0]["generators"]
     assert runner.talker_mtp.calls[0]["generator"] is None
+    row_generators = runner.talker_mtp.calls[0]["generators"]
+    assert row_generators is not None
     assert len(row_generators) == 2
     assert all(generator is not None for generator in row_generators)
     assert row_generators[0] is not row_generators[1]
@@ -402,6 +437,62 @@ def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypa
     OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], inputs_embeds)
     assert set(runner._talker_mtp_generators) == {"r1"}
     assert runner.talker_mtp.calls[2]["generator"] is row_generators[0]
+
+
+def test_talker_mtp_forward_batches_mixed_explicit_seed_requests(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("seeded", "unseeded"), hidden_size=4)
+    runner.requests["seeded"].sampling_params = SimpleNamespace(
+        seed=11,
+        extra_args={"tts_local_seed": 11},
+    )
+    runner.talker_mtp = CaptureTalkerMTP()
+    _enable_talker_seed(runner, accepts_generators=True)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["seeded", "unseeded"], inputs_embeds)
+
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    generators = runner.talker_mtp.calls[0]["generators"]
+    assert generators is not None
+    assert len(generators) == 2
+    assert generators[0] is not None
+    assert generators[1] is None
+
+
+def test_talker_mtp_forward_does_not_pass_generators_without_explicit_seed(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.talker_mtp = CaptureTalkerMTP()
+    _enable_talker_seed(runner, accepts_generators=True)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [2]
+    assert runner.talker_mtp.calls[0]["generator"] is None
+    assert runner.talker_mtp.calls[0]["generators"] is None
 
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):

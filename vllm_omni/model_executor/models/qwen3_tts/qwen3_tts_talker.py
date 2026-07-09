@@ -266,6 +266,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     """vLLM-AR talker: step-wise layer-0 codec decoding.
     Predicts residual codebooks (1..Q-1) into `audio_codes` and streams text via `tailing_text_hidden`."""
 
+    talker_mtp_accepts_generators = True
+    talker_mtp_seed_extra_arg = "tts_local_seed"
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             # Talker backbone (Qwen3 decoder-only).
@@ -324,13 +327,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
-        # talker_mtp samples with per-row generators, so explicitly-seeded
-        # requests stay batched instead of one scalar forward per row (#4883).
-        # Only valid while talker_mtp receives the unpadded active batch (this
-        # talker is not graph-wrapped); a padded batch would need the runner to
-        # pad the generators list as well.
-        self.talker_mtp_accepts_per_row_generators = True
-
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
