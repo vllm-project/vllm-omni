@@ -200,9 +200,9 @@ def test_save_async(build_adapter):
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
     adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": False}
-    adapter.save_async(pooling_output=None, request=request)
+    adapter.save_async(multimodal_output=None, request=request)
     adapter.custom_process_next_stage_input_func = lambda **kwargs: {}
-    adapter.save_async(pooling_output=None, request=request)
+    adapter.save_async(multimodal_output=None, request=request)
 
     task = adapter._pending_save_reqs.popleft()
     assert task["is_finished"] is False
@@ -214,7 +214,7 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
     request.num_computed_tokens = 10
     request.num_output_placeholders = 2
 
-    adapter.save_async(pooling_output=None, request=request)
+    adapter.save_async(multimodal_output=None, request=request)
 
     assert adapter.requests_num_chunks_sent["external-async"] == 8
     assert len(adapter._pending_save_reqs) == 1
@@ -236,7 +236,7 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
     adapter._send_single_request(
-        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
     )
 
     assert cleanup_calls == []  # no terminal cleanup; meta.finished is false
@@ -256,7 +256,7 @@ def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatc
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
     adapter._send_single_request(
-        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
     )
 
     assert connector.put.called
@@ -274,7 +274,7 @@ def test_send_single_request_struct_preserves_segment_finished(build_adapter, mo
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
     adapter._send_single_request(
-        {"pooling_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
     )
 
     sent_payload = connector.put.call_args.kwargs["data"]
@@ -289,13 +289,13 @@ def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapt
     request.num_computed_tokens = 0
     adapter.requests_num_chunks_sent["ext-stream"] = 111
 
-    adapter.save_async(pooling_output=None, request=request, is_segment_finished=False)
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=False)
 
     assert len(adapter._pending_save_reqs) == 0
     assert adapter.requests_num_chunks_sent["ext-stream"] == 111
 
     adapter.requests_num_chunks_sent.pop("ext-stream")
-    adapter.save_async(pooling_output=None, request=request, is_segment_finished=False)
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=False)
 
     assert len(adapter._pending_save_reqs) == 1
     assert adapter.requests_num_chunks_sent["ext-stream"] == 0
@@ -312,7 +312,7 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
     adapter._send_single_request(
-        {"pooling_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
+        {"multimodal_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
     )
 
     assert len(cleanup_calls) == 1

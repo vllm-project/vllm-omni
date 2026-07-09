@@ -65,7 +65,6 @@ class _PagedMiniCPM4Attention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         self.head_dim = kv_channels if kv_channels else hidden_size // num_attention_heads
@@ -318,18 +317,12 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
                 ).detach()
 
     def compile_selective(self) -> list[str]:
-        """Compile the full model forward as one graph.
+        """Compile the full model ``forward`` as one graph.
 
-        Earlier versions compiled ``layer.mlp`` + ``layer.self_attn.o_proj``
-        (PR #2690) and then the whole ``layer`` (perf/voxcpm2-streaming-vae).
-        Both still paid one Dynamo dispatch per layer per decode step.
-        V3 profiling showed 1,332 per-layer dispatches (~28 layers × ~47
-        decode steps) costing ~726 ms of CPU self-time for a long prompt.
-
-        Compiling ``forward`` at the model level lets Dynamo unroll the
-        28-layer Python loop inside the graph. Graph breaks at
-        PagedAttention produce sub-graphs but Dynamo memoises the whole
-        trace once, so the per-step dispatch drops from 28 to just a few.
+        ``torch.compile`` is applied at the model level so Dynamo unrolls the
+        per-layer Python loop inside the graph. Graph breaks at PagedAttention
+        produce sub-graphs, but Dynamo memoises the whole trace once, so the
+        per-decode-step dispatch drops to just a few instead of one per layer.
         """
         if self._compiled_layers:
             return []

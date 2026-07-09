@@ -16,6 +16,22 @@ TEXT_EOS_TOKEN_ID = 151669  # <text_eos>
 
 
 # ---------------------------------------------------------------------------
+# MoE (bailing_moe / Ming-omni-tts-16.8B-A3B) token IDs
+# (confirmed from the bailing tokenizer_config.json — different vocab than the
+# dense Qwen2 tokenizer above). The bailing tokenizer has NO <text_eos>; the
+# audio AR loop terminates purely on the stop-head (see upstream
+# modeling_bailingmm.sample), so <end_of_audio> doubles as the AR stop token.
+# ---------------------------------------------------------------------------
+
+MOE_AUDIO_DUMMY_TOKEN_ID = 126357  # <audioPatch>
+MOE_AUDIO_START_TOKEN_ID = 126358  # <audio>
+MOE_AUDIO_END_TOKEN_ID = 126359  # </audio>
+MOE_AUDIO_EOS_TOKEN_ID = 126356  # <end_of_audio>
+MOE_TEXT_EOS_TOKEN_ID = 126356  # no <text_eos> in bailing; reuse <end_of_audio> as AR stop
+MOE_SPK_TOKEN_ID = 126368  # <spk> — speaker-embedding placeholder (dense uses <|vision_start|>)
+
+
+# ---------------------------------------------------------------------------
 # Architectural constants (confirmed from original config.json)
 # ---------------------------------------------------------------------------
 
@@ -55,7 +71,6 @@ KEY_DECODE_STEP = "ming_decode_step"
 KEY_LAST_STOP_PROB = "ming_last_stop_prob"
 KEY_NEXT_EMBEDS = "ming_next_embeds"
 KEY_PROMPT_LATENTS = "ming_prompt_latents"
-KEY_PROMPT_LATENT_TAIL = "ming_prompt_latent_tail"
 KEY_SPEAKER_EMBEDDING = "ming_speaker_embedding"
 KEY_REQUEST_ID = "ming_request_id"
 KEY_CHUNK_ID = "ming_chunk_id"

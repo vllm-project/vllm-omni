@@ -104,10 +104,9 @@ def expand_cfg_prompts(
 ) -> list[_CfgExpandedPrompt]:
     """Expand a text-to-image request into one CFG-text companion (opt-in).
 
-    Triggers only when a non-empty
-    ``sampling_params.extra_args["image_gen"]["negative_prompt"]`` is set on
-    the stage-0 params; otherwise returns ``[]`` and the pipeline falls back
-    to zero negative (Ming's default behavior).
+    Triggers only when a non-empty `negative_prompt` is set flat on the stage-0 params
+    (`sampling_params.extra_args`); otherwise returns an empty list
+    and the pipeline falls back to zero negative (Ming's default behavior).
     """
     if not isinstance(prompt, dict):
         return []
@@ -115,8 +114,7 @@ def expand_cfg_prompts(
         return []
 
     extra_args = getattr(sampling_params, "extra_args", None) or {}
-    image_gen_args = extra_args.get("image_gen") or {}
-    negative = image_gen_args.get("negative_prompt")
+    negative = extra_args.get("negative_prompt")
     if not isinstance(negative, str) or not negative.strip():
         return []
 
@@ -328,7 +326,7 @@ def _resolve_token_ids_from_stage_or_defaults(
 def _extract_byte5_from_sampling_params(sampling_params: Any) -> list[str] | None:
     """Read ``byte5_text`` from the diffusion-stage sampling_params.
 
-    Looks up ``sampling_params.extra_args["image_gen"]["byte5_text"]`` (the
+    Looks up `sampling_params.extra_args["byte5_text"]` key (the
     explicit API surface for ByT5 glyph text). Returns ``None`` if absent or
     malformed, so callers can fall back to other sources.
     """
@@ -337,10 +335,9 @@ def _extract_byte5_from_sampling_params(sampling_params: Any) -> list[str] | Non
     extra = getattr(sampling_params, "extra_args", None)
     if not isinstance(extra, dict):
         return None
-    image_gen = extra.get("image_gen")
-    if not isinstance(image_gen, dict):
-        return None
-    texts = image_gen.get("byte5_text")
+    texts = extra.get("byte5_text")
+    if isinstance(texts, str):
+        texts = [texts]
     if isinstance(texts, list) and texts:
         return [t for t in texts if isinstance(t, str)]
     return None
@@ -361,10 +358,9 @@ def thinker2imagegen(
     CFG negative conditioning. Unknown-suffix outputs are skipped.
 
     ``sampling_params`` is the diffusion stage's own SamplingParams, supplied
-    by the orchestrator. ByT5 explicit ``byte5_text`` is read from
-    ``sampling_params.extra_args.image_gen.byte5_text`` (preferred); falls
-    back to ``prompt.image_gen_extra_args.byte5_text``, then to auto-extraction
-    from quoted prompt text.
+    by the orchestrator. ByT5 explicit ``byte5_text`` is read from the flat
+    `sampling_params.extra_args.byte5_text` key (preferred); otherwise it is
+    auto-extracted from quoted prompt text.
     """
     thinker_outputs = source_outputs
     image_patch_token_id, image_end_token_id, num_query_tokens = _resolve_token_ids_from_stage_or_defaults(stage=None)
@@ -417,17 +413,10 @@ def thinker2imagegen(
         if ref_image is not None:
             extra["reference_image"] = ref_image
 
-        # ByT5 glyph text: prefer sampling_params (stage-1 explicit API), then
-        # prompt.image_gen_extra_args (serving_chat path), then auto-extract
-        # from quoted prompt text.
+        # ByT5 glyph text: prefer the flat byte5_text on sampling_params
+        # (stage-1 explicit API), else auto-extract from quoted prompt text.
         prompt_text = prompt.get("prompt", "")
-        sp_byte5 = _extract_byte5_from_sampling_params(sampling_params)
-        if sp_byte5:
-            byte5_texts: list[str] | None = sp_byte5
-        else:
-            ig_extra = prompt.get("image_gen_extra_args") or {}
-            cand = ig_extra.get("byte5_text")
-            byte5_texts = cand if isinstance(cand, list) and cand else None
+        byte5_texts: list[str] | None = _extract_byte5_from_sampling_params(sampling_params)
 
         if byte5_texts:
             extra["byte5_text"] = [
@@ -511,25 +500,6 @@ def _build_talker_inputs(
     return talker_inputs
 
 
-def thinker2talker(
-    source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    _requires_multimodal_data: bool = False,
-    _streaming_context: Any | None = None,
-) -> list[OmniTokensPrompt]:
-    """Build talker stage inputs from thinker stage outputs."""
-    return _build_talker_inputs(source_outputs, prompt)
-
-
-# ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` or
-# ``_FULL_PAYLOAD_INPUT_STAGES``, so the worker connector is not
-# initialised for this arch and the consumer never waits on a connector
-# payload.  Data flows through ``additional_information`` written by
-# ``thinker2talker_token_only`` (wired as ``sync_process_input_func``
-# in the pipeline) or ``thinker2talker`` (wired as
-# ``custom_process_input_func``).
-
-
 def thinker2talker_token_only(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
@@ -542,29 +512,9 @@ def thinker2talker_token_only(
 thinker2talker_token_only._is_sync_input = True
 
 
-def thinker2talker_full_payload(
-    transfer_manager,
-    pooling_output,
-    request,
-):
-    """Producer-side payload builder — no-op.
-
-    ming_flash_omni's thinker emits no heavy tensor to ship via the
-    worker connector (the bridge passes text only, and speaker metadata
-    arrives through the USER request's additional_information).
-    ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` so this
-    function is never invoked at runtime; it is retained for forward
-    compatibility with the connector path.
-    """
-    del transfer_manager, pooling_output, request
-    return None
-
-
 __all__ = [
     "CFG_TEXT_SUFFIX",
     "expand_cfg_prompts",
     "thinker2imagegen",
-    "thinker2talker",
-    "thinker2talker_full_payload",
     "thinker2talker_token_only",
 ]

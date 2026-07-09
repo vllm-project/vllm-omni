@@ -126,6 +126,7 @@ def _sample_token(
     top_k: int,
     top_p: float,
     do_sample: bool,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Top-k + top-p sampling (matches upstream's ``sample_token`` for the
     inference branch).
@@ -152,7 +153,7 @@ def _sample_token(
 
     probs = F.softmax(logits, dim=-1)
     flat = probs.reshape(-1, probs.shape[-1])
-    sampled = torch.multinomial(flat, num_samples=1).reshape(probs.shape[:-1])
+    sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
     return sampled
 
 

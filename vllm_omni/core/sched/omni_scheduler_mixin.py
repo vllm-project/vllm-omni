@@ -26,15 +26,15 @@ _STATS_INTERVAL_S = 1.0
 # Scope: this constant only covers the full-payload coordinator path
 # (``input_coordinator``).  The async-chunk path uses
 # ``chunk_transfer_adapter`` and is not affected by this constant.
-_INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "300")
+_INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "600")
 try:
     DEFAULT_INPUT_WAIT_TIMEOUT_S: float = float(_INPUT_WAIT_TIMEOUT_RAW)
 except ValueError:
     logger.warning(
-        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to 300 seconds.",
+        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to 600 seconds.",
         _INPUT_WAIT_TIMEOUT_RAW,
     )
-    DEFAULT_INPUT_WAIT_TIMEOUT_S = 300.0
+    DEFAULT_INPUT_WAIT_TIMEOUT_S = 600.0
 
 
 class OmniSchedulerMixin:

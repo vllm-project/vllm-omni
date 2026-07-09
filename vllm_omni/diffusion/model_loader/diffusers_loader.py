@@ -18,7 +18,6 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
-    download_gguf,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -41,6 +40,39 @@ from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
+
+
+# download_gguf was removed from upstream vLLM (commit 6635279d8).
+# Inlined from the last upstream version before the GGUF plugin migration.
+def download_gguf(
+    repo_id: str,
+    quant_type: str,
+    cache_dir: str | None = None,
+    revision: str | None = None,
+    ignore_patterns: str | list[str] | None = None,
+) -> str:
+    allow_patterns = [
+        f"*-{quant_type}.gguf",
+        f"*-{quant_type}-*.gguf",
+        f"*/*-{quant_type}.gguf",
+        f"*/*-{quant_type}-*.gguf",
+    ]
+    folder = download_weights_from_hf(
+        model_name_or_path=repo_id,
+        cache_dir=cache_dir,
+        allow_patterns=allow_patterns,
+        revision=revision,
+        ignore_patterns=ignore_patterns,
+    )
+    local_files: list[str] = []
+    for pattern in allow_patterns:
+        glob_pattern = os.path.join(folder, pattern)
+        local_files.extend(glob.glob(glob_pattern))
+    if not local_files:
+        raise ValueError(f"Downloaded GGUF files not found in {folder} for quant_type {quant_type}")
+    local_files.sort(key=lambda x: (x.count("-"), x))
+    return local_files[0]
+
 
 logger = init_logger(__name__)
 
@@ -602,10 +634,17 @@ class DiffusersPipelineLoader:
             model_cls = _resolve_custom_pipeline_cls(custom_pipeline_name)
             with set_current_diffusion_config(self.od_config):
                 model = model_cls(od_config=self.od_config)
-            if not is_hsdp and target_device.type != "cpu":
+            # HSDP normally defers GPU placement to apply_hsdp_to_model to keep peak
+            # load-time memory on CPU. Online quantization (e.g. fp8) runs CUDA-only
+            # kernels inside load_weights via the layerwise loader, so when a quant
+            # config is set we initialize on the accelerator like the non-HSDP path;
+            # apply_hsdp_to_model shards GPU-resident params equally well.
+            hsdp_defer_to_cpu = is_hsdp and self.quant_config is None
+            if not hsdp_defer_to_cpu and target_device.type != "cpu":
                 model.to(target_device)
         else:
-            device_ctx = target_device if not is_hsdp else contextlib.nullcontext()
+            hsdp_defer_to_cpu = is_hsdp and self.quant_config is None
+            device_ctx = contextlib.nullcontext() if hsdp_defer_to_cpu else target_device
             with device_ctx:
                 if load_format == "default":
                     model = initialize_model(self.od_config)
@@ -646,26 +685,37 @@ class DiffusersPipelineLoader:
         model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
         self.load_weights(model)
 
-        # Collect all transformers to shard (some models have transformer_2 for MoE)
-        transformers_to_shard = []
-        transformer = getattr(model, "transformer", None)
-        if transformer is None:
-            raise ValueError("Model has no transformer attribute for HSDP")
-        transformers_to_shard.append(("transformer", transformer))
-
-        # Check for transformer_2 (MoE two-stage models like Wan2.2-I2V)
-        transformer_2 = getattr(model, "transformer_2", None)
-        if transformer_2 is not None:
-            transformers_to_shard.append(("transformer_2", transformer_2))
-
-        # Apply HSDP sharding to all transformers
-        for name, trans in transformers_to_shard:
-            logger.debug("Applying HSDP to %s", name)
-            apply_hsdp_to_model(trans, hsdp_config)
-
-        # # HSDP only shards transformer modules. All other runtime modules must
-        # # be placed on the execution device explicitly after sharding.
+        # Discover pipeline components (DiT, encoders, VAEs) via
+        # ModuleDiscovery, which consults SupportsComponentDiscovery
+        # when available and falls back to well-known attribute names.
+        # This supports nested pipelines (e.g. LTX2TwoStagesPipeline
+        # where the transformer lives at "pipe.transformer").
         discovered_modules = ModuleDiscovery.discover(model)
+
+        # Online FP8 quantization (Fp8OnlineLinearMethod) leaves layer weights
+        # as non-contiguous transpose views (qweight.t()) so the Cutlass kernel
+        # gets a column-major B. FSDP2 fully_shard rejects non-contiguous params.
+        # Rewrite affected layers in-place to row-major contiguous storage and
+        # shift the .t() to GEMM-call time. Layers using other quant methods or
+        # already-contiguous weights are left untouched.
+        if self.quant_config is not None:
+            from vllm_omni.diffusion.quantization.hsdp_fp8 import (
+                prepare_fp8_layers_for_fsdp,
+            )
+
+            for trans in discovered_modules.dits:
+                prepare_fp8_layers_for_fsdp(trans)
+
+        if not discovered_modules.dits:
+            raise ValueError("No DiT modules discovered for HSDP sharding")
+
+        # Apply HSDP sharding to all discovered DiT transformers
+        for name, trans in zip(discovered_modules.dit_names, discovered_modules.dits):
+            logger.debug("Applying HSDP to %s", name)
+            apply_hsdp_to_model(trans, hsdp_config, target_device=target_device)
+
+        # HSDP only shards transformer modules. All other runtime modules must
+        # be placed on the execution device explicitly after sharding.
         modules_to_move: list[nn.Module] = []
         if discovered_modules.vaes is not None:
             modules_to_move.extend(discovered_modules.vaes)

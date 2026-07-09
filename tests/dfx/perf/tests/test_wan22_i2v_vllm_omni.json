@@ -30,9 +30,9 @@
                     }
                 ],
                 "baseline": {
-                    "throughput_qps": 0.04,
-                    "latency_mean": 30,
-                    "peak_memory_mb_mean": 75000
+                    "throughput_qps": 0.0465,
+                    "latency_mean": 21.4354,
+                    "peak_memory_mb_mean": 72557.58
                 }
             }
         ]
@@ -72,9 +72,9 @@
                     }
                 ],
                 "baseline": {
-                    "throughput_qps": 0.06,
-                    "latency_mean": 20,
-                    "peak_memory_mb_mean": 48000
+                    "throughput_qps": 0.0642,
+                    "latency_mean": 15.5589,
+                    "peak_memory_mb_mean": 45742.88
                 }
             },
             {
@@ -97,9 +97,9 @@
                     }
                 ],
                 "baseline": {
-                    "throughput_qps": 0.01,
-                    "latency_mean": 90,
-                    "peak_memory_mb_mean": 56000
+                    "throughput_qps": 0.0128,
+                    "latency_mean": 77.8565,
+                    "peak_memory_mb_mean": 53947.84
                 }
             }
         ]

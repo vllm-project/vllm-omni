@@ -70,6 +70,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
 | `video_reference` | string | null | JSON-encoded reference video payload; do not combine with `input_reference` or `image_reference` |
+| `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
 | `width` | integer | model default | Output video width |
 | `height` | integer | model default | Output video height |
 | `num_frames` | integer | model default | Number of generated frames |
@@ -159,7 +160,31 @@ JSON references currently support `image_url`/`video_url`; `file_id` references
 are not implemented yet. Models may expose additional V2V controls through
 `extra_params`. For example, Cosmos3 supports
 `condition_frame_indexes_vision` and `condition_video_keep` to select which
-decoded reference frames are used as clean conditioning.
+decoded reference frames are used as clean conditioning. Cosmos3 transfer mode
+also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints plus
+transfer options such as `control_path`, `control_guidance`,
+`control_guidance_interval`, `num_video_frames_per_chunk`,
+`num_conditional_frames`, `show_control_condition`, and `show_input`; see the
+Cosmos3 recipe for complete examples.
+
+### Speech-to-Video
+
+For models that support audio-driven generation (e.g., Wan2.2-S2V), pass both
+an image reference and an audio reference. The `audio_reference` field accepts a
+JSON string with `audio_url` pointing to an HTTP(s) URL or base64 data URL.
+
+```bash
+curl -s http://localhost:8091/v1/videos \
+  -F "prompt=A person singing" \
+  -F 'image_reference={"image_url": "https://example.com/face.png"}' \
+  -F 'audio_reference={"audio_url": "https://example.com/speech.mp3"}' \
+  -F "width=832" \
+  -F "height=480" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=4.5" \
+  -F "fps=16"
+```
+
 
 ### Synchronous Generation
 
@@ -175,12 +200,15 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 
 ## Storage
 
-Set `VLLM_OMNI_STORAGE_PATH` to control where asynchronous video outputs are
+Set `VLLM_OMNI_SERVER_STORAGE__PATH` to control where asynchronous video outputs are
 stored:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 ```
+
+> `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
+> use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.
 
 ## Model-Specific Examples
 
@@ -189,5 +217,7 @@ walkthroughs, see:
 
 - [Text-to-Video](../user_guide/examples/online_serving/text_to_video.md)
 - [Image-to-Video](../user_guide/examples/online_serving/image_to_video.md)
+- [Speech-to-Video](../user_guide/examples/online_serving/speech_to_video.md)
+  for Wan2.2-S2V audio-driven lip-sync generation
 - [Cosmos3 recipes](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano.md)
   for model-specific video-to-video examples and conditioning controls

@@ -65,12 +65,20 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0.25,
         le=4.0,
     )
-    stream_format: Literal["sse", "audio"] | None = "audio"
+    stream_format: Literal["sse", "audio"] | None = Field(
+        default=None,
+        description=(
+            "Streaming output format. 'audio' streams raw pcm/wav bytes; "
+            "'sse' streams OpenAI speech.audio.* SSE events. If omitted, stream=true "
+            "selects SSE and stream=false remains non-streaming."
+        ),
+    )
     stream: bool = Field(
         default=False,
         description=(
-            "If true, stream raw PCM audio chunks as they are decoded. "
-            "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
+            "Streaming switch; defaults to OpenAI speech.audio.* SSE events. "
+            "Set stream_format='audio' to opt into raw pcm/wav byte streaming. "
+            "Requires response_format='pcm' or 'wav'. Speed adjustment is not supported when streaming."
         ),
     )
 
@@ -133,16 +141,31 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    non_streaming_mode: bool | None = Field(
+        default=None,
+        description=(
+            "Qwen3-TTS prompt construction mode override. This does not "
+            "control HTTP response streaming or async-chunk pipelining. "
+            "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
+        ),
+    )
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
+    )
+    word_timestamps: bool = Field(
+        default=False,
+        description=(
+            "When true, the server runs a shared forced aligner alongside the streamed "
+            "audio and emits per-chunk word timestamps. Requires the server to be "
+            "launched with --forced-aligner pointing at an aligner model. No effect "
+            "when streaming is off."
+        ),
     )
 
     @field_validator("stream_format")
     @classmethod
     def validate_stream_format(cls, v: str) -> str:
-        if v == "sse":
-            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
 
     @field_validator("ref_audio", mode="before")
@@ -270,20 +293,28 @@ class OpenAICreateSpeechRequest(BaseModel):
                 raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
         return self
 
+    def is_raw_audio_stream(self) -> bool:
+        return self.stream_format == "audio"
+
+    def is_sse_stream(self) -> bool:
+        return (self.stream or self.stream_format == "sse") and not self.is_raw_audio_stream()
+
+    def is_streaming(self) -> bool:
+        return self.is_raw_audio_stream() or self.is_sse_stream()
+
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
-        if self.stream:
+        if self.is_streaming():
             if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
-                    "Streaming (stream=true) requires response_format='pcm' or 'wav'. "
+                    "Streaming (stream=true, stream_format='audio', or stream_format='sse') "
+                    "requires response_format='pcm' or 'wav'. "
                     f"Got response_format='{self.response_format}'."
                 )
             if self.speed is None:
                 self.speed = 1.0
             elif self.speed != 1.0:
-                raise ValueError(
-                    "Speed adjustment is not supported when streaming (stream=true). Set speed=1.0 or omit it."
-                )
+                raise ValueError("Speed adjustment is not supported when streaming. Set speed=1.0 or omit it.")
         return self
 
 
@@ -339,7 +370,6 @@ class CreateAudio(BaseModel):
     sample_rate: int = 24000
     response_format: str = "wav"
     speed: float = 1.0
-    stream_format: Literal["sse", "audio"] | None = "audio"
     base64_encode: bool = True
 
     class Config:
@@ -370,6 +400,7 @@ class SpeechBatchItem(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    non_streaming_mode: bool | None = None
 
 
 class BatchSpeechRequest(BaseModel):
@@ -389,6 +420,57 @@ class BatchSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    non_streaming_mode: bool | None = None
+
+
+class SpeechInputTokenDetails(BaseModel):
+    """Per-modality breakdown of the speech request's *input* tokens.
+
+    The aggregate ``input_tokens`` on :class:`SpeechTokenUsage` is the sum of
+    these. We surface the split (rather than one opaque number) for the same
+    reason OpenAI's realtime/chat usage does: text and audio inputs are billed
+    and reasoned about differently, and folding them together is misleading.
+
+    Fields:
+        text_tokens: Tokens of the text to synthesize. This is ``input`` plus
+            ``instructions`` (style/emotion prompt), because both are tokenized
+            into the model prefill. This is the number that should scale with
+            how much text the caller asked to speak.
+        audio_tokens: Reference-audio codec frames used as voice-cloning
+            conditioning. NON-ZERO only when in-context voice cloning is
+            actually active (Qwen3-TTS ``task_type='Base'`` ICL). It is 0 for
+            CustomVoice/VoiceDesign and for x-vector-only cloning, because those
+            paths put no reference codec frames into the prefill. See issue
+            #4646: this is the value that previously leaked into ``prompt_tokens``
+            and made Base usage look independent of the input text.
+    """
+
+    text_tokens: int = 0
+    audio_tokens: int = 0
+
+
+class SpeechTokenUsage(BaseModel):
+    """Token usage for a speech (TTS) request.
+
+    Field naming follows OpenAI's documented ``speech.audio.done`` event
+    (``input_tokens``/``output_tokens``/``total_tokens``), NOT chat's
+    ``prompt_tokens``/``completion_tokens``.
+
+    input_tokens  = text_tokens + audio_tokens   (see SpeechInputTokenDetails)
+    output_tokens = generated codec/audio tokens (stage-0 decode steps)
+    total_tokens  = input_tokens + output_tokens
+
+    IMPORTANT: ``input_tokens`` is computed from the *semantic* request inputs
+    (tokenized text + reference-audio frames), NOT from ``len(prompt_token_ids)``.
+    For staged TTS models that engine prompt is a ``[1] * prefill_len``
+    placeholder whose length mirrors the model prefill, so it is not a faithful
+    input-token count (issue #4646).
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    input_token_details: SpeechInputTokenDetails = Field(default_factory=SpeechInputTokenDetails)
 
 
 class SpeechBatchItemResult(BaseModel):
@@ -397,6 +479,9 @@ class SpeechBatchItemResult(BaseModel):
     audio_data: str | None = None
     media_type: str | None = None
     error: str | None = None
+    # Per-item token usage (input text + reference-audio conditioning, and
+    # generated audio tokens). None when the item errored before generation.
+    usage: SpeechTokenUsage | None = None
 
 
 class BatchSpeechResponse(BaseModel):
@@ -423,6 +508,14 @@ class StreamingSpeechSessionConfig(BaseModel):
         ge=0,
         description="Initial chunk size for reduced TTFA. Overrides stage config for this session.",
     )
+    non_streaming_mode: bool | None = Field(
+        default=None,
+        description=(
+            "Qwen3-TTS prompt construction mode override. This does not "
+            "control WebSocket audio streaming or async-chunk pipelining. "
+            "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
+        ),
+    )
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
@@ -438,11 +531,13 @@ class StreamingSpeechSessionConfig(BaseModel):
             "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
         ),
     )
-    split_granularity: Literal["sentence", "clause"] = Field(
-        default="sentence",
+    word_timestamps: bool = Field(
+        default=False,
         description=(
-            "Text splitting granularity: 'sentence' splits on .!?。！？, "
-            "'clause' also splits on CJK commas ， and semicolons ；."
+            "When true, audio chunks are wrapped in JSON 'audio.chunk' frames carrying "
+            "base64-encoded PCM plus aligned word timestamps. Requires the server to be "
+            "launched with --forced-aligner. When false, audio is sent as raw binary "
+            "frames (existing behavior)."
         ),
     )
 

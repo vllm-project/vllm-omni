@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_glm_image import GlmImageCombinedTimestepSizeEmbeddings
 from vllm.logger import init_logger
@@ -19,6 +20,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -934,6 +937,13 @@ class GlmImageTransformer2DModel(CachedTransformer):
             Transformer hyper-parameters (e.g. patch size / channels / heads) are read from
             `od_config.tf_model_config`.
     """
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_0,
+        },
+        has_separate_cfg=True,
+    )
 
     _repeated_blocks = ["GlmImageTransformerBlock"]
     # SP plan using GlmImagePrepare module for sharding hidden_states and RoPE together.

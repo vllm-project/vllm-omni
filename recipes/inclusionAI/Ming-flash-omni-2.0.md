@@ -18,6 +18,7 @@ Use this recipe when you want a known-good starting point for serving
 
 - **Thinker only** — multimodal understanding with text output.
 - **Thinker + Talker (omni-speech)** — multimodal understanding with text and spoken output.
+- **Thinker + Imagegen (DiT)** — text-to-image / img2img
 - **Talker only (TTS)** — standalone text-to-speech via the OpenAI `/v1/audio/speech` endpoint.
 
 ## References
@@ -159,6 +160,129 @@ deltas appear at `choices[0].delta.content`.
   to `detailed thinking on` in any request above.
 - Memory usage: size depends on output modalities and multimodal input; leave
   headroom for video frames and audio caches.
+
+## Image generation (text-to-image / img2img)
+
+Ming-flash-omni-2.0 also exposes an image-generation (diffusion) stage. Launch with the image deploy YAML, which adds an image-gen stage behind the thinker.
+
+The image-generation stage is a standard vLLM-Omni diffusion pipeline (`MingImagePipeline`); its request knobs are declared in `vllm_omni/model_extras/ming_flash_omni.py` and routed through `extra_body`, so they no longer need a bespoke `sampling_params_list` recipe (that form is still available for per-stage thinker sampling — see below).
+
+```bash
+vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni \
+    --deploy-config vllm_omni/deploy/ming_flash_omni_image.yaml \
+    --stage-init-timeout 1800 \
+    --init-timeout 1800 \
+    --port 8091
+```
+
+With fewer GPUs, copy the YAML and drop the thinker to TP=2 with the DiT on a
+free card.
+
+### Online (text-to-image)
+
+Request image output with `"modalities": ["image"]`:
+
+```bash
+curl -s http://127.0.0.1:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Jonathan1909/Ming-flash-omni-2.0",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Please draw a cute cat."
+      }
+    ],
+    "modalities": ["image"]
+  }' \
+  | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
+  | base64 -d > ming_imagegen.png
+```
+
+**Quick form — `extra_body`** (keys are filtered against the declared set and routed into every stage's `extra_args`). Convenient, but it does **not** let you set the thinker (stage-0) sampling params. Wrap the knobs in a literal `"extra_body"` object for raw curl; the OpenAI Python client's `extra_body=` kwarg produces the same request:
+
+```bash
+curl http://127.0.0.1:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Jonathan1909/Ming-flash-omni-2.0",
+    "modalities": ["image"],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Draw a poster."
+      }
+    ],
+    "extra_body": {
+      "steps": 6,
+      "cfg": 1.5,
+      "height": 512,
+      "width": 512,
+      "seed": 123,
+      "byte5_text": ["理解与生成统一"],
+      "negative_prompt": "ugly, blurry, distorted"
+    }
+  }' \
+  | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
+  | base64 -d > ming_imagegen_extra_body.png
+```
+
+**Full control — `sampling_params_list`** (one entry per stage: `[thinker, imagegen]`).
+Use this when you need to tune the thinker's own sampling (`temperature` / `top_p` / `top_k` / `max_tokens`), or to place knobs explicitly per stage.
+Note `negative_prompt` must sit on the **stage-0 thinker** `extra_args`; the imagegen-stage knobs (`steps` / `cfg` / `height` / `width` / `seed` / `byte5_text`) go on the **stage-1** entry:
+
+```bash
+curl http://127.0.0.1:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Jonathan1909/Ming-flash-omni-2.0",
+    "modalities": ["image"],
+    "sampling_params_list": [
+      {
+        "temperature": 0.4,
+        "top_p": 0.9,
+        "top_k": 1,
+        "max_tokens": 1,
+        "seed": 42,
+        "extra_args": {
+          "negative_prompt": "ugly, blurry, distorted"
+        }
+      },
+      {
+        "seed": 42,
+        "extra_args": {
+          "steps": 6,
+          "cfg": 1.5,
+          "height": 512,
+          "width": 512,
+          "seed": 123,
+          "byte5_text": ["理解与生成统一"]
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Draw a poster."
+      }
+    ]
+  }' \
+  | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
+  | base64 -d > ming_imagegen_knobs.png
+```
+
+### Knobs (declared `extra_body` params)
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `height` / `width` | 1024 | Output resolution (multiples of `vae_scale_factor * 2`, currently 16). |
+| `steps` | 30 | Number of FlowMatchEuler denoise steps. |
+| `cfg` | 2.0 | Classifier-free guidance scale. |
+| `seed` | 42 | Per-request RNG seed. |
+| `byte5_text` | (auto) | Glyph text for ByT5 enhancement; raw strings are auto-wrapped to Ming's `Text "…". ` format. Auto-extracted from quoted spans in the prompt when omitted. |
+| `negative_prompt` | (empty) | Real CFG negative conditioning. Spawns a CFG-text companion via `expand_cfg_prompts`; **online / text-to-image only** (offline uses Ming's default zero-negative). |
+
+For img2img, add an `image_url` content part to the user message (online) or pass `--image` (offline); the reference image is routed into the DiT stage as `extra[reference_image]`.
 
 ### 1x H100 80GB — standalone TTS (talker only)
 

@@ -42,10 +42,12 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
                         yield chunk
 
             class MockResponse:
-                def __init__(self):
-                    self.status = 200
-                    self.reason = "OK"
-                    self.content = _Content(SSE_CHUNKS)
+                def __init__(self, status=200, reason="OK", chunks=None):
+                    self.status = status
+                    self.reason = reason
+                    self.content = _Content(chunks or SSE_CHUNKS)
+                    self._json_data = None
+                    self._text_data = None
 
                 async def __aenter__(self):
                     return self
@@ -53,20 +55,49 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
                 async def __aexit__(self, exc_type, exc, tb):
                     return False
 
+                async def text(self):
+                    if self._text_data is not None:
+                        return self._text_data
+                    return json.dumps({"tokens": [1, 2, 3, 4, 5]})
+
+                async def json(self):
+                    if self._json_data is not None:
+                        return self._json_data
+                    return {"tokens": [1, 2, 3, 4, 5]}
+
+                def raise_for_status(self):
+                    pass
+
             class MockClientSession:
                 def __init__(self, *args, **kwargs):
                     pass
 
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
                 def post(self, url=None, *args, **kwargs):
                     if url is not None:
                         POST_CALLS.append(url)
-                    return MockResponse()
+                    return MockResponse(status=200)
+
+                async def get(self, url=None, *args, **kwargs):
+                    if url is not None:
+                        POST_CALLS.append(url)
+                    return MockResponse(status=200)
 
                 async def close(self):
                     return None
 
-            import vllm_omni.benchmarks.patch.patch as patch_mod
+            # Patch globally so modules loaded after this also see the mock
+            import aiohttp
+            aiohttp.ClientSession = MockClientSession
+            aiohttp.TCPConnector = lambda *args, **kwargs: object()
 
+            # Also patch in the patch module
+            import vllm_omni.benchmarks.patch.patch as patch_mod
             patch_mod.aiohttp.ClientSession = MockClientSession
             patch_mod.aiohttp.TCPConnector = lambda *args, **kwargs: object()
 
@@ -136,8 +167,13 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
 
     expected_url = f"http://127.0.0.1:{port}/v1/chat/completions"
     requested_urls = calls["requested_urls"]
-    sent_requests = len(requested_urls)
+    # Count only benchmark requests (to the chat completions endpoint),
+    # excluding tokenize/detokenize alignment calls from the upstream.
+    bench_requests = [url for url in requested_urls if url == expected_url]
+    sent_bench_requests = len(bench_requests)
 
-    assert result["completed"] == sent_requests == num_prompts
-    assert requested_urls
-    assert all(url == expected_url for url in requested_urls), f"Unexpected target URLs: {requested_urls}"
+    assert result["completed"] == sent_bench_requests == num_prompts, (
+        f"completed={result['completed']}, bench_requests={sent_bench_requests}, all_requested_urls={requested_urls}"
+    )
+    assert bench_requests
+    assert all(url == expected_url for url in bench_requests), f"Unexpected target URLs: {bench_requests}"

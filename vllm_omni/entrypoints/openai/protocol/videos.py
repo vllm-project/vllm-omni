@@ -86,6 +86,14 @@ class UrlVideoReference(BaseModel):
 VideoReference = UrlVideoReference | FileVideoReference
 
 
+class UrlAudioReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    audio_url: str
+
+
+AudioReference = UrlAudioReference
+
+
 class VideoGenerationRequest(BaseModel):
     """
     OpenAI-style video generation request.
@@ -115,6 +123,10 @@ class VideoGenerationRequest(BaseModel):
     video_reference: VideoReference | None = Field(
         default=None,
         description="Optional JSON-safe video reference that guides generation. Provide either video_url or file_id.",
+    )
+    audio_reference: AudioReference | None = Field(
+        default=None,
+        description="Optional audio reference for speech-to-video. Provide audio_url (http(s) or data URL).",
     )
 
     # Video params block for extensibility

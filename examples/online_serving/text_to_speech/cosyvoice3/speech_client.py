@@ -60,6 +60,7 @@ def run_tts(args) -> None:
 
     if args.stream:
         payload["stream"] = True
+        payload["stream_format"] = "audio"
         payload["response_format"] = "pcm"
 
     print(f"Model: {args.model}")

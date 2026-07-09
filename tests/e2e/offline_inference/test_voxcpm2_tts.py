@@ -1,6 +1,7 @@
 """E2E test for VoxCPM2 native AR offline inference."""
 
 import os
+from collections.abc import Mapping
 
 import pytest
 import torch
@@ -13,17 +14,15 @@ VOXCPM2_MODEL = "openbmb/VoxCPM2"
 DEPLOY_CONFIG = get_deploy_config_path("voxcpm2.yaml")
 SAMPLE_RATE = 48000
 
+# (model, stage_config_path) — see ``omni_runner`` in tests.helpers.fixtures.runtime
+_OMNI_RUNNER_PARAM = (VOXCPM2_MODEL, DEPLOY_CONFIG)
 
-@pytest.fixture(scope="module")
-def voxcpm2_engine():
-    """Create VoxCPM2 engine for testing."""
-    with OmniRunner(VOXCPM2_MODEL, stage_configs_path=DEPLOY_CONFIG) as runner:
-        yield runner.omni
+pytestmark = pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
 
 
 def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     """Extract the final complete audio tensor from multimodal output."""
-    assert isinstance(multimodal_output, dict), f"Expected dict, got {type(multimodal_output)}"
+    assert isinstance(multimodal_output, (dict, Mapping)), f"Expected dict/Mapping, got {type(multimodal_output)}"
 
     # Output processor accumulates per-step audio chunks under "audio".
     audio = multimodal_output.get("audio")
@@ -44,9 +43,9 @@ def _extract_audio(multimodal_output: dict) -> torch.Tensor:
 @pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_voxcpm2_zero_shot_001(voxcpm2_engine):
+def test_voxcpm2_zero_shot_001(omni_runner: OmniRunner) -> None:
     """Test zero-shot TTS produces valid audio output."""
-    outputs = voxcpm2_engine.generate([{"prompt": "Hello, this is a test."}])
+    outputs = omni_runner.omni.generate([{"prompt": "Hello, this is a test."}])
     assert len(outputs) == 1
 
     audio = _extract_audio(outputs[0].outputs[0].multimodal_output)
@@ -58,7 +57,7 @@ def test_voxcpm2_zero_shot_001(voxcpm2_engine):
 @pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_voxcpm2_voice_clone_002(voxcpm2_engine):
+def test_voxcpm2_voice_clone_002(omni_runner: OmniRunner) -> None:
     """Test voice cloning with a reference audio file.
 
     Uses the example ``reference_speaker.wav`` bundled with the voxcpm
@@ -81,7 +80,7 @@ def test_voxcpm2_voice_clone_002(voxcpm2_engine):
     if ref_path is None:
         pytest.skip("No reference audio available for voice clone test")
 
-    outputs = voxcpm2_engine.generate(
+    outputs = omni_runner.omni.generate(
         [
             {
                 "prompt": "Hello, this is a voice clone demo.",
@@ -100,7 +99,7 @@ def test_voxcpm2_voice_clone_002(voxcpm2_engine):
 @pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_voxcpm2_prefill_decode_mixed_batch_003(voxcpm2_engine):
+def test_voxcpm2_prefill_decode_mixed_batch_003(omni_runner: OmniRunner) -> None:
     """Regression: prefill+decode mixed batch must not crash (PR #2903)."""
     long_prompt = (
         "This is a deliberately long prompt that will stay in the decode "
@@ -116,7 +115,7 @@ def test_voxcpm2_prefill_decode_mixed_batch_003(voxcpm2_engine):
     ]
     requests = [{"prompt": long_prompt}] + [{"prompt": p} for p in short_prompts]
 
-    outputs = voxcpm2_engine.generate(requests)
+    outputs = omni_runner.omni.generate(requests)
     assert len(outputs) == len(requests)
 
     for i, out in enumerate(outputs):
