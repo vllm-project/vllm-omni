@@ -1166,7 +1166,10 @@ class TestQwen3OmniPipeline:
         assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
         assert s.sampling_constraints["stop_token_ids"] == [2150]
-        assert s.custom_process_input_func is not None
+        # thinker2talker was removed: sync_process_input_func always wins.
+        assert s.custom_process_input_func is None
+        assert s.sync_process_input_func is not None
+        assert s.sync_process_input_func.endswith("thinker2talker_token_only")
         assert s.custom_process_next_stage_input_func is not None
 
     def test_code2wav(self):
@@ -1180,7 +1183,7 @@ class TestQwen3OmniPipeline:
         assert isinstance(s, StagePipelineConfig)
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
-        assert s.custom_process_input_func is not None
+        assert s.engine_output_type == "audio"
 
 
 class TestQwen2_5OmniPipeline:
