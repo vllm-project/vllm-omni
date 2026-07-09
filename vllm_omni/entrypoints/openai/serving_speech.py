@@ -3317,7 +3317,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 profile, folder = "tta", "checkpoint_folder_audiogen"
             else:
                 profile, folder = "tts", "checkpoint_folder_audiogen"
-            root = ensure_audex_snapshot(self.engine_client.model_config.model, profile=profile)
+            # The serving model_config may already hold the RESOLVED per-stage
+            # checkpoint folder (stage init joins model_subdir onto the
+            # snapshot root); joining again would produce a non-existent path
+            # that transformers then mistakes for a repo id.
+            model_path = os.path.normpath(self.engine_client.model_config.model)
+            if os.path.basename(model_path).startswith("checkpoint_folder"):
+                root = os.path.dirname(model_path)
+            else:
+                root = ensure_audex_snapshot(model_path, profile=profile)
             self._audex_tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, folder))
         return self._audex_tokenizer
 
