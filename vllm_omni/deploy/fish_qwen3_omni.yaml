@@ -67,6 +67,7 @@ stages:
 platforms:
   xpu:
     stages:
+      # Verified on Intel Arc B60.
       - stage_id: 0
         gpu_memory_utilization: 0.8
         max_model_len: 2048
