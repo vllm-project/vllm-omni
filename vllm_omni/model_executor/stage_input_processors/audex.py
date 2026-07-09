@@ -257,6 +257,20 @@ def thinker2xcodec_full_payload(
     usable = len(codes) - (len(codes) % _TTA_NUM_CODEBOOKS)
     if usable == 0:
         raise ValueError(f"Audex TTA thinker produced fewer than one full RVQ frame for request {request_id}")
+
+    # Validate the ACTUAL generated stream against the 4-codebook phase
+    # contract before decode: XCodec's per-layer offset removal clamps
+    # invalid ids into range, which would silently mask a phase violation.
+    from vllm_omni.model_executor.models.audex.tta import validate_rvq_phase
+
+    validity = validate_rvq_phase(codes[:usable])
+    if not validity["phase_valid"]:
+        raise ValueError(
+            f"Audex TTA thinker produced a phase-invalid RVQ stream for request {request_id}: "
+            f"{validity['mismatch_count']} mismatched positions "
+            f"(first mismatch [index, codec_id, got_phase, expected_phase] = {validity['first_mismatch']})"
+        )
+
     frames = torch.tensor(codes[:usable], dtype=torch.long).reshape(-1, _TTA_NUM_CODEBOOKS)
     return {
         "codes": {"audio": frames},

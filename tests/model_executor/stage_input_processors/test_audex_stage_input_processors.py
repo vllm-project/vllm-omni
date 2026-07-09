@@ -275,3 +275,35 @@ class TestThinker2XcodecFullPayload:
     def test_less_than_one_frame_raises(self):
         with pytest.raises(ValueError, match="full RVQ frame"):
             self._payload([_TTA_OFFSET + 0, _TTA_OFFSET + 1024])
+
+
+class TestThinker2XcodecPhaseValidation:
+    """The producer validates the ACTUAL generated stream before decode."""
+
+    def _payload(self, codes):
+        from vllm_omni.model_executor.stage_input_processors.audex import thinker2xcodec_full_payload
+
+        tokens = [_TTA_OFFSET + c for c in codes]
+        request = _request("req-rvq", tokens, finished=True)
+        return thinker2xcodec_full_payload(_tta_transfer_manager(), None, request)
+
+    def test_phase_valid_stream_passes(self):
+        codes = [0, 1024, 2048, 3072, 1, 1025, 2049, 3073]
+        payload = self._payload(codes)
+        assert payload["codes"]["audio"].shape == (2, 4)
+
+    def test_phase_invalid_stream_raises_before_decode(self):
+        # Position 1 must be phase 1 (1024..2047); a phase-0 id there is
+        # exactly what XCodec's clamping would otherwise silently absorb.
+        codes = [0, 5, 2048, 3072]
+        with pytest.raises(ValueError, match="phase-invalid") as excinfo:
+            self._payload(codes)
+        assert "req-rvq" in str(excinfo.value)
+        assert "first mismatch" in str(excinfo.value)
+
+    def test_partial_frame_tail_not_validated_after_truncation(self):
+        # 1 valid frame + a valid-phase partial tail: truncation happens
+        # first, then validation over the usable frames only.
+        codes = [0, 1024, 2048, 3072, 2]
+        payload = self._payload(codes)
+        assert payload["codes"]["audio"].shape == (1, 4)
