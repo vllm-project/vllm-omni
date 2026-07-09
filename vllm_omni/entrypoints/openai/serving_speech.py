@@ -3333,13 +3333,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._audex_tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, folder))
         return self._audex_tokenizer
 
-    def _inject_audex_tta_args(self, request_id: str, prompt: Any, stage0_params: Any) -> None:
-        """Complete the Audex TTA contract on the stage-0 sampling params.
+    def _inject_audex_tta_args(self, request_id: str, prompt: Any, stage0_params: Any) -> Any:
+        """Complete the Audex TTA contract on a CLONE of the stage-0 params.
 
         Always attaches the RVQ phase-mask contract (required for token
         validity) and the CFG pair contract at the official default scale
         3.0 unless the caller passed ``cfg_scale`` (1.0 disables guidance).
+
+        Returns the cloned params; the input is never mutated. On the
+        no-extra_params online path the input is an element of the engine's
+        SHARED ``default_sampling_params_list`` — writing per-request pair
+        state (``cfg_pair_id``/``cfg_null_prompt``) into it would race
+        concurrent requests and leak stale CFG metadata into later ones.
         """
+        import copy
+
         from vllm_omni.model_executor.models.audex.prompt import build_tta_null_prompt
         from vllm_omni.model_executor.models.audex.tta import build_tta_phase_token_ids
 
@@ -3347,6 +3355,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not isinstance(cond_prompt, str) or not cond_prompt:
             raise ValueError("Audex TTA requires the adapter-built caption prompt")
 
+        stage0_params = copy.deepcopy(stage0_params)
         tokenizer = self._get_audex_tokenizer()
         if self._audex_tta_rvq is None:
             phase_token_ids, start_tid, end_tid = build_tta_phase_token_ids(tokenizer)
@@ -3370,7 +3379,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         cfg_scale = 3.0 if cfg_scale is None else float(cfg_scale)
         if cfg_scale <= 1.0:
             extra_args.pop("cfg_scale", None)
-            return
+            return stage0_params
         extra_args.update(
             {
                 "cfg_scale": cfg_scale,
@@ -3379,24 +3388,32 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "cfg_null_prompt": build_tta_null_prompt(cond_prompt, tokenizer),
             }
         )
+        return stage0_params
 
-    def _inject_audex_cfg_pair_args(self, request_id: str, prompt: Any, stage0_params: Any) -> None:
-        """Complete the Audex CFG contract on the stage-0 sampling params.
+    def _inject_audex_cfg_pair_args(self, request_id: str, prompt: Any, stage0_params: Any) -> Any:
+        """Complete the Audex CFG contract on a CLONE of the stage-0 params.
 
         The adapter validated ``cfg_scale``; here (where the final request id
         exists) the cond role, pair id, and the length-matched null prompt are
-        attached. ``cfg_scale`` absent/1.0 leaves the params byte-identical to
+        attached. ``cfg_scale`` absent/1.0 returns a clone value-identical to
         the non-CFG flow (the key is dropped rather than forwarded).
+
+        Returns the cloned params; the input is never mutated (it may be an
+        element of the engine's shared ``default_sampling_params_list`` —
+        see ``_inject_audex_tta_args``).
         """
+        import copy
+
+        stage0_params = copy.deepcopy(stage0_params)
         extra_args = getattr(stage0_params, "extra_args", None)
         if not extra_args or extra_args.get("cfg_scale") is None:
             if extra_args:
                 extra_args.pop("cfg_scale", None)
-            return
+            return stage0_params
         cfg_scale = float(extra_args["cfg_scale"])
         if cfg_scale <= 1.0:
             extra_args.pop("cfg_scale", None)
-            return
+            return stage0_params
 
         from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
 
@@ -3417,6 +3434,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # on the en-24 gate corpus at cfg 1.5: temp 0.1 -> CER 7.31%,
         # temp 0.05 -> CER 6.87% (unguided baseline 7.24%).
         stage0_params.temperature = 0.05
+        return stage0_params
 
     def _apply_cosyvoice3_dynamic_tokens(
         self,
@@ -3800,10 +3818,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Audex CFG: turn an adapter-validated cfg_scale into the engine-side
         # pair contract. This must run here (not in the adapter) because the
         # pair id is the final request_id, which the adapter never sees.
+        # The injectors return a CLONE: without extra_params above,
+        # sampling_params_list still holds the engine's shared default params,
+        # which must never carry per-request CFG state.
         if self._tts_model_type == "audex" and sampling_params_list:
-            self._inject_audex_cfg_pair_args(request_id, prompt, sampling_params_list[0])
+            sampling_params_list[0] = self._inject_audex_cfg_pair_args(request_id, prompt, sampling_params_list[0])
         elif self._tts_model_type == "audex_tta" and sampling_params_list:
-            self._inject_audex_tta_args(request_id, prompt, sampling_params_list[0])
+            sampling_params_list[0] = self._inject_audex_tta_args(request_id, prompt, sampling_params_list[0])
 
         # Some TTS model defaults come from deploy YAML. Their AR
         # generation length is controlled by SamplingParams.max_tokens, so only

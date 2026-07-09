@@ -102,3 +102,6 @@ def test_registered_in_bench_patch_source():
     patch_src = (_REPO_ROOT / "vllm_omni" / "benchmarks" / "patch" / "patch.py").read_text()
     assert '"audex-tta"' in patch_src
     assert '"audex-tta": AudexTTADataset' in patch_src
+    # The seed-tts branch must NOT force its 2048 default onto audex-tta:
+    # out_len stays None so sample() applies DEFAULT_OUTPUT_LEN (4200).
+    assert "DatasetCls is not AudexTTADataset" in patch_src

@@ -367,7 +367,10 @@ def get_samples(args, tokenizer):
         out_len = getattr(args, "output_len", None)
         if out_len is None:
             out_len = getattr(args, "hf_output_len", None)
-        if out_len is None:
+        if out_len is None and DatasetCls is not AudexTTADataset:
+            # Historical forced default for the seed-tts family. audex-tta
+            # keeps out_len None so its sample() applies the dataset's own
+            # DEFAULT_OUTPUT_LEN (4200, the documented TTA cap), not 2048.
             out_len = SeedTTSDataset.DEFAULT_OUTPUT_LEN
         return dataset.sample(
             tokenizer=tokenizer,

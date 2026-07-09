@@ -150,8 +150,8 @@ class TestAudexCfgValidation:
         assert _adapter().validate(_speech_request(cfg_scale=None)) is None
         serving = TestAudexCfgInjection()._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args={"cfg_scale": None})
-        serving._inject_audex_cfg_pair_args("req-1", {"prompt": "p"}, params)
-        assert params.extra_args == {}
+        out = serving._inject_audex_cfg_pair_args("req-1", {"prompt": "p"}, params)
+        assert out.extra_args == {}
 
     @pytest.mark.parametrize("key", ["cfg_role", "cfg_pair_id", "cfg_null_prompt"])
     def test_internal_cfg_keys_rejected(self, key):
@@ -173,22 +173,23 @@ class TestAudexCfgInjection:
     def test_no_extra_args_is_untouched(self):
         serving = self._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args=None)
-        serving._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
+        out = serving._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
+        assert out.extra_args is None
         assert params.extra_args is None
 
     def test_scale_one_leaves_params_byte_identical(self):
         serving = self._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args={"cfg_scale": 1.0})
-        serving._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
-        assert params.extra_args == {}
+        out = serving._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
+        assert out.extra_args == {}
 
     def test_guided_request_gains_pair_contract(self):
         serving = self._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args={"cfg_scale": 1.5})
         cond = self._cond_prompt("Some transcription text here.")
-        serving._inject_audex_cfg_pair_args("req-42", {"prompt": cond}, params)
+        out = serving._inject_audex_cfg_pair_args("req-42", {"prompt": cond}, params)
 
-        extra = params.extra_args
+        extra = out.extra_args
         assert extra["cfg_scale"] == 1.5
         assert extra["cfg_role"] == "cond"
         assert extra["cfg_pair_id"] == "req-42"
@@ -203,6 +204,18 @@ class TestAudexCfgInjection:
         params = SimpleNamespace(extra_args={"cfg_scale": 1.5})
         with pytest.raises(ValueError, match="adapter-built text prompt"):
             serving._inject_audex_cfg_pair_args("req-1", {"prompt_token_ids": [1]}, params)
+
+    def test_injection_never_mutates_input_params(self):
+        """The input may be the engine's SHARED default params (review P2):
+        pair state must land only on the returned clone."""
+        serving = self._serving_with_fake_tokenizer()
+        shared = SimpleNamespace(extra_args={"cfg_scale": 1.5}, temperature=0.1)
+        out = serving._inject_audex_cfg_pair_args("req-7", {"prompt": self._cond_prompt()}, shared)
+        assert out is not shared
+        assert shared.extra_args == {"cfg_scale": 1.5}
+        assert shared.temperature == 0.1
+        assert out.extra_args["cfg_pair_id"] == "req-7"
+        assert out.temperature == 0.05
 
 
 class TestAudexStageDetection:
@@ -235,12 +248,12 @@ def test_guided_injection_sets_guided_temperature():
     serving = TestAudexCfgInjection()._serving_with_fake_tokenizer()
     cond = TestAudexCfgInjection()._cond_prompt()
     params = SimpleNamespace(extra_args={"cfg_scale": 1.5}, temperature=0.1)
-    serving._inject_audex_cfg_pair_args("req-1", {"prompt": cond}, params)
-    assert params.temperature == 0.05
+    out = serving._inject_audex_cfg_pair_args("req-1", {"prompt": cond}, params)
+    assert out.temperature == 0.05
 
     unguided = SimpleNamespace(extra_args={"cfg_scale": 1.0}, temperature=0.1)
-    serving._inject_audex_cfg_pair_args("req-2", {"prompt": cond}, unguided)
-    assert unguided.temperature == 0.1
+    out = serving._inject_audex_cfg_pair_args("req-2", {"prompt": cond}, unguided)
+    assert out.temperature == 0.1
 
 
 # ---------------------------------------------------------------- TTA serving surface
@@ -323,9 +336,9 @@ class TestAudexTTAInjection:
     def test_default_injection_applies_rvq_and_cfg3(self):
         serving = self._serving()
         params = SimpleNamespace(extra_args=None)
-        serving._inject_audex_tta_args("req-9", self._prompt(), params)
+        out = serving._inject_audex_tta_args("req-9", self._prompt(), params)
 
-        extra = params.extra_args
+        extra = out.extra_args
         rvq = extra["tta_rvq"]
         assert len(rvq["phase_token_ids"]) == 4
         assert all(len(ids) == 1024 for ids in rvq["phase_token_ids"])
@@ -338,15 +351,26 @@ class TestAudexTTAInjection:
     def test_explicit_scale_one_disables_cfg_but_keeps_rvq(self):
         serving = self._serving()
         params = SimpleNamespace(extra_args={"cfg_scale": 1.0})
-        serving._inject_audex_tta_args("req-1", self._prompt(), params)
-        assert "tta_rvq" in params.extra_args
-        assert "cfg_scale" not in params.extra_args
-        assert "cfg_role" not in params.extra_args
+        out = serving._inject_audex_tta_args("req-1", self._prompt(), params)
+        assert "tta_rvq" in out.extra_args
+        assert "cfg_scale" not in out.extra_args
+        assert "cfg_role" not in out.extra_args
 
     def test_rvq_contract_cached_per_process(self):
         serving = self._serving()
-        params_a = SimpleNamespace(extra_args=None)
-        params_b = SimpleNamespace(extra_args=None)
-        serving._inject_audex_tta_args("a", self._prompt(), params_a)
-        serving._inject_audex_tta_args("b", self._prompt(), params_b)
-        assert params_a.extra_args["tta_rvq"] is params_b.extra_args["tta_rvq"]
+        out_a = serving._inject_audex_tta_args("a", self._prompt(), SimpleNamespace(extra_args=None))
+        out_b = serving._inject_audex_tta_args("b", self._prompt(), SimpleNamespace(extra_args=None))
+        assert out_a.extra_args["tta_rvq"] is out_b.extra_args["tta_rvq"]
+
+    def test_injection_never_mutates_input_params(self):
+        """The default online path hands the injector an element of the
+        engine's SHARED default_sampling_params_list (review P2): the
+        per-request pair state must land only on the returned clone."""
+        serving = self._serving()
+        shared = SimpleNamespace(extra_args=None)
+        out_1 = serving._inject_audex_tta_args("req-1", self._prompt(), shared)
+        out_2 = serving._inject_audex_tta_args("req-2", self._prompt(), shared)
+        assert shared.extra_args is None
+        assert out_1 is not shared and out_2 is not shared
+        assert out_1.extra_args["cfg_pair_id"] == "req-1"
+        assert out_2.extra_args["cfg_pair_id"] == "req-2"
