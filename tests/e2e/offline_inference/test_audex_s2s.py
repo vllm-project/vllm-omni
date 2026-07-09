@@ -109,27 +109,18 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
         assert answer, "Chat pass produced an empty answer"
 
     # Pass 3 — TTS (audio-final; streams through code2wav). Both final
-    # stages may emit an output record; collect audio incrementally through
-    # the generator so time-to-first-audio can be measured.
+    # stages may emit an output record; collect the audio-bearing one.
     tts_text = answer if answer else "The weather is nice today."
-    t_start = time.perf_counter()
-    first_audio_s: float | None = None
-    chunks: list[np.ndarray] = []
-    for req_output in omni_runner.omni.generate(
-        [{"prompt": build_cond_prompt(tts_text[:200]), "modalities": ["audio"]}],
-        py_generator=True,
-    ):
+    tts_prompt = {"prompt": build_cond_prompt(tts_text[:200]), "modalities": ["audio"]}
+    tts_outputs = omni_runner.omni.generate([tts_prompt])
+    assert tts_outputs, "TTS pass returned no outputs"
+    speech = np.zeros((0,), dtype=np.float32)
+    for req_output in tts_outputs:
         mm = getattr(req_output, "multimodal_output", None) or {}
         if "audio" in mm:
-            piece = _concat_audio(mm["audio"])
-            if piece.size > 0:
-                if first_audio_s is None:
-                    first_audio_s = time.perf_counter() - t_start
-                chunks.append(piece)
-    speech = np.concatenate(chunks) if chunks else np.zeros((0,), dtype=np.float32)
+            speech = _concat_audio(mm["audio"])
+            break
     assert speech.size > 0, "TTS pass produced empty audio"
-    assert first_audio_s is not None
-    print(f"[trend] Audex S2S TTS-pass first-audio latency: {first_audio_s * 1000.0:.0f} ms")
 
     if real_weights:
         rms = float(np.sqrt(np.mean(np.square(speech))))
@@ -158,3 +149,16 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
         # (lenient threshold absorbs ASR quoting/prefix differences).
         assert wer <= 0.5, f"Output WAV does not match the answer (WER={wer:.2f}): {verify_text!r} vs {tts_text!r}"
         print(f"[trend] Audex S2S output-ASR WER vs answer: {wer:.3f} ({verify_text!r})")
+
+    # Final pass — time-to-first-audio for the streaming TTS path. This
+    # MUST be the last engine call: the py_generator API closes the engine
+    # when the generator is exhausted.
+    t_start = time.perf_counter()
+    first_audio_s: float | None = None
+    for req_output in omni_runner.omni.generate([tts_prompt], py_generator=True):
+        mm = getattr(req_output, "multimodal_output", None) or {}
+        if "audio" in mm and _concat_audio(mm["audio"]).size > 0:
+            if first_audio_s is None:
+                first_audio_s = time.perf_counter() - t_start
+    assert first_audio_s is not None, "streaming TTS never produced an audio-bearing chunk"
+    print(f"[trend] Audex S2S TTS-pass first-audio latency: {first_audio_s * 1000.0:.0f} ms")
