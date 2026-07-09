@@ -23,12 +23,11 @@ except Exception:  # pragma: no cover - depends on installed vLLM
     _HAS_W4A16 = False
     ModelOptNvFp4W4A16LinearMethod = None  # bound for skip-guarded references
 
-needs_w4a16 = pytest.mark.skipif(
-    not _HAS_W4A16, reason="vLLM ModelOptNvFp4W4A16LinearMethod not available in this env"
-)
+needs_w4a16 = pytest.mark.skipif(not _HAS_W4A16, reason="vLLM ModelOptNvFp4W4A16LinearMethod not available in this env")
 
 
 # --- pure prefix predicate --------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "prefix",
@@ -69,6 +68,7 @@ def test_non_target_prefixes_excluded(prefix):
 
 # --- config build -----------------------------------------------------------
 
+
 @needs_w4a16
 def test_build_selects_w4a16_method():
     cfg = nb.build_nvfp4_blockwise_w4a16_config()
@@ -91,6 +91,7 @@ def test_config_quantizes_only_targets():
 
 
 # --- resolution helper ------------------------------------------------------
+
 
 def test_maybe_build_returns_active_for_non_recipe():
     sentinel = object()

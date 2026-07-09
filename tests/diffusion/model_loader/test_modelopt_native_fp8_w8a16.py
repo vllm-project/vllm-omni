@@ -6,6 +6,7 @@ The on-disk format mirrors the dequant adapter's FP8 ``<m>.weight`` plus bf16
 2D ``._scale`` grid and ``._amax`` twin. The adapter keeps MLP targets
 FP8-resident and dequantizes ``lm_head``.
 """
+
 import json
 from types import SimpleNamespace
 
@@ -16,6 +17,8 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     ModelOptNativeFp8CheckpointAdapter,
     ModelOptNativeFp8W8A16CheckpointAdapter,
     get_checkpoint_adapter,
+)
+from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     modelopt_native_fp8_w8a16 as mw8,
 )
 from vllm_omni.diffusion.model_loader.checkpoint_adapters.modelopt_native import (
@@ -160,7 +163,7 @@ def _write_model_dir(tmp_path, sidecar=None):
     root = tmp_path / "model"
     (root / "transformer").mkdir(parents=True)
     (root / "quantization_config.json").write_text(json.dumps(sidecar or _sidecar()))
-    tensors = {k[len("transformer."):]: v for k, v in _stream()}
+    tensors = {k[len("transformer.") :]: v for k, v in _stream()}
     save_file(tensors, str(root / "transformer" / "model.safetensors"))
     return str(root)
 
@@ -200,9 +203,7 @@ def test_probe_main_usage():
 def test_dispatch_default_selects_dequant(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", raising=False)
     root = _write_model_dir(tmp_path)
-    adapter = get_checkpoint_adapter(
-        torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True
-    )
+    adapter = get_checkpoint_adapter(torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True)
     assert isinstance(adapter, ModelOptNativeFp8CheckpointAdapter)
     assert not isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
 
@@ -210,9 +211,7 @@ def test_dispatch_default_selects_dequant(tmp_path, monkeypatch):
 def test_dispatch_opt_in_selects_w8a16(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
     root = _write_model_dir(tmp_path)
-    adapter = get_checkpoint_adapter(
-        torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True
-    )
+    adapter = get_checkpoint_adapter(torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True)
     assert isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
 
 
@@ -222,9 +221,7 @@ def test_dispatch_default_inert_without_fp8_sidecar(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
     root = tmp_path / "no_sidecar"
     (root / "transformer").mkdir(parents=True)
-    adapter = get_checkpoint_adapter(
-        torch.nn.Module(), _source(str(root)), quant_config=None, use_safetensors=True
-    )
+    adapter = get_checkpoint_adapter(torch.nn.Module(), _source(str(root)), quant_config=None, use_safetensors=True)
     # No sidecar at all -> no adapter engages (W8A16 declines, dequant/NVFP4 find no
     # sidecar); assert the exact None (stronger than "not W8A16", which None also satisfies).
     assert adapter is None
@@ -266,9 +263,7 @@ def test_adapt_scale_before_weight_flushes_pending():
         ("transformer.lm_head.weight_quantizer._amax", _amax(256, 128)),
     ]
     out = dict(_adapter(_sidecar(n_quantized=1, n_scale=2)).adapt(stream))
-    torch.testing.assert_close(
-        out["transformer.lm_head.weight"], dequantize_weight(w, s, torch.bfloat16, (128, 128))
-    )
+    torch.testing.assert_close(out["transformer.lm_head.weight"], dequantize_weight(w, s, torch.bfloat16, (128, 128)))
 
 
 def test_adapt_max_pending_overflow_aborts():

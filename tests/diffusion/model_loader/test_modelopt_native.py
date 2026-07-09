@@ -28,6 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 # --- fixtures ---------------------------------------------------------------
 
+
 def _authoritative_sidecar(n_quantized=2, n_scale=4):
     """Sidecar dict mirroring the real deliverable's quantization_config.json."""
     return {
@@ -113,9 +114,7 @@ def _write_model_dir(tmp_path, sidecar, tensors=None):
 
 
 def _source(model_or_path="unused"):
-    return SimpleNamespace(
-        model_or_path=model_or_path, subfolder=None, prefix="transformer."
-    )
+    return SimpleNamespace(model_or_path=model_or_path, subfolder=None, prefix="transformer.")
 
 
 class _TinyModel(nn.Module):
@@ -125,6 +124,7 @@ class _TinyModel(nn.Module):
 
 
 # --- parse_quant_spec --------------------------------------------------------
+
 
 def test_parse_spec_accepts_authoritative_sidecar():
     spec = mn.parse_quant_spec(_authoritative_sidecar())
@@ -150,6 +150,7 @@ def test_parse_spec_rejects_inconsistent_scale_count():
 
 
 # --- name/dtype calculations -------------------------------------------------
+
 
 def test_scale_name_roundtrip():
     w = "layers.0.mlp.gate_proj.weight"
@@ -179,6 +180,7 @@ def test_pattern_matching_with_and_without_prefix():
 
 
 # --- scale expansion & dequant ------------------------------------------------
+
 
 def test_expand_block_scale_broadcasts_per_block():
     scale = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -226,7 +228,7 @@ def test_dequantize_reconstructs_random_weight_within_tolerance():
     # wrong block boundary or transposed grid fails — locks Correctness-F1
     # (declared block must be honored, not inferred from shapes).
     torch.manual_seed(0)
-    rows, cols, block = 200, 384, 128           # 200 not divisible by 128
+    rows, cols, block = 200, 384, 128  # 200 not divisible by 128
     ob, ib = (rows + block - 1) // block, (cols + block - 1) // block  # 2, 3
     ref = torch.randn(rows, cols, dtype=torch.float32) * 0.05
     # per-block amax -> scale = amax/448; quantize codes = round-to-e4m3(w/scale)
@@ -246,18 +248,17 @@ def test_dequantize_reconstructs_random_weight_within_tolerance():
     rel = (out.float() - ref).abs() / (ref.abs() + 1e-6)
     assert rel.median().item() < 0.05, rel.median().item()
     # A wrong (inferred-from-shape) block would misplace the row-128 boundary:
-    wrong = mn.dequantize_weight(w8, scale.to(torch.bfloat16), torch.bfloat16,
-                                 block=(math.ceil(rows / ob), math.ceil(cols / ib)))
+    wrong = mn.dequantize_weight(
+        w8, scale.to(torch.bfloat16), torch.bfloat16, block=(math.ceil(rows / ob), math.ceil(cols / ib))
+    )
     assert not torch.equal(out, wrong)
 
 
 # --- unified verification (shared by adapter and CLI probe) -------------------
 
+
 def _infos_from(items, prefix="transformer."):
-    return [
-        mn.TensorInfo(name[len(prefix):], mn.is_fp8_dtype(t.dtype), tuple(t.shape))
-        for name, t in items
-    ]
+    return [mn.TensorInfo(name[len(prefix) :], mn.is_fp8_dtype(t.dtype), tuple(t.shape)) for name, t in items]
 
 
 def test_verify_observations_happy_path_is_clean():
@@ -287,8 +288,7 @@ def test_verify_observations_flags_count_drift_and_missing_scale():
 def test_verify_observations_flags_scale_grid_mismatch():
     spec = mn.parse_quant_spec(_authoritative_sidecar())
     infos = [
-        mn.TensorInfo(i.name, i.is_fp8, (3, 3)) if i.name.endswith("._scale") else i
-        for i in _infos_from(_stream())
+        mn.TensorInfo(i.name, i.is_fp8, (3, 3)) if i.name.endswith("._scale") else i for i in _infos_from(_stream())
     ]
     violations = mn.verify_observations(infos, spec)
     assert any("grid" in v or "shape" in v for v in violations)
@@ -296,11 +296,10 @@ def test_verify_observations_flags_scale_grid_mismatch():
 
 # --- adapter shell -------------------------------------------------------------
 
+
 def _detect(tmp_path, sidecar, tensors=None, dtype=torch.bfloat16):
     root = _write_model_dir(tmp_path, sidecar, tensors)
-    return mn.ModelOptNativeFp8CheckpointAdapter.detect(
-        _source(root), target_dtype=dtype
-    )
+    return mn.ModelOptNativeFp8CheckpointAdapter.detect(_source(root), target_dtype=dtype)
 
 
 @pytest.mark.parametrize("order", ["scale_first", "weight_first"])
@@ -321,9 +320,7 @@ def test_adapt_dequantizes_and_consumes_quantizer_tensors(tmp_path, order):
 
 def test_adapt_aggregates_violations_into_one_error(tmp_path):
     adapter = _detect(tmp_path, _authoritative_sidecar())
-    bad = [
-        (n, t) for n, t in _stream() if not n.endswith("._scale")
-    ]  # both scales missing
+    bad = [(n, t) for n, t in _stream() if not n.endswith("._scale")]  # both scales missing
     with pytest.raises(mn.CheckpointIntegrityError) as exc:
         list(adapter.adapt(iter(bad)))
     msg = str(exc.value)
@@ -369,21 +366,15 @@ def test_get_checkpoint_adapter_engages_without_quant_config(tmp_path, monkeypat
     monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", raising=False)
     root = _write_model_dir(tmp_path, _authoritative_sidecar())
     model = _TinyModel()
-    adapter = get_checkpoint_adapter(
-        model=model, source=_source(root), quant_config=None, use_safetensors=True
-    )
+    adapter = get_checkpoint_adapter(model=model, source=_source(root), quant_config=None, use_safetensors=True)
     assert isinstance(adapter, mn.ModelOptNativeFp8CheckpointAdapter)
 
     plain = _write_model_dir(tmp_path / "plain", None)
-    assert (
-        get_checkpoint_adapter(
-            model=model, source=_source(plain), quant_config=None, use_safetensors=True
-        )
-        is None
-    )
+    assert get_checkpoint_adapter(model=model, source=_source(plain), quant_config=None, use_safetensors=True) is None
 
 
 # --- fp8 guard -----------------------------------------------------------------
+
 
 def test_assert_not_fp8_guard():
     mn.assert_not_fp8("x.weight", torch.bfloat16)  # no raise
@@ -393,6 +384,7 @@ def test_assert_not_fp8_guard():
 
 
 # --- CLI probe (header-only) ----------------------------------------------------
+
 
 def test_cli_probe_exit_codes(tmp_path, capsys):
     good = _write_model_dir(tmp_path / "good", _authoritative_sidecar())

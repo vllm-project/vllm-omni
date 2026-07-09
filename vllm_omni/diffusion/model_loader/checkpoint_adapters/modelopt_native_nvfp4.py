@@ -165,9 +165,7 @@ def parse_nvfp4_spec(config: Mapping) -> Nvfp4BlockwiseSpec:
         for tname, decl in tensors.items():
             ws = decl.get("weight_shape") if isinstance(decl, Mapping) else None
             if not (isinstance(ws, (list, tuple)) and len(ws) == 2 and all(isinstance(d, int) for d in ws)):
-                violations.append(
-                    f"tensors[{tname!r}].weight_shape: expected [rows, cols] ints, found {ws!r}"
-                )
+                violations.append(f"tensors[{tname!r}].weight_shape: expected [rows, cols] ints, found {ws!r}")
 
     expected_count = config.get("expected_quantized_count")
     if not isinstance(expected_count, int) or expected_count <= 0:
@@ -179,8 +177,7 @@ def parse_nvfp4_spec(config: Mapping) -> Nvfp4BlockwiseSpec:
 
     if violations:
         raise CheckpointIntegrityError(
-            "nvfp4_blockwise_mixed_v1.json is not the supported NVFP4 deliverable:\n  "
-            + "\n  ".join(violations)
+            "nvfp4_blockwise_mixed_v1.json is not the supported NVFP4 deliverable:\n  " + "\n  ".join(violations)
         )
     assert isinstance(recipe, str) and isinstance(block_size, int) and isinstance(expected_count, int)
     return Nvfp4BlockwiseSpec(
@@ -286,9 +283,7 @@ def verify_observations(infos: Iterable[TensorInfo], spec: Nvfp4BlockwiseSpec) -
     violations: list[str] = []
 
     if len(packed) != spec.expected_count:
-        violations.append(
-            f"quantized-target count mismatch: declared {spec.expected_count}, observed {len(packed)}"
-        )
+        violations.append(f"quantized-target count mismatch: declared {spec.expected_count}, observed {len(packed)}")
 
     for wname, info in sorted(packed.items()):
         module = module_of(wname)
@@ -303,9 +298,7 @@ def verify_observations(infos: Iterable[TensorInfo], spec: Nvfp4BlockwiseSpec) -
             wshape = tuple(decl["weight_shape"])
             exp_packed = (wshape[0], expected_packed_width(wshape[-1]))
             if info.shape != exp_packed:
-                violations.append(
-                    f"packed shape mismatch for {info.name}: found {info.shape}, expected {exp_packed}"
-                )
+                violations.append(f"packed shape mismatch for {info.name}: found {info.shape}, expected {exp_packed}")
         if info.tag != TAG_U8:
             violations.append(f"packed tensor {info.name} must be uint8, found {info.tag}")
 
@@ -406,13 +399,15 @@ class ModelOptNativeNvfp4CheckpointAdapter:
         model_dir = getattr(source, "model_or_path", None)
         logger.info(
             "ModelOpt-native NVFP4 checkpoint detected at %s (declared: %d quantized targets, block %d)",
-            model_dir, spec.expected_count, spec.block_size,
+            model_dir,
+            spec.expected_count,
+            spec.block_size,
         )
         return cls(spec=spec, source_prefix=str(getattr(source, "prefix", "") or ""))
 
     def _strip_prefix(self, name: str) -> str:
         if self._prefix and name.startswith(self._prefix):
-            return name[len(self._prefix):]
+            return name[len(self._prefix) :]
         return name
 
     def adapt(
@@ -444,7 +439,8 @@ class ModelOptNativeNvfp4CheckpointAdapter:
             )
         logger.info(
             "ModelOpt-native NVFP4 adapter: passed %d FP4-resident targets through (marker: %s)",
-            self._spec.expected_count, NVFP4_BLOCKWISE_MARKER,
+            self._spec.expected_count,
+            NVFP4_BLOCKWISE_MARKER,
         )
 
 
@@ -468,10 +464,7 @@ def _read_safetensors_header(path: str) -> dict:
 
 def header_tensor_infos(header: Mapping) -> list[TensorInfo]:
     """Pure: safetensors header dict -> normalized TensorInfo list."""
-    return [
-        TensorInfo(name, dtype_tag(entry["dtype"]), tuple(entry["shape"]))
-        for name, entry in header.items()
-    ]
+    return [TensorInfo(name, dtype_tag(entry["dtype"]), tuple(entry["shape"])) for name, entry in header.items()]
 
 
 def main(argv: list[str] | None = None) -> int:

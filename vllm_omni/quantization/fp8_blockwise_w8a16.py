@@ -65,8 +65,8 @@ def _is_fp8_blockwise_dir(model_dir: str | None) -> bool:
 
     Keys on ``recipe`` only. The quantized target family is enforced fail-fast at adapter
     engagement (:func:`...modelopt_native_fp8_w8a16.assert_target_family`), so a
-    recipe-matching but mis-declared checkpoint fails loudly there rather than being
-    silently mis-routed here. A missing/unreadable sidecar (plain BF16, NVFP4) ⇒ False.
+    recipe-matching but incorrectly declared checkpoint fails loudly there rather than being
+    silently routed incorrectly here. A missing/unreadable sidecar (plain BF16, NVFP4) ⇒ False.
     """
     if not model_dir:
         return False
@@ -96,6 +96,7 @@ def fp8_w8a16_selected(model_dir: str | None) -> bool:
     the expected FP8-blockwise recipe.
     """
     return fp8_w8a16_forced() and _is_fp8_blockwise_dir(model_dir)
+
 
 # Quantized MLP projections (``mlp.*`` and ``mlp_moe_gen.*``).
 # ``lm_head`` is deliberately excluded: it stays BF16 at compute; the
@@ -231,9 +232,7 @@ class Fp8BlockwiseW8A16LinearMethod(LinearMethodBase):
             dequantize_weight,
         )
 
-        weight = dequantize_weight(
-            layer.weight, layer.weight_scale, x.dtype, tuple(layer.weight_block_size)
-        )
+        weight = dequantize_weight(layer.weight, layer.weight_scale, x.dtype, tuple(layer.weight_block_size))
         return F.linear(x, weight, bias)
 
 

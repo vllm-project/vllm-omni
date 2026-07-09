@@ -76,8 +76,7 @@ def assert_scale_finite(name: str, tensor: torch.Tensor) -> None:
     """Raise on any NaN/Inf scale byte (owner decision: abort, do not clamp)."""
     if not torch.isfinite(tensor.to(torch.float32)).all():
         raise CheckpointIntegrityError(
-            f"scale tensor {name!r} contains NaN/Inf; the artifact is corrupt. "
-            "Refusing to serve W8A16-resident."
+            f"scale tensor {name!r} contains NaN/Inf; the artifact is corrupt. Refusing to serve W8A16-resident."
         )
 
 
@@ -123,15 +122,14 @@ class ModelOptNativeFp8W8A16CheckpointAdapter:
         Reuses the dequant adapter's sidecar parse so detection is identical; the
         dispatcher decides W8A16-vs-dequant via ``fp8_w8a16_selected`` (explicit
         opt-in; dequant is default). Construction asserts the declared target
-        family, so a mis-declared sidecar fails fast here rather than mid-load.
+        family, so an incorrectly declared sidecar fails fast here rather than mid-load.
         """
         spec = ModelOptNativeFp8CheckpointAdapter._parse_source_sidecar(source)
         if spec is None:
             return None
         model_dir = getattr(source, "model_or_path", None)
         logger.info(
-            "ModelOpt-native FP8 W8A16-RESIDENT path engaged at %s "
-            "(declared %d quantized modules, block %dx%d)",
+            "ModelOpt-native FP8 W8A16-RESIDENT path engaged at %s (declared %d quantized modules, block %dx%d)",
             model_dir,
             spec.n_quantized,
             spec.block_rows,
@@ -145,7 +143,7 @@ class ModelOptNativeFp8W8A16CheckpointAdapter:
 
     def _strip_prefix(self, name: str) -> str:
         if self._prefix and name.startswith(self._prefix):
-            return name[len(self._prefix):]
+            return name[len(self._prefix) :]
         return name
 
     @staticmethod
@@ -185,9 +183,7 @@ class ModelOptNativeFp8W8A16CheckpointAdapter:
                     for pend_full, pend_w in pending.pop(name, ()):
                         n_pending -= 1
                         n_dequant += 1
-                        yield pend_full, dequantize_weight(
-                            pend_w, tensor, self._target_dtype, self._block
-                        )
+                        yield pend_full, dequantize_weight(pend_w, tensor, self._target_dtype, self._block)
                 continue
 
             if is_fp8_dtype(tensor.dtype):
@@ -202,9 +198,7 @@ class ModelOptNativeFp8W8A16CheckpointAdapter:
                     continue  # flagged by verify_observations at end of stream
                 if scale_name in scales:
                     n_dequant += 1
-                    yield full_name, dequantize_weight(
-                        tensor, scales[scale_name], self._target_dtype, self._block
-                    )
+                    yield full_name, dequantize_weight(tensor, scales[scale_name], self._target_dtype, self._block)
                 else:
                     pending.setdefault(scale_name, []).append((full_name, tensor))
                     n_pending += 1
@@ -228,15 +222,12 @@ class ModelOptNativeFp8W8A16CheckpointAdapter:
             raise CheckpointIntegrityError(
                 f"routing count mismatch: {n_resident} resident + {n_dequant} dequant "
                 f"= {n_resident + n_dequant} != declared {self._spec.n_quantized} fp8 "
-                "weights (some target/non-target was mis-routed or dropped)."
+                "weights (some target/non-target was routed incorrectly or dropped)."
             )
         if n_pending:
-            raise CheckpointIntegrityError(
-                f"{n_pending} non-target fp8 weight(s) never received a scale."
-            )
+            raise CheckpointIntegrityError(f"{n_pending} non-target fp8 weight(s) never received a scale.")
         logger.info(
-            "FP8 W8A16 adapter: %d MLP targets FP8-resident, %d non-target(s) "
-            "dequantized to %s (marker: %s)",
+            "FP8 W8A16 adapter: %d MLP targets FP8-resident, %d non-target(s) dequantized to %s (marker: %s)",
             n_resident,
             n_dequant,
             self._target_dtype,
@@ -279,18 +270,12 @@ def main(argv: list[str] | None = None) -> int:
 
     violations = verify_observations(infos, spec)
     n_resident = sum(
-        1
-        for i in infos
-        if i.is_fp8
-        and i.name.endswith(WEIGHT_SUFFIX)
-        and is_target_prefix(_module_of_weight(i.name))
+        1 for i in infos if i.is_fp8 and i.name.endswith(WEIGHT_SUFFIX) and is_target_prefix(_module_of_weight(i.name))
     )
     n_dequant = sum(
         1
         for i in infos
-        if i.is_fp8
-        and i.name.endswith(WEIGHT_SUFFIX)
-        and not is_target_prefix(_module_of_weight(i.name))
+        if i.is_fp8 and i.name.endswith(WEIGHT_SUFFIX) and not is_target_prefix(_module_of_weight(i.name))
     )
     print(
         f"declared: {spec.n_quantized} fp8 weights; W8A16 split: "

@@ -91,7 +91,8 @@ def build_nvfp4_blockwise_w4a16_config():
     logger.info(
         "Built NVFP4 blockwise W4A16 config (recipe=%s): target-inclusion on "
         "'.mlp|.mlp_moe_gen.{gate,up,down}_proj', method=%s",
-        RECIPE, cfg.LinearMethodCls.__name__,
+        RECIPE,
+        cfg.LinearMethodCls.__name__,
     )
     return cfg
 

@@ -5,6 +5,7 @@
 The tests cover target selection, recipe-gated dispatch, resident weight
 allocation, and per-op dequantized GEMM behavior.
 """
+
 import json
 from types import SimpleNamespace
 
@@ -139,9 +140,7 @@ def test_omni_diffusion_config_opt_in_wires_fp8_w8a16(tmp_path, monkeypatch):
 def test_fp8_w8a16_selected_declines_non_fp8_blockwise(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
     # foreign recipe (mirrors NVFP4) -> declines (predicate is False, no raise here)
-    assert w8.fp8_w8a16_selected(
-        _sidecar_dir(tmp_path / "nv", recipe="nvfp4_blockwise_mixed_v1")
-    ) is False
+    assert w8.fp8_w8a16_selected(_sidecar_dir(tmp_path / "nv", recipe="nvfp4_blockwise_mixed_v1")) is False
     # missing sidecar (plain BF16 dir) -> declines
     (tmp_path / "bf16").mkdir()
     assert w8.fp8_w8a16_selected(str(tmp_path / "bf16")) is False

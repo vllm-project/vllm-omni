@@ -32,12 +32,13 @@ BLOCK = 16
 # Two real target names (one UND mlp, one GEN mlp_moe_gen) + shapes small but
 # 16-divisible so packed/scale grids are exact.
 _TARGETS = {
-    "layers.0.mlp.gate_proj.weight": (32, 64),          # out=32, in=64
+    "layers.0.mlp.gate_proj.weight": (32, 64),  # out=32, in=64
     "layers.0.mlp_moe_gen.down_proj.weight": (64, 32),  # out=64, in=32
 }
 
 
 # --- fixtures ---------------------------------------------------------------
+
 
 def _packed_width(cols: int) -> int:
     return (cols + 1) // 2
@@ -63,8 +64,16 @@ def _authoritative_sidecar():
         "expected_quantized_count": len(_TARGETS),
         "target_patterns": [r"^layers\.\d+\.mlp\.", r"^layers\.\d+\.mlp_moe_gen\."],
         "forbidden_patterns": [
-            "embed_tokens", "lm_head", "self_attn", "norm", "time_embedder",
-            "proj_in", "proj_out", "audio_", "action_", "blocks.",
+            "embed_tokens",
+            "lm_head",
+            "self_attn",
+            "norm",
+            "time_embedder",
+            "proj_in",
+            "proj_out",
+            "audio_",
+            "action_",
+            "blocks.",
         ],
         "scale_encoding": {
             "block_along": "last_dim",
@@ -130,6 +139,7 @@ def _source(model_or_path="unused"):
 
 # --- parse_nvfp4_spec --------------------------------------------------------
 
+
 def test_parse_spec_accepts_authoritative_sidecar():
     spec = mn4.parse_nvfp4_spec(_authoritative_sidecar())
     assert spec.recipe == "nvfp4_blockwise_mixed_v1"
@@ -153,6 +163,7 @@ def test_parse_spec_rejects_bad_scale_encoding():
 
 # --- pure name/shape calculations -------------------------------------------
 
+
 def test_remap_name_roundtrip():
     assert mn4.remap_name("x.mlp.gate_proj.weight_packed") == "x.mlp.gate_proj.weight"
     assert mn4.remap_name("x.mlp.gate_proj.weight_block_scale") == "x.mlp.gate_proj.weight_scale"
@@ -175,6 +186,7 @@ def test_expected_packed_width_and_grid():
 
 
 # --- adapter detect ---------------------------------------------------------
+
 
 def test_detect_engages_on_sidecar(tmp_path):
     model_dir = _write_model_dir(tmp_path, _authoritative_sidecar())
@@ -202,6 +214,7 @@ def test_registry_selects_nvfp4_native_before_generic(tmp_path):
 
 
 # --- adapt: rename + passthrough, no dequant --------------------------------
+
 
 def _run_adapt(stream, sidecar=None):
     spec = mn4.parse_nvfp4_spec(sidecar or _authoritative_sidecar())
@@ -270,6 +283,7 @@ def test_adapt_rejects_wrong_packed_width():
 
 # --- CLI probe --------------------------------------------------------------
 
+
 def test_cli_probe_passes_on_good_dir(tmp_path, capsys):
     model_dir = _write_model_dir(tmp_path, _authoritative_sidecar())
     rc = mn4.main([model_dir])
@@ -287,6 +301,7 @@ def test_cli_probe_usage_error():
 
 
 # --- additional integrity scenarios (spec-mandated) --------------------------
+
 
 def test_adapt_rejects_wrong_block_scale_grid():
     bad = _tensors()

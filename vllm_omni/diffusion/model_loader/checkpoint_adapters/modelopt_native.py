@@ -124,9 +124,7 @@ def parse_quant_spec(config: Mapping) -> BlockwiseQuantSpec:
     scale_layout = config.get("scale_layout") or {}
     granularity = scale_layout.get("granularity")
     if granularity != EXPECTED_GRANULARITY:
-        violations.append(
-            f"scale granularity: expected {EXPECTED_GRANULARITY!r}, found {granularity!r}"
-        )
+        violations.append(f"scale granularity: expected {EXPECTED_GRANULARITY!r}, found {granularity!r}")
     block_sizes = scale_layout.get("block_sizes") or {}
     block_rows = block_sizes.get("rows")
     block_cols = block_sizes.get("cols")
@@ -146,9 +144,7 @@ def parse_quant_spec(config: Mapping) -> BlockwiseQuantSpec:
     if not isinstance(n_scale, int):
         violations.append(f"scale_layout.n_scale: expected int, found {n_scale!r}")
     elif isinstance(n_quantized, int) and n_scale != 2 * n_quantized:
-        violations.append(
-            f"scale_layout.n_scale: expected 2*n_quantized = {2 * n_quantized}, found {n_scale}"
-        )
+        violations.append(f"scale_layout.n_scale: expected 2*n_quantized = {2 * n_quantized}, found {n_scale}")
 
     if violations:
         raise CheckpointIntegrityError(
@@ -245,10 +241,7 @@ def expand_block_scale(
             f"grid {expected} for weight {tuple(weight_shape)} at block {block}"
         )
     rows, cols = weight_shape
-    return (
-        scale.repeat_interleave(block[0], dim=0)[:rows]
-        .repeat_interleave(block[1], dim=1)[:, :cols]
-    )
+    return scale.repeat_interleave(block[0], dim=0)[:rows].repeat_interleave(block[1], dim=1)[:, :cols]
 
 
 def dequantize_weight(
@@ -306,8 +299,7 @@ def verify_observations(
         module_path = name[: -len(WEIGHT_SUFFIX)]
         if matches_any(module_path, spec.kept_patterns):
             violations.append(
-                f"excluded (bf16-kept) module found quantized: {name} "
-                f"(kept patterns: {list(spec.kept_patterns)})"
+                f"excluded (bf16-kept) module found quantized: {name} (kept patterns: {list(spec.kept_patterns)})"
             )
         elif not matches_any(module_path, spec.quantized_patterns):
             violations.append(
@@ -321,8 +313,7 @@ def verify_observations(
             expected = _expected_grid(shape, block)
             if scales[scale_name] != expected:
                 violations.append(
-                    f"scale grid shape mismatch for {name}: scale "
-                    f"{scales[scale_name]} vs expected grid {expected}"
+                    f"scale grid shape mismatch for {name}: scale {scales[scale_name]} vs expected grid {expected}"
                 )
 
     for scale_name in sorted(scales):
@@ -331,10 +322,7 @@ def verify_observations(
             violations.append(f"orphan quantizer scale without fp8 weight: {scale_name}")
 
     if len(fp8_weights) != spec.n_quantized:
-        violations.append(
-            f"quantized-weight count mismatch: declared {spec.n_quantized}, "
-            f"observed {len(fp8_weights)}"
-        )
+        violations.append(f"quantized-weight count mismatch: declared {spec.n_quantized}, observed {len(fp8_weights)}")
     n_scale_family = len(scales) + n_amax
     if n_scale_family != spec.n_scale:
         violations.append(
@@ -402,9 +390,7 @@ class ModelOptNativeFp8CheckpointAdapter:
             with open(sidecar_path) as f:
                 config = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
-            raise CheckpointIntegrityError(
-                f"unreadable quantization sidecar {sidecar_path}: {e}"
-            ) from e
+            raise CheckpointIntegrityError(f"unreadable quantization sidecar {sidecar_path}: {e}") from e
         return parse_quant_spec(config)
 
     @classmethod
@@ -435,7 +421,11 @@ class ModelOptNativeFp8CheckpointAdapter:
         logger.info(
             "ModelOpt-native FP8-blockwise checkpoint detected at %s "
             "(declared: %d quantized modules, %d scale tensors, %dx%d blocks)",
-            model_dir, spec.n_quantized, spec.n_scale, spec.block_rows, spec.block_cols,
+            model_dir,
+            spec.n_quantized,
+            spec.n_scale,
+            spec.block_rows,
+            spec.block_cols,
         )
         return cls(
             spec=spec,
@@ -445,7 +435,7 @@ class ModelOptNativeFp8CheckpointAdapter:
 
     def _strip_prefix(self, name: str) -> str:
         if self._prefix and name.startswith(self._prefix):
-            return name[len(self._prefix):]
+            return name[len(self._prefix) :]
         return name
 
     def adapt(
@@ -489,9 +479,7 @@ class ModelOptNativeFp8CheckpointAdapter:
                     continue  # flagged by verify_observations at end of stream
                 if scale_name in scales:
                     dequantized += 1
-                    yield full_name, dequantize_weight(
-                        tensor, scales[scale_name], self._target_dtype, block
-                    )
+                    yield full_name, dequantize_weight(tensor, scales[scale_name], self._target_dtype, block)
                 else:
                     pending.setdefault(scale_name, []).append((full_name, tensor))
                     n_pending += 1
@@ -513,9 +501,11 @@ class ModelOptNativeFp8CheckpointAdapter:
                 f"({len(violations)} violation(s)):\n  " + "\n  ".join(violations)
             )
         logger.info(
-            "ModelOpt-native FP8 adapter: dequantized %d/%d quantized weights "
-            "to %s (marker: %s)",
-            dequantized, self._spec.n_quantized, self._target_dtype, FP8_BLOCKWISE_MARKER,
+            "ModelOpt-native FP8 adapter: dequantized %d/%d quantized weights to %s (marker: %s)",
+            dequantized,
+            self._spec.n_quantized,
+            self._target_dtype,
+            FP8_BLOCKWISE_MARKER,
         )
 
 
@@ -543,10 +533,7 @@ def _read_safetensors_header(path: str) -> dict:
 
 def header_tensor_infos(header: Mapping) -> list[TensorInfo]:
     """Pure: safetensors header dict -> normalized TensorInfo list."""
-    return [
-        TensorInfo(name, is_fp8_dtype_str(entry["dtype"]), tuple(entry["shape"]))
-        for name, entry in header.items()
-    ]
+    return [TensorInfo(name, is_fp8_dtype_str(entry["dtype"]), tuple(entry["shape"])) for name, entry in header.items()]
 
 
 def main(argv: list[str] | None = None) -> int:

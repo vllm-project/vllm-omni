@@ -50,19 +50,13 @@ def get_checkpoint_adapter(
         # the explicit opt-in is set and the root recipe matches, so dequant is
         # the default and NVFP4 is unaffected.
         if fp8_w8a16_selected(getattr(source, "model_or_path", None)):
-            w8a16_adapter = ModelOptNativeFp8W8A16CheckpointAdapter.detect(
-                source, target_dtype=_model_dtype(model)
-            )
+            w8a16_adapter = ModelOptNativeFp8W8A16CheckpointAdapter.detect(source, target_dtype=_model_dtype(model))
             if w8a16_adapter is not None:
                 return w8a16_adapter
-        native_adapter = ModelOptNativeFp8CheckpointAdapter.detect(
-            source, target_dtype=_model_dtype(model)
-        )
+        native_adapter = ModelOptNativeFp8CheckpointAdapter.detect(source, target_dtype=_model_dtype(model))
         if native_adapter is not None:
             return native_adapter
-        nvfp4_native_adapter = ModelOptNativeNvfp4CheckpointAdapter.detect(
-            source, target_dtype=_model_dtype(model)
-        )
+        nvfp4_native_adapter = ModelOptNativeNvfp4CheckpointAdapter.detect(source, target_dtype=_model_dtype(model))
         if nvfp4_native_adapter is not None:
             return nvfp4_native_adapter
     if ModelOptFp8CheckpointAdapter.is_compatible(source, quant_config, use_safetensors):
