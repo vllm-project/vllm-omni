@@ -23,6 +23,8 @@ previous KV-cache loop -- causal attention, only the last position is read.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,6 +62,22 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
             use_parallel_embedding=False,
             prefix="model",
         )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Delegate ``model.*`` tensors to ``CodePredictorBaseModel.load_weights``.
+
+        The shared body fuses ``q/k/v_proj`` into ``qkv_proj`` and
+        ``gate/up_proj`` into ``gate_up_proj``; its loader re-packs the HF
+        shards and raises on incomplete or missing fused parameters.  Going
+        through it (instead of ``default_weight_loader`` per tensor) keeps
+        those guarantees for the MossTTSRealtime checkpoint too.
+        """
+        model_weights: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            if name.startswith("model."):
+                model_weights.append((name[len("model.") :], tensor))
+        loaded = self.model.load_weights(iter(model_weights))
+        return {f"model.{n}" for n in loaded}
 
     @torch.no_grad()
     def generate_frame(
