@@ -20,6 +20,7 @@ from transformers import PretrainedConfig
 from vllm.config.utils import config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _STAGE_DEPLOY_FIELDS,
@@ -235,16 +236,6 @@ def _registered_pipeline_keys() -> list[str]:
     from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 
     return sorted(OMNI_PIPELINES)
-
-
-def _resolve_registered_pipeline(
-    model_type: str,
-    hf_config: PretrainedConfig | None = None,
-) -> PipelineConfig | None:
-    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-
-    registered = OMNI_PIPELINES[model_type]
-    return registered(hf_config) if callable(registered) else registered
 
 
 @config
@@ -1256,7 +1247,7 @@ class VllmOmniConfig:
             )
         pipeline = resolved_pipeline
         if pipeline is None:
-            pipeline = _resolve_registered_pipeline(pipeline_key, hf_config)
+            pipeline = resolve_pipeline_config(pipeline_key, hf_config)
             if pipeline is None:
                 raise ValueError(f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig")
 

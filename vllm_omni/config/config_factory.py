@@ -17,7 +17,7 @@ from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
-from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     DeployConfig,
@@ -206,7 +206,7 @@ class StageConfigFactory:
 
         # Pipeline isn't set in the yaml spec, so we need infer it ourselves.
         if model_type and model_type in OMNI_PIPELINES:
-            pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
+            pipeline_cfg = resolve_pipeline_config(model_type, hf_config)
             if pipeline_cfg is not None:
                 return pipeline_cfg
 
@@ -257,7 +257,7 @@ class StageConfigFactory:
         if deploy_path.exists():
             deploy_cfg = load_deploy_config(deploy_path)
             if deploy_cfg.pipeline is not None:
-                return cls.resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
+                return resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
         return None
 
     @staticmethod
@@ -451,16 +451,3 @@ class StageConfigFactory:
         ``filter_dataclass_kwargs(OmniEngineArgs, ...)``.
         """
         return build_stage_runtime_overrides(stage.stage_id, cli_overrides)
-
-    @staticmethod
-    def resolve_pipeline_config(
-        model_type: str,
-        hf_config: PretrainedConfig | None = None,
-    ) -> PipelineConfig | None:
-        """Given a model type, resolve to the pipeline to be used. If the pipeline
-        maps to a callable we resolve based on the HF config."""
-        if model_type not in OMNI_PIPELINES:
-            logger.warning("Model type %s is not registered to OMNI_PIPELINES", model_type)
-            return None
-        obj = OMNI_PIPELINES[model_type]
-        return obj(hf_config) if callable(obj) else obj

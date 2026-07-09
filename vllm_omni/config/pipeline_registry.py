@@ -157,3 +157,15 @@ def register_pipeline(pipeline: PipelineConfig | PipelineResolverFunc, model_typ
     if errors:
         logger.warning("Registration for pipeline of type %s produced the following issues: %s", model_type, errors)
     OMNI_PIPELINES[model_type] = pipeline
+
+
+def resolve_pipeline_config(
+    model_type: str,
+    hf_config: PretrainedConfig | None = None,
+) -> PipelineConfig | None:
+    """Resolve a registry key to a concrete pipeline config."""
+    if model_type not in OMNI_PIPELINES:
+        logger.warning("Model type %s is not registered to OMNI_PIPELINES", model_type)
+        return None
+    pipeline = OMNI_PIPELINES[model_type]
+    return pipeline(hf_config) if callable(pipeline) else pipeline
