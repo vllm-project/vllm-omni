@@ -309,6 +309,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # tensor read; postprocess receives the tail-only slice instead, which
         # avoids ~18 ms merge + ~6 ms write per step (Sy0307 profile, #3665).
         self.requires_full_prefix_cached_hidden_states = False
+        # Stage 1 (code2wav) consumes runtime audio codes, not hidden states,
+        # so the inter-stage pooler payload never needs a CPU hidden-states
+        # view. Opting out lets the runner skip the per-step blocking
+        # ``hidden_states[:n].to("cpu")`` (measured at 24% of stage-0 on-CPU
+        # samples at c=64 on H20).
+        self.omni_pooler_payload_include_hidden = False
         # ``codes.audio`` is only needed for future prefix-hit reconstruction
         # after a request has produced codec rows. Keep per-step rows on GPU and
         # materialize the CPU OmniTensorPrefixCache entry once at completion.

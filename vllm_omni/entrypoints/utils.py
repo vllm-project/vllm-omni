@@ -345,6 +345,7 @@ def load_stage_configs_from_model(
 
     stages = StageConfigFactory.create_from_model(
         model,
+        trust_remote_code=cli_overrides.get("trust_remote_code", False),
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
     )
