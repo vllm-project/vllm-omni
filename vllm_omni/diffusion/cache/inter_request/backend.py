@@ -191,7 +191,17 @@ class InterRequestCacheBackend(CacheBackend):
                 inputs = self._clip_tokenizer([prompt], padding=True, return_tensors="pt").to(self._clip_device)
                 with torch.no_grad():
                     text_features = self._full_clip_model.get_text_features(**inputs)
-                feat = text_features.squeeze(0)
+                # Handle both raw tensor (older transformers) and HF model output.
+                # Newer transformers return BaseModelOutputWithPooling where the
+                # text embedding is in pooler_output.
+                if hasattr(text_features, "pooler_output"):
+                    feat = text_features.pooler_output.squeeze(0)
+                elif hasattr(text_features, "text_embeds"):
+                    feat = text_features.text_embeds.squeeze(0)
+                elif torch.is_tensor(text_features):
+                    feat = text_features.squeeze(0)
+                else:
+                    feat = text_features.last_hidden_state.mean(dim=1).squeeze(0)
                 feat = feat / feat.norm(dim=-1, keepdim=True)
                 return feat
         except Exception as e:
@@ -211,20 +221,57 @@ class InterRequestCacheBackend(CacheBackend):
 
             img = image_tensor.float().cpu()
             if img.dim() == 4:
-                img = img[0]
-            if img.shape[0] == 3:
-                img = img.permute(1, 2, 0)
+                img = img[0]  # [C, H, W]
+            # Only process 3-channel RGB images (CLIP expects 3 channels).
+            # Latents have 16+ channels and cannot be directly CLIP-encoded.
+            if img.shape[0] != 3:
+                logger.debug("encode_image: skipping non-RGB tensor (channels=%d)", img.shape[0])
+                return None
+            # Normalize from [-1, 1] or arbitrary range to [0, 255] uint8
             img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-            img = (img * 255).clamp(0, 255).to(torch.uint8).numpy()
-            pil_image = Image.fromarray(img)
+            img = (img * 255).clamp(0, 255).to(torch.uint8)
+            # Convert to HWC for PIL
+            img_hwc = img.permute(1, 2, 0).numpy()
+            pil_image = Image.fromarray(img_hwc)
             inputs = self._clip_image_processor(images=[pil_image], return_tensors="pt").to(self._clip_device)
             with torch.no_grad():
                 image_features = self._full_clip_model.get_image_features(**inputs)
-            feat = image_features.squeeze(0)
+            # Handle both raw tensor (older transformers) and HF model output.
+            if hasattr(image_features, "pooler_output"):
+                feat = image_features.pooler_output.squeeze(0)
+            elif hasattr(image_features, "image_embeds"):
+                feat = image_features.image_embeds.squeeze(0)
+            elif torch.is_tensor(image_features):
+                feat = image_features.squeeze(0)
+            else:
+                feat = image_features.last_hidden_state.mean(dim=1).squeeze(0)
             feat = feat / feat.norm(dim=-1, keepdim=True)
             return feat
         except Exception as e:
             logger.warning("CLIP image encoding failed: %s", e)
+            return None
+
+    def _encode_image_cpu(self, image_tensor: torch.Tensor) -> torch.Tensor | None:
+        """Encode image on CPU to avoid NPU async issues."""
+        if image_tensor.dim() != 4 or image_tensor.shape[1] != 3:
+            return None
+        try:
+            from PIL import Image
+            img = image_tensor[0].float().cpu()  # [3, H, W]
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+            img = (img * 255).clamp(0, 255).to(torch.uint8)
+            pil_image = Image.fromarray(img.permute(1, 2, 0).numpy())
+            inputs = self._clip_image_processor(images=[pil_image], return_tensors="pt")
+            with torch.no_grad():
+                feats = self._full_clip_model.get_image_features(**inputs)
+            if hasattr(feats, "pooler_output"):
+                feat = feats.pooler_output.squeeze(0)
+            elif torch.is_tensor(feats):
+                feat = feats.squeeze(0)
+            else:
+                feat = feats.last_hidden_state.mean(dim=1).squeeze(0)
+            return feat / feat.norm(dim=-1, keepdim=True)
+        except Exception as e:
             return None
 
     def update_image_embedding(self, cache_key_hash: str | None, image_tensor: torch.Tensor) -> None:
@@ -232,7 +279,8 @@ class InterRequestCacheBackend(CacheBackend):
             return
         if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:
             return
-        image_emb = self.encode_image(image_tensor)
+        # Force CPU for image embedding to avoid NPU async issues in daemon threads
+        image_emb = self._encode_image_cpu(image_tensor)
         if image_emb is not None:
             self._cache_store.update_image_embedding(cache_key_hash, image_emb)
 

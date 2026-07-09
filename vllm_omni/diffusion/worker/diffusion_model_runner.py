@@ -306,21 +306,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return None
         return self.prompt_embed_cache.stats()
 
+    # DEBUG
     def _update_cache_image_embedding(self, cache_key_hash: str, image_tensor: torch.Tensor) -> None:
         # Skip image embedding update for video (5D tensor [B,C,T,H,W])
-        if image_tensor.dim() == 5:
+        if not hasattr(image_tensor, "dim") or image_tensor.dim() == 5:
             return
-        # Copy tensor to CPU before async to avoid NPU synchronization issues
+        # Synchronous update (async daemon threads hang on NPU)
         image_tensor_cpu = image_tensor.detach().clone().cpu()
-
-        def _worker():
-            try:
-                self.cache_backend.update_image_embedding(cache_key_hash, image_tensor_cpu)
-            except Exception as e:
-                logger.debug("Failed to update image embedding: %s", e)
-
-        t_thread = threading.Thread(target=_worker, daemon=True)
-        t_thread.start()
+        try:
+            self.cache_backend.update_image_embedding(cache_key_hash, image_tensor_cpu)
+        except Exception as e:
+            logger.debug("Failed to update image embedding: %s", e)
 
     def _sample_peak_memory_mb(self) -> float:
         """Return peak GPU memory for the current forward pass in MB.
@@ -420,7 +416,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
         if num_inference_steps is not None:
-            self.cache_backend.refresh(self.pipeline, num_inference_steps)
+            resume = getattr(first_req.sampling_params, "resume_from_step", 0) or 0
+            self.cache_backend.refresh(
+                self.pipeline,
+                num_inference_steps,
+                resume_from_step=resume,
+            )
         else:
             logger.warning(
                 "Failed to refresh the diffusion transformer cache; backend %s "
