@@ -171,3 +171,47 @@ def test_audex_tts_mixed_cfg_concurrency(omni_server, openai_client) -> None:
         assert resp.status_code == 200, f"{payload} -> {resp.status_code}: {resp.text[:200]}"
         assert resp.content[:4] == b"RIFF", f"{payload}: not a WAV response"
         assert len(resp.content) > 44, f"{payload}: empty audio body"
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
+def test_audex_tts_stream_abort_leaves_server_healthy(omni_server, openai_client) -> None:
+    """Aborting a guided streaming request mid-flight must not wedge the server.
+
+    The abort cascades to the CFG companion (cfg_companion_tracker); a
+    follow-up guided request on the same server must still succeed.
+    """
+    import requests
+
+    url = f"{openai_client.base_url.rstrip('/')}/v1/audio/speech"
+    long_input = " ".join([PROMPT] * 4)
+
+    with requests.post(
+        url,
+        json={
+            "model": omni_server.model,
+            "input": long_input,
+            "stream": True,
+            "stream_format": "audio",
+            "response_format": "wav",
+            "extra_params": {"cfg_scale": 1.5},
+        },
+        stream=True,
+        timeout=300,
+    ) as resp:
+        assert resp.status_code == 200, resp.text
+        # Read one chunk, then abort the connection mid-stream.
+        next(resp.iter_content(chunk_size=4096))
+
+    follow_up = requests.post(
+        url,
+        json={
+            "model": omni_server.model,
+            "input": PROMPT,
+            "response_format": "wav",
+            "extra_params": {"cfg_scale": 1.5},
+        },
+        timeout=300,
+    )
+    assert follow_up.status_code == 200, follow_up.text[:200]
+    assert follow_up.content[:4] == b"RIFF" and len(follow_up.content) > 44
