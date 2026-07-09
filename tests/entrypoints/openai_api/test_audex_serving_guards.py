@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Serving-layer regressions for the Audex zero-codec-token contract.
 
-A zero-codec-token request reaches the serving layer as a stream whose only
-audio payloads are zero-size tensors. The streaming generator must not turn
-that into a header-only/empty successful stream: the raw-bytes generator
-raises (before any WAV header), and the SSE wrapper surfaces
-``speech.audio.error`` instead of ``speech.audio.done``.
+A zero-codec-token (or phase-invalid TTA) request reaches the serving layer
+as a stream whose only audio payloads are zero-size tensors. The streaming
+generator must not turn that into a header-only/empty successful stream: the
+raw-bytes generator raises (before any WAV header), and the SSE wrapper
+surfaces ``speech.audio.error`` instead of ``speech.audio.done``. The
+contract covers both audex pipelines (``audex`` TTS and ``audex_tta``).
 """
 
 from types import SimpleNamespace
@@ -14,7 +15,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech import (
+    _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES,
+    OmniOpenAIServingSpeech,
+)
 
 
 def _serving(model_type: str = "audex") -> OmniOpenAIServingSpeech:
@@ -41,9 +45,16 @@ async def _collect(chunks):
     return out
 
 
+def test_no_audio_guard_covers_both_audex_pipelines():
+    # The non-streaming CreateAudio guard keys off the same constant; pin
+    # its membership so neither pipeline regresses to empty-200 responses.
+    assert _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES == {"audex", "audex_tta"}
+
+
 @pytest.mark.asyncio
-async def test_raw_stream_raises_on_empty_audio_before_any_header():
-    serving = _serving()
+@pytest.mark.parametrize("model_type", ["audex", "audex_tta"])
+async def test_raw_stream_raises_on_empty_audio_before_any_header(model_type):
+    serving = _serving(model_type)
     chunks = serving._generate_audio_chunks(
         _gen(_result(torch.empty(0)), _result(torch.empty(0))),
         request_id="req-empty",
@@ -69,8 +80,9 @@ async def test_raw_stream_yields_audio_normally_when_non_empty():
 
 
 @pytest.mark.asyncio
-async def test_sse_stream_emits_error_not_done_on_empty_audio():
-    serving = _serving()
+@pytest.mark.parametrize("model_type", ["audex", "audex_tta"])
+async def test_sse_stream_emits_error_not_done_on_empty_audio(model_type):
+    serving = _serving(model_type)
     events = serving._generate_audio_sse_events(
         _gen(_result(torch.empty(0))),
         request_id="req-empty",

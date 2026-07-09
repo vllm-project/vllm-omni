@@ -39,6 +39,11 @@ from vllm_omni.model_executor.models.audex.prompt import build_tta_cond_prompt, 
 from vllm_omni.model_executor.models.audex.tta import build_tta_phase_token_ids
 
 SAMPLE_RATE = 16_000
+# The model root's default deploy yaml is the TTS pipeline; TTA prompts and
+# RVQ sampling params require the dedicated TTA pipeline, so default to it.
+_DEFAULT_DEPLOY_CONFIG = str(
+    Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / "nemotron_labs_audex_tta.yaml"
+)
 DEFAULT_CAPTIONS = (
     "Heavy rain falling on a tin roof.",
     "A dog barking in the distance while birds chirp.",
@@ -58,7 +63,12 @@ def parse_args():
         help="TSV corpus: one 'utt_id<TAB>caption' per line (overrides --captions).",
     )
     parser.add_argument("--output-dir", type=str, default="results/audex_tta_wavs")
-    parser.add_argument("--deploy-config", type=str, default=None)
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=_DEFAULT_DEPLOY_CONFIG,
+        help="Deploy yaml (defaults to the nemotron_labs_audex_tta pipeline).",
+    )
     parser.add_argument(
         "--xcodec1-path",
         type=str,

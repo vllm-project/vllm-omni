@@ -135,6 +135,10 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "audex",
     "audex_tta",
 }
+# Audex contract: zero-codec / invalid generations arrive as empty terminal
+# payloads and must fail the request, never serialize as a successful empty
+# WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
+_AUDEX_NO_AUDIO_GUARD_MODEL_TYPES = frozenset({"audex", "audex_tta"})
 _TTS_LANGUAGES = frozenset(
     {
         "Auto",
@@ -2785,7 +2789,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
-                    if self._tts_model_type == "audex" and int(np.size(chunk_np)) == 0:
+                    if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and int(np.size(chunk_np)) == 0:
                         # Zero-size chunks must not emit a WAV header or count
                         # as first audio; the post-loop guard below needs to
                         # see an audio-less stream to fail the request.
@@ -2821,10 +2825,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         yield audio_bytes, sample_rate_val
                     else:
                         yield audio_bytes
-            if self._tts_model_type == "audex" and first_audio_chunk_s is None:
+            if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and first_audio_chunk_s is None:
                 # Audex contract: zero codec tokens must abort the stream, not
                 # complete it cleanly with zero audio bytes.
-                raise ValueError("Audex produced no audio (the thinker emitted zero codec tokens)")
+                raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
@@ -3994,10 +3998,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if audio_tensor.ndim > 1:
                 audio_tensor = audio_tensor.squeeze()
 
-            if self._tts_model_type == "audex" and int(np.size(audio_tensor)) == 0:
+            if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and int(np.size(audio_tensor)) == 0:
                 # Audex contract: zero codec tokens must fail the request, not
                 # serialize as an empty-but-successful WAV.
-                raise ValueError("Audex produced no audio (the thinker emitted zero codec tokens)")
+                raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,

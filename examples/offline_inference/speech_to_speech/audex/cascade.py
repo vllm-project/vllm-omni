@@ -33,6 +33,11 @@ from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt, buil
 
 SAMPLE_RATE = 16_000
 ASR_QUESTION = "Transcribe the input speech."
+# The model root's default deploy yaml is the TTS-only pipeline; the cascade
+# needs the audio-capable 2-stage full pipeline, so default to it.
+_DEFAULT_DEPLOY_CONFIG = str(
+    Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / "nemotron_labs_audex_full.yaml"
+)
 
 
 def parse_args():
@@ -40,7 +45,12 @@ def parse_args():
     parser.add_argument("--model", type=str, default="nvidia/Nemotron-Labs-Audex-2B")
     parser.add_argument("--audio-file", type=str, required=True, help="Spoken question (WAV).")
     parser.add_argument("--output", type=str, default="results/audex_s2s_answer.wav")
-    parser.add_argument("--deploy-config", type=str, default=None)
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=_DEFAULT_DEPLOY_CONFIG,
+        help="Deploy yaml (defaults to the nemotron_labs_audex_full pipeline).",
+    )
     parser.add_argument(
         "--cfg-scale",
         type=float,

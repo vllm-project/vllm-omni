@@ -34,6 +34,11 @@ from vllm_omni import Omni
 
 ASR_QUESTION = "Transcribe the input speech."
 TARGET_SR = 16_000
+# The model root's default deploy yaml is the TTS pipeline; audio
+# understanding needs the single-stage thinker-only pipeline, so default to it.
+_DEFAULT_DEPLOY_CONFIG = str(
+    Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / "nemotron_labs_audex_thinker_only.yaml"
+)
 
 
 def build_prompt(question: str) -> str:
@@ -45,7 +50,12 @@ def parse_args():
     parser.add_argument("--model", type=str, default="nvidia/Nemotron-Labs-Audex-2B")
     parser.add_argument("--audio-files", type=str, nargs="+", required=True)
     parser.add_argument("--question", type=str, default=ASR_QUESTION)
-    parser.add_argument("--deploy-config", type=str, default=None)
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=_DEFAULT_DEPLOY_CONFIG,
+        help="Deploy yaml (defaults to the nemotron_labs_audex_thinker_only pipeline).",
+    )
     return parser.parse_args()
 
 
