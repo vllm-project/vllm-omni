@@ -58,6 +58,16 @@ def parse_args():
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results/audex_bench")
     parser.add_argument("--deploy-config", type=str, default=None)
+    parser.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Classifier-free guidance strength (1.0 = off, matches the v1 "
+            "baseline; 1.5 = official quality setting). Guided runs force "
+            "batch size 1: each request carries its own null prompt/pair id."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -100,6 +110,36 @@ def _req_index(req_output) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _load_audex_tokenizer(model: str):
+    from transformers import AutoTokenizer
+
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+    root = ensure_audex_snapshot(model)
+    return AutoTokenizer.from_pretrained(str(Path(root) / "checkpoint_folder_audiogen"))
+
+
+def _cfg_sampling_params(engine: Omni, cfg_scale: float, pair_id: str, cond_prompt: str, tokenizer):
+    """Stage sampling params carrying the CFG pair contract for one request."""
+    import copy
+
+    from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
+
+    params = copy.deepcopy(engine.resolve_sampling_params_list(None))
+    stage0 = params[0]
+    if stage0.extra_args is None:
+        stage0.extra_args = {}
+    stage0.extra_args.update(
+        {
+            "cfg_scale": float(cfg_scale),
+            "cfg_role": "cond",
+            "cfg_pair_id": pair_id,
+            "cfg_null_prompt": build_null_prompt(cond_prompt, tokenizer),
+        }
+    )
+    return params
+
+
 def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -116,14 +156,26 @@ def main():
         engine.generate(warmup)
         print(f"warmup done ({len(warmup)} prompts, untimed)")
 
+    cfg_enabled = args.cfg_scale > 1.0
+    batch_size = 1 if cfg_enabled else args.batch_size
+    tokenizer = None
+    if cfg_enabled:
+        tokenizer = _load_audex_tokenizer(args.model)
+        print(f"CFG scale {args.cfg_scale}: forcing batch size 1 (per-request guidance pair)")
+
     total_elapsed = 0.0
     total_audio = 0.0
     refs_lines: list[str] = []
-    for start in range(0, len(corpus), args.batch_size):
-        batch = corpus[start : start + args.batch_size]
+    for start in range(0, len(corpus), batch_size):
+        batch = corpus[start : start + batch_size]
         prompts = [build_cond_prompt(text) for _u, text in batch]
+        sampling_params_list = None
+        if cfg_enabled:
+            sampling_params_list = _cfg_sampling_params(
+                engine, args.cfg_scale, f"cfg-{batch[0][0]}", prompts[0], tokenizer
+            )
         t0 = time.perf_counter()
-        outputs = engine.generate(prompts)
+        outputs = engine.generate(prompts, sampling_params_list)
         total_elapsed += time.perf_counter() - t0
 
         ordered = sorted(outputs, key=_req_index)

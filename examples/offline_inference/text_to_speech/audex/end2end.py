@@ -66,6 +66,17 @@ def parse_args():
         action="store_true",
         help="Submit one request at a time instead of all at once.",
     )
+    parser.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Classifier-free guidance strength. 1.0 disables guidance (default, "
+            "matches the v1 baseline); 1.5 is the official quality setting. "
+            "Guided runs submit one request at a time (each carries its own "
+            "length-matched null prompt and pair id)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -105,6 +116,36 @@ def _pcm_to_int16(pcm: torch.Tensor) -> np.ndarray:
     return (arr * 32767.0).astype(np.int16)
 
 
+def _load_audex_tokenizer(model: str):
+    from transformers import AutoTokenizer
+
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+    root = ensure_audex_snapshot(model)
+    return AutoTokenizer.from_pretrained(str(Path(root) / "checkpoint_folder_audiogen"))
+
+
+def _cfg_sampling_params(engine: Omni, cfg_scale: float, pair_id: str, cond_prompt: str, tokenizer):
+    """Stage sampling params carrying the CFG pair contract for one request."""
+    import copy
+
+    from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
+
+    params = copy.deepcopy(engine.resolve_sampling_params_list(None))
+    stage0 = params[0]
+    if stage0.extra_args is None:
+        stage0.extra_args = {}
+    stage0.extra_args.update(
+        {
+            "cfg_scale": float(cfg_scale),
+            "cfg_role": "cond",
+            "cfg_pair_id": pair_id,
+            "cfg_null_prompt": build_null_prompt(cond_prompt, tokenizer),
+        }
+    )
+    return params
+
+
 def _write_outputs(outputs, batch: list[tuple[str, str]], output_dir: Path) -> float:
     # Omni.generate may return outputs out of submission order; align by the
     # numeric request-id suffix, which follows submission order.
@@ -138,18 +179,29 @@ def main():
 
     engine = Omni(model=args.model, deploy_config=args.deploy_config, trust_remote_code=True)
 
+    cfg_enabled = args.cfg_scale > 1.0
+    tokenizer = _load_audex_tokenizer(args.model) if cfg_enabled else None
+
     print(f"Model       : {args.model}")
     print(f"Prompts     : {len(corpus)}")
-    print(f"Mode        : {'sequential' if args.sequential else 'batched'}")
+    print(f"Mode        : {'sequential' if args.sequential or cfg_enabled else 'batched'}")
+    print(f"CFG scale   : {args.cfg_scale}" + (" (guidance off)" if not cfg_enabled else ""))
     print(f"Output dir  : {output_dir}")
 
     total_elapsed = 0.0
     total_dur = 0.0
-    batches = [[item] for item in corpus] if args.sequential else [corpus]
+    # CFG runs one request at a time: each request needs its own pair id and
+    # text-specific null prompt in the stage-0 sampling params.
+    batches = [[item] for item in corpus] if (args.sequential or cfg_enabled) else [corpus]
     for batch in batches:
         prompts = [build_cond_prompt(text) for _utt, text in batch]
+        sampling_params_list = None
+        if cfg_enabled:
+            sampling_params_list = _cfg_sampling_params(
+                engine, args.cfg_scale, f"cfg-{batch[0][0]}", prompts[0], tokenizer
+            )
         t_start = time.perf_counter()
-        outputs = engine.generate(prompts)
+        outputs = engine.generate(prompts, sampling_params_list)
         total_elapsed += time.perf_counter() - t_start
         total_dur += _write_outputs(outputs, batch, output_dir)
 

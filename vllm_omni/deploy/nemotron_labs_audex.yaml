@@ -9,6 +9,13 @@
 #     <speechcodec_N> block (pinned by a unit test).
 #   * Stage 0 sampling defaults follow the official TTS script
 #     (temperature 0.1, top_k 80, max_tokens 2048).
+#   * Classifier-free guidance: the stage-0 logits processor + scheduler
+#     pair patches are always installed but idle until a request carries
+#     extra_args.cfg_scale > 1.0 (serving: extra_params.cfg_scale; offline:
+#     --cfg-scale). Every guided request adds an unconditional companion
+#     sequence in stage 0 — at max_num_seqs 8 that means at most 4 guided
+#     requests decode concurrently; raise max_num_seqs if CFG-heavy traffic
+#     needs more parallelism.
 async_chunk: true
 
 connectors:
@@ -39,6 +46,8 @@ stages:
     max_model_len: 4096
     dtype: bfloat16
     devices: "0"
+    logits_processors:
+      - vllm_omni.model_executor.models.audex.cfg.AudexCFGLogitsProcessor
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
