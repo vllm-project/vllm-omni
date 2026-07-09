@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import FRAMES_PER_CHUNK
+from vllm_omni.experimental.world_models.memory.attrs import SessionAttr, window_reset_survivors
 from vllm_omni.experimental.world_models.memory.manager import SessionMemoryManager
 from vllm_omni.experimental.world_models.memory.objects import LatentBuffer
 
@@ -39,7 +40,26 @@ _VIDEO_LATENTS = "video_latents"
 
 
 class DreamZeroStateAdapter:
-    """Drop-in replacement for ``DreamZeroState`` backed by the manager."""
+    """Drop-in replacement for ``DreamZeroState`` backed by the manager.
+
+    Session-scoped metadata is declared once per attribute via ``SessionAttr``
+    (reads fall back to the default after a session reset clears ``attrs``;
+    writes go through to the pinned session). The ``survives_window_reset``
+    marks drive ``reset(clear_video_latents=False)``, so the survival set
+    lives on the declarations rather than in a separate list.
+    """
+
+    call_count = SessionAttr[int](default=0, coerce=int)
+    current_start_frame = SessionAttr[int](default=0, coerce=int)
+    clip_feas = SessionAttr[torch.Tensor | None](default=None)
+    ys = SessionAttr[torch.Tensor | None](default=None)
+    language = SessionAttr[torch.Tensor | None](default=None, survives_window_reset=True)
+    prompt_embeds = SessionAttr[torch.Tensor | None](default=None, survives_window_reset=True)
+    # -- incremental VAE encoder stream (fields mirror DreamZeroState) --
+    vae_stream_initialized = SessionAttr[bool](default=False, coerce=bool, survives_window_reset=True)
+    vae_enc_feat_map = SessionAttr[list[torch.Tensor | None] | None](default=None, survives_window_reset=True)
+    vae_encoder_out = SessionAttr[torch.Tensor | None](default=None, survives_window_reset=True)
+    vae_pending_body_frames = SessionAttr[torch.Tensor | None](default=None, survives_window_reset=True)
 
     def __init__(self, session_id: str | None, manager: SessionMemoryManager) -> None:
         self._session_id = session_id
@@ -60,112 +80,23 @@ class DreamZeroStateAdapter:
         buffer.allocate(maxlen=FRAMES_PER_CHUNK)
         return buffer
 
+    @staticmethod
+    def _new_video_buffer() -> LatentBuffer[torch.Tensor]:
+        buffer: LatentBuffer[torch.Tensor] = LatentBuffer()
+        buffer.allocate(maxlen=None)
+        return buffer
+
     def _ensure_frame_buffer(self) -> LatentBuffer[np.ndarray]:
-        buffer = self._session.get(_FRAMES)
-        if not isinstance(buffer, LatentBuffer) or not buffer.resident:
-            new_buffer = self._new_frame_buffer()
-            self._session.put(_FRAMES, new_buffer)
-            return new_buffer
-        # The item type is erased at runtime; only this adapter writes the key.
-        return cast("LatentBuffer[np.ndarray]", buffer)
+        """The stitched-frame ring for this session (created on first use)."""
+        return self._session.get_or_create(_FRAMES, self._new_frame_buffer, LatentBuffer)
 
     def _ensure_video_buffer(self) -> LatentBuffer[torch.Tensor]:
         """The accumulated AR video-latent chunks (unbounded, CPU)."""
-        buffer = self._session.get(_VIDEO_LATENTS)
-        if not isinstance(buffer, LatentBuffer) or not buffer.resident:
-            new_buffer: LatentBuffer[torch.Tensor] = LatentBuffer()
-            new_buffer.allocate(maxlen=None)
-            self._session.put(_VIDEO_LATENTS, new_buffer)
-            return new_buffer
-        return cast("LatentBuffer[torch.Tensor]", buffer)
-
-    # Metadata getters read with a default so they never raise after a session
-    # reset clears attrs; setters write through to the pinned session.
-    @property
-    def call_count(self) -> int:
-        return int(cast("int", self._session.attrs.get("call_count", 0)))
-
-    @call_count.setter
-    def call_count(self, value: int) -> None:
-        self._session.attrs["call_count"] = int(value)
-
-    @property
-    def current_start_frame(self) -> int:
-        return int(cast("int", self._session.attrs.get("current_start_frame", 0)))
-
-    @current_start_frame.setter
-    def current_start_frame(self, value: int) -> None:
-        self._session.attrs["current_start_frame"] = int(value)
-
-    @property
-    def clip_feas(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs.get("clip_feas"))
-
-    @clip_feas.setter
-    def clip_feas(self, value: torch.Tensor | None) -> None:
-        self._session.attrs["clip_feas"] = value
-
-    @property
-    def ys(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs.get("ys"))
-
-    @ys.setter
-    def ys(self, value: torch.Tensor | None) -> None:
-        self._session.attrs["ys"] = value
-
-    @property
-    def language(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs.get("language"))
-
-    @language.setter
-    def language(self, value: torch.Tensor | None) -> None:
-        self._session.attrs["language"] = value
-
-    @property
-    def prompt_embeds(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs.get("prompt_embeds"))
-
-    @prompt_embeds.setter
-    def prompt_embeds(self, value: torch.Tensor | None) -> None:
-        self._session.attrs["prompt_embeds"] = value
+        return self._session.get_or_create(_VIDEO_LATENTS, self._new_video_buffer, LatentBuffer)
 
     @property
     def stitched_buffer(self) -> LatentBuffer[np.ndarray]:
         return self._ensure_frame_buffer()
-
-    # -- incremental VAE encoder stream (logic mirrors DreamZeroState) --
-
-    @property
-    def vae_stream_initialized(self) -> bool:
-        return bool(self._session.attrs.get("vae_stream_initialized", False))
-
-    @vae_stream_initialized.setter
-    def vae_stream_initialized(self, value: bool) -> None:
-        self._session.attrs["vae_stream_initialized"] = bool(value)
-
-    @property
-    def vae_enc_feat_map(self) -> list[torch.Tensor | None] | None:
-        return cast("list[torch.Tensor | None] | None", self._session.attrs.get("vae_enc_feat_map"))
-
-    @vae_enc_feat_map.setter
-    def vae_enc_feat_map(self, value: list[torch.Tensor | None] | None) -> None:
-        self._session.attrs["vae_enc_feat_map"] = value
-
-    @property
-    def vae_encoder_out(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs.get("vae_encoder_out"))
-
-    @vae_encoder_out.setter
-    def vae_encoder_out(self, value: torch.Tensor | None) -> None:
-        self._session.attrs["vae_encoder_out"] = value
-
-    @property
-    def vae_pending_body_frames(self) -> torch.Tensor | None:
-        return cast("torch.Tensor | None", self._session.attrs.get("vae_pending_body_frames"))
-
-    @vae_pending_body_frames.setter
-    def vae_pending_body_frames(self, value: torch.Tensor | None) -> None:
-        self._session.attrs["vae_pending_body_frames"] = value
 
     def reset_vae_encoder_stream(self) -> None:
         """Clear incremental Wan VAE encoder state used across AR steps."""
@@ -234,9 +165,7 @@ class DreamZeroStateAdapter:
 
     def clear_video_latents(self) -> None:
         """Drop accumulated video latents without resetting frame/VAE state."""
-        buffer: LatentBuffer[torch.Tensor] = LatentBuffer()
-        buffer.allocate(maxlen=None)
-        self._session.put(_VIDEO_LATENTS, buffer)
+        self._session.put(_VIDEO_LATENTS, self._new_video_buffer())
 
     # -- reset / should_reset (logic mirrors DreamZeroState) ------------
 
@@ -256,14 +185,7 @@ class DreamZeroStateAdapter:
             stored = self._session.get(_VIDEO_LATENTS)
             if isinstance(stored, LatentBuffer) and stored.resident:
                 saved_chunks = cast("LatentBuffer[torch.Tensor]", stored).view()
-            for key in (
-                "language",
-                "prompt_embeds",
-                "vae_stream_initialized",
-                "vae_enc_feat_map",
-                "vae_encoder_out",
-                "vae_pending_body_frames",
-            ):
+            for key in window_reset_survivors(self):
                 if key in self._session.attrs:
                     saved_attrs[key] = self._session.attrs[key]
 

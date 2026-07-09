@@ -11,6 +11,10 @@ Paged-KV backing, byte-budget enforcement, and copy-on-write session forking are
 not yet implemented; see RFC #4480 for the roadmap.
 """
 
+from vllm_omni.experimental.world_models.memory.attrs import (
+    SessionAttr,
+    window_reset_survivors,
+)
 from vllm_omni.experimental.world_models.memory.base import MemoryObject
 from vllm_omni.experimental.world_models.memory.manager import (
     DEFAULT_MAX_SESSIONS,
@@ -28,7 +32,9 @@ __all__ = [
     "EncodeOnceKV",
     "LatentBuffer",
     "MemoryObject",
+    "SessionAttr",
     "SessionMemory",
     "SessionMemoryManager",
     "resolve_session_memory_config",
+    "window_reset_survivors",
 ]

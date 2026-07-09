@@ -17,6 +17,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from typing import TypeVar
 
 from vllm_omni.experimental.world_models.memory.base import MemoryObject
 
@@ -24,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 # Matches the bespoke DreamZero cap so the new path evicts identically.
 DEFAULT_MAX_SESSIONS = 64
+
+M = TypeVar("M", bound=MemoryObject)
 
 
 class SessionMemory:
@@ -42,6 +45,15 @@ class SessionMemory:
 
     def put(self, name: str, obj: MemoryObject) -> MemoryObject:
         self._objects[name] = obj
+        return obj
+
+    def get_or_create(self, name: str, factory: Callable[[], M], cls: type[M]) -> M:
+        """Return the resident object of type ``cls`` under ``name``, building
+        it via ``factory`` when absent, wrong-typed, or no longer resident."""
+        obj = self._objects.get(name)
+        if not isinstance(obj, cls) or not obj.resident:
+            obj = factory()
+            self._objects[name] = obj
         return obj
 
     def names(self) -> list[str]:
