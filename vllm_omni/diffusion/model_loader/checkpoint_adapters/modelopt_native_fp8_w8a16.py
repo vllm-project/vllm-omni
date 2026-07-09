@@ -24,9 +24,9 @@ Integrity is fail-fast, reusing the dequant adapter's
 ``transformer/modelopt_state.pt`` pickle is never opened. A GPU-free header probe is
 available as ``python -m ...modelopt_native_fp8_w8a16 <model_dir>``.
 
-Selected by the dispatcher **by default** for the FP8-blockwise checkpoint (see
-``fp8_w8a16_selected`` in ``checkpoint_adapters/__init__.py``); ``VLLM_OMNI_FP8_BLOCKWISE_DEQUANT=1``
-routes to the dequant adapter instead. A checkpoint whose sidecar declares a
+Selected by the dispatcher only when ``VLLM_OMNI_FP8_BLOCKWISE_W8A16=1`` and
+the checkpoint root recipe matches (see ``fp8_w8a16_selected`` in
+``checkpoint_adapters/__init__.py``). A checkpoint whose sidecar declares a
 quantized target family outside ``mlp.*``/``mlp_moe_gen.*``/``lm_head`` fails fast.
 """
 
@@ -121,9 +121,9 @@ class ModelOptNativeFp8W8A16CheckpointAdapter:
         """Engage iff the source carries the FP8-blockwise sidecar (same as dequant).
 
         Reuses the dequant adapter's sidecar parse so detection is identical; the
-        dispatcher decides W8A16-vs-dequant via ``fp8_w8a16_selected`` (W8A16 by default;
-        ``VLLM_OMNI_FP8_BLOCKWISE_DEQUANT=1`` opts out). Construction asserts the declared target family
-       , so a mis-declared sidecar fails fast here rather than mid-load.
+        dispatcher decides W8A16-vs-dequant via ``fp8_w8a16_selected`` (explicit
+        opt-in; dequant is default). Construction asserts the declared target
+        family, so a mis-declared sidecar fails fast here rather than mid-load.
         """
         spec = ModelOptNativeFp8CheckpointAdapter._parse_source_sidecar(source)
         if spec is None:

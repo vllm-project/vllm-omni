@@ -38,6 +38,9 @@ needs_w4a16 = pytest.mark.skipif(
         "language_model.layers.7.mlp.down_proj",
         "gen_layers.0.mlp.gate_proj",
         "gen_layers.35.mlp.down_proj",
+        "gen_layers.0.mlp_moe_gen.gate_proj",
+        "gen_layers.10.mlp_moe_gen.up_proj",
+        "gen_layers.35.mlp_moe_gen.down_proj",
     ],
 )
 def test_target_prefixes_included(prefix):
@@ -80,6 +83,7 @@ def test_config_quantizes_only_targets():
     # targets NOT excluded (get the W4A16 FP4 method)
     assert cfg.is_layer_excluded("language_model.layers.0.mlp.gate_proj") is False
     assert cfg.is_layer_excluded("gen_layers.10.mlp.down_proj") is False
+    assert cfg.is_layer_excluded("gen_layers.10.mlp_moe_gen.down_proj") is False
     # non-targets excluded (stay BF16 / UnquantizedLinearMethod)
     assert cfg.is_layer_excluded("language_model.layers.0.self_attn.to_q") is True
     assert cfg.is_layer_excluded("lm_head") is True
@@ -99,3 +103,14 @@ def test_maybe_build_builds_for_recipe_when_no_active():
     cfg = nb.maybe_build_nvfp4_blockwise_config(nb.RECIPE, None)
     assert cfg is not None
     assert cfg.LinearMethodCls is ModelOptNvFp4W4A16LinearMethod
+
+
+@needs_w4a16
+def test_transformer_config_quant_recipe_builds_w4a16_config():
+    from vllm_omni.diffusion.data import TransformerConfig
+
+    tf_config = TransformerConfig.from_dict({"quant_recipe": nb.RECIPE})
+
+    assert tf_config.quant_config is not None
+    assert tf_config.quant_config.LinearMethodCls is ModelOptNvFp4W4A16LinearMethod
+    assert tf_config.quant_method == nb.RECIPE

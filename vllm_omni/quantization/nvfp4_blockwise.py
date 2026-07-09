@@ -13,8 +13,10 @@ requires:
 2. **target-inclusion** layer selection: vLLM's ``ModelOptNvFp4Config`` is
    exclusion-based ("quantize every Linear except ``exclude_modules``"), which
    for a selective checkpoint would need every non-target enumerated. We invert
-   it: quantize **only** ``...mlp.{gate,up,down}_proj``, leaving attention, embeddings, ``lm_head``,
-   norms, projections, audio and action modules BF16 (``UnquantizedLinearMethod``).
+   it: quantize **only** ``...mlp`` / ``...mlp_moe_gen``
+   ``.{gate,up,down}_proj``, leaving attention, embeddings, ``lm_head``,
+   norms, projections, audio and action modules BF16
+   (``UnquantizedLinearMethod``).
 
 The transformer's own ``config.json`` carries ``quant_recipe`` at top level (not
 in a nested ``quantization_config`` block), so model construction resolves
@@ -28,10 +30,11 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 RECIPE = "nvfp4_blockwise_mixed_v1"
-# Target modules end in ``.mlp.{gate,up,down}_proj``. Attention uses
+# Target modules end in ``.mlp`` / ``.mlp_moe_gen``
+# ``.{gate,up,down}_proj``. Attention uses
 # ``to_q``/``to_k``/``to_v``/``to_out``/``add_*_proj``; small projections,
 # embeddings, and heads stay unquantized.
-_TARGET_RE = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)$")
+_TARGET_RE = re.compile(r"\.(mlp|mlp_moe_gen)\.(gate_proj|up_proj|down_proj)$")
 
 
 def is_target_prefix(prefix: str) -> bool:
@@ -87,7 +90,7 @@ def build_nvfp4_blockwise_w4a16_config():
         )
     logger.info(
         "Built NVFP4 blockwise W4A16 config (recipe=%s): target-inclusion on "
-        "'.mlp.{gate,up,down}_proj', method=%s",
+        "'.mlp|.mlp_moe_gen.{gate,up,down}_proj', method=%s",
         RECIPE, cfg.LinearMethodCls.__name__,
     )
     return cfg

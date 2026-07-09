@@ -364,11 +364,9 @@ def test_detect_paths(tmp_path):
 
 
 def test_get_checkpoint_adapter_engages_without_quant_config(tmp_path, monkeypatch):
-    # default: W8A16-resident is now the DEFAULT for the fp8_blockwise checkpoint; the
-    # dequant-on-load native adapter is the explicit diagnostic fallback. Opt out so this
-    # test exercises the dequant adapter's sidecar-driven engagement (its intent). The
-    # default->W8A16 and opt-out->dequant routing is covered in test_modelopt_native_fp8_w8a16.
-    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", "1")
+    # Default route stays dequant-on-load; the resident W8A16 path is an explicit opt-in
+    # covered in test_modelopt_native_fp8_w8a16.
+    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", raising=False)
     root = _write_model_dir(tmp_path, _authoritative_sidecar())
     model = _TinyModel()
     adapter = get_checkpoint_adapter(

@@ -194,21 +194,11 @@ def test_probe_main_usage():
     assert mw8.main([]) == 2
 
 
-# --- recipe-gated dispatch (default: W8A16 default, dequant via opt-out) --------
+# --- recipe-gated dispatch (default: dequant, W8A16 via explicit opt-in) --------
 
 
-def test_dispatch_default_selects_w8a16(tmp_path, monkeypatch):
-    # No env flag needed: the fp8_blockwise recipe makes W8A16 the default.
-    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", raising=False)
-    root = _write_model_dir(tmp_path)
-    adapter = get_checkpoint_adapter(
-        torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True
-    )
-    assert isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
-
-
-def test_dispatch_opt_out_selects_dequant(tmp_path, monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", "1")
+def test_dispatch_default_selects_dequant(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", raising=False)
     root = _write_model_dir(tmp_path)
     adapter = get_checkpoint_adapter(
         torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True
@@ -217,10 +207,19 @@ def test_dispatch_opt_out_selects_dequant(tmp_path, monkeypatch):
     assert not isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
 
 
+def test_dispatch_opt_in_selects_w8a16(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
+    root = _write_model_dir(tmp_path)
+    adapter = get_checkpoint_adapter(
+        torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True
+    )
+    assert isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
+
+
 def test_dispatch_default_inert_without_fp8_sidecar(tmp_path, monkeypatch):
     # No FP8 sidecar (mirrors NVFP4-dist, which has no root quantization_config.json):
     # the recipe predicate is False, so W8A16 does not engage and NVFP4 is unaffected.
-    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", raising=False)
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
     root = tmp_path / "no_sidecar"
     (root / "transformer").mkdir(parents=True)
     adapter = get_checkpoint_adapter(

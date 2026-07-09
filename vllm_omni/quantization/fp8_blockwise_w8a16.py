@@ -16,13 +16,12 @@ for a normal BF16 GEMM (W8A16: weights FP8, activations BF16), reusing the teste
 non-target stay/become BF16 at compute. It mirrors the NVFP4 W4A16 structure
 (:mod:`vllm_omni.quantization.nvfp4_blockwise`).
 
-Selection is disk-recipe-gated: a checkpoint's ``transformer/config.json`` may carry no
-``quant_recipe`` (unlike NVFP4), but its root ``quantization_config.json`` declares
-``recipe: fp8_blockwise_mixed``. That disk signal, not an operator flag, makes W8A16 the
-**default** served path for the FP8-blockwise checkpoint; :func:`fp8_w8a16_selected` reads
-it, and the load dispatch consults the same predicate. The
-dequant-on-load path stays reachable as an explicit diagnostic fallback via
-``VLLM_OMNI_FP8_BLOCKWISE_DEQUANT=1``.
+Selection is opt-in and disk-recipe-gated: a checkpoint's
+``transformer/config.json`` may carry no ``quant_recipe`` (unlike NVFP4), but
+its root ``quantization_config.json`` declares ``recipe: fp8_blockwise_mixed``.
+``VLLM_OMNI_FP8_BLOCKWISE_W8A16=1`` enables this resident path only when that
+disk recipe matches. The dequant-on-load path remains the default until a fused
+or cached W8A16 kernel avoids per-forward full-weight dequantization.
 
 Pure calculation: :func:`is_target_prefix`. Disk selection reads the sidecar at
 the adapter/config boundary. Compute action at the GEMM boundary:
@@ -49,15 +48,15 @@ BLOCK = (128, 128)  # blockwise-128x128 (declared in quantization_config.json)
 # serve log proves the W8A16-resident path (not dequant-on-load) is engaged.
 W8A16_MARKER = "modelopt-fp8-blockwise-w8a16"
 
-# Explicit diagnostic opt-out: force the dequant-on-load fallback for the
-# FP8-blockwise checkpoint. W8A16 is the default for that checkpoint, so this
-# is the only knob needed.
-FP8_DEQUANT_FLAG = "VLLM_OMNI_FP8_BLOCKWISE_DEQUANT"
+# Explicit opt-in: the resident path saves weight memory but currently
+# dequantizes the full weight per forward, so the load-time dequant path stays
+# the default.
+FP8_W8A16_FLAG = "VLLM_OMNI_FP8_BLOCKWISE_W8A16"
 
 
-def fp8_dequant_forced() -> bool:
-    """True iff the diagnostic dequant opt-out env flag is set."""
-    return os.environ.get(FP8_DEQUANT_FLAG) == "1"
+def fp8_w8a16_forced() -> bool:
+    """True iff the explicit resident-W8A16 opt-in env flag is set."""
+    return os.environ.get(FP8_W8A16_FLAG) == "1"
 
 
 def _is_fp8_blockwise_dir(model_dir: str | None) -> bool:
@@ -91,10 +90,12 @@ def _is_fp8_blockwise_dir(model_dir: str | None) -> bool:
 
 
 def fp8_w8a16_selected(model_dir: str | None) -> bool:
-    """Single source of truth: serve the FP8-blockwise checkpoint W8A16-resident by
-    default, unless the diagnostic dequant opt-out is set.
+    """Single source of truth for the experimental FP8-blockwise W8A16 path.
+
+    The opt-in flag alone is insufficient: the checkpoint root must also carry
+    the expected FP8-blockwise recipe.
     """
-    return _is_fp8_blockwise_dir(model_dir) and not fp8_dequant_forced()
+    return fp8_w8a16_forced() and _is_fp8_blockwise_dir(model_dir)
 
 # Quantized MLP projections (``mlp.*`` and ``mlp_moe_gen.*``).
 # ``lm_head`` is deliberately excluded: it stays BF16 at compute; the
@@ -282,8 +283,7 @@ def build_fp8_blockwise_w8a16_config():
 def maybe_build_fp8_blockwise_w8a16_config(enabled, active_quant_config=None):
     """Return the W8A16 config when *enabled*, else *active_quant_config* unchanged.
 
-    *enabled* is the resolved :func:`fp8_w8a16_selected` decision (W8A16 is the default for
-    the FP8-blockwise checkpoint; the dequant opt-out yields False). Mirrors the intent of
+    *enabled* is the resolved :func:`fp8_w8a16_selected` decision. Mirrors the intent of
     :func:`vllm_omni.quantization.nvfp4_blockwise.maybe_build_nvfp4_blockwise_config`, but
     gated on the checkpoint's on-disk ``quantization_config.json`` recipe rather than a
     ``quant_recipe`` in ``transformer/config.json`` (which the FP8-dist checkpoint lacks).

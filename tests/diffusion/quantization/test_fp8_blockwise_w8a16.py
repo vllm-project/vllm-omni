@@ -104,29 +104,40 @@ def _sidecar_dir(root, recipe="fp8_blockwise_mixed"):
     return str(root)
 
 
-def test_fp8_dequant_forced(monkeypatch):
-    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", raising=False)
-    assert w8.fp8_dequant_forced() is False
-    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", "1")
-    assert w8.fp8_dequant_forced() is True
-    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", "0")  # only "1" opts out
-    assert w8.fp8_dequant_forced() is False
+def test_fp8_w8a16_forced(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", raising=False)
+    assert w8.fp8_w8a16_forced() is False
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
+    assert w8.fp8_w8a16_forced() is True
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "0")  # only "1" opts in
+    assert w8.fp8_w8a16_forced() is False
 
 
-def test_fp8_w8a16_selected_default_on_for_fp8_blockwise(tmp_path, monkeypatch):
-    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", raising=False)
-    # the fp8_blockwise recipe -> W8A16 is the default, no opt-in flag needed
-    assert w8.fp8_w8a16_selected(_sidecar_dir(tmp_path / "fp8")) is True
+def test_fp8_w8a16_selected_default_off_for_fp8_blockwise(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", raising=False)
+    assert w8.fp8_w8a16_selected(_sidecar_dir(tmp_path / "fp8")) is False
 
 
-def test_fp8_w8a16_selected_opt_out_forces_dequant(tmp_path, monkeypatch):
+def test_fp8_w8a16_selected_explicit_opt_in(tmp_path, monkeypatch):
     root = _sidecar_dir(tmp_path / "fp8")
-    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", "1")
-    assert w8.fp8_w8a16_selected(root) is False
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
+    assert w8.fp8_w8a16_selected(root) is True
+
+
+def test_omni_diffusion_config_opt_in_wires_fp8_w8a16(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+
+    root = _sidecar_dir(tmp_path / "fp8")
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
+
+    config = OmniDiffusionConfig(model=root, tf_model_config=TransformerConfig.from_dict({}))
+
+    assert config.quantization_config is not None
+    assert config.quantization_config.LinearMethodCls.__name__ == "Fp8BlockwiseW8A16LinearMethod"
 
 
 def test_fp8_w8a16_selected_declines_non_fp8_blockwise(tmp_path, monkeypatch):
-    monkeypatch.delenv("VLLM_OMNI_FP8_BLOCKWISE_DEQUANT", raising=False)
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
     # foreign recipe (mirrors NVFP4) -> declines (predicate is False, no raise here)
     assert w8.fp8_w8a16_selected(
         _sidecar_dir(tmp_path / "nv", recipe="nvfp4_blockwise_mixed_v1")

@@ -14,9 +14,9 @@ from .modelopt_native import ModelOptNativeFp8CheckpointAdapter
 from .modelopt_native_fp8_w8a16 import ModelOptNativeFp8W8A16CheckpointAdapter
 from .modelopt_native_nvfp4 import ModelOptNativeNvfp4CheckpointAdapter
 
-# Recipe-gated dispatch: an FP8-blockwise checkpoint is served W8A16-resident
-# by default, keyed on its root ``quantization_config.json`` recipe.
-# ``VLLM_OMNI_FP8_BLOCKWISE_DEQUANT=1`` forces the dequant-on-load path.
+# Recipe-gated dispatch: the FP8-blockwise resident W8A16 path is explicit
+# opt-in via ``VLLM_OMNI_FP8_BLOCKWISE_W8A16=1`` and still requires the root
+# ``quantization_config.json`` recipe. Load-time dequant remains the default.
 
 
 def _model_dtype(model: nn.Module) -> torch.dtype:
@@ -45,11 +45,10 @@ def get_checkpoint_adapter(
         # native adapters key off distinct sidecar filenames, so order is safe;
         # both must precede the generic quant_config-driven adapters below.
         #
-        # The FP8-blockwise checkpoint is served W8A16-resident by default
-        # (fp8_w8a16_selected reads the root quantization_config.json recipe). This must
-        # precede the dequant FP8 adapter (both key off the same sidecar). The predicate is
-        # False for the NVFP4 sidecar and when VLLM_OMNI_FP8_BLOCKWISE_DEQUANT=1, so NVFP4 is unaffected
-        # and the dequant fallback stays reachable.
+        # The optional FP8 W8A16 path must precede the dequant FP8 adapter
+        # because both key off the same sidecar. The predicate is false unless
+        # the explicit opt-in is set and the root recipe matches, so dequant is
+        # the default and NVFP4 is unaffected.
         if fp8_w8a16_selected(getattr(source, "model_or_path", None)):
             w8a16_adapter = ModelOptNativeFp8W8A16CheckpointAdapter.detect(
                 source, target_dtype=_model_dtype(model)
