@@ -210,3 +210,27 @@ class TestPhaseMask:
         proc._output_tokens[0] = []
         with pytest.raises(RuntimeError, match="phase token ids missing"):
             proc.apply(torch.zeros(1, VOCAB))
+
+
+class TestMaskSensitivity:
+    """The phase-validity check must catch what unmasked sampling produces.
+
+    This is the unit-level control for the e2e RVQ gate: the e2e cannot
+    disable the mask in-engine (a different logits-processor config needs a
+    second engine boot), so sensitivity is proven here against the official
+    validator semantics.
+    """
+
+    def test_unmasked_sampling_violates_phase_validity(self):
+        rng = torch.Generator().manual_seed(0)
+        # Uniform draws over the full 4096-codec space, as an unmasked
+        # sampler would produce: phase-invalid with overwhelming probability.
+        codes = torch.randint(0, 4096, (64,), generator=rng).tolist()
+        result = validate_rvq_phase(codes)
+        assert not result["phase_valid"]
+        assert result["mismatch_count"] > 0
+
+    def test_masked_construction_passes_validity(self):
+        # What the mask permits at each position: phase p codes only.
+        codes = [(i % 4) * XCODEC1_CODEBOOK_SIZE + (i * 7) % XCODEC1_CODEBOOK_SIZE for i in range(64)]
+        assert validate_rvq_phase(codes)["phase_valid"]

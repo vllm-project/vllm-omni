@@ -11,6 +11,7 @@ audio-modality TTS pass streams through the causal speech decoder.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,23 @@ pytestmark = [
     pytest.mark.slow,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
 ]
+
+
+def _normalize(text: str) -> list[str]:
+    return "".join(c.lower() if c.isalnum() or c.isspace() else " " for c in text).split()
+
+
+def _wer(hyp: str, ref: str) -> float:
+    hyp_words, ref_words = _normalize(hyp), _normalize(ref)
+    if not ref_words:
+        return 0.0
+    rows = list(range(len(hyp_words) + 1))
+    for i, ref_word in enumerate(ref_words, 1):
+        prev, rows[0] = rows[0], i
+        for j, hyp_word in enumerate(hyp_words, 1):
+            cur = min(rows[j] + 1, rows[j - 1] + 1, prev + (ref_word != hyp_word))
+            prev, rows[j] = rows[j], cur
+    return rows[-1] / len(ref_words)
 
 
 def _concat_audio(audio_val) -> np.ndarray:
@@ -91,18 +109,52 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
         assert answer, "Chat pass produced an empty answer"
 
     # Pass 3 — TTS (audio-final; streams through code2wav). Both final
-    # stages may emit an output record; the audio-bearing one must exist.
+    # stages may emit an output record; collect audio incrementally through
+    # the generator so time-to-first-audio can be measured.
     tts_text = answer if answer else "The weather is nice today."
-    tts_outputs = omni_runner.omni.generate([{"prompt": build_cond_prompt(tts_text[:200]), "modalities": ["audio"]}])
-    assert tts_outputs, "TTS pass returned no outputs"
-    speech = np.zeros((0,), dtype=np.float32)
-    for req_output in tts_outputs:
+    t_start = time.perf_counter()
+    first_audio_s: float | None = None
+    chunks: list[np.ndarray] = []
+    for req_output in omni_runner.omni.generate(
+        [{"prompt": build_cond_prompt(tts_text[:200]), "modalities": ["audio"]}],
+        py_generator=True,
+    ):
         mm = getattr(req_output, "multimodal_output", None) or {}
         if "audio" in mm:
-            speech = _concat_audio(mm["audio"])
-            break
+            piece = _concat_audio(mm["audio"])
+            if piece.size > 0:
+                if first_audio_s is None:
+                    first_audio_s = time.perf_counter() - t_start
+                chunks.append(piece)
+    speech = np.concatenate(chunks) if chunks else np.zeros((0,), dtype=np.float32)
     assert speech.size > 0, "TTS pass produced empty audio"
+    assert first_audio_s is not None
+    print(f"[trend] Audex S2S TTS-pass first-audio latency: {first_audio_s * 1000.0:.0f} ms")
 
     if real_weights:
         rms = float(np.sqrt(np.mean(np.square(speech))))
         assert rms > 1e-3, f"TTS-pass audio near-silent (rms={rms})"
+
+        # Pass 4 — output verification: transcribe the synthesized answer
+        # with the SAME deployment's ASR pass and compare to the answer
+        # text (self-contained; no external ASR dependency).
+        verify_outputs = omni_runner.omni.generate(
+            [
+                {
+                    "prompt": ASR_PROMPT,
+                    "multi_modal_data": {"audio": (speech, SAMPLE_RATE)},
+                    "modalities": ["text"],
+                }
+            ]
+        )
+        verify_text = (verify_outputs[0].outputs[0].text or "").strip()
+        assert verify_text, "Output-verification ASR pass returned empty text"
+        # The full checkpoint prefixes transcripts with a language-tag
+        # sentence and quotes the content; extract the quoted payload.
+        if "'" in verify_text and len(verify_text.split("'")) >= 3:
+            verify_text = verify_text.split("'")[1].strip()
+        wer = _wer(verify_text, tts_text)
+        # Hard gate: the synthesized WAV must transcribe back to the answer
+        # (lenient threshold absorbs ASR quoting/prefix differences).
+        assert wer <= 0.5, f"Output WAV does not match the answer (WER={wer:.2f}): {verify_text!r} vs {tts_text!r}"
+        print(f"[trend] Audex S2S output-ASR WER vs answer: {wer:.3f} ({verify_text!r})")
