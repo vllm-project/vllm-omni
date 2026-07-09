@@ -47,7 +47,18 @@ def parse_args():
 def _chat(base_url: str, model: str, messages: list[dict], max_tokens: int) -> str:
     resp = requests.post(
         f"{base_url}/v1/chat/completions",
-        json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.0},
+        json={
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            # Text-final passes must say so explicitly: without "modalities"
+            # the server falls back to the deployment's configured output
+            # modalities, which for the full pipeline include the audio final
+            # stage — routing ASR/chat through code2wav instead of stopping
+            # at stage 0.
+            "modalities": ["text"],
+        },
         timeout=300,
     )
     resp.raise_for_status()
