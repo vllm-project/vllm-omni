@@ -73,6 +73,31 @@ AUDEX_PIPELINE = PipelineConfig(
 # decoded over the full sequence, so this pipeline is sync full-payload only
 # (deploy yaml sets async_chunk: false). CFG is effectively mandatory for TTA
 # quality (official default scale 3.0).
+# Audio understanding (ASR / audio QA): single-stage deployment of the
+# audio-capable full checkpoint — speech (+ text instruction) in, text out.
+# Modeled on the ming_flash_omni / qwen2_5_omni thinker-only pipelines.
+AUDEX_THINKER_ONLY_PIPELINE = PipelineConfig(
+    model_type="nemotron_labs_audex_thinker_only",
+    model_arch="NemotronDenseAudexForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="audex_omni",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="text",
+            model_subdir="checkpoint_folder_full",
+            tokenizer_subdir="checkpoint_folder_full",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
+
 AUDEX_TTA_PIPELINE = PipelineConfig(
     model_type="nemotron_labs_audex_tta",
     model_arch="NemotronDenseForCausalLM",
@@ -102,6 +127,9 @@ AUDEX_TTA_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="AudexXCodec1",
+            # Length placeholder for the stage-1 request; the bulk codec
+            # payload ships via thinker2xcodec_full_payload.
+            sync_process_input_func=f"{_PROC}.thinker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
         ),
     ),
