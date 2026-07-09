@@ -1,0 +1,14 @@
+{
+  "description": "Audex full-checkpoint TTS-pass CER anchor. Gate: CER <= anchor + 2pp on subsequent full-weight runs, measured by examples/offline_inference/speech_to_speech/audex/tts_cer_gate.py --check-asr-log over a transcribe-tts-output-style log of the generated corpus.",
+  "corpus": "tests/assets/audex/texts_en24.tsv",
+  "corpus_clips": 24,
+  "asr": "transcribe-tts-output skill (sherpa-onnx paraformer-zh) transcripts; CER computed by the gate script's own normalization",
+  "pipeline": "nemotron_labs_audex_full",
+  "deploy_config": "vllm_omni/deploy/nemotron_labs_audex_full.yaml",
+  "anchor_cer_percent": 7.95,
+  "anchor_edits": 110,
+  "anchor_ref_chars": 1384,
+  "gate_cer_percent": 9.95,
+  "reference_skill_cer_percent": 7.24,
+  "measured": "2026-07-08, 1x H100, vLLM 0.24.0, seed 0, sequential (batch 1)"
+}
