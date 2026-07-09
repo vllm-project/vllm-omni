@@ -35,14 +35,6 @@ logger = init_logger(__name__)
 _DEFAULT_MAX_TTA_FRAMES = 500
 
 
-def _meta_bool(value: Any) -> bool:
-    if isinstance(value, torch.Tensor):
-        return bool(value.reshape(-1)[0].item()) if value.numel() else False
-    if isinstance(value, list | tuple):
-        return _meta_bool(value[0]) if value else False
-    return bool(value)
-
-
 def _meta_str(value: Any) -> str | None:
     if isinstance(value, list | tuple):
         return _meta_str(value[0]) if value else None

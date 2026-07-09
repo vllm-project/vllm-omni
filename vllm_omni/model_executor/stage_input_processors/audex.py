@@ -65,6 +65,32 @@ def _codec_frames(tokens: list[int], codec_offset: int, codec_size: int) -> list
     return [int(t) - codec_offset for t in tokens if codec_offset <= int(t) < codec_offset + codec_size]
 
 
+def _finished_meta(request_id: Any) -> dict[str, Any]:
+    """Terminal-payload meta shared by the sync full-payload producers."""
+    return {
+        "finished": torch.tensor(True, dtype=torch.bool),
+        "req_id": [request_id],
+    }
+
+
+def _finished_request_codes(
+    transfer_manager: Any,
+    request: Any,
+    offset_key: str,
+    size_key: str,
+    default_offset: int,
+    default_size: int,
+) -> tuple[list[int], Any]:
+    """Codec frame ids from a finished request's full token stream, plus its id."""
+    cfg = _connector_extra(transfer_manager)
+    codec_offset = int(cfg.get(offset_key, default_offset))
+    codec_size = int(cfg.get(size_key, default_size))
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
+    codes = _codec_frames(output_token_ids, codec_offset, codec_size)
+    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    return codes, request_id
+
+
 def _empty_finished_payload(request_id: Any, codebooks: int) -> dict[str, Any]:
     """Terminal payload for a failed request on the sync full-payload path.
 
@@ -74,10 +100,7 @@ def _empty_finished_payload(request_id: Any, codebooks: int) -> dict[str, Any]:
     """
     return {
         "codes": {"audio": torch.empty((0, codebooks), dtype=torch.long)},
-        "meta": {
-            "finished": torch.tensor(True, dtype=torch.bool),
-            "req_id": [request_id],
-        },
+        "meta": _finished_meta(request_id),
     }
 
 
@@ -231,13 +254,14 @@ def thinker2code2wav_full_payload(
 ) -> dict[str, Any] | None:
     """Sync-path producer: ship the full codec sequence once at finish."""
     del pooling_output  # thinker emits none; codes come from the token stream
-    cfg = _connector_extra(transfer_manager)
-    codec_offset = int(cfg.get("codec_token_offset", _DEFAULT_CODEC_TOKEN_OFFSET))
-    codec_size = int(cfg.get("codec_vocab_size", _DEFAULT_CODEC_VOCAB_SIZE))
-
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
-    codes = _codec_frames(output_token_ids, codec_offset, codec_size)
-    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    codes, request_id = _finished_request_codes(
+        transfer_manager,
+        request,
+        "codec_token_offset",
+        "codec_vocab_size",
+        _DEFAULT_CODEC_TOKEN_OFFSET,
+        _DEFAULT_CODEC_VOCAB_SIZE,
+    )
     if not codes:
         # Do NOT raise: the sync payload hook swallows exceptions and returns
         # None, so no terminal payload would reach stage 1 and the request
@@ -247,13 +271,7 @@ def thinker2code2wav_full_payload(
             "Audex thinker produced no codec tokens for request %s; sending empty terminal payload", request_id
         )
         return _empty_finished_payload(request_id, codebooks=1)
-    return {
-        "codes": {"audio": codes},
-        "meta": {
-            "finished": torch.tensor(True, dtype=torch.bool),
-            "req_id": [request_id],
-        },
-    }
+    return {"codes": {"audio": codes}, "meta": _finished_meta(request_id)}
 
 
 def thinker2xcodec_full_payload(
@@ -268,13 +286,14 @@ def thinker2xcodec_full_payload(
     subtracted; the XCodec1 stage removes the per-layer offset).
     """
     del pooling_output  # thinker emits none; codes come from the token stream
-    cfg = _connector_extra(transfer_manager)
-    codec_offset = int(cfg.get("audiocodec_token_offset", _DEFAULT_AUDIOCODEC_TOKEN_OFFSET))
-    codec_size = int(cfg.get("audiocodec_vocab_size", _DEFAULT_AUDIOCODEC_VOCAB_SIZE))
-
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
-    codes = _codec_frames(output_token_ids, codec_offset, codec_size)
-    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    codes, request_id = _finished_request_codes(
+        transfer_manager,
+        request,
+        "audiocodec_token_offset",
+        "audiocodec_vocab_size",
+        _DEFAULT_AUDIOCODEC_TOKEN_OFFSET,
+        _DEFAULT_AUDIOCODEC_VOCAB_SIZE,
+    )
     # Error paths do NOT raise: the sync payload hook swallows exceptions and
     # returns None, so no terminal payload would reach stage 1 and the
     # request would stall. An empty FINISHED payload lets stage 1 complete
@@ -310,13 +329,7 @@ def thinker2xcodec_full_payload(
         return _empty_finished_payload(request_id, codebooks=_TTA_NUM_CODEBOOKS)
 
     frames = torch.tensor(codes[:usable], dtype=torch.long).reshape(-1, _TTA_NUM_CODEBOOKS)
-    return {
-        "codes": {"audio": frames},
-        "meta": {
-            "finished": torch.tensor(True, dtype=torch.bool),
-            "req_id": [request_id],
-        },
-    }
+    return {"codes": {"audio": frames}, "meta": _finished_meta(request_id)}
 
 
 def thinker2code2wav_token_only(
