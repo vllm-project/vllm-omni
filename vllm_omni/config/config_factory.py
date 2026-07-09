@@ -267,6 +267,12 @@ class StageConfigFactory:
 
     @staticmethod
     def _get_default_deploy_key(model_type: str | None, pipeline_cfg: PipelineConfig) -> str:
+        """Use the resolved pipeline key when HF reports an unregistered type.
+
+        For example, MiMo Audio reports ``model_type="qwen2"`` but resolves
+        through its HF architecture to the ``mimo_audio`` pipeline and deploy
+        config.
+        """
         if model_type in OMNI_PIPELINES:
             return model_type
         return pipeline_cfg.model_type
