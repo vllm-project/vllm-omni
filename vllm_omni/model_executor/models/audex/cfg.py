@@ -213,12 +213,21 @@ def _wait_queues(scheduler: Any) -> list[Any]:
     return queues
 
 
-def _pair_complete(scheduler: Any, request_id: str) -> bool:
+def _pair_complete(scheduler: Any, request_id: str, blocked_ids: set[str] | None = None) -> bool:
     pair_id = scheduler._cfg_req_to_pair.get(request_id)
     if pair_id is None:
         return True
     roles = scheduler._cfg_pairs.get(pair_id, {})
-    return len(roles) == 2 and all(rid in scheduler.requests for rid in roles.values())
+    if len(roles) != 2 or not all(rid in scheduler.requests for rid in roles.values()):
+        return False
+    if blocked_ids:
+        # A partner parked in skipped_waiting (e.g. waiting for remote KVs)
+        # may fail promotion this step while this member gets scheduled from
+        # waiting — hold this member until the partner is schedulable.
+        for rid in roles.values():
+            if rid != request_id and rid in blocked_ids:
+                return False
+    return True
 
 
 # Schedule steps a lone pair member may wait for its partner. Partners arrive
@@ -253,11 +262,17 @@ def _hold_incomplete_pairs(scheduler: Any) -> list[tuple[Any, Any]]:
     hold_counts: dict[str, int] = getattr(scheduler, "_cfg_hold_counts", None) or {}
     scheduler._cfg_hold_counts = hold_counts
 
+    skipped = getattr(scheduler, "skipped_waiting", None)
+    blocked_ids = {req.request_id for req in list(skipped)} if skipped is not None else set()
+
     held: list[tuple[Any, Any]] = []
     for queue in _wait_queues(scheduler):
+        # A member is only "blocked" for its partner's sake when it sits in
+        # the OTHER queue; members of the queue being scanned move together.
+        partner_blockers = blocked_ids if queue is not skipped else set()
         held_here = []
         for request in list(queue):
-            if _pair_complete(scheduler, request.request_id):
+            if _pair_complete(scheduler, request.request_id, partner_blockers):
                 hold_counts.pop(request.request_id, None)
                 continue
             count = hold_counts.get(request.request_id, 0) + 1
@@ -366,18 +381,22 @@ def _equalize_cfg_pair_progress(scheduler: Any, scheduler_output: Any) -> None:
                 )
 
 
-def _warn_split_pairs(scheduler: Any) -> None:
-    """Detect a desynced CFG pair (one running without the other / uneven progress).
+def _drop_split_pairs(scheduler: Any) -> None:
+    """Deregister a desynced CFG pair (one member preempted / left behind).
 
-    Manual re-preemption surgery is unsafe against the upstream scheduler,
-    so this is a detection-and-log guard; ``_hold_incomplete_pairs`` and
-    ``_equalize_cfg_pair_progress`` prevent the split in practice.
+    Manual re-preemption surgery is unsafe against the upstream scheduler.
+    Instead, a pair that split anyway (KV-pressure preemption of exactly one
+    member, or unrecoverable progress skew) is dropped from the registry:
+    the cond request continues UNGUIDED (its logits are never blended again)
+    rather than being re-paired against a desynced partner, and the
+    companion's discarded output no longer matters.
     """
     if not scheduler._cfg_pairs:
         return
 
     running_ids = {req.request_id for req in scheduler.running}
-    for roles in scheduler._cfg_pairs.values():
+    to_drop: list[tuple[str, str, str, str]] = []
+    for pair_id, roles in scheduler._cfg_pairs.items():
         cond_id = roles.get(_COND)
         uncond_id = roles.get(_UNCOND)
         if cond_id is None or uncond_id is None:
@@ -388,7 +407,11 @@ def _warn_split_pairs(scheduler: Any) -> None:
         cond_running = cond_id in running_ids
         uncond_running = uncond_id in running_ids
         if cond_running != uncond_running:
-            logger.warning("CFG pair split detected (cond=%s uncond=%s)", cond_id, uncond_id)
+            # Split only counts once decoding started: a lone member that has
+            # computed tokens while its partner was pushed back is desynced.
+            runner = scheduler.requests.get(cond_id if cond_running else uncond_id)
+            if runner is not None and runner.num_computed_tokens > 0:
+                to_drop.append((pair_id, cond_id, uncond_id, "one member preempted"))
             continue
 
         if cond_running and uncond_running:
@@ -396,12 +419,24 @@ def _warn_split_pairs(scheduler: Any) -> None:
             uncond_req = scheduler.requests.get(uncond_id)
             if cond_req and uncond_req and cond_req.num_computed_tokens != uncond_req.num_computed_tokens:
                 logger.warning(
-                    "CFG pair progress mismatch: %s@%d vs %s@%d",
+                    "CFG pair progress mismatch (equalize will retry): %s@%d vs %s@%d",
                     cond_id,
                     cond_req.num_computed_tokens,
                     uncond_id,
                     uncond_req.num_computed_tokens,
                 )
+
+    for pair_id, cond_id, uncond_id, reason in to_drop:
+        scheduler._cfg_pairs.pop(pair_id, None)
+        scheduler._cfg_req_to_pair.pop(cond_id, None)
+        scheduler._cfg_req_to_pair.pop(uncond_id, None)
+        logger.warning(
+            "CFG pair %s split (%s); releasing cond=%s unguided, uncond=%s output is discarded",
+            pair_id,
+            reason,
+            cond_id,
+            uncond_id,
+        )
 
 
 _patches_applied = False
@@ -432,6 +467,12 @@ def _patch_scheduler() -> None:
         if pair_id and role:
             self._cfg_pairs.setdefault(pair_id, {})[role] = request.request_id
             self._cfg_req_to_pair[request.request_id] = pair_id
+            # An asymmetric prefix-cache hit (the cond prompt shares cached
+            # branches; the <unk> null prompt does not) can advance one
+            # member past what post-schedule equalization can claw back.
+            # Skip prefix-cache reads for CFG requests entirely.
+            if hasattr(request, "skip_reading_prefix_cache"):
+                request.skip_reading_prefix_cache = True
 
     def _finish(self, request_ids: Any, finished_status: Any) -> Any:
         if request_ids is None:
@@ -487,7 +528,7 @@ def _patch_scheduler() -> None:
             _release_held(held)
 
         _equalize_cfg_pair_progress(self, scheduler_output)
-        _warn_split_pairs(self)
+        _drop_split_pairs(self)
         return scheduler_output
 
     _schedule._audex_cfg_patched = True  # type: ignore[attr-defined]

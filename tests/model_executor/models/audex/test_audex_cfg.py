@@ -342,3 +342,43 @@ class TestApplyPatches:
 
     def test_module_flag_tracks_state(self):
         assert audex_cfg._patches_applied == cfg_patches_applied()
+
+
+class TestReviewHardening:
+    """Fixes from the adversarial 0.24 scheduler review."""
+
+    def test_partner_in_skipped_waiting_holds_waiting_member(self):
+        cond, uncond = _fake_request("c"), _fake_request("u")
+        scheduler = _fake_scheduler({"p0": {"cond": "c", "uncond": "u"}}, {"c": cond, "u": uncond})
+        scheduler.waiting.append(cond)
+        scheduler.skipped_waiting.append(uncond)
+
+        held = _hold_incomplete_pairs(scheduler)
+
+        held_ids = {req.request_id for _, req in held}
+        assert "c" in held_ids, "waiting member must hold while its partner is parked in skipped_waiting"
+
+    def test_split_pair_dropped_and_released_unguided(self):
+        from vllm_omni.model_executor.models.audex.cfg import _drop_split_pairs
+
+        cond = _fake_request("c", num_computed_tokens=40)
+        uncond = _fake_request("u", num_computed_tokens=0)
+        scheduler = _fake_scheduler({"p0": {"cond": "c", "uncond": "u"}}, {"c": cond, "u": uncond})
+        scheduler.running = [cond]  # uncond preempted back to waiting
+
+        _drop_split_pairs(scheduler)
+
+        assert scheduler._cfg_pairs == {}
+        assert scheduler._cfg_req_to_pair == {}
+
+    def test_prefill_only_split_not_dropped(self):
+        from vllm_omni.model_executor.models.audex.cfg import _drop_split_pairs
+
+        cond = _fake_request("c", num_computed_tokens=0)
+        uncond = _fake_request("u", num_computed_tokens=0)
+        scheduler = _fake_scheduler({"p0": {"cond": "c", "uncond": "u"}}, {"c": cond, "u": uncond})
+        scheduler.running = [cond]  # partner merely not admitted yet
+
+        _drop_split_pairs(scheduler)
+
+        assert "p0" in scheduler._cfg_pairs
