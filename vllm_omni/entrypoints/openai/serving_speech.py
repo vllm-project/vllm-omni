@@ -676,12 +676,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _find_tts_stage(self):
         """Find and return the TTS stage config, or None if not found."""
+        all_stages = {getattr(stage.engine_args, "model_stage", None) for stage in self.engine_client.stage_configs}
         for stage in self.engine_client.stage_configs:
             engine_args = stage.engine_args
             model_stage = engine_args.model_stage
             model_arch = getattr(engine_args, "model_arch", None)
             worker_type = getattr(engine_args, "worker_type", None)
             if model_stage in _TTS_MODEL_STAGES:
+                # The audio-capable Audex thinker is only speech-capable when
+                # deployed WITH the speech decoder (nemotron_labs_audex_full);
+                # the thinker-only deployment is text-final and must not
+                # accept /v1/audio/speech requests.
+                if model_stage == "audex_omni" and "audex_code2wav" not in all_stages:
+                    continue
                 return stage
             # Ming dense identifies its AR entry stage by architecture because
             # it does not use a dedicated TTS model_stage value.

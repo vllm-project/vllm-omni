@@ -191,3 +191,28 @@ class TestAudexCfgInjection:
         params = SimpleNamespace(extra_args={"cfg_scale": 1.5})
         with pytest.raises(ValueError, match="adapter-built text prompt"):
             serving._inject_audex_cfg_pair_args("req-1", {"prompt_token_ids": [1]}, params)
+
+
+class TestAudexStageDetection:
+    """audex_omni is speech-capable only alongside the speech decoder."""
+
+    def _serving_with_stages(self, stages: list[str]) -> OmniOpenAIServingSpeech:
+        serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+        serving.engine_client = SimpleNamespace(
+            stage_configs=[SimpleNamespace(engine_args=SimpleNamespace(model_stage=s)) for s in stages]
+        )
+        return serving
+
+    def test_full_pipeline_detected_as_tts(self):
+        serving = self._serving_with_stages(["audex_omni", "audex_code2wav"])
+        stage = serving._find_tts_stage()
+        assert stage is not None and stage.engine_args.model_stage == "audex_omni"
+
+    def test_thinker_only_not_detected_as_tts(self):
+        serving = self._serving_with_stages(["audex_omni"])
+        assert serving._find_tts_stage() is None
+
+    def test_tts_pipeline_still_detected(self):
+        serving = self._serving_with_stages(["audex_thinker", "audex_code2wav"])
+        stage = serving._find_tts_stage()
+        assert stage is not None and stage.engine_args.model_stage == "audex_thinker"

@@ -739,9 +739,10 @@ def build_engine_args_dict(
             audex_profile = "tts"
         model = ensure_audex_snapshot(model, profile=audex_profile)
     model = _resolve_model_tokenizer_paths(model, engine_args_dict)
-    if engine_args_dict.get("model_stage") == "audex_thinker":
+    if engine_args_dict.get("model_stage") in ("audex_thinker", "audex_tta_thinker"):
         # Audex ships its thinker weights deduplicated into a sibling folder;
-        # replicate the official prepare-script symlink on first use.
+        # replicate the official prepare-script symlink on first use. The TTA
+        # thinker loads the same checkpoint_folder_audiogen checkpoint.
         from vllm_omni.model_executor.models.audex.checkpoint import ensure_audiogen_weights
 
         ensure_audiogen_weights(model)

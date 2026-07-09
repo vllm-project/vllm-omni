@@ -75,8 +75,17 @@ def main():
         )
 
     outputs = engine.generate(prompts)
-    by_request = {str(o.request_id): o for o in outputs}
-    ordered = [by_request[k] for k in sorted(by_request)]
+
+    # Outputs may return out of submission order; the numeric request-id
+    # prefix follows submission order (lexicographic sort would misplace
+    # "10_..." before "2_...").
+    def _req_index(req_output) -> int:
+        import re as _re
+
+        match = _re.search(r"(\d+)", str(req_output.request_id))
+        return int(match.group(1)) if match else 0
+
+    ordered = sorted(outputs, key=_req_index)
     for path, req_output in zip(args.audio_files, ordered):
         text = req_output.outputs[0].text if req_output.outputs else ""
         print(f"{Path(path).name}: {text.strip()}")
