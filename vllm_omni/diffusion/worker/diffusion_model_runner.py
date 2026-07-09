@@ -39,7 +39,15 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
+from vllm_omni.diffusion.worker.utils import (
+    BatchRunnerOutput,
+    DiffusionRequestState,
+    RunnerOutput,
+    attach_stage_durations,
+    clear_pipeline_stage_durations,
+    consume_pipeline_stage_durations,
+    merge_stage_durations,
+)
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -487,6 +495,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return self._runner_output_from_outputs(reqs, outputs)
 
+    def _attach_stepwise_metrics(
+        self,
+        state: DiffusionRequestState,
+        output: DiffusionOutput,
+        *,
+        is_primary: bool,
+    ) -> None:
+        merge_stage_durations(
+            state,
+            consume_pipeline_stage_durations(self.pipeline),
+        )
+        attach_stage_durations(state, output)
+
     def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -601,8 +622,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     else:
                         gen_device = self.device
                     state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                clear_pipeline_stage_durations(self.pipeline)
                 # encode
                 self.pipeline.prepare_encode(state)
+                merge_stage_durations(
+                    state,
+                    consume_pipeline_stage_durations(self.pipeline),
+                )
 
         input_batch = InputBatch.make_batch(
             states,
@@ -658,19 +684,27 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
+            had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
+            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
+                current_omni_platform.reset_peak_memory_stats()
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = self._prepare_attn_metadata(input_batch)
-            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if is_primary:
-                current_omni_platform.reset_peak_memory_stats()
 
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
+                clear_pipeline_stage_durations(self.pipeline)
                 noise_pred = self.pipeline.denoise_step(input_batch, states=states)
+                denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
+                for state in states:
+                    merge_stage_durations(
+                        state,
+                        denoise_stage_durations,
+                    )
 
                 runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
@@ -693,14 +727,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             self.pipeline.step_scheduler(
                                 req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                             )
-                            offset = offset + row_num
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed
                             else:
                                 should_decode = req.denoise_completed
 
                             if should_decode:
+                                clear_pipeline_stage_durations(self.pipeline)
                                 result = self.pipeline.post_decode(req)
+                                if result is not None:
+                                    self._attach_stepwise_metrics(
+                                        req,
+                                        result,
+                                        is_primary=is_primary,
+                                    )
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index
@@ -717,6 +757,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                     result=result,
                                 )
                             )
+                            offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
                             logger.error(
