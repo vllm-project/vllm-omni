@@ -269,16 +269,10 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             torch_dtype=transformer_dtype,
             local_files_only=local_files_only,
         ).to(self.device)
-        attn_implementation = os.environ.get(
-            "LINGBOT_QWEN_ATTN_IMPLEMENTATION",
-            str(model_config.get("qwen_attn_implementation", "sdpa")),
-        )
         text_encoder_kwargs: dict[str, Any] = {
             "dtype": text_encoder_dtype,
             "local_files_only": local_files_only,
         }
-        if attn_implementation:
-            text_encoder_kwargs["attn_implementation"] = attn_implementation
         self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
             model,
             subfolder=text_encoder_subfolder,

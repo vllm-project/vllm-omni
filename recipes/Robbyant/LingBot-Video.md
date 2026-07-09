@@ -45,7 +45,7 @@ resolution/frame count if your target workload runs out of memory.
 #### Offline T2V
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 LINGBOT_QWEN_ATTN_IMPLEMENTATION=sdpa \
+CUDA_VISIBLE_DEVICES=0 \
 python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
   --model robbyant/lingbot-video-dense-1.3b \
   --prompt "a robotic arm picks up a red block" \
@@ -63,7 +63,7 @@ python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
 #### Online Serving
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 LINGBOT_QWEN_ATTN_IMPLEMENTATION=sdpa \
+CUDA_VISIBLE_DEVICES=0 \
 vllm serve robbyant/lingbot-video-dense-1.3b \
   --omni \
   --model-class-name LingBotVideoPipeline \
