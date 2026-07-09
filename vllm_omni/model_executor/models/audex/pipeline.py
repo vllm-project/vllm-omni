@@ -73,6 +73,56 @@ AUDEX_PIPELINE = PipelineConfig(
 # decoded over the full sequence, so this pipeline is sync full-payload only
 # (deploy yaml sets async_chunk: false). CFG is effectively mandatory for TTA
 # quality (official default scale 3.0).
+# Cascaded speech-to-speech: the audio-capable full checkpoint serves all
+# three official passes (ASR → chat → TTS) in one deployment; only the TTS
+# pass (output modality "audio", final_stage_id 1) traverses the streaming
+# speech decoder — text-modality passes finish at stage 0 and never reach
+# the codec path. The cascade itself is orchestrated by the client/example.
+AUDEX_FULL_PIPELINE = PipelineConfig(
+    model_type="nemotron_labs_audex_full",
+    model_arch="NemotronDenseAudexForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="audex_omni",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="latent",
+            model_subdir="checkpoint_folder_full",
+            tokenizer_subdir="checkpoint_folder_full",
+            prompt_expand_func=f"{_PROC}.expand_cfg_prompts",
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.thinker2code2wav_async_chunk"),
+            custom_process_next_stage_input_func=f"{_PROC}.thinker2code2wav_full_payload",
+            # <speechgen_end> additionally stops the TTS pass; text passes
+            # stop at their natural eos first. detokenize stays on for the
+            # text-final passes.
+            sampling_constraints={
+                "detokenize": True,
+                "stop_token_ids": [AUDEX_SPEECHGEN_END_TOKEN_ID],
+            },
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="audex_code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="AudexCode2Wav",
+            model_subdir="audex_causal_speech_decoder",
+            tokenizer_subdir="checkpoint_folder_full",
+            sync_process_input_func=f"{_PROC}.thinker2code2wav_token_only",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
+
 # Audio understanding (ASR / audio QA): single-stage deployment of the
 # audio-capable full checkpoint — speech (+ text instruction) in, text out.
 # Modeled on the ming_flash_omni / qwen2_5_omni thinker-only pipelines.

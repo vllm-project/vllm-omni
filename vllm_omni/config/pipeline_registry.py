@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.model_executor.models.audex.pipeline import (
+    AUDEX_FULL_PIPELINE,
     AUDEX_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
     AUDEX_TTA_PIPELINE,
@@ -120,6 +121,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "nemotron_labs_audex": AUDEX_PIPELINE,
     "nemotron_labs_audex_tta": AUDEX_TTA_PIPELINE,
     "nemotron_labs_audex_thinker_only": AUDEX_THINKER_ONLY_PIPELINE,
+    "nemotron_labs_audex_full": AUDEX_FULL_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,
     "ming_tts": MING_TTS_PIPELINE,
     "ming_tts_moe": MING_TTS_MOE_PIPELINE,

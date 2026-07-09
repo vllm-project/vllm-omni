@@ -105,9 +105,69 @@ def test_audex_tts_request_policies(omni_server, openai_client) -> None:
     for bad_payload, needle in (
         ({"input": PROMPT, "voice": "alloy"}, "voice"),
         ({"input": "   "}, "non-empty"),
-        ({"input": PROMPT, "extra_params": {"cfg_scale": 1.5}}, "cfg_scale"),
+        ({"input": PROMPT, "extra_params": {"cfg_scale": 0.5}}, "cfg_scale"),
+        ({"input": PROMPT, "extra_params": {"cfg_scale": 10.5}}, "cfg_scale"),
+        ({"input": PROMPT, "extra_params": {"cfg_scale": "big"}}, "cfg_scale"),
+        ({"input": PROMPT, "extra_params": {"cfg_role": "cond"}}, "cfg_role"),
+        ({"input": PROMPT, "extra_params": {"cfg_pair_id": "x"}}, "cfg_pair_id"),
         ({"input": PROMPT, "ref_audio": "https://example.com/ref.wav"}, "reference audio"),
     ):
         resp = requests.post(url, json={"model": omni_server.model, **bad_payload})
         assert resp.status_code == 400, f"{bad_payload} -> {resp.status_code}: {resp.text[:200]}"
         assert needle in resp.text, f"{bad_payload} error missing {needle!r}: {resp.text[:200]}"
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
+def test_audex_tts_cfg_nonstream(omni_server, openai_client) -> None:
+    """Guided (cfg_scale=1.5) non-streaming request returns one WAV."""
+    request_config = {
+        "model": omni_server.model,
+        "input": PROMPT,
+        "stream": False,
+        "response_format": "wav",
+        "extra_params": {"cfg_scale": 1.5},
+    }
+    openai_client.send_audio_speech_request(request_config)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
+def test_audex_tts_cfg_stream_audio(omni_server, openai_client) -> None:
+    """Guided (cfg_scale=1.5) streaming request yields a single audio stream."""
+    request_config = {
+        "model": omni_server.model,
+        "input": PROMPT,
+        "stream": True,
+        "stream_format": "audio",
+        "response_format": "wav",
+        "extra_params": {"cfg_scale": 1.5},
+    }
+    openai_client.send_audio_speech_request(request_config)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", audex_server_params, indirect=True)
+def test_audex_tts_mixed_cfg_concurrency(omni_server, openai_client) -> None:
+    """Mixed guided/unguided requests at concurrency 4 all complete with audio."""
+    import concurrent.futures
+
+    import requests
+
+    url = f"{openai_client.base_url.rstrip('/')}/v1/audio/speech"
+    payloads = [
+        {"model": omni_server.model, "input": f"{PROMPT} Take {i}.", "response_format": "wav"}
+        | ({"extra_params": {"cfg_scale": 1.5}} if i % 2 == 0 else {})
+        for i in range(4)
+    ]
+
+    def _post(payload):
+        return requests.post(url, json=payload, timeout=300)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(_post, payloads))
+
+    for payload, resp in zip(payloads, responses):
+        assert resp.status_code == 200, f"{payload} -> {resp.status_code}: {resp.text[:200]}"
+        assert resp.content[:4] == b"RIFF", f"{payload}: not a WAV response"
+        assert len(resp.content) > 44, f"{payload}: empty audio body"
