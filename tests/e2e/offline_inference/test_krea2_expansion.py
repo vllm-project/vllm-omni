@@ -65,6 +65,19 @@ def test_krea2_layerwise_offload(omni_runner_handler: OmniRunnerHandler) -> None
     omni_runner_handler.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
 
 
+@hardware_test(res={"cuda": "H100"})
+@pytest.mark.cache
+@pytest.mark.parametrize("omni_runner", [(MODEL, None, {"cache_backend": "cache_dit"})], indirect=True)
+def test_krea2_cache_dit(omni_runner_handler: OmniRunnerHandler) -> None:
+    """Exercise Cache-DiT on Krea 2 via the custom Krea2Pipeline enabler (``enable_cache_for_krea2``).
+
+    Validates the docs' Cache-DiT support claim for Krea 2. ``has_separate_cfg`` is checkpoint-aware
+    (False for the distilled Turbo no-CFG path, True for the Raw CFG path); the default Turbo checkpoint
+    exercises the no-CFG branch.
+    """
+    omni_runner_handler.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
+
+
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize(
     "omni_runner",
