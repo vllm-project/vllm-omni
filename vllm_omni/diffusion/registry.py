@@ -256,6 +256,11 @@ _DIFFUSION_MODELS = {
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
     ),
+    "LingBotVideoPipeline": (
+        "lingbot_video",
+        "pipeline_lingbot_video",
+        "LingBotVideoPipeline",
+    ),
     "MagiHumanPipeline": (
         "magi_human",
         "pipeline_magi_human",
@@ -526,6 +531,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",

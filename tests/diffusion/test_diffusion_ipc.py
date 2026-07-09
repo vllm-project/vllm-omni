@@ -3,6 +3,7 @@
 
 import contextlib
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,7 +26,7 @@ def _large_numel(dtype: torch.dtype) -> int:
 
 
 def _cleanup_shm_handle(value: object) -> None:
-    if isinstance(value, dict) and value.get("__tensor_shm__"):
+    if isinstance(value, dict) and (value.get("__tensor_shm__") or value.get("__ndarray_shm__")):
         with contextlib.suppress(FileNotFoundError):
             _unpack_if_shm_handle(value)
 
@@ -143,6 +144,14 @@ def test_pack_value_keeps_tensor_at_threshold_inline() -> None:
     assert packed is tensor
 
 
+def test_pack_value_keeps_array_at_threshold_inline() -> None:
+    array = np.arange(_SHM_TENSOR_THRESHOLD, dtype=np.uint8)
+
+    packed = _pack_value_if_large(array)
+
+    assert packed is array
+
+
 def test_pack_value_packs_large_tensor_and_round_trips() -> None:
     tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
     packed = _pack_value_if_large(tensor)
@@ -158,6 +167,42 @@ def test_pack_value_packs_large_tensor_and_round_trips() -> None:
         torch.testing.assert_close(unpacked, tensor)
     finally:
         _cleanup_shm_handle(packed)
+
+
+def test_pack_value_packs_large_array_and_round_trips() -> None:
+    array = np.arange(_SHM_TENSOR_THRESHOLD + 1, dtype=np.uint8).reshape(1, -1)
+    packed = _pack_value_if_large(array)
+
+    try:
+        assert isinstance(packed, dict)
+        assert packed["__ndarray_shm__"] is True
+        assert packed["shape"] == list(array.shape)
+        assert packed["numpy_dtype"] == "uint8"
+
+        unpacked = _unpack_if_shm_handle(packed)
+        assert isinstance(unpacked, np.ndarray)
+        np.testing.assert_array_equal(unpacked, array)
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+def test_diffusion_output_list_arrays_round_trip_through_shm() -> None:
+    frames = [
+        np.arange(_SHM_TENSOR_THRESHOLD + 1, dtype=np.uint8),
+        np.arange(_SHM_TENSOR_THRESHOLD + 1, dtype=np.uint8) + 1,
+    ]
+    output = DiffusionOutput(output=list(frames))
+
+    pack_diffusion_output_shm(output)
+
+    assert isinstance(output.output, list)
+    assert all(isinstance(item, dict) and item["__ndarray_shm__"] is True for item in output.output)
+
+    unpack_diffusion_output_shm(output)
+
+    assert isinstance(output.output, list)
+    np.testing.assert_array_equal(output.output[0], frames[0])
+    np.testing.assert_array_equal(output.output[1], frames[1])
 
 
 def test_pack_value_recurses_nested_dicts_and_lists_without_mutating_inline_values() -> None:

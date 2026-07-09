@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""IPC utilities for transferring large tensors via POSIX shared memory.
+"""IPC utilities for transferring large arrays via POSIX shared memory.
 
 Used by Hop1 (GPU worker <-> scheduler) to avoid pickling large video tensors
-through the MessageQueue. Tensors above ``_SHM_TENSOR_THRESHOLD`` are copied
-into a named shared-memory segment; only a lightweight metadata dict is
-serialised through the queue.
+or NumPy arrays through the MessageQueue. Values above
+``_SHM_TENSOR_THRESHOLD`` are copied into a named shared-memory segment; only a
+lightweight metadata dict is serialised through the queue.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
@@ -79,6 +80,40 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     return tensor
 
 
+def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
+    """Copy a NumPy array into POSIX shared memory and return a metadata handle."""
+    from multiprocessing import shared_memory
+
+    array = np.ascontiguousarray(array)
+    nbytes = array.nbytes
+    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+    shm_arr = np.ndarray(array.shape, dtype=array.dtype, buffer=shm.buf[:nbytes])
+    np.copyto(shm_arr, array)
+    handle = {
+        "__ndarray_shm__": True,
+        "name": shm.name,
+        "shape": list(array.shape),
+        "numpy_dtype": str(array.dtype),
+        "nbytes": nbytes,
+    }
+    shm.close()
+    return handle
+
+
+def _array_from_shm(handle: dict[str, Any]) -> np.ndarray:
+    """Reconstruct a NumPy array from a shared-memory handle and free the segment."""
+    from multiprocessing import shared_memory
+
+    shm = shared_memory.SharedMemory(name=handle["name"])
+    try:
+        dtype = np.dtype(handle["numpy_dtype"])
+        arr = np.ndarray(handle["shape"], dtype=dtype, buffer=shm.buf[: handle["nbytes"]])
+        return arr.copy()
+    finally:
+        shm.close()
+        shm.unlink()
+
+
 def _pack_tensor_if_large(val: torch.Tensor) -> torch.Tensor | dict:
     """Replace a tensor with an SHM handle if it exceeds the threshold."""
     if val.nelement() * val.element_size() > _SHM_TENSOR_THRESHOLD:
@@ -86,17 +121,26 @@ def _pack_tensor_if_large(val: torch.Tensor) -> torch.Tensor | dict:
     return val
 
 
+def _pack_array_if_large(val: np.ndarray) -> np.ndarray | dict:
+    """Replace a NumPy array with an SHM handle if it exceeds the threshold."""
+    if val.nbytes > _SHM_TENSOR_THRESHOLD:
+        return _array_to_shm(val)
+    return val
+
+
 def _pack_value_if_large(val: object) -> object:
-    """Recursively replace large tensors with SHM handles.
+    """Recursively replace large tensors and arrays with SHM handles.
 
     Walks the container shapes pipelines return as ``DiffusionOutput.output``:
-    bare tensors, dicts (e.g. Cosmos3 ``{"image"/"video": ...}``), and
+    bare tensors/arrays, dicts (e.g. Cosmos3 ``{"image"/"video": ...}``), and
     tuples/lists (e.g. LTX2 and DreamID ``(video, audio)``). Other values pass
-    through unchanged. ``_unpack_if_shm_handle`` must mirror these shapes — keep
+    through unchanged. ``_unpack_if_shm_handle`` must mirror these shapes; keep
     the two in sync.
     """
     if isinstance(val, torch.Tensor):
         return _pack_tensor_if_large(val)
+    if isinstance(val, np.ndarray):
+        return _pack_array_if_large(val)
     if isinstance(val, dict):
         return {key: _pack_value_if_large(value) for key, value in val.items()}
     if isinstance(val, list):
@@ -107,9 +151,11 @@ def _pack_value_if_large(val: object) -> object:
 
 
 def _unpack_if_shm_handle(val: object) -> object:
-    """Reconstruct tensors from SHM handles, mirroring ``_pack_value_if_large``."""
+    """Reconstruct tensors and arrays from SHM handles, mirroring packing."""
     if isinstance(val, dict) and val.get("__tensor_shm__"):
         return _tensor_from_shm(val)
+    if isinstance(val, dict) and val.get("__ndarray_shm__"):
+        return _array_from_shm(val)
     if isinstance(val, dict):
         return {key: _unpack_if_shm_handle(value) for key, value in val.items()}
     if isinstance(val, list):
@@ -172,7 +218,7 @@ def _unpack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
 
 
 def unpack_diffusion_output_shm(output: object) -> object:
-    """Reconstruct tensors from SHM handles in diffusion worker outputs."""
+    """Reconstruct tensors and arrays from SHM handles in diffusion worker outputs."""
     if isinstance(output, DiffusionOutput):
         return _unpack_diffusion_fields(output)
 
