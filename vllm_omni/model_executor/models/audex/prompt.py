@@ -11,16 +11,22 @@ requires, so the prompt is built from a literal template here; a unit test
 pins it byte-for-byte against the official format.
 
 ``build_null_prompt`` is the unconditional-prompt counterpart used by
-classifier-free guidance. CFG execution is not supported yet, so it is a
-guarded stub; the split exists so CFG support can slot in without reshaping
-callers.
+classifier-free guidance: the transcription is replaced with repeated
+``<unk>`` tokens, iteratively adjusted so the tokenized null prompt is
+exactly as long as the conditional prompt (the CFG pair must decode the
+same positions).
 """
 
 AUDEX_SYSTEM_PROMPT = "You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools."
 
+# ``{text}`` carries its own leading whitespace: the conditional prompt uses
+# " {transcription}" (matching the official script byte-for-byte), while the
+# CFG null prompt inserts the bare ``<unk>`` run. ``<unk>`` is a special
+# token, so a leading space would tokenize as a standalone space token and
+# make some conditional lengths unreachable by whole-``<unk>`` steps.
 _TTS_PROMPT_TEMPLATE = (
     "<|im_start|>system\n{system_prompt}<|im_end|>\n"
-    "<|im_start|>user\n<|text to speech|> Generate speech for this transcription. {text}<|im_end|>\n"
+    "<|im_start|>user\n<|text to speech|> Generate speech for this transcription.{text}<|im_end|>\n"
     "<|im_start|>assistant\n<think></think><speechgen_start>"
 )
 
@@ -30,13 +36,25 @@ def build_cond_prompt(text: str) -> str:
     text = text.strip()
     if not text:
         raise ValueError("Audex TTS requires non-empty input text")
-    return _TTS_PROMPT_TEMPLATE.format(system_prompt=AUDEX_SYSTEM_PROMPT, text=text)
+    return _TTS_PROMPT_TEMPLATE.format(system_prompt=AUDEX_SYSTEM_PROMPT, text=f" {text}")
 
 
-def build_null_prompt(cond_prompt: str, tokenizer) -> str:
+def build_null_prompt(cond_prompt: str, tokenizer, max_iters: int = 64) -> str:
     """Unconditional prompt for CFG (length-matched ``<unk>`` padding).
 
-    Not implemented: Audex CFG execution is not supported yet (requests with
-    ``cfg_scale > 1.0`` are rejected at the serving layer).
+    Replaces the transcription with ``<unk>`` repeated, adjusting the count
+    until ``tokenizer.encode`` yields exactly the conditional prompt's
+    length. Raises when no count matches so callers can fail the request
+    instead of submitting a misaligned pair.
     """
-    raise NotImplementedError("Audex classifier-free guidance is not supported yet")
+    target_len = len(tokenizer.encode(cond_prompt))
+    n_unk = 1
+    for _ in range(max_iters):
+        prompt = _TTS_PROMPT_TEMPLATE.format(system_prompt=AUDEX_SYSTEM_PROMPT, text="<unk>" * n_unk)
+        diff = target_len - len(tokenizer.encode(prompt))
+        if diff == 0:
+            return prompt
+        n_unk = max(1, n_unk + diff)
+        if diff < 0 and n_unk == 1:
+            break
+    raise ValueError(f"Could not length-match the CFG null prompt to {target_len} tokens")

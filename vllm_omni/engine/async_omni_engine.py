@@ -800,6 +800,11 @@ class AsyncOmniEngine:
                 supported_tasks=self.supported_tasks,
             )
             request.external_req_id = cid
+            # Companions are stage-0-final: without this worker-visible tag
+            # the AR runner would still emit downstream connector payloads
+            # for them (the orchestrator-side final_stage_id=0 registration
+            # alone does not reach the worker).
+            request = _apply_omni_final_stage_metadata(request, 0)
 
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes

@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,9 +42,39 @@ def test_cond_prompt_rejects_empty_text():
         build_cond_prompt("   ")
 
 
-def test_null_prompt_is_reserved_for_cfg():
-    with pytest.raises(NotImplementedError):
-        build_null_prompt("prompt", tokenizer=None)
+class _CountingTokenizer:
+    """Fake tokenizer: special markers are single tokens, words/punct split."""
+
+    _TOKEN_RE = re.compile(r"<unk>|<\|[^|]*\|>|<[a-z_]+>|\w+|[^\w\s]")
+
+    def encode(self, text: str) -> list[int]:
+        return [0] * len(self._TOKEN_RE.findall(text))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Hello.",
+        "one two three four five",
+        "A somewhat longer sentence with punctuation, numbers 123 and several more words to pad it out.",
+    ],
+)
+def test_null_prompt_length_matches_cond_prompt(text):
+    tokenizer = _CountingTokenizer()
+    cond = build_cond_prompt(text)
+    null = build_null_prompt(cond, tokenizer)
+    assert len(tokenizer.encode(null)) == len(tokenizer.encode(cond))
+    assert "<unk>" in null
+    assert text not in null
+
+
+def test_null_prompt_raises_when_no_count_matches():
+    class _ConstantTokenizer:
+        def encode(self, text: str) -> list[int]:
+            return [0] * (100 if "<unk>" in text else 1)
+
+    with pytest.raises(ValueError, match="length-match"):
+        build_null_prompt(build_cond_prompt("hi"), _ConstantTokenizer())
 
 
 # ---------------------------------------------------------------- pipeline / registries
@@ -348,6 +379,21 @@ def _local_audiogen_dir() -> str | None:
         return path if os.path.isdir(path) else None
     except Exception:
         return None
+
+
+@pytest.mark.skipif(_local_audiogen_dir() is None, reason="Audex snapshot not in local HF cache")
+def test_null_prompt_length_parity_real_tokenizer():
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(_local_audiogen_dir())
+    for text in (
+        "Hello there.",
+        "The quick brown fox jumps over the lazy dog, twice on Sundays.",
+        "Short",
+    ):
+        cond = build_cond_prompt(text)
+        null = build_null_prompt(cond, tok)
+        assert len(tok.encode(null)) == len(tok.encode(cond))
 
 
 @pytest.mark.skipif(_local_audiogen_dir() is None, reason="Audex snapshot not in local HF cache")

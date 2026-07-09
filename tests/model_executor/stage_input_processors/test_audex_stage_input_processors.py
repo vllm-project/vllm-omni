@@ -150,3 +150,83 @@ def test_meta_finished_tensor_dtype():
     assert isinstance(payload.meta.finished, torch.Tensor)
     assert payload.meta.finished.dtype == torch.bool
     assert isinstance(payload.meta.stream_finished, torch.Tensor)
+
+
+# ---------------------------------------------------------------- CFG prompt expansion
+
+
+def _cfg_params(extra_args):
+    from vllm.sampling_params import SamplingParams
+
+    return SamplingParams(extra_args=extra_args)
+
+
+class TestExpandCfgPrompts:
+    def _cond_args(self, **overrides):
+        args = {
+            "cfg_scale": 1.5,
+            "cfg_role": "cond",
+            "cfg_pair_id": "req-1",
+            "cfg_null_prompt": "<unk><unk><unk>",
+        }
+        args.update(overrides)
+        return args
+
+    def test_no_extra_args_expands_to_nothing(self):
+        from vllm_omni.model_executor.stage_input_processors.audex import expand_cfg_prompts
+
+        assert expand_cfg_prompts({"prompt": "p"}, _cfg_params(None)) == []
+
+    def test_scale_one_expands_to_nothing(self):
+        from vllm_omni.model_executor.stage_input_processors.audex import expand_cfg_prompts
+
+        params = _cfg_params(self._cond_args(cfg_scale=1.0))
+        assert expand_cfg_prompts({"prompt": "p"}, params) == []
+
+    def test_non_cond_role_expands_to_nothing(self):
+        from vllm_omni.model_executor.stage_input_processors.audex import expand_cfg_prompts
+
+        params = _cfg_params(self._cond_args(cfg_role="uncond"))
+        assert expand_cfg_prompts({"prompt": "p"}, params) == []
+
+    def test_malformed_scale_expands_to_nothing(self):
+        from vllm_omni.model_executor.stage_input_processors.audex import expand_cfg_prompts
+
+        params = _cfg_params(self._cond_args(cfg_scale="big"))
+        assert expand_cfg_prompts({"prompt": "p"}, params) == []
+
+    @pytest.mark.parametrize("missing", ["cfg_pair_id", "cfg_null_prompt"])
+    def test_missing_pair_metadata_raises(self, missing):
+        from vllm_omni.model_executor.stage_input_processors.audex import expand_cfg_prompts
+
+        args = self._cond_args()
+        del args[missing]
+        with pytest.raises(ValueError, match="cfg_pair_id/cfg_null_prompt"):
+            expand_cfg_prompts({"prompt": "p"}, _cfg_params(args))
+
+    def test_companion_shape_for_dict_prompt(self):
+        from vllm_omni.model_executor.stage_input_processors.audex import (
+            CFG_UNCOND_SUFFIX,
+            expand_cfg_prompts,
+        )
+
+        prompt = {"prompt": "cond text", "modalities": ["audio"], "prompt_token_ids": [1, 2]}
+        params = _cfg_params(self._cond_args())
+        (companion,) = expand_cfg_prompts(prompt, params)
+
+        assert companion.role == "uncond"
+        assert companion.request_id_suffix == CFG_UNCOND_SUFFIX
+        assert companion.prompt["prompt"] == "<unk><unk><unk>"
+        assert companion.prompt["modalities"] == ["audio"]
+        assert "prompt_token_ids" not in companion.prompt
+
+        patched, _ = companion.apply_overrides(params, [params])
+        assert patched.extra_args == {"cfg_scale": 1.5, "cfg_role": "uncond", "cfg_pair_id": "req-1"}
+        # The original cond params must not be mutated by the override.
+        assert params.extra_args["cfg_role"] == "cond"
+
+    def test_companion_shape_for_string_prompt(self):
+        from vllm_omni.model_executor.stage_input_processors.audex import expand_cfg_prompts
+
+        (companion,) = expand_cfg_prompts("cond text", _cfg_params(self._cond_args()))
+        assert companion.prompt == "<unk><unk><unk>"

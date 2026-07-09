@@ -21,8 +21,11 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 logger = init_logger(__name__)
+
+CFG_UNCOND_SUFFIX = "__cfg_uncond"
 
 # Vocab layout of nvidia/Nemotron-Labs-Audex-2B checkpoint_folder_audiogen:
 # <speechcodec_0> .. <speechcodec_65535> occupy a contiguous id block. The
@@ -54,6 +57,54 @@ def _connector_extra(transfer_manager: Any) -> dict[str, Any]:
 def _codec_frames(tokens: list[int], codec_offset: int, codec_size: int) -> list[int]:
     """Map ``<speechcodec_N>`` token ids to codec frame ids, dropping all other tokens."""
     return [int(t) - codec_offset for t in tokens if codec_offset <= int(t) < codec_offset + codec_size]
+
+
+def expand_cfg_prompts(prompt: dict[str, Any] | str, sampling_params: Any) -> list[ExpandedPrompt]:
+    """Emit the unconditional CFG companion for a guided Audex TTS request.
+
+    A request opts into CFG by carrying ``extra_args`` with
+    ``cfg_scale > 1.0``, ``cfg_role="cond"``, ``cfg_pair_id`` and the
+    pre-built length-matched ``cfg_null_prompt`` (constructed where a
+    tokenizer is available: the serving layer or the offline example).
+    Unguided requests (no/1.0 scale) expand to nothing, keeping the
+    disabled path identical to the non-CFG flow.
+    """
+    extra_args = getattr(sampling_params, "extra_args", None) or {}
+    try:
+        cfg_scale = float(extra_args.get("cfg_scale", 1.0))
+    except (TypeError, ValueError):
+        return []
+    if cfg_scale <= 1.0 or extra_args.get("cfg_role") != "cond":
+        return []
+
+    pair_id = extra_args.get("cfg_pair_id")
+    null_prompt = extra_args.get("cfg_null_prompt")
+    if not pair_id or not isinstance(null_prompt, str) or not null_prompt:
+        raise ValueError(
+            "Audex CFG request is missing cfg_pair_id/cfg_null_prompt in extra_args; "
+            "the caller must build the length-matched null prompt before submission"
+        )
+
+    if isinstance(prompt, dict):
+        companion_prompt: dict[str, Any] | str = {**prompt, "prompt": null_prompt}
+        companion_prompt.pop("prompt_token_ids", None)
+    else:
+        companion_prompt = null_prompt
+
+    return [
+        ExpandedPrompt(
+            prompt=companion_prompt,
+            role="uncond",
+            request_id_suffix=CFG_UNCOND_SUFFIX,
+            sampling_params_override={
+                "extra_args": {
+                    "cfg_scale": cfg_scale,
+                    "cfg_role": "uncond",
+                    "cfg_pair_id": pair_id,
+                }
+            },
+        )
+    ]
 
 
 def _extract_new_codes(

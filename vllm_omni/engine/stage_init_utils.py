@@ -1134,3 +1134,26 @@ def initialize_diffusion_stage(
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+
+
+def maybe_apply_audex_cfg_patches(vllm_config: Any) -> None:
+    """Install the Audex CFG scheduler patches for CFG-configured engines.
+
+    Must run in the engine-core process BEFORE ``Scheduler`` is constructed:
+    the patch wraps ``Scheduler.__init__`` to add the pair registry, so a
+    scheduler built earlier would never become pair-aware. Gated on the
+    engine's ``logits_processors`` so non-CFG stages stay untouched.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    processors = getattr(model_config, "logits_processors", None) or []
+    if not any("AudexCFGLogitsProcessor" in getattr(proc, "__name__", str(proc)) for proc in processors):
+        return
+
+    from vllm_omni.model_executor.models.audex.cfg import apply_cfg_patches
+
+    apply_cfg_patches()
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if not getattr(Scheduler.schedule, "_audex_cfg_patched", False):
+        raise RuntimeError("Audex CFG scheduler patches failed to install before Scheduler construction")
