@@ -1234,6 +1234,7 @@ class VllmOmniConfig:
         hf_config: PretrainedConfig | None = None,
         deploy_config_path: str | None = None,
         cli_overrides: dict[str, Any] | None = None,
+        resolved_pipeline: PipelineConfig | None = None,
     ) -> VllmOmniConfig:
         """Create a structured config from a registered pipeline and deploy YAML."""
         if cli_overrides is None:
@@ -1246,16 +1247,18 @@ class VllmOmniConfig:
         else:
             deploy = DeployConfig()
 
-        pipeline_key = deploy.pipeline or model_type
-        if pipeline_key not in _registered_pipeline_keys():
+        pipeline_key = model_type if resolved_pipeline is not None else deploy.pipeline or model_type
+        if resolved_pipeline is None and pipeline_key not in _registered_pipeline_keys():
             raise KeyError(
                 f"Pipeline {pipeline_key!r} not in registry "
                 f"(resolved from {deploy_path.name!r}). Available: "
                 f"{_registered_pipeline_keys()}"
             )
-        pipeline = _resolve_registered_pipeline(pipeline_key, hf_config)
+        pipeline = resolved_pipeline
         if pipeline is None:
-            raise ValueError(f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig")
+            pipeline = _resolve_registered_pipeline(pipeline_key, hf_config)
+            if pipeline is None:
+                raise ValueError(f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig")
 
         deploy_with_cli_overrides = copy.deepcopy(deploy)
         if cli_overrides.get("async_chunk") is not None:

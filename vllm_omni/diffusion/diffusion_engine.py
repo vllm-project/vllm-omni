@@ -134,6 +134,14 @@ class _RpcTask:
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
+    #: Import path of the model runner this engine's workers should build, or
+    #: ``None`` for the platform default. Subclasses declare their runner here
+    #: (e.g. the AR-Diffusion engine), the worker resolves it through
+    #: :meth:`resolve_engine_class` — so engine->runner routing lives on the
+    #: engine class itself, and ``od_config.diffusion_model_runner_cls``
+    #: remains a pure explicit user override (never mutated by engines).
+    default_diffusion_model_runner_cls: str | None = None
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
@@ -609,19 +617,55 @@ class DiffusionEngine:
             self._put_streaming_output_with_cv(request_id, out)
 
     @staticmethod
-    def make_engine(
-        config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ) -> DiffusionEngine:
-        """Factory method to create a DiffusionEngine instance.
+    def resolve_engine_class(config: OmniDiffusionConfig) -> type[DiffusionEngine]:
+        """Resolve the engine class selected by ``config.engine_backend``.
+
+        Mirrors ``DiffusionExecutor.get_class``: accepts ``"default"``, a
+        ``DiffusionEngine`` subclass, or an import-path string (e.g. a deploy
+        config's ``engine_backend``). Kept separate from :meth:`make_engine` so the
+        selection is testable without constructing an engine (which runs a dummy forward).
 
         Args:
             config: The configuration for the diffusion engine.
 
         Returns:
-            An instance of DiffusionEngine.
+            The ``DiffusionEngine`` (sub)class to instantiate.
         """
-        return DiffusionEngine(config, scheduler=scheduler)
+        backend = getattr(config, "engine_backend", "default") or "default"
+
+        if isinstance(backend, type):
+            if not issubclass(backend, DiffusionEngine):
+                raise TypeError(f"engine_backend must be a DiffusionEngine subclass. Got {backend}.")
+            return backend
+        if backend == "default":
+            return DiffusionEngine
+        if isinstance(backend, str):
+            try:
+                engine_class = resolve_obj_by_qualname(backend)
+            except (ImportError, ValueError) as e:
+                raise ValueError(
+                    f"Failed to load engine_backend '{backend}'. Ensure it is a valid python path. Error: {e}"
+                ) from e
+            if not issubclass(engine_class, DiffusionEngine):
+                raise TypeError(f"engine_backend must resolve to a DiffusionEngine subclass. Got {engine_class}.")
+            return engine_class
+        raise ValueError(f"Unknown engine_backend: {backend!r}")
+
+    @staticmethod
+    def make_engine(
+        config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ) -> DiffusionEngine:
+        """Factory method to create the engine selected by ``config.engine_backend``.
+
+        Args:
+            config: The configuration for the diffusion engine.
+
+        Returns:
+            An instance of the resolved ``DiffusionEngine`` (sub)class.
+        """
+        engine_class = DiffusionEngine.resolve_engine_class(config)
+        return engine_class(config, scheduler=scheduler)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         with self._cv:

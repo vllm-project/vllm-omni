@@ -619,6 +619,17 @@ def test_from_registry_uses_hf_config_for_callable_resolver():
     assert omni_config.stage_configs[0].model_stage == "thinker"
 
 
+def test_from_registry_accepts_pre_resolved_pipeline():
+    resolved_pipeline = PipelineConfig(model_type="callable_resolved_variant")
+
+    omni_config = VllmOmniConfig.from_registry(
+        "unregistered_resolver_key",
+        resolved_pipeline=resolved_pipeline,
+    )
+
+    assert omni_config.pipeline_config is resolved_pipeline
+
+
 def test_from_registry_deploy_pipeline_override_resolves_from_registry():
     deploy_path = get_deploy_config_path("aura_omni.yaml")
 

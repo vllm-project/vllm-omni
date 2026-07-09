@@ -144,7 +144,7 @@ class OmniBase(PDDisaggregationMixin):
         log_stats = kwargs.pop("log_stats", False)
         self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
-        # before it reaches ``StageConfigFactory._create_from_registry``, so
+        # before it reaches ``StageConfigFactory._create_legacy_from_registry``, so
         # ``--no-async-chunk`` (``async_chunk=False``) silently fails to
         # override the deploy YAML's ``async_chunk: true`` default.
         async_chunk = kwargs.get("async_chunk")
@@ -220,6 +220,13 @@ class OmniBase(PDDisaggregationMixin):
     def stage_configs(self) -> list:
         """Expose engine stage configs for PD disaggregation detection and validation."""
         return self.engine.stage_configs
+
+    def _consumed_metric_message_ids(self, request_id: str) -> set[int]:
+        consumed_by_request = getattr(self, "_consumed_metric_messages", None)
+        if consumed_by_request is None:
+            consumed_by_request = {}
+            self._consumed_metric_messages = consumed_by_request
+        return consumed_by_request.setdefault(request_id, set())
 
     def _has_dead_stage(self) -> bool:
         for stage_client in self.engine.stage_clients:
@@ -310,7 +317,9 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
-            self._consumed_metric_messages.pop(request_id, None)
+            consumed_by_request = getattr(self, "_consumed_metric_messages", None)
+            if consumed_by_request is not None:
+                consumed_by_request.pop(request_id, None)
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
             # is still in self.request_states) is corrected after the pop.
@@ -397,7 +406,7 @@ class OmniBase(PDDisaggregationMixin):
             stage_meta = self.engine.get_stage_metadata(stage_id)
             output_type = getattr(msg.engine_outputs, "final_output_type", stage_meta.final_output_type)
             msg_id = id(msg)
-            consumed = self._consumed_metric_messages.setdefault(req_id, set())
+            consumed = self._consumed_metric_message_ids(req_id)
             if msg_id not in consumed:
                 req_state.metrics.on_stage_metrics(stage_id, req_id, msg.metrics, output_type)
                 submit_ts = msg.stage_submit_ts
@@ -505,7 +514,11 @@ class OmniBase(PDDisaggregationMixin):
         stage_meta = self.engine.get_stage_metadata(stage_id)
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
-            metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
+            msg_id = id(result)
+            consumed = self._consumed_metric_message_ids(req_id)
+            if msg_id not in consumed:
+                metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
+                consumed.add(msg_id)
 
         if not stage_meta.final_output:
             return None

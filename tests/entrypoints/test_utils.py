@@ -315,9 +315,12 @@ class TestResolveModelConfigPath:
 
 
 class TestLoadAndResolveStageConfigs:
-    def test_load_and_resolve_with_kwargs(self):
+    def test_load_and_resolve_with_kwargs(self, mocker: MockerFixture):
         """Ensure that dtype survives default stage creation."""
         kwargs = {"dtype": torch.float32}
+        mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path", return_value=None)
+        mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=[])
+
         config_path, stage_configs = load_and_resolve_stage_configs(
             model="black-forest-labs/FLUX.2-klein-4B",
             stage_configs_path=None,

@@ -77,6 +77,7 @@ from .action import (
     normalize_action_mode,
     pad_action_to_dim,
     resolve_domain_id,
+    vision_condition_indexes,
 )
 from .transfer import (
     Cosmos3TransferConfig,
@@ -2009,8 +2010,21 @@ class Cosmos3OmniDiffusersPipeline(
         generator: torch.Generator,
         image_size: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare video latents for action modes with mode-specific conditioning."""
+        """Prepare video latents for action modes with mode-specific conditioning.
+
+        Policy and forward-dynamics modes condition only latent frame zero.
+        The Wan VAE is temporally causal, so encoding only the first pixel
+        frame preserves that latent while avoiding unused future-frame work.
+        Inverse dynamics conditions every latent and keeps the full encode.
+        """
         del height, width
+        if video_tensor.ndim == 4:
+            video_tensor = video_tensor.unsqueeze(0)
+        if video_tensor.ndim != 5 or video_tensor.shape[0] != 1 or video_tensor.shape[1] != 3:
+            raise ValueError(f"Cosmos3 video tensor must have shape [1, 3, T, H, W], got {tuple(video_tensor.shape)}.")
+        if video_tensor.shape[2] < 1:
+            raise ValueError("Cosmos3 action video tensor must contain at least one frame.")
+
         C = self.transformer.latent_channel_size
         T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_hw = self._latent_hw_from_image_size(image_size)
@@ -2026,12 +2040,24 @@ class Cosmos3OmniDiffusersPipeline(
             device=self.device,
             dtype=self.dtype,
         )
-        cond_latent = self._encode_video_tensor(video_tensor, image_size=image_size)
-        if cond_latent.shape[2:] != noise.shape[2:]:
+        condition_indexes = vision_condition_indexes(mode, num_frames, self.vae_scale_factor_temporal)
+        condition_video = video_tensor[:, :, :1] if condition_indexes == [0] else video_tensor
+        cond_prefix_latent = self._encode_video_tensor(condition_video, image_size=image_size)
+        expected_prefix = (1, C, max(condition_indexes) + 1, H_lat, W_lat)
+        if (
+            cond_prefix_latent.shape[0] != expected_prefix[0]
+            or cond_prefix_latent.shape[1] != expected_prefix[1]
+            or cond_prefix_latent.shape[2] < expected_prefix[2]
+            or cond_prefix_latent.shape[3:] != expected_prefix[3:]
+        ):
             raise ValueError(
                 "Cosmos3 action video latent shape mismatch: "
-                f"encoded={tuple(cond_latent.shape)}, expected={tuple(noise.shape)}."
+                f"encoded={tuple(cond_prefix_latent.shape)}, expected at least {expected_prefix}."
             )
+
+        condition_latents = torch.zeros_like(noise)
+        for index in condition_indexes:
+            condition_latents[:, :, index : index + 1] = cond_prefix_latent[:, :, index : index + 1]
         condition_mask = build_vision_condition_mask(
             mode,
             num_frames,
@@ -2039,9 +2065,9 @@ class Cosmos3OmniDiffusersPipeline(
             device=self.device,
             dtype=self.dtype,
         )
-        latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
+        latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
         velocity_mask = 1.0 - condition_mask
-        return latents, velocity_mask, cond_latent
+        return latents, velocity_mask, condition_latents
 
     def _prepare_action_latents(
         self,

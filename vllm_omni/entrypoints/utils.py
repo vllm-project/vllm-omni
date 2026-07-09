@@ -320,7 +320,7 @@ def load_stage_configs_from_model(
     """Load stage configurations from model's default config file.
 
     For models registered in the pipeline registry (new path), uses
-    ``StageConfigFactory.create_from_model()`` which merges
+    ``StageConfigFactory.create_legacy_stage_configs_from_model()`` which merges
     PipelineConfig + DeployConfig + CLI overrides.
 
     For other models (legacy path), loads stage configs from YAML.

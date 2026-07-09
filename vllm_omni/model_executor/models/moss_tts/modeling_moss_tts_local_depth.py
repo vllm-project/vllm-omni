@@ -160,6 +160,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
         text_top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
+        generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate one audio frame for batch B.
 
@@ -183,7 +184,16 @@ class MossTTSLocalDepthTransformer(nn.Module):
         local_hidden = hidden[:, 0, :]
 
         binary_logits = local_text_lm_head(local_hidden).float()
-        binary_choice = _sample_token(binary_logits, text_temperature, text_top_k, text_top_p, do_sample)
+        # This is a binary continue/stop gate. The checkpoint expects sampling
+        # here; greedy argmax is biased toward "continue" and may never stop.
+        binary_choice = _sample_token(
+            binary_logits,
+            text_temperature,
+            text_top_k,
+            text_top_p,
+            do_sample,
+            generator=generator,
+        )
         should_continue = binary_choice.eq(0)
         import os as _os
 
@@ -209,7 +219,14 @@ class MossTTSLocalDepthTransformer(nn.Module):
                     pos = sel > 0
                     sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
                     channel_logits.index_copy_(-1, hist_t, sel)
-            channel_token = _sample_token(channel_logits, temperature, top_k, top_p, do_sample)
+            channel_token = _sample_token(
+                channel_logits,
+                temperature,
+                top_k,
+                top_p,
+                do_sample,
+                generator=generator,
+            )
             codes[:, channel_index] = channel_token
 
             if channel_index + 1 < n_vq:

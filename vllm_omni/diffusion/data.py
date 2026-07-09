@@ -6,6 +6,7 @@ import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import diffusers
@@ -613,6 +614,20 @@ class OmniDiffusionConfig:
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
 
+    # Engine backend selection, resolved by ``DiffusionEngine.resolve_engine_class``
+    # (mirrors ``DiffusionExecutor.get_class``). Config files use a string:
+    # "default" -> DiffusionEngine, or an import path (set e.g. by a deploy
+    # config). Programmatic callers may pass a DiffusionEngine subclass
+    # directly — hence ``str | type`` (structured-config mirrors should expose
+    # the string form only).
+    engine_backend: str | type = "default"
+
+    # Optional override for the diffusion model runner class (import path).
+    # Precedence in the worker: this override > the runner declared by the
+    # selected engine class (``default_diffusion_model_runner_cls``) > the
+    # platform default. Never mutated by engines.
+    diffusion_model_runner_cls: str | None = None
+
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
@@ -1173,7 +1188,8 @@ class OmniDiffusionConfig:
         valid_fields = {f.name for f in fields(cls)}
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
 
-        return cls(**filtered_kwargs)
+        instance = cls(**filtered_kwargs)
+        return instance
 
 
 @dataclass
@@ -1471,6 +1487,13 @@ class OmniWakeTask:
 
     task_id: str
     tags: list[str] | None = None
+
+
+class CuMemTag(str, Enum):
+    """Tags representing specific CuMem allocations for sleep/wake state tracking."""
+
+    WEIGHTS = "weights"
+    KV_CACHE = "kv_cache"
 
 
 # Special message broadcast via scheduler queues to signal worker shutdown.

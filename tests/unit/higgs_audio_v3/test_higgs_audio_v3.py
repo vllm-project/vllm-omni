@@ -7,6 +7,7 @@ without requiring the actual checkpoint or GPU.
 """
 
 import asyncio
+import json
 import time
 from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
@@ -1309,13 +1310,42 @@ class TestVoiceCloneReferenceCache:
         parent = tmp_path / "OmniVoice"
         subdir = parent / "audio_tokenizer"
         subdir.mkdir(parents=True)
-        (subdir / "config.json").write_text("{}", encoding="utf-8")
+        (subdir / "config.json").write_text(
+            json.dumps({"model_type": "higgs_audio_v2_tokenizer"}),
+            encoding="utf-8",
+        )
 
         monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(parent))
         assert tok._resolve_audio_tokenizer_dir() == str(subdir)
 
         monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(subdir))
         assert tok._resolve_audio_tokenizer_dir() == str(subdir)
+
+    def test_audio_tokenizer_dir_rejects_omnivoice_config(self, tmp_path, monkeypatch):
+        import huggingface_hub
+        import huggingface_hub.constants as hub_constants
+
+        from vllm_omni.model_executor.models.higgs_audio_v2 import higgs_audio_v2_tokenizer as tok
+
+        parent = tmp_path / "OmniVoice"
+        subdir = parent / "audio_tokenizer"
+        subdir.mkdir(parents=True)
+        (subdir / "config.json").write_text(
+            json.dumps({"model_type": "omnivoice"}),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(parent))
+        monkeypatch.setenv("HIGGS_AUDIO_V2_TOKENIZER_PATH", "")
+        monkeypatch.setattr(
+            huggingface_hub,
+            "try_to_load_from_cache",
+            lambda **_: str(subdir / "config.json"),
+        )
+        monkeypatch.setattr(hub_constants, "HF_HUB_CACHE", str(tmp_path / "empty_cache"))
+
+        assert tok._normalize_audio_tokenizer_dir(str(parent)) is None
+        assert tok._resolve_audio_tokenizer_dir() is None
 
     def test_higgs_v3_ref_code_cache_returns_clone(self):
         from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
