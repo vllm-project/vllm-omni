@@ -26,7 +26,7 @@ _AUDEX_INTERNAL_CFG_KEYS = ("cfg_role", "cfg_pair_id", "cfg_null_prompt")
 class AudexAdapter(ARTTSAdapter):
     """Plain English TTS: single built-in voice, no reference audio, optional CFG."""
 
-    stage_keys = frozenset({"audex_thinker"})
+    stage_keys = frozenset({"audex_thinker", "audex_omni"})
     name = "audex"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:

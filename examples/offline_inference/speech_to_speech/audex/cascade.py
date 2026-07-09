@@ -132,18 +132,27 @@ def main():
     if not answer:
         raise SystemExit("Chat pass produced an empty answer; aborting cascade")
 
-    # Pass 3 — TTS (audio-final; streams through code2wav).
+    # Pass 3 — TTS (audio-final; streams through code2wav). Both final
+    # stages of the pipeline may emit an output record for the request;
+    # collect the audio-bearing one.
     tts_prompt = build_cond_prompt(answer)
     outputs = engine.generate(
         [{"prompt": tts_prompt, "modalities": ["audio"]}],
         _tts_params(engine, args.cfg_scale, tts_prompt, tokenizer),
     )
-    (req_output,) = outputs
-    audio_val = req_output.outputs[0].multimodal_output.get("model_outputs")
-    if isinstance(audio_val, list):
-        pcm = torch.cat([torch.as_tensor(a).float().cpu().reshape(-1) for a in audio_val if a is not None])
-    else:
-        pcm = torch.as_tensor(audio_val).float().cpu().reshape(-1)
+    chunks: list[torch.Tensor] = []
+    for req_output in outputs:
+        mm = getattr(req_output, "multimodal_output", None) or {}
+        if not mm and req_output.outputs:
+            mm = getattr(req_output.outputs[0], "multimodal_output", None) or {}
+        audio_val = mm.get("model_outputs", mm.get("audio"))
+        if audio_val is None:
+            continue
+        if isinstance(audio_val, list):
+            chunks.extend(torch.as_tensor(a).float().cpu().reshape(-1) for a in audio_val if a is not None)
+        else:
+            chunks.append(torch.as_tensor(audio_val).float().cpu().reshape(-1))
+    pcm = torch.cat(chunks) if chunks else torch.empty(0)
     if pcm.numel() == 0:
         raise SystemExit("TTS pass produced empty audio")
 

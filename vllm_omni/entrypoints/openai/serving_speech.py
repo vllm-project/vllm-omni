@@ -99,7 +99,9 @@ _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
 _INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
-_AUDEX_TTS_MODEL_STAGES = {"audex_thinker"}
+# audex_omni covers the nemotron_labs_audex_full S2S deployment, whose
+# TTS pass uses the same /v1/audio/speech surface.
+_AUDEX_TTS_MODEL_STAGES = {"audex_thinker", "audex_omni"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
