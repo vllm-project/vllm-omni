@@ -33,7 +33,10 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     the abstract methods below and bind ``PayloadT``/``ViewT`` to their real
     payload and view types. In Phase 1 the RFC's ``PagedKV`` joins them to
     cover the AR self-attention KV — as a handle wrapping the engine-owned
-    paged state (PR #4534) rather than a plain buffer here. The non-abstract
+    paged state (PR #4534) rather than a plain buffer here. The RFC's
+    remaining members, ``FixedState`` (constant-size recurrent state, e.g. a
+    linear-attention carry) and ``RetrievalStore`` (retrieval memory pools),
+    land with their first consumers; the names are reserved. The non-abstract
     methods provide the default behaviour described in their docstrings.
     """
 
