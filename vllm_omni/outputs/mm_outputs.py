@@ -14,26 +14,10 @@ import torch
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput
 
-from vllm_omni.engine.output_modality import TensorAccumulationStrategy
+from vllm_omni.outputs.output_modality import TensorAccumulationStrategy
+from vllm_omni.outputs.utils import _is_tensor_list, _to_cpu
 
 logger = init_logger(__name__)
-
-
-def _to_cpu(x: Any) -> Any:
-    """Move a tensor to CPU; pass through non-tensors unchanged."""
-    if isinstance(x, torch.Tensor):
-        try:
-            return x.detach().to("cpu", non_blocking=True).contiguous()
-        except (RuntimeError, AttributeError):
-            return x
-    if isinstance(x, dict):
-        return {str(sub_key): _to_cpu(sub_value) for sub_key, sub_value in x.items()}
-    return x
-
-
-def _is_tensor_list(value: Any) -> bool:
-    """Return True if *value* is a non-empty list of tensors (deferred concat)."""
-    return isinstance(value, list) and bool(value) and isinstance(value[0], torch.Tensor)
 
 
 def _cat_tensors(
@@ -58,6 +42,8 @@ def _consolidate_tensor_list(
     try:
         return _cat_tensors(tensor_list, strategy)
     except RuntimeError:
+        # [TODO: this part is for async chunk, not for audio only. can we come up with a design
+        # that identify this by whether using async chunk instead of modality?]
         if key != "audio":
             logger.warning("Error concatenating tensor for key %s; keeping last tensor", key)
             return tensor_list[-1]
