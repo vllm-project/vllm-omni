@@ -17,14 +17,21 @@ site. See RFC #4480 for the full design and roadmap.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Generic, TypeVar
+
+# What writers pass into ``stage()`` / ``commit()`` / ``append()``.
+PayloadT = TypeVar("PayloadT")
+# What ``view()`` hands to the consumer (not necessarily the payload type:
+# an append buffer views as a list of payloads).
+ViewT = TypeVar("ViewT")
 
 
-class MemoryObject(ABC):
+class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     """One typed unit of session memory with a uniform lifecycle.
 
     Concrete classes (``EncodeOnceKV``, ``LatentBuffer``) implement
-    the abstract methods below. The non-abstract methods provide the default
+    the abstract methods below and bind ``PayloadT``/``ViewT`` to their real
+    payload and view types. The non-abstract methods provide the default
     behaviour described in their docstrings.
     """
 
@@ -34,12 +41,19 @@ class MemoryObject(ABC):
     recompute_source: MemoryObject | None = None
     # Estimated work to rebuild, given ``recompute_source`` is resident.
     recompute_cost: int = 0
+    # Payload held by ``stage()`` until ``discard()`` clears it.
+    _staged: PayloadT | None = None
 
     @abstractmethod
-    def allocate(self, **spec: Any) -> None:
-        """Size and initialise the backing buffer to its empty state."""
+    def allocate(self) -> None:
+        """Size and initialise the backing buffer to its empty state.
 
-    def stage(self, payload: Any) -> None:
+        Concrete classes declare their sizing parameters as typed keyword-only
+        arguments (e.g. ``LatentBuffer.allocate(maxlen=...)``); a mistyped
+        keyword raises ``TypeError`` instead of being silently ignored.
+        """
+
+    def stage(self, payload: PayloadT) -> None:
         """Hold data for an in-progress window.
 
         Currently single-window writes go straight through ``commit()``, so
@@ -49,7 +63,7 @@ class MemoryObject(ABC):
         self._staged = payload
 
     @abstractmethod
-    def commit(self, payload: Any = None) -> None:
+    def commit(self, payload: PayloadT | None = None) -> None:
         """Promote data to persistent context.
 
         Currently this is the synchronous write the bespoke caches already do
@@ -64,14 +78,17 @@ class MemoryObject(ABC):
         """
         self._staged = None
 
-    def append(self, payload: Any) -> None:
+    def append(self, payload: PayloadT) -> None:
         """``stage()`` + ``commit()``; single-shot writers use only this."""
         self.commit(payload)
 
     @abstractmethod
-    def view(self, *, include_staged: bool = True) -> Any:
+    def view(self, *, include_staged: bool = True) -> ViewT:
         """Return what the consumer (attention metadata, pipeline) reads."""
 
+    # ``policy`` deliberately stays ``Any`` until the Phase-1 byte-budget
+    # planner exists to define the policy protocol; typing it now would invent
+    # an interface that design owns.
     def evict(self, policy: Any = None) -> int:
         """Release this object's backing storage so it can be reused; return the
         bytes freed.

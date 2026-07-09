@@ -17,7 +17,6 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Any
 
 from vllm_omni.experimental.world_models.memory.base import MemoryObject
 
@@ -35,7 +34,8 @@ class SessionMemory:
         # Session-scoped scalar/tensor metadata that is not itself a typed
         # MemoryObject (e.g. counters, cached conditioning tensors). Persists
         # across the per-call adapters that read/write it.
-        self.attrs: dict[str, Any] = {}
+        # ``object`` (not ``Any``) so every read site must narrow explicitly.
+        self.attrs: dict[str, object] = {}
 
     def get(self, name: str) -> MemoryObject | None:
         return self._objects.get(name)
@@ -71,7 +71,7 @@ class SessionMemoryManager:
         self,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         byte_budget: int | None = None,
-        lock_factory: Callable[[], AbstractContextManager[Any]] = threading.Lock,
+        lock_factory: Callable[[], AbstractContextManager[object]] = threading.Lock,
     ) -> None:
         if max_sessions <= 0:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")

@@ -55,26 +55,29 @@ class DreamZeroStateAdapter:
     # -- session / metadata plumbing ------------------------------------
 
     @staticmethod
-    def _new_frame_buffer() -> LatentBuffer:
-        buffer = LatentBuffer()
+    def _new_frame_buffer() -> LatentBuffer[np.ndarray]:
+        buffer: LatentBuffer[np.ndarray] = LatentBuffer()
         buffer.allocate(maxlen=FRAMES_PER_CHUNK)
         return buffer
 
-    def _ensure_frame_buffer(self) -> LatentBuffer:
+    def _ensure_frame_buffer(self) -> LatentBuffer[np.ndarray]:
         buffer = self._session.get(_FRAMES)
         if not isinstance(buffer, LatentBuffer) or not buffer.resident:
-            buffer = self._new_frame_buffer()
-            self._session.put(_FRAMES, buffer)
-        return buffer
+            new_buffer = self._new_frame_buffer()
+            self._session.put(_FRAMES, new_buffer)
+            return new_buffer
+        # The item type is erased at runtime; only this adapter writes the key.
+        return cast("LatentBuffer[np.ndarray]", buffer)
 
-    def _ensure_video_buffer(self) -> LatentBuffer:
+    def _ensure_video_buffer(self) -> LatentBuffer[torch.Tensor]:
         """The accumulated AR video-latent chunks (unbounded, CPU)."""
         buffer = self._session.get(_VIDEO_LATENTS)
         if not isinstance(buffer, LatentBuffer) or not buffer.resident:
-            buffer = LatentBuffer()
-            buffer.allocate(maxlen=None)
-            self._session.put(_VIDEO_LATENTS, buffer)
-        return buffer
+            new_buffer: LatentBuffer[torch.Tensor] = LatentBuffer()
+            new_buffer.allocate(maxlen=None)
+            self._session.put(_VIDEO_LATENTS, new_buffer)
+            return new_buffer
+        return cast("LatentBuffer[torch.Tensor]", buffer)
 
     # Metadata getters read with a default so they never raise after a session
     # reset clears attrs; setters write through to the pinned session.
@@ -127,7 +130,7 @@ class DreamZeroStateAdapter:
         self._session.attrs["prompt_embeds"] = value
 
     @property
-    def stitched_buffer(self) -> LatentBuffer:
+    def stitched_buffer(self) -> LatentBuffer[np.ndarray]:
         return self._ensure_frame_buffer()
 
     # -- incremental VAE encoder stream (logic mirrors DreamZeroState) --
@@ -218,19 +221,20 @@ class DreamZeroStateAdapter:
 
     def get_concatenated_video_latents(self) -> torch.Tensor | None:
         """Return all accumulated chunks concatenated along the time dimension."""
-        buffer = self._session.get(_VIDEO_LATENTS)
-        if not isinstance(buffer, LatentBuffer) or not buffer.resident:
+        stored = self._session.get(_VIDEO_LATENTS)
+        if not isinstance(stored, LatentBuffer) or not stored.resident:
             return None
+        buffer = cast("LatentBuffer[torch.Tensor]", stored)
         chunks = buffer.view()
         if not chunks:
             return None
         if len(chunks) == 1:
-            return cast("torch.Tensor", chunks[0])
+            return chunks[0]
         return torch.cat(chunks, dim=2)
 
     def clear_video_latents(self) -> None:
         """Drop accumulated video latents without resetting frame/VAE state."""
-        buffer = LatentBuffer()
+        buffer: LatentBuffer[torch.Tensor] = LatentBuffer()
         buffer.allocate(maxlen=None)
         self._session.put(_VIDEO_LATENTS, buffer)
 
@@ -247,11 +251,11 @@ class DreamZeroStateAdapter:
         history is independent of the DiT attention window.
         """
         saved_attrs: dict[str, object] = {}
-        saved_chunks: list[object] = []
+        saved_chunks: list[torch.Tensor] = []
         if not clear_video_latents:
-            buffer = self._session.get(_VIDEO_LATENTS)
-            if isinstance(buffer, LatentBuffer) and buffer.resident:
-                saved_chunks = list(buffer.view())
+            stored = self._session.get(_VIDEO_LATENTS)
+            if isinstance(stored, LatentBuffer) and stored.resident:
+                saved_chunks = cast("LatentBuffer[torch.Tensor]", stored).view()
             for key in (
                 "language",
                 "prompt_embeds",

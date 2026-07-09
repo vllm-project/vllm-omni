@@ -14,15 +14,23 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable
-from typing import Any
+from typing import TypeVar
 
 import numpy as np
 import torch
 
 from vllm_omni.experimental.world_models.memory.base import MemoryObject
 
+# The live ``{"is_init", "k", "v"}`` dict an encode-once cross-attention layer
+# populates on the first forward and reads thereafter.
+CrossKVCache = dict[str, bool | torch.Tensor | None]
 
-class EncodeOnceKV(MemoryObject):
+# The frame/chunk type a ``LatentBuffer`` holds (e.g. ``np.ndarray`` pixel
+# frames, ``torch.Tensor`` latent chunks).
+ItemT = TypeVar("ItemT")
+
+
+class EncodeOnceKV(MemoryObject[CrossKVCache, CrossKVCache]):
     """Encode-once cross-attention KV.
 
     Wraps an ``{"is_init", "k", "v"}`` dict that a model's cross-attention
@@ -33,16 +41,16 @@ class EncodeOnceKV(MemoryObject):
     """
 
     def __init__(self) -> None:
-        self._cache: dict[str, bool | torch.Tensor | None] | None = None
+        self._cache: CrossKVCache | None = None
 
-    def allocate(self, **_: Any) -> None:
+    def allocate(self) -> None:
         self._cache = {"is_init": False, "k": None, "v": None}
 
-    def commit(self, payload: dict[str, bool | torch.Tensor | None] | None = None) -> None:
+    def commit(self, payload: CrossKVCache | None = None) -> None:
         if payload is not None:
             self._cache = payload
 
-    def view(self, *, include_staged: bool = True) -> dict[str, bool | torch.Tensor | None]:
+    def view(self, *, include_staged: bool = True) -> CrossKVCache:
         if self._cache is None:
             raise RuntimeError("EncodeOnceKV is not allocated; call allocate() first.")
         return self._cache
@@ -66,7 +74,7 @@ class EncodeOnceKV(MemoryObject):
         return self._cache is not None
 
 
-class LatentBuffer(MemoryObject):
+class LatentBuffer(MemoryObject[ItemT, list[ItemT]]):
     """Append / ring buffer of latent or pixel frames.
 
     A bounded ``deque`` (``maxlen`` set at ``allocate()`` time). Compaction
@@ -75,26 +83,26 @@ class LatentBuffer(MemoryObject):
     """
 
     def __init__(self) -> None:
-        self._buf: deque[Any] | None = None
+        self._buf: deque[ItemT] | None = None
 
-    def allocate(self, *, maxlen: int | None = None, **_: Any) -> None:
+    def allocate(self, *, maxlen: int | None = None) -> None:
         self._buf = deque(maxlen=maxlen)
 
-    def append(self, payload: Any) -> None:
+    def append(self, payload: ItemT) -> None:
         if self._buf is None:
             raise RuntimeError("LatentBuffer is not allocated; call allocate() first.")
         self._buf.append(payload)
 
-    def extend(self, payloads: Iterable[Any]) -> None:
+    def extend(self, payloads: Iterable[ItemT]) -> None:
         if self._buf is None:
             raise RuntimeError("LatentBuffer is not allocated; call allocate() first.")
         self._buf.extend(payloads)
 
-    def commit(self, payload: Any = None) -> None:
+    def commit(self, payload: ItemT | None = None) -> None:
         if payload is not None:
             self.append(payload)
 
-    def view(self, *, include_staged: bool = True) -> list[Any]:
+    def view(self, *, include_staged: bool = True) -> list[ItemT]:
         if self._buf is None:
             raise RuntimeError("LatentBuffer is not allocated; call allocate() first.")
         return list(self._buf)
