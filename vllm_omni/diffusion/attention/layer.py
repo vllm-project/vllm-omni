@@ -140,6 +140,7 @@ class Attention(nn.Module):
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
+            causal=causal,
         )
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()

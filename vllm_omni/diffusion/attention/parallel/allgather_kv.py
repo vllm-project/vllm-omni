@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -48,6 +48,7 @@ class AllGatherKVParallelAttention:
         self._sp_group = sp_group
         self._ag_group = sp_group.ulysses_group
         self._sp_size = sp_group.ulysses_world_size
+        self._sp_rank = sp_group.ulysses_rank
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
 
@@ -95,6 +96,15 @@ class AllGatherKVParallelAttention:
         else:
             q_local = query
 
+        attn_metadata = self._slice_attn_metadata_for_local_query(
+            attn_metadata,
+            q_local_len=q_local.shape[1],
+            img_seq_local=query.shape[1],
+            img_seq_full=k_img_full.shape[1],
+            joint_len=joint_q.shape[1] if joint_q is not None else 0,
+            joint_strategy=joint_strategy,
+        )
+
         ctx = _AllGatherKVCtx(
             name=self.name,
             joint_len=joint_q.shape[1] if joint_q is not None else 0,
@@ -102,6 +112,67 @@ class AllGatherKVParallelAttention:
             img_seq_local=query.shape[1],
         )
         return q_local, k_full, v_full, attn_metadata, ctx
+
+    def _slice_attn_metadata_for_local_query(
+        self,
+        attn_metadata: AttentionMetadata | None,
+        *,
+        q_local_len: int,
+        img_seq_local: int,
+        img_seq_full: int,
+        joint_len: int,
+        joint_strategy: str,
+    ) -> AttentionMetadata | None:
+        """Convert a full-Q dense mask into the local-Q mask used by AG-KV.
+
+        HunyuanImage3 builds masks in global sequence coordinates. AllGather-KV
+        keeps the K/V axis global but computes only this rank's Q rows, so a
+        [B, H, Q_full, K_full] mask must be row-sliced to
+        [B, H, Q_local, K_full].
+        """
+        if attn_metadata is None or attn_metadata.attn_mask is None:
+            return attn_metadata
+
+        mask = attn_metadata.attn_mask
+        if mask.ndim != 4:
+            return attn_metadata
+
+        if mask.shape[-2] == q_local_len:
+            return attn_metadata
+
+        q_full_len = joint_len + img_seq_full
+        if mask.shape[-2] != q_full_len:
+            raise ValueError(
+                "AllGather-KV SP received an attention mask with incompatible Q length: "
+                f"mask_q={mask.shape[-2]}, expected local_q={q_local_len} or full_q={q_full_len} "
+                f"(joint_len={joint_len}, img_seq_local={img_seq_local}, img_seq_full={img_seq_full})."
+            )
+
+        img_start = self._sp_rank * img_seq_local
+        img_end = img_start + img_seq_local
+        if img_end > img_seq_full:
+            raise ValueError(
+                "AllGather-KV SP local image query range exceeds gathered image length: "
+                f"rank={self._sp_rank}, img_start={img_start}, img_end={img_end}, img_seq_full={img_seq_full}."
+            )
+
+        if joint_len > 0 and joint_strategy == "front":
+            joint_mask = mask[..., :joint_len, :]
+            img_mask = mask[..., joint_len + img_start : joint_len + img_end, :]
+            local_mask = torch.cat([joint_mask, img_mask], dim=-2)
+        elif joint_len > 0:
+            img_mask = mask[..., img_start:img_end, :]
+            joint_mask = mask[..., img_seq_full : img_seq_full + joint_len, :]
+            local_mask = torch.cat([img_mask, joint_mask], dim=-2)
+        else:
+            local_mask = mask[..., img_start:img_end, :]
+
+        if local_mask.shape[-2] != q_local_len:
+            raise ValueError(
+                "AllGather-KV SP produced an attention mask with incompatible local Q length: "
+                f"mask_q={local_mask.shape[-2]}, q_local={q_local_len}."
+            )
+        return replace(attn_metadata, attn_mask=local_mask.contiguous())
 
     def post_attention(
         self,

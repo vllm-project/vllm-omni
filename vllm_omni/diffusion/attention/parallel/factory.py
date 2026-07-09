@@ -28,6 +28,7 @@ def build_parallel_attention_strategy(
     scatter_idx: int,
     gather_idx: int,
     use_sync: bool,
+    causal: bool = False,
 ) -> ParallelAttentionStrategy:
     """Select a parallel attention strategy based on current diffusion config.
 
@@ -66,6 +67,8 @@ def build_parallel_attention_strategy(
     # Each rank holds 1/P of Q; AllGather collects full K/V; single local
     # attention kernel computes Q_local x K_full. Only valid for causal=False.
     if allgather_degree > 1:
+        if causal:
+            raise ValueError("AllGather-KV SP only supports non-causal attention.")
         if ulysses_degree > 1 or ring_degree > 1:
             raise ValueError(
                 f"AllGather-KV SP is mutually exclusive with Ulysses/Ring in v1 "

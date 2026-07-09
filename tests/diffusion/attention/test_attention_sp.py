@@ -31,7 +31,11 @@ import tempfile
 import pytest
 import torch
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.parallel.allgather_kv import (
+    AllGatherKVParallelAttention,
+)
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
@@ -153,6 +157,69 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         for layer in self.layers:
             hidden_states = hidden_states + layer(hidden_states)
         return hidden_states
+
+
+class _MockAllGatherSPGroup:
+    def __init__(self, *, rank: int, chunks: list[torch.Tensor]) -> None:
+        self.ulysses_group = object()
+        self.ulysses_world_size = len(chunks)
+        self.ulysses_rank = rank
+        self._chunks = chunks
+
+    def all_gather(self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False):
+        assert not separate_tensors
+        return torch.cat(self._chunks, dim=dim)
+
+
+def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
+    rank = 1
+    joint_len = 1
+    img_seq_local = 2
+    img_seq_full = 4
+    key_chunks = [
+        torch.full((1, img_seq_local, 1, 1), 10.0),
+        torch.full((1, img_seq_local, 1, 1), 20.0),
+    ]
+    value_chunks = [
+        torch.full((1, img_seq_local, 1, 1), 30.0),
+        torch.full((1, img_seq_local, 1, 1), 40.0),
+    ]
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(rank=rank, chunks=key_chunks),
+    )
+
+    query = torch.zeros((1, img_seq_local, 1, 1))
+    key = key_chunks[rank]
+    value = value_chunks[rank]
+    joint = torch.ones((1, joint_len, 1, 1))
+    mask = torch.arange((joint_len + img_seq_full) * (joint_len + img_seq_full))
+    mask = (mask % 2 == 0).view(1, 1, joint_len + img_seq_full, joint_len + img_seq_full)
+    metadata = AttentionMetadata(
+        attn_mask=mask,
+        joint_query=joint,
+        joint_key=joint,
+        joint_value=joint,
+        joint_strategy="front",
+    )
+
+    q_local, k_full, v_full, metadata_local, _ = strategy.pre_attention(query, key, value, metadata)
+
+    expected_rows = torch.cat(
+        [
+            mask[..., :joint_len, :],
+            mask[
+                ...,
+                joint_len + rank * img_seq_local : joint_len + (rank + 1) * img_seq_local,
+                :,
+            ],
+        ],
+        dim=-2,
+    )
+    assert q_local.shape[1] == joint_len + img_seq_local
+    assert k_full.shape[1] == joint_len + img_seq_full
+    assert v_full.shape[1] == joint_len + img_seq_full
+    assert metadata_local is not None
+    assert torch.equal(metadata_local.attn_mask, expected_rows)
 
 
 @pytest.mark.parametrize(
