@@ -1124,6 +1124,7 @@ class ImageKVCacheManager:
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
         repeat_num = head_num_per_rank // kv_head_num_per_rank
+        use_allgather_kv = self.sp_size > 1 and getattr(self.attn.parallel_strategy, "name", None) == "allgather_kv"
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
@@ -1165,11 +1166,12 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
-        if self.sp_size > 1:
-            joint_text_key = repeat_kv(joint_text_key, repeat_num)
-            joint_text_value = repeat_kv(joint_text_value, repeat_num)
+        if not use_allgather_kv:
+            key = repeat_kv(key, repeat_num)
+            value = repeat_kv(value, repeat_num)
+            if self.sp_size > 1:
+                joint_text_key = repeat_kv(joint_text_key, repeat_num)
+                joint_text_value = repeat_kv(joint_text_value, repeat_num)
 
         attention_mask = attention_mask.contiguous()
 
@@ -1188,6 +1190,7 @@ class ImageKVCacheManager:
                 joint_strategy="front",
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra={"kv_repeat_num": repeat_num} if use_allgather_kv else {},
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
