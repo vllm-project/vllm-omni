@@ -23,6 +23,9 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.audex"
 # by a unit test against the real tokenizer fixture.
 AUDEX_SPEECHGEN_END_TOKEN_ID = 131076
 
+# <audiogen_end> stops TTA generation (pinned in tests via models/audex/tta.py).
+AUDEX_AUDIOGEN_END_TOKEN_ID = 131074
+
 AUDEX_PIPELINE = PipelineConfig(
     model_type="nemotron_labs_audex",
     model_arch="NemotronDenseForCausalLM",
@@ -58,6 +61,47 @@ AUDEX_PIPELINE = PipelineConfig(
             model_subdir="audex_causal_speech_decoder",
             tokenizer_subdir="checkpoint_folder_audiogen",
             sync_process_input_func=f"{_PROC}.thinker2code2wav_token_only",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
+
+# Text-to-audio (caption → general audio): same audiogen thinker checkpoint,
+# but the output rides the interleaved 4-codebook <audiocodec_N> RVQ block
+# and decodes through the EXTERNAL XCodec1 checkpoint. XCodec1 is a CNN codec
+# decoded over the full sequence, so this pipeline is sync full-payload only
+# (deploy yaml sets async_chunk: false). CFG is effectively mandatory for TTA
+# quality (official default scale 3.0).
+AUDEX_TTA_PIPELINE = PipelineConfig(
+    model_type="nemotron_labs_audex_tta",
+    model_arch="NemotronDenseForCausalLM",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="audex_tta_thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            engine_output_type="latent",
+            model_subdir="checkpoint_folder_audiogen",
+            tokenizer_subdir="checkpoint_folder_audiogen",
+            prompt_expand_func=f"{_PROC}.expand_cfg_prompts",
+            custom_process_next_stage_input_func=f"{_PROC}.thinker2xcodec_full_payload",
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [AUDEX_AUDIOGEN_END_TOKEN_ID],
+            },
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="audex_xcodec",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="AudexXCodec1",
             sampling_constraints={"detokenize": True},
         ),
     ),

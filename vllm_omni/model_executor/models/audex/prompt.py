@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Audex TTS prompt construction.
+"""Audex TTS/TTA prompt construction.
 
 The Audex thinker consumes the exact ChatML prompt used by the official
 inference script (``inference_scripts_vllm/audiogen_scripts/run_audio_gen_vllm.py``
@@ -30,6 +30,12 @@ _TTS_PROMPT_TEMPLATE = (
     "<|im_start|>assistant\n<think></think><speechgen_start>"
 )
 
+_TTA_PROMPT_TEMPLATE = (
+    "<|im_start|>system\n{system_prompt}<|im_end|>\n"
+    "<|im_start|>user\n<|text to audio|> Generate audio for this caption.{text}<|im_end|>\n"
+    "<|im_start|>assistant\n<think></think><audiogen_start>"
+)
+
 
 def build_cond_prompt(text: str) -> str:
     """Build the conditional TTS prompt for one transcription."""
@@ -39,18 +45,19 @@ def build_cond_prompt(text: str) -> str:
     return _TTS_PROMPT_TEMPLATE.format(system_prompt=AUDEX_SYSTEM_PROMPT, text=f" {text}")
 
 
-def build_null_prompt(cond_prompt: str, tokenizer, max_iters: int = 64) -> str:
-    """Unconditional prompt for CFG (length-matched ``<unk>`` padding).
+def build_tta_cond_prompt(caption: str) -> str:
+    """Build the conditional TTA prompt for one audio caption."""
+    caption = caption.strip()
+    if not caption:
+        raise ValueError("Audex TTA requires a non-empty caption")
+    return _TTA_PROMPT_TEMPLATE.format(system_prompt=AUDEX_SYSTEM_PROMPT, text=f" {caption}")
 
-    Replaces the transcription with ``<unk>`` repeated, adjusting the count
-    until ``tokenizer.encode`` yields exactly the conditional prompt's
-    length. Raises when no count matches so callers can fail the request
-    instead of submitting a misaligned pair.
-    """
+
+def _length_matched_null(cond_prompt: str, tokenizer, template: str, max_iters: int) -> str:
     target_len = len(tokenizer.encode(cond_prompt))
     n_unk = 1
     for _ in range(max_iters):
-        prompt = _TTS_PROMPT_TEMPLATE.format(system_prompt=AUDEX_SYSTEM_PROMPT, text="<unk>" * n_unk)
+        prompt = template.format(system_prompt=AUDEX_SYSTEM_PROMPT, text="<unk>" * n_unk)
         diff = target_len - len(tokenizer.encode(prompt))
         if diff == 0:
             return prompt
@@ -58,3 +65,19 @@ def build_null_prompt(cond_prompt: str, tokenizer, max_iters: int = 64) -> str:
         if diff < 0 and n_unk == 1:
             break
     raise ValueError(f"Could not length-match the CFG null prompt to {target_len} tokens")
+
+
+def build_null_prompt(cond_prompt: str, tokenizer, max_iters: int = 64) -> str:
+    """Unconditional TTS prompt for CFG (length-matched ``<unk>`` padding).
+
+    Replaces the transcription with ``<unk>`` repeated, adjusting the count
+    until ``tokenizer.encode`` yields exactly the conditional prompt's
+    length. Raises when no count matches so callers can fail the request
+    instead of submitting a misaligned pair.
+    """
+    return _length_matched_null(cond_prompt, tokenizer, _TTS_PROMPT_TEMPLATE, max_iters)
+
+
+def build_tta_null_prompt(cond_prompt: str, tokenizer, max_iters: int = 64) -> str:
+    """Unconditional TTA prompt for CFG (length-matched ``<unk>`` padding)."""
+    return _length_matched_null(cond_prompt, tokenizer, _TTA_PROMPT_TEMPLATE, max_iters)

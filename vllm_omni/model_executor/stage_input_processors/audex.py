@@ -34,6 +34,12 @@ CFG_UNCOND_SUFFIX = "__cfg_uncond"
 _DEFAULT_CODEC_TOKEN_OFFSET = 131077
 _DEFAULT_CODEC_VOCAB_SIZE = 65536
 
+# TTA <audiocodec_N> block (see models/audex/tta.py; pinned against the real
+# tokenizer there). Interleaved 4-codebook RVQ.
+_DEFAULT_AUDIOCODEC_TOKEN_OFFSET = 196613
+_DEFAULT_AUDIOCODEC_VOCAB_SIZE = 8192
+_TTA_NUM_CODEBOOKS = 4
+
 _STATE_KEY = "_audex_async_state"
 
 
@@ -220,6 +226,40 @@ def thinker2code2wav_full_payload(
         raise ValueError(f"Audex thinker produced no codec tokens for request {request_id}")
     return {
         "codes": {"audio": codes},
+        "meta": {
+            "finished": torch.tensor(True, dtype=torch.bool),
+            "req_id": [request_id],
+        },
+    }
+
+
+def thinker2xcodec_full_payload(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any] | None,
+    request: Any,
+) -> dict[str, Any] | None:
+    """TTA sync-path producer: ship the de-interleaved RVQ payload at finish.
+
+    Filters ``<audiocodec_N>`` ids from the sampled stream, truncates to whole
+    4-token frames, and ships a ``[frames, 4]`` codec-id payload (offsets NOT
+    subtracted; the XCodec1 stage removes the per-layer offset).
+    """
+    del pooling_output  # thinker emits none; codes come from the token stream
+    cfg = _connector_extra(transfer_manager)
+    codec_offset = int(cfg.get("audiocodec_token_offset", _DEFAULT_AUDIOCODEC_TOKEN_OFFSET))
+    codec_size = int(cfg.get("audiocodec_vocab_size", _DEFAULT_AUDIOCODEC_VOCAB_SIZE))
+
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
+    codes = _codec_frames(output_token_ids, codec_offset, codec_size)
+    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    if not codes:
+        raise ValueError(f"Audex TTA thinker produced no codec tokens for request {request_id}")
+    usable = len(codes) - (len(codes) % _TTA_NUM_CODEBOOKS)
+    if usable == 0:
+        raise ValueError(f"Audex TTA thinker produced fewer than one full RVQ frame for request {request_id}")
+    frames = torch.tensor(codes[:usable], dtype=torch.long).reshape(-1, _TTA_NUM_CODEBOOKS)
+    return {
+        "codes": {"audio": frames},
         "meta": {
             "finished": torch.tensor(True, dtype=torch.bool),
             "req_id": [request_id],

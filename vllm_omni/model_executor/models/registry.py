@@ -94,6 +94,11 @@ _OMNI_MODELS = {
         "audex_code2wav",
         "AudexCode2Wav",
     ),
+    "AudexXCodec1": (
+        "audex",
+        "audex_xcodec",
+        "AudexXCodec1",
+    ),
     "OmniVoiceModel": (
         "omnivoice",
         "omnivoice",

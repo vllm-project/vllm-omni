@@ -412,3 +412,88 @@ def test_tokenizer_pins_codec_offset_and_markers():
     assert vocab["<speechcodec_65535>"] == _DEFAULT_CODEC_TOKEN_OFFSET + _DEFAULT_CODEC_VOCAB_SIZE - 1
     assert vocab["<speechgen_end>"] == AUDEX_SPEECHGEN_END_TOKEN_ID
     assert vocab["<speechgen_start>"] == AUDEX_SPEECHGEN_END_TOKEN_ID - 1
+
+
+# ---------------------------------------------------------------- TTA pipeline / prompts / profiles
+
+
+def test_tta_pipeline_topology():
+    from vllm_omni.model_executor.models.audex.pipeline import (
+        AUDEX_AUDIOGEN_END_TOKEN_ID,
+        AUDEX_TTA_PIPELINE,
+    )
+
+    assert AUDEX_TTA_PIPELINE.model_type == "nemotron_labs_audex_tta"
+    stage0, stage1 = AUDEX_TTA_PIPELINE.stages
+    assert stage0.model_stage == "audex_tta_thinker"
+    assert stage0.model_subdir == "checkpoint_folder_audiogen"
+    assert stage0.sampling_constraints["stop_token_ids"] == [AUDEX_AUDIOGEN_END_TOKEN_ID]
+    assert stage0.prompt_expand_func.endswith("expand_cfg_prompts")
+    assert stage1.model_stage == "audex_xcodec"
+    assert stage1.model_arch == "AudexXCodec1"
+    assert stage1.model_subdir is None  # external checkpoint, not a repo subdir
+    assert stage1.final_output_type == "audio"
+
+
+def test_tta_pipeline_registered():
+    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+
+    assert OMNI_PIPELINES["nemotron_labs_audex_tta"].model_type == "nemotron_labs_audex_tta"
+
+
+def test_tta_cond_prompt_matches_official_format():
+    from vllm_omni.model_executor.models.audex.prompt import build_tta_cond_prompt
+
+    caption = "Rain falling on a tin roof."
+    official = (
+        "<|im_start|>system\n"
+        "You are a helpful and harmless assistant.\n\n"
+        "You are not allowed to use any tools.<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"<|text to audio|> Generate audio for this caption. {caption}<|im_end|>\n"
+        "<|im_start|>assistant\n<think></think><audiogen_start>"
+    )
+    assert build_tta_cond_prompt(caption) == official
+
+
+def test_tta_null_prompt_length_matches():
+    from vllm_omni.model_executor.models.audex.prompt import build_tta_cond_prompt, build_tta_null_prompt
+
+    tokenizer = _CountingTokenizer()
+    cond = build_tta_cond_prompt("dogs barking in the distance")
+    null = build_tta_null_prompt(cond, tokenizer)
+    assert len(tokenizer.encode(null)) == len(tokenizer.encode(cond))
+    assert "<unk>" in null
+
+
+def test_snapshot_profiles():
+    from vllm_omni.model_executor.models.audex.checkpoint import _SNAPSHOT_PROFILE_PATTERNS
+
+    # The TTS profile is the v1 contract: byte-identical pattern list.
+    assert _SNAPSHOT_PROFILE_PATTERNS["tts"] == [
+        "config.json",
+        "checkpoint_folder_audiogen/*",
+        "audex_causal_speech_decoder/*",
+        "checkpoint_folder_full/model-00001-of-00002.safetensors",
+    ]
+    assert "audex_causal_speech_decoder/*" not in _SNAPSHOT_PROFILE_PATTERNS["tta"]
+    assert "checkpoint_folder_full/*" in _SNAPSHOT_PROFILE_PATTERNS["full"]
+
+
+def test_snapshot_unknown_profile_raises(tmp_path):
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+    with pytest.raises(ValueError, match="profile"):
+        ensure_audex_snapshot("nvidia/Nemotron-Labs-Audex-2B", profile="bogus")
+    # Local directories pass through regardless of profile.
+    assert ensure_audex_snapshot(str(tmp_path)) == str(tmp_path)
+
+
+def test_xcodec_snapshot_local_dir_passthrough(tmp_path):
+    from vllm_omni.model_executor.models.audex.checkpoint import (
+        XCODEC1_DEFAULT_REPO,
+        ensure_xcodec1_snapshot,
+    )
+
+    assert ensure_xcodec1_snapshot(str(tmp_path)) == str(tmp_path)
+    assert XCODEC1_DEFAULT_REPO == "hf-audio/xcodec-hubert-general-balanced"

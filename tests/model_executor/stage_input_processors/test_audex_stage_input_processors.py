@@ -230,3 +230,48 @@ class TestExpandCfgPrompts:
 
         (companion,) = expand_cfg_prompts("cond text", _cfg_params(self._cond_args()))
         assert companion.prompt == "<unk><unk><unk>"
+
+
+# ---------------------------------------------------------------- TTA full payload
+
+_TTA_OFFSET = 196613
+
+
+def _tta_transfer_manager():
+    return SimpleNamespace(
+        request_payload={},
+        connector=SimpleNamespace(
+            config={"extra": {"audiocodec_token_offset": _TTA_OFFSET, "audiocodec_vocab_size": 8192}}
+        ),
+    )
+
+
+class TestThinker2XcodecFullPayload:
+    def _payload(self, output_token_ids):
+        from vllm_omni.model_executor.stage_input_processors.audex import thinker2xcodec_full_payload
+
+        request = _request("req-tta", output_token_ids, finished=True)
+        return thinker2xcodec_full_payload(_tta_transfer_manager(), None, request)
+
+    def test_ships_deinterleaved_frames(self):
+        codes = [0, 1024, 2048, 3072, 1, 1025, 2049, 3073]
+        tokens = [999] + [_TTA_OFFSET + c for c in codes] + [131074]  # noise + end marker filtered
+        payload = self._payload(tokens)
+        frames = payload["codes"]["audio"]
+        assert frames.shape == (2, 4)
+        assert frames.reshape(-1).tolist() == codes
+        assert bool(payload["meta"]["finished"]) is True
+        assert payload["meta"]["req_id"] == ["req-tta"]
+
+    def test_partial_frame_truncated(self):
+        codes = [0, 1024, 2048, 3072, 1, 1025]  # 1.5 frames
+        payload = self._payload([_TTA_OFFSET + c for c in codes])
+        assert payload["codes"]["audio"].shape == (1, 4)
+
+    def test_zero_codes_raises(self):
+        with pytest.raises(ValueError, match="no codec tokens"):
+            self._payload([999, 131074])
+
+    def test_less_than_one_frame_raises(self):
+        with pytest.raises(ValueError, match="full RVQ frame"):
+            self._payload([_TTA_OFFSET + 0, _TTA_OFFSET + 1024])
