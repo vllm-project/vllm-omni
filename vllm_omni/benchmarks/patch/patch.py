@@ -45,6 +45,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextDataset,
 )
+from vllm_omni.benchmarks.data_modules.audex_tta_dataset import AudexTTADataset
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.metrics import definitions as defs
@@ -231,6 +232,7 @@ def get_samples(args, tokenizer):
         "seed-tts-design",
         "ttsd",
         "sound-effect",
+        "audex-tta",
     )
 
     # Check if we need to handle omni-related backends/datasets
@@ -350,6 +352,7 @@ def get_samples(args, tokenizer):
             "seed-tts-design": SeedTTSDesignDataset,
             "ttsd": TTSDDataset,
             "sound-effect": SoundEffectDataset,
+            "audex-tta": AudexTTADataset,
         }
         DatasetCls = _cls_map[args.dataset_name]
         dataset = DatasetCls(

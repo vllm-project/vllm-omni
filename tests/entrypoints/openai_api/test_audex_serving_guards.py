@@ -216,3 +216,125 @@ class TestAudexStageDetection:
         serving = self._serving_with_stages(["audex_thinker", "audex_code2wav"])
         stage = serving._find_tts_stage()
         assert stage is not None and stage.engine_args.model_stage == "audex_thinker"
+
+
+def test_guided_injection_sets_guided_temperature():
+    """Guided requests decode at the measured CFG temperature (0.05)."""
+    serving = TestAudexCfgInjection()._serving_with_fake_tokenizer()
+    cond = TestAudexCfgInjection()._cond_prompt()
+    params = SimpleNamespace(extra_args={"cfg_scale": 1.5}, temperature=0.1)
+    serving._inject_audex_cfg_pair_args("req-1", {"prompt": cond}, params)
+    assert params.temperature == 0.05
+
+    unguided = SimpleNamespace(extra_args={"cfg_scale": 1.0}, temperature=0.1)
+    serving._inject_audex_cfg_pair_args("req-2", {"prompt": cond}, unguided)
+    assert unguided.temperature == 0.1
+
+
+# ---------------------------------------------------------------- TTA serving surface
+
+from vllm_omni.entrypoints.openai.tts_adapters import resolve_adapter  # noqa: E402
+from vllm_omni.entrypoints.openai.tts_adapters.audex_tta import AudexTTAAdapter  # noqa: E402
+
+
+def _tta_adapter() -> AudexTTAAdapter:
+    return AudexTTAAdapter.__new__(AudexTTAAdapter)
+
+
+class _TTAVocabTokenizer(_MarkerTokenizer):
+    """Marker tokenizer + a full audiocodec vocab for phase-id building."""
+
+    def get_vocab(self):
+        vocab = {"<audiogen_start>": 7, "<audiogen_end>": 8}
+        for n in range(8192):
+            vocab[f"<audiocodec_{n}>"] = 1000 + n
+        return vocab
+
+
+class TestAudexTTAAdapterValidation:
+    def test_default_caption_accepted(self):
+        assert _tta_adapter().validate(_speech_request()) is None
+
+    def test_empty_caption_rejected(self):
+        req = _speech_request()
+        req.input = "  "
+        assert _tta_adapter().validate(req) is not None
+
+    @pytest.mark.parametrize("scale", [1.0, 3.0, 10.0])
+    def test_in_range_scale_accepted(self, scale):
+        assert _tta_adapter().validate(_speech_request(cfg_scale=scale)) is None
+
+    @pytest.mark.parametrize("scale", [0.5, 10.5, "big"])
+    def test_out_of_range_scale_rejected(self, scale):
+        error = _tta_adapter().validate(_speech_request(cfg_scale=scale))
+        assert error is not None and "cfg_scale" in error
+
+    @pytest.mark.parametrize("key", ["cfg_role", "cfg_pair_id", "cfg_null_prompt", "tta_rvq"])
+    def test_internal_keys_rejected(self, key):
+        error = _tta_adapter().validate(_speech_request(**{key: "x"}))
+        assert error is not None and key in error
+
+
+class TestAdapterRouting:
+    def test_tta_adapter_resolves_by_model_type(self):
+        adapter_cls = resolve_adapter("audex_tta")
+        assert adapter_cls is AudexTTAAdapter
+        assert adapter_cls.stage_keys == frozenset({"audex_tta_thinker"})
+
+    def test_tts_adapter_never_selects_tta_stage(self):
+        assert "audex_tta_thinker" not in AudexAdapter.stage_keys
+        assert not (AudexAdapter.stage_keys & AudexTTAAdapter.stage_keys)
+
+    def test_detection_separates_tts_and_tta(self):
+        tta_serving = TestAudexStageDetection()._serving_with_stages(["audex_tta_thinker", "audex_xcodec"])
+        tta_serving._tts_stage = tta_serving._find_tts_stage()
+        assert tta_serving._tts_stage.engine_args.model_stage == "audex_tta_thinker"
+        assert tta_serving._detect_tts_model_type() == "audex_tta"
+
+        tts_serving = TestAudexStageDetection()._serving_with_stages(["audex_thinker", "audex_code2wav"])
+        tts_serving._tts_stage = tts_serving._find_tts_stage()
+        assert tts_serving._detect_tts_model_type() == "audex"
+
+
+class TestAudexTTAInjection:
+    def _serving(self):
+        serving = _serving(model_type="audex_tta")
+        serving._get_audex_tokenizer = lambda: _TTAVocabTokenizer()
+        serving._audex_tta_rvq = None
+        return serving
+
+    def _prompt(self):
+        from vllm_omni.model_executor.models.audex.prompt import build_tta_cond_prompt
+
+        return {"prompt": build_tta_cond_prompt("Rain on a tin roof.")}
+
+    def test_default_injection_applies_rvq_and_cfg3(self):
+        serving = self._serving()
+        params = SimpleNamespace(extra_args=None)
+        serving._inject_audex_tta_args("req-9", self._prompt(), params)
+
+        extra = params.extra_args
+        rvq = extra["tta_rvq"]
+        assert len(rvq["phase_token_ids"]) == 4
+        assert all(len(ids) == 1024 for ids in rvq["phase_token_ids"])
+        assert (rvq["start_tid"], rvq["end_tid"]) == (7, 8)
+        assert rvq["codec_cap"] == 4000 and rvq["start_in_prompt"] is True
+        assert extra["cfg_scale"] == 3.0
+        assert extra["cfg_role"] == "cond" and extra["cfg_pair_id"] == "req-9"
+        assert "<unk>" in extra["cfg_null_prompt"]
+
+    def test_explicit_scale_one_disables_cfg_but_keeps_rvq(self):
+        serving = self._serving()
+        params = SimpleNamespace(extra_args={"cfg_scale": 1.0})
+        serving._inject_audex_tta_args("req-1", self._prompt(), params)
+        assert "tta_rvq" in params.extra_args
+        assert "cfg_scale" not in params.extra_args
+        assert "cfg_role" not in params.extra_args
+
+    def test_rvq_contract_cached_per_process(self):
+        serving = self._serving()
+        params_a = SimpleNamespace(extra_args=None)
+        params_b = SimpleNamespace(extra_args=None)
+        serving._inject_audex_tta_args("a", self._prompt(), params_a)
+        serving._inject_audex_tta_args("b", self._prompt(), params_b)
+        assert params_a.extra_args["tta_rvq"] is params_b.extra_args["tta_rvq"]

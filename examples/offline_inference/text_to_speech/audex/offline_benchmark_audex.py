@@ -119,6 +119,11 @@ def _load_audex_tokenizer(model: str):
     return AutoTokenizer.from_pretrained(str(Path(root) / "checkpoint_folder_audiogen"))
 
 
+# Guided decoding sharpens the distribution; the guided temperature 0.05
+# is the measured quality setting (see end2end.py for the en-24 numbers).
+GUIDED_TEMPERATURE = 0.05
+
+
 def _cfg_sampling_params(engine: Omni, cfg_scale: float, pair_id: str, cond_prompt: str, tokenizer):
     """Stage sampling params carrying the CFG pair contract for one request."""
     import copy
@@ -127,6 +132,7 @@ def _cfg_sampling_params(engine: Omni, cfg_scale: float, pair_id: str, cond_prom
 
     params = copy.deepcopy(engine.resolve_sampling_params_list(None))
     stage0 = params[0]
+    stage0.temperature = GUIDED_TEMPERATURE
     if stage0.extra_args is None:
         stage0.extra_args = {}
     stage0.extra_args.update(

@@ -102,6 +102,7 @@ _INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
 # audex_omni covers the nemotron_labs_audex_full S2S deployment, whose
 # TTS pass uses the same /v1/audio/speech surface.
 _AUDEX_TTS_MODEL_STAGES = {"audex_thinker", "audex_omni"}
+_AUDEX_TTA_MODEL_STAGES = {"audex_tta_thinker"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -120,6 +121,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _STEP_AUDIO2_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
     | _AUDEX_TTS_MODEL_STAGES
+    | _AUDEX_TTA_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -131,6 +133,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v3",
     "indextts2",
     "audex",
+    "audex_tta",
 }
 _TTS_LANGUAGES = frozenset(
     {
@@ -496,6 +499,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
         self._audex_tokenizer = None
+        self._audex_tta_rvq = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
 
         logger.info("Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers))
@@ -741,6 +745,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "indextts2"
         if model_stage in _AUDEX_TTS_MODEL_STAGES:
             return "audex"
+        if model_stage in _AUDEX_TTA_MODEL_STAGES:
+            return "audex_tta"
         return None
 
     def _get_custom_voice_dir(self) -> str | None:
@@ -3293,15 +3299,74 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return {"prompt_token_ids": prompt_ids}
 
     def _get_audex_tokenizer(self):
-        """Load (once per process) the Audex thinker tokenizer for CFG null prompts."""
+        """Load (once per process) the Audex thinker tokenizer for CFG/TTA prompts.
+
+        The folder follows the serving stage: the full-pipeline thinker
+        (``audex_omni``) tokenizes with ``checkpoint_folder_full``; the TTS
+        and TTA thinkers use ``checkpoint_folder_audiogen``.
+        """
         if self._audex_tokenizer is None:
             from transformers import AutoTokenizer
 
             from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
 
-            root = ensure_audex_snapshot(self.engine_client.model_config.model)
-            self._audex_tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"))
+            stage = getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
+            if stage == "audex_omni":
+                profile, folder = "full", "checkpoint_folder_full"
+            elif stage == "audex_tta_thinker":
+                profile, folder = "tta", "checkpoint_folder_audiogen"
+            else:
+                profile, folder = "tts", "checkpoint_folder_audiogen"
+            root = ensure_audex_snapshot(self.engine_client.model_config.model, profile=profile)
+            self._audex_tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, folder))
         return self._audex_tokenizer
+
+    def _inject_audex_tta_args(self, request_id: str, prompt: Any, stage0_params: Any) -> None:
+        """Complete the Audex TTA contract on the stage-0 sampling params.
+
+        Always attaches the RVQ phase-mask contract (required for token
+        validity) and the CFG pair contract at the official default scale
+        3.0 unless the caller passed ``cfg_scale`` (1.0 disables guidance).
+        """
+        from vllm_omni.model_executor.models.audex.prompt import build_tta_null_prompt
+        from vllm_omni.model_executor.models.audex.tta import build_tta_phase_token_ids
+
+        cond_prompt = prompt.get("prompt") if isinstance(prompt, dict) else prompt
+        if not isinstance(cond_prompt, str) or not cond_prompt:
+            raise ValueError("Audex TTA requires the adapter-built caption prompt")
+
+        tokenizer = self._get_audex_tokenizer()
+        if self._audex_tta_rvq is None:
+            phase_token_ids, start_tid, end_tid = build_tta_phase_token_ids(tokenizer)
+            self._audex_tta_rvq = {
+                "phase_token_ids": phase_token_ids,
+                "start_tid": start_tid,
+                "end_tid": end_tid,
+                # Official generation cap (decode truncates at 500 frames).
+                "codec_cap": 4000,
+                # The TTA prompt ends with <audiogen_start>.
+                "start_in_prompt": True,
+            }
+
+        extra_args = getattr(stage0_params, "extra_args", None)
+        if extra_args is None:
+            extra_args = {}
+            stage0_params.extra_args = extra_args
+        extra_args["tta_rvq"] = self._audex_tta_rvq
+
+        cfg_scale = extra_args.get("cfg_scale")
+        cfg_scale = 3.0 if cfg_scale is None else float(cfg_scale)
+        if cfg_scale <= 1.0:
+            extra_args.pop("cfg_scale", None)
+            return
+        extra_args.update(
+            {
+                "cfg_scale": cfg_scale,
+                "cfg_role": "cond",
+                "cfg_pair_id": request_id,
+                "cfg_null_prompt": build_tta_null_prompt(cond_prompt, tokenizer),
+            }
+        )
 
     def _inject_audex_cfg_pair_args(self, request_id: str, prompt: Any, stage0_params: Any) -> None:
         """Complete the Audex CFG contract on the stage-0 sampling params.
@@ -3335,6 +3400,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "cfg_null_prompt": null_prompt,
             }
         )
+        # Guided decoding sharpens the distribution; the unguided default
+        # temperature (0.1) adds excess sampling noise under CFG. Measured
+        # on the en-24 gate corpus at cfg 1.5: temp 0.1 -> CER 7.31%,
+        # temp 0.05 -> CER 6.87% (unguided baseline 7.24%).
+        stage0_params.temperature = 0.05
 
     def _apply_cosyvoice3_dynamic_tokens(
         self,
@@ -3720,6 +3790,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # pair id is the final request_id, which the adapter never sees.
         if self._tts_model_type == "audex" and sampling_params_list:
             self._inject_audex_cfg_pair_args(request_id, prompt, sampling_params_list[0])
+        elif self._tts_model_type == "audex_tta" and sampling_params_list:
+            self._inject_audex_tta_args(request_id, prompt, sampling_params_list[0])
 
         # Some TTS model defaults come from deploy YAML. Their AR
         # generation length is controlled by SamplingParams.max_tokens, so only

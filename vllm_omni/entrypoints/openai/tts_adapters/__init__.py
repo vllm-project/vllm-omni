@@ -52,6 +52,7 @@ def resolve_adapter(model_type: str | None) -> type[TTSModelAdapter] | None:
 # so the registry helpers above are defined first.
 from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     audex,
+    audex_tta,
     cosyvoice3,
     covo_audio,
     fish_speech,

@@ -12,10 +12,13 @@
 #   * Classifier-free guidance: the stage-0 logits processor + scheduler
 #     pair patches are always installed but idle until a request carries
 #     extra_args.cfg_scale > 1.0 (serving: extra_params.cfg_scale; offline:
-#     --cfg-scale). Every guided request adds an unconditional companion
-#     sequence in stage 0 — at max_num_seqs 8 that means at most 4 guided
-#     requests decode concurrently; raise max_num_seqs if CFG-heavy traffic
-#     needs more parallelism.
+#     --cfg-scale). Guided requests decode at temperature 0.05 (CFG
+#     sharpens the distribution; measured en-24 cfg1.5 CER: 6.87% at
+#     temp 0.05 vs 7.31% at the unguided 0.1 — baseline 7.24%).
+#     Every guided request adds an unconditional companion sequence in
+#     stage 0 — at max_num_seqs 8 that means at most 4 guided requests
+#     decode concurrently; raise max_num_seqs if CFG-heavy traffic needs
+#     more parallelism.
 async_chunk: true
 
 connectors:
