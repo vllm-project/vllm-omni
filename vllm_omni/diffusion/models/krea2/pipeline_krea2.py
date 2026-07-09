@@ -16,7 +16,6 @@
 # limitations under the License.
 
 import inspect
-import json
 import logging
 import os
 from collections.abc import Iterable
@@ -45,7 +44,6 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
-from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
 
@@ -55,14 +53,11 @@ DEFAULT_TEXT_ENCODER_SELECT_LAYERS = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 3
 
 def get_krea2_post_process_func(od_config: OmniDiffusionConfig):
     model_name = od_config.model
-    if os.path.exists(model_name):
-        model_path = model_name
-    else:
-        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** len(vae_config["temperal_downsample"]) if "temperal_downsample" in vae_config else 8
+    # Read only the VAE config (``get_hf_file_to_dict`` resolves a local dir via
+    # ``Path(model)/file`` and a hub repo via a single-file download) instead of
+    # pulling all weights just to compute ``vae_scale_factor``.
+    vae_config = get_hf_file_to_dict("vae/config.json", model_name) or {}
+    vae_scale_factor = 2 ** len(vae_config["temperal_downsample"]) if "temperal_downsample" in vae_config else 8
 
     patch_size = 2
     try:
@@ -188,6 +183,7 @@ class Krea2Pipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin,
             subfolder="text_encoder",
             prefetch_list=subfolders,
             local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
         )
         # Drop the unused Qwen3-VL vision tower before moving to GPU so it never consumes GPU memory.
         if hasattr(self.text_encoder, "visual"):
@@ -202,6 +198,7 @@ class Krea2Pipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin,
             subfolder="vae",
             prefetch_list=subfolders,
             local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
         ).to(self.device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Krea2Transformer2DModel)
