@@ -257,12 +257,18 @@ class StageConfigFactory:
         if deploy_path.exists():
             deploy_cfg = load_deploy_config(deploy_path)
             if deploy_cfg.pipeline is not None:
-                return resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
+                pipeline_cfg = resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
+                if pipeline_cfg is None:
+                    raise KeyError(
+                        f"Pipeline {deploy_cfg.pipeline!r} from deploy config {deploy_path} "
+                        f"is not registered to OMNI_PIPELINES. Available: {sorted(OMNI_PIPELINES)}"
+                    )
+                return pipeline_cfg
         return None
 
     @staticmethod
     def _get_trust_remote_code(cli_overrides: dict[str, Any]) -> bool:
-        trust_remote_code = cli_overrides.get("trust_remote_code", True)
+        trust_remote_code = cli_overrides.get("trust_remote_code", False)
         return False if trust_remote_code is None else bool(trust_remote_code)
 
     @staticmethod

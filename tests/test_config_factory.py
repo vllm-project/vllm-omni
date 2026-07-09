@@ -375,6 +375,12 @@ class TestStageConfig:
 class TestStageConfigFactory:
     """Tests for StageConfigFactory class."""
 
+    def test_get_trust_remote_code_defaults_false(self):
+        assert StageConfigFactory._get_trust_remote_code({}) is False
+        assert StageConfigFactory._get_trust_remote_code({"trust_remote_code": None}) is False
+        assert StageConfigFactory._get_trust_remote_code({"trust_remote_code": False}) is False
+        assert StageConfigFactory._get_trust_remote_code({"trust_remote_code": True}) is True
+
     def test_default_diffusion_no_yaml(self):
         """Test single-stage diffusion works without YAML config (@ZJY0516)."""
         kwargs = {
@@ -640,14 +646,13 @@ class TestPipelineRegistration:
 
         assert pipeline_cfg is deploy_pipe
 
-    def test_resolve_pipeline_falls_back_to_model_type_when_deploy_key_is_invalid(
+    def test_resolve_pipeline_rejects_invalid_deploy_pipeline_key(
         self,
         clean_pipeline_registry,
         tmp_path,
     ):
         model_type_key = "registered_model_type_pipeline"
-        model_type_pipe = PipelineConfig(model_type=model_type_key)
-        register_pipeline(model_type_pipe)
+        register_pipeline(PipelineConfig(model_type=model_type_key))
 
         deploy_path = tmp_path / "deploy.yaml"
         deploy_path.write_text("pipeline: missing_pipeline\n", encoding="utf-8")
@@ -656,22 +661,20 @@ class TestPipelineRegistration:
             model_type = model_type_key
 
         with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
-            pipeline_cfg = StageConfigFactory.get_pipeline_config(
-                "fake/model",
-                trust_remote_code=True,
-                deploy_config_path=str(deploy_path),
-            )
-            omni_config = StageConfigFactory.create_from_model("fake/model", {}, str(deploy_path))
-            legacy_configs = StageConfigFactory.create_legacy_stage_configs_from_model(
-                "fake/model",
-                {},
-                str(deploy_path),
-            )
-
-        assert pipeline_cfg is model_type_pipe
-        assert omni_config is not None
-        assert omni_config.pipeline_config is model_type_pipe
-        assert legacy_configs == []
+            with pytest.raises(KeyError, match="missing_pipeline"):
+                StageConfigFactory.get_pipeline_config(
+                    "fake/model",
+                    trust_remote_code=True,
+                    deploy_config_path=str(deploy_path),
+                )
+            with pytest.raises(KeyError, match="missing_pipeline"):
+                StageConfigFactory.create_from_model("fake/model", {}, str(deploy_path))
+            with pytest.raises(KeyError, match="missing_pipeline"):
+                StageConfigFactory.create_legacy_stage_configs_from_model(
+                    "fake/model",
+                    {},
+                    str(deploy_path),
+                )
 
     def test_resolve_pipeline_matches_hf_architecture_fallback(self, clean_pipeline_registry):
         pipeline_key = "architecture_fallback_pipeline"
