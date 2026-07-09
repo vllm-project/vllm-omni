@@ -21,7 +21,6 @@ from vllm_omni.engine.mm_outputs import MultimodalCompletionOutput, MultimodalPa
 from vllm_omni.engine.output_modality import (
     DRAINABLE_MODALITIES,
     OutputModality,
-    TensorAccumulationStrategy,
     get_accumulation_strategy,
 )
 from vllm_omni.outputs import OmniRequestOutput
@@ -38,59 +37,6 @@ _METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_s
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
-
-
-def _to_cpu(x: Any) -> Any:
-    """Move a tensor to CPU; pass through non-tensors unchanged."""
-    if isinstance(x, torch.Tensor):
-        try:
-            return x.detach().to("cpu", non_blocking=True).contiguous()
-        except (RuntimeError, AttributeError):
-            return x
-    if isinstance(x, dict):
-        return {str(sk): _to_cpu(sv) for sk, sv in x.items()}
-    return x
-
-
-def _merge_payload(target: MultimodalPayload, incoming: MultimodalPayload) -> None:
-    """Merge *incoming* into *target* using list-based deferred concatenation."""
-    for k, v in incoming.tensors.items():
-        if k not in target.tensors:
-            target.tensors[k] = v
-        else:
-            existing = target.tensors[k]
-            if isinstance(existing, list):
-                existing.append(v)
-            elif isinstance(existing, torch.Tensor) and isinstance(v, torch.Tensor):
-                target.tensors[k] = [existing, v]
-            else:
-                target.tensors[k] = v
-
-    for k, v in incoming.metadata.items():
-        if k not in target.metadata:
-            target.metadata[k] = v
-        else:
-            existing = target.metadata[k]
-            if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
-                target.metadata[k] = [existing, v]
-            elif isinstance(v, torch.Tensor) and isinstance(existing, list):
-                existing.append(v)
-            else:
-                # Metadata: replace with latest value
-                target.metadata[k] = v
-
-
-def _cat_tensors(
-    tensors: list[torch.Tensor],
-    strategy: TensorAccumulationStrategy,
-) -> torch.Tensor:
-    """Concatenate a list of tensors according to *strategy*."""
-    if strategy == TensorAccumulationStrategy.CONCAT_LAST:
-        return torch.cat(tensors, dim=-1)
-    if strategy == TensorAccumulationStrategy.REPLACE:
-        return tensors[-1]
-    # CONCAT_DIM0 / APPEND_LIST / default
-    return torch.cat(tensors, dim=0)
 
 
 def _modality_to_type_string(modality: OutputModality) -> str:
@@ -147,16 +93,6 @@ class OmniRequestState(RequestState):
         super().apply_streaming_update(update)
         self.native_text_stats.arrival_time = update.arrival_time
 
-    @staticmethod
-    def _to_cpu(x):
-        """Try to convert to CPU tensor if needed."""
-        if isinstance(x, torch.Tensor):
-            try:
-                return x.detach().to("cpu", non_blocking=True).contiguous()
-            except Exception:
-                return x
-        return x
-
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         """Accumulate a multimodal tensor payload into the request state.
 
@@ -169,36 +105,12 @@ class OmniRequestState(RequestState):
             return
         try:
             if mm_type:
-                self.mm_type = (mm_type or "").lower()
+                self.mm_type = mm_type.lower()
+            modality_key = self.mm_type or "hidden"
 
-            target_key = self.mm_type or "hidden"
-
-            # Build incoming MultimodalPayload
-            if isinstance(payload, dict):
-                remapped: dict[str, Any] = {}
-                for k, v in payload.items():
-                    # Normalize producer keys to the modality name.
-                    # AR runners produce {"hidden": ...} and generation
-                    # runners produce {"model_outputs": ...}; remap both
-                    # to the semantic modality key (e.g. "audio", "latent").
-                    if k == "model_outputs":
-                        k = target_key
-                    elif k == "hidden" and target_key != "hidden":
-                        k = target_key
-                    remapped[k] = _to_cpu(v)
-                incoming = MultimodalPayload.from_dict(remapped)
-            elif isinstance(payload, MultimodalPayload):
-                incoming = payload
-            else:
-                incoming = MultimodalPayload.from_dict({target_key: _to_cpu(payload)})
-
-            if incoming is None:
-                return
-
-            if self.mm_accumulated.is_empty:
-                self.mm_accumulated = incoming
-            else:
-                _merge_payload(self.mm_accumulated, incoming)
+            incoming = MultimodalPayload.from_raw(payload, modality_key)
+            if incoming is not None:
+                self.mm_accumulated = self.mm_accumulated.append(incoming)
         except (ValueError, TypeError, RuntimeError):
             logger.exception("Error accumulating multimodal tensor")
 
@@ -231,31 +143,8 @@ class OmniRequestState(RequestState):
                     self.mm_accumulated.metadata[key] = v
 
         try:
-            for k, v in list(self.mm_accumulated.tensors.items()):
-                if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
-                    try:
-                        self.mm_accumulated.tensors[k] = _cat_tensors(v, strategy)
-                    except RuntimeError:
-                        if k == "audio":
-                            try:
-                                self.mm_accumulated.tensors[k] = torch.cat(v, dim=-1)
-                            except RuntimeError:
-                                self.mm_accumulated.tensors[k] = torch.cat([t.reshape(-1) for t in v], dim=0)
-                        else:
-                            logger.warning(
-                                "Error concatenating tensor for key %s; keeping last tensor",
-                                k,
-                            )
-                            self.mm_accumulated.tensors[k] = v[-1]
-
-            # Metadata: consolidate any deferred tensor lists (REPLACE semantics)
-            for k, v in list(self.mm_accumulated.metadata.items()):
-                if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
-                    self.mm_accumulated.metadata[k] = v[-1]
-                elif isinstance(v, dict):
-                    for sk, sv in list(v.items()):
-                        if isinstance(sv, list) and sv and isinstance(sv[0], torch.Tensor):
-                            v[sk] = sv[-1]
+            self.mm_accumulated.consolidate_tensors(strategy)
+            self.mm_accumulated.consolidate_metadata()
         except (RuntimeError, TypeError, KeyError):
             logger.exception("Error consolidating multimodal tensors")
 

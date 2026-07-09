@@ -11,7 +11,78 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput
+
+from vllm_omni.engine.output_modality import TensorAccumulationStrategy
+
+logger = init_logger(__name__)
+
+
+def _to_cpu(x: Any) -> Any:
+    """Move a tensor to CPU; pass through non-tensors unchanged."""
+    if isinstance(x, torch.Tensor):
+        try:
+            return x.detach().to("cpu", non_blocking=True).contiguous()
+        except (RuntimeError, AttributeError):
+            return x
+    if isinstance(x, dict):
+        return {str(sub_key): _to_cpu(sub_value) for sub_key, sub_value in x.items()}
+    return x
+
+
+def _is_tensor_list(value: Any) -> bool:
+    """Return True if *value* is a non-empty list of tensors (deferred concat)."""
+    return isinstance(value, list) and bool(value) and isinstance(value[0], torch.Tensor)
+
+
+def _cat_tensors(
+    tensors: list[torch.Tensor],
+    strategy: TensorAccumulationStrategy,
+) -> torch.Tensor:
+    """Concatenate a list of tensors according to *strategy*."""
+    if strategy == TensorAccumulationStrategy.CONCAT_LAST:
+        return torch.cat(tensors, dim=-1)
+    if strategy == TensorAccumulationStrategy.REPLACE:
+        return tensors[-1]
+    # CONCAT_DIM0 / APPEND_LIST / default
+    return torch.cat(tensors, dim=0)
+
+
+def _consolidate_tensor_list(
+    key: str,
+    tensor_list: list[torch.Tensor],
+    strategy: TensorAccumulationStrategy,
+) -> torch.Tensor:
+    """Concatenate a deferred tensor list, with fallbacks on shape mismatch."""
+    try:
+        return _cat_tensors(tensor_list, strategy)
+    except RuntimeError:
+        if key != "audio":
+            logger.warning("Error concatenating tensor for key %s; keeping last tensor", key)
+            return tensor_list[-1]
+        # Audio chunks may have mismatched shapes; retry along the last dim,
+        # then fall back to flattening each chunk.
+        try:
+            return torch.cat(tensor_list, dim=-1)
+        except RuntimeError:
+            return torch.cat([chunk.reshape(-1) for chunk in tensor_list], dim=0)
+
+
+def _append_entries(store: dict[str, Any], incoming: dict[str, Any]) -> None:
+    """Append *incoming* entries into *store*.
+
+    Tensor values are collected into lists (deferred concatenation, avoiding
+    O(n²) repeated torch.cat); non-tensor values replace the existing entry.
+    """
+    for key, new_value in incoming.items():
+        existing = store.get(key)
+        if isinstance(existing, list) and isinstance(new_value, torch.Tensor):
+            existing.append(new_value)
+        elif isinstance(existing, torch.Tensor) and isinstance(new_value, torch.Tensor):
+            store[key] = [existing, new_value]
+        else:
+            store[key] = new_value
 
 
 @dataclass(eq=False)
@@ -79,6 +150,46 @@ class MultimodalPayload(Mapping):
             return dict(self) == dict(other)
         return NotImplemented
 
+    def append(self, incoming: MultimodalPayload) -> MultimodalPayload:
+        """Append *incoming* onto this payload and return the result.
+
+        Tensor values accumulate into lists for deferred concatenation;
+        non-tensor values are replaced with the latest. When this payload
+        is empty, *incoming* is returned as-is, so callers should use the
+        return value: ``accumulated = accumulated.append(incoming)``.
+        """
+        if self.is_empty:
+            return incoming
+        _append_entries(self.tensors, incoming.tensors)
+        _append_entries(self.metadata, incoming.metadata)
+        return self
+
+    def consolidate_tensors(self, strategy: TensorAccumulationStrategy) -> None:
+        """Concatenate deferred tensor lists into single tensors.
+
+        Tensors are generated content accumulated as chunks, so lists are
+        concatenated according to *strategy* (e.g. audio chunks along the
+        time dimension, latent frames along the batch dimension).
+        """
+        for key, value in list(self.tensors.items()):
+            if _is_tensor_list(value):
+                self.tensors[key] = _consolidate_tensor_list(key, value, strategy)
+
+    def consolidate_metadata(self) -> None:
+        """Resolve deferred tensor lists in metadata by keeping the latest value.
+
+        Metadata values are per-step snapshots (e.g. sample rate), not
+        content deltas, so the latest value supersedes earlier ones.
+        Nested dicts (unflattened payloads) are resolved one level down.
+        """
+        for key, value in list(self.metadata.items()):
+            if _is_tensor_list(value):
+                self.metadata[key] = value[-1]
+            elif isinstance(value, dict):
+                for sub_key, sub_value in list(value.items()):
+                    if _is_tensor_list(sub_value):
+                        value[sub_key] = sub_value[-1]
+
     def to_dict(self) -> dict[str, Any]:
         """Convert back to a plain dict (tensors + metadata merged)."""
         result: dict[str, Any] = dict(self.tensors)
@@ -104,6 +215,28 @@ class MultimodalPayload(Mapping):
         if not tensors and not metadata:
             return None
         return cls(tensors=tensors, metadata=metadata)
+
+    @classmethod
+    def from_raw(cls, payload: Any, modality_key: str) -> MultimodalPayload | None:
+        """Create a MultimodalPayload from a raw producer payload.
+
+        Accepts a MultimodalPayload (returned as-is), a dict, or a bare
+        tensor (stored under *modality_key*). Tensors are moved to CPU.
+        Producer-specific dict keys are remapped to the semantic modality
+        key (e.g. "audio", "latent"): AR runners produce {"hidden": ...}
+        and generation runners produce {"model_outputs": ...}.
+        """
+        if isinstance(payload, MultimodalPayload):
+            return payload
+
+        if not isinstance(payload, dict):
+            return cls.from_dict({modality_key: _to_cpu(payload)})
+
+        remapped: dict[str, Any] = {}
+        for key, value in payload.items():
+            is_producer_key = key == "model_outputs" or (key == "hidden" and modality_key != "hidden")
+            remapped[modality_key if is_producer_key else key] = _to_cpu(value)
+        return cls.from_dict(remapped)
 
 
 @dataclass
