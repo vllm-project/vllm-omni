@@ -251,7 +251,13 @@ class TTARVQPhaseMaskLogitsProcessor(LogitsProcessor):
         if self._disallow_phase is None:
             self._build_masks(logits.shape[-1])
 
+        num_rows = logits.shape[0]
         for idx, state in self._req.items():
+            # Rows beyond this step's logits (pure-prefill / partially
+            # scheduled steps) have nothing to mask; the persistent-batch
+            # index re-enters range on the decode steps that sample.
+            if idx >= num_rows:
+                continue
             tokens = self._output_tokens.get(idx)
             if tokens is None:
                 continue

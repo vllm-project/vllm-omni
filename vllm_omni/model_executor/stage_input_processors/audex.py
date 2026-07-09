@@ -65,6 +65,22 @@ def _codec_frames(tokens: list[int], codec_offset: int, codec_size: int) -> list
     return [int(t) - codec_offset for t in tokens if codec_offset <= int(t) < codec_offset + codec_size]
 
 
+def _empty_finished_payload(request_id: Any, codebooks: int) -> dict[str, Any]:
+    """Terminal payload for a failed request on the sync full-payload path.
+
+    Stage 1 decodes it to empty audio, which the serving layer's no-audio
+    guard turns into a request-level error. Raising here instead would be
+    swallowed by the payload hook (no terminal payload -> stage-1 stall).
+    """
+    return {
+        "codes": {"audio": torch.empty((0, codebooks), dtype=torch.long)},
+        "meta": {
+            "finished": torch.tensor(True, dtype=torch.bool),
+            "req_id": [request_id],
+        },
+    }
+
+
 def expand_cfg_prompts(prompt: dict[str, Any] | str, sampling_params: Any) -> list[ExpandedPrompt]:
     """Emit the unconditional CFG companion for a guided Audex TTS request.
 
@@ -223,7 +239,14 @@ def thinker2code2wav_full_payload(
     codes = _codec_frames(output_token_ids, codec_offset, codec_size)
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     if not codes:
-        raise ValueError(f"Audex thinker produced no codec tokens for request {request_id}")
+        # Do NOT raise: the sync payload hook swallows exceptions and returns
+        # None, so no terminal payload would reach stage 1 and the request
+        # would stall. An empty FINISHED payload lets stage 1 complete with
+        # empty audio and the serving-layer no-audio guard fail the request.
+        logger.error(
+            "Audex thinker produced no codec tokens for request %s; sending empty terminal payload", request_id
+        )
+        return _empty_finished_payload(request_id, codebooks=1)
     return {
         "codes": {"audio": codes},
         "meta": {
@@ -252,11 +275,22 @@ def thinker2xcodec_full_payload(
     output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
     codes = _codec_frames(output_token_ids, codec_offset, codec_size)
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    # Error paths do NOT raise: the sync payload hook swallows exceptions and
+    # returns None, so no terminal payload would reach stage 1 and the
+    # request would stall. An empty FINISHED payload lets stage 1 complete
+    # with empty audio and the serving-layer no-audio guard fail the request.
     if not codes:
-        raise ValueError(f"Audex TTA thinker produced no codec tokens for request {request_id}")
+        logger.error(
+            "Audex TTA thinker produced no codec tokens for request %s; sending empty terminal payload", request_id
+        )
+        return _empty_finished_payload(request_id, codebooks=_TTA_NUM_CODEBOOKS)
     usable = len(codes) - (len(codes) % _TTA_NUM_CODEBOOKS)
     if usable == 0:
-        raise ValueError(f"Audex TTA thinker produced fewer than one full RVQ frame for request {request_id}")
+        logger.error(
+            "Audex TTA thinker produced fewer than one full RVQ frame for request %s; sending empty terminal payload",
+            request_id,
+        )
+        return _empty_finished_payload(request_id, codebooks=_TTA_NUM_CODEBOOKS)
 
     # Validate the ACTUAL generated stream against the 4-codebook phase
     # contract before decode: XCodec's per-layer offset removal clamps
@@ -265,11 +299,15 @@ def thinker2xcodec_full_payload(
 
     validity = validate_rvq_phase(codes[:usable])
     if not validity["phase_valid"]:
-        raise ValueError(
-            f"Audex TTA thinker produced a phase-invalid RVQ stream for request {request_id}: "
-            f"{validity['mismatch_count']} mismatched positions "
-            f"(first mismatch [index, codec_id, got_phase, expected_phase] = {validity['first_mismatch']})"
+        logger.error(
+            "Audex TTA thinker produced a phase-invalid RVQ stream for request %s: "
+            "%d mismatched positions (first mismatch [index, codec_id, got_phase, expected_phase] = %s); "
+            "sending empty terminal payload",
+            request_id,
+            validity["mismatch_count"],
+            validity["first_mismatch"],
         )
+        return _empty_finished_payload(request_id, codebooks=_TTA_NUM_CODEBOOKS)
 
     frames = torch.tensor(codes[:usable], dtype=torch.long).reshape(-1, _TTA_NUM_CODEBOOKS)
     return {

@@ -234,3 +234,27 @@ class TestMaskSensitivity:
         # What the mask permits at each position: phase p codes only.
         codes = [(i % 4) * XCODEC1_CODEBOOK_SIZE + (i * 7) % XCODEC1_CODEBOOK_SIZE for i in range(64)]
         assert validate_rvq_phase(codes)["phase_valid"]
+
+
+class TestPartialStepRobustness:
+    """Rows beyond a step's logits must be skipped, not crash the engine."""
+
+    def test_mask_skips_rows_beyond_step(self):
+        proc = _processor()
+        # Persistent-batch rows 2/3 tracked, but this step schedules 2 rows.
+        _add(proc, [(2, _tta_params(), None, []), (3, _tta_params(), None, [])])
+        logits = torch.zeros(2, VOCAB)
+        proc.apply(logits)
+        assert _allowed(logits[0]) == set(range(VOCAB))
+        assert _allowed(logits[1]) == set(range(VOCAB))
+
+    def test_mask_applies_once_row_back_in_range(self):
+        proc = _processor()
+        _add(proc, [(1, _tta_params(), None, [])])
+        short = torch.zeros(1, VOCAB)
+        proc.apply(short)  # row 1 out of range: untouched
+        assert _allowed(short[0]) == set(range(VOCAB))
+
+        full = torch.zeros(2, VOCAB)
+        proc.apply(full)  # row 1 in range: masked to phase 0
+        assert _allowed(full[1]) == set(PHASES[0])

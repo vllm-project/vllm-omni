@@ -136,11 +136,16 @@ def test_async_chunk_zero_codec_tokens_raises_on_terminal():
     assert thinker2code2wav_async_chunk(tm, None, req) is None
 
 
-def test_full_payload_zero_codec_tokens_raises():
+def test_full_payload_zero_codec_tokens_sends_empty_terminal():
+    """No raise: the sync payload hook swallows exceptions (stage-1 stall);
+    an empty FINISHED payload routes the failure to the serving no-audio guard."""
     tm = _transfer_manager()
     req = _request("r1", [42, 43], finished=True)
-    with pytest.raises(ValueError, match="no codec tokens"):
-        thinker2code2wav_full_payload(tm, None, req)
+    payload = thinker2code2wav_full_payload(tm, None, req)
+    audio = payload["codes"]["audio"]
+    assert audio.shape == (0, 1) and audio.numel() == 0
+    assert bool(payload["meta"]["finished"]) is True
+    assert payload["meta"]["req_id"] == ["r1"]
 
 
 def test_meta_finished_tensor_dtype():
@@ -268,13 +273,17 @@ class TestThinker2XcodecFullPayload:
         payload = self._payload([_TTA_OFFSET + c for c in codes])
         assert payload["codes"]["audio"].shape == (1, 4)
 
-    def test_zero_codes_raises(self):
-        with pytest.raises(ValueError, match="no codec tokens"):
-            self._payload([999, 131074])
+    def _assert_empty_terminal(self, payload, req_id: str = "req-tta"):
+        audio = payload["codes"]["audio"]
+        assert audio.shape == (0, 4) and audio.numel() == 0
+        assert bool(payload["meta"]["finished"]) is True
+        assert payload["meta"]["req_id"] == [req_id]
 
-    def test_less_than_one_frame_raises(self):
-        with pytest.raises(ValueError, match="full RVQ frame"):
-            self._payload([_TTA_OFFSET + 0, _TTA_OFFSET + 1024])
+    def test_zero_codes_sends_empty_terminal(self):
+        self._assert_empty_terminal(self._payload([999, 131074]))
+
+    def test_less_than_one_frame_sends_empty_terminal(self):
+        self._assert_empty_terminal(self._payload([_TTA_OFFSET + 0, _TTA_OFFSET + 1024]))
 
 
 class TestThinker2XcodecPhaseValidation:
@@ -292,14 +301,22 @@ class TestThinker2XcodecPhaseValidation:
         payload = self._payload(codes)
         assert payload["codes"]["audio"].shape == (2, 4)
 
-    def test_phase_invalid_stream_raises_before_decode(self):
+    def test_phase_invalid_stream_fails_before_decode(self, caplog):
         # Position 1 must be phase 1 (1024..2047); a phase-0 id there is
         # exactly what XCodec's clamping would otherwise silently absorb.
+        # No raise (the payload hook swallows exceptions -> stage-1 stall):
+        # an empty FINISHED payload routes the failure to the serving
+        # no-audio guard, with the mismatch details in the error log.
+        import logging
+
         codes = [0, 5, 2048, 3072]
-        with pytest.raises(ValueError, match="phase-invalid") as excinfo:
-            self._payload(codes)
-        assert "req-rvq" in str(excinfo.value)
-        assert "first mismatch" in str(excinfo.value)
+        with caplog.at_level(logging.ERROR):
+            payload = self._payload(codes)
+        audio = payload["codes"]["audio"]
+        assert audio.shape == (0, 4) and audio.numel() == 0
+        assert bool(payload["meta"]["finished"]) is True
+        assert payload["meta"]["req_id"] == ["req-rvq"]
+        assert any("phase-invalid" in rec.message and "req-rvq" in str(rec.args) for rec in caplog.records)
 
     def test_partial_frame_tail_not_validated_after_truncation(self):
         # 1 valid frame + a valid-phase partial tail: truncation happens
