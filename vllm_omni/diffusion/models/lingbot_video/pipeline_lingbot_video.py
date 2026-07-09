@@ -668,7 +668,10 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             if sampling.guidance_scale_provided or sampling.guidance_scale > 0
             else extra_args.pop("guidance_scale", 6.0)
         )
-        shift = extra_args.pop("shift", getattr(self.od_config, "flow_shift", None) or 3.0)
+        shift = extra_args.pop(
+            "shift",
+            extra_args.pop("flow_shift", getattr(self.od_config, "flow_shift", None) or 3.0),
+        )
         negative_prompt = extra_args.pop("negative_prompt", prompt_negative or self.default_negative_prompt)
         output_type = (
             sampling.output_type or getattr(self.od_config, "output_type", None) or extra_args.pop("output_type", "pt")
