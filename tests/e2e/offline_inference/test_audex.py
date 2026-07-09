@@ -90,3 +90,69 @@ def test_audex_offline_tts_smoke(omni_runner: OmniRunner, run_level: str) -> Non
             # Real speech, not silence.
             rms = float(np.sqrt(np.mean(np.square(audio))))
             assert rms > 1e-3, f"Audio is near-silent (rms={rms})"
+
+
+def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, cond_prompt: str):
+    """Stage sampling params carrying the CFG pair contract for one request."""
+    import copy
+
+    from transformers import AutoTokenizer
+
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+    from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
+
+    root = ensure_audex_snapshot(_audex_model)
+    tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"))
+    params = copy.deepcopy(runner.omni.resolve_sampling_params_list(None))
+    stage0 = params[0]
+    if stage0.extra_args is None:
+        stage0.extra_args = {}
+    stage0.extra_args.update(
+        {
+            "cfg_scale": float(cfg_scale),
+            "cfg_role": "cond",
+            "cfg_pair_id": pair_id,
+            "cfg_null_prompt": build_null_prompt(cond_prompt, tokenizer),
+        }
+    )
+    return params
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_level: str) -> None:
+    """A guided request must yield exactly ONE audio stream (companion suppressed)."""
+    prompt = build_cond_prompt(SYNTH_TEXTS[0])
+    params = _cfg_sampling_params(omni_runner, 1.5, "e2e-cfg-pair", prompt)
+    outputs = omni_runner.omni.generate([prompt], params)
+
+    assert len(outputs) == 1, f"expected exactly one output (no companion leak), got {len(outputs)}"
+    audio = _concat_audio(outputs[0].multimodal_output["audio"])
+    assert audio.size > 0, "Guided generation produced empty audio"
+    if run_level in {"advanced_model", "full_model"}:
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        assert rms > 1e-3, f"Guided audio is near-silent (rms={rms})"
+        duration_s = audio.size / SAMPLE_RATE
+        assert 0.5 <= duration_s <= 20.0, f"Unexpected duration={duration_s:.3f}s"
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, run_level: str) -> None:
+    """cfg_scale=1.0 must be indistinguishable from not passing cfg at all."""
+    prompt = build_cond_prompt(SYNTH_TEXTS[1])
+
+    baseline = omni_runner.omni.generate([prompt])
+    base_audio = _concat_audio(baseline[0].multimodal_output["audio"])
+
+    import copy
+
+    params = copy.deepcopy(omni_runner.omni.resolve_sampling_params_list(None))
+    if params[0].extra_args is None:
+        params[0].extra_args = {}
+    params[0].extra_args["cfg_scale"] = 1.0
+    disabled = omni_runner.omni.generate([prompt], params)
+    disabled_audio = _concat_audio(disabled[0].multimodal_output["audio"])
+
+    assert base_audio.shape == disabled_audio.shape, (
+        f"cfg_scale=1.0 changed output length: {base_audio.shape} vs {disabled_audio.shape}"
+    )
+    np.testing.assert_array_equal(base_audio, disabled_audio)
