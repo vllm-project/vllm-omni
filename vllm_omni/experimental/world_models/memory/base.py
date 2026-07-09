@@ -8,7 +8,8 @@ evictability -- never tokens, layers, or attention. Writes are two-phase:
 ``stage()`` holds data for an in-progress window, ``commit()`` promotes it to
 persistent context, and ``discard()`` drops it.
 
-The objects are backed by plain (non-paged) buffers. Several methods are
+The concrete classes shipped so far back their storage with plain (non-paged)
+buffers; the contract itself does not require that. Several methods are
 intentionally inert today and documented as such; they exist so that paged-KV
 backing and speculative forking can be added later without changing any call
 site. See RFC #4480 for the full design and roadmap.
@@ -29,15 +30,19 @@ ViewT = TypeVar("ViewT")
 class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     """One typed unit of session memory with a uniform lifecycle.
 
-    Concrete classes (``EncodeOnceKV``, ``LatentBuffer``) implement
-    the abstract methods below and bind ``PayloadT``/``ViewT`` to their real
-    payload and view types. In Phase 1 the RFC's ``PagedKV`` joins them to
-    cover the AR self-attention KV — as a handle wrapping the engine-owned
-    paged state (PR #4534) rather than a plain buffer here. The RFC's
-    remaining members, ``FixedState`` (constant-size recurrent state, e.g. a
-    linear-attention carry) and ``RetrievalStore`` (retrieval memory pools),
-    land with their first consumers; the names are reserved. The non-abstract
-    methods provide the default behaviour described in their docstrings.
+    A session's state is a named collection of these objects; the kinds of
+    memory they represent include attention K/V (growing self-attention
+    caches, or conditioning K/V written once and reread), constant-size
+    recurrent state (e.g. a linear-attention carry), frame or latent buffers,
+    and retrieval pools. A concrete class binds ``PayloadT`` and ``ViewT`` to
+    its real payload and view types and implements the abstract methods; the
+    non-abstract methods provide the default behaviour described in their
+    docstrings.
+
+    The contract is storage-agnostic. A concrete class may hold its bytes in
+    a buffer it owns, or it may be a handle to storage owned by another
+    component, such as a paged KV pool. In the handle case it delegates its
+    lifecycle operations to that owner instead of copying the data.
     """
 
     # The dependency edge: what this object rebuilds from. ``None`` means it is
@@ -51,7 +56,7 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
 
     @abstractmethod
     def allocate(self) -> None:
-        """Size and initialise the backing buffer to its empty state.
+        """Size and initialise the backing storage to its empty state.
 
         Concrete classes declare their sizing parameters as typed keyword-only
         arguments (e.g. ``LatentBuffer.allocate(maxlen=...)``); a mistyped
@@ -91,9 +96,9 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     def view(self, *, include_staged: bool = True) -> ViewT:
         """Return what the consumer (attention metadata, pipeline) reads."""
 
-    # ``policy`` deliberately stays ``Any`` until the Phase-1 byte-budget
-    # planner exists to define the policy protocol; typing it now would invent
-    # an interface that design owns.
+    # ``policy`` deliberately stays ``Any`` until a byte-budget eviction
+    # planner exists to define the policy protocol; typing it now would
+    # invent an interface that design owns.
     def evict(self, policy: Any = None) -> int:
         """Release this object's backing storage so it can be reused; return the
         bytes freed.
