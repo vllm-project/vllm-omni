@@ -106,8 +106,16 @@ class AudexCFGLogitsProcessor(LogitsProcessor):
             sampler_output = orig_sample(self, logits, spec_decode_metadata)
             for proc in self.input_batch.logitsprocs.all:
                 if isinstance(proc, AudexCFGLogitsProcessor) and proc._pairs:
+                    sampled = sampler_output.sampled_token_ids
+                    num_rows = sampled.shape[0] if hasattr(sampled, "shape") else len(sampled)
                     for cond_idx, uncond_idx, _ in proc._pairs:
-                        sampler_output.sampled_token_ids[uncond_idx] = sampler_output.sampled_token_ids[cond_idx]
+                        # Steps that sample fewer rows than the persistent
+                        # batch (pure-prefill / partially scheduled steps)
+                        # have nothing to sync for this pair; the scheduler
+                        # pair patches keep both members step-locked on the
+                        # decode steps that matter.
+                        if cond_idx < num_rows and uncond_idx < num_rows:
+                            sampled[uncond_idx] = sampled[cond_idx]
                     break
             return sampler_output
 
@@ -188,7 +196,13 @@ class AudexCFGLogitsProcessor(LogitsProcessor):
         if self._dirty:
             self._rebuild_pairs()
 
+        num_rows = logits.shape[0]
         for cond_idx, uncond_idx, cfg_scale in self._pairs:
+            # Rows beyond this step's logits (pure-prefill / partially
+            # scheduled steps) have nothing to blend; decode steps carry
+            # both pair rows thanks to the scheduler pair patches.
+            if cond_idx >= num_rows or uncond_idx >= num_rows:
+                continue
             blended = logits[uncond_idx] + cfg_scale * (logits[cond_idx] - logits[uncond_idx])
             logits[cond_idx] = blended
             logits[uncond_idx] = blended

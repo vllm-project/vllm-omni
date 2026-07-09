@@ -382,3 +382,14 @@ class TestReviewHardening:
         _drop_split_pairs(scheduler)
 
         assert "p0" in scheduler._cfg_pairs
+
+
+class TestPartialStepRobustness:
+    """Pairs indexed beyond a step's rows must be skipped, not crash."""
+
+    def test_blend_skips_rows_beyond_step(self):
+        proc = _processor()
+        _add(proc, [(2, _params("cond"), None, []), (3, _params("uncond"), None, [])])
+        logits = torch.randn(2, VOCAB)  # partially scheduled step: 2 rows only
+        reference = logits.clone()
+        assert torch.equal(proc.apply(logits), reference)
