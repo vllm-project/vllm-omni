@@ -37,6 +37,11 @@ include:
   local plus CI-like `pytest` commands; see `references/test-routing.md` for
   level-to-command mapping
 - `review-pr`: provides a structured workflow for reviewing pull requests
+- `review-worker-runner`: reviews/audits `vllm_omni/worker/*` (GPU worker + AR/generation
+  model runners) with a fixed set of lenses — upstream-vs-omni fork drift, dead/deprecated
+  code, base↔AR divergent duplicates, model-specific logic that belongs in `OmniModelState`,
+  wrapper-vs-raw model access, silent failures, async/threading correctness, rebase
+  fork-fragility; produces inline `# ISSUE(review):` marks and a type-first rollup audit
 - `vllm-omni-npu-model-runner-upgrade`: upgrades NPU model runners to align with the
   latest vllm-ascend NPUModelRunner
 
