@@ -168,7 +168,8 @@ def test_adapter_rejects_ref_audio():
 def test_adapter_cfg_scale_policy():
     adapter = _adapter()
     assert adapter.validate(_speech_request(extra_params={"cfg_scale": 1.0})) is None
-    err = adapter.validate(_speech_request(extra_params={"cfg_scale": 1.5}))
+    assert adapter.validate(_speech_request(extra_params={"cfg_scale": 1.5})) is None
+    err = adapter.validate(_speech_request(extra_params={"cfg_scale": 0.5}))
     assert err is not None and "cfg_scale" in err
 
 

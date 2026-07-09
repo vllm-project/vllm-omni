@@ -493,6 +493,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
+        self._audex_tokenizer = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
 
         logger.info("Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers))
@@ -3282,6 +3283,50 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return {"prompt_token_ids": prompt_ids}
 
+    def _get_audex_tokenizer(self):
+        """Load (once per process) the Audex thinker tokenizer for CFG null prompts."""
+        if self._audex_tokenizer is None:
+            from transformers import AutoTokenizer
+
+            from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+            root = ensure_audex_snapshot(self.engine_client.model_config.model)
+            self._audex_tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"))
+        return self._audex_tokenizer
+
+    def _inject_audex_cfg_pair_args(self, request_id: str, prompt: Any, stage0_params: Any) -> None:
+        """Complete the Audex CFG contract on the stage-0 sampling params.
+
+        The adapter validated ``cfg_scale``; here (where the final request id
+        exists) the cond role, pair id, and the length-matched null prompt are
+        attached. ``cfg_scale`` absent/1.0 leaves the params byte-identical to
+        the non-CFG flow (the key is dropped rather than forwarded).
+        """
+        extra_args = getattr(stage0_params, "extra_args", None)
+        if not extra_args or extra_args.get("cfg_scale") is None:
+            if extra_args:
+                extra_args.pop("cfg_scale", None)
+            return
+        cfg_scale = float(extra_args["cfg_scale"])
+        if cfg_scale <= 1.0:
+            extra_args.pop("cfg_scale", None)
+            return
+
+        from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
+
+        cond_prompt = prompt.get("prompt") if isinstance(prompt, dict) else prompt
+        if not isinstance(cond_prompt, str) or not cond_prompt:
+            raise ValueError("Audex CFG requires the adapter-built text prompt")
+        null_prompt = build_null_prompt(cond_prompt, self._get_audex_tokenizer())
+        extra_args.update(
+            {
+                "cfg_scale": cfg_scale,
+                "cfg_role": "cond",
+                "cfg_pair_id": request_id,
+                "cfg_null_prompt": null_prompt,
+            }
+        )
+
     def _apply_cosyvoice3_dynamic_tokens(
         self,
         sampling_params_list: list,
@@ -3660,6 +3705,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sampling_params_list[0].extra_args = {}
             sampling_params_list[0].extra_args.update(request.extra_params)
             logger.info("Applied extra_params: %s", request.extra_params)
+
+        # Audex CFG: turn an adapter-validated cfg_scale into the engine-side
+        # pair contract. This must run here (not in the adapter) because the
+        # pair id is the final request_id, which the adapter never sees.
+        if self._tts_model_type == "audex" and sampling_params_list:
+            self._inject_audex_cfg_pair_args(request_id, prompt, sampling_params_list[0])
 
         # Some TTS model defaults come from deploy YAML. Their AR
         # generation length is controlled by SamplingParams.max_tokens, so only

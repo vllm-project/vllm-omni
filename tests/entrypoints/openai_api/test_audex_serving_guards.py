@@ -91,3 +91,103 @@ async def test_non_audex_empty_chunks_keep_legacy_behavior():
         response_format="pcm",
     )
     await _collect(chunks)  # must not raise
+
+
+# ---------------------------------------------------------------- CFG serving surface
+
+import re  # noqa: E402
+
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest  # noqa: E402
+from vllm_omni.entrypoints.openai.tts_adapters.audex import AudexAdapter  # noqa: E402
+
+
+def _adapter() -> AudexAdapter:
+    return AudexAdapter.__new__(AudexAdapter)
+
+
+def _speech_request(**extra_params) -> OpenAICreateSpeechRequest:
+    payload = {"model": "audex", "input": "Hello world."}
+    if extra_params:
+        payload["extra_params"] = extra_params
+    return OpenAICreateSpeechRequest(**payload)
+
+
+class _MarkerTokenizer:
+    """Special markers count one token; words and punctuation split."""
+
+    _TOKEN_RE = re.compile(r"<unk>|<\|[^|]*\|>|<[a-z_]+>|\w+|[^\w\s]")
+
+    def encode(self, text: str) -> list[int]:
+        return [0] * len(self._TOKEN_RE.findall(text))
+
+
+class TestAudexCfgValidation:
+    def test_no_cfg_scale_accepted(self):
+        assert _adapter().validate(_speech_request()) is None
+
+    @pytest.mark.parametrize("scale", [1.0, 1.5, 3.0, 10.0])
+    def test_in_range_scale_accepted(self, scale):
+        assert _adapter().validate(_speech_request(cfg_scale=scale)) is None
+
+    @pytest.mark.parametrize("scale", [0.5, 0.0, -1.0, 10.5, "big"])
+    def test_out_of_range_or_malformed_scale_rejected(self, scale):
+        error = _adapter().validate(_speech_request(cfg_scale=scale))
+        assert error is not None and "cfg_scale" in error
+
+    def test_explicit_null_scale_treated_as_absent(self):
+        assert _adapter().validate(_speech_request(cfg_scale=None)) is None
+        serving = TestAudexCfgInjection()._serving_with_fake_tokenizer()
+        params = SimpleNamespace(extra_args={"cfg_scale": None})
+        serving._inject_audex_cfg_pair_args("req-1", {"prompt": "p"}, params)
+        assert params.extra_args == {}
+
+    @pytest.mark.parametrize("key", ["cfg_role", "cfg_pair_id", "cfg_null_prompt"])
+    def test_internal_cfg_keys_rejected(self, key):
+        error = _adapter().validate(_speech_request(**{key: "x"}))
+        assert error is not None and key in error
+
+
+class TestAudexCfgInjection:
+    def _serving_with_fake_tokenizer(self):
+        serving = _serving()
+        serving._get_audex_tokenizer = lambda: _MarkerTokenizer()
+        return serving
+
+    def _cond_prompt(self, text: str = "Hello world.") -> str:
+        from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
+
+        return build_cond_prompt(text)
+
+    def test_no_extra_args_is_untouched(self):
+        serving = self._serving_with_fake_tokenizer()
+        params = SimpleNamespace(extra_args=None)
+        serving._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
+        assert params.extra_args is None
+
+    def test_scale_one_leaves_params_byte_identical(self):
+        serving = self._serving_with_fake_tokenizer()
+        params = SimpleNamespace(extra_args={"cfg_scale": 1.0})
+        serving._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
+        assert params.extra_args == {}
+
+    def test_guided_request_gains_pair_contract(self):
+        serving = self._serving_with_fake_tokenizer()
+        params = SimpleNamespace(extra_args={"cfg_scale": 1.5})
+        cond = self._cond_prompt("Some transcription text here.")
+        serving._inject_audex_cfg_pair_args("req-42", {"prompt": cond}, params)
+
+        extra = params.extra_args
+        assert extra["cfg_scale"] == 1.5
+        assert extra["cfg_role"] == "cond"
+        assert extra["cfg_pair_id"] == "req-42"
+        null_prompt = extra["cfg_null_prompt"]
+        assert "<unk>" in null_prompt
+        assert "Some transcription" not in null_prompt
+        tok = _MarkerTokenizer()
+        assert len(tok.encode(null_prompt)) == len(tok.encode(cond))
+
+    def test_missing_text_prompt_raises(self):
+        serving = self._serving_with_fake_tokenizer()
+        params = SimpleNamespace(extra_args={"cfg_scale": 1.5})
+        with pytest.raises(ValueError, match="adapter-built text prompt"):
+            serving._inject_audex_cfg_pair_args("req-1", {"prompt_token_ids": [1]}, params)

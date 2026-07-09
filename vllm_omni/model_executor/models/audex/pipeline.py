@@ -36,6 +36,9 @@ AUDEX_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             model_subdir="checkpoint_folder_audiogen",
             tokenizer_subdir="checkpoint_folder_audiogen",
+            # Emits the unconditional CFG companion for cfg_scale > 1.0
+            # requests; a no-op for unguided requests.
+            prompt_expand_func=f"{_PROC}.expand_cfg_prompts",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.thinker2code2wav_async_chunk"),
             custom_process_next_stage_input_func=f"{_PROC}.thinker2code2wav_full_payload",
             sampling_constraints={

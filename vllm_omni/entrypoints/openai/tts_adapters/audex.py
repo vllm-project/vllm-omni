@@ -11,9 +11,20 @@ if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 
+# Classifier-free guidance strength accepted on /v1/audio/speech via
+# extra_params. 1.0 disables guidance (identical to omitting it); the
+# official TTS quality setting is 1.5.
+AUDEX_CFG_SCALE_MIN = 1.0
+AUDEX_CFG_SCALE_MAX = 10.0
+
+# Internal CFG pair-plumbing keys; injected by the serving layer once the
+# request id exists, never accepted from callers.
+_AUDEX_INTERNAL_CFG_KEYS = ("cfg_role", "cfg_pair_id", "cfg_null_prompt")
+
+
 @register_tts_adapter
 class AudexAdapter(ARTTSAdapter):
-    """Plain English TTS: single built-in voice, no reference audio, no CFG."""
+    """Plain English TTS: single built-in voice, no reference audio, optional CFG."""
 
     stage_keys = frozenset({"audex_thinker"})
     name = "audex"
@@ -30,16 +41,22 @@ class AudexAdapter(ARTTSAdapter):
         if request.ref_audio is not None:
             return "Audex does not support reference audio (no voice cloning)."
         extra = request.extra_params or {}
+        for key in _AUDEX_INTERNAL_CFG_KEYS:
+            if key in extra:
+                return f"extra_params.{key} is managed internally by the server; only cfg_scale may be set."
         cfg_scale = extra.get("cfg_scale")
         if cfg_scale is not None:
             try:
                 cfg_value = float(cfg_scale)
             except (TypeError, ValueError):
-                cfg_value = None
-            if cfg_value != 1.0:
                 return (
-                    f"Audex classifier-free guidance is not yet supported; got cfg_scale={cfg_scale!r}. "
-                    "Omit cfg_scale or pass 1.0."
+                    f"extra_params.cfg_scale must be a number in "
+                    f"[{AUDEX_CFG_SCALE_MIN}, {AUDEX_CFG_SCALE_MAX}]; got {cfg_scale!r}."
+                )
+            if not (AUDEX_CFG_SCALE_MIN <= cfg_value <= AUDEX_CFG_SCALE_MAX):
+                return (
+                    f"extra_params.cfg_scale must be within [{AUDEX_CFG_SCALE_MIN}, {AUDEX_CFG_SCALE_MAX}]; "
+                    f"got {cfg_scale!r}. 1.0 disables guidance; 1.5 is the recommended quality setting."
                 )
         return None
 
