@@ -47,7 +47,7 @@ stages:
     dtype: bfloat16
     devices: "0"
     logits_processors:
-      - vllm_omni.model_executor.models.audex.cfg.AudexCFGLogitsProcessor
+      - "vllm_omni.model_executor.models.audex.cfg:AudexCFGLogitsProcessor"
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
