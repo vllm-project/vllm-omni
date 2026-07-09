@@ -7,8 +7,8 @@
 it interchangeably with the bespoke ``DreamZeroState`` (behind the opt-in flag).
 
 DreamZero's attention KV lives in the AR-Diffusion engine's paged pool
-(``self._ar_diffusion_kv_state``, see PR #4534) and is *not* managed here; this
-adapter covers the model's non-KV session state. Storage is delegated to typed
+(``self._ar_diffusion_kv_state``) and is *not* managed here; this adapter
+covers the model's non-KV session state. Storage is delegated to typed
 ``MemoryObject`` instances owned by the ``SessionMemoryManager``:
 
     * the stitched frame buffer            -> ``LatentBuffer`` (ring)

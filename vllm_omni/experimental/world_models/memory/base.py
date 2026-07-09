@@ -8,11 +8,11 @@ evictability -- never tokens, layers, or attention. Writes are two-phase:
 ``stage()`` holds data for an in-progress window, ``commit()`` promotes it to
 persistent context, and ``discard()`` drops it.
 
-The concrete classes shipped so far back their storage with plain (non-paged)
-buffers; the contract itself does not require that. Several methods are
-intentionally inert today and documented as such; they exist so that paged-KV
-backing and speculative forking can be added later without changing any call
-site. See RFC #4480 for the full design and roadmap.
+A concrete class may back its storage with plain (non-paged) buffers; the
+contract itself does not require that. Several methods are
+intentionally inert and documented as such; they exist so that paged-KV
+backing and speculative forking can be added without changing any call site.
+See RFC #4480 for the full design and roadmap.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
 
     # The dependency edge: what this object rebuilds from. ``None`` means it is
     # never recomputable (it must be preempted or rejected, not silently
-    # dropped). No concrete class sets this yet.
+    # dropped).
     recompute_source: MemoryObject | None = None
     # Estimated work to rebuild, given ``recompute_source`` is resident.
     recompute_cost: int = 0
@@ -66,9 +66,9 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     def stage(self, payload: PayloadT) -> None:
         """Hold data for an in-progress window.
 
-        Currently single-window writes go straight through ``commit()``, so
-        staging only records the payload and is otherwise inert. Speculative
-        forking (not yet implemented) will make this the real staging path.
+        Single-window writers go straight through ``commit()``, so the default
+        implementation only records the payload and is otherwise inert.
+        Speculative forking is the intended consumer of staged state.
         """
         self._staged = payload
 
@@ -76,15 +76,14 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     def commit(self, payload: PayloadT | None = None) -> None:
         """Promote data to persistent context.
 
-        Currently this is the synchronous write the bespoke caches already do
-        (e.g. ``cache[i] = updated_kv.clone()``).
+        For a plain-buffer object this is the synchronous write into its
+        committed storage (e.g. ``cache[i] = updated_kv.clone()``).
         """
 
     def discard(self) -> None:
         """Drop staged data (speculative rejection).
 
-        There is no speculative path yet, so this only clears any recorded
-        staged payload and never touches committed bytes.
+        Clears any recorded staged payload; committed bytes are never touched.
         """
         self._staged = None
 
@@ -96,9 +95,9 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     def view(self, *, include_staged: bool = True) -> ViewT:
         """Return what the consumer (attention metadata, pipeline) reads."""
 
-    # ``policy`` deliberately stays ``Any`` until a byte-budget eviction
-    # planner exists to define the policy protocol; typing it now would
-    # invent an interface that design owns.
+    # ``policy`` deliberately stays ``Any``: the policy protocol belongs to
+    # the byte-budget eviction planner (RFC #4480), and defining it here
+    # would invent an interface that design owns.
     def evict(self, policy: Any = None) -> int:
         """Release this object's backing storage so it can be reused; return the
         bytes freed.
@@ -112,9 +111,9 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
         Releasing storage that is still referenced is a correctness bug (another
         consumer could reuse it). Count-based session eviction therefore does NOT
         call this — it only drops the lookup-table entry and lets an unreferenced
-        session be garbage-collected. A byte-budget eviction planner (a later
-        phase) is what drives this hook, with the recompute-DAG safety from the
-        RFC; no caller invokes it yet.
+        session be garbage-collected. The intended driver of this hook is a
+        byte-budget eviction planner with the recompute-DAG safety described in
+        RFC #4480.
         """
         freed = self.nbytes
         self.reset()
@@ -127,7 +126,8 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     @property
     @abstractmethod
     def nbytes(self) -> int:
-        """Bytes currently held (committed + staged)."""
+        """Bytes held in this object's committed storage; staged payloads are
+        not counted."""
 
     @property
     @abstractmethod

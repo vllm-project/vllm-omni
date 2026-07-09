@@ -4,7 +4,7 @@
 
 Model-agnostic session memory for AR-diffusion world models: a typed
 ``MemoryObject`` contract and a ``SessionMemoryManager`` that owns the objects
-per session, plus per-model adapters that present a model's bespoke per-session
+per session, plus per-model adapters that present a model's own per-session
 cache over that contract. APIs may change without notice.
 """
 

@@ -2,13 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Session memory for AR-diffusion world models (RFC #4480).
 
-Typed ``MemoryObject`` instances backed by plain (non-paged) buffers, owned per
-session by ``SessionMemoryManager`` (see RFC #4480). This package is
-model-agnostic; a model opts in by adapting its bespoke per-session cache onto
-this contract (e.g. ``state_dreamzero_adapter.DreamZeroStateAdapter``).
-
-Paged-KV backing, byte-budget enforcement, and copy-on-write session forking are
-not yet implemented; see RFC #4480 for the roadmap.
+Typed ``MemoryObject`` instances owned per session by ``SessionMemoryManager``.
+This package is model-agnostic; a model opts in by adapting its own per-session
+cache onto this contract (e.g. ``state_dreamzero_adapter.DreamZeroStateAdapter``).
+See RFC #4480 for the full design and roadmap.
 """
 
 from vllm_omni.experimental.world_models.memory.attrs import (

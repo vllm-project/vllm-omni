@@ -35,9 +35,8 @@ class EncodeOnceKV(MemoryObject[CrossKVCache, CrossKVCache]):
 
     Wraps an ``{"is_init", "k", "v"}`` dict that a model's cross-attention
     layers populate once (on the first forward) and read thereafter. ``view()``
-    returns the live dict so the model mutates it in place. DreamZero's
-    cross-attn KV moved into the AR-Diffusion engine pool (PR #4534); the
-    in-tree consumer of this class is the Cosmos3 UND text K/V port.
+    returns the live dict so the model mutates it in place. A typical use is
+    text-conditioning K/V that a session encodes once and rereads every step.
     """
 
     def __init__(self) -> None:
@@ -77,9 +76,9 @@ class EncodeOnceKV(MemoryObject[CrossKVCache, CrossKVCache]):
 class LatentBuffer(MemoryObject[ItemT, list[ItemT]]):
     """Append / ring buffer of latent or pixel frames.
 
-    A bounded ``deque`` (``maxlen`` set at ``allocate()`` time). Compaction
-    (FramePack-style) is not yet implemented. Model-specific stacking logic
-    stays in the caller; this object only stores and views the frames.
+    A bounded ``deque`` (``maxlen`` set at ``allocate()`` time). The object
+    only stores and views the frames; model-specific stacking stays in the
+    caller.
     """
 
     def __init__(self) -> None:

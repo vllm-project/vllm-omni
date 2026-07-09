@@ -4,9 +4,10 @@
 
 ``SessionMemoryManager`` maps ``session_id -> {name: MemoryObject}`` and is the
 single authority for session lifecycle and eviction. It evicts by session count
-(LRU), matching the bespoke per-model caches it replaces; the byte budget is
-recorded for observability but not yet enforced (enforcing it would diverge from
-the budget-less bespoke paths this currently stays equivalent to).
+(LRU), matching the per-model session caches it adapts (e.g. DreamZero's), so
+an adapted model keeps the same eviction behaviour. A byte budget is recorded
+for observability; enforcing it is left to a byte-budget eviction planner (see
+RFC #4480).
 """
 
 from __future__ import annotations
@@ -23,7 +24,8 @@ from vllm_omni.experimental.world_models.memory.base import MemoryObject
 
 logger = logging.getLogger(__name__)
 
-# Matches the bespoke DreamZero cap so the new path evicts identically.
+# Matches DreamZero's MAX_DREAMZERO_SESSIONS cap so an adapted DreamZero
+# evicts identically.
 DEFAULT_MAX_SESSIONS = 64
 
 M = TypeVar("M", bound=MemoryObject)
@@ -88,16 +90,17 @@ class SessionMemoryManager:
         if max_sessions <= 0:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")
         self.max_sessions = max_sessions
-        # Recorded but not enforced yet. See RFC #4480.
+        # Recorded for observability; enforcement is left to an eviction
+        # planner (see RFC #4480).
         self.byte_budget = byte_budget
         self._sessions: OrderedDict[str, SessionMemory] = OrderedDict()
-        # The locking strategy is injected rather than hard-coded: today's
-        # callers run the manager from worker threads, so the default is a
-        # ``threading.Lock``, but an async or single-threaded owner can pass
+        # The locking strategy is injected rather than hard-coded: callers
+        # that run the manager from worker threads keep the default
+        # ``threading.Lock``, while an async or single-threaded owner can pass
         # e.g. ``contextlib.nullcontext`` (or a custom strategy) without any
         # call-site change -- the manager only ever does ``with self._lock:``.
-        # Heavier operations planned for later phases (paged allocation,
-        # eviction planning) keep this seam.
+        # Heavier operations (paged allocation, eviction planning) keep this
+        # seam.
         self._lock = lock_factory()
         self.hits = 0
         self.misses = 0
@@ -118,9 +121,10 @@ class SessionMemoryManager:
                 while len(self._sessions) > self.max_sessions:
                     # Drop the oldest from the table only; do not free its
                     # buffers. An adapter still using the session keeps its own
-                    # reference, so its state survives (matching the bespoke
-                    # per-session state, which the caller holds even after it
-                    # leaves the table). Unreferenced sessions are GC-reclaimed.
+                    # reference, so its state survives (matching a model's own
+                    # per-session state object, which the caller holds even
+                    # after it leaves the table). Unreferenced sessions are
+                    # GC-reclaimed.
                     self._sessions.popitem(last=False)
                     self.evictions += 1
             else:
