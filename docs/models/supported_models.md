@@ -103,8 +103,12 @@ LingBot-World 2.0 v1 is limited to the 14B causal-fast checkpoint, one first-fra
 camera directory, fixed four-step DMD sampling, and request-local history. Its DiT path is TP-aware,
 but v1 does not support sequence/Ulysses parallelism, Cache-DiT/TeaCache, VAE parallelism,
 cross-request or streaming session state, runtime events, causal-pretrain, or the 1.3B checkpoint.
+Camera directories consume only `poses.npy` and `intrinsics.npy`; any `wasd_action.npy` or
+`ijkl_action.npy` files are ignored rather than converted to runtime action events.
 The repository includes an opt-in H100/CUDA E2E entry; the table remains experimental until a
-real-checkpoint GPU run is recorded, and no AMD GPU, Ascend NPU, or Intel GPU support is claimed.
+real-checkpoint GPU run is recorded. Golden-video quality comparison is deferred to that real GPU
+validation and is not claimed by the local CPU/stub suite. No AMD GPU, Ascend NPU, or Intel GPU
+support is claimed.
 
 The [LingBot-World checkpoint](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers)
 is separately licensed under CC BY-NC-SA and restricted to non-commercial use. The vLLM-Omni

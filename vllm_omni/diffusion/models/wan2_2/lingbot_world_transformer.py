@@ -7,6 +7,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any, Self
 
 import torch
 import torch.nn as nn
@@ -143,7 +144,7 @@ def _validate_cache_storage(
         or cache.value.grad_fn is not None
     ):
         raise ValueError(f"{cache_name} cache key and value must be detached from autograd.")
-    return capacity
+    return int(capacity)
 
 
 def _validate_metadata_integer(name: str, value: int | None, *, allow_none: bool = False) -> None:
@@ -573,6 +574,7 @@ class LingBotCrossAttention(nn.Module):
             key = key.unflatten(2, (self.num_local_heads, self.head_dim))
             value = value.unflatten(2, (self.num_local_heads, self.head_dim))
             cache = LingBotAttentionCache(
+                # The request cache owns its storage independently of encoder activations.
                 key=key.detach().clone(),
                 value=value.detach().clone(),
                 end=key.shape[1],
@@ -713,6 +715,8 @@ class LingBotAttentionBlock(nn.Module):
         normalized = (normalized * (1 + scale_ffn) + shift_ffn).flatten(1, 2).to(hidden_states.dtype)
         ffn_output = self.ffn(normalized).unflatten(1, (num_frames, tokens_per_frame))
         hidden_states = (hidden_grid + ffn_output * gate_ffn).flatten(1, 2).to(hidden_states.dtype)
+        if cross_cache is None:
+            raise RuntimeError("Cross-attention must return a populated request cache.")
         return hidden_states, cross_cache
 
 
@@ -872,7 +876,6 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 "quant_config is not supported by the LingBot World transformer; construct the unquantized model."
             )
 
-        patch_size = tuple(patch_size)
         dim = num_attention_heads * attention_head_dim
         self.dim = dim
         self.config = SimpleNamespace(
@@ -961,11 +964,11 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
     @classmethod
     def from_config(
         cls,
-        config: dict,
+        config: dict[str, Any],
         *,
-        quant_config: object | None = None,
+        quant_config: Any | None = None,
         prefix: str = "",
-    ):
+    ) -> Self:
         metadata_keys = {"_class_name", "_diffusers_version"}
         constructor_keys = {
             "patch_size",
@@ -996,6 +999,50 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         if "patch_size" in kwargs:
             kwargs["patch_size"] = tuple(kwargs["patch_size"])
         return cls(**kwargs, quant_config=quant_config, prefix=prefix)
+
+    def allocate_cache(
+        self,
+        *,
+        batch_size: int,
+        latent_height: int,
+        latent_width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> LingBotTransformerCache:
+        """Allocate one caller-owned cache using this transformer's geometry."""
+
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer for LingBot cache allocation.")
+        if (
+            isinstance(latent_height, bool)
+            or not isinstance(latent_height, int)
+            or latent_height <= 0
+            or isinstance(latent_width, bool)
+            or not isinstance(latent_width, int)
+            or latent_width <= 0
+        ):
+            raise ValueError("latent_height and latent_width must be positive integers.")
+
+        patch_frames, patch_height, patch_width = self.config.patch_size
+        if patch_frames != 1 or latent_height % patch_height or latent_width % patch_width:
+            raise ValueError("latent height/width must align with the configured LingBot patch size.")
+        post_patch_height = latent_height // patch_height
+        post_patch_width = latent_width // patch_width
+        window_frames = (
+            self.config.local_attn_size if self.config.local_attn_size != -1 else self.config.sliding_window_num_frames
+        )
+        max_tokens = int(window_frames * post_patch_height * post_patch_width)
+        tp_size = get_tensor_model_parallel_world_size()
+        num_local_heads = self.config.num_attention_heads // tp_size
+        return allocate_lingbot_cache(
+            batch_size=batch_size,
+            num_layers=self.config.num_layers,
+            max_tokens=max_tokens,
+            num_local_heads=num_local_heads,
+            head_dim=self.config.attention_head_dim,
+            device=device,
+            dtype=dtype,
+        )
 
     def _rotary_embedding(
         self,
