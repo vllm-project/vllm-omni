@@ -46,9 +46,13 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 LINGBOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _CAMERA_SPATIAL_FOLD = 8
 _MAX_PIXEL_AREA = 480 * 832
+_MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
 _MAX_RAW_FRAMES = 117
 _MAX_SEQUENCE_LENGTH = 512
 _ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
+_SOURCE_IMAGE_ERROR = (
+    "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
+)
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,40 @@ def _build_shifted_flow_sigma_lookup(
     normalized_timesteps = torch.tensor(timesteps, dtype=shifted_sigmas.dtype) / num_train_timesteps
     indices = (shifted_sigmas[:, None] - normalized_timesteps[None, :]).abs().argmin(dim=0)
     return tuple(float(value) for value in shifted_sigmas[indices].tolist())
+
+
+def _validate_source_image_size(image: PIL.Image.Image) -> None:
+    width, height = image.size
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width <= 0
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height <= 0
+    ):
+        raise ValueError("source image width and height must be positive integers.")
+    if width * height > _MAX_SOURCE_IMAGE_PIXELS:
+        raise ValueError("source image pixel count must not exceed 4096 * 4096.")
+
+
+def _decode_source_image(image: PIL.Image.Image) -> PIL.Image.Image:
+    _validate_source_image_size(image)
+    try:
+        return image.convert("RGB")
+    except (OSError, SyntaxError, ValueError, PIL.Image.DecompressionBombError):
+        raise ValueError(_SOURCE_IMAGE_ERROR) from None
+
+
+def _load_source_image(path: str | os.PathLike) -> PIL.Image.Image:
+    try:
+        source_image = PIL.Image.open(path)
+    except (OSError, SyntaxError, ValueError, PIL.Image.DecompressionBombError):
+        raise ValueError(_SOURCE_IMAGE_ERROR) from None
+    try:
+        return _decode_source_image(source_image)
+    finally:
+        source_image.close()
 
 
 def _fold_camera_embedding(
@@ -266,10 +304,10 @@ class LingBotWorldCausalDMDPipeline(
         if not root.is_dir():
             raise ValueError("The configured LingBot trusted action root must be a directory.")
 
-        candidate = Path(action_path).expanduser()
-        if not candidate.is_absolute():
-            candidate = root / candidate
         try:
+            candidate = Path(action_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
             candidate = candidate.resolve(strict=True)
             candidate.relative_to(root)
         except (OSError, RuntimeError, ValueError):
@@ -319,10 +357,9 @@ class LingBotWorldCausalDMDPipeline(
         if image is None:
             raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
         if isinstance(image, (str, os.PathLike)):
-            try:
-                image = PIL.Image.open(image).convert("RGB")
-            except OSError as exc:
-                raise ValueError(f"Unable to load multi_modal_data.image: {image}") from exc
+            image = _load_source_image(image)
+        elif isinstance(image, PIL.Image.Image):
+            image = _decode_source_image(image)
         if not isinstance(image, (PIL.Image.Image, torch.Tensor)):
             raise ValueError("multi_modal_data.image must be a PIL image, tensor, file path, or single-item list.")
 
@@ -457,6 +494,20 @@ class LingBotWorldCausalDMDPipeline(
             image_tensor = image_tensor * 2.0 - 1.0
         return image_tensor.to(device=self.device, dtype=torch.float32)
 
+    def _vae_latent_stats(self, reference: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (1, -1, 1, 1, 1)
+        latent_mean = torch.as_tensor(
+            self.vae.config.latents_mean,
+            device=reference.device,
+            dtype=reference.dtype,
+        ).view(*shape)
+        latent_std = torch.as_tensor(
+            self.vae.config.latents_std,
+            device=reference.device,
+            dtype=reference.dtype,
+        ).view(*shape)
+        return latent_mean, latent_std
+
     def _prepare_condition(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
         image = self._prepare_image_tensor(inputs.image, height=inputs.height, width=inputs.width)
         video_condition = image.new_zeros(1, 3, inputs.num_frames, inputs.height, inputs.width)
@@ -475,16 +526,7 @@ class LingBotWorldCausalDMDPipeline(
             raise RuntimeError(
                 f"vae.encode returned an incompatible image latent shape: got {tuple(latent_condition.shape)}."
             )
-        latent_mean = torch.tensor(
-            self.vae.config.latents_mean,
-            device=latent_condition.device,
-            dtype=latent_condition.dtype,
-        ).view(1, -1, 1, 1, 1)
-        latent_std = torch.tensor(
-            self.vae.config.latents_std,
-            device=latent_condition.device,
-            dtype=latent_condition.dtype,
-        ).view(1, -1, 1, 1, 1)
+        latent_mean, latent_std = self._vae_latent_stats(latent_condition)
         latent_condition = (latent_condition - latent_mean) / latent_std
         temporal_mask = latent_condition.new_zeros(
             1,
@@ -708,16 +750,7 @@ class LingBotWorldCausalDMDPipeline(
         if inputs.output_type == "latent":
             output = generated_latents
         else:
-            latent_mean = torch.tensor(
-                self.vae.config.latents_mean,
-                device=generated_latents.device,
-                dtype=generated_latents.dtype,
-            ).view(1, -1, 1, 1, 1)
-            latent_std = torch.tensor(
-                self.vae.config.latents_std,
-                device=generated_latents.device,
-                dtype=generated_latents.dtype,
-            ).view(1, -1, 1, 1, 1)
+            latent_mean, latent_std = self._vae_latent_stats(generated_latents)
             vae_latents = (generated_latents * latent_std + latent_mean).to(dtype=self.vae.dtype)
             output = self.vae.decode(vae_latents, return_dict=False)[0]
             if output.shape[2] != inputs.num_frames:

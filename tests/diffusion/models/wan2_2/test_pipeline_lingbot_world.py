@@ -652,6 +652,106 @@ def test_noise_uses_device_safe_diffusers_helper() -> None:
     assert calls == [((1, 2, 3), generator, torch.device("cpu"), torch.float32)]
 
 
+def test_path_image_rejects_oversized_source_before_decode_or_convert(monkeypatch, tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    source_path = tmp_path / "oversized-compressed.png"
+    Image.new("1", (4097, 4097)).save(source_path)
+    decode_calls: list[str] = []
+
+    def forbidden_convert(*args, **kwargs):
+        del args, kwargs
+        decode_calls.append("convert")
+        raise AssertionError("oversized source reached convert")
+
+    def forbidden_load(*args, **kwargs):
+        del args, kwargs
+        decode_calls.append("load")
+        raise AssertionError("oversized source reached load")
+
+    monkeypatch.setattr(module.PIL.Image.Image, "convert", forbidden_convert)
+    monkeypatch.setattr(module.PIL.Image.Image, "load", forbidden_load)
+
+    with pytest.raises(ValueError, match="source image.*4096.*4096"):
+        _pipeline(module)._parse_request(
+            _RequestBatch(_prompt(action_path="prompt-actions", images=str(source_path)), _SamplingParams())
+        )
+
+    assert decode_calls == []
+
+
+def test_normal_path_image_is_decoded_after_source_size_validation(tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    source_path = tmp_path / "normal.png"
+    Image.new("RGBA", (32, 24), color=(1, 2, 3, 128)).save(source_path)
+
+    parsed = _pipeline(module)._parse_request(
+        _RequestBatch(_prompt(action_path="prompt-actions", images=str(source_path)), _SamplingParams())
+    )
+
+    assert module._MAX_SOURCE_IMAGE_PIXELS == 4096 * 4096
+    assert isinstance(parsed.image, Image.Image)
+    assert parsed.image.mode == "RGB"
+    assert parsed.image.size == (32, 24)
+
+
+def test_path_image_decode_error_is_sanitized(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    unsafe_path = "/private/source/customer-secret.png"
+    monkeypatch.setattr(
+        module.PIL.Image,
+        "open",
+        lambda path: (_ for _ in ()).throw(module.PIL.Image.DecompressionBombError(f"unsafe {path}")),
+    )
+
+    with pytest.raises(ValueError, match="Unable to load multi_modal_data.image") as exc_info:
+        _pipeline(module)._parse_request(
+            _RequestBatch(_prompt(action_path="prompt-actions", images=unsafe_path), _SamplingParams())
+        )
+
+    assert unsafe_path not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("source_size", [(4096, 4096), (4097, 4097)])
+def test_supplied_pil_image_obeys_documented_source_pixel_ceiling(source_size) -> None:
+    module = _load_pipeline_module()
+    source_image = Image.new("1", source_size)
+    close_calls: list[bool] = []
+    source_image.close = lambda: close_calls.append(True)
+
+    if source_size[0] * source_size[1] <= 4096 * 4096:
+        parsed = _pipeline(module)._parse_request(
+            _RequestBatch(_prompt(action_path="prompt-actions", images=source_image), _SamplingParams())
+        )
+        assert parsed.image is not source_image
+        assert parsed.image.mode == "RGB"
+        assert close_calls == []
+    else:
+        with pytest.raises(ValueError, match="source image.*4096.*4096"):
+            _pipeline(module)._parse_request(
+                _RequestBatch(_prompt(action_path="prompt-actions", images=source_image), _SamplingParams())
+            )
+        assert close_calls == []
+
+
+def test_supplied_pil_decode_error_is_sanitized_without_closing_caller(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    source_image = Image.new("RGB", (16, 16))
+    unsafe_detail = "/private/source/customer-secret.png"
+    close_calls: list[bool] = []
+    monkeypatch.setattr(source_image, "convert", lambda mode: (_ for _ in ()).throw(OSError(unsafe_detail)))
+    monkeypatch.setattr(source_image, "close", lambda: close_calls.append(True))
+
+    with pytest.raises(ValueError, match="Unable to load multi_modal_data.image") as exc_info:
+        _pipeline(module)._parse_request(
+            _RequestBatch(_prompt(action_path="prompt-actions", images=source_image), _SamplingParams())
+        )
+
+    assert unsafe_detail not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert close_calls == []
+
+
 @pytest.mark.parametrize("source", ["extra", "prompt"])
 def test_action_path_resolves_from_exactly_one_supported_source(source: str, tmp_path: Path) -> None:
     module = _load_pipeline_module()
@@ -734,6 +834,23 @@ def test_online_action_path_error_suppresses_path_bearing_filesystem_cause(tmp_p
         pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": "does-not-exist"})))
 
     assert str(root) not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("source", ["root", "candidate"])
+def test_online_action_path_unknown_user_is_sanitized(source: str, tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    unknown_user_path = "~__vllm_omni_user_that_does_not_exist__/actions"
+    root = tmp_path / "trusted"
+    root.mkdir()
+    configured_root = unknown_user_path if source == "root" else str(root)
+    action_path = "actions" if source == "root" else unknown_user_path
+    pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": configured_root}))
+
+    with pytest.raises(ValueError, match="trusted action root") as exc_info:
+        pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": action_path})))
+
+    assert "__vllm_omni_user_that_does_not_exist__" not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
 
 
@@ -858,6 +975,25 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
     torch.testing.assert_close(expected_camera, reference_camera)
     torch.testing.assert_close(transformer.calls[0]["camera_hidden_states"], expected_camera)
     assert expected_camera.shape == (1, 384, 3, 2, 2)
+
+
+def test_vae_latent_stats_helper_is_shared_by_encode_and_decode() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    original_stats = pipeline._vae_latent_stats
+    references: list[torch.Tensor] = []
+
+    def recording_stats(reference: torch.Tensor):
+        references.append(reference)
+        return original_stats(reference)
+
+    pipeline._vae_latent_stats = recording_stats
+
+    pipeline(_request(sampling=_SamplingParams(output_type="np")))
+
+    assert len(references) == 2
+    assert all(reference.shape[1] == 16 for reference in references)
+    assert all(reference.dtype == torch.float32 for reference in references)
 
 
 def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
