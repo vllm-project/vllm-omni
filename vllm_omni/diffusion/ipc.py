@@ -119,6 +119,41 @@ def _unpack_if_shm_handle(val: object) -> object:
     return val
 
 
+def _value_has_shm_handle(val: object) -> bool:
+    """True iff ``_pack_value_if_large`` placed an SHM handle anywhere in ``val``.
+
+    Mirrors the recursive container walk of ``_pack_value_if_large`` /
+    ``_unpack_if_shm_handle``: a handle can sit at the top level (a bare packed
+    tensor) or nested inside the dict/list/tuple shapes pipelines return as
+    ``DiffusionOutput.output`` (e.g. ``{"image": tensor}``, ``(video, audio)``).
+    Keep this in sync with those two functions.
+    """
+    if isinstance(val, dict):
+        if val.get("__tensor_shm__"):
+            return True
+        return any(_value_has_shm_handle(value) for value in val.values())
+    if isinstance(val, (list, tuple)):
+        return any(_value_has_shm_handle(item) for item in val)
+    return False
+
+
+def diffusion_output_has_shm_handles(output: DiffusionOutput) -> bool:
+    """True iff ``pack_diffusion_output_shm`` created any SHM handle in ``output``.
+
+    Checks every field ``_pack_diffusion_fields`` touches -- ``output`` (walked
+    recursively, since large tensors may be nested in its dict/list/tuple
+    container) and all three ``trajectory_*`` tensors -- so callers can tell a
+    real SHM transport (handles created; receiver must unpack + unlink) apart
+    from a no-op pack (everything under threshold; nothing to unlink).
+    """
+    return (
+        _value_has_shm_handle(output.output)
+        or _value_has_shm_handle(output.trajectory_latents)
+        or _value_has_shm_handle(output.trajectory_timesteps)
+        or _value_has_shm_handle(output.trajectory_log_probs)
+    )
+
+
 def _pack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
     if output.output is not None:
         output.output = _pack_value_if_large(output.output)
