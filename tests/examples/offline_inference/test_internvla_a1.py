@@ -66,6 +66,8 @@ def test_internvla_a1_offline_open_loop(run_level: str) -> None:
             "float32",
             "--attn-implementation",
             "eager",
+            "--num-steps",
+            "2",
             "--skip-plots",
         ]
         subprocess.run(cmd, check=True, env=env)
@@ -79,6 +81,7 @@ def test_internvla_a1_offline_open_loop(run_level: str) -> None:
         assert summary["mode"] == "registry"
         assert summary["attn_implementation"] == "eager"
         assert summary["dtype"] == "float32"
+        assert summary["num_steps"] == 2
         assert len(summary["results"]) == 1
         assert "registry" in summary["eval_summaries"]
 

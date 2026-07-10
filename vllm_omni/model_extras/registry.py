@@ -34,6 +34,10 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.internvla_a1 import (
+    INTERNVLA_A1_EXTRA_BODY_PARAMS,
+    INTERNVLA_A1_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -164,6 +168,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "HeliosPyramidPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
+    },
+    "InternVLAA1Pipeline": {
+        "extra_body_params": INTERNVLA_A1_EXTRA_BODY_PARAMS,
+        "extra_output_params": INTERNVLA_A1_EXTRA_OUTPUT_PARAMS,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,

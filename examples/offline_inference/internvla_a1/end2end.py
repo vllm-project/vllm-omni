@@ -35,7 +35,12 @@ from vllm_omni.diffusion.models.internvla_a1 import (  # noqa: E402
 from vllm_omni.diffusion.models.internvla_a1.config import OBS_STATE  # noqa: E402
 from vllm_omni.diffusion.registry import initialize_model  # noqa: E402
 from vllm_omni.diffusion.request import OmniDiffusionRequest  # noqa: E402
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args  # noqa: E402
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch  # noqa: E402
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams  # noqa: E402
+from vllm_omni.model_extras import get_extra_body_params  # noqa: E402
+
+MODEL_CLASS_NAME = "InternVLAA1Pipeline"
 
 
 def _required_path_arg(env_name: str, cli_value: str | None) -> str:
@@ -59,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-regional-compile", action="store_true")
     parser.add_argument("--enable-warmup", action="store_true")
     parser.add_argument("--strict-load", action="store_true")
+    parser.add_argument("--num-steps", type=int, default=None)
+    parser.add_argument("--decode-image", action="store_true")
     parser.add_argument("--output-dir", default="outputs/internvla_a1/vllm_infer")
     parser.add_argument("--skip-plots", action="store_true")
     parser.add_argument("--benchmark-forward", action="store_true")
@@ -70,7 +77,7 @@ def parse_args() -> argparse.Namespace:
 def build_od_config(args: argparse.Namespace, processor_model_name: str) -> OmniDiffusionConfig:
     return OmniDiffusionConfig(
         model=str(Path(args.model_dir).resolve()),
-        model_class_name="InternVLAA1Pipeline",
+        model_class_name=MODEL_CLASS_NAME,
         dtype=tensor_dtype(args.dtype),
         custom_pipeline_args={
             "device": args.device,
@@ -132,6 +139,8 @@ def run_one_path(
             batch_inputs,
             noise,
             request_id=f"internvla-a1-sample-{index}",
+            num_steps=args.num_steps,
+            decode_image=args.decode_image,
         )
         pred = pred[:, :, : dataset.physical_action_dim].to(torch.float32).cpu()
         results.append(
@@ -156,18 +165,33 @@ def run_pipeline_forward(
     batch_inputs: dict[str, torch.Tensor],
     noise: torch.Tensor,
     request_id: str,
+    *,
+    num_steps: int | None = None,
+    decode_image: bool = False,
 ) -> torch.Tensor:
+    sampling_params = OmniDiffusionSamplingParams(
+        extra_args={
+            "batch_inputs": batch_inputs,
+            "noise": noise,
+        }
+    )
+    apply_declared_extra_args(
+        sampling_params,
+        get_extra_body_params(MODEL_CLASS_NAME),
+        {
+            "num_steps": num_steps,
+            "decode_image": decode_image,
+        },
+    )
     output = pipeline.forward(
-        OmniDiffusionRequest(
-            prompts=[""],
-            sampling_params=OmniDiffusionSamplingParams(
-                extra_args={
-                    "batch_inputs": batch_inputs,
-                    "noise": noise,
-                    "decode_image": False,
-                }
-            ),
-            request_id=request_id,
+        DiffusionRequestBatch(
+            requests=[
+                OmniDiffusionRequest(
+                    prompt="",
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                )
+            ]
         )
     )
     if output.error:
@@ -224,6 +248,8 @@ def benchmark_forward(
         batch_inputs,
         noise,
         request_id=f"internvla-a1-benchmark-{index}-cold",
+        num_steps=args.num_steps,
+        decode_image=args.decode_image,
     )
     _synchronize(args.device)
     cold_start_ms = (time.perf_counter() - cold_start_begin) * 1000.0
@@ -237,6 +263,8 @@ def benchmark_forward(
             batch_inputs,
             noise,
             request_id=f"internvla-a1-benchmark-{index}-warmup-{iter_idx}",
+            num_steps=args.num_steps,
+            decode_image=args.decode_image,
         )
         _synchronize(args.device)
         warmup_ms.append((time.perf_counter() - begin) * 1000.0)
@@ -250,6 +278,8 @@ def benchmark_forward(
             batch_inputs,
             noise,
             request_id=f"internvla-a1-benchmark-{index}-iter-{iter_idx}",
+            num_steps=args.num_steps,
+            decode_image=args.decode_image,
         )
         _synchronize(args.device)
         benchmark_ms.append((time.perf_counter() - begin) * 1000.0)
@@ -266,6 +296,8 @@ def benchmark_forward(
         "dtype": args.dtype,
         "attn_implementation": args.attn_implementation,
         "enable_regional_compile": args.enable_regional_compile,
+        "num_steps": args.num_steps,
+        "decode_image": args.decode_image,
         "warmup_iters": args.warmup_iters,
         "benchmark_iters": args.benchmark_iters,
         "output_shape": list(pred.shape),
@@ -322,6 +354,8 @@ def main() -> None:
                 batch_inputs,
                 noise,
                 request_id="internvla-a1-open-loop",
+                num_steps=args.num_steps,
+                decode_image=args.decode_image,
             ),
             num_episodes=args.num_episodes,
             seed=args.seed,
@@ -339,6 +373,8 @@ def main() -> None:
         "dtype": args.dtype,
         "attn_implementation": args.attn_implementation,
         "enable_regional_compile": args.enable_regional_compile,
+        "num_steps": args.num_steps,
+        "decode_image": args.decode_image,
         "seed": args.seed,
         "indices": indices,
         "results": results,

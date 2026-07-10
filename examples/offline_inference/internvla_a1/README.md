@@ -2,6 +2,8 @@
 
 Full usage and result-reporting guidance lives in [docs/user_guide/examples/offline_inference/internvla_a1.md](../../../docs/user_guide/examples/offline_inference/internvla_a1.md).
 
+Recipe: [recipes/InternRobotics/InternVLA-A1-3B.md](../../../recipes/InternRobotics/InternVLA-A1-3B.md)
+
 Quick start:
 
 ```bash
@@ -16,6 +18,11 @@ bash run.sh --num-episodes 1
 bash collect_results.sh
 ```
 
+Request-time knobs declared in `vllm_omni/model_extras/internvla_a1.py`:
+
+- `--num-steps N`: routes `num_steps` through the declared `extra_body` path
+- `--decode-image`: requests `custom_output["decoded"]`
+
 Expected files under `INTERNVLA_A1_COSMOS_DIR`:
 
 - `encoder.safetensors`
@@ -28,3 +35,9 @@ Key entrypoints:
 - `run.sh`: wrapper for offline inference and GT evaluation
 - `collect_results.sh`: collect sample output, latency, metrics, plots, and logs
 - `end2end.py`: underlying Python entrypoint
+
+Gated e2e test path:
+
+```bash
+python -m pytest -sv tests/examples/offline_inference/test_internvla_a1.py -m advanced_model
+```

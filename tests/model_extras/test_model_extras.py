@@ -60,6 +60,19 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_internvla_a1_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("InternVLAA1Pipeline") == frozenset(
+        {
+            "num_steps",
+            "decode_image",
+        }
+    )
+    assert get_extra_output_params("InternVLAA1Pipeline") == frozenset({"decoded"})
+    assert should_init_extra_args_for_non_diffusion_stages("InternVLAA1Pipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_cosmos3_extra_registry_declares_request_and_response_params() -> None:
     assert get_extra_body_params("Cosmos3OmniDiffusersPipeline") == frozenset(
         {

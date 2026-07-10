@@ -939,6 +939,7 @@ class InternVLAA1Policy(nn.Module):
         batch: dict[str, Any],
         *,
         noise: torch.Tensor | None = None,
+        num_steps: int | None = None,
         decode_image: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         task = self._get_task(batch)
@@ -958,5 +959,6 @@ class InternVLAA1Policy(nn.Module):
             lang_masks,
             state,
             noise=noise,
+            num_steps=num_steps,
             decode_image=decode_image,
         )

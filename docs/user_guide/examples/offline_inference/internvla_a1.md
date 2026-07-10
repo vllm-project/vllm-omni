@@ -8,6 +8,8 @@ This example is adapted from: https://github.com/InternRobotics/InternVLA-A1/blo
 
 This example runs the single-path vLLM offline inference workflow for InternVLA-A1 open-loop action prediction.
 
+Recipe: [`recipes/InternRobotics/InternVLA-A1-3B.md`](../../../../recipes/InternRobotics/InternVLA-A1-3B.md)
+
 Before running the script, export the required local paths:
 
 ```bash
@@ -82,7 +84,15 @@ bash run.sh \
 - `--attn-implementation {eager,sdpa}`: switch attention backend
 - `--enable-regional-compile`: enable regional `torch.compile`
 - `--enable-warmup`: run pipeline warmup in initialization
+- `--num-steps N`: override `config.num_inference_steps` for this request
+- `--decode-image`: request decoded image features in `custom_output["decoded"]`
 - `--skip-plots`: skip plot generation even if `matplotlib` is installed
+
+InternVLA-A1 declares the request knobs `num_steps` and `decode_image` in
+`vllm_omni/model_extras/internvla_a1.py`. The example keeps robot tensor
+payloads (`batch_inputs`, `noise`) as direct `extra_args`, while these knobs are
+routed through the declared `extra_body` contract with
+`apply_declared_extra_args`.
 
 ### Collect results and performance logs
 
@@ -180,6 +190,10 @@ pip install matplotlib
 - `run.sh`: shell wrapper with local path env vars
 - `collect_results.sh`: helper to gather result summaries and performance logs into one directory
 - `internvla_a1_common.py`: dataset, evaluation, and plotting helpers
+
+The gated e2e test lives at
+`tests/examples/offline_inference/test_internvla_a1.py` and requires local
+checkpoints, processor files, Cosmos tokenizer checkpoints, and dataset paths.
 
 ## Embedded source listings
 
