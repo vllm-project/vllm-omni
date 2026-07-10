@@ -97,12 +97,12 @@ _DIFFUSION_MODELS = {
         "LTX2I2VDMD2Pipeline",
     ),
     "LTX23Pipeline": (
-        "ltx2",
+        "ltx2_3",
         "pipeline_ltx2_3",
         "LTX23Pipeline",
     ),
     "LTX23ImageToVideoPipeline": (
-        "ltx2",
+        "ltx2_3",
         "pipeline_ltx2_3_image2video",
         "LTX23ImageToVideoPipeline",
     ),
