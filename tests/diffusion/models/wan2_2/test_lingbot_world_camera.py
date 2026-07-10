@@ -118,6 +118,36 @@ def test_load_camera_trajectory_normalizes_c2w_poses_to_first_camera(tmp_path: P
     torch.testing.assert_close(trajectory.intrinsics, torch.from_numpy(intrinsics).float())
 
 
+def test_load_camera_trajectory_normalizes_non_commuting_rotations(tmp_path: Path) -> None:
+    first_c2w = np.array(
+        [
+            [0.0, -1.0, 0.0, 2.0],
+            [1.0, 0.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0, 3.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    current_c2w = np.array(
+        [
+            [0.0, 0.0, 1.0, 5.0],
+            [0.0, 1.0, 0.0, 4.0],
+            [-1.0, 0.0, 0.0, 6.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    assert not np.allclose(first_c2w[:3, :3] @ current_c2w[:3, :3], current_c2w[:3, :3] @ first_c2w[:3, :3])
+    _write_trajectory(
+        tmp_path,
+        np.stack((first_c2w, current_c2w)),
+        np.ones((2, 4), dtype=np.float64),
+    )
+
+    trajectory = load_camera_trajectory(tmp_path)
+
+    expected_relative_pose = np.linalg.inv(first_c2w) @ current_c2w
+    torch.testing.assert_close(trajectory.poses[1], torch.from_numpy(expected_relative_pose).float())
+
+
 def test_interpolate_camera_trajectory_uses_linear_and_spherical_interpolation() -> None:
     poses = torch.eye(4).repeat(2, 1, 1)
     poses[1, :3, :3] = torch.tensor(
@@ -182,6 +212,28 @@ def test_build_plucker_embedding_scales_reference_intrinsics() -> None:
 
     expected_corner_direction = torch.tensor([-1.0, -1.0, 1.0]) / math.sqrt(3.0)
     torch.testing.assert_close(result[0, :3, 0, 0], expected_corner_direction)
+
+
+def test_build_plucker_embedding_samples_target_pixel_centers() -> None:
+    trajectory = _trajectory(
+        torch.eye(4).unsqueeze(0),
+        torch.tensor([[416.0, 240.0, 416.0, 240.0]]),
+    )
+
+    result = build_plucker_embedding(
+        trajectory,
+        height=6,
+        width=10,
+        target_height=2,
+        target_width=5,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    # The first target cell is centered at source pixel (x=0.5, y=1.0).
+    expected_direction = torch.tensor([-0.9, -2.0 / 3.0, 1.0])
+    expected_direction /= torch.linalg.vector_norm(expected_direction)
+    torch.testing.assert_close(result[0, :3, 0, 0], expected_direction)
 
 
 def test_build_plucker_embedding_transforms_rays_with_c2w_pose() -> None:
