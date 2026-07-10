@@ -150,8 +150,18 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
-"vllm_omni" = ["_version.py", "py.typed"]
+# NOTE: keep these patterns in sync with the non-Python data files shipped
+# under vllm_omni/. They are required for `pip install` from a source tarball
+# (e.g. a release/tag archive), where setuptools-scm's git file-finder is
+# unavailable and only these declarations get the data into the wheel. A plain
+# git-checkout build happens to include them via the file-finder, which is why
+# CI never caught this. See #4932.
+"vllm_omni" = ["_version.py", "py.typed", "deploy/*.yaml", "deploy/*.md"]
 "vllm_omni.model_executor.stage_configs" = ["*.yaml"]
+"vllm_omni.platforms.xpu" = ["stage_configs/*.yaml"]
+"vllm_omni.model_executor.models.covo_audio" = ["speaker_prompt/*.npy"]
+"vllm_omni.model_executor.models.step_audio2" = ["assets/*.wav"]
+"vllm_omni.experimental.fullduplex" = ["*.md"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
