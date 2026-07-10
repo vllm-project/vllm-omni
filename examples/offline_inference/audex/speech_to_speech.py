@@ -119,12 +119,13 @@ def _extract_final_response(text: str) -> str:
 
 def _clean(text: str) -> str:
     # The full checkpoint prefixes transcripts with a language tag sentence
-    # and quotes the content; extract the quoted payload when present.
+    # and quotes the content; extract the quoted payload when present. Span
+    # first-to-last quote (not split on every apostrophe) so contractions
+    # inside the transcript (e.g. "don't") survive intact.
     text = text.strip()
-    if "'" in text:
-        parts = text.split("'")
-        if len(parts) >= 3:
-            return parts[1].strip()
+    match = re.search(r"'(.*)'", text, flags=re.S)
+    if match and match.group(1).strip():
+        return match.group(1).strip()
     return text
 
 
