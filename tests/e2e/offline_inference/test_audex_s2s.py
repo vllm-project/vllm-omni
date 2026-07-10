@@ -34,9 +34,15 @@ ASR_PROMPT = (
 )
 
 # Official chat-pass recipe (examples/offline_inference/audex/speech_to_speech.py,
-# mirroring the official cascaded web demo). The formatting-instruction prefix is
-# load-bearing on the 30B-A3B: without it a bare transcript turn is treated as a
-# TTS request and the model emits literal <speechcodec_N> tokens instead of text.
+# mirroring the official cascaded web demo) — 30B-A3B ONLY. The
+# formatting-instruction prefix is load-bearing on the 30B-A3B: without it a bare
+# transcript turn is treated as a TTS request and the model emits literal
+# <speechcodec_N> tokens instead of text, and under the yaml's near-greedy
+# defaults its reasoning block never closes. The 2B must NOT use this recipe:
+# it is long-verified stable on a bare prompt + engine-default sampling, while
+# the official temp-1.0 seed-0 draw hallucinates off-language text (yet closes
+# </think> cleanly, so the seed retry never fires) and fails the round-trip
+# WER gate — measured, reproduced byte-identically.
 SYSTEM_PROMPT = "You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools."
 TEXT_INSTRUCTION = (
     "SYSTEM & FORMATTING INSTRUCTION: You are Audex, created by NVIDIA based on the Nemotron-Cascade-2 architecture. "
@@ -179,19 +185,29 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
     stage1_audio = _concat_audio(mm.get("audio")) if "audio" in mm else np.zeros((0,), dtype=np.float32)
     assert stage1_audio.size == 0, "Text-modality ASR pass produced stage-1 audio (routing regression)"
 
-    # Pass 2 — chat (text-final; official recipe, see _chat_prompt). The raw
-    # completion is <reasoning...></think><answer>; speak only the final
-    # response. Retry with the next seed only when the budget ran out before
-    # the reasoning block closed (a natural stop without </think> is a
-    # complete answer); if every seed spins, keep the full text (official
-    # demo behavior).
-    chat_prompt = _chat_prompt(transcript or "Hello.")
-    raw = ""
-    for seed in CHAT_SEEDS:
-        raw, truncated = _chat_once(omni_runner, chat_prompt, seed)
-        if "</think>" in raw or not truncated:
-            break
-    answer = _extract_final_response(raw)
+    # Pass 2 — chat (text-final). The recipe is size-conditional (see the
+    # SYSTEM_PROMPT comment above): the 30B requires the official recipe,
+    # the 2B regresses under it.
+    if omni_runner.model_name == _AUDEX_30B_MODEL:
+        # Official recipe. The raw completion is
+        # <reasoning...></think><answer>; speak only the final response.
+        # Retry with the next seed only when the budget ran out before the
+        # reasoning block closed (a natural stop without </think> is a
+        # complete answer); if every seed spins, keep the full text
+        # (official demo behavior).
+        chat_prompt = _chat_prompt(transcript or "Hello.")
+        raw = ""
+        for seed in CHAT_SEEDS:
+            raw, truncated = _chat_once(omni_runner, chat_prompt, seed)
+            if "</think>" in raw or not truncated:
+                break
+        answer = _extract_final_response(raw)
+    else:
+        # 2B: bare prompt with a closed think block, engine-default sampling
+        # (yaml near-greedy), no retry; the answer is used as-is.
+        chat_prompt = f"<|im_start|>user\n{transcript or 'Hello.'}<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        (chat_output,) = omni_runner.omni.generate([{"prompt": chat_prompt, "modalities": ["text"]}])
+        answer = (chat_output.outputs[0].text or "").strip()
 
     if real_weights:
         assert transcript, "ASR pass produced an empty transcript"
