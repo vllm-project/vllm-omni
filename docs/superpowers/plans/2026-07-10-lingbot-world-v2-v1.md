@@ -23,7 +23,7 @@
 
 ---
 
-### Task 1: Camera trajectory loading and Plücker conditioning
+### Task 1: Camera trajectory loading and checkpoint ray conditioning
 
 **Files:**
 
@@ -58,16 +58,19 @@ def build_plucker_embedding(
     ...
 ```
 
-- `load_camera_trajectory` resolves both files, rejects missing/non-finite/invalid shapes, and converts NumPy arrays to `float32` tensors.
-- Treat `poses.npy` as camera-to-world transforms and normalize every pose into the first camera's coordinate frame before deriving rays.
-- Interpolate translations linearly and rotations with SciPy quaternion SLERP when the requested frame count differs.
+- `load_camera_trajectory` resolves both files, rejects missing/non-finite/invalid shapes, converts NumPy arrays to `float32` tensors, and preserves the raw camera-to-world poses.
+- Interpolate raw translations linearly and raw rotations with SciPy quaternion SLERP when the requested frame count differs; interpolation must happen before relative/framewise conversion.
+- After interpolation, normalize poses into the first camera frame, compute framewise deltas as `inv(relative[i-1]) @ relative[i]` for frames `1..N-1`, set frame 0 to identity, and divide all translations by the maximum translation norm when nonzero.
 - Scale `fx, fy, cx, cy` from the checkpoint reference resolution `480 x 832` to the requested pixel resolution.
-- Build world-space ray origins and normalized directions, then concatenate `(direction, origin × direction)` in six channels.
+- Use half-pixel centers and build six checkpoint channels in exact `[ray_origin_xyz, normalized_ray_direction_xyz]` order.
 - Resize/sample the ray grid directly at the requested latent/camera-conditioning spatial resolution without materializing an unnecessarily large repeated tensor.
+
+This camera section corrects the early plan convention to match the Apache SGLang checkpoint adapter;
+the implementation reimplements the compact math and does not copy the CC BY-NC-SA upstream source.
 
 **Steps:**
 
-- [ ] Write tests for missing files, invalid shapes/non-finite values, first-frame identity, interpolation endpoints, center ray direction, intrinsics scaling, output shape/dtype/device, and deterministic results.
+- [ ] Write tests for missing files, invalid shapes/non-finite values, raw-load semantics, interpolation-before-framewise conversion, nontrivial framewise rotations/translations, max-norm translation normalization, half-pixel ray direction, channel order, folded placement, output shape/dtype/device, and deterministic results.
 - [ ] Run the focused test and capture the expected RED failure because the module does not exist.
 - [ ] Implement the smallest pure camera module satisfying those tests.
 - [ ] Run `../../.venv/bin/python -m pytest --noconftest -q tests/diffusion/models/wan2_2/test_lingbot_world_camera.py`; expected result: all tests pass on CPU.
@@ -190,7 +193,7 @@ class LingBotWorldCausalDMDPipeline(
 
 - Discover/load the scheduler, UMT5 text encoder/tokenizer, Wan VAE, and `CausalLingBotWorldTransformer3DModel` through normal vLLM-Omni component loading.
 - Parse one prompt, one image, and one camera action directory. Reject absent/multiple images, absent/ambiguous action paths, invalid dimensions, unsupported batching, unsupported `num_inference_steps`, and insufficient camera frames with actionable errors.
-- Encode the first image with the Wan VAE. Construct the 20-channel condition as 16 latent channels plus the four-channel temporal mask, then concatenate 16 noise channels to form the transformer’s 36-channel input.
+- Encode the first image with the Wan VAE. Construct the 20-channel condition as `[mask4, image_latent16]`, then concatenate it after 16 noise channels to form the exact transformer input `[noise16, mask4, image_latent16]`.
 - Use scheduler `flow_shift=5.0` and exactly four DMD timesteps `[1000, 750, 500, 250]` per generated chunk.
 - After the fourth denoising step, perform the required `t=0` cache-update forward, append the generated latent chunk, and continue until the requested frame count is reached.
 - Allocate transformer cache at request entry and discard it on return or error.
@@ -199,7 +202,7 @@ class LingBotWorldCausalDMDPipeline(
 
 **Steps:**
 
-- [ ] Write stub-component tests for input parsing, action-path source precedence/ambiguity, first-frame condition channels, fixed timestep ordering, one cache allocation per request, `t=0` update call, multi-chunk concatenation, cache teardown, and registry lookup.
+- [ ] Write stub-component tests for input parsing, action-path source precedence/ambiguity, exact sentinel channel positions, first-frame condition channels, fixed timestep ordering, one transformer-owned cache allocation per request, `t=0` update call, multi-chunk concatenation, cache teardown, and registry lookup.
 - [ ] Run the focused test and capture RED before creating the pipeline.
 - [ ] Implement component discovery/loading, prompt/image/camera preparation, latent creation, the chunk loop, decode/postprocess, exports, and registry entry.
 - [ ] Run the focused tests in CI/Linux; locally compile all changed files and run any pure helpers that do not import vLLM native extensions.

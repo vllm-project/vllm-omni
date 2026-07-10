@@ -125,6 +125,7 @@ class _RecordingTransformer(nn.Module):
         for block in self.blocks:
             block.self_attn = SimpleNamespace(num_local_heads=2, head_dim=4)
         self.calls: list[dict] = []
+        self.cache_allocations: list[dict] = []
         self.raise_on_call = raise_on_call
         self.loaded_weights: list[tuple[str, torch.Tensor]] = []
 
@@ -146,6 +147,20 @@ class _RecordingTransformer(nn.Module):
         if self.raise_on_call == len(self.calls):
             raise RuntimeError("forced transformer failure")
         return torch.ones_like(kwargs["hidden_states"][:, :16])
+
+    def allocate_cache(self, **kwargs):
+        self.cache_allocations.append(dict(kwargs))
+        patch_height, patch_width = self.config.patch_size[1:]
+        window_frames = (
+            self.config.local_attn_size if self.config.local_attn_size != -1 else self.config.sliding_window_num_frames
+        )
+        max_tokens = window_frames * (kwargs["latent_height"] // patch_height) * (kwargs["latent_width"] // patch_width)
+        return _Cache(
+            num_layers=self.config.num_layers,
+            max_tokens=max_tokens,
+            num_local_heads=2,
+            head_dim=4,
+        )
 
     def load_weights(self, weights):
         self.loaded_weights = list(weights)
@@ -308,6 +323,7 @@ def _load_pipeline_module():
         assert filename == "scheduler/scheduler_config.json"
         return {
             "num_train_timesteps": 1000,
+            "flow_shift": 5.0,
             "prediction_type": "flow_prediction",
             "solver_order": 2,
             "predict_x0": True,
@@ -946,6 +962,7 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
+    pipeline._randn = lambda shape, **kwargs: torch.full(shape, -99.0, dtype=kwargs["dtype"])
 
     result = pipeline(_request())
 
@@ -956,10 +973,11 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
     std = torch.tensor(pipeline.vae.config.latents_std).view(1, 16, 1, 1)
     expected_first = (torch.full((1, 16, 2, 2), 2.0) - mean) / std
     expected_future = (torch.zeros(1, 16, 2, 2, 2) - mean.unsqueeze(2)) / std.unsqueeze(2)
-    torch.testing.assert_close(first_input[:, 16:32, 0], expected_first)
-    torch.testing.assert_close(first_input[:, 16:32, 1:], expected_future)
-    torch.testing.assert_close(first_input[:, 32:36, 0], torch.ones(1, 4, 2, 2))
-    torch.testing.assert_close(first_input[:, 32:36, 1:], torch.zeros(1, 4, 2, 2, 2))
+    torch.testing.assert_close(first_input[:, :16], torch.full((1, 16, 3, 2, 2), -99.0))
+    torch.testing.assert_close(first_input[:, 16:20, 0], torch.ones(1, 4, 2, 2))
+    torch.testing.assert_close(first_input[:, 16:20, 1:], torch.zeros(1, 4, 2, 2, 2))
+    torch.testing.assert_close(first_input[:, 20:36, 0], expected_first)
+    torch.testing.assert_close(first_input[:, 20:36, 1:], expected_future)
 
     raw_camera = module.build_plucker_embedding(
         SimpleNamespace(poses=torch.empty(3, 4, 4)),
@@ -1092,6 +1110,51 @@ def test_request_flow_shift_override_has_precedence_without_mutating_scheduler()
     assert pipeline.scheduler.config.shift == 3.0
 
 
+def test_checkpoint_flow_shift_default_and_engine_request_override_precedence() -> None:
+    module = _load_pipeline_module()
+    checkpoint_scheduler_config = {
+        "num_train_timesteps": 1000,
+        "flow_shift": 6.25,
+        "shift": 7.5,
+    }
+    module._load_json = lambda *args, **kwargs: checkpoint_scheduler_config.copy()
+
+    checkpoint_default = _pipeline(module)
+    engine_override = _pipeline(module, od_config=_od_config(flow_shift=3.5))
+    request_override = checkpoint_default._parse_request(
+        _RequestBatch(
+            _prompt(action_path="prompt-actions"),
+            _SamplingParams(extra_args={"flow_shift": 2.25}),
+        )
+    )
+
+    assert checkpoint_default.scheduler.config.shift == 6.25
+    assert checkpoint_default._parse_request(_request()).flow_shift == 6.25
+    assert engine_override.scheduler.config.shift == 3.5
+    assert engine_override._parse_request(_request()).flow_shift == 3.5
+    assert request_override.flow_shift == 2.25
+
+
+@pytest.mark.parametrize(
+    ("scheduler_config", "expected"),
+    [
+        ({"flow_shift": 6.0, "shift": 7.0}, 6.0),
+        ({"shift": 7.0}, 7.0),
+        ({}, 5.0),
+    ],
+)
+def test_checkpoint_scheduler_shift_fallback_order(scheduler_config, expected: float) -> None:
+    module = _load_pipeline_module()
+    module._load_json = lambda *args, **kwargs: {
+        "num_train_timesteps": 1000,
+        **scheduler_config,
+    }
+
+    pipeline = _pipeline(module)
+
+    assert pipeline.scheduler.config.shift == expected
+
+
 @pytest.mark.parametrize("flow_shift", [0, -1, float("nan"), float("inf"), "invalid"])
 def test_request_flow_shift_must_be_positive_and_finite(flow_shift) -> None:
     module = _load_pipeline_module()
@@ -1180,14 +1243,14 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
     allocations = []
-    original_allocate = module.allocate_lingbot_cache
+    original_allocate = transformer.allocate_cache
 
     def allocate(**kwargs):
         cache = original_allocate(**kwargs)
         allocations.append((kwargs, weakref.ref(cache)))
         return cache
 
-    module.allocate_lingbot_cache = allocate
+    transformer.allocate_cache = allocate
     sampling = _SamplingParams(num_frames=21, output_type="np")
 
     result = pipeline(_request(sampling=sampling))
@@ -1198,7 +1261,13 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     assert [int(call["timestep"].item()) for call in transformer.calls] == [1000, 750, 500, 250, 0] * 2
     assert len(allocations) == 1
     kwargs, cache_ref = allocations[0]
-    assert kwargs["max_tokens"] == 6
+    assert kwargs == {
+        "batch_size": 1,
+        "latent_height": 2,
+        "latent_width": 2,
+        "device": torch.device("cpu"),
+        "dtype": torch.float32,
+    }
     assert not hasattr(pipeline, "cache")
     assert not hasattr(pipeline, "transformer_cache")
     assert pipeline.vae.decode_inputs[0].shape == (1, 16, 6, 2, 2)
@@ -1219,14 +1288,14 @@ def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
     transformer = _RecordingTransformer(raise_on_call=2)
     pipeline = _pipeline(module, transformer=transformer)
     cache_refs = []
-    original_allocate = module.allocate_lingbot_cache
+    original_allocate = transformer.allocate_cache
 
     def allocate(**kwargs):
         cache = original_allocate(**kwargs)
         cache_refs.append(weakref.ref(cache))
         return cache
 
-    module.allocate_lingbot_cache = allocate
+    transformer.allocate_cache = allocate
 
     with pytest.raises(RuntimeError, match="forced transformer failure") as exc_info:
         pipeline(_request())

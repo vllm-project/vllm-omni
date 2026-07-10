@@ -45,7 +45,7 @@ def _trajectory(
     intrinsics: torch.Tensor | None = None,
 ) -> CameraTrajectory:
     if intrinsics is None:
-        intrinsics = torch.tensor([[832.0 / 3.0, 160.0, 832.0 / 3.0, 160.0]]).repeat(poses.shape[0], 1)
+        intrinsics = torch.tensor([[832.0 / 3.0, 160.0, 416.0, 240.0]]).repeat(poses.shape[0], 1)
     return CameraTrajectory(poses=poses, intrinsics=intrinsics)
 
 
@@ -94,7 +94,7 @@ def test_load_camera_trajectory_rejects_non_finite_values(tmp_path: Path, array_
         load_camera_trajectory(tmp_path)
 
 
-def test_load_camera_trajectory_normalizes_c2w_poses_to_first_camera(tmp_path: Path) -> None:
+def test_load_camera_trajectory_preserves_raw_c2w_poses(tmp_path: Path) -> None:
     first_c2w = np.array(
         [
             [0.0, -1.0, 0.0, 2.0],
@@ -103,31 +103,7 @@ def test_load_camera_trajectory_normalizes_c2w_poses_to_first_camera(tmp_path: P
             [0.0, 0.0, 0.0, 1.0],
         ]
     )
-    relative_pose = np.eye(4)
-    relative_pose[:3, 3] = [1.0, 2.0, 3.0]
-    poses = np.stack((first_c2w, first_c2w @ relative_pose))
-    intrinsics = np.array([[100.0, 110.0, 120.0, 130.0]] * 2)
-    _write_trajectory(tmp_path, poses, intrinsics)
-
-    trajectory = load_camera_trajectory(tmp_path)
-
-    assert trajectory.poses.dtype == torch.float32
-    assert trajectory.intrinsics.dtype == torch.float32
-    torch.testing.assert_close(trajectory.poses[0], torch.eye(4))
-    torch.testing.assert_close(trajectory.poses[1], torch.from_numpy(relative_pose).float())
-    torch.testing.assert_close(trajectory.intrinsics, torch.from_numpy(intrinsics).float())
-
-
-def test_load_camera_trajectory_normalizes_non_commuting_rotations(tmp_path: Path) -> None:
-    first_c2w = np.array(
-        [
-            [0.0, -1.0, 0.0, 2.0],
-            [1.0, 0.0, 0.0, -1.0],
-            [0.0, 0.0, 1.0, 3.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]
-    )
-    current_c2w = np.array(
+    second_c2w = np.array(
         [
             [0.0, 0.0, 1.0, 5.0],
             [0.0, 1.0, 0.0, 4.0],
@@ -135,17 +111,16 @@ def test_load_camera_trajectory_normalizes_non_commuting_rotations(tmp_path: Pat
             [0.0, 0.0, 0.0, 1.0],
         ]
     )
-    assert not np.allclose(first_c2w[:3, :3] @ current_c2w[:3, :3], current_c2w[:3, :3] @ first_c2w[:3, :3])
-    _write_trajectory(
-        tmp_path,
-        np.stack((first_c2w, current_c2w)),
-        np.ones((2, 4), dtype=np.float64),
-    )
+    poses = np.stack((first_c2w, second_c2w))
+    intrinsics = np.array([[100.0, 110.0, 120.0, 130.0]] * 2)
+    _write_trajectory(tmp_path, poses, intrinsics)
 
     trajectory = load_camera_trajectory(tmp_path)
 
-    expected_relative_pose = np.linalg.inv(first_c2w) @ current_c2w
-    torch.testing.assert_close(trajectory.poses[1], torch.from_numpy(expected_relative_pose).float())
+    assert trajectory.poses.dtype == torch.float32
+    assert trajectory.intrinsics.dtype == torch.float32
+    torch.testing.assert_close(trajectory.poses, torch.from_numpy(poses).float())
+    torch.testing.assert_close(trajectory.intrinsics, torch.from_numpy(intrinsics).float())
 
 
 def test_interpolate_camera_trajectory_uses_linear_and_spherical_interpolation() -> None:
@@ -190,8 +165,8 @@ def test_build_plucker_embedding_has_forward_center_ray() -> None:
         dtype=torch.float32,
     )
 
-    torch.testing.assert_close(result[0, :3, 1, 1], torch.tensor([0.0, 0.0, 1.0]))
-    torch.testing.assert_close(result[0, 3:, 1, 1], torch.zeros(3))
+    torch.testing.assert_close(result[0, :3, 1, 1], torch.zeros(3))
+    torch.testing.assert_close(result[0, 3:, 1, 1], torch.tensor([0.0, 0.0, 1.0]))
 
 
 def test_build_plucker_embedding_scales_reference_intrinsics() -> None:
@@ -210,8 +185,9 @@ def test_build_plucker_embedding_scales_reference_intrinsics() -> None:
         dtype=torch.float32,
     )
 
-    expected_corner_direction = torch.tensor([-1.0, -1.0, 1.0]) / math.sqrt(3.0)
-    torch.testing.assert_close(result[0, :3, 0, 0], expected_corner_direction)
+    expected_corner_direction = torch.tensor([-0.875, -0.75, 1.0])
+    expected_corner_direction /= torch.linalg.vector_norm(expected_corner_direction)
+    torch.testing.assert_close(result[0, 3:, 0, 0], expected_corner_direction)
 
 
 def test_build_plucker_embedding_samples_target_pixel_centers() -> None:
@@ -230,14 +206,15 @@ def test_build_plucker_embedding_samples_target_pixel_centers() -> None:
         dtype=torch.float32,
     )
 
-    # The first target cell is centered at source pixel (x=0.5, y=1.0).
-    expected_direction = torch.tensor([-0.9, -2.0 / 3.0, 1.0])
+    # Target centers map through the source scale: (0.5 * 2, 0.5 * 3).
+    expected_direction = torch.tensor([-0.8, -0.5, 1.0])
     expected_direction /= torch.linalg.vector_norm(expected_direction)
-    torch.testing.assert_close(result[0, :3, 0, 0], expected_direction)
+    torch.testing.assert_close(result[0, 3:, 0, 0], expected_direction)
 
 
-def test_build_plucker_embedding_transforms_rays_with_c2w_pose() -> None:
-    poses = torch.eye(4).repeat(2, 1, 1)
+def test_build_plucker_embedding_uses_framewise_deltas_for_rotations_and_translations() -> None:
+    poses = torch.eye(4).repeat(3, 1, 1)
+    poses[0, :3, 3] = torch.tensor([5.0, 7.0, 11.0])
     poses[1, :3, :3] = torch.tensor(
         [
             [0.0, -1.0, 0.0],
@@ -245,23 +222,107 @@ def test_build_plucker_embedding_transforms_rays_with_c2w_pose() -> None:
             [0.0, 0.0, 1.0],
         ]
     )
-    poses[1, :3, 3] = torch.tensor([1.0, 0.0, 0.0])
-    trajectory = _trajectory(poses)
+    poses[1, :3, 3] = torch.tensor([5.0, 9.0, 11.0])
+    poses[2, :3, :3] = torch.tensor(
+        [
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    poses[2, :3, 3] = torch.tensor([3.0, 9.0, 11.0])
+    trajectory = _trajectory(
+        poses,
+        torch.tensor([[416.0, 480.0, 208.0, 240.0]]).repeat(3, 1),
+    )
 
     result = build_plucker_embedding(
         trajectory,
-        height=3,
-        width=3,
-        target_height=3,
-        target_width=3,
+        height=1,
+        width=2,
+        target_height=1,
+        target_width=2,
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
 
     expected_direction = torch.tensor([0.0, 1.0, 1.0]) / math.sqrt(2.0)
-    expected_moment = torch.tensor([0.0, -1.0, 1.0]) / math.sqrt(2.0)
-    torch.testing.assert_close(result[1, :3, 1, 2], expected_direction)
-    torch.testing.assert_close(result[1, 3:, 1, 2], expected_moment)
+    torch.testing.assert_close(result[0, :3, 0, 1], torch.zeros(3))
+    torch.testing.assert_close(result[1, :3, 0, 1], torch.tensor([0.0, 1.0, 0.0]))
+    torch.testing.assert_close(result[2, :3, 0, 1], torch.tensor([0.0, 1.0, 0.0]))
+    torch.testing.assert_close(result[1, 3:, 0, 1], expected_direction)
+    torch.testing.assert_close(result[2, 3:, 0, 1], expected_direction)
+
+
+def test_build_plucker_embedding_normalizes_framewise_translation_by_max_norm() -> None:
+    poses = torch.eye(4).repeat(3, 1, 1)
+    poses[:, :3, 3] = torch.tensor(
+        [
+            [10.0, -2.0, 5.0],
+            [13.0, 2.0, 5.0],
+            [19.0, 10.0, 5.0],
+        ]
+    )
+
+    result = build_plucker_embedding(
+        _trajectory(poses),
+        height=1,
+        width=1,
+        target_height=1,
+        target_width=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    expected_origins = torch.tensor([[0.0, 0.0, 0.0], [0.3, 0.4, 0.0], [0.6, 0.8, 0.0]])
+    torch.testing.assert_close(result[:, :3, 0, 0], expected_origins)
+
+
+def test_build_plucker_embedding_interpolates_raw_poses_before_framewise_conversion() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[0, :3, 3] = torch.tensor([20.0, 4.0, -2.0])
+    poses[1, :3, 3] = torch.tensor([26.0, 12.0, -2.0])
+    raw = _trajectory(poses)
+
+    interpolated = interpolate_camera_trajectory(raw, 3)
+    result = build_plucker_embedding(
+        interpolated,
+        height=1,
+        width=1,
+        target_height=1,
+        target_width=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    expected_delta = torch.tensor([0.6, 0.8, 0.0])
+    torch.testing.assert_close(result[0, :3, 0, 0], torch.zeros(3))
+    torch.testing.assert_close(result[1, :3, 0, 0], expected_delta)
+    torch.testing.assert_close(result[2, :3, 0, 0], expected_delta)
+
+
+def test_build_plucker_embedding_uses_half_pixel_centers_and_origin_direction_channel_order() -> None:
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[1, :3, 3] = torch.tensor([2.0, 0.0, 0.0])
+    trajectory = _trajectory(
+        poses,
+        torch.tensor([[832.0, 480.0, 0.0, 0.0]]).repeat(2, 1),
+    )
+
+    result = build_plucker_embedding(
+        trajectory,
+        height=1,
+        width=2,
+        target_height=1,
+        target_width=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    expected_direction = torch.tensor([0.25, 0.5, 1.0])
+    expected_direction /= torch.linalg.vector_norm(expected_direction)
+    torch.testing.assert_close(result[1, :3, 0, 0], torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(result[1, 3:, 0, 0], expected_direction)
 
 
 def test_build_plucker_embedding_honors_shape_dtype_and_device() -> None:

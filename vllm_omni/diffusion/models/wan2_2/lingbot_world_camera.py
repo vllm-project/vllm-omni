@@ -47,7 +47,7 @@ def _validate_trajectory(
 
 
 def load_camera_trajectory(action_path: str | os.PathLike[str]) -> CameraTrajectory:
-    """Load and normalize a camera-to-world trajectory from an action directory."""
+    """Load raw camera-to-world poses and intrinsics from an action directory."""
 
     action_directory = Path(action_path)
     poses_path = action_directory / "poses.npy"
@@ -67,14 +67,7 @@ def load_camera_trajectory(action_path: str | os.PathLike[str]) -> CameraTraject
         intrinsics=torch.from_numpy(intrinsics_array),
     )
     _validate_trajectory(trajectory, file_suffix=".npy")
-
-    try:
-        first_world_to_camera = torch.linalg.inv(trajectory.poses[0])
-    except RuntimeError as exc:
-        raise ValueError("the first camera-to-world pose must be invertible") from exc
-
-    relative_poses = torch.matmul(first_world_to_camera, trajectory.poses)
-    return CameraTrajectory(poses=relative_poses, intrinsics=trajectory.intrinsics)
+    return trajectory
 
 
 def _linear_interpolate(values: torch.Tensor, target_times: np.ndarray) -> torch.Tensor:
@@ -126,6 +119,35 @@ def interpolate_camera_trajectory(
     return CameraTrajectory(poses=poses, intrinsics=intrinsics)
 
 
+def _invert_camera_poses(poses: torch.Tensor) -> torch.Tensor:
+    rotations = poses[:, :3, :3]
+    translations = poses[:, :3, 3:]
+    inverse_rotations = rotations.transpose(-1, -2)
+    inverse = torch.eye(4, device=poses.device, dtype=poses.dtype).repeat(poses.shape[0], 1, 1)
+    inverse[:, :3, :3] = inverse_rotations
+    inverse[:, :3, 3:] = -torch.bmm(inverse_rotations, translations)
+    return inverse
+
+
+def _prepare_framewise_poses(raw_poses: torch.Tensor) -> torch.Tensor:
+    """Convert raw C2W poses to normalized first-relative framewise deltas."""
+
+    first_world_to_camera = _invert_camera_poses(raw_poses[:1])
+    relative_poses = torch.matmul(first_world_to_camera, raw_poses).clone()
+    relative_poses[0] = torch.eye(4, device=raw_poses.device, dtype=raw_poses.dtype)
+    if relative_poses.shape[0] > 1:
+        relative_poses[1:] = torch.bmm(
+            _invert_camera_poses(relative_poses[:-1]),
+            relative_poses[1:],
+        )
+
+    translations = relative_poses[:, :3, 3]
+    max_translation_norm = torch.linalg.vector_norm(translations, dim=-1).max()
+    if max_translation_norm > 0:
+        relative_poses[:, :3, 3] = translations / max_translation_norm
+    return relative_poses
+
+
 def build_plucker_embedding(
     trajectory: CameraTrajectory,
     *,
@@ -136,7 +158,7 @@ def build_plucker_embedding(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Build ``(direction, origin x direction)`` at the target spatial size."""
+    """Build checkpoint-ordered ``(ray origin, ray direction)`` channels."""
 
     _validate_trajectory(trajectory)
     dimensions = {
@@ -152,7 +174,7 @@ def build_plucker_embedding(
         raise ValueError(f"dtype must be floating point, got {dtype}")
 
     compute_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
-    poses = trajectory.poses.to(device=device, dtype=compute_dtype)
+    poses = _prepare_framewise_poses(trajectory.poses.to(device=device, dtype=compute_dtype))
     intrinsics = trajectory.intrinsics.to(device=device, dtype=compute_dtype).clone()
     intrinsics[:, (0, 2)] *= width / _REFERENCE_WIDTH
     intrinsics[:, (1, 3)] *= height / _REFERENCE_HEIGHT
@@ -160,12 +182,8 @@ def build_plucker_embedding(
         raise ValueError("camera focal lengths fx and fy must be non-zero")
 
     # Sample requested-pixel coordinates directly at the conditioning resolution.
-    x_coordinates = (torch.arange(target_width, device=device, dtype=compute_dtype) + 0.5) * (
-        width / target_width
-    ) - 0.5
-    y_coordinates = (torch.arange(target_height, device=device, dtype=compute_dtype) + 0.5) * (
-        height / target_height
-    ) - 0.5
+    x_coordinates = (torch.arange(target_width, device=device, dtype=compute_dtype) + 0.5) * (width / target_width)
+    y_coordinates = (torch.arange(target_height, device=device, dtype=compute_dtype) + 0.5) * (height / target_height)
     grid_y, grid_x = torch.meshgrid(y_coordinates, x_coordinates, indexing="ij")
     grid_x = grid_x.unsqueeze(0)
     grid_y = grid_y.unsqueeze(0)
@@ -186,7 +204,6 @@ def build_plucker_embedding(
     )
     world_directions = world_directions / torch.linalg.vector_norm(world_directions, dim=-1, keepdim=True)
     ray_origins = poses[:, None, None, :3, 3].expand_as(world_directions)
-    moments = torch.linalg.cross(ray_origins, world_directions, dim=-1)
 
-    embedding = torch.cat((world_directions, moments), dim=-1)
+    embedding = torch.cat((ray_origins, world_directions), dim=-1)
     return embedding.permute(0, 3, 1, 2).contiguous().to(dtype=dtype)

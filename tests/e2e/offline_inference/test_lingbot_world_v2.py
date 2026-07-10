@@ -277,7 +277,11 @@ def _required_e2e_path(env_name: str, *, directory: bool) -> Path:
     reason=f"set {_RUN_E2E_ENV}=1 and the LingBot asset-path variables to run",
 )
 def test_lingbot_world_v2_real_checkpoint_one_block(tmp_path: Path) -> None:
-    """Auto-discover the official class and generate one 3-latent/9-raw-frame block."""
+    """Auto-discover the official class and generate one 3-latent/9-raw-frame block.
+
+    This is a runtime smoke test; golden-video comparison remains deferred to a
+    separately reviewed real-GPU quality run.
+    """
 
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():

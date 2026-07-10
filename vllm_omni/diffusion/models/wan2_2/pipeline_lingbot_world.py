@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -36,12 +36,14 @@ from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
     interpolate_camera_trajectory,
     load_camera_trajectory,
 )
-from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import (
-    CausalLingBotWorldTransformer3DModel,
-    allocate_lingbot_cache,
-)
+from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import CausalLingBotWorldTransformer3DModel
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+if TYPE_CHECKING:
+    from tqdm.std import tqdm as TqdmProgressBar
+
+    from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import LingBotTransformerCache
 
 LINGBOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _CAMERA_SPATIAL_FOLD = 8
@@ -71,7 +73,7 @@ class _LingBotRequestInputs:
     seed: int | None
 
 
-def _positive_finite_flow_shift(value: object) -> float:
+def _positive_finite_flow_shift(value: Any) -> float:
     if isinstance(value, bool):
         raise ValueError("flow_shift must be a positive finite number.")
     try:
@@ -128,7 +130,7 @@ def _decode_source_image(image: PIL.Image.Image) -> PIL.Image.Image:
         raise ValueError(_SOURCE_IMAGE_ERROR) from None
 
 
-def _load_source_image(path: str | os.PathLike) -> PIL.Image.Image:
+def _load_source_image(path: str | os.PathLike[str]) -> PIL.Image.Image:
     try:
         source_image = PIL.Image.open(path)
     except (OSError, SyntaxError, ValueError, PIL.Image.DecompressionBombError):
@@ -148,13 +150,13 @@ def _fold_camera_embedding(
 
     if camera_embedding.ndim != 4 or camera_embedding.shape[1] != 6:
         raise ValueError(
-            f"camera Plucker embedding must have shape [frames, 6, height, width], got {tuple(camera_embedding.shape)}"
+            f"camera ray embedding must have shape [frames, 6, height, width], got {tuple(camera_embedding.shape)}"
         )
     if spatial_fold <= 0:
         raise ValueError(f"spatial_fold must be positive, got {spatial_fold}")
     frames, channels, height, width = camera_embedding.shape
     if height % spatial_fold or width % spatial_fold:
-        raise ValueError(f"camera Plucker height and width must be divisible by {spatial_fold}, got {height}x{width}")
+        raise ValueError(f"camera ray height and width must be divisible by {spatial_fold}, got {height}x{width}")
     folded = (
         camera_embedding.reshape(
             frames,
@@ -175,13 +177,17 @@ def _fold_camera_embedding(
     return folded.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
 
 
-def get_lingbot_world_post_process_func(od_config: OmniDiffusionConfig):
+def get_lingbot_world_post_process_func(od_config: OmniDiffusionConfig) -> Callable[..., Any]:
     del od_config
     from diffusers.video_processor import VideoProcessor
 
     video_processor = VideoProcessor(vae_scale_factor=8)
 
-    def post_process_func(video: torch.Tensor, output_type: str = "np", sampling_params=None):
+    def post_process_func(
+        video: torch.Tensor,
+        output_type: str = "np",
+        sampling_params: Any | None = None,
+    ) -> Any:
         if sampling_params is not None:
             output_type = getattr(sampling_params, "output_type", None) or output_type
         if output_type == "latent":
@@ -267,7 +273,10 @@ class LingBotWorldCausalDMDPipeline(
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
         configured_shift = getattr(od_config, "flow_shift", None)
-        scheduler_shift = _positive_finite_flow_shift(5.0 if configured_shift is None else configured_shift)
+        checkpoint_shift = scheduler_config.get("flow_shift", scheduler_config.get("shift", 5.0))
+        scheduler_shift = _positive_finite_flow_shift(
+            checkpoint_shift if configured_shift is None else configured_shift
+        )
         scheduler_keys = {
             "num_train_timesteps",
             "solver_order",
@@ -291,7 +300,7 @@ class LingBotWorldCausalDMDPipeline(
         self.vae_scale_factor_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
 
-    def _resolve_online_action_path(self, action_path: str | os.PathLike) -> str:
+    def _resolve_online_action_path(self, action_path: str | os.PathLike[str]) -> str:
         if not self._online_action_root:
             raise ValueError(
                 "sampling_params.extra_args.action_path requires a trusted action root configured by "
@@ -332,6 +341,8 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot World does not support caller-provided latents.")
 
         prompt_value = req.prompts[0]
+        multi_modal_data: dict[str, Any]
+        additional_information: dict[str, Any]
         if isinstance(prompt_value, str):
             prompt = prompt_value
             multi_modal_data = {}
@@ -536,10 +547,10 @@ class LingBotWorldCausalDMDPipeline(
             latent_condition.shape[-1],
         )
         temporal_mask[:, :, 0] = 1
-        condition = torch.cat((latent_condition, temporal_mask), dim=1).to(dtype=dtype)
+        condition = torch.cat((temporal_mask, latent_condition), dim=1).to(dtype=dtype)
         if condition.shape[1] != 20:
             raise RuntimeError(
-                "LingBot image condition must contain 16 image-latent and 4 temporal-mask channels, "
+                "LingBot image condition must contain 4 temporal-mask then 16 image-latent channels, "
                 f"got {condition.shape[1]}."
             )
         return condition
@@ -573,39 +584,20 @@ class LingBotWorldCausalDMDPipeline(
         )
         return _fold_camera_embedding(camera_embedding, spatial_fold=_CAMERA_SPATIAL_FOLD)
 
-    def _allocate_request_cache(self, *, latent_height: int, latent_width: int, dtype: torch.dtype):
-        patch_frames, patch_height, patch_width = self.transformer.config.patch_size
-        if patch_frames != 1 or latent_height % patch_height or latent_width % patch_width:
-            raise RuntimeError(
-                "latent height/width must align with transformer.config.patch_size before cache allocation."
-            )
-        post_patch_height = latent_height // patch_height
-        post_patch_width = latent_width // patch_width
-        window_frames = (
-            self.transformer.config.local_attn_size
-            if self.transformer.config.local_attn_size != -1
-            else self.transformer.config.sliding_window_num_frames
-        )
-        max_tokens = int(window_frames * post_patch_height * post_patch_width)
-        self_attention = self.transformer.blocks[0].self_attn
-        cache = allocate_lingbot_cache(
+    def _allocate_request_cache(
+        self,
+        *,
+        latent_height: int,
+        latent_width: int,
+        dtype: torch.dtype,
+    ) -> LingBotTransformerCache:
+        return self.transformer.allocate_cache(
             batch_size=1,
-            num_layers=self.transformer.config.num_layers,
-            max_tokens=max_tokens,
-            num_local_heads=self_attention.num_local_heads,
-            head_dim=self_attention.head_dim,
+            latent_height=latent_height,
+            latent_width=latent_width,
             device=self.device,
             dtype=dtype,
         )
-        if len(cache.self_attention) != self.transformer.config.num_layers:
-            raise RuntimeError("allocated LingBot cache layer count does not match transformer.config.num_layers.")
-        if any(
-            layer.key.shape[1] != max_tokens or layer.value.shape[1] != max_tokens for layer in cache.self_attention
-        ):
-            raise RuntimeError(
-                "allocated LingBot cache capacity does not match configured window frames times post-patch H*W."
-            )
-        return cache
 
     def _request_generator(self, inputs: _LingBotRequestInputs) -> torch.Generator | None:
         if inputs.generator is not None:
@@ -614,7 +606,13 @@ class LingBotWorldCausalDMDPipeline(
             return None
         return torch.Generator(device=self.device).manual_seed(inputs.seed)
 
-    def _randn(self, shape: torch.Size | tuple[int, ...], *, generator, dtype: torch.dtype) -> torch.Tensor:
+    def _randn(
+        self,
+        shape: torch.Size | tuple[int, ...],
+        *,
+        generator: torch.Generator | None,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         return randn_tensor(shape, generator=generator, device=self.device, dtype=dtype)
 
     def _generate_block(
@@ -623,11 +621,11 @@ class LingBotWorldCausalDMDPipeline(
         condition: torch.Tensor,
         camera: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        cache,
+        cache: LingBotTransformerCache,
         start_frame: int,
         sigma_lookup: tuple[float, ...],
         generator: torch.Generator | None,
-        progress_bar,
+        progress_bar: TqdmProgressBar[Any],
     ) -> torch.Tensor:
         block_shape = (
             1,
@@ -728,7 +726,7 @@ class LingBotWorldCausalDMDPipeline(
             dtype=dtype,
         )
         generator = self._request_generator(inputs)
-        generated_blocks = []
+        generated_blocks: list[torch.Tensor] = []
         total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
         with self.progress_bar(total=total_steps) as progress_bar:
             for start_frame in range(0, inputs.num_latent_frames, block_frames):
@@ -761,4 +759,4 @@ class LingBotWorldCausalDMDPipeline(
         return DiffusionOutput(output=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        return set(AutoWeightsLoader(self).load_weights(weights))

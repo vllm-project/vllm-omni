@@ -196,6 +196,30 @@ def test_forward_accepts_exactly_one_configured_frame_block() -> None:
     assert output.shape == (1, 2, 3, 4, 4)
 
 
+def test_transformer_allocates_request_cache_from_its_configured_geometry() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(
+        module,
+        num_layers=2,
+        num_frames_per_block=3,
+        sliding_window_num_frames=6,
+    )
+
+    cache = model.allocate_cache(
+        batch_size=2,
+        latent_height=8,
+        latent_width=12,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert len(cache.self_attention) == 2
+    assert len(cache.cross_attention) == 2
+    assert cache.cross_attention == [None, None]
+    assert all(layer.key.shape == (2, 6 * 4 * 6, 2, 2) for layer in cache.self_attention)
+    assert all(layer.value.shape == (2, 6 * 4 * 6, 2, 2) for layer in cache.self_attention)
+
+
 def test_video_patch_embedding_uses_temporal_height_width_token_order() -> None:
     module = attention_tests._load_module()
     model = _tiny_model(module, num_layers=1, num_frames_per_block=2)
