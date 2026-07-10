@@ -15,17 +15,10 @@ from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.group_coordinator import (
     SequenceParallelGroupCoordinator,
 )
+from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-
-
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1:
-        return hidden_states
-    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
-    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +50,6 @@ class AllGatherKVParallelAttention:
         gather_idx: int = 1,
     ) -> None:
         self._sp_group = sp_group
-        self._ag_group = sp_group.ulysses_group
         self._sp_size = sp_group.ulysses_world_size
         self._sp_rank = sp_group.ulysses_rank
         self.scatter_idx = scatter_idx
@@ -94,6 +86,13 @@ class AllGatherKVParallelAttention:
         v_img_full = self._sp_group.all_gather(value, dim=1)
 
         if joint_k is not None:
+            if joint_k.shape[2] != key.shape[2]:
+                raise ValueError(
+                    "AllGather-KV SP expects joint_k to be GQA-compressed with the "
+                    f"same num_kv_heads as the image shard, got joint_k.heads="
+                    f"{joint_k.shape[2]} vs key.heads={key.shape[2]}. The strategy "
+                    "expands KV locally via repeat_kv, so joint KV must arrive compressed."
+                )
             if joint_strategy == "front":
                 k_full = torch.cat([joint_k, k_img_full], dim=1)
                 v_full = torch.cat([joint_v, v_img_full], dim=1)
@@ -103,8 +102,8 @@ class AllGatherKVParallelAttention:
         else:
             k_full, v_full = k_img_full, v_img_full
 
-        k_full = _repeat_kv(k_full, kv_repeat_num)
-        v_full = _repeat_kv(v_full, kv_repeat_num)
+        k_full = repeat_kv(k_full, kv_repeat_num)
+        v_full = repeat_kv(v_full, kv_repeat_num)
 
         if joint_q is not None:
             if joint_strategy == "front":

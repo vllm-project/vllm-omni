@@ -35,6 +35,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
+    _AllGatherKVCtx,
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
@@ -313,6 +314,102 @@ def test_allgather_kv_gathers_compressed_kv_then_repeats_locally():
     expected_value = torch.cat(value_chunks, dim=1).repeat_interleave(repeat_num, dim=2)
     torch.testing.assert_close(k_full, expected_key)
     torch.testing.assert_close(v_full, expected_value)
+
+
+def test_allgather_kv_post_attention_returns_local_shard_no_joint():
+    """post_attention with joint_len=0 returns the attention output unchanged."""
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(
+            rank=0,
+            gather_chunks=[
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+            ],
+        ),
+    )
+    attn_output = torch.arange(1 * 2 * 3 * 4, dtype=torch.float32).view(1, 2, 3, 4)
+    ctx = _AllGatherKVCtx(
+        name=strategy.name,
+        joint_len=0,
+        joint_strategy="front",
+        img_seq_local=2,
+    )
+
+    out = strategy.post_attention(attn_output, ctx)
+
+    assert out.shape == attn_output.shape
+    torch.testing.assert_close(out, attn_output)
+
+
+def test_allgather_kv_post_attention_returns_local_shard_front_joint():
+    """post_attention with joint_strategy='front' keeps joint at the front.
+
+    The attention output arrives as [joint, img_local]; post_attention splits
+    it back into the same order so downstream layers see the joint prefix
+    preserved.
+    """
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(
+            rank=0,
+            gather_chunks=[
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+            ],
+        ),
+    )
+    joint_len = 1
+    img_seq_local = 2
+    joint_slice = torch.full((1, joint_len, 3, 4), 7.0)
+    img_slice = torch.full((1, img_seq_local, 3, 4), 9.0)
+    attn_output = torch.cat([joint_slice, img_slice], dim=1)
+    ctx = _AllGatherKVCtx(
+        name=strategy.name,
+        joint_len=joint_len,
+        joint_strategy="front",
+        img_seq_local=img_seq_local,
+    )
+
+    out = strategy.post_attention(attn_output, ctx)
+
+    assert out.shape == attn_output.shape
+    torch.testing.assert_close(out, attn_output)
+    torch.testing.assert_close(out[:, :joint_len], joint_slice)
+    torch.testing.assert_close(out[:, joint_len:], img_slice)
+
+
+def test_allgather_kv_post_attention_returns_local_shard_rear_joint():
+    """post_attention with joint_strategy='rear' keeps joint at the back.
+
+    The attention output arrives as [img_local, joint]; post_attention splits
+    it back into the same order so the joint suffix is preserved.
+    """
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(
+            rank=0,
+            gather_chunks=[
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+            ],
+        ),
+    )
+    joint_len = 1
+    img_seq_local = 2
+    joint_slice = torch.full((1, joint_len, 3, 4), 7.0)
+    img_slice = torch.full((1, img_seq_local, 3, 4), 9.0)
+    attn_output = torch.cat([img_slice, joint_slice], dim=1)
+    ctx = _AllGatherKVCtx(
+        name=strategy.name,
+        joint_len=joint_len,
+        joint_strategy="rear",
+        img_seq_local=img_seq_local,
+    )
+
+    out = strategy.post_attention(attn_output, ctx)
+
+    assert out.shape == attn_output.shape
+    torch.testing.assert_close(out, attn_output)
+    torch.testing.assert_close(out[:, :img_seq_local], img_slice)
+    torch.testing.assert_close(out[:, img_seq_local:], joint_slice)
 
 
 @pytest.mark.parametrize(

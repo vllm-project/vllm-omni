@@ -78,6 +78,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
+from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 logger = logging.getLogger(__name__)
@@ -424,22 +425,6 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Equivalent to torch.repeat_interleave(x, dim=2, repeats=n_rep).
-    Input:  (batch, seqlen, num_key_value_heads, head_dim)
-    Output: (batch, seqlen, num_attention_heads, head_dim)
-    """
-    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-
-    if n_rep == 1:
-        return hidden_states
-
-    hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
-
-    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
 
 
 def default(value, default_value):
