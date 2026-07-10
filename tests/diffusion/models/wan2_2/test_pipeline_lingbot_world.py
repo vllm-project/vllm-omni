@@ -498,20 +498,15 @@ def _request(*, sampling=None, prompt=None, num_reqs: int = 1):
 
 
 def _independent_sigma_oracle(timestep: int, *, flow_shift: float, num_train_timesteps: int = 1000) -> float:
-    """Closed-form inverse plus local lattice search, independent of production lookup code."""
+    """Scalar reference over the real FlowUniPC lattice, independent of production tensors."""
 
     target = timestep / num_train_timesteps
-    base = target / (flow_shift - (flow_shift - 1.0) * target)
-    continuous_index = num_train_timesteps * (1.0 - base)
-    candidates = {
-        min(num_train_timesteps - 1, max(0, int(math.floor(continuous_index)) + offset)) for offset in (-1, 0, 1, 2)
-    }
-
-    def shifted(index: int) -> float:
-        sigma = 1.0 - index / num_train_timesteps
-        return flow_shift * sigma / (1.0 + (flow_shift - 1.0) * sigma)
-
-    return min((shifted(index) for index in candidates), key=lambda sigma: abs(sigma - target))
+    shifted_lattice = []
+    for lattice_index in range(num_train_timesteps):
+        base_sigma = (num_train_timesteps - 1 - lattice_index) / num_train_timesteps
+        scaled_sigma = flow_shift * base_sigma
+        shifted_lattice.append(scaled_sigma / ((1.0 - base_sigma) + scaled_sigma))
+    return min(shifted_lattice, key=lambda sigma: abs(sigma - target))
 
 
 def _resolve_pipeline_through_real_registry(pipeline_module):
@@ -908,8 +903,33 @@ def test_dmd_sigma_lookup_matches_independent_oracle(flow_shift: float) -> None:
     assert lookup == pytest.approx(expected, abs=1e-7)
 
 
-@pytest.mark.parametrize("flow_shift", [1e-300, 1e300])
-def test_dmd_sigma_lookup_stays_finite_for_extreme_finite_flow_shifts(flow_shift: float) -> None:
+@pytest.mark.parametrize(
+    ("flow_shift", "expected"),
+    [
+        (5.0, (0.999799839872, 0.75, 0.500599520384, 0.251597444089)),
+        (2.5, (0.999599759856, 0.749656121045, 0.500349895031, 0.250637213254)),
+    ],
+)
+def test_dmd_sigma_lookup_matches_flow_unipc_reference_values(flow_shift: float, expected) -> None:
+    module = _load_pipeline_module()
+
+    lookup = module._build_shifted_flow_sigma_lookup(
+        flow_shift=flow_shift,
+        num_train_timesteps=1000,
+        timesteps=module.LINGBOT_DMD_TIMESTEPS,
+    )
+
+    assert lookup == pytest.approx(expected, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("flow_shift", "expected"),
+    [
+        (1e-300, (9.99e-298, 9.99e-298, 9.99e-298, 9.99e-298)),
+        (1e300, (1.0, 1.0, 1.0, 0.0)),
+    ],
+)
+def test_dmd_sigma_lookup_stays_finite_for_extreme_finite_flow_shifts(flow_shift: float, expected) -> None:
     module = _load_pipeline_module()
 
     lookup = module._build_shifted_flow_sigma_lookup(
@@ -919,7 +939,7 @@ def test_dmd_sigma_lookup_stays_finite_for_extreme_finite_flow_shifts(flow_shift
     )
 
     assert all(math.isfinite(sigma) and 0.0 <= sigma <= 1.0 for sigma in lookup)
-    assert lookup[0] == 1.0
+    assert lookup == pytest.approx(expected, rel=1e-12, abs=0.0)
 
 
 def test_request_flow_shift_override_has_precedence_without_mutating_scheduler() -> None:
@@ -938,6 +958,19 @@ def test_request_flow_shift_override_has_precedence_without_mutating_scheduler()
 
 @pytest.mark.parametrize("flow_shift", [0, -1, float("nan"), float("inf"), "invalid"])
 def test_request_flow_shift_must_be_positive_and_finite(flow_shift) -> None:
+    module = _load_pipeline_module()
+    sampling = _SamplingParams(extra_args={"flow_shift": flow_shift})
+
+    with pytest.raises(ValueError, match="flow_shift.*positive.*finite"):
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="prompt-actions"), sampling))
+
+
+@pytest.mark.parametrize(
+    "flow_shift",
+    [True, False, 10**10000],
+    ids=["true", "false", "overflowing-integer"],
+)
+def test_request_flow_shift_rejects_booleans_and_normalizes_integer_overflow(flow_shift) -> None:
     module = _load_pipeline_module()
     sampling = _SamplingParams(extra_args={"flow_shift": flow_shift})
 
