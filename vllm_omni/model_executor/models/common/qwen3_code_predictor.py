@@ -31,6 +31,9 @@ logger = init_logger(__name__)
 _GeneratorLike = torch.Generator | Sequence[torch.Generator | None] | None
 _UNIFORM_EPS = 1e-20
 
+if current_omni_platform.is_npu():
+    import torch_npu
+
 
 # ===================================================================
 # Portable layers for code predictor
@@ -57,8 +60,6 @@ class _RMSNorm(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.device.type == "npu":
-            import torch_npu
-
             hidden_states, _ = torch_npu.npu_rms_norm(
                 hidden_states,
                 self.weight,
@@ -186,8 +187,6 @@ class CodePredictorAttention(nn.Module):
         bsz: int,
         seq_len: int,
     ) -> torch.Tensor:
-        import torch_npu
-
         q_f, k_f, v_f = q, k, v
         if self.is_gqa:
             k_f = (
@@ -249,8 +248,6 @@ class CodePredictorAttention(nn.Module):
         cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
         sin = sin.unsqueeze(1)
         if hidden_states.device.type == "npu":
-            import torch_npu
-
             q = torch_npu.npu_rotary_mul(q, cos, sin)
             k = torch_npu.npu_rotary_mul(k, cos, sin)
         else:
@@ -315,8 +312,6 @@ class CodePredictorDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings)
         if hidden_states.device.type == "npu":
-            import torch_npu
-
             hidden_states, _, residual = torch_npu.npu_add_rms_norm(
                 hidden_states,
                 residual,
