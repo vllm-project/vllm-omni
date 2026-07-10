@@ -130,6 +130,15 @@ def _validate_cache_storage(
     capacity = cache.key.shape[1]
     if capacity <= 0:
         raise ValueError(f"{cache_name} cache capacity must be positive.")
+    if cache.key.untyped_storage().data_ptr() == cache.value.untyped_storage().data_ptr():
+        raise ValueError(f"{cache_name} cache key and value must not share backing storage.")
+    if (
+        cache.key.requires_grad
+        or cache.value.requires_grad
+        or cache.key.grad_fn is not None
+        or cache.value.grad_fn is not None
+    ):
+        raise ValueError(f"{cache_name} cache key and value must be detached from autograd.")
     return capacity
 
 
@@ -138,6 +147,13 @@ def _validate_metadata_integer(name: str, value: int | None, *, allow_none: bool
         return
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"Cache metadata {name} must be an integer{' or None' if allow_none else ''}.")
+
+
+def _validate_current_start(current_start: int) -> None:
+    if not isinstance(current_start, int) or isinstance(current_start, bool):
+        raise ValueError("current_start must be a non-boolean integer.")
+    if current_start < 0:
+        raise ValueError(f"current_start must be non-negative, got {current_start}.")
 
 
 def _select_rotary_chunk(
@@ -284,8 +300,7 @@ class LingBotSelfAttention(nn.Module):
         value: torch.Tensor,
         current_start: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if current_start < 0:
-            raise ValueError(f"current_start must be non-negative, got {current_start}.")
+        _validate_current_start(current_start)
         if key.shape[1] == 0:
             raise ValueError("The current attention chunk must contain at least one token.")
 
@@ -374,8 +389,7 @@ class LingBotSelfAttention(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.ndim != 3:
             raise ValueError("Self-attention hidden_states must be rank 3 [batch, tokens, dim].")
-        if current_start < 0:
-            raise ValueError(f"current_start must be non-negative, got {current_start}.")
+        _validate_current_start(current_start)
         self._validate_cache(cache, hidden_states)
 
         query = self.norm_q(self.q(hidden_states))

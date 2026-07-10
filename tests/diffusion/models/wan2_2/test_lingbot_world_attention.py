@@ -199,16 +199,16 @@ def _record_outputs(module: nn.Module) -> list[torch.Tensor]:
 
 def _cache_snapshot(cache) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int, int | None, int]]:
     return (
-        cache.key.view(torch.uint8).clone(),
-        cache.value.view(torch.uint8).clone(),
+        cache.key.detach().view(torch.uint8).clone(),
+        cache.value.detach().view(torch.uint8).clone(),
         (cache.end, cache.absolute_end, cache.last_start, cache.sink_end),
     )
 
 
 def _assert_cache_unchanged(cache, snapshot) -> None:
     key, value, metadata = snapshot
-    assert torch.equal(cache.key.view(torch.uint8), key)
-    assert torch.equal(cache.value.view(torch.uint8), value)
+    assert torch.equal(cache.key.detach().view(torch.uint8), key)
+    assert torch.equal(cache.value.detach().view(torch.uint8), value)
     assert (cache.end, cache.absolute_end, cache.last_start, cache.sink_end) == metadata
 
 
@@ -689,3 +689,70 @@ def test_tp_rmsnorm_weight_loader_selects_rank_shard(monkeypatch: pytest.MonkeyP
     norm.weight.weight_loader(norm.weight, torch.tensor([10.0, 20.0, 30.0, 40.0]))
 
     torch.testing.assert_close(norm.weight, torch.tensor([30.0, 40.0]))
+
+
+@pytest.mark.parametrize("current_start", [True, 1.5], ids=("boolean", "positive_float"))
+def test_non_integer_current_start_is_rejected_before_projection_and_preserves_cache(current_start) -> None:
+    module = _load_module()
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
+    cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
+    snapshot = _cache_snapshot(cache)
+    projection_calls = _record_inputs(attention.q)
+    attention_calls = _record_inputs(attention.attn)
+
+    with pytest.raises(ValueError, match="non-boolean integer"):
+        attention(_tokens(1), cache=cache, current_start=current_start)
+
+    assert projection_calls == []
+    assert attention_calls == []
+    _assert_cache_unchanged(cache, snapshot)
+
+
+def _make_invalid_storage_cache(module, *, attention_kind: str, case: str):
+    if attention_kind == "self":
+        cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
+    else:
+        cache = _make_cross_cache(module)
+
+    shape = cache.key.shape
+    if case == "aliased_backing_storage":
+        backing = torch.randn(shape[0], shape[1] * 2, shape[2], shape[3])
+        cache.key = backing[:, : shape[1]]
+        cache.value = backing[:, shape[1] :]
+    elif case == "requires_grad":
+        cache.key = torch.randn(shape, requires_grad=True)
+        cache.value = torch.randn(shape)
+    elif case == "grad_fn":
+        base = torch.randn(shape, requires_grad=True)
+        cache.key = torch.randn(shape)
+        cache.value = base * 2
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(case)
+    return cache
+
+
+@pytest.mark.parametrize("attention_kind", ["self", "cross"])
+@pytest.mark.parametrize("case", ["aliased_backing_storage", "requires_grad", "grad_fn"])
+def test_unsafe_caller_cache_storage_is_rejected_before_projection_and_preserved(
+    attention_kind: str,
+    case: str,
+) -> None:
+    module = _load_module()
+    if attention_kind == "self":
+        attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
+    else:
+        attention = module.LingBotCrossAttention(dim=2, num_heads=1)
+    cache = _make_invalid_storage_cache(module, attention_kind=attention_kind, case=case)
+    snapshot = _cache_snapshot(cache)
+    projection_calls = _record_inputs(attention.q)
+    attention_calls = _record_inputs(attention.attn)
+
+    with pytest.raises(ValueError, match="storage|autograd"):
+        if attention_kind == "self":
+            attention(_tokens(1), cache=cache, current_start=0)
+        else:
+            attention(_tokens(1), None, cache=cache)
+
+    assert projection_calls == []
+    assert attention_calls == []
+    _assert_cache_unchanged(cache, snapshot)
