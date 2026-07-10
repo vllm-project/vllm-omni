@@ -3431,7 +3431,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         prompt_tokens=len(prompt.split()),
                         completion_tokens=len(text_body.split()),
                         total_tokens=len(prompt.split()) + len(text_body.split()),
-                    ),
+                    ).model_dump(mode="json"),
                     metrics=self._get_diffusion_extra_output_params(result.custom_output),
                 )
                 logger.info(
