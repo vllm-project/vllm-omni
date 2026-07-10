@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -50,7 +51,21 @@ if current_omni_platform.is_npu():
 # See: https://github.com/vllm-project/vllm-omni/issues/2274
 
 
-class _RMSNorm(nn.Module):
+class _NativeFallbackCustomOp(CustomOp):
+    def forward_cuda(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_hip(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_xpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_musa(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+
+class _RMSNorm(_NativeFallbackCustomOp):
     """RMSNorm with HuggingFace-compatible CPU/CUDA math and an NPU fast path."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
@@ -58,15 +73,15 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.device.type == "npu":
-            hidden_states, _ = torch_npu.npu_rms_norm(
-                hidden_states,
-                self.weight,
-                self.variance_epsilon,
-            )
-            return hidden_states
+    def forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, _ = torch_npu.npu_rms_norm(
+            hidden_states,
+            self.weight,
+            self.variance_epsilon,
+        )
+        return hidden_states
 
+    def forward_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -81,7 +96,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-class _RotaryEmbedding(nn.Module):
+class _RotaryEmbedding(_NativeFallbackCustomOp):
     """RoPE with HuggingFace-compatible CPU/CUDA math and cached NPU tables."""
 
     def __init__(self, config) -> None:
@@ -95,20 +110,16 @@ class _RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
-        if current_omni_platform.is_npu() and max_seq > 1:
-            positions = torch.arange(max_seq, dtype=torch.float32)
-            freqs = torch.outer(positions, inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            self.register_buffer("cos_cached", emb.cos(), persistent=False)
-            self.register_buffer("sin_cached", emb.sin(), persistent=False)
-        else:
-            self.cos_cached = None
-            self.sin_cached = None
+        positions = torch.arange(max_seq, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if x.device.type == "npu" and self.cos_cached is not None and self.sin_cached is not None:
-            return self.cos_cached[position_ids].to(dtype=x.dtype), self.sin_cached[position_ids].to(dtype=x.dtype)
+    def forward_npu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cos_cached[position_ids].to(dtype=x.dtype), self.sin_cached[position_ids].to(dtype=x.dtype)
 
+    def forward_native(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # position_ids: [batch, seq_len]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -129,7 +140,7 @@ class _RotaryEmbedding(nn.Module):
 # ===================================================================
 
 
-class CodePredictorAttention(nn.Module):
+class CodePredictorAttention(_NativeFallbackCustomOp):
     """Multi-head self-attention for code predictor.
 
     Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
@@ -164,20 +175,35 @@ class CodePredictorAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.register_buffer("_fusion_causal_mask", torch.empty(0, dtype=torch.bool), persistent=False)
 
-        if current_omni_platform.is_npu():
-            if self.max_seq > 2048:
-                raise ValueError(
-                    "Qwen3-TTS code predictor NPU fusion attention uses a fixed 2048x2048 "
-                    f"causal mask, but max_seq={self.max_seq} exceeds the mask size."
-                )
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        bsz, seq_len, _ = hidden_states.shape
+        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
+        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
+        return q, k, v, bsz, seq_len
+
+    def _ensure_npu_fusion_mask(self) -> torch.Tensor:
+        if self.max_seq > 2048:
+            raise ValueError(
+                "Qwen3-TTS code predictor NPU fusion attention uses a fixed 2048x2048 "
+                f"causal mask, but max_seq={self.max_seq} exceeds the mask size."
+            )
+        if self._fusion_causal_mask.numel() == 0:
             # Ascend SDPA is_causal migration example uses a fixed 2048x2048
             # compressed causal mask with sparse_mode=2.
-            fusion_mask = torch.triu(
-                torch.ones(2048, 2048, dtype=torch.bool),
+            self._fusion_causal_mask = torch.triu(
+                torch.ones(2048, 2048, dtype=torch.bool, device=self._fusion_causal_mask.device),
                 diagonal=1,
             )
-            self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
+        return self._fusion_causal_mask
 
     def _forward_npu_attention(
         self,
@@ -200,7 +226,7 @@ class CodePredictorAttention(nn.Module):
                 .reshape(bsz, self.num_heads, seq_len, self.head_dim)
             )
 
-        mask = self._fusion_causal_mask
+        mask = self._ensure_npu_fusion_mask()
         mask = mask.contiguous()
         q_f = q_f.contiguous()
         k_f = k_f.contiguous()
@@ -230,41 +256,46 @@ class CodePredictorAttention(nn.Module):
             sync=True,
         )[0]
 
-    def forward(
+    def forward_native(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        bsz, seq_len, _ = hidden_states.shape
-        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
-        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
-
-        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
+        q, k, v, bsz, seq_len = self._project_qkv(hidden_states)
 
         cos, sin = position_embeddings
         # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
         cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
         sin = sin.unsqueeze(1)
-        if hidden_states.device.type == "npu":
-            q = torch_npu.npu_rotary_mul(q, cos, sin)
-            k = torch_npu.npu_rotary_mul(k, cos, sin)
-        else:
-            q = (q * cos) + (_rotate_half(q) * sin)
-            k = (k * cos) + (_rotate_half(k) * sin)
+        q = (q * cos) + (_rotate_half(q) * sin)
+        k = (k * cos) + (_rotate_half(k) * sin)
 
-        if not current_omni_platform.is_npu():
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                scale=self.scaling,
-                is_causal=True,
-                enable_gqa=self.is_gqa,
-            )
-        else:
-            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=self.scaling,
+            is_causal=True,
+            enable_gqa=self.is_gqa,
+        )
+
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        return self.o_proj(attn_out)
+
+    def forward_npu(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        q, k, v, bsz, seq_len = self._project_qkv(hidden_states)
+
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q = torch_npu.npu_rotary_mul(q, cos, sin)
+        k = torch_npu.npu_rotary_mul(k, cos, sin)
+
+        attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -293,7 +324,7 @@ class CodePredictorMLP(nn.Module):
 # ===================================================================
 
 
-class CodePredictorDecoderLayer(nn.Module):
+class CodePredictorDecoderLayer(_NativeFallbackCustomOp):
     """Transformer decoder layer (SDPA, no KV cache)."""
 
     def __init__(self, config, *, prefix: str = "") -> None:
@@ -303,7 +334,7 @@ class CodePredictorDecoderLayer(nn.Module):
         self.input_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
+    def forward_native(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -311,17 +342,27 @@ class CodePredictorDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings)
-        if hidden_states.device.type == "npu":
-            hidden_states, _, residual = torch_npu.npu_add_rms_norm(
-                hidden_states,
-                residual,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
-        else:
-            hidden_states = residual + hidden_states
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+    def forward_npu(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        hidden_states, _, residual = torch_npu.npu_add_rms_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
