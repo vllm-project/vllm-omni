@@ -99,30 +99,46 @@ def _audio_b64(audio_file: str | None) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _chat(base_url: str, model: str, messages: list[dict], max_tokens: int) -> str:
+def _chat(
+    base_url: str,
+    model: str,
+    messages: list[dict],
+    max_tokens: int,
+    enable_thinking: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    seed: int = 0,
+) -> tuple[str, str]:
     resp = requests.post(
         f"{base_url}/v1/chat/completions",
         json={
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.0,
+            "temperature": temperature,
+            "top_p": top_p,
+            "seed": seed,
             # Text-final passes must say so explicitly: without "modalities"
             # the server falls back to the deployment's configured output
             # modalities, which for the s2s pipeline include the audio final
             # stage — routing ASR/chat through code2wav instead of stopping
             # at stage 0.
             "modalities": ["text"],
-            # The checkpoint's chat template supports the thinking toggle;
-            # disable it so answers are direct (the offline examples do the
-            # same by priming a closed <think></think>). _strip_think below
-            # remains as a safety net for templates without the kwarg.
-            "chat_template_kwargs": {"enable_thinking": False},
+            # The checkpoint's chat template thinking toggle. The official
+            # cascaded demo transcribes with enable_thinking=False but runs
+            # the chat pass with reasoning ENABLED (its web UI ships the
+            # "Enable reasoning" checkbox checked), priming the generation
+            # prompt with an open "<think>\n" so the model's reasoning stays
+            # inside the think block; _extract_final_response then drops it.
+            # With thinking disabled the 30B leaks its reasoning as plain
+            # text in front of the final response.
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
         },
         timeout=300,
     )
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    choice = resp.json()["choices"][0]
+    return choice["message"]["content"].strip(), choice.get("finish_reason") or ""
 
 
 def _speech(base_url: str, model: str, text: str, cfg_scale: float, out_path: Path) -> None:
@@ -148,21 +164,40 @@ def _audio_question(audio_b64: str, question: str) -> list[dict]:
 
 
 def _tts_text(answer: str) -> str:
-    # The chat answer may carry markdown markup that makes the TTS thinker
-    # stop almost immediately; speak a cleaned, length-capped version (the
-    # offline example caps the same way).
-    text = re.sub(r"[*#_`]+", "", answer)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:200]
+    # The formatting instruction's CRITICAL rule puts each final-response
+    # sentence on its own line, and the official demo TTS-es those sentence
+    # segments (split_sentence_segments). Mirror that per-line segmentation
+    # but keep a single /v1/audio/speech request: speak the leading whole
+    # sentences of the CLEANED final response up to ~200 chars, never
+    # cutting mid-sentence. Markdown markup is stripped as before (it makes
+    # the TTS thinker stop almost immediately).
+    sentences = []
+    for line in answer.splitlines():
+        line = re.sub(r"[*#_`]+", "", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            sentences.append(line)
+    picked: list[str] = []
+    total = 0
+    for sentence in sentences:
+        if picked and total + len(sentence) > 200:
+            break
+        picked.append(sentence)
+        total += len(sentence) + 1
+    return " ".join(picked)
 
 
-def _strip_think(text: str) -> str:
-    # The chat template lets the model reason before answering; keep only
-    # the part after the closing think tag so the TTS pass speaks the
-    # actual answer, not the chain of thought.
+def _extract_final_response(text: str) -> str:
+    # Mirror the official demo's extract_spoken_answer
+    # (cascaded_s2s_web_server.py): the chat pass reasons inside the primed
+    # <think> block, so keep only what follows the LAST closing tag; fall
+    # back to the full text when the model skipped reasoning or never
+    # closed the block. Benign no-op for the 2B's clean answers.
     if "</think>" in text:
-        return text.split("</think>", 1)[1].strip()
-    return text
+        answer = text.rsplit("</think>", 1)[-1].strip()
+        if answer:
+            return answer
+    return text.strip()
 
 
 def _clean_transcript(text: str) -> str:
@@ -195,25 +230,47 @@ def main():
     audio_b64 = _audio_b64(args.audio_file)
 
     if args.mode == "thinker_only":
-        answer = _strip_think(_chat(base_url, args.model, _audio_question(audio_b64, args.question), args.max_tokens))
-        print(f"answer: {answer}")
+        content, _ = _chat(base_url, args.model, _audio_question(audio_b64, args.question), args.max_tokens)
+        print(f"answer: {_extract_final_response(content)}")
         return
 
     # s2s — the official three-pass cascade.
-    transcript = _clean_transcript(
-        _chat(base_url, args.model, _audio_question(audio_b64, ASR_QUESTION), args.max_tokens)
-    )
+    asr_content, _ = _chat(base_url, args.model, _audio_question(audio_b64, ASR_QUESTION), args.max_tokens)
+    transcript = _clean_transcript(asr_content)
     print(f"[1/3] transcript : {transcript}")
     if not transcript:
         raise SystemExit("ASR pass produced an empty transcript; aborting cascade")
 
     # Official chat-pass recipe: system prompt + formatting instruction
-    # prefixed to the transcript (see TEXT_INSTRUCTION above).
+    # prefixed to the transcript (see TEXT_INSTRUCTION above), reasoning
+    # enabled, and the official demo's text-pass sampling (its defaults:
+    # --text-temperature 1.0, --text-top-p 0.95, --text-max-tokens 2048).
+    # Near-greedy decoding makes the 30B loop inside its reasoning block
+    # until the token budget runs out without ever closing </think>. Even at
+    # the official temperature some trajectories spin past the budget, so
+    # retry a few deterministic seeds; a natural stop without </think> is a
+    # complete answer (the 2B never reasons), and if every seed spins we
+    # keep the full text like the official demo does.
     chat_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"{TEXT_INSTRUCTION}\n\n{transcript}"},
     ]
-    answer = _strip_think(_chat(base_url, args.model, chat_messages, args.max_tokens))
+    raw = ""
+    for seed in (0, 1, 2):
+        raw, finish_reason = _chat(
+            base_url,
+            args.model,
+            chat_messages,
+            max(args.max_tokens, 2048),
+            enable_thinking=True,
+            temperature=1.0,
+            top_p=0.95,
+            seed=seed,
+        )
+        if "</think>" in raw or finish_reason != "length":
+            break
+        print(f"[2/3] chat seed {seed} hit the token budget mid-reasoning; retrying")
+    answer = _extract_final_response(raw)
     print(f"[2/3] answer     : {answer}")
     if not answer:
         raise SystemExit("Chat pass produced an empty answer; aborting cascade")

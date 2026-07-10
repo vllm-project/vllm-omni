@@ -85,18 +85,36 @@ def parse_args():
 
 def _chat_prompt(user_text: str) -> str:
     # Official chat-pass recipe: system prompt + formatting instruction
-    # prefixed to the user text, thinking disabled via a closed <think>
-    # block (chat_template.jinja renders the same generation prompt for
-    # enable_thinking=False).
+    # prefixed to the user text, thinking ENABLED via an open <think> block
+    # (the official demo's web UI ships "Enable reasoning" checked, i.e.
+    # build_chat_prompt(..., enable_thinking=True); chat_template.jinja then
+    # renders "<|im_start|>assistant\n<think>\n"). The instruction invites
+    # the model to reason before answering — priming the block open keeps
+    # that reasoning inside <think>...</think> so _extract_final_response
+    # below can drop it; with a closed block the 30B leaks the reasoning as
+    # plain text in front of the answer.
     return (
         f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
         f"<|im_start|>user\n{TEXT_INSTRUCTION}\n\n{user_text}<|im_end|>\n"
-        "<|im_start|>assistant\n<think></think>"
+        "<|im_start|>assistant\n<think>\n"
     )
 
 
 def _asr_prompt() -> str:
     return f"<|im_start|>user\n<so_embedding>\n{ASR_QUESTION}<|im_end|>\n<|im_start|>assistant\n<think></think>"
+
+
+def _extract_final_response(text: str) -> str:
+    # Mirror the official demo's extract_spoken_answer
+    # (cascaded_s2s_web_server.py): keep only what follows the LAST closing
+    # think tag, falling back to the full text when the model skipped
+    # reasoning or never closed the block. Benign no-op for the 2B, whose
+    # answers carry no think block.
+    if "</think>" in text:
+        answer = text.rsplit("</think>", 1)[-1].strip()
+        if answer:
+            return answer
+    return text.strip()
 
 
 def _clean(text: str) -> str:
@@ -113,6 +131,38 @@ def _clean(text: str) -> str:
 def _text_of(outputs) -> str:
     (req_output,) = outputs
     return (req_output.outputs[0].text or "").strip()
+
+
+CHAT_MAX_TOKENS = 2048  # official --text-max-tokens default
+# The official demo samples this pass unseeded; some trajectories deliberate
+# past the token budget without ever closing the think block, so retry a few
+# deterministic seeds until one closes (see the chat pass below).
+CHAT_SEEDS = (0, 1, 2)
+
+
+def _chat_params(engine: Omni, seed: int):
+    # Official demo text-pass sampling (cascaded_s2s_web_server.py defaults:
+    # --text-temperature 1.0, --text-top-p 0.95, --text-max-tokens 2048).
+    # The yaml stage-0 defaults (temperature 0.1, top_k 80) are TTS-thinker
+    # settings; under near-greedy decoding the 30B loops inside its
+    # reasoning block until the token budget runs out and never emits
+    # </think>, so the extracted "answer" would be truncated reasoning.
+    params = copy.deepcopy(engine.resolve_sampling_params_list(None))
+    stage0 = params[0]
+    stage0.temperature = 1.0
+    stage0.top_p = 0.95
+    stage0.top_k = -1
+    stage0.max_tokens = CHAT_MAX_TOKENS
+    stage0.seed = seed
+    return params
+
+
+def _chat_once(engine: Omni, prompt: str, seed: int) -> tuple[str, bool]:
+    (req_output,) = engine.generate([{"prompt": prompt, "modalities": ["text"]}], _chat_params(engine, seed))
+    out = req_output.outputs[0]
+    text = (out.text or "").strip()
+    truncated = getattr(out, "finish_reason", None) == "length" or len(out.token_ids or []) >= CHAT_MAX_TOKENS
+    return text, truncated
 
 
 def _tts_params(engine: Omni, cfg_scale: float, cond_prompt: str, tokenizer):
@@ -170,8 +220,19 @@ def main():
     if not transcript:
         raise SystemExit("ASR pass produced an empty transcript; aborting cascade")
 
-    # Pass 2 — chat answer (text-final).
-    answer = _text_of(engine.generate([{"prompt": _chat_prompt(transcript), "modalities": ["text"]}]))
+    # Pass 2 — chat answer (text-final). The raw completion is
+    # <reasoning...></think><answer>; speak only the final response. Retry
+    # with the next seed only when the budget ran out before the reasoning
+    # block closed (a natural stop without </think> is a complete answer);
+    # if every seed spins, fall back to the official demo's behavior of
+    # keeping the full text.
+    raw = ""
+    for seed in CHAT_SEEDS:
+        raw, truncated = _chat_once(engine, _chat_prompt(transcript), seed)
+        if "</think>" in raw or not truncated:
+            break
+        print(f"[2/3] chat seed {seed} hit the token budget mid-reasoning; retrying")
+    answer = _extract_final_response(raw)
     print(f"[2/3] answer     : {answer}")
     if not answer:
         raise SystemExit("Chat pass produced an empty answer; aborting cascade")
