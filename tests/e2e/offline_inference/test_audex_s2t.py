@@ -25,7 +25,14 @@ from tests.helpers.stage_config import get_deploy_config_path
 MODEL = "nvidia/Nemotron-Labs-Audex-2B"
 MODEL_DIR_ENV = "VLLM_OMNI_AUDEX_MODEL_DIR"
 
-_REFERENCE = "mary had a little lamb its fleece was white as snow"
+# Full transcript of the mary_had_lamb asset (Edison's phonograph recording);
+# a shortened reference would count the extra spoken words as insertions and
+# inflate WER past the trend threshold.
+_REFERENCE = (
+    "the first words i spoke in the original phonograph a little piece of practical poetry "
+    "mary had a little lamb its fleece was white as snow and everywhere that mary went the "
+    "lamb was sure to go"
+)
 
 ASR_PROMPT = (
     "<|im_start|>user\n<so_embedding>\nTranscribe the input speech.<|im_end|>\n<|im_start|>assistant\n<think></think>"
