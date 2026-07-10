@@ -60,7 +60,6 @@ curl -X POST http://localhost:8000/v1/videos \
   -F "fps=24" \
   -F "size=768x512" \
   -F "num_inference_steps=30" \
-  -F "guidance_scale=4.0" \
   -F "seed=42"
 
 # Generate a 10-second video (241 frames)
@@ -70,8 +69,7 @@ curl -X POST http://localhost:8000/v1/videos \
   -F "num_frames=241" \
   -F "fps=24" \
   -F "size=768x512" \
-  -F "num_inference_steps=30" \
-  -F "guidance_scale=4.0"
+  -F "num_inference_steps=30"
 
 # Generate a 20-second video (481 frames)
 curl -X POST http://localhost:8000/v1/videos \
@@ -80,8 +78,7 @@ curl -X POST http://localhost:8000/v1/videos \
   -F "num_frames=481" \
   -F "fps=24" \
   -F "size=768x512" \
-  -F "num_inference_steps=30" \
-  -F "guidance_scale=4.0"
+  -F "num_inference_steps=30"
 ```
 
 ### I2V Verification
@@ -101,9 +98,43 @@ curl -X POST http://localhost:8000/v1/videos/sync \
   -F "fps=24" \
   -F "size=768x512" \
   -F "num_inference_steps=30" \
-  -F "guidance_scale=4.0" \
   -F "seed=42" \
   -o ltx23_i2v.mp4
+```
+
+### Guidance Controls
+
+`LTX23Pipeline` defaults to the official one-stage non-HQ guidance recipe:
+video CFG `3.0`, audio CFG `7.0`, STG `1.0`, modality guidance `3.0`,
+rescale `0.7`, and STG block `[28]`.
+
+Use `extra_params` for LTX-2.3-specific controls:
+
+| Control | Official default | Disable / neutral value |
+|---|---:|---:|
+| `video_cfg_scale` / `audio_cfg_scale` | `3.0` / `7.0` | `1.0` |
+| `video_stg_scale` / `audio_stg_scale` | `1.0` | `0.0` |
+| `video_modality_scale` / `audio_modality_scale` | `3.0` | `1.0` |
+| `video_rescale_scale` / `audio_rescale_scale` | `0.7` | `0.0` |
+| `video_stg_blocks` / `audio_stg_blocks` | `[28]` | `[]` |
+
+`guidance_scale` is only the generic CFG fallback. It does not disable STG,
+modality guidance, or rescale, and specific `extra_params` values take
+precedence. Partial overrides keep the remaining official defaults.
+
+To run CFG-only, or to use CFG parallelism, set matching video/audio CFG scales
+and disable the other guidance branches:
+
+```bash
+curl -X POST http://localhost:8000/v1/videos \
+  -F "prompt=A serene lakeside sunrise with mist over the water." \
+  -F "model=dg845/LTX-2.3-Diffusers" \
+  -F "num_frames=25" \
+  -F "fps=24" \
+  -F "size=512x384" \
+  -F "num_inference_steps=20" \
+  -F "guidance_scale=4.0" \
+  -F 'extra_params={"audio_cfg_scale": 4.0, "video_stg_scale": 0.0, "audio_stg_scale": 0.0, "video_modality_scale": 1.0, "audio_modality_scale": 1.0, "video_rescale_scale": 0.0, "audio_rescale_scale": 0.0, "video_stg_blocks": [], "audio_stg_blocks": []}'
 ```
 
 ### Notes
@@ -147,8 +178,9 @@ curl -X POST http://localhost:8000/v1/videos/sync \
 Do not copy latency or VRAM numbers between commits or machines. Record them
 only after running a latest-head sweep on the target hardware.
 
-For formal PR benchmarking, reuse
-`tests/dfx/perf/tests/test_ltx2_3_vllm_omni.json` with
-`tests/dfx/perf/scripts/run_diffusion_benchmark.py`. That config captures the
-single-device eager baseline and CFG-parallel=2 case for a small 384x512,
-25-frame, 20-step workload.
+For formal PR benchmarking, add or update a checked-in DFX perf config in
+`tests/dfx/perf/tests/`, then run it with
+`tests/dfx/perf/scripts/run_diffusion_benchmark.py`. At minimum, include a
+single-device eager baseline for a small 384x512, 25-frame, 20-step workload.
+If the PR changes parallel execution, include the corresponding CFG/TP/USP case
+in the same config so the result is comparable on the target hardware.

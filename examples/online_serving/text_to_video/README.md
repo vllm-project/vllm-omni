@@ -325,6 +325,10 @@ curl -sS -X POST http://localhost:8098/v1/videos \
   -F "seed=42"
 ```
 
+For LTX-2.3, start the server with `--model-class-name LTX23Pipeline`.
+Model-specific guidance controls are sent through the generic `extra_params`
+JSON form field; see the [LTX-2.3 recipe](../../../recipes/LTX/LTX-2.3.md) for defaults and CFG-only examples.
+
 ## Helios
 
 Helios ships three variants (`Helios-Base`, `Helios-Mid`, `Helios-Distilled`) that

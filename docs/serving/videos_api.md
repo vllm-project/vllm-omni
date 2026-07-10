@@ -167,6 +167,10 @@ transfer options such as `control_path`, `control_guidance`,
 `num_conditional_frames`, `show_control_condition`, and `show_input`; see the
 Cosmos3 recipe for complete examples.
 
+Some models also use `extra_params` for model-specific generation controls.
+For LTX-2.3 guidance controls and defaults, see the
+[LTX-2.3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.3.md).
+
 ### Speech-to-Video
 
 For models that support audio-driven generation (e.g., Wan2.2-S2V), pass both

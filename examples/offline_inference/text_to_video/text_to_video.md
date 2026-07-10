@@ -8,7 +8,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | 480x832 | 81 | 30 | 5.0 | ~20 GiB (RTX 5090, VAE tiling) |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
-| `dg845/LTX-2.3-Diffusers` | 384x512 | 25 | 20 | 4.0 | 96GB-class GPU |
+| `dg845/LTX-2.3-Diffusers` | 512x768 | 121 | 30 | official recipe | 96GB-class GPU |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
@@ -73,6 +73,23 @@ python text_to_video.py \
 
 ### LTX-2.3
 
+Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers` and pass
+`--model-class-name LTX23Pipeline`. The pipeline follows the official
+one-stage defaults; see the [LTX-2.3 recipe](../../../recipes/LTX/LTX-2.3.md) for model-specific guidance controls.
+
+```bash
+python text_to_video.py \
+  --model dg845/LTX-2.3-Diffusers \
+  --model-class-name LTX23Pipeline \
+  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
+  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
+  --audio-sample-rate 48000 \
+  --output ltx23_t2v_output.mp4
+```
+
+For a short smoke test, override only the shape and step count. Guidance still
+uses the official LTX-2.3 defaults unless overridden:
+
 ```bash
 python text_to_video.py \
   --model dg845/LTX-2.3-Diffusers \
@@ -82,18 +99,11 @@ python text_to_video.py \
   --height 384 \
   --width 512 \
   --num-frames 25 \
-  --num-inference-steps 20 \
-  --guidance-scale 4.0 \
-  --frame-rate 24 \
+  --num-inference-steps 3 \
   --fps 24 \
   --audio-sample-rate 48000 \
-  --output ltx23_t2v_output.mp4
+  --output ltx23_smoke.mp4
 ```
-
-Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers`; the
-upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
-this pipeline. Pass `--model-class-name LTX23Pipeline` to select the LTX-2.3
-text-to-video pipeline explicitly.
 
 ### HunyuanVideo-1.5 (480p)
 
