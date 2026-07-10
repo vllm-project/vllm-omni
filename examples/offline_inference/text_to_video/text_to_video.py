@@ -65,6 +65,14 @@ _MODEL_PRESETS = {
         "fps": 16,
         "output": "helios_output.mp4",
     },
+    "ltx23": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 121,
+        "num_inference_steps": 30,
+        "fps": 24,
+        "output": "ltx23_t2v_output.mp4",
+    },
 }
 
 
@@ -78,6 +86,8 @@ def _detect_preset(model: str) -> dict:
         return _MODEL_PRESETS["hunyuan"]
     if "helios" in model_lower:
         return _MODEL_PRESETS["helios"]
+    if "ltx-2.3" in model_lower or "ltx2.3" in model_lower or "ltx23" in model_lower:
+        return _MODEL_PRESETS["ltx23"]
     return _MODEL_PRESETS["wan"]
 
 
@@ -425,6 +435,8 @@ def main():
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_frames=args.num_frames,
+        fps=args.fps,
+        frame_rate=args.frame_rate if args.frame_rate is not None else args.fps,
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high

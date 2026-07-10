@@ -19,12 +19,13 @@ from .ltx2_3_pipeline_base import (
     _should_decode_video_on_rank,
     get_ltx2_post_process_func,
 )
+from .ltx2_3_recipes import LTX23_ONE_STAGE_RECIPE
 
 
 class LTX23Pipeline(LTX23PipelineBase):
     """One-stage LTX-2.3 text-to-video pipeline."""
 
-    pass
+    _ltx23_recipe = LTX23_ONE_STAGE_RECIPE
 
 
 __all__ = [

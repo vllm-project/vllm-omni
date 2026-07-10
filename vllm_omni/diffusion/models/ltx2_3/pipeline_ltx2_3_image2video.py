@@ -16,7 +16,6 @@ from diffusers.video_processor import VideoProcessor
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from .ltx2_3_recipes import LTX23_DEFAULT_RECIPE
 from .pipeline_ltx2_3 import (
     LTX23Pipeline,
     _LTX23DenoiseContext,
@@ -445,6 +444,7 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         noise_pred_video: torch.Tensor,
         noise_pred_audio: torch.Tensor,
         t: torch.Tensor,
+        _step_index: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         latents, audio_latents = self.scheduler_step_maybe_with_cfg(
             (noise_pred_video, noise_pred_audio),
@@ -472,7 +472,7 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
-        guidance_scale: float = LTX23_DEFAULT_RECIPE.video_cfg_scale,
+        guidance_scale: float | None = None,
         noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -482,8 +482,8 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         negative_prompt_embeds: torch.Tensor | None = None,
         prompt_attention_mask: torch.Tensor | None = None,
         negative_prompt_attention_mask: torch.Tensor | None = None,
-        decode_timestep: float | list[float] = LTX23_DEFAULT_RECIPE.decode_timestep,
-        decode_noise_scale: float | list[float] | None = LTX23_DEFAULT_RECIPE.decode_noise_scale,
+        decode_timestep: float | list[float] | None = None,
+        decode_noise_scale: float | list[float] | None = None,
         output_type: str = "np",
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
