@@ -46,6 +46,7 @@ import struct
 import sys
 from collections.abc import Generator, Iterable, Mapping
 from dataclasses import dataclass
+from os import PathLike
 from typing import NamedTuple
 
 import torch
@@ -347,6 +348,19 @@ def assert_not_fp8(name: str, dtype: torch.dtype) -> None:
         )
 
 
+def resolved_model_root(source: object) -> str | PathLike | None:
+    """Return the resolved local model root for sidecar reads.
+
+    ``model_or_path`` remains the user-facing repo ID/path. The diffusers
+    loader sets ``resolved_model_or_path`` after HF download/local resolution
+    so checkpoint adapters can inspect sidecars in the actual local snapshot.
+    """
+    resolved = getattr(source, "resolved_model_or_path", None)
+    if resolved is not None:
+        return resolved
+    return getattr(source, "model_or_path", None)
+
+
 # --- adapter (Action shell) ----------------------------------------------------
 
 
@@ -380,7 +394,7 @@ class ModelOptNativeFp8CheckpointAdapter:
         """
         if not cls._is_transformer_source(source):
             return None
-        model_dir = getattr(source, "model_or_path", None)
+        model_dir = resolved_model_root(source)
         if not isinstance(model_dir, (str, os.PathLike)) or not os.path.isdir(model_dir):
             return None
         sidecar_path = os.path.join(model_dir, SIDECAR_FILENAME)
@@ -417,7 +431,7 @@ class ModelOptNativeFp8CheckpointAdapter:
         spec = cls._parse_source_sidecar(source)
         if spec is None:
             return None
-        model_dir = getattr(source, "model_or_path", None)
+        model_dir = resolved_model_root(source)
         logger.info(
             "ModelOpt-native FP8-blockwise checkpoint detected at %s "
             "(declared: %d quantized modules, %d scale tensors, %dx%d blocks)",
@@ -561,7 +575,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     infos: list[TensorInfo] = []
     for shard_path in shard_paths:
-        infos.extend(header_tensor_infos(_read_safetensors_header(shard_path)))
+        try:
+            infos.extend(header_tensor_infos(_read_safetensors_header(shard_path)))
+        except (OSError, ValueError, struct.error, json.JSONDecodeError) as e:
+            print(f"INTEGRITY FAIL: unreadable safetensors header {shard_path}: {e}")
+            return 1
 
     n_fp8 = sum(1 for i in infos if i.is_fp8)
     n_scale_family = sum(1 for i in infos if classify_name(i.name) is not TensorKind.OTHER)

@@ -52,6 +52,8 @@ from typing import NamedTuple
 import torch
 from vllm.logger import init_logger
 
+from .modelopt_native import resolved_model_root
+
 logger = init_logger(__name__)
 
 # Deploy-side marker for the mount-shadowing probe (mirrors the FP8 adapter):
@@ -369,7 +371,7 @@ class ModelOptNativeNvfp4CheckpointAdapter:
         """
         if not cls._is_transformer_source(source):
             return None
-        model_dir = getattr(source, "model_or_path", None)
+        model_dir = resolved_model_root(source)
         if not isinstance(model_dir, (str, os.PathLike)) or not os.path.isdir(model_dir):
             return None
         sidecar_path = cls._sidecar_path(model_dir)
@@ -396,7 +398,7 @@ class ModelOptNativeNvfp4CheckpointAdapter:
         spec = cls._parse_source_sidecar(source)
         if spec is None:
             return None
-        model_dir = getattr(source, "model_or_path", None)
+        model_dir = resolved_model_root(source)
         logger.info(
             "ModelOpt-native NVFP4 checkpoint detected at %s (declared: %d quantized targets, block %d)",
             model_dir,
@@ -492,7 +494,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     infos: list[TensorInfo] = []
     for shard_path in shard_paths:
-        infos.extend(header_tensor_infos(_read_safetensors_header(shard_path)))
+        try:
+            infos.extend(header_tensor_infos(_read_safetensors_header(shard_path)))
+        except (OSError, ValueError, struct.error, json.JSONDecodeError) as e:
+            print(f"INTEGRITY FAIL: unreadable safetensors header {shard_path}: {e}")
+            return 1
 
     n_packed = sum(1 for i in infos if i.name.endswith(PACKED_SUFFIX))
     violations = verify_observations(infos, spec)

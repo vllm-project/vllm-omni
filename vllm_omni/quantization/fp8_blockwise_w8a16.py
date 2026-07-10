@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
 
@@ -59,7 +60,16 @@ def fp8_w8a16_forced() -> bool:
     return os.environ.get(FP8_W8A16_FLAG) == "1"
 
 
-def _is_fp8_blockwise_dir(model_dir: str | None) -> bool:
+def _resolved_model_root(model_or_source: object | None) -> object | None:
+    if model_or_source is None or isinstance(model_or_source, (str, os.PathLike)):
+        return model_or_source
+    resolved = getattr(model_or_source, "resolved_model_or_path", None)
+    if resolved is not None:
+        return resolved
+    return getattr(model_or_source, "model_or_path", None)
+
+
+def _is_fp8_blockwise_dir(model_dir: object | None) -> bool:
     """True iff *model_dir*'s root ``quantization_config.json`` declares the fp8_blockwise
     recipe (a disk read that returns data; no mutation).
 
@@ -68,6 +78,7 @@ def _is_fp8_blockwise_dir(model_dir: str | None) -> bool:
     recipe-matching but incorrectly declared checkpoint fails loudly there rather than being
     silently routed incorrectly here. A missing/unreadable sidecar (plain BF16, NVFP4) ⇒ False.
     """
+    model_dir = _resolved_model_root(model_dir)
     if not model_dir:
         return False
     # Single-source the sidecar filename AND the recipe string from the dequant adapter's
@@ -89,7 +100,7 @@ def _is_fp8_blockwise_dir(model_dir: str | None) -> bool:
     return isinstance(data, dict) and data.get("recipe") == EXPECTED_RECIPE
 
 
-def fp8_w8a16_selected(model_dir: str | None) -> bool:
+def fp8_w8a16_selected(model_dir: object | None) -> bool:
     """Single source of truth for the experimental FP8-blockwise W8A16 path.
 
     The opt-in flag alone is insufficient: the checkpoint root must also carry
@@ -236,7 +247,7 @@ class Fp8BlockwiseW8A16LinearMethod(LinearMethodBase):
         return F.linear(x, weight, bias)
 
 
-def build_fp8_blockwise_w8a16_config():
+def build_fp8_blockwise_w8a16_config() -> QuantizationConfig:
     """Build the weight-only W8A16 FP8-blockwise config (target-inclusion).
 
     Subclasses vLLM's ``ModelOptFp8Config`` (mirroring how the NVFP4 W4A16 config
@@ -269,6 +280,7 @@ def build_fp8_blockwise_w8a16_config():
     # The method reads the declared block size; pin it and the weight-only method.
     cfg.weight_block_size = list(BLOCK)
     cfg.LinearMethodCls = Fp8BlockwiseW8A16LinearMethod
+    cfg.vllm_omni_quant_recipe = RECIPE
     logger.info(
         "Built FP8 blockwise W8A16 config (recipe=%s): target-inclusion on "
         "'.mlp|.mlp_moe_gen.{gate,up,down}_proj', method=%s, block=%s",
@@ -279,7 +291,18 @@ def build_fp8_blockwise_w8a16_config():
     return cfg
 
 
-def maybe_build_fp8_blockwise_w8a16_config(enabled, active_quant_config=None):
+def is_fp8_blockwise_w8a16_config(quant_config: QuantizationConfig | None) -> bool:
+    return (
+        quant_config is not None
+        and getattr(quant_config, "vllm_omni_quant_recipe", None) == RECIPE
+        and getattr(quant_config, "LinearMethodCls", None) is Fp8BlockwiseW8A16LinearMethod
+    )
+
+
+def maybe_build_fp8_blockwise_w8a16_config(
+    enabled: bool,
+    active_quant_config: QuantizationConfig | None = None,
+) -> QuantizationConfig | None:
     """Return the W8A16 config when *enabled*, else *active_quant_config* unchanged.
 
     *enabled* is the resolved :func:`fp8_w8a16_selected` decision. Mirrors the intent of

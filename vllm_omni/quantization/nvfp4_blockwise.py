@@ -26,6 +26,7 @@ this config via :func:`maybe_build_nvfp4_blockwise_config` at construction time.
 import re
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
 
@@ -49,7 +50,7 @@ def _load_base_config_cls():
     return ModelOptNvFp4Config
 
 
-def build_nvfp4_blockwise_w4a16_config():
+def build_nvfp4_blockwise_w4a16_config() -> QuantizationConfig:
     """Build the W4A16 target-inclusion NVFP4 config for the blockwise recipe."""
     base_cls = _load_base_config_cls()
 
@@ -78,6 +79,7 @@ def build_nvfp4_blockwise_w4a16_config():
         exclude_modules=[],
         group_size=16,
     )
+    cfg.vllm_omni_quant_recipe = RECIPE
     # Fail fast if this vLLM build does not resolve the weight-only W4A16 method:
     # a stock/older vLLM could otherwise silently attach the W4A4 method, which
     # needs an activation input_scale this artifact does not carry.
@@ -97,12 +99,23 @@ def build_nvfp4_blockwise_w4a16_config():
     return cfg
 
 
-def _is_generic_nvfp4(quant_config: object) -> bool:
+def _is_generic_nvfp4(quant_config: QuantizationConfig) -> bool:
     getter = getattr(quant_config, "get_name", None)
     return callable(getter) and getter() in {"fp4", "nvfp4", "modelopt_fp4"}
 
 
-def maybe_build_nvfp4_blockwise_config(quant_recipe, active_quant_config=None):
+def is_nvfp4_blockwise_w4a16_config(quant_config: QuantizationConfig | None) -> bool:
+    return (
+        quant_config is not None
+        and getattr(quant_config, "vllm_omni_quant_recipe", None) == RECIPE
+        and getattr(getattr(quant_config, "LinearMethodCls", None), "__name__", "") == "ModelOptNvFp4W4A16LinearMethod"
+    )
+
+
+def maybe_build_nvfp4_blockwise_config(
+    quant_recipe: str | None,
+    active_quant_config: QuantizationConfig | None = None,
+) -> QuantizationConfig | None:
     """Resolve the NVFP4 blockwise W4A16 config from a transformer's recipe.
 
     Rules (mirroring the intent of ``resolve_quant_config_from_disk``):

@@ -31,7 +31,9 @@ quantized target family outside ``mlp.*``/``mlp_moe_gen.*``/``lm_head`` fails fa
 """
 
 import glob
+import json
 import os
+import struct
 import sys
 from collections.abc import Generator, Iterable
 
@@ -251,8 +253,6 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.exists(sidecar_path):
         print(f"INTEGRITY FAIL: no {SIDECAR_FILENAME} sidecar in {model_dir}")
         return 1
-    import json
-
     try:
         with open(sidecar_path) as f:
             spec = parse_quant_spec(json.load(f))
@@ -266,7 +266,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     infos: list[TensorInfo] = []
     for shard_path in shard_paths:
-        infos.extend(header_tensor_infos(_read_safetensors_header(shard_path)))
+        try:
+            infos.extend(header_tensor_infos(_read_safetensors_header(shard_path)))
+        except (OSError, ValueError, struct.error, json.JSONDecodeError) as e:
+            print(f"INTEGRITY FAIL: unreadable safetensors header {shard_path}: {e}")
+            return 1
 
     violations = verify_observations(infos, spec)
     n_resident = sum(

@@ -25,6 +25,7 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     modelopt_native_nvfp4 as mn4,
 )
+from vllm_omni.quantization.nvfp4_blockwise import build_nvfp4_blockwise_w4a16_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -120,6 +121,15 @@ def _stream(prefix="transformer.", nan=False):
     return [(f"{prefix}{n}", t) for n, t in _tensors(nan=nan).items()]
 
 
+def _remote_source(repo_id, resolved_model_or_path):
+    return SimpleNamespace(
+        model_or_path=repo_id,
+        resolved_model_or_path=resolved_model_or_path,
+        subfolder="transformer",
+        prefix="transformer.",
+    )
+
+
 def _write_model_dir(tmp_path, sidecar, tensors=None):
     from safetensors.torch import save_file
 
@@ -194,6 +204,12 @@ def test_detect_engages_on_sidecar(tmp_path):
     assert isinstance(adapter, mn4.ModelOptNativeNvfp4CheckpointAdapter)
 
 
+def test_detect_uses_resolved_model_root_for_remote_sources(tmp_path):
+    model_dir = _write_model_dir(tmp_path, _authoritative_sidecar())
+    adapter = mn4.ModelOptNativeNvfp4CheckpointAdapter.detect(_remote_source("owner/repo", model_dir))
+    assert isinstance(adapter, mn4.ModelOptNativeNvfp4CheckpointAdapter)
+
+
 def test_detect_returns_none_without_sidecar(tmp_path):
     model_dir = _write_model_dir(tmp_path, None)
     adapter = mn4.ModelOptNativeNvfp4CheckpointAdapter.detect(_source(model_dir))
@@ -209,8 +225,16 @@ def test_detect_raises_on_malformed_sidecar(tmp_path):
 def test_registry_selects_nvfp4_native_before_generic(tmp_path):
     model_dir = _write_model_dir(tmp_path, _authoritative_sidecar())
     model = torch.nn.Linear(2, 2)
-    adapter = get_checkpoint_adapter(model, _source(model_dir), quant_config=None, use_safetensors=True)
+    cfg = build_nvfp4_blockwise_w4a16_config()
+    adapter = get_checkpoint_adapter(model, _source(model_dir), quant_config=cfg, use_safetensors=True)
     assert isinstance(adapter, mn4.ModelOptNativeNvfp4CheckpointAdapter)
+
+
+def test_registry_rejects_nvfp4_sidecar_without_matching_config(tmp_path):
+    model_dir = _write_model_dir(tmp_path, _authoritative_sidecar())
+    model = torch.nn.Linear(2, 2)
+    with pytest.raises(mn4.CheckpointIntegrityError, match="NVFP4"):
+        get_checkpoint_adapter(model, _source(model_dir), quant_config=None, use_safetensors=True)
 
 
 # --- adapt: rename + passthrough, no dequant --------------------------------

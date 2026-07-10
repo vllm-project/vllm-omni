@@ -27,6 +27,7 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters.modelopt_native import
     is_fp8_dtype,
     parse_quant_spec,
 )
+from vllm_omni.quantization.fp8_blockwise_w8a16 import build_fp8_blockwise_w8a16_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -172,9 +173,24 @@ def _source(model_or_path):
     return SimpleNamespace(model_or_path=model_or_path, subfolder="transformer", prefix="transformer.")
 
 
+def _remote_source(repo_id, resolved_model_or_path):
+    return SimpleNamespace(
+        model_or_path=repo_id,
+        resolved_model_or_path=resolved_model_or_path,
+        subfolder="transformer",
+        prefix="transformer.",
+    )
+
+
 def test_detect_engages_on_fp8_sidecar(tmp_path):
     root = _write_model_dir(tmp_path)
     adapter = mw8.ModelOptNativeFp8W8A16CheckpointAdapter.detect(_source(root))
+    assert adapter is not None
+
+
+def test_detect_uses_resolved_model_root_for_remote_sources(tmp_path):
+    root = _write_model_dir(tmp_path)
+    adapter = mw8.ModelOptNativeFp8W8A16CheckpointAdapter.detect(_remote_source("owner/repo", root))
     assert adapter is not None
 
 
@@ -211,8 +227,16 @@ def test_dispatch_default_selects_dequant(tmp_path, monkeypatch):
 def test_dispatch_opt_in_selects_w8a16(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
     root = _write_model_dir(tmp_path)
-    adapter = get_checkpoint_adapter(torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True)
+    cfg = build_fp8_blockwise_w8a16_config()
+    adapter = get_checkpoint_adapter(torch.nn.Module(), _source(root), quant_config=cfg, use_safetensors=True)
     assert isinstance(adapter, ModelOptNativeFp8W8A16CheckpointAdapter)
+
+
+def test_dispatch_opt_in_rejects_missing_w8a16_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
+    root = _write_model_dir(tmp_path)
+    with pytest.raises(CheckpointIntegrityError, match="W8A16"):
+        get_checkpoint_adapter(torch.nn.Module(), _source(root), quant_config=None, use_safetensors=True)
 
 
 def test_dispatch_default_inert_without_fp8_sidecar(tmp_path, monkeypatch):

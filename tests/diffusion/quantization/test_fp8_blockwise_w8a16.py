@@ -125,6 +125,14 @@ def test_fp8_w8a16_selected_explicit_opt_in(tmp_path, monkeypatch):
     assert w8.fp8_w8a16_selected(root) is True
 
 
+def test_fp8_w8a16_selected_uses_resolved_model_root(tmp_path, monkeypatch):
+    root = _sidecar_dir(tmp_path / "fp8")
+    source = SimpleNamespace(model_or_path="owner/repo", resolved_model_or_path=root)
+    monkeypatch.setenv("VLLM_OMNI_FP8_BLOCKWISE_W8A16", "1")
+
+    assert w8.fp8_w8a16_selected(source) is True
+
+
 def test_omni_diffusion_config_opt_in_wires_fp8_w8a16(tmp_path, monkeypatch):
     from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 

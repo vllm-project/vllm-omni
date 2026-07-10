@@ -131,6 +131,9 @@ class DiffusersPipelineLoader:
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
+        resolved_model_or_path: str | None = None
+        """The local model root after download/resolution, if different from model_or_path."""
+
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
@@ -147,7 +150,7 @@ class DiffusersPipelineLoader:
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
-    ) -> tuple[Path | str, list[str], bool]:
+    ) -> tuple[Path | str, Path | str, list[str], bool]:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
@@ -196,6 +199,7 @@ class DiffusersPipelineLoader:
         else:
             hf_folder = model_name_or_path
 
+        resolved_model_or_path = hf_folder
         if subfolder is not None:
             hf_folder = os.path.join(hf_folder, subfolder)
 
@@ -228,7 +232,7 @@ class DiffusersPipelineLoader:
         if len(hf_weights_files) == 0:
             raise RuntimeError(f"Cannot find any model weights with `{model_name_or_path}`")
 
-        return hf_folder, hf_weights_files, use_safetensors
+        return resolved_model_or_path, hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
         self,
@@ -236,13 +240,14 @@ class DiffusersPipelineLoader:
         model: nn.Module | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
-        _, hf_weights_files, use_safetensors = self._prepare_weights(
+        resolved_model_or_path, _, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        adapter_source = dataclasses.replace(source, resolved_model_or_path=str(resolved_model_or_path))
 
         use_multithread = (
             use_safetensors
@@ -270,7 +275,7 @@ class DiffusersPipelineLoader:
         # Apply the prefix.
         prefixed_weights_iterator = ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
         if model is not None:
-            checkpoint_adapter = self._get_checkpoint_adapter(model, source, use_safetensors)
+            checkpoint_adapter = self._get_checkpoint_adapter(model, adapter_source, use_safetensors)
             if checkpoint_adapter is not None:
                 return checkpoint_adapter.adapt(prefixed_weights_iterator)
         return prefixed_weights_iterator

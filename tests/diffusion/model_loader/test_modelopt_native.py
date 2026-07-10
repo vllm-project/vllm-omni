@@ -117,6 +117,15 @@ def _source(model_or_path="unused"):
     return SimpleNamespace(model_or_path=model_or_path, subfolder=None, prefix="transformer.")
 
 
+def _remote_source(repo_id, resolved_model_or_path):
+    return SimpleNamespace(
+        model_or_path=repo_id,
+        resolved_model_or_path=resolved_model_or_path,
+        subfolder=None,
+        prefix="transformer.",
+    )
+
+
 class _TinyModel(nn.Module):
     def __init__(self, dtype=torch.bfloat16):
         super().__init__()
@@ -360,6 +369,12 @@ def test_detect_paths(tmp_path):
     assert adapter is not None
 
 
+def test_detect_uses_resolved_model_root_for_remote_sources(tmp_path):
+    root = _write_model_dir(tmp_path, _authoritative_sidecar())
+    adapter = mn.ModelOptNativeFp8CheckpointAdapter.detect(_remote_source("owner/repo", root))
+    assert adapter is not None
+
+
 def test_get_checkpoint_adapter_engages_without_quant_config(tmp_path, monkeypatch):
     # Default route stays dequant-on-load; the resident W8A16 path is an explicit opt-in
     # covered in test_modelopt_native_fp8_w8a16.
@@ -371,6 +386,18 @@ def test_get_checkpoint_adapter_engages_without_quant_config(tmp_path, monkeypat
 
     plain = _write_model_dir(tmp_path / "plain", None)
     assert get_checkpoint_adapter(model=model, source=_source(plain), quant_config=None, use_safetensors=True) is None
+
+
+def test_probe_main_reports_header_read_error(tmp_path, capsys):
+    root = _write_model_dir(tmp_path, _authoritative_sidecar())
+    shard = tmp_path / "model" / "transformer" / "diffusion_pytorch_model.safetensors"
+    shard.write_bytes(b"bad")
+
+    rc = mn.main([root])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "INTEGRITY FAIL" in captured.out
 
 
 # --- fp8 guard -----------------------------------------------------------------
