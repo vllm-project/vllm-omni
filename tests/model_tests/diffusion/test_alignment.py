@@ -77,6 +77,7 @@ EXCLUDED_MODELS = [
     "Gr00tN1d7Pipeline",
     "SoulXSingerPipeline",
     "SoulXSingerSVCPipeline",
+    "Krea2Pipeline",
 ]
 
 
