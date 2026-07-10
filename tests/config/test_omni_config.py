@@ -628,7 +628,19 @@ def test_from_pipeline_config_uses_hf_config_for_callable_resolver():
 
     assert omni_config.pipeline_config.model_type == "qwen3_omni_moe_thinker_only"
     assert len(omni_config.stage_configs) == 1
-    assert omni_config.stage_configs[0].model_stage == "thinker"
+    assert omni_config.orchestrator_config.deploy_config_path == str(_DEPLOY_DIR / "qwen3_omni_moe_thinker_only.yaml")
+
+    thinker = omni_config.stage_configs[0]
+    assert thinker.model_stage == "thinker"
+    assert thinker.scheduler_config.max_num_batched_tokens == 32768
+    assert thinker.scheduler_config.max_num_seqs == 64
+    assert thinker.cache_config.gpu_memory_utilization == 0.9
+    assert thinker.runtime_config.devices == "0"
+    assert thinker.model_config.default_sampling_params == {
+        "temperature": 0.0,
+        "max_tokens": 2048,
+        "detokenize": True,
+    }
 
 
 def test_from_pipeline_config_accepts_pre_resolved_pipeline():
