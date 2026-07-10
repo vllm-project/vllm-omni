@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -254,7 +258,13 @@ class LingBotSelfAttention(nn.Module):
             skip_sequence_parallel=True,
         )
 
-    def _validate_cache(self, cache: LingBotAttentionCache, hidden_states: torch.Tensor) -> None:
+    def _validate_cache(
+        self,
+        cache: LingBotAttentionCache,
+        hidden_states: torch.Tensor,
+        *,
+        sink_tokens: int,
+    ) -> None:
         capacity = _validate_cache_storage(
             cache,
             batch_size=hidden_states.shape[0],
@@ -273,7 +283,7 @@ class LingBotSelfAttention(nn.Module):
             raise ValueError(f"Self-attention cache end={cache.end} must be within [0, {capacity}].")
         if not 0 <= cache.sink_end <= cache.end:
             raise ValueError("Self-attention cache sink_end must be within the retained cache span.")
-        if cache.sink_end > self.sink_tokens:
+        if cache.sink_end > sink_tokens:
             raise ValueError("Self-attention cache sink_end exceeds the configured sink token count.")
         if cache.absolute_end < 0:
             raise ValueError("Self-attention cache absolute_end must be non-negative.")
@@ -299,6 +309,9 @@ class LingBotSelfAttention(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         current_start: int,
+        *,
+        sink_tokens: int,
+        update_cache: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         _validate_current_start(current_start)
         if key.shape[1] == 0:
@@ -317,7 +330,7 @@ class LingBotSelfAttention(nn.Module):
                 )
             next_key = key
             next_value = value
-            next_sink_end = max(0, min(chunk_tokens, self.sink_tokens - current_start))
+            next_sink_end = max(0, min(chunk_tokens, sink_tokens - current_start))
         elif current_start == cache.last_start:
             if current_start + chunk_tokens != cache.absolute_end:
                 raise ValueError("A repeated current_start must overwrite the same-size current chunk.")
@@ -338,7 +351,7 @@ class LingBotSelfAttention(nn.Module):
                     f"New chunks must be contiguous: current_start={current_start}, expected {cache.absolute_end}."
                 )
 
-            incoming_sink_tokens = max(0, min(chunk_tokens, self.sink_tokens - current_start))
+            incoming_sink_tokens = max(0, min(chunk_tokens, sink_tokens - current_start))
             old_sink_key = cache.key[:, : cache.sink_end]
             old_sink_value = cache.value[:, : cache.sink_end]
             new_sink_key = key[:, :incoming_sink_tokens]
@@ -367,16 +380,17 @@ class LingBotSelfAttention(nn.Module):
             next_value = torch.cat((old_sink_value, new_sink_value, old_local_value, new_local_value), dim=1)
 
         next_end = next_key.shape[1]
-        with torch.no_grad():
-            cache.key[:, :next_end].copy_(next_key.detach())
-            cache.value[:, :next_end].copy_(next_value.detach())
-            if next_end < previous_end:
-                cache.key[:, next_end:previous_end].zero_()
-                cache.value[:, next_end:previous_end].zero_()
-        cache.end = next_end
-        cache.absolute_end = current_start + chunk_tokens
-        cache.last_start = current_start
-        cache.sink_end = next_sink_end
+        if update_cache:
+            with torch.no_grad():
+                cache.key[:, :next_end].copy_(next_key.detach())
+                cache.value[:, :next_end].copy_(next_value.detach())
+                if next_end < previous_end:
+                    cache.key[:, next_end:previous_end].zero_()
+                    cache.value[:, next_end:previous_end].zero_()
+            cache.end = next_end
+            cache.absolute_end = current_start + chunk_tokens
+            cache.last_start = current_start
+            cache.sink_end = next_sink_end
         return next_key, next_value
 
     def forward(
@@ -386,11 +400,19 @@ class LingBotSelfAttention(nn.Module):
         cache: LingBotAttentionCache,
         current_start: int,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sink_tokens: int | None = None,
+        update_cache: bool = True,
     ) -> torch.Tensor:
         if hidden_states.ndim != 3:
             raise ValueError("Self-attention hidden_states must be rank 3 [batch, tokens, dim].")
         _validate_current_start(current_start)
-        self._validate_cache(cache, hidden_states)
+        if sink_tokens is None:
+            sink_tokens = self.sink_tokens
+        if not isinstance(sink_tokens, int) or isinstance(sink_tokens, bool) or sink_tokens < 0:
+            raise ValueError("sink_tokens must be a non-negative integer.")
+        if not isinstance(update_cache, bool):
+            raise ValueError("update_cache must be a boolean.")
+        self._validate_cache(cache, hidden_states, sink_tokens=sink_tokens)
 
         query = self.norm_q(self.q(hidden_states))
         key = self.norm_k(self.k(hidden_states))
@@ -408,7 +430,14 @@ class LingBotSelfAttention(nn.Module):
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
 
-        visible_key, visible_value = self._update_cache(cache, key, value, current_start)
+        visible_key, visible_value = self._update_cache(
+            cache,
+            key,
+            value,
+            current_start,
+            sink_tokens=sink_tokens,
+            update_cache=update_cache,
+        )
         output = self.attn(query, visible_key, visible_value)
         return self.o(output.flatten(2, 3))
 
@@ -559,18 +588,23 @@ class LingBotCrossAttention(nn.Module):
 
 
 class LingBotAttentionBlock(nn.Module):
-    """Checkpoint namespace container for LingBot self- and cross-attention."""
+    """Checkpoint-compatible LingBot block with causal video attention."""
 
     def __init__(
         self,
         dim: int,
         num_heads: int,
         *,
+        ffn_dim: int | None = None,
         sink_tokens: int = 0,
+        cross_attn_norm: bool = True,
         eps: float = 1e-6,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        ffn_dim = ffn_dim or dim * 4
+        self.dim = dim
+        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.self_attn = LingBotSelfAttention(
             dim,
             num_heads,
@@ -584,3 +618,627 @@ class LingBotAttentionBlock(nn.Module):
             eps=eps,
             prefix=_projection_prefix(prefix, "cross_attn"),
         )
+        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm3 = nn.LayerNorm(dim, eps=eps) if cross_attn_norm else nn.Identity()
+        self.ffn = nn.Sequential(
+            ColumnParallelLinear(
+                dim,
+                ffn_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                prefix=_projection_prefix(prefix, "ffn.0"),
+            ),
+            nn.GELU(approximate="tanh"),
+            RowParallelLinear(
+                ffn_dim,
+                dim,
+                bias=True,
+                input_is_parallel=True,
+                return_bias=False,
+                prefix=_projection_prefix(prefix, "ffn.2"),
+            ),
+        )
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / math.sqrt(dim))
+        self.cam_injector_layer1 = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            prefix=_projection_prefix(prefix, "cam_injector_layer1"),
+        )
+        self.cam_injector_layer2 = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            prefix=_projection_prefix(prefix, "cam_injector_layer2"),
+        )
+        self.cam_scale_layer = nn.Linear(dim, dim)
+        self.cam_shift_layer = nn.Linear(dim, dim)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None,
+        timestep_projection: torch.Tensor,
+        camera_hidden_states: torch.Tensor,
+        *,
+        self_cache: LingBotAttentionCache,
+        cross_cache: LingBotAttentionCache | None,
+        current_start: int,
+        sink_tokens: int,
+        update_cache: bool,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, LingBotAttentionCache]:
+        batch_size, token_count, dim = hidden_states.shape
+        num_frames = timestep_projection.shape[1]
+        if token_count % num_frames != 0:
+            raise ValueError("The patched token count must be divisible by the timestep frame count.")
+        tokens_per_frame = token_count // num_frames
+        modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
+        shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation.chunk(6, dim=2)
+
+        hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
+        normalized = self.norm1(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
+        normalized = (normalized * (1 + scale_msa) + shift_msa).flatten(1, 2).to(hidden_states.dtype)
+        attention_output = self.self_attn(
+            normalized,
+            cache=self_cache,
+            current_start=current_start,
+            rotary_emb=rotary_emb,
+            sink_tokens=sink_tokens,
+            update_cache=update_cache,
+        )
+        hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
+        hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
+
+        camera_features = self.cam_injector_layer2(F.silu(self.cam_injector_layer1(camera_hidden_states)))
+        camera_features = camera_features + camera_hidden_states
+        camera_scale = self.cam_scale_layer(camera_features)
+        camera_shift = self.cam_shift_layer(camera_features)
+        hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
+
+        attention_output, cross_cache = self.cross_attn(
+            self.norm3(hidden_states),
+            encoder_hidden_states,
+            cache=cross_cache,
+        )
+        hidden_states = hidden_states + attention_output
+
+        hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
+        normalized = self.norm2(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
+        normalized = (normalized * (1 + scale_ffn) + shift_ffn).flatten(1, 2).to(hidden_states.dtype)
+        ffn_output = self.ffn(normalized).unflatten(1, (num_frames, tokens_per_frame))
+        hidden_states = (hidden_grid + ffn_output * gate_ffn).flatten(1, 2).to(hidden_states.dtype)
+        return hidden_states, cross_cache
+
+
+class _LingBotCameraPatchEmbedding(nn.Module):
+    """Linear camera patchifier matching the checkpoint's direct parameter names."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        dim: int,
+        patch_size: tuple[int, int, int],
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.in_features = in_channels * math.prod(patch_size)
+        self.weight = nn.Parameter(torch.empty(dim, self.in_features))
+        self.bias = nn.Parameter(torch.empty(dim))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        bound = 1 / math.sqrt(self.in_features)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.ndim != 5:
+            raise ValueError("camera_hidden_states must be rank 5 [batch, channels, frames, height, width].")
+        batch_size, channels, frames, height, width = hidden_states.shape
+        patch_frames, patch_height, patch_width = self.patch_size
+        if frames % patch_frames or height % patch_height or width % patch_width:
+            raise ValueError("camera_hidden_states dimensions must be divisible by patch_size.")
+        hidden_states = hidden_states.reshape(
+            batch_size,
+            channels,
+            frames // patch_frames,
+            patch_frames,
+            height // patch_height,
+            patch_height,
+            width // patch_width,
+            patch_width,
+        )
+        hidden_states = hidden_states.permute(0, 2, 4, 6, 1, 3, 5, 7)
+        hidden_states = hidden_states.reshape(batch_size, -1, self.in_features)
+        return F.linear(hidden_states, self.weight, self.bias)
+
+
+class _LingBotHead(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        out_channels: int,
+        patch_size: tuple[int, int, int],
+        eps: float,
+    ) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.head = nn.Linear(dim, out_channels * math.prod(patch_size))
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / math.sqrt(dim))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        num_frames = timestep_embedding.shape[1]
+        tokens_per_frame = hidden_states.shape[1] // num_frames
+        modulation = self.modulation.unsqueeze(1) + timestep_embedding.unsqueeze(2).float()
+        shift, scale = modulation.chunk(2, dim=2)
+        normalized = self.norm(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
+        normalized = (normalized * (1 + scale) + shift).flatten(1, 2).to(hidden_states.dtype)
+        return self.head(normalized)
+
+
+def _sinusoidal_embedding(dim: int, timestep: torch.Tensor) -> torch.Tensor:
+    if dim % 2:
+        raise ValueError(f"freq_dim must be even, got {dim}.")
+    half_dim = dim // 2
+    timestep = timestep.to(torch.float64)
+    frequencies = torch.pow(
+        10000,
+        -torch.arange(half_dim, device=timestep.device, dtype=torch.float64) / half_dim,
+    )
+    phase = torch.outer(timestep, frequencies)
+    return torch.cat((phase.cos(), phase.sin()), dim=1)
+
+
+def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if dim == 0:
+        empty = torch.empty(max_seq_len, 0, dtype=torch.float32)
+        return empty, empty.clone()
+    if dim % 2:
+        raise ValueError(f"RoPE axis dimension must be even, got {dim}.")
+    frequencies = 1.0 / torch.pow(
+        10000,
+        torch.arange(0, dim, 2, dtype=torch.float64) / dim,
+    )
+    phase = torch.outer(torch.arange(max_seq_len, dtype=torch.float64), frequencies)
+    return phase.cos().float(), phase.sin().float()
+
+
+class CausalLingBotWorldTransformer3DModel(nn.Module):
+    """Checkpoint-compatible causal LingBot World video transformer."""
+
+    _layerwise_offload_blocks_attrs = ["blocks"]
+
+    def __init__(
+        self,
+        patch_size: tuple[int, int, int] = (1, 2, 2),
+        num_attention_heads: int = 40,
+        attention_head_dim: int = 128,
+        in_channels: int = 36,
+        out_channels: int = 16,
+        text_dim: int = 4096,
+        freq_dim: int = 256,
+        ffn_dim: int = 13824,
+        num_layers: int = 40,
+        cross_attn_norm: bool = True,
+        eps: float = 1e-6,
+        image_dim: int | None = None,
+        added_kv_proj_dim: int | None = None,
+        rope_max_seq_len: int = 1024,
+        pos_embed_seq_len: int | None = None,
+        qk_norm: str = "rms_norm_across_heads",
+        sink_size: int = 9,
+        num_frames_per_block: int = 3,
+        sliding_window_num_frames: int = 18,
+        local_attn_size: int = -1,
+        quant_config: object | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if len(patch_size) != 3 or any(size <= 0 for size in patch_size):
+            raise ValueError("patch_size must contain three positive integers.")
+        if num_attention_heads <= 0 or attention_head_dim <= 0:
+            raise ValueError("Attention head counts and dimensions must be positive.")
+        if attention_head_dim % 2:
+            raise ValueError("attention_head_dim must be even for RoPE.")
+        if num_layers <= 0 or ffn_dim <= 0 or freq_dim <= 0:
+            raise ValueError("num_layers, ffn_dim, and freq_dim must be positive.")
+        if sink_size < 0 or num_frames_per_block <= 0 or sliding_window_num_frames <= 0:
+            raise ValueError("Causal frame-window sizes must be positive, except sink_size which may be zero.")
+        if local_attn_size != -1 and local_attn_size <= 0:
+            raise ValueError("local_attn_size must be -1 or a positive frame count.")
+        cache_window_frames = local_attn_size if local_attn_size != -1 else sliding_window_num_frames
+        if cache_window_frames < sink_size + num_frames_per_block:
+            raise ValueError("The causal cache window must fit all sink frames and one complete current block.")
+        if qk_norm != "rms_norm_across_heads":
+            raise NotImplementedError(f"Unsupported LingBot qk_norm={qk_norm!r}.")
+        if image_dim is not None or added_kv_proj_dim is not None or pos_embed_seq_len is not None:
+            raise NotImplementedError("LingBot World v2 does not define image cross-attention embeddings.")
+        if quant_config is not None:
+            raise NotImplementedError("LingBot World transformer quantization is not implemented yet.")
+
+        patch_size = tuple(patch_size)
+        dim = num_attention_heads * attention_head_dim
+        self.dim = dim
+        self.config = SimpleNamespace(
+            patch_size=patch_size,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            text_dim=text_dim,
+            freq_dim=freq_dim,
+            ffn_dim=ffn_dim,
+            num_layers=num_layers,
+            cross_attn_norm=cross_attn_norm,
+            eps=eps,
+            image_dim=image_dim,
+            added_kv_proj_dim=added_kv_proj_dim,
+            rope_max_seq_len=rope_max_seq_len,
+            pos_embed_seq_len=pos_embed_seq_len,
+            qk_norm=qk_norm,
+            sink_size=sink_size,
+            num_frames_per_block=num_frames_per_block,
+            sliding_window_num_frames=sliding_window_num_frames,
+            local_attn_size=local_attn_size,
+        )
+
+        self.patch_embedding = nn.Conv3d(
+            in_channels,
+            dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.patch_embedding_wancamctrl = _LingBotCameraPatchEmbedding(6 * 8 * 8, dim, patch_size)
+        self.c2ws_hidden_states_layer1 = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            prefix=_projection_prefix(prefix, "c2ws_hidden_states_layer1"),
+        )
+        self.c2ws_hidden_states_layer2 = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            prefix=_projection_prefix(prefix, "c2ws_hidden_states_layer2"),
+        )
+        self.text_embedding = nn.Sequential(
+            nn.Linear(text_dim, dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(dim, dim),
+        )
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+        self.time_projection = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, dim * 6),
+        )
+        self.blocks = nn.ModuleList(
+            [
+                LingBotAttentionBlock(
+                    dim,
+                    num_attention_heads,
+                    ffn_dim=ffn_dim,
+                    sink_tokens=0,
+                    cross_attn_norm=cross_attn_norm,
+                    eps=eps,
+                    prefix=_projection_prefix(prefix, f"blocks.{index}"),
+                )
+                for index in range(num_layers)
+            ]
+        )
+        self.head = _LingBotHead(dim, out_channels, patch_size, eps)
+
+        temporal_dim = attention_head_dim - 4 * (attention_head_dim // 6)
+        height_dim = width_dim = 2 * (attention_head_dim // 6)
+        for axis, axis_dim in (("temporal", temporal_dim), ("height", height_dim), ("width", width_dim)):
+            cosine, sine = _rope_axis(rope_max_seq_len, axis_dim)
+            self.register_buffer(f"_rope_{axis}_cosine", cosine, persistent=False)
+            self.register_buffer(f"_rope_{axis}_sine", sine, persistent=False)
+
+    @classmethod
+    def from_config(
+        cls,
+        config: dict,
+        *,
+        quant_config: object | None = None,
+        prefix: str = "",
+    ):
+        metadata_keys = {"_class_name", "_diffusers_version"}
+        constructor_keys = {
+            "patch_size",
+            "num_attention_heads",
+            "attention_head_dim",
+            "in_channels",
+            "out_channels",
+            "text_dim",
+            "freq_dim",
+            "ffn_dim",
+            "num_layers",
+            "cross_attn_norm",
+            "eps",
+            "image_dim",
+            "added_kv_proj_dim",
+            "rope_max_seq_len",
+            "pos_embed_seq_len",
+            "qk_norm",
+            "sink_size",
+            "num_frames_per_block",
+            "sliding_window_num_frames",
+            "local_attn_size",
+        }
+        unexpected = set(config) - constructor_keys - metadata_keys
+        if unexpected:
+            raise ValueError(f"Unexpected LingBot config keys: {sorted(unexpected)}")
+        kwargs = {name: value for name, value in config.items() if name in constructor_keys}
+        if "patch_size" in kwargs:
+            kwargs["patch_size"] = tuple(kwargs["patch_size"])
+        return cls(**kwargs, quant_config=quant_config, prefix=prefix)
+
+    def _rotary_embedding(
+        self,
+        *,
+        frames: int,
+        height: int,
+        width: int,
+        start_frame: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if start_frame + frames > self.config.rope_max_seq_len:
+            raise ValueError("Temporal RoPE positions exceed rope_max_seq_len.")
+        if height > self.config.rope_max_seq_len or width > self.config.rope_max_seq_len:
+            raise ValueError("Spatial RoPE positions exceed rope_max_seq_len.")
+
+        def expand_axis(table: torch.Tensor, axis: str) -> torch.Tensor:
+            if axis == "temporal":
+                return (
+                    table[start_frame : start_frame + frames].view(frames, 1, 1, -1).expand(frames, height, width, -1)
+                )
+            if axis == "height":
+                return table[:height].view(1, height, 1, -1).expand(frames, height, width, -1)
+            return table[:width].view(1, 1, width, -1).expand(frames, height, width, -1)
+
+        cosine = torch.cat(
+            (
+                expand_axis(self._rope_temporal_cosine, "temporal"),
+                expand_axis(self._rope_height_cosine, "height"),
+                expand_axis(self._rope_width_cosine, "width"),
+            ),
+            dim=-1,
+        )
+        sine = torch.cat(
+            (
+                expand_axis(self._rope_temporal_sine, "temporal"),
+                expand_axis(self._rope_height_sine, "height"),
+                expand_axis(self._rope_width_sine, "width"),
+            ),
+            dim=-1,
+        )
+        return (
+            cosine.reshape(frames * height * width, -1).to(device=device, dtype=dtype),
+            sine.reshape(frames * height * width, -1).to(device=device, dtype=dtype),
+        )
+
+    def _validate_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        camera_hidden_states: torch.Tensor,
+        cache: LingBotTransformerCache,
+        start_frame: int,
+    ) -> tuple[int, int, int, int, int]:
+        if hidden_states.ndim != 5:
+            raise ValueError("hidden_states must be rank 5 [batch, channels, frames, height, width].")
+        if hidden_states.shape[1] != self.config.in_channels:
+            raise ValueError(f"hidden_states must have {self.config.in_channels} channels.")
+        if not isinstance(start_frame, int) or isinstance(start_frame, bool) or start_frame < 0:
+            raise ValueError("start_frame must be a non-negative integer latent-frame offset.")
+        patch_frames, patch_height, patch_width = self.config.patch_size
+        batch_size, _, frames, height, width = hidden_states.shape
+        if frames % patch_frames or height % patch_height or width % patch_width:
+            raise ValueError("hidden_states dimensions must be divisible by patch_size.")
+        if start_frame % patch_frames:
+            raise ValueError("start_frame must align to the temporal patch size.")
+        if encoder_hidden_states.ndim != 3:
+            raise ValueError("encoder_hidden_states must be rank 3 [batch, tokens, text_dim].")
+        if encoder_hidden_states.shape[0] != batch_size or encoder_hidden_states.shape[2] != self.config.text_dim:
+            raise ValueError("encoder_hidden_states batch/width do not match the LingBot config.")
+        if encoder_hidden_states.shape[1] == 0:
+            raise ValueError("encoder_hidden_states must contain at least one token.")
+        expected_camera_shape = (batch_size, 6 * 8 * 8, frames, height, width)
+        if camera_hidden_states.shape != expected_camera_shape:
+            raise ValueError(
+                "camera_hidden_states must use folded [batch, 6*8*8, frames, height, width] layout "
+                f"matching the video; expected {expected_camera_shape}, got {tuple(camera_hidden_states.shape)}."
+            )
+        if hidden_states.device != encoder_hidden_states.device or hidden_states.device != camera_hidden_states.device:
+            raise ValueError("Video, text, and camera tensors must be on the same device.")
+        if hidden_states.dtype != encoder_hidden_states.dtype or hidden_states.dtype != camera_hidden_states.dtype:
+            raise ValueError("Video, text, and camera tensors must use the same dtype.")
+        if timestep.device != hidden_states.device:
+            raise ValueError("timestep must be on the same device as hidden_states.")
+        if len(cache.self_attention) != self.config.num_layers or len(cache.cross_attention) != self.config.num_layers:
+            raise ValueError("LingBotTransformerCache layer counts must match num_layers.")
+        return batch_size, frames, height, width, patch_frames
+
+    def _timestep_embeddings(
+        self,
+        timestep: torch.Tensor,
+        *,
+        batch_size: int,
+        frames: int,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if timestep.ndim == 0:
+            if batch_size != 1:
+                raise ValueError("A scalar timestep is only valid for batch_size=1.")
+            timestep = timestep.reshape(1)
+        if timestep.ndim == 1:
+            if timestep.shape[0] != batch_size:
+                raise ValueError("A rank-1 timestep must contain one value per batch item.")
+            timestep = timestep.unsqueeze(1).expand(batch_size, frames)
+        elif timestep.ndim == 2:
+            if timestep.shape != (batch_size, frames):
+                raise ValueError(f"A rank-2 timestep must have shape {(batch_size, frames)}.")
+        else:
+            raise ValueError("timestep must be scalar, rank 1 [batch], or rank 2 [batch, frames].")
+
+        frequency_embedding = _sinusoidal_embedding(self.config.freq_dim, timestep.reshape(-1)).to(dtype=dtype)
+        timestep_embedding = self.time_embedding(frequency_embedding).unflatten(0, (batch_size, frames))
+        timestep_projection = self.time_projection(timestep_embedding).unflatten(2, (6, self.dim))
+        return timestep_embedding, timestep_projection
+
+    def _unpatchify(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        batch_size: int,
+        frames: int,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        patch_frames, patch_height, patch_width = self.config.patch_size
+        hidden_states = hidden_states.reshape(
+            batch_size,
+            frames,
+            height,
+            width,
+            patch_frames,
+            patch_height,
+            patch_width,
+            self.config.out_channels,
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        return hidden_states.reshape(
+            batch_size,
+            self.config.out_channels,
+            frames * patch_frames,
+            height * patch_height,
+            width * patch_width,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        camera_hidden_states: torch.Tensor,
+        *,
+        cache: LingBotTransformerCache,
+        start_frame: int,
+        update_cache: bool,
+    ) -> torch.Tensor:
+        if not isinstance(update_cache, bool):
+            raise ValueError("update_cache must be a boolean.")
+        batch_size, frames, height, width, patch_frames = self._validate_inputs(
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            camera_hidden_states,
+            cache,
+            start_frame,
+        )
+        patch_height, patch_width = self.config.patch_size[1:]
+        patched_frames = frames // patch_frames
+        patched_height = height // patch_height
+        patched_width = width // patch_width
+        tokens_per_frame = patched_height * patched_width
+        patched_start_frame = start_frame // patch_frames
+        current_start = patched_start_frame * tokens_per_frame
+        sink_tokens = self.config.sink_size * tokens_per_frame
+        cache_window_frames = (
+            self.config.local_attn_size if self.config.local_attn_size != -1 else self.config.sliding_window_num_frames
+        )
+        expected_cache_tokens = cache_window_frames * tokens_per_frame
+        for index, layer_cache in enumerate(cache.self_attention):
+            if layer_cache.key.ndim != 4 or layer_cache.value.ndim != 4:
+                raise ValueError(f"Self-attention cache layer {index} must use rank-4 K/V storage.")
+            if layer_cache.key.shape[1] != expected_cache_tokens or layer_cache.value.shape[1] != expected_cache_tokens:
+                raise ValueError(
+                    f"Self-attention cache layer {index} capacity must be {expected_cache_tokens} tokens "
+                    f"for the configured causal window, got K={layer_cache.key.shape[1]} "
+                    f"and V={layer_cache.value.shape[1]}."
+                )
+
+        rotary_emb = self._rotary_embedding(
+            frames=patched_frames,
+            height=patched_height,
+            width=patched_width,
+            start_frame=patched_start_frame,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+        camera_hidden_states = self.patch_embedding_wancamctrl(camera_hidden_states)
+        camera_hidden_states = camera_hidden_states + self.c2ws_hidden_states_layer2(
+            F.silu(self.c2ws_hidden_states_layer1(camera_hidden_states))
+        )
+        if hidden_states.shape != camera_hidden_states.shape:
+            raise ValueError("Patched video and camera token shapes must match.")
+
+        timestep_embedding, timestep_projection = self._timestep_embeddings(
+            timestep,
+            batch_size=batch_size,
+            frames=patched_frames,
+            dtype=hidden_states.dtype,
+        )
+        encoder_hidden_states = self.text_embedding(encoder_hidden_states)
+        for index, block in enumerate(self.blocks):
+            hidden_states, cross_cache = block(
+                hidden_states,
+                encoder_hidden_states if cache.cross_attention[index] is None else None,
+                timestep_projection,
+                camera_hidden_states,
+                self_cache=cache.self_attention[index],
+                cross_cache=cache.cross_attention[index],
+                current_start=current_start,
+                sink_tokens=sink_tokens,
+                update_cache=update_cache,
+                rotary_emb=rotary_emb,
+            )
+            cache.cross_attention[index] = cross_cache
+
+        hidden_states = self.head(hidden_states, timestep_embedding)
+        return self._unpatchify(
+            hidden_states,
+            batch_size=batch_size,
+            frames=patched_frames,
+            height=patched_height,
+            width=patched_width,
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            if name not in params:
+                raise KeyError(f"Unexpected LingBot model weight name: {name}")
+            param = params[name]
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                weight_loader(param, loaded_weight)
+            else:
+                if param.shape != loaded_weight.shape:
+                    raise ValueError(
+                        f"Weight shape mismatch for {name}: parameter={tuple(param.shape)}, "
+                        f"checkpoint={tuple(loaded_weight.shape)}."
+                    )
+                with torch.no_grad():
+                    param.copy_(loaded_weight)
+            loaded.add(name)
+        return loaded
