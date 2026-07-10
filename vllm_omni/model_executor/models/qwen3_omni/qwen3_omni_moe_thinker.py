@@ -74,7 +74,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
     check_interleaved_audio_video,
     merge_interleaved_embeddings,
 )
@@ -120,6 +119,9 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
+    Qwen2_5OmniThinkerMultiModalDataParser,
+    Qwen2_5OmniThinkerMultiModalProcessor,
+    _presampled_videos_hf_kwargs,
 )
 from vllm_omni.quantization.component_config import (
     PRE_QUANTIZED_METHODS,
@@ -621,6 +623,19 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
         assert isinstance(feature_extractor, WhisperFeatureExtractor)
         return feature_extractor
 
+    def get_data_parser(self):
+        feature_extractor = self.get_feature_extractor()
+
+        # Install the Omni parser, which keeps video metadata from vLLM's
+        # video loader (see Qwen2_5OmniVideoProcessorItems); the parser
+        # inherited from Qwen2AudioProcessingInfo would drop it.
+        return Qwen2_5OmniThinkerMultiModalDataParser(
+            spatial_merge_size=self.get_hf_config().vision_config.spatial_merge_size,
+            target_sr=feature_extractor.sampling_rate,
+            target_channels=1,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None, "image": None, "video": None}
 
@@ -671,7 +686,10 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         mm_data = dict(mm_data)
+        mm_kwargs = dict(mm_kwargs)
         audios = mm_data.pop("audios", [])
+
+        mm_kwargs = dict(_presampled_videos_hf_kwargs(mm_data, mm_kwargs))
 
         def pad_to_hop_length(x: np.ndarray, hop_length: int) -> np.ndarray:
             length = x.shape[-1]
@@ -927,9 +945,13 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
 
             audio_in_video_item_idx += 1
 
-            second_per_grid_ts = hf_processor_mm_kwargs.get("second_per_grid_ts", None)
-            if second_per_grid_ts:
-                video_second_per_grid_t = second_per_grid_ts[item_idx]
+            # Prefer the HF-computed value (temporal_patch_size / sampled fps)
+            # over request kwargs;
+            second_per_grid_ts = out_mm_data.get("second_per_grid_ts")
+            if second_per_grid_ts is None:
+                second_per_grid_ts = hf_processor_mm_kwargs.get("second_per_grid_ts", None)
+            if second_per_grid_ts is not None:
+                video_second_per_grid_t = float(second_per_grid_ts[item_idx])
             else:
                 video_second_per_grid_t = 2.0
 
