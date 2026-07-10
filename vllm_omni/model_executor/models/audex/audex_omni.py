@@ -32,7 +32,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import (
+    HasInnerState,
+    IsHybrid,
     MultiModalEmbeddings,
+    SupportsMambaPrefixCaching,
     SupportsMultiModal,
     SupportsPP,
 )
@@ -122,6 +125,8 @@ class NemotronDenseAudexForConditionalGeneration(
     SupportsMultiModal,
     SupportsPP,
 ):
+    _LM_ARCHITECTURE = "NemotronDenseForCausalLM"
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
@@ -138,7 +143,7 @@ class NemotronDenseAudexForConditionalGeneration(
                 vllm_config=vllm_config,
                 hf_config=config,
                 prefix=maybe_prefix(prefix, "language_model"),
-                architectures=["NemotronDenseForCausalLM"],
+                architectures=[self._LM_ARCHITECTURE],
             )
         llm_dtype = self.language_model.config.dtype
         assert isinstance(llm_dtype, torch.dtype)
@@ -270,3 +275,48 @@ class NemotronDenseAudexForConditionalGeneration(
         loaded |= {f"audio_projector.{k}" for k in proj_map}
 
         return loaded
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    AudexMultiModalProcessor,
+    info=AudexProcessingInfo,
+    dummy_inputs=AudexDummyInputsBuilder,
+)
+class NemotronHAudexForConditionalGeneration(
+    NemotronDenseAudexForConditionalGeneration,
+    IsHybrid,
+    HasInnerState,
+    SupportsMambaPrefixCaching,
+):
+    """Audex 30B-A3B audio-understanding model (``checkpoint_folder_full``).
+
+    Mirrors nvidia/Nemotron-Labs-Audex-30B-A3B's
+    ``inference_scripts_vllm/audioqa_scripts/audex_30b_a3b_vllm/modeling_audex_vllm.py``:
+    the same encoder/projector/processing as the dense 2B wrapper around
+    vLLM's native hybrid Mamba+MoE ``NemotronHForCausalLM``, whose state
+    hooks are delegated below.
+    """
+
+    _LM_ARCHITECTURE = "NemotronHForCausalLM"
+
+    is_hybrid = True
+    has_inner_state = True
+    supports_mamba_prefix_caching = True
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
+        return NemotronHForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
+        return NemotronHForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
+        return NemotronHForCausalLM.get_mamba_state_copy_func()

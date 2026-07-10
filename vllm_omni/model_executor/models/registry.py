@@ -104,6 +104,11 @@ _OMNI_MODELS = {
         "audex_omni",
         "NemotronDenseAudexForConditionalGeneration",
     ),
+    "NemotronHAudexForConditionalGeneration": (
+        "audex",
+        "audex_omni",
+        "NemotronHAudexForConditionalGeneration",
+    ),
     "OmniVoiceModel": (
         "omnivoice",
         "omnivoice",
