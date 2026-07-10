@@ -857,11 +857,20 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         if cache_window_frames < sink_size + num_frames_per_block:
             raise ValueError("The causal cache window must fit all sink frames and one complete current block.")
         if qk_norm != "rms_norm_across_heads":
-            raise NotImplementedError(f"Unsupported LingBot qk_norm={qk_norm!r}.")
-        if image_dim is not None or added_kv_proj_dim is not None or pos_embed_seq_len is not None:
-            raise NotImplementedError("LingBot World v2 does not define image cross-attention embeddings.")
+            raise ValueError(
+                f"qk_norm must be 'rms_norm_across_heads' for the LingBot World v2 checkpoint, got {qk_norm!r}."
+            )
+        for field_name, field_value in (
+            ("image_dim", image_dim),
+            ("added_kv_proj_dim", added_kv_proj_dim),
+            ("pos_embed_seq_len", pos_embed_seq_len),
+        ):
+            if field_value is not None:
+                raise ValueError(f"{field_name} must be None because LingBot World v2 has no image embedding path.")
         if quant_config is not None:
-            raise NotImplementedError("LingBot World transformer quantization is not implemented yet.")
+            raise RuntimeError(
+                "quant_config is not supported by the LingBot World transformer; construct the unquantized model."
+            )
 
         patch_size = tuple(patch_size)
         dim = num_attention_heads * attention_head_dim
@@ -1052,6 +1061,12 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         batch_size, _, frames, height, width = hidden_states.shape
         if frames % patch_frames or height % patch_height or width % patch_width:
             raise ValueError("hidden_states dimensions must be divisible by patch_size.")
+        post_patch_frames = frames // patch_frames
+        if post_patch_frames != self.config.num_frames_per_block:
+            raise ValueError(
+                f"Each LingBot forward must contain exactly {self.config.num_frames_per_block} post-patch frames, "
+                f"got {post_patch_frames}."
+            )
         if start_frame % patch_frames:
             raise ValueError("start_frame must align to the temporal patch size.")
         if encoder_hidden_states.ndim != 3:
