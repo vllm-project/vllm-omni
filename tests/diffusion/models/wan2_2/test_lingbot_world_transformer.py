@@ -15,9 +15,16 @@ from tests.diffusion.models.wan2_2 import test_lingbot_world_attention as attent
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 _FIXTURE_PATH = Path(__file__).with_name("fixtures") / "lingbot_world_weight_index_names.json.fixture"
+_SHAPE_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "lingbot_world_official_shapes.json.fixture"
 
 
-def _tiny_model(module, *, num_layers: int = 2):
+def _tiny_model(
+    module,
+    *,
+    num_layers: int = 2,
+    num_frames_per_block: int = 1,
+    sliding_window_num_frames: int = 3,
+):
     return module.CausalLingBotWorldTransformer3DModel(
         patch_size=(1, 2, 2),
         num_attention_heads=2,
@@ -32,8 +39,8 @@ def _tiny_model(module, *, num_layers: int = 2):
         eps=1e-6,
         rope_max_seq_len=16,
         sink_size=1,
-        num_frames_per_block=1,
-        sliding_window_num_frames=3,
+        num_frames_per_block=num_frames_per_block,
+        sliding_window_num_frames=sliding_window_num_frames,
         local_attn_size=-1,
     )
 
@@ -138,6 +145,135 @@ def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera
     assert not torch.equal(camera_output, alternate_output)
 
 
+@pytest.mark.parametrize("frames", [1, 6], ids=("partial", "multiple_blocks"))
+def test_forward_rejects_chunks_that_do_not_equal_configured_block_size(frames: int) -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(
+        module,
+        num_layers=1,
+        num_frames_per_block=3,
+        sliding_window_num_frames=6,
+    )
+    cache = _cache(module, model)
+    snapshot = _self_cache_snapshot(cache)
+    patch_inputs = attention_tests._record_inputs(model.patch_embedding)
+
+    with pytest.raises(ValueError, match="exactly 3 post-patch frames"):
+        model(
+            torch.randn(1, 36, frames, 4, 4),
+            torch.tensor([1.0]),
+            torch.randn(1, 3, 6),
+            torch.randn(1, 6 * 8 * 8, frames, 4, 4),
+            cache=cache,
+            start_frame=0,
+            update_cache=True,
+        )
+
+    assert patch_inputs == []
+    _assert_self_cache_unchanged(cache, snapshot)
+    assert cache.cross_attention == [None]
+
+
+def test_forward_accepts_exactly_one_configured_frame_block() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(
+        module,
+        num_layers=1,
+        num_frames_per_block=3,
+        sliding_window_num_frames=6,
+    )
+
+    output = model(
+        torch.randn(1, 36, 3, 4, 4),
+        torch.tensor([1.0]),
+        torch.randn(1, 3, 6),
+        torch.randn(1, 6 * 8 * 8, 3, 4, 4),
+        cache=_cache(module, model),
+        start_frame=0,
+        update_cache=False,
+    )
+
+    assert output.shape == (1, 2, 3, 4, 4)
+
+
+def test_video_patch_embedding_uses_temporal_height_width_token_order() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, num_frames_per_block=2)
+    hidden_states = torch.zeros(1, 36, 2, 2, 4)
+    hidden_states[0, 0] = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+            [[9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]],
+        ]
+    )
+    with torch.no_grad():
+        model.patch_embedding.weight.zero_()
+        model.patch_embedding.bias.zero_()
+        model.patch_embedding.weight[0, 0, 0, 0, 0] = 1
+
+    tokens = model.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+
+    torch.testing.assert_close(tokens[0, :, 0], torch.tensor([1.0, 3.0, 9.0, 11.0]))
+
+
+def test_unpatchify_restores_two_frame_channel_and_spatial_order() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, num_frames_per_block=2)
+    hidden_states = (
+        torch.stack(
+            (
+                torch.arange(0, 8),
+                torch.arange(10, 18),
+                torch.arange(20, 28),
+                torch.arange(30, 38),
+            )
+        )
+        .unsqueeze(0)
+        .float()
+    )
+    expected = torch.tensor(
+        [
+            [
+                [[0, 2, 10, 12], [4, 6, 14, 16]],
+                [[20, 22, 30, 32], [24, 26, 34, 36]],
+            ],
+            [
+                [[1, 3, 11, 13], [5, 7, 15, 17]],
+                [[21, 23, 31, 33], [25, 27, 35, 37]],
+            ],
+        ],
+        dtype=torch.float32,
+    ).unsqueeze(0)
+
+    output = model._unpatchify(
+        hidden_states,
+        batch_size=1,
+        frames=2,
+        height=1,
+        width=2,
+    )
+
+    torch.testing.assert_close(output, expected)
+
+
+def test_head_modulation_broadcasts_distinct_condition_per_frame() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, num_frames_per_block=2)
+    model.head.norm = torch.nn.Identity()
+    with torch.no_grad():
+        model.head.modulation.zero_()
+        model.head.head.weight.zero_()
+        model.head.head.bias.zero_()
+        model.head.head.weight[:, 0] = 1
+    hidden_states = torch.ones(1, 4, model.dim)
+    timestep_embedding = torch.tensor([[[10.0, 0.0, 0.0, 0.0], [20.0, 0.0, 0.0, 0.0]]])
+    expected = torch.tensor([21.0, 21.0, 41.0, 41.0]).view(1, 4, 1).expand(1, 4, 8)
+
+    output = model.head(hidden_states, timestep_embedding)
+
+    torch.testing.assert_close(output, expected)
+
+
 def test_constructor_defaults_match_official_checkpoint_config() -> None:
     module = attention_tests._load_module()
     parameters = inspect.signature(module.CausalLingBotWorldTransformer3DModel.__init__).parameters
@@ -161,6 +297,28 @@ def test_constructor_defaults_match_official_checkpoint_config() -> None:
     }
 
     assert {name: parameters[name].default for name in expected} == expected
+
+
+def test_constructor_rejects_unsupported_qk_norm_with_config_error() -> None:
+    module = attention_tests._load_module()
+
+    with pytest.raises(ValueError, match="qk_norm.*rms_norm_across_heads"):
+        module.CausalLingBotWorldTransformer3DModel(qk_norm="layer_norm")
+
+
+@pytest.mark.parametrize("field", ["image_dim", "added_kv_proj_dim", "pos_embed_seq_len"])
+def test_constructor_rejects_non_null_image_embedding_fields(field: str) -> None:
+    module = attention_tests._load_module()
+
+    with pytest.raises(ValueError, match=field):
+        module.CausalLingBotWorldTransformer3DModel(**{field: 4})
+
+
+def test_constructor_rejects_unsupported_quantization_with_runtime_error() -> None:
+    module = attention_tests._load_module()
+
+    with pytest.raises(RuntimeError, match="quant_config.*not supported"):
+        module.CausalLingBotWorldTransformer3DModel(quant_config=object())
 
 
 def test_from_config_accepts_diffusers_metadata_and_normalizes_patch_size() -> None:
@@ -277,3 +435,17 @@ def test_checkpoint_weight_index_fixture_matches_model_namespaces() -> None:
     assert fixture["index_parameter_count"] == 40 * len(fixture["block_parameter_suffixes"]) + len(
         fixture["non_block_parameters"]
     )
+
+
+def test_official_default_shapes_match_public_safetensors_header_fixture() -> None:
+    module = attention_tests._load_module()
+    fixture = json.loads(_SHAPE_FIXTURE_PATH.read_text())
+
+    with torch.device("meta"):
+        model = module.CausalLingBotWorldTransformer3DModel()
+    parameters = dict(model.named_parameters())
+    expected_dtype = {"F32": torch.float32}[fixture["dtype"]]
+
+    for name, expected_shape in fixture["parameter_shapes"].items():
+        assert tuple(parameters[name].shape) == tuple(expected_shape), name
+        assert parameters[name].dtype == expected_dtype

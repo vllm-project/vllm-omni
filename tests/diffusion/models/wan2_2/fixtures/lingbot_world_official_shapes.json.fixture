@@ -1,0 +1,24 @@
+{
+  "sources": {
+    "config": "https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers/resolve/main/transformer/config.json",
+    "shard_1_header": "https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers/resolve/main/transformer/diffusion_pytorch_model-00001-of-00008.safetensors",
+    "shard_8_header": "https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers/resolve/main/transformer/diffusion_pytorch_model-00008-of-00008.safetensors"
+  },
+  "dtype": "F32",
+  "parameter_shapes": {
+    "patch_embedding.weight": [5120, 36, 1, 2, 2],
+    "patch_embedding_wancamctrl.weight": [5120, 1536],
+    "c2ws_hidden_states_layer1.weight": [5120, 5120],
+    "c2ws_hidden_states_layer2.weight": [5120, 5120],
+    "blocks.0.modulation": [1, 6, 5120],
+    "blocks.0.self_attn.q.weight": [5120, 5120],
+    "blocks.0.ffn.0.weight": [13824, 5120],
+    "blocks.0.ffn.2.weight": [5120, 13824],
+    "blocks.0.cam_injector_layer1.weight": [5120, 5120],
+    "blocks.0.cam_injector_layer2.weight": [5120, 5120],
+    "blocks.0.cam_scale_layer.weight": [5120, 5120],
+    "blocks.0.cam_shift_layer.weight": [5120, 5120],
+    "head.modulation": [1, 2, 5120],
+    "head.head.weight": [64, 5120]
+  }
+}
