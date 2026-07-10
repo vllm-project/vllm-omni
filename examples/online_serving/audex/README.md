@@ -1,60 +1,78 @@
 # Audex (Nemotron-Labs-Audex-2B) online serving
 
-One checkpoint, four deployment pipelines. Pick the deploy yaml that matches
-the task; the capability matrix:
+One checkpoint, four deployment modes. `run_server.sh` starts the server
+for a given `MODE`; `client.py --mode <mode>` tests it. The capability
+matrix:
 
-| pipeline (`vllm_omni/deploy/<name>.yaml`) | audio in | text out | speech out | general audio out |
-|---|---|---|---|---|
-| `audex_tts` | ❌ | ❌ | ✅ | ❌ |
-| `audex_tta` | ❌ | ❌ | ❌ | ✅ |
-| `audex_thinker_only` | ✅ | ✅ | ❌ | ❌ |
-| `audex_s2s` | ✅ | ✅ | ✅ | ❌ |
+| mode (`vllm_omni/deploy/audex_<mode>.yaml`) | audio in | text out | speech out | general audio out | endpoint |
+|---|---|---|---|---|---|
+| `tts` | ❌ | ❌ | ✅ | ❌ | `/v1/audio/speech` |
+| `tta` | ❌ | ❌ | ❌ | ✅ | `/v1/audio/speech` |
+| `thinker_only` | ✅ | ✅ | ❌ | ❌ | `/v1/chat/completions` |
+| `s2s` | ✅ | ✅ | ✅ | ❌ | both |
 
-- **`audex_tts`** — text → speech. Text-only thinker
-  (`checkpoint_folder_audiogen`) emits `<speechcodec_N>` tokens; the
-  streaming causal speech decoder turns them into 16 kHz waveforms. Serve
-  via `/v1/audio/speech`; classifier-free guidance through
-  `extra_params.cfg_scale` (1.0 disables). This is the DEFAULT pipeline
-  when the repo root is served without a deploy config.
-- **`audex_tta`** — caption → general audio (rain, barking, …). Same
-  audiogen thinker but over the interleaved 4-codebook `<audiocodec_N>`
-  RVQ block, decoded by the external XCodec1 checkpoint. CFG is
-  effectively mandatory (default scale 3.0). Serve via `/v1/audio/speech`.
-- **`audex_thinker_only`** — audio (+ instruction) → text (ASR / audio
-  QA). Single stage: the audio-capable full checkpoint (NV-Whisper
-  encoder + projector + LM). Serve via `/v1/chat/completions` with
-  `input_audio` content.
-- **`audex_s2s`** — the cascaded speech-to-speech deployment: the
-  audio-capable thinker plus the same speech decoder. Per-request
-  `modalities` route the official three passes — `["text"]` requests
-  (ASR, chat) finish at stage 0, only `["audio"]` requests (TTS) stream
-  through the decoder.
+Audio-input modes of `client.py` fall back to vLLM's public
+`mary_had_lamb` asset when `--audio-file` is omitted; CFG defaults follow
+the official settings per mode (tts/s2s 1.5, tta 3.0; `--cfg-scale 1.0`
+disables).
 
-## Quick start
+## tts — text → speech
 
-TTS (default pipeline — no deploy config needed):
+Text-only thinker (`checkpoint_folder_audiogen`) emits `<speechcodec_N>`
+tokens; the streaming causal decoder produces 16 kHz WAVs. This is also
+the DEFAULT pipeline when the repo root is served without a deploy config.
 
 ```bash
-./run_server.sh                       # vllm-omni serve nvidia/Nemotron-Labs-Audex-2B --omni
+./run_server.sh                       # MODE=tts, port 8097
+
+python client.py --mode tts --text "Hello there." --output hello.wav
+# or raw curl:
 curl -s http://localhost:8097/v1/audio/speech \
     -H 'Content-Type: application/json' \
     -d '{"model": "nvidia/Nemotron-Labs-Audex-2B", "input": "Hello there.", "response_format": "wav", "extra_params": {"cfg_scale": 1.5}}' \
     -o hello.wav
 ```
 
-Speech-to-speech (three-pass cascade against one server):
+## tta — caption → general audio
+
+Same thinker over the 4-codebook `<audiocodec_N>` RVQ block, decoded by
+the external XCodec1 checkpoint (auto-downloaded; override with
+`XCODEC1_PATH`). Clips are capped at 10 s.
 
 ```bash
-vllm-omni serve nvidia/Nemotron-Labs-Audex-2B --omni --port 8098 \
-    --trust-remote-code \
-    --stage-configs-path vllm_omni/deploy/audex_s2s.yaml
+MODE=tta ./run_server.sh
 
-python client.py --audio-file question.wav --port 8098 --output answer.wav
+python client.py --mode tta --caption "Heavy rain falling on a tin roof." \
+    --output rain.wav
 ```
 
-Text-to-audio / audio understanding: serve with
-`--stage-configs-path vllm_omni/deploy/audex_tta.yaml` (then
-`/v1/audio/speech` with the caption as `input`) or
-`vllm_omni/deploy/audex_thinker_only.yaml` (then `/v1/chat/completions`
-with `input_audio`). Offline counterparts for all four live in
+## thinker_only — audio (+ instruction) → text
+
+Single-stage audio understanding on the full checkpoint (NV-Whisper
+encoder + projector + LM). Send the clip as `input_audio` chat content.
+
+```bash
+MODE=thinker_only ./run_server.sh
+
+python client.py --mode thinker_only                      # transcribe the demo asset
+python client.py --mode thinker_only --audio-file a.wav \
+    --question "What language is being spoken?"
+```
+
+## s2s — spoken question → spoken answer
+
+The audio-capable thinker plus the speech decoder in one deployment.
+`client.py --mode s2s` runs the official three passes: ASR (chat with
+`input_audio`) → chat on the transcript → TTS on the answer. Text-final
+passes carry `"modalities": ["text"]`; only the TTS pass streams through
+the decoder.
+
+```bash
+MODE=s2s PORT=8098 ./run_server.sh
+
+python client.py --mode s2s --port 8098 \
+    --audio-file question.wav --output answer.wav
+```
+
+Offline counterparts (no HTTP, one `Omni` engine per script) live in
 `examples/offline_inference/audex/`.
