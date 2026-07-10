@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.multimodal.audio import AudioResampler
 from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
+from vllm_ascend.ascend_forward_context import get_forward_context
 from vllm_ascend.sample.sampler import apply_top_k_top_p, random_sample
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, nd_to_nz_2d
 
@@ -35,6 +36,11 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._embedding_dtype = _RUNTIME_DTYPE
         self._prompt_builder._embedding_dtype = _RUNTIME_DTYPE
+        # 310P random sampling operators cannot be captured by ACL graphs.
+        # Keep Talker-MTP eager so CodePredictor can replay its own NPU graphs
+        # without changing sampling semantics.
+        self.talker_mtp_graph_safe = False
+        self.talker_mtp_accepts_per_row_generators = True
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
@@ -438,7 +444,10 @@ class _Qwen3TTSTalkerCodePredictor310P(
                 )
 
             device_graph_entry = self._device_graphs.get(graph_key)
-            if device_graph_entry is not None:
+            # talker_mtp ACL graph owns outer capture. Nested NPUGraph replay
+            # is unsupported on ACL capture stream; capture model_fwd instead.
+            in_outer_graph_capture = get_forward_context().capturing
+            if device_graph_entry is not None and not in_outer_graph_capture:
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
             else:

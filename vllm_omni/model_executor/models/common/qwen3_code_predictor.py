@@ -34,6 +34,7 @@ _UNIFORM_EPS = 1e-20
 
 if current_omni_platform.is_npu():
     import torch_npu
+    from vllm_ascend.ascend_forward_context import get_forward_context
 
 
 # ===================================================================
@@ -45,27 +46,13 @@ if current_omni_platform.is_npu():
 # HuggingFace reference on CPU/CUDA. vLLM's fused kernels (RMSNorm,
 # QKVParallel, get_rope) introduce small precision differences that compound
 # across the autoregressive steps of the code predictor, causing severe audio
-# quality degradation. The Ascend fused norm/RoPE kernels and prepacked linear
-# weights below are guarded by NPU tensor/device checks.
+# quality degradation. The Ascend fused norm/RoPE kernels below are dispatched
+# by the current device platform.
 #
 # See: https://github.com/vllm-project/vllm-omni/issues/2274
 
 
-class _NativeFallbackCustomOp(CustomOp):
-    def forward_cuda(self, *args, **kwargs):
-        return self.forward_native(*args, **kwargs)
-
-    def forward_hip(self, *args, **kwargs):
-        return self.forward_native(*args, **kwargs)
-
-    def forward_xpu(self, *args, **kwargs):
-        return self.forward_native(*args, **kwargs)
-
-    def forward_musa(self, *args, **kwargs):
-        return self.forward_native(*args, **kwargs)
-
-
-class _RMSNorm(_NativeFallbackCustomOp):
+class _RMSNorm(CustomOp):
     """RMSNorm with HuggingFace-compatible CPU/CUDA math and an NPU fast path."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
@@ -80,6 +67,18 @@ class _RMSNorm(_NativeFallbackCustomOp):
             self.variance_epsilon,
         )
         return hidden_states
+
+    def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(hidden_states)
+
+    def forward_hip(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(hidden_states)
+
+    def forward_xpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(hidden_states)
+
+    def forward_musa(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(hidden_states)
 
     def forward_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -96,7 +95,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-class _RotaryEmbedding(_NativeFallbackCustomOp):
+class _RotaryEmbedding(CustomOp):
     """RoPE with HuggingFace-compatible CPU/CUDA math and cached NPU tables."""
 
     def __init__(self, config) -> None:
@@ -119,6 +118,18 @@ class _RotaryEmbedding(_NativeFallbackCustomOp):
     def forward_npu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.cos_cached[position_ids].to(dtype=x.dtype), self.sin_cached[position_ids].to(dtype=x.dtype)
 
+    def forward_cuda(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(x, position_ids)
+
+    def forward_hip(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(x, position_ids)
+
+    def forward_xpu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(x, position_ids)
+
+    def forward_musa(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(x, position_ids)
+
     def forward_native(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # position_ids: [batch, seq_len]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
@@ -140,7 +151,7 @@ class _RotaryEmbedding(_NativeFallbackCustomOp):
 # ===================================================================
 
 
-class CodePredictorAttention(_NativeFallbackCustomOp):
+class CodePredictorAttention(nn.Module):
     """Multi-head self-attention for code predictor.
 
     Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
@@ -176,6 +187,11 @@ class CodePredictorAttention(_NativeFallbackCustomOp):
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.register_buffer("_fusion_causal_mask", torch.empty(0, dtype=torch.bool), persistent=False)
+        self._apply_rope = self._apply_native_rope
+        self._attention = self._forward_native_attention
+        if current_omni_platform.is_npu():
+            self._apply_rope = self._apply_npu_rope
+            self._attention = self._forward_npu_attention
 
     def _project_qkv(
         self,
@@ -256,7 +272,42 @@ class CodePredictorAttention(_NativeFallbackCustomOp):
             sync=True,
         )[0]
 
-    def forward_native(
+    def _forward_native_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bsz: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=self.scaling,
+            is_causal=True,
+            enable_gqa=self.is_gqa,
+        )
+
+    def _apply_native_rope(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
+
+    def _apply_npu_rope(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch_npu.npu_rotary_mul(q, cos, sin), torch_npu.npu_rotary_mul(k, cos, sin)
+
+    def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -267,35 +318,8 @@ class CodePredictorAttention(_NativeFallbackCustomOp):
         # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
         cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
         sin = sin.unsqueeze(1)
-        q = (q * cos) + (_rotate_half(q) * sin)
-        k = (k * cos) + (_rotate_half(k) * sin)
-
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale=self.scaling,
-            is_causal=True,
-            enable_gqa=self.is_gqa,
-        )
-
-        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-        return self.o_proj(attn_out)
-
-    def forward_npu(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        q, k, v, bsz, seq_len = self._project_qkv(hidden_states)
-
-        cos, sin = position_embeddings
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        q = torch_npu.npu_rotary_mul(q, cos, sin)
-        k = torch_npu.npu_rotary_mul(k, cos, sin)
-
-        attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+        q, k = self._apply_rope(q, k, cos, sin)
+        attn_out = self._attention(q, k, v, bsz, seq_len)
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -324,7 +348,7 @@ class CodePredictorMLP(nn.Module):
 # ===================================================================
 
 
-class CodePredictorDecoderLayer(_NativeFallbackCustomOp):
+class CodePredictorDecoderLayer(nn.Module):
     """Transformer decoder layer (SDPA, no KV cache)."""
 
     def __init__(self, config, *, prefix: str = "") -> None:
@@ -333,36 +357,42 @@ class CodePredictorDecoderLayer(_NativeFallbackCustomOp):
         self.mlp = CodePredictorMLP(config, prefix=f"{prefix}.mlp")
         self.input_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._post_attention_residual_norm = self._post_attention_residual_norm_native
+        if current_omni_platform.is_npu():
+            self._post_attention_residual_norm = self._post_attention_residual_norm_npu
 
-    def forward_native(
+    def _post_attention_residual_norm_native(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
-    def forward_npu(
+    def _post_attention_residual_norm_npu(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, _, residual = torch_npu.npu_add_rms_norm(
             hidden_states,
             residual,
             self.post_attention_layernorm.weight,
             self.post_attention_layernorm.variance_epsilon,
         )
+        return hidden_states, residual
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        hidden_states, residual = self._post_attention_residual_norm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
@@ -944,8 +974,11 @@ class CodePredictorWrapper(nn.Module):
             # Use captured device graph if available, otherwise call compiled fn.
             device_graph_entry = self._device_graphs.get(graph_key)
 
-            # Run transformer (device graph replay or compiled forward)
-            if device_graph_entry is not None:
+            # The talker MTP ACL graph owns the outer capture. Replaying a
+            # nested code-predictor NPUGraph on that capture stream is not
+            # supported by ACL, so capture the eager model path instead.
+            in_outer_graph_capture = current_omni_platform.is_npu() and get_forward_context().capturing
+            if device_graph_entry is not None and not in_outer_graph_capture:
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
             else:
