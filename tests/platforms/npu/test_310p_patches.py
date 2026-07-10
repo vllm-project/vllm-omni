@@ -67,10 +67,34 @@ def _install_qwen3_tts_patch_fakes(monkeypatch: pytest.MonkeyPatch):
     class FakeCodePredictorBaseModel(torch.nn.Module):
         pass
 
-    class FakeMimiEuclideanCodebook(torch.nn.Module):
-        @property
-        def embed(self):
-            return self._embed
+    class FakeCodePredictorWrapper(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.codec_embedding = torch.nn.ModuleList([torch.nn.Embedding(8, 4), torch.nn.Embedding(8, 4)])
+            self.model.linear = torch.nn.Linear(4, 4, bias=False)
+            self.lm_head = torch.nn.ModuleList([torch.nn.Linear(4, 8, bias=False), torch.nn.Linear(4, 8, bias=False)])
+            self.small_to_mtp_projection = torch.nn.Linear(4, 4, bias=False)
+            with torch.no_grad():
+                self.small_to_mtp_projection.weight.copy_(torch.eye(4))
+            self._wrapper_config = SimpleNamespace(use_parallel_embedding=False)
+            self._static_310p_ready = False
+            self._projected_codec_embed_weight = None
+
+        def load_weights(self, weights):
+            del weights
+            return {"loaded"}
+
+        def forward(self, *args, **kwargs):
+            self.forward_args = args
+            self.forward_kwargs = kwargs
+            return "fallback"
+
+    class FakeCode2WavBase(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            super().__init__()
 
     class FakeEncoder:
         def __init__(self):
@@ -136,8 +160,29 @@ def _install_qwen3_tts_patch_fakes(monkeypatch: pytest.MonkeyPatch):
         CodePredictorAttention=FakeCodePredictorAttention,
         CodePredictorDecoderLayer=FakeCodePredictorDecoderLayer,
         CodePredictorBaseModel=FakeCodePredictorBaseModel,
+        CodePredictorWrapper=FakeCodePredictorWrapper,
         _rotate_half=lambda x: x,
     )
+    fake_qwen3_tts_code_predictor_vllm = _install_fake_module(
+        monkeypatch,
+        "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code_predictor_vllm",
+        Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM=FakeCodePredictorWrapper,
+        Qwen3TTSTalkerCodePredictorModelVLLM=FakeCodePredictorBaseModel,
+        CodePredictorWrapper=FakeCodePredictorWrapper,
+    )
+    fake_qwen3_tts_code2wav = _install_fake_module(
+        monkeypatch,
+        "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav",
+        Qwen3TTSCode2Wav=FakeCode2WavBase,
+    )
+    fake_tokenizer_12hz = _install_fake_module(monkeypatch, "vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz")
+    fake_tokenizer_v2 = _install_fake_module(
+        monkeypatch,
+        "vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2",
+        Qwen3TTSTokenizerV2DecoderRMSNorm=torch.nn.Module,
+        apply_rotary_pos_emb=lambda q, k, cos, sin, position_ids=None, unsqueeze_dim=1: (q, k),
+    )
+    fake_tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 = fake_tokenizer_v2
     fake_prompt_builder = _install_fake_module(
         monkeypatch,
         "vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder",
@@ -150,22 +195,40 @@ def _install_qwen3_tts_patch_fakes(monkeypatch: pytest.MonkeyPatch):
         Qwen3TTSTalkerForConditionalGeneration=FakeTalkerBase,
         Qwen3TTSPromptEmbedsBuilder=FakePromptEmbedsBuilder,
     )
-    fake_modeling_mimi = _install_fake_module(
-        monkeypatch,
-        "transformers.models.mimi.modeling_mimi",
-        MimiEuclideanCodebook=FakeMimiEuclideanCodebook,
-    )
-    fake_mimi = _install_fake_module(
-        monkeypatch,
-        "transformers.models.mimi",
-        modeling_mimi=fake_modeling_mimi,
-    )
 
     _install_fake_module(monkeypatch, "vllm")
     _install_fake_module(monkeypatch, "vllm.multimodal")
     _install_fake_module(monkeypatch, "vllm.multimodal.audio", AudioResampler=FakeAudioResampler)
-    _install_fake_module(monkeypatch, "transformers")
-    _install_fake_module(monkeypatch, "transformers.models", mimi=fake_mimi)
+    _install_fake_module(monkeypatch, "torch_npu", npu_format_cast=lambda weight, _fmt: weight)
+    _install_fake_module(monkeypatch, "vllm_ascend")
+    _install_fake_module(monkeypatch, "vllm_ascend._310p")
+    _install_fake_module(monkeypatch, "vllm_ascend._310p.attention")
+    _install_fake_module(
+        monkeypatch,
+        "vllm_ascend._310p.attention.attention_mask",
+        AttentionMaskBuilder310=SimpleNamespace(
+            gen_causal_additive_mask=lambda max_seq, device: torch.zeros(
+                max_seq,
+                max_seq,
+                device=device,
+            )
+        ),
+    )
+    _install_fake_module(monkeypatch, "vllm_ascend.sample")
+    _install_fake_module(
+        monkeypatch,
+        "vllm_ascend.sample.sampler",
+        apply_top_k_top_p=lambda logits, **_kwargs: logits,
+        random_sample=lambda probs, _generators: probs.argmax(dim=-1, keepdim=True),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm_ascend.utils",
+        ACL_FORMAT_FRACTAL_NZ=29,
+        aligned_16=lambda tensor: tensor,
+        maybe_trans_nz=lambda weight: weight,
+        nd_to_nz_2d=lambda tensor: tensor,
+    )
     _install_fake_module(monkeypatch, "vllm_omni")
     _install_fake_module(monkeypatch, "vllm_omni.model_executor")
     _install_fake_module(monkeypatch, "vllm_omni.model_executor.models")
@@ -178,9 +241,19 @@ def _install_qwen3_tts_patch_fakes(monkeypatch: pytest.MonkeyPatch):
         monkeypatch,
         "vllm_omni.model_executor.models.qwen3_tts",
         prompt_embeds_builder=fake_prompt_builder,
+        qwen3_tts_code2wav=fake_qwen3_tts_code2wav,
+        qwen3_tts_code_predictor_vllm=fake_qwen3_tts_code_predictor_vllm,
         qwen3_tts_talker=fake_talker,
+        tokenizer_12hz=fake_tokenizer_12hz,
     )
-    return fake_qwen3_code_predictor, fake_prompt_builder, fake_talker
+    return (
+        fake_qwen3_code_predictor,
+        fake_qwen3_tts_code_predictor_vllm,
+        fake_qwen3_tts_code2wav,
+        fake_tokenizer_v2,
+        fake_prompt_builder,
+        fake_talker,
+    )
 
 
 def _load_qwen3_tts_patch(monkeypatch: pytest.MonkeyPatch):
@@ -193,7 +266,7 @@ def _load_qwen3_tts_patch(monkeypatch: pytest.MonkeyPatch):
 def test_registry_applies_worker_once_and_model_patch_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
     registry_path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "__init__.py"
     registry = _load_source_module("vllm_omni_test_310p_patch_registry", registry_path)
-    calls = {"worker": 0, "talker": 0}
+    calls = {"worker": 0, "talker": 0, "code2wav": 0}
 
     _install_fake_module(
         monkeypatch,
@@ -204,14 +277,16 @@ def test_registry_applies_worker_once_and_model_patch_lazily(monkeypatch: pytest
         monkeypatch,
         "vllm_omni.platforms.npu._310p.patch.qwen3_tts",
         apply_talker_patches=lambda: calls.__setitem__("talker", calls["talker"] + 1),
+        apply_code2wav_patches=lambda: calls.__setitem__("code2wav", calls["code2wav"] + 1),
     )
 
     registry.apply_patches()
     registry.apply_patches()
     registry.apply_model_patches(SimpleNamespace(model_arch="OtherModel"))
     registry.apply_model_patches(SimpleNamespace(model_arch="Qwen3TTSTalkerForConditionalGeneration"))
+    registry.apply_model_patches(SimpleNamespace(model_arch="Qwen3TTSCode2Wav"))
 
-    assert calls == {"worker": 1, "talker": 1}
+    assert calls == {"worker": 1, "talker": 1, "code2wav": 1}
 
 
 def test_worker_patch_replaces_base_and_runs_disable_jit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -247,7 +322,20 @@ def test_worker_patch_replaces_base_and_runs_disable_jit(monkeypatch: pytest.Mon
 
 
 def test_qwen3_tts_patch_replaces_target_classes(monkeypatch: pytest.MonkeyPatch) -> None:
-    module, (fake_code_predictor, fake_prompt_builder, fake_talker) = _load_qwen3_tts_patch(monkeypatch)
+    (
+        module,
+        (
+            fake_code_predictor,
+            fake_code_predictor_vllm,
+            _fake_code2wav,
+            _fake_tokenizer_v2,
+            fake_prompt_builder,
+            fake_talker,
+        ),
+    ) = _load_qwen3_tts_patch(monkeypatch)
+
+    original_common_wrapper = fake_code_predictor.CodePredictorWrapper
+    original_vllm_wrapper = fake_code_predictor_vllm.CodePredictorWrapper
 
     module.apply_talker_patches()
 
@@ -257,6 +345,73 @@ def test_qwen3_tts_patch_replaces_target_classes(monkeypatch: pytest.MonkeyPatch
     assert fake_code_predictor.CodePredictorAttention is module._Qwen3CodePredictorAttention310P
     assert fake_code_predictor.CodePredictorDecoderLayer is module._Qwen3CodePredictorDecoderLayer310P
     assert fake_code_predictor.CodePredictorBaseModel is module._Qwen3CodePredictorBaseModel310P
+    assert (
+        fake_code_predictor_vllm.Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+        is module._Qwen3TTSTalkerCodePredictor310P
+    )
+    assert fake_code_predictor.CodePredictorWrapper is original_common_wrapper
+    assert fake_code_predictor_vllm.CodePredictorWrapper is original_vllm_wrapper
+
+
+def test_qwen3_tts_code2wav_patch_only_selects_310p_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, (_, _, fake_code2wav, fake_tokenizer_v2, _, _) = _load_qwen3_tts_patch(monkeypatch)
+    original_rms_norm = fake_tokenizer_v2.Qwen3TTSTokenizerV2DecoderRMSNorm
+    original_apply_rotary = fake_tokenizer_v2.apply_rotary_pos_emb
+
+    module.apply_code2wav_patches()
+    module.apply_code2wav_patches()
+
+    assert fake_code2wav.Qwen3TTSCode2Wav is module._Qwen3TTSCode2Wav310P
+    assert fake_tokenizer_v2.Qwen3TTSTokenizerV2DecoderRMSNorm is original_rms_norm
+    assert fake_tokenizer_v2.apply_rotary_pos_emb is original_apply_rotary
+
+    code2wav = module._Qwen3TTSCode2Wav310P(
+        vllm_config=SimpleNamespace(device_config=SimpleNamespace(device=torch.device("cpu")))
+    )
+
+    assert code2wav._decoder_runtime_dtype(torch.device("cpu")) is torch.float16
+
+
+def test_qwen3_tts_code_predictor_patch_prepares_static_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, _ = _load_qwen3_tts_patch(monkeypatch)
+    predictor = module._Qwen3TTSTalkerCodePredictor310P(
+        vllm_config=object(),
+        config=object(),
+        talker_config=object(),
+    )
+    codec_weight_before = predictor.model.codec_embedding[0].weight.detach().clone()
+
+    loaded = predictor.load_weights(iter(()))
+    predictor._prepare_static_weights_310p()
+
+    assert loaded == {"loaded"}
+    assert predictor._static_310p_ready is True
+    assert predictor._lm_heads_list == list(predictor.lm_head)
+    assert predictor._codec_embeds_list == list(predictor.model.codec_embedding)
+    assert predictor._projected_codec_embed_weight.shape == (2, 8, 4)
+    torch.testing.assert_close(predictor._projected_codec_embed_weight[0], codec_weight_before)
+
+
+def test_qwen3_tts_code_predictor_cpu_fallback_preserves_generators(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, _ = _load_qwen3_tts_patch(monkeypatch)
+    predictor = module._Qwen3TTSTalkerCodePredictor310P(
+        vllm_config=object(),
+        config=object(),
+        talker_config=object(),
+    )
+    generators = [None]
+
+    result = predictor.forward(
+        torch.zeros(1, dtype=torch.long),
+        torch.zeros(1, 4),
+        torch.zeros(1, 4),
+        generator=None,
+        generators=generators,
+    )
+
+    assert result == "fallback"
+    assert predictor.forward_kwargs["generator"] is None
+    assert predictor.forward_kwargs["generators"] is generators
 
 
 def test_qwen3_tts_talker_patch_uses_fp16_runtime_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,11 +421,11 @@ def test_qwen3_tts_talker_patch_uses_fp16_runtime_dtype(monkeypatch: pytest.Monk
     assert talker._embedding_dtype is torch.float16
     assert talker._prompt_builder._embedding_dtype is torch.float16
     assert talker.load_weights([]) == {"loaded"}
-    assert talker.encoder.to_calls[-1] == {"dtype": torch.float16}
+    assert talker.encoder.to_calls[-1] == {"device": torch.device("cpu"), "dtype": torch.float32}
 
     codes = talker._encode_ref_audio_batch([np.zeros(8, dtype=np.float32)], 24000, device=torch.device("cpu"))
 
-    assert talker.encoder.last_input_dtype is torch.float16
+    assert talker.encoder.last_input_dtype is torch.float32
     assert len(codes) == 1
     assert codes[0].dtype is torch.long
     assert codes[0].shape == (4, 2)
@@ -311,28 +466,41 @@ def test_qwen3_tts_prompt_patch_runs_stft_frontend_on_cpu(monkeypatch: pytest.Mo
     assert speaker.dtype is torch.float16
 
 
-def test_qwen3_tts_mimi_codebook_quantize_uses_cpu_fp32_cdist(monkeypatch: pytest.MonkeyPatch) -> None:
-    module, _ = _load_qwen3_tts_patch(monkeypatch)
-    real_cdist = torch.cdist
-    captured = {}
+def test_qwen3_tts_common_npu_optimizations_live_outside_310p_patch() -> None:
+    root = _repo_root()
+    patch_source = (root / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "qwen3_tts.py").read_text()
+    code_predictor_source = (
+        root / "vllm_omni" / "model_executor" / "models" / "common" / "qwen3_code_predictor.py"
+    ).read_text()
+    code2wav_source = (
+        root / "vllm_omni" / "model_executor" / "models" / "qwen3_tts" / "qwen3_tts_code2wav.py"
+    ).read_text()
+    tokenizer_source = (
+        root
+        / "vllm_omni"
+        / "model_executor"
+        / "models"
+        / "qwen3_tts"
+        / "tokenizer_12hz"
+        / "modeling_qwen3_tts_tokenizer_v2.py"
+    ).read_text()
 
-    def fake_cdist(x1, x2, p=2):
-        captured["x1_device"] = x1.device
-        captured["x2_device"] = x2.device
-        captured["x1_dtype"] = x1.dtype
-        captured["x2_dtype"] = x2.dtype
-        return real_cdist(x1, x2, p=p)
+    assert "_MimiEuclideanCodebook310P" not in patch_source
+    assert "_Qwen3TTSTokenizerV2DecoderRMSNorm310P" not in patch_source
+    assert "_code2wav_apply_rotary_pos_emb_310p" not in patch_source
+    assert "maybe_trans_nz" not in patch_source
 
-    monkeypatch.setattr(torch, "cdist", fake_cdist)
-    codebook = object.__new__(module._MimiEuclideanCodebook310P)
-    codebook._embed = torch.tensor([[0.0, 0.0], [2.0, 0.0]], dtype=torch.float16)
+    assert "torch_npu.npu_rms_norm" in code_predictor_source
+    assert "torch_npu.npu_add_rms_norm" in code_predictor_source
+    assert "torch_npu.npu_rotary_mul" in code_predictor_source
+    assert "def _prepare_npu_weights" in code_predictor_source
+    assert "maybe_trans_nz" in code_predictor_source
 
-    indices = codebook.quantize(torch.tensor([[0.1, 0.0], [1.8, 0.0]], dtype=torch.float16))
+    assert "def _prepare_npu_decoder_weights" in code2wav_source
+    assert "nn.Conv1d" in code2wav_source
+    assert "nn.ConvTranspose1d" in code2wav_source
+    assert "_ACL_FORMAT_FRACTAL_Z" in code2wav_source
+    assert "maybe_trans_nz" in code2wav_source
 
-    assert captured == {
-        "x1_device": torch.device("cpu"),
-        "x2_device": torch.device("cpu"),
-        "x1_dtype": torch.float32,
-        "x2_dtype": torch.float32,
-    }
-    assert indices.tolist() == [0, 1]
+    assert "torch_npu.npu_rms_norm" in tokenizer_source
+    assert "torch_npu.npu_rotary_mul" in tokenizer_source
