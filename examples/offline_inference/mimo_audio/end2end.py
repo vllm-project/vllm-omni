@@ -30,6 +30,11 @@ SEED = 42
 
 MAX_CODE2WAV_TOKENS = 18192  # Maximum tokens supported by code2wav model
 
+# MiMoAudio was trained with short reference clips (~3-10 s).
+# Long reference audio confuses the model, causing repetition and loss of
+# speaker identity. Limit to 8 seconds at 24 kHz.
+MAX_REF_AUDIO_SAMPLES = 8 * 24000  # 192000 samples = 8 seconds
+
 
 class QueryResult(NamedTuple):
     inputs: dict
@@ -195,20 +200,18 @@ def main(args):
         temperature=0.0,
         top_p=1.0,
         top_k=-1,
-        max_tokens=2048,
+        max_tokens=8192,
         seed=SEED,
-        logit_bias={},
-        repetition_penalty=1.1,
+        stop=["<|eostm|>", "<|im_end|>"],
+        stop_token_ids=[151671, 151645],  # <|eostm|>=151671, <|im_end|>=151645
     )
 
     code2wav_sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
         top_k=-1,
-        max_tokens=4096 * 16,
+        max_tokens=18192,
         seed=SEED,
-        detokenize=True,
-        repetition_penalty=1.1,
     )
 
     sampling_params_list = [
@@ -220,28 +223,43 @@ def main(args):
     # Notice: The audio files used in this example are available at: https://github.com/XiaomiMiMo/MiMo-Audio/tree/main/examples
     if args.query_type == "tts_sft":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft
+        if text is None:
+            text = "The weather is so nice today."
         query_result = query_func(text=text, read_text_only=True)
     elif args.query_type == "tts_sft_with_instruct":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_instruct --instruct "Speak happily in a child's voice"
+        if text is None:
+            text = "The weather is so nice today."
         query_result = query_func(text=text, instruct=instruct, read_text_only=True)
     elif args.query_type == "tts_sft_with_audio":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_audio --audio_path "./spoken_dialogue_assistant_turn_1.wav"
-        audio_list = [get_audio_data(audio_path)]
+        if text is None:
+            text = "The weather is so nice today."
+        raw_audio = get_audio_data(audio_path)
+        # Truncate reference audio to avoid model confusion (repetition / voice loss)
+        sig, sr = raw_audio
+        if len(sig) > MAX_REF_AUDIO_SAMPLES:
+            sig = sig[:MAX_REF_AUDIO_SAMPLES]
+        audio_list = [(sig, sr)]
         query_result = query_func(text=text, read_text_only=True, prompt_speech=audio_path, audio_list=audio_list)
     elif args.query_type == "tts_sft_with_natural_instruction":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type tts_sft_with_natural_instruction --text "In a panting young male voice, he said: I can't run anymore, wait for me!"
         query_result = query_func(text=text, read_text_only=False)
     elif args.query_type == "audio_trancribing_sft":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type audio_trancribing_sft --audio_path "./spoken_dialogue_assistant_turn_1.wav"
-        audio_path = "spoken_dialogue_assistant_turn_1.wav"
-        text = "Please transcribe this audio and repeat it once."
+        if audio_path is None:
+            audio_path = "spoken_dialogue_assistant_turn_1.wav"
+        if text is None:
+            text = "Please transcribe this audio and repeat it once."
         query_result = query_func(text=text, audio_path=audio_path, use_sostm=True)
     elif args.query_type == "audio_understanding_sft":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type audio_understanding_sft --text "Summarize the audio." --audio_path "./spoken_dialogue_assistant_turn_1.wav"
         query_result = query_func(text=text, audio_path=audio_path)
+        query_result["modalities"] = ["text"]
     elif args.query_type == "audio_understanding_sft_with_thinking":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type audio_understanding_sft_with_thinking --text "Summarize the audio." --audio_path "./spoken_dialogue_assistant_turn_1.wav"
         query_result = query_func(text=text, audio_path=audio_path, thinking=True)
+        query_result["modalities"] = ["text"]
     elif args.query_type == "spoken_dialogue_sft_multiturn":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type spoken_dialogue_sft_multiturn  --audio_path "./prompt_speech_zh_m.wav"
         first_turn_text_response = "我没办法获取实时的天气信息。不过呢，你可以试试几个方法来查看今天的天气。首先，你可以用手机自带的天气功能，比如苹果手机的天气应用，或者直接在系统设置里查看。其次，你也可以用一些专业的天气服务，像是国外的AccuWeather、Weather.com，或者国内的中国天气网、墨迹天气等等。再有就是，你还可以在谷歌或者百度里直接搜索你所在的城市加上天气这两个字。如果你能告诉我你所在的城市，我也可以帮你分析一下历史天气趋势，不过最新的数据还是需要你通过官方渠道去获取哦。"
@@ -249,7 +267,12 @@ def main(args):
         s1_audio_path = "weather_of_today.mp3"
         s2_audio_path = "spoken_dialogue_assistant_turn_1.wav"
         s3_audio_path = "beijing.mp3"
-        audio_list.append(get_audio_data(audio_path))
+        # Truncate reference voice audio to avoid model confusion
+        ref_raw = get_audio_data(audio_path)
+        ref_sig, ref_sr = ref_raw
+        if len(ref_sig) > MAX_REF_AUDIO_SAMPLES:
+            ref_sig = ref_sig[:MAX_REF_AUDIO_SAMPLES]
+        audio_list.append((ref_sig, ref_sr))
         audio_list.append(get_audio_data(s1_audio_path))
         audio_list.append(get_audio_data(s2_audio_path))
         audio_list.append(get_audio_data(s3_audio_path))
@@ -276,6 +299,7 @@ def main(args):
             {"role": "user", "content": s2_audio_path},
         ]
         query_result = query_func(message_list, thinking=True, audio_list=audio_list)
+        query_result["modalities"] = ["text"]
     elif args.query_type == "text_dialogue_sft_multiturn":
         # python3 -u end2end.py --stage-configs-path ${config_file} --model ${MODEL_PATH}  --query-type text_dialogue_sft_multiturn
         message_list = [
@@ -284,6 +308,7 @@ def main(args):
             {"role": "user", "content": "Beijing"},
         ]
         query_result = query_func(message_list=message_list)
+        query_result["modalities"] = ["text"]
     else:
         raise ValueError(f"Invalid query type: {args.query_type}")
 
@@ -336,6 +361,11 @@ def main(args):
             if audio_numpy.ndim > 1:
                 audio_numpy = audio_numpy.flatten()
 
+            # Skip if audio is too short to be valid (e.g. text-only output)
+            if audio_numpy.size < 240:  # less than 10ms at 24kHz
+                print(f"Request ID: {request_id}, Skipping invalid/empty audio ({audio_numpy.size} samples)")
+                continue
+
             # Save audio file with explicit WAV format
             sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
             print(f"Request ID: {request_id}, Audio saved to {output_wav}")
@@ -354,7 +384,7 @@ def parse_args():
         "--text",
         "-t",
         type=str,
-        default="",
+        default=None,
         help="input text",
     )
     parser.add_argument(

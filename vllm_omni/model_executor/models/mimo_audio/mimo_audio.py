@@ -349,6 +349,18 @@ class MiMoAudioDataParser(MultiModalDataParser):
 
 
 class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProcessingInfo]):
+    def _hf_processor_applies_updates(
+        self,
+        prompt_text,
+        mm_items,
+        hf_processor_mm_kwargs,
+        tokenization_kwargs,
+    ) -> bool:
+        # MiMoAudio's _call_hf_processor does NOT expand <|empty|> placeholders
+        # into audio feature tokens. We must let vllm apply the updates itself
+        # via _apply_prompt_updates (requires is_update_applied=False).
+        return False
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -357,7 +369,8 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         sampling_rate = 24000
-        audios = mm_data.pop("audios", [])
+        mm_data = dict(mm_data)
+        audios = mm_data.pop("audios", []) or mm_data.pop("audio", [])
         tokenizer = self.info.get_tokenizer()
         if audios:
             mm_data["audio"] = audios
@@ -610,6 +623,7 @@ class MiMoAudioForConditionalGeneration(
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         mm_features = info_dict.get("mm_features", [])
         mm_embeddings = []
+
         prompt_ids = torch.tensor(
             interleave_5_and_5_in_span(input_ids.tolist()),
             dtype=torch.int64,
@@ -865,8 +879,10 @@ class MiMoAudioForConditionalGeneration(
     def generate_audio(self, code: torch.Tensor):
         token2wav_dev = self._module_device(self.token2wav)
         # Check if in CUDA graph capture phase
-        is_capturing = torch.cuda.is_current_stream_capturing()
-
+        if torch.cuda.is_available() and token2wav_dev.type == "cuda":
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        else:
+            is_capturing = False
         if isinstance(code, torch.Tensor):
             if is_capturing:
                 # During CUDA graph capture, avoid device movement operations
