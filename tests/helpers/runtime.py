@@ -47,6 +47,7 @@ from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     decode_b64_image,
 )
+from tests.model_tests.diffusion.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
@@ -2815,11 +2816,24 @@ def iter_omni_server(
 
     with omni_fixture_lock:
         params: OmniServerParams = request.param
-        model = model_prefix + params.model
+        # For now, when a tiny model is substituted, we preserve the original model
+        # name via --served-model-name (so that the server still accepts requests with
+        # the original name). We also do the same for server.model so that tests reading
+        # server.model send the correct name in requests.
+        #
+        # TODO: core models on this path currently do not clean up tiny models, although
+        # tiny model paths are deterministic, so it's not a huge footprint. Still, it would
+        # be ideal to cleanup consistently everywhere.
+        original_model = model_prefix + params.model
+        model = original_model
+        if run_level == "core_model":
+            model = resolve_tiny_model_path(model)
         port = params.port
         stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
 
         server_args = params.server_args or []
+        if model != original_model:
+            server_args = [*server_args, "--served-model-name", original_model]
         if params.use_omni and params.stage_init_timeout is not None:
             server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
         else:
@@ -2845,6 +2859,8 @@ def iter_omni_server(
                 port=port,
                 env_dict=params.env_dict,
             ) as server:
+                if model != original_model:
+                    server.model = original_model
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")
@@ -2868,6 +2884,8 @@ def iter_omni_server(
                     use_omni=params.use_omni,
                 )
             ) as server:
+                if model != original_model:
+                    server.model = original_model
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")
@@ -2899,6 +2917,8 @@ def iter_omni_runner(
             extra_omni_kwargs = dict(extra) if extra is not None else {}
         stage_config_path = stage_config_path_for_run_level(stage_config_path, run_level)
         model = model_prefix + model
+        if run_level == "core_model":
+            model = resolve_tiny_model_path(model)
         with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
             yield runner
