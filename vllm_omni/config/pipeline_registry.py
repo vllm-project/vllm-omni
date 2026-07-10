@@ -49,6 +49,7 @@ from vllm_omni.model_executor.models.glm_tts.pipeline import GLM_TTS_PIPELINE
 from vllm_omni.model_executor.models.gr00t.pipeline import GR00T_N1D7_PIPELINE
 from vllm_omni.model_executor.models.higgs_audio_v2.pipeline import HIGGS_AUDIO_V2_PIPELINE
 from vllm_omni.model_executor.models.higgs_audio_v3.pipeline import HIGGS_AUDIO_V3_PIPELINE
+from vllm_omni.model_executor.models.hunyuan_video.pipeline import HUNYUAN_VIDEO_15_DIT_FP8_PIPELINE
 from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
     HUNYUAN_IMAGE3_AR_PIPELINE,
     HUNYUAN_IMAGE3_DIT_PIPELINE,
@@ -85,6 +86,12 @@ from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.step_audio2.pipeline import (
+    STEP_AUDIO2_ASR_PIPELINE,
+    STEP_AUDIO2_ASYNC_CHUNK_PIPELINE,
+    STEP_AUDIO2_PIPELINE,
+)
+from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_TI2V_DIT_FP8_PIPELINE
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
 
@@ -99,6 +106,9 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
+    "step_audio2": STEP_AUDIO2_PIPELINE,
+    "step_audio2_asr": STEP_AUDIO2_ASR_PIPELINE,
+    "step_audio2_async_chunk": STEP_AUDIO2_ASYNC_CHUNK_PIPELINE,
     "covo_audio": COVO_AUDIO_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
@@ -110,6 +120,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
     "hunyuan_image3_ar": HUNYUAN_IMAGE3_AR_PIPELINE,
     "hunyuan_image3_dit": HUNYUAN_IMAGE3_DIT_PIPELINE,
+    "hunyuan_video_15_dit_fp8": HUNYUAN_VIDEO_15_DIT_FP8_PIPELINE,
+    "wan2_2_ti2v_dit_fp8": WAN2_2_TI2V_DIT_FP8_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,

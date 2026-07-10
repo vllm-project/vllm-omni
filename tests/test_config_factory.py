@@ -797,11 +797,17 @@ stages:
         assert runtime_config == expected_runtime_config
 
     @pytest.mark.parametrize(
-        ("deploy_name", "pipeline_name", "stage_count", "final_output_type"),
+        ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
-            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image"),
-            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text"),
-            ("omnivoice.yaml", "omnivoice", 1, "audio"),
+            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
+            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
+            ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
+            ("mimo_audio.yaml", "mimo_audio", 2, "audio", "mimo_audio"),
+            ("step_audio2.yaml", "step_audio2", 2, "audio", "step_audio2"),
+            ("step_audio2_asr.yaml", "step_audio2_asr", 1, "text", "step_audio2_asr"),
+            ("step_audio2_async_chunk.yaml", "step_audio2_async_chunk", 2, "audio", "step_audio2_async_chunk"),
+            ("hunyuan_video_15_dit_fp8.yaml", "hunyuan_video_15_dit_fp8", 1, "video", "hunyuan_video_15_dit_fp8"),
+            ("wan2_2_ti2v_dit_fp8.yaml", "wan2_2_ti2v_dit_fp8", 1, "video", "wan2_2_ti2v_dit_fp8"),
         ],
     )
     def test_load_new_registry_backed_deploy_configs(
@@ -810,10 +816,11 @@ stages:
         pipeline_name: str,
         stage_count: int,
         final_output_type: str,
+        declared_pipeline: str | None,
     ):
         deploy_path = Path(get_deploy_config_path(deploy_name))
         deploy = load_deploy_config(deploy_path)
-        assert deploy.pipeline == pipeline_name
+        assert deploy.pipeline == declared_pipeline
 
         with patch("vllm_omni.platforms.current_omni_platform") as platform:
             platform.device_name = "cuda"
@@ -821,6 +828,20 @@ stages:
         assert len(stages) == stage_count
         assert stages[-1].final_output is True
         assert stages[-1].final_output_type == final_output_type
+        if deploy.trust_remote_code is not None:
+            assert {s.yaml_engine_args.get("trust_remote_code") for s in stages} == {deploy.trust_remote_code}
+
+    def test_async_engine_reads_deploy_trust_remote_code(self, tmp_path):
+        deploy_path = tmp_path / "deploy.yaml"
+        deploy_path.write_text("trust_remote_code: true\nstages: []\n", encoding="utf-8")
+
+        from vllm_omni.engine.async_omni_engine import _deploy_trust_remote_code
+
+        assert _deploy_trust_remote_code(str(deploy_path)) is True
+
+    def test_no_bundled_legacy_stage_config_yamls(self):
+        stage_config_dir = Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
+        assert not list(stage_config_dir.glob("*.yaml"))
 
     def test_merge_pipeline_deploy(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"

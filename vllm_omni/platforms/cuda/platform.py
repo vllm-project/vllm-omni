@@ -36,7 +36,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/model_executor/stage_configs"
+        return "vllm_omni/deploy"
 
     @classmethod
     def has_flash_attn_package(cls) -> bool:

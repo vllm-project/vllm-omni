@@ -93,21 +93,17 @@ pip install step-audio2
 
 ### Option 1: Auto-download from HuggingFace (Recommended)
 
-The script will **automatically download** the model on first run:
+The script will **automatically download** the model on first run when a
+HuggingFace model id is passed:
 
 ```bash
-# Just run without specifying --model, it will auto-download stepfun-ai/Step-Audio2-mini
-python end2end.py --query-type audio_to_text
-
-# Or explicitly specify the HuggingFace model
-python end2end.py --query-type audio_to_text --model stepfun-ai/Step-Audio2-mini
+python end2end.py --query-type audio_to_text --model stepfun-ai/Step-Audio-2-mini
 ```
 
 Models will be cached in `~/.cache/huggingface/hub/` for future use.
 
 **Available models**:
-- `stepfun-ai/Step-Audio2-mini` (smaller, faster)
-- `stepfun-ai/Step-Audio2-7B` (larger, better quality)
+- `stepfun-ai/Step-Audio-2-mini` (smaller, faster)
 
 ### Option 2: Manual Download (for offline use)
 
@@ -115,15 +111,15 @@ Download and use locally:
 
 ```bash
 # Download from HuggingFace
-huggingface-cli download stepfun-ai/Step-Audio2-mini --local-dir ./models/Step-Audio2-mini
+hf download stepfun-ai/Step-Audio-2-mini --local-dir ./models/Step-Audio-2-mini
 
 # Then use the local path
-python end2end.py --query-type audio_to_text --model ./models/Step-Audio2-mini
+python end2end.py --query-type audio_to_text --model ./models/Step-Audio-2-mini
 ```
 
 Ensure the model directory contains:
 ```
-Step-Audio2-mini/
+Step-Audio-2-mini/
 ├── config.json
 ├── model.safetensors (or pytorch_model.bin)
 ├── tokenizer.json
@@ -144,20 +140,23 @@ Transcribe audio to text:
 
 ```bash
 # Quick start - Using default model and test audio
-python end2end.py --query-type audio_to_text
+python end2end.py --query-type audio_to_text \
+    --model stepfun-ai/Step-Audio-2-mini
 
 # Using your own audio file (model will auto-download)
 python end2end.py --query-type audio_to_text \
-    --audio-path /path/to/input.wav
+    --audio-path /path/to/input.wav \
+    --model stepfun-ai/Step-Audio-2-mini
 
 # With specific model
 python end2end.py --query-type audio_to_text \
     --audio-path /path/to/input.wav \
-    --model stepfun-ai/Step-Audio2-7B
+    --model stepfun-ai/Step-Audio-2-mini
 
 # With custom question
 python end2end.py --query-type audio_to_text \
     --audio-path input.wav \
+    --model stepfun-ai/Step-Audio-2-mini \
     --question "What is the speaker saying?"
 ```
 
@@ -170,12 +169,13 @@ Convert text to speech:
 ```bash
 # Basic TTS (model auto-downloads)
 python end2end.py --query-type text_to_audio \
-    --text "Hello, this is a test of Step Audio 2 synthesis."
+    --text "Hello, this is a test of Step Audio 2 synthesis." \
+    --model stepfun-ai/Step-Audio-2-mini
 
 # With specific model
 python end2end.py --query-type text_to_audio \
     --text "Hello, this is a test." \
-    --model stepfun-ai/Step-Audio2-7B
+    --model stepfun-ai/Step-Audio-2-mini
 ```
 
 **Note**: Speaker voice is controlled by the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable or the default prompt wav bundled with the model.
@@ -191,12 +191,13 @@ Process input audio and generate output audio:
 ```bash
 # Basic voice conversion (model auto-downloads)
 python end2end.py --query-type audio_to_audio \
-    --audio-path /path/to/source_audio.wav
+    --audio-path /path/to/source_audio.wav \
+    --model stepfun-ai/Step-Audio-2-mini
 
 # With specific model
 python end2end.py --query-type audio_to_audio \
     --audio-path source.wav \
-    --model stepfun-ai/Step-Audio2-7B
+    --model stepfun-ai/Step-Audio-2-mini
 ```
 
 This mode:
@@ -210,7 +211,13 @@ This mode:
 ```bash
 # Use custom stage configuration
 python end2end.py --query-type audio_to_text \
+    --model stepfun-ai/Step-Audio-2-mini \
     --stage-configs-path /path/to/custom_config.yaml
+
+# Use custom deploy configuration
+python end2end.py --query-type audio_to_text \
+    --model stepfun-ai/Step-Audio-2-mini \
+    --deploy-config /path/to/step_audio2_asr.yaml
 
 # Multiple prompts (for batch testing)
 python end2end.py --query-type audio_to_text \
@@ -246,14 +253,14 @@ python end2end.py --query-type text_to_audio \
 
 ## Configuration
 
-### Stage Configuration
+### Deploy Configuration
 
-The default configuration (`step_audio_2.yaml`) uses:
+The default configuration (`vllm_omni/deploy/step_audio2.yaml`) uses:
 
-- **Stage 0 (Thinker)**: GPU 0, 80% memory
-- **Stage 1 (Token2Wav)**: GPU 1, 30% memory
+- **Stage 0 (Thinker)**: GPUs 0-3 with tensor parallel size 4, 80% memory
+- **Stage 1 (Token2Wav)**: GPU 3, 30% memory
 
-For **single GPU** setup, edit the config to use `devices: "0"` for both stages.
+For **single GPU** setup, edit a deploy config copy to use `devices: "0"` for both stages.
 
 ### Sampling Parameters
 
@@ -351,7 +358,7 @@ Complete example from audio to final output:
 # 1. ASR: Transcribe audio
 python end2end.py --query-type audio_to_text \
     --audio-path interview.wav \
-    --model ./models/Step-Audio2-7B \
+    --model ./models/Step-Audio-2-mini \
     --output-dir ./outputs
 
 # 2. Check the transcription
@@ -361,7 +368,7 @@ cat ./outputs/00000_text.txt
 STEP_AUDIO2_DEFAULT_PROMPT_WAV=./speaker_samples/female_voice.wav \
 python end2end.py --query-type text_to_audio \
     --text "The quick brown fox jumps over the lazy dog" \
-    --model ./models/Step-Audio2-7B \
+    --model ./models/Step-Audio-2-mini \
     --output-dir ./outputs
 
 # 4. Listen to the result

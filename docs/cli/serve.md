@@ -8,8 +8,7 @@ The stage-based CLI is designed for deployments that require launching each pipe
 - For **migrated models** that utilize the bundled deployment YAML configurations located in
   `vllm_omni/deploy/`, the `--deploy-config` flag is only required to override the default configuration. By default, executing `vllm serve MODEL --omni ...`
   automatically loads the bundled deployment configuration.
-- For **legacy models** utilizing configuration files located in
-  `vllm_omni/model_executor/stage_configs/`, the `--stage-configs-path` parameter remains mandatory.
+- For custom legacy `stage_args` YAMLs, pass the file with `--stage-configs-path`.
 
 Example: Initializing Stage 0 (Orchestrator and API Server):
 The commands below show a common device mapping where Stage 0 uses GPU 0 and

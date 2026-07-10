@@ -17,8 +17,8 @@ logger = init_logger(__name__)
 # sequence fed to stage-1 must not exceed this, otherwise gpu_input_batch
 # add_request will fail with a broadcast error when copying prompt_token_ids
 # into token_ids_cpu. Keep in sync with the stage-1 ``max_model_len`` in
-# ``vllm_omni/model_executor/stage_configs/mimo_audio.yaml`` and the offline
-# example ``examples/offline_inference/mimo_audio/end2end.py``.
+# ``vllm_omni/deploy/mimo_audio.yaml`` and the offline example
+# ``examples/offline_inference/mimo_audio/end2end.py``.
 MAX_CODE2WAV_TOKENS = 18192
 
 # Minimum safe values for codec streaming parameters.

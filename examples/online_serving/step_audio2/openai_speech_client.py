@@ -87,7 +87,7 @@ def parse_args():
         "--model",
         "-m",
         type=str,
-        default="stepfun-ai/Step-Audio2-mini",
+        default="stepfun-ai/Step-Audio-2-mini",
         help="Model name/path",
     )
     parser.add_argument(
