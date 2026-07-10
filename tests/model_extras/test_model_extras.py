@@ -16,6 +16,15 @@ from vllm_omni.model_extras import (
     get_extra_output_params,
     should_init_extra_args_for_non_diffusion_stages,
 )
+from vllm_omni.model_extras.ltx2_3 import LTX23_EXTRA_BODY_PARAMS
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx23_extra_registry_declares_guidance_params() -> None:
+    assert get_extra_body_params("LTX23Pipeline") == LTX23_EXTRA_BODY_PARAMS
+    assert get_extra_body_params("LTX23ImageToVideoPipeline") == LTX23_EXTRA_BODY_PARAMS
+    assert get_extra_output_params("LTX23Pipeline") == frozenset()
 
 
 @pytest.mark.core_model

@@ -24,10 +24,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_ltx23_pipeline(sequence_parallel_size: int = 1):
-    from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+    from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
 
     pipeline = object.__new__(LTX23Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline.vae_spatial_compression_ratio = 32
+    pipeline.vae_temporal_compression_ratio = 8
+    pipeline.transformer_spatial_patch_size = 1
+    pipeline.transformer_temporal_patch_size = 1
     pipeline.audio_vae_temporal_compression_ratio = 4
     pipeline.audio_vae_mel_compression_ratio = 4
     pipeline.od_config = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=sequence_parallel_size))
@@ -46,7 +50,9 @@ def _make_ltx23_request_pipe(cls):
     return pipe
 
 
-def _resolve_request_inputs_for_test(pipe, req):
+def _resolve_request_inputs_for_test(pipe, req, guidance_scale=None):
+    from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import LTX23_ONE_STAGE_RECIPE
+
     return pipe._resolve_request_inputs(
         req,
         prompt=None,
@@ -57,7 +63,7 @@ def _resolve_request_inputs_for_test(pipe, req):
         frame_rate=None,
         num_inference_steps=None,
         timesteps=None,
-        guidance_scale=4.0,
+        guidance_scale=guidance_scale,
         num_videos_per_prompt=1,
         generator=None,
         latents=None,
@@ -66,17 +72,231 @@ def _resolve_request_inputs_for_test(pipe, req):
         negative_prompt_embeds=None,
         prompt_attention_mask=None,
         negative_prompt_attention_mask=None,
-        decode_timestep=0.0,
-        decode_noise_scale=None,
+        decode_timestep=LTX23_ONE_STAGE_RECIPE.decode_timestep,
+        decode_noise_scale=LTX23_ONE_STAGE_RECIPE.decode_noise_scale,
         output_type="np",
         max_sequence_length=None,
     )
 
 
 class TestLTX23RequestParsing:
+    def test_official_ltx23_recipes_capture_stage_defaults(self):
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import (
+            LTX23_HQ_TWO_STAGE_RECIPE,
+            LTX23_ONE_STAGE_RECIPE,
+            LTX23_STAGE_2_DISTILLED_SIGMAS,
+            LTX23_TWO_STAGE_RECIPE,
+        )
+
+        assert LTX23_ONE_STAGE_RECIPE.name == "one_stage_official"
+        assert (LTX23_ONE_STAGE_RECIPE.height, LTX23_ONE_STAGE_RECIPE.width) == (512, 768)
+        assert LTX23_ONE_STAGE_RECIPE.num_inference_steps == 30
+        assert LTX23_ONE_STAGE_RECIPE.video_guidance.stg_blocks == (28,)
+        assert len(LTX23_ONE_STAGE_RECIPE.stages) == 1
+
+        assert LTX23_TWO_STAGE_RECIPE.name == "two_stage_official"
+        assert (LTX23_TWO_STAGE_RECIPE.height, LTX23_TWO_STAGE_RECIPE.width) == (1024, 1536)
+        assert LTX23_TWO_STAGE_RECIPE.stages[0].width_scale == 0.5
+        assert LTX23_TWO_STAGE_RECIPE.stages[1].sigma_values == LTX23_STAGE_2_DISTILLED_SIGMAS
+        assert LTX23_TWO_STAGE_RECIPE.stages[1].uses_spatial_upsampler
+
+        assert LTX23_HQ_TWO_STAGE_RECIPE.name == "two_stage_hq_official"
+        assert (LTX23_HQ_TWO_STAGE_RECIPE.height, LTX23_HQ_TWO_STAGE_RECIPE.width) == (1088, 1920)
+        assert LTX23_HQ_TWO_STAGE_RECIPE.num_inference_steps == 15
+        assert LTX23_HQ_TWO_STAGE_RECIPE.video_guidance.stg_scale == 0.0
+        assert LTX23_HQ_TWO_STAGE_RECIPE.audio_guidance.rescale_scale == 1.0
+        assert LTX23_HQ_TWO_STAGE_RECIPE.stages[0].sampler == "res2s"
+        assert LTX23_HQ_TWO_STAGE_RECIPE.stages[0].distilled_lora_strength == 0.25
+        assert LTX23_HQ_TWO_STAGE_RECIPE.stages[1].distilled_lora_strength == 0.5
+
+    def test_request_input_resolution_uses_official_ltx23_defaults(self):
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import LTX23_ONE_STAGE_RECIPE
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={"prompt": "prompt", "negative_prompt": "negative"},
+                    sampling_params=OmniDiffusionSamplingParams(num_frames=None),
+                    request_id="ltx23-defaults",
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(_make_ltx23_request_pipe(LTX23Pipeline), req)
+
+        assert resolved.height == LTX23_ONE_STAGE_RECIPE.height
+        assert resolved.width == LTX23_ONE_STAGE_RECIPE.width
+        assert resolved.num_frames == LTX23_ONE_STAGE_RECIPE.num_frames
+        assert resolved.frame_rate == LTX23_ONE_STAGE_RECIPE.frame_rate
+        assert resolved.num_inference_steps == LTX23_ONE_STAGE_RECIPE.num_inference_steps
+        assert resolved.guidance_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.cfg_scale
+        assert resolved.guidance_params.video_cfg_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.cfg_scale
+        assert resolved.guidance_params.audio_cfg_scale == LTX23_ONE_STAGE_RECIPE.audio_guidance.cfg_scale
+        assert resolved.guidance_params.video_stg_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.stg_scale
+        assert resolved.guidance_params.audio_stg_scale == LTX23_ONE_STAGE_RECIPE.audio_guidance.stg_scale
+        assert resolved.guidance_params.video_modality_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.modality_scale
+        assert resolved.guidance_params.audio_modality_scale == LTX23_ONE_STAGE_RECIPE.audio_guidance.modality_scale
+        assert resolved.guidance_params.video_rescale_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.rescale_scale
+        assert resolved.guidance_params.audio_rescale_scale == LTX23_ONE_STAGE_RECIPE.audio_guidance.rescale_scale
+        assert resolved.guidance_params.video_stg_blocks == LTX23_ONE_STAGE_RECIPE.video_guidance.stg_blocks
+        assert resolved.guidance_params.audio_stg_blocks == LTX23_ONE_STAGE_RECIPE.audio_guidance.stg_blocks
+        assert resolved.decode_timestep == LTX23_ONE_STAGE_RECIPE.decode_timestep
+        assert resolved.decode_noise_scale == LTX23_ONE_STAGE_RECIPE.decode_noise_scale
+
+    def test_dummy_request_input_resolution_uses_pipeline_recipe_guidance_defaults(self):
+        from dataclasses import replace
+
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import LTX23_ONE_STAGE_RECIPE
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        pipe._ltx23_recipe = replace(
+            LTX23_ONE_STAGE_RECIPE,
+            video_guidance=replace(LTX23_ONE_STAGE_RECIPE.video_guidance, cfg_scale=5.0),
+            audio_guidance=replace(LTX23_ONE_STAGE_RECIPE.audio_guidance, cfg_scale=9.0),
+        )
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt="dummy run",
+                    sampling_params=OmniDiffusionSamplingParams(guidance_scale=0.0),
+                    request_id=DUMMY_DIFFUSION_REQUEST_ID,
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(pipe, req)
+
+        assert resolved.guidance_scale == 5.0
+        assert resolved.guidance_params.video_cfg_scale == 5.0
+        assert resolved.guidance_params.audio_cfg_scale == 9.0
+
+    def test_request_input_resolution_uses_split_audio_video_recipe_guidance_defaults(self):
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import LTX23_HQ_TWO_STAGE_RECIPE
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        pipe._ltx23_recipe = LTX23_HQ_TWO_STAGE_RECIPE
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={"prompt": "prompt", "negative_prompt": "negative"},
+                    sampling_params=OmniDiffusionSamplingParams(),
+                    request_id="ltx23-hq-guidance-defaults",
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(pipe, req)
+
+        assert resolved.guidance_params.video_rescale_scale == LTX23_HQ_TWO_STAGE_RECIPE.video_guidance.rescale_scale
+        assert resolved.guidance_params.audio_rescale_scale == LTX23_HQ_TWO_STAGE_RECIPE.audio_guidance.rescale_scale
+        assert resolved.guidance_params.video_stg_blocks == LTX23_HQ_TWO_STAGE_RECIPE.video_guidance.stg_blocks
+        assert resolved.guidance_params.audio_stg_blocks == LTX23_HQ_TWO_STAGE_RECIPE.audio_guidance.stg_blocks
+
+    def test_request_input_resolution_allows_ltx23_guidance_overrides(self):
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={"prompt": "prompt", "negative_prompt": "negative"},
+                    sampling_params=OmniDiffusionSamplingParams(
+                        guidance_scale=4.0,
+                        extra_args={
+                            "video_cfg_scale": 4.0,
+                            "audio_cfg_scale": 4.0,
+                            "video_stg_scale": 0.0,
+                            "audio_stg_scale": 0.0,
+                            "video_modality_scale": 1.0,
+                            "audio_modality_scale": 1.0,
+                            "video_rescale_scale": 0.0,
+                            "audio_rescale_scale": 0.0,
+                            "video_stg_blocks": [],
+                            "audio_stg_blocks": [],
+                        },
+                    ),
+                    request_id="ltx23-overrides",
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(_make_ltx23_request_pipe(LTX23Pipeline), req)
+
+        assert resolved.guidance_scale == 4.0
+        assert resolved.guidance_params.video_cfg_scale == 4.0
+        assert resolved.guidance_params.audio_cfg_scale == 4.0
+        assert resolved.guidance_params.video_stg_scale == 0.0
+        assert resolved.guidance_params.audio_stg_scale == 0.0
+        assert resolved.guidance_params.video_modality_scale == 1.0
+        assert resolved.guidance_params.audio_modality_scale == 1.0
+        assert resolved.guidance_params.video_rescale_scale == 0.0
+        assert resolved.guidance_params.audio_rescale_scale == 0.0
+        assert resolved.guidance_params.video_stg_blocks == ()
+        assert resolved.guidance_params.audio_stg_blocks == ()
+
+    def test_request_input_resolution_explicit_guidance_scale_keeps_legacy_cfg_fallback(self):
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={"prompt": "prompt", "negative_prompt": "negative"},
+                    sampling_params=OmniDiffusionSamplingParams(guidance_scale=4.0),
+                    request_id="ltx23-guidance-scale-fallback",
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(_make_ltx23_request_pipe(LTX23Pipeline), req)
+
+        assert resolved.guidance_params.video_cfg_scale == 4.0
+        assert resolved.guidance_params.audio_cfg_scale == 4.0
+
+    def test_request_input_resolution_rejects_mixed_explicit_guidance_scale_batch(self):
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={"prompt": "prompt 0", "negative_prompt": "negative"},
+                    sampling_params=OmniDiffusionSamplingParams(guidance_scale=4.0),
+                    request_id="ltx23-mixed-guidance-scale-0",
+                ),
+                OmniDiffusionRequest(
+                    prompt={"prompt": "prompt 1", "negative_prompt": "negative"},
+                    sampling_params=OmniDiffusionSamplingParams(guidance_scale=5.0),
+                    request_id="ltx23-mixed-guidance-scale-1",
+                ),
+            ]
+        )
+
+        with pytest.raises(ValueError, match="homogeneous guidance"):
+            _resolve_request_inputs_for_test(pipe, req)
+
     def test_t2v_and_i2v_share_request_input_resolution(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -169,7 +389,7 @@ class TestLTX23RequestParsing:
         )
 
     def test_request_input_resolution_rejects_mixed_precomputed_prompt_fields(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -208,8 +428,65 @@ class TestLTX23RequestParsing:
 
 
 class TestLTX23ForwardStages:
+    def test_encode_prompt_batches_positive_and_negative_prompts_for_cfg(self):
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        calls = []
+
+        def fake_get_gemma_prompt_embeds(
+            *,
+            prompt,
+            num_videos_per_prompt,
+            max_sequence_length,
+            device,
+            dtype=None,
+        ):
+            calls.append(
+                {
+                    "prompt": prompt,
+                    "num_videos_per_prompt": num_videos_per_prompt,
+                    "max_sequence_length": max_sequence_length,
+                    "device": device,
+                    "dtype": dtype,
+                }
+            )
+            values = torch.arange(len(prompt), dtype=torch.float32, device=device).view(-1, 1, 1)
+            mask = torch.ones((len(prompt), 1), dtype=torch.bool, device=device)
+            return values, mask
+
+        pipe._get_gemma_prompt_embeds = fake_get_gemma_prompt_embeds
+
+        (
+            prompt_embeds,
+            prompt_attention_mask,
+            negative_prompt_embeds,
+            negative_prompt_attention_mask,
+        ) = pipe.encode_prompt(
+            prompt=["p0", "p1"],
+            negative_prompt=["n0", "n1"],
+            do_classifier_free_guidance=True,
+            num_videos_per_prompt=2,
+            max_sequence_length=1024,
+            device=torch.device("cpu"),
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["prompt"] == ["p0", "p1", "n0", "n1"]
+        assert calls[0]["num_videos_per_prompt"] == 1
+        torch.testing.assert_close(prompt_embeds[:, 0, 0], torch.tensor([0.0, 0.0, 1.0, 1.0]))
+        torch.testing.assert_close(negative_prompt_embeds[:, 0, 0], torch.tensor([2.0, 2.0, 3.0, 3.0]))
+        torch.testing.assert_close(
+            prompt_attention_mask,
+            torch.ones((4, 1), dtype=torch.bool),
+        )
+        torch.testing.assert_close(
+            negative_prompt_attention_mask,
+            torch.ones((4, 1), dtype=torch.bool),
+        )
+
     def test_encode_prompt_repeats_precomputed_embeds_for_num_outputs(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
 
         pipe = _make_ltx23_request_pipe(LTX23Pipeline)
         prompt_embeds = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
@@ -251,7 +528,7 @@ class TestLTX23ForwardStages:
         )
 
     def test_t2v_forward_delegates_to_shared_forward_impl(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -317,7 +594,7 @@ class TestPipelineIndependence:
     def test_ltx23_pipeline_does_not_inherit_from_ltx2(self):
         """LTX23Pipeline must NOT inherit from LTX2Pipeline."""
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
 
         assert not issubclass(LTX23Pipeline, LTX2Pipeline), (
             "LTX23Pipeline should be fully independent and not inherit from LTX2Pipeline"
@@ -327,20 +604,20 @@ class TestPipelineIndependence:
         """LTX23Pipeline must be an nn.Module."""
         import torch.nn as nn
 
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
 
         assert issubclass(LTX23Pipeline, nn.Module)
 
     def test_ltx23_pipeline_has_progress_bar(self):
         """LTX23Pipeline must mix in ProgressBarMixin."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 
         assert issubclass(LTX23Pipeline, ProgressBarMixin)
 
     def test_ltx23_pipeline_declares_offload_components(self):
         """LTX23Pipeline must expose LTX-2.3-specific modules to offload discovery."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 
         pipe = object.__new__(LTX23Pipeline)
@@ -365,7 +642,7 @@ class TestPipelineIndependence:
 
     def test_ltx23_pipeline_has_diffusion_pipeline_profiler_mixin(self):
         """LTX23Pipeline must support lightweight stage timing."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 
         assert issubclass(LTX23Pipeline, DiffusionPipelineProfilerMixin)
@@ -373,21 +650,21 @@ class TestPipelineIndependence:
 
 class TestLTX23DecodeConditioning:
     def test_decode_conditioning_expands_per_prompt_values_to_effective_batch(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _expand_per_prompt_decode_value
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_latent_preparation import expand_per_prompt_decode_value
 
-        assert _expand_per_prompt_decode_value(
+        assert expand_per_prompt_decode_value(
             [0.1, 0.2],
             prompt_batch_size=2,
             effective_batch_size=4,
             field_name="decode_timestep",
         ) == [0.1, 0.1, 0.2, 0.2]
-        assert _expand_per_prompt_decode_value(
+        assert expand_per_prompt_decode_value(
             [0.3],
             prompt_batch_size=2,
             effective_batch_size=4,
             field_name="decode_timestep",
         ) == [0.3, 0.3, 0.3, 0.3]
-        assert _expand_per_prompt_decode_value(
+        assert expand_per_prompt_decode_value(
             [0.1, 0.2, 0.3, 0.4],
             prompt_batch_size=2,
             effective_batch_size=4,
@@ -395,10 +672,10 @@ class TestLTX23DecodeConditioning:
         ) == [0.1, 0.2, 0.3, 0.4]
 
     def test_decode_conditioning_rejects_ambiguous_lengths(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _expand_per_prompt_decode_value
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_latent_preparation import expand_per_prompt_decode_value
 
         with pytest.raises(ValueError, match="decode_timestep"):
-            _expand_per_prompt_decode_value(
+            expand_per_prompt_decode_value(
                 [0.1, 0.2, 0.3],
                 prompt_batch_size=2,
                 effective_batch_size=4,
@@ -425,11 +702,11 @@ class TestRegistryIntegration:
         from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
 
         # T2V -> pipeline_ltx2_3
-        assert _DIFFUSION_MODELS["LTX23Pipeline"] == ("ltx2", "pipeline_ltx2_3", "LTX23Pipeline")
+        assert _DIFFUSION_MODELS["LTX23Pipeline"] == ("ltx2_3", "pipeline_ltx2_3", "LTX23Pipeline")
 
         # I2V -> pipeline_ltx2_3_image2video
         assert _DIFFUSION_MODELS["LTX23ImageToVideoPipeline"] == (
-            "ltx2",
+            "ltx2_3",
             "pipeline_ltx2_3_image2video",
             "LTX23ImageToVideoPipeline",
         )
@@ -465,7 +742,7 @@ class TestVocoderSampleRateDetection:
 
     def test_detects_48khz_from_config(self):
         """Should detect output_sampling_rate=48000 from vocoder/config.json."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _detect_vocoder_output_sample_rate
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import _detect_vocoder_output_sample_rate
 
         with tempfile.TemporaryDirectory() as tmpdir:
             vocoder_dir = os.path.join(tmpdir, "vocoder")
@@ -478,7 +755,7 @@ class TestVocoderSampleRateDetection:
 
     def test_returns_none_for_no_output_sr(self):
         """Should return None if vocoder config has no output_sampling_rate."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _detect_vocoder_output_sample_rate
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import _detect_vocoder_output_sample_rate
 
         with tempfile.TemporaryDirectory() as tmpdir:
             vocoder_dir = os.path.join(tmpdir, "vocoder")
@@ -491,7 +768,7 @@ class TestVocoderSampleRateDetection:
 
     def test_returns_none_for_missing_directory(self):
         """Should return None if vocoder directory doesn't exist."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _detect_vocoder_output_sample_rate
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import _detect_vocoder_output_sample_rate
 
         result = _detect_vocoder_output_sample_rate("/nonexistent/path")
         assert result is None
@@ -504,7 +781,7 @@ class TestPostProcessFunction:
         """Post-process func should include audio_sample_rate when detected."""
         import torch
 
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import get_ltx2_post_process_func
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import get_ltx2_post_process_func
 
         with tempfile.TemporaryDirectory() as tmpdir:
             vocoder_dir = os.path.join(tmpdir, "vocoder")
@@ -531,7 +808,7 @@ class TestPostProcessFunction:
         """Post-process func should work without vocoder config (no audio_sample_rate key)."""
         import torch
 
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import get_ltx2_post_process_func
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import get_ltx2_post_process_func
 
         class MockConfig:
             model = "/nonexistent/path"
@@ -552,19 +829,75 @@ class TestInitExports:
     """Test that __init__.py exports all LTX-2.3 classes."""
 
     def test_all_ltx23_classes_exported(self):
-        """All LTX-2.3 pipeline classes must be in the ltx2 package __all__."""
-        from vllm_omni.diffusion.models import ltx2
+        """All LTX-2.3 pipeline classes must be in the ltx2_3 package __all__."""
+        from vllm_omni.diffusion.models import ltx2_3
 
         expected_classes = [
             "LTX23Pipeline",
             "LTX23ImageToVideoPipeline",
         ]
         for name in expected_classes:
-            assert hasattr(ltx2, name), f"{name} not exported from ltx2 package"
-            assert name in ltx2.__all__, f"{name} not in ltx2.__all__"
+            assert hasattr(ltx2_3, name), f"{name} not exported from ltx2_3 package"
+            assert name in ltx2_3.__all__, f"{name} not in ltx2_3.__all__"
 
 
 class TestAudioLatentSPPadding:
+    def test_sp_plan_shards_video_and_audio_timesteps(self):
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_transformer import LTX2VideoTransformer3DModel
+
+        root_plan = LTX2VideoTransformer3DModel._build_sp_plan("split")[""]
+
+        for name in ("timestep", "audio_timestep"):
+            assert root_plan[name].split_dim == 1
+            assert root_plan[name].expected_dims == 2
+            assert not root_plan[name].split_output
+
+    def test_prepare_video_latents_samples_packed_token_space(self):
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+
+        pipeline = _make_ltx23_pipeline()
+        generator = torch.Generator(device="cpu").manual_seed(0)
+
+        latents = pipeline.prepare_latents(
+            batch_size=1,
+            num_channels_latents=2,
+            height=64,
+            width=64,
+            num_frames=9,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            generator=generator,
+        )
+
+        direct_generator = torch.Generator(device="cpu").manual_seed(0)
+        expected = torch.randn((1, 8, 2), generator=direct_generator, dtype=torch.float32)
+        spatial_generator = torch.Generator(device="cpu").manual_seed(0)
+        spatial_then_packed = LTX23Pipeline._pack_latents(
+            torch.randn((1, 2, 2, 2, 2), generator=spatial_generator, dtype=torch.float32)
+        )
+        torch.testing.assert_close(latents, expected)
+        assert not torch.equal(latents, spatial_then_packed)
+
+    def test_prepare_audio_latents_samples_packed_token_space(self):
+        pipeline = _make_ltx23_pipeline(sequence_parallel_size=2)
+        generator = torch.Generator(device="cpu").manual_seed(0)
+
+        latents, original_num_frames, padded_num_frames = pipeline.prepare_audio_latents(
+            batch_size=1,
+            num_channels_latents=2,
+            num_mel_bins=8,
+            audio_latent_length=3,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            generator=generator,
+        )
+
+        expected_generator = torch.Generator(device="cpu").manual_seed(0)
+        expected = torch.randn((1, 4, 4), generator=expected_generator, dtype=torch.float32)
+        assert original_num_frames == 3
+        assert padded_num_frames == 4
+        torch.testing.assert_close(latents, expected)
+
     def test_prepare_audio_latents_pads_generated_dummy_length_for_sp(self):
         pipeline = _make_ltx23_pipeline(sequence_parallel_size=2)
 
@@ -621,6 +954,16 @@ class TestAudioLatentSPPadding:
         assert padded_num_frames == 12
         assert padded.shape == (1, 12, 8)
         torch.testing.assert_close(padded, pipeline._pack_audio_latents(latents))
+
+    def test_audio_latent_patch_pack_roundtrips(self):
+        pipeline = _make_ltx23_pipeline()
+        latents = torch.arange(32, dtype=torch.float32).view(1, 2, 4, 4)
+
+        packed = pipeline._pack_audio_latents(latents, patch_size=2, patch_size_t=2)
+        unpacked = pipeline._unpack_audio_latents(packed, latent_length=4, num_mel_bins=4, patch_size=2, patch_size_t=2)
+
+        assert packed.shape == (1, 4, 8)
+        torch.testing.assert_close(unpacked, latents)
 
     def test_resolve_audio_latent_length_preserves_legacy_4d_shape_inference(self):
         pipeline = _make_ltx23_pipeline(sequence_parallel_size=4)

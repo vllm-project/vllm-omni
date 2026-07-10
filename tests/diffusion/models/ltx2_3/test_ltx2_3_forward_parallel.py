@@ -15,9 +15,11 @@ class TestCFGParallelIntegration:
     def test_ltx23_pipeline_has_cfg_parallel_mixin(self):
         """LTX23Pipeline must use the shared CFG parallel implementation."""
         from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_guidance_parallel import LTX23GuidanceParallelMixin
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
 
         assert issubclass(LTX23Pipeline, CFGParallelMixin)
+        assert issubclass(LTX23Pipeline, LTX23GuidanceParallelMixin)
 
     def test_ltx2_transformer_has_dit_cache_config(self):
         """Ensure LTX2 has a Cache DiT adapter config and that it uses separate CFG."""
@@ -33,7 +35,7 @@ class TestCFGParallelHelpers:
     """Test LTX-2.3 CFG helper math without loading model weights."""
 
     def test_combine_cfg_noise_matches_x0_space_formula(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
 
         pipe = object.__new__(LTX23Pipeline)
         video_sample = torch.tensor([[[1.0, -2.0]]])
@@ -69,7 +71,8 @@ class TestCFGParallelHelpers:
         assert torch.allclose(audio_combined, expected_audio)
 
     def test_two_rank_cfg_parallel_smoke_uses_rank_local_branch_and_x0_formula(self, monkeypatch):
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+        import vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.models.ltx2_3 import ltx2_3_guidance_parallel as ltx23_parallel
 
         pipe = object.__new__(ltx23.LTX23Pipeline)
         video_sample = torch.tensor([[[1.0, -2.0]]])
@@ -89,8 +92,8 @@ class TestCFGParallelHelpers:
                     return [video_pos, video_neg]
                 return [audio_pos, audio_neg]
 
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx23, "get_cfg_group", lambda: FakeCfgGroup())
+        monkeypatch.setattr(ltx23_parallel, "get_classifier_free_guidance_world_size", lambda: 2)
+        monkeypatch.setattr(ltx23_parallel, "get_cfg_group", lambda: FakeCfgGroup())
 
         expected_video = ltx23.LTX23Pipeline._combine_x0_space_cfg(
             video_sample,
@@ -109,7 +112,7 @@ class TestCFGParallelHelpers:
 
         for rank, expected_branch in ((0, "positive"), (1, "negative")):
             calls = []
-            monkeypatch.setattr(ltx23, "get_classifier_free_guidance_rank", lambda rank=rank: rank)
+            monkeypatch.setattr(ltx23_parallel, "get_classifier_free_guidance_rank", lambda rank=rank: rank)
 
             def fake_predict_noise(**kwargs):
                 calls.append(kwargs["branch"])
@@ -141,7 +144,8 @@ class TestCFGParallelForwardPath:
     """Test the LTX-2.3 CFG-parallel denoising path without loading model weights."""
 
     def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch):
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+        import vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.models.ltx2_3 import ltx2_3_guidance_parallel as ltx23_parallel
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -150,7 +154,7 @@ class TestCFGParallelForwardPath:
         torch.nn.Module.__init__(pipe)
         pipe.device = torch.device("cpu")
         pipe.tokenizer_max_length = 4
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 1)
+        monkeypatch.setattr(ltx23_parallel, "get_classifier_free_guidance_world_size", lambda: 1)
 
         class StopAtEncodePromptError(Exception):
             pass
@@ -247,7 +251,9 @@ class TestCFGParallelForwardPath:
         audio_sampling_rate,
         expected_frame_rate,
     ):
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+        import vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.models.ltx2_3 import ltx2_3_denoise_scheduling
+        from vllm_omni.diffusion.models.ltx2_3 import ltx2_3_guidance_parallel as ltx23_parallel
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -291,26 +297,32 @@ class TestCFGParallelForwardPath:
                     return [audio_pos, audio_neg]
                 raise AssertionError(f"Unexpected gathered tensor: {tensor}")
 
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_rank", lambda: cfg_rank)
-        monkeypatch.setattr(ltx23, "get_cfg_group", lambda: FakeCfgGroup())
+        monkeypatch.setattr(ltx23_parallel, "get_classifier_free_guidance_world_size", lambda: 2)
+        monkeypatch.setattr(ltx23_parallel, "get_classifier_free_guidance_rank", lambda: cfg_rank)
+        monkeypatch.setattr(ltx23_parallel, "get_cfg_group", lambda: FakeCfgGroup())
 
         def fake_retrieve_timesteps(scheduler, num_inference_steps, device, timesteps, sigmas=None, mu=None):
             scheduler.sigmas = torch.tensor([0.25, 0.25], device=device)
             return torch.tensor([1.0, 0.5], device=device), 2
 
-        monkeypatch.setattr(ltx23, "retrieve_timesteps", fake_retrieve_timesteps)
+        monkeypatch.setattr(ltx2_3_denoise_scheduling, "retrieve_timesteps", fake_retrieve_timesteps)
+
+        class FakeSchedulerConfig(dict):
+            @property
+            def num_train_timesteps(self):
+                return self["num_train_timesteps"]
 
         class FakeScheduler:
             def __init__(self, name="video", calls=None):
                 self.name = name
                 self.calls = [] if calls is None else calls
-                self.config = {
-                    "max_image_seq_len": 4096,
-                    "base_image_seq_len": 1024,
-                    "base_shift": 0.95,
-                    "max_shift": 2.05,
-                }
+                self.config = FakeSchedulerConfig(
+                    max_image_seq_len=4096,
+                    base_image_seq_len=1024,
+                    base_shift=0.95,
+                    max_shift=2.05,
+                    num_train_timesteps=1,
+                )
                 self.sigmas = torch.tensor([0.25, 0.25])
 
             def __deepcopy__(self, memo):
@@ -326,7 +338,10 @@ class TestCFGParallelForwardPath:
 
             def __call__(self, prompt_embeds, prompt_attention_mask, padding_side):
                 assert padding_side == "left"
-                assert prompt_embeds.shape[0] == 2
+                # LTX-2.3 matches the official path: positive and negative
+                # prompts run through the connector separately, then get
+                # concatenated by the pipeline.
+                assert prompt_embeds.shape[0] == 1
                 return prompt_embeds, prompt_embeds, prompt_attention_mask
 
         rope_video_fps: list[float] = []
@@ -395,6 +410,18 @@ class TestCFGParallelForwardPath:
                 guidance_scale=4.0,
                 latents=video_latents,
                 audio_latents=audio_latents,
+                extra_args={
+                    "video_cfg_scale": 4.0,
+                    "audio_cfg_scale": 4.0,
+                    "video_stg_scale": 0.0,
+                    "audio_stg_scale": 0.0,
+                    "video_modality_scale": 1.0,
+                    "audio_modality_scale": 1.0,
+                    "video_rescale_scale": 0.0,
+                    "audio_rescale_scale": 0.0,
+                    "video_stg_blocks": [],
+                    "audio_stg_blocks": [],
+                },
                 output_type="latent",
             ),
             request_id="ltx23-cfg-parallel-forward-test",
