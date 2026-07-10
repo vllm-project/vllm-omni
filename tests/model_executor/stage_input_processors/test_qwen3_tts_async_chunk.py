@@ -12,9 +12,9 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     max_ic_for_chunk_size,
 )
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
-    talker2code2wav,
     talker2code2wav_async_chunk,
     talker2code2wav_full_payload,
+    talker2code2wav_token_only,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -368,7 +368,15 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     assert rid in tm.request_payload
 
 
-def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
+def test_non_async_token_only_sizes_placeholder_for_ref_and_audio_frames():
+    """``talker2code2wav_token_only`` only allocates placeholder prompt slots.
+
+    After the connector refactor, actual codec flattening (ref prepend +
+    codebook-major layout) is performed by ``talker2code2wav_full_payload`` on
+    the worker data plane.  The orchestrator hook still derives
+    ``left_context_size`` from stage-0 multimodal_output so Code2Wav can trim
+    reference frames once the connector payload arrives.
+    """
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
     audio_codes = torch.tensor(
         [
@@ -387,12 +395,38 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
         engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
     )
 
-    prompts = talker2code2wav(stage.engine_outputs)
+    prompts = talker2code2wav_token_only(stage.engine_outputs)
 
     assert len(prompts) == 1
     prompt = prompts[0]
     assert prompt["additional_information"] == {"meta": {"left_context_size": 2}}
-    assert prompt["prompt_token_ids"] == [
+    # 2 ref frames + 2 valid audio frames (zero row filtered), 4 quantizers.
+    assert prompt["prompt_token_ids"] == [0] * (_Q * (2 + 2))
+
+
+def test_full_payload_prepends_ref_code_and_flattens_codebook_major():
+    """Worker producer is authoritative for ref prepend + codec flatten."""
+    ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    audio_codes = torch.tensor(
+        [
+            [0, 0, 0, 0],
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+        ],
+        dtype=torch.long,
+    )
+    pooling_output = {
+        "codes.audio": audio_codes,
+        "codes.ref": ref_code,
+        "meta.ref_code_len": 2,
+    }
+    request = SimpleNamespace(request_id="r", output_token_ids=list(range(3)))
+
+    payload = talker2code2wav_full_payload(transfer_manager=None, pooling_output=pooling_output, request=request)
+
+    assert payload is not None
+    assert payload["meta"]["left_context_size"] == 2
+    assert payload["codes"]["audio"].tolist() == [
         9,
         8,
         1,
@@ -433,7 +467,7 @@ def test_non_async_processor_filters_out_of_range_codec_values():
         engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
     )
 
-    prompts = talker2code2wav(stage.engine_outputs)
+    prompts = talker2code2wav_token_only(stage.engine_outputs)
 
     assert len(prompts) == 1
     prompt = prompts[0]
