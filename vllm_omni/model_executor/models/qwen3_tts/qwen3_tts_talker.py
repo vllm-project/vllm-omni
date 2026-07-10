@@ -324,13 +324,33 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
+        self.talker_mtp_graph_safe = True
         # talker_mtp samples with per-row generators, so explicitly-seeded
         # requests stay batched instead of one scalar forward per row (#4883).
-        # Only valid while talker_mtp receives the unpadded active batch (this
-        # talker is not graph-wrapped); a padded batch would need the runner to
-        # pad the generators list as well.
-        self.talker_mtp_accepts_per_row_generators = True
-
+        # This is only valid while talker_mtp receives the *unpadded* active
+        # batch, i.e. when it is NOT graph-wrapped. The runner wraps talker_mtp
+        # (padded batches + a single captured RNG stream) whenever full
+        # cudagraphs are enabled, so disable per-row generators in that case.
+        # Consequence: under full cudagraphs, per-request ``tts_local_seed`` is
+        # not reproducible (matching Qwen3-Omni, which has no per-row seeding);
+        # eager mode keeps the per-row generator fast-path.
+        # TODO(#4923): the model should not read ``cudagraph_mode`` — it is an
+        # upstream (runner) concern, and the runner already re-derives the same
+        # wrap decision in ``_init_talker_mtp``. Once all TTS models declare
+        # ``talker_mtp_graph_safe`` we should move this gating into the model
+        # runner (models only expose the static capability flag, and users can
+        # then configure ``cudagraph_mode`` freely). This also means mtp seeding
+        # is silently dropped when the decode batch > 1 under full cudagraphs;
+        # the follow-up should refactor the per-row generator in the runner to
+        # be cudagraph-safe so seeded batches stay reproducible.
+        cudagraph_mode = getattr(vllm_config.compilation_config, "cudagraph_mode", None)
+        talker_mtp_graph_wrapped = (
+            self.talker_mtp_graph_safe and cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
+        )
+        self.talker_mtp_accepts_per_row_generators = not talker_mtp_graph_wrapped
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:

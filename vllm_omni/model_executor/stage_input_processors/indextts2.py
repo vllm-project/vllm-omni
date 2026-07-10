@@ -143,65 +143,6 @@ def _request_id(request: Any) -> str:
     return str(getattr(request, "external_req_id", None) or getattr(request, "request_id", "?"))
 
 
-def talker2s2mel(
-    source_outputs: list[Any],
-    prompt: Any = None,
-    _requires_multimodal_data: bool = False,
-) -> list[Any]:
-    """Legacy orchestrator path: collect all Stage 0 output, format Stage 1 input."""
-    _old_nt = torch.get_num_threads()
-    torch.set_num_threads(1)
-    try:
-        return _talker2s2mel_impl(source_outputs)
-    finally:
-        torch.set_num_threads(_old_nt)
-
-
-def _talker2s2mel_impl(source_outputs: list[Any]) -> list[Any]:
-    from vllm_omni.inputs.data import OmniTokensPrompt
-
-    s2mel_inputs: list[OmniTokensPrompt] = []
-
-    for i, talker_output in enumerate(source_outputs):
-        if not talker_output.finished:
-            continue
-
-        output = talker_output.outputs[0]
-        mm = output.multimodal_output
-        if not isinstance(mm, dict):
-            logger.warning("Talker output %d has no multimodal_output dict", i)
-            continue
-
-        codes_dict = mm.get("codes", {})
-        mel_codes = codes_dict.get("mel")
-        if not isinstance(mel_codes, torch.Tensor) or mel_codes.numel() == 0:
-            logger.warning("Talker output %d has empty mel_codes", i)
-            continue
-        mel_codes = mel_codes.to(torch.long)
-
-        hs_dict = mm.get("hidden_states", {})
-        latent = hs_dict.get("latent")
-        if not isinstance(latent, torch.Tensor) or latent.numel() == 0:
-            logger.warning("Talker output %d has empty latent", i)
-            continue
-
-        meta = mm.get("meta", {})
-        if not isinstance(meta, dict):
-            meta = {}
-
-        additional_information = _build_s2mel_additional_information(mel_codes, latent, meta, context="talker2s2mel")
-        s2mel_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0],
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-                additional_information=additional_information,
-            )
-        )
-
-    return s2mel_inputs
-
-
 def talker2s2mel_token_only(
     source_outputs: list[Any],
     prompt: Any = None,

@@ -119,30 +119,6 @@ def _decode_additional_information(raw_info: Any) -> dict[str, Any]:
     return decoded
 
 
-def text2flow(
-    source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt = None,
-    _requires_multimodal_data: bool = True,
-):
-    """Build stage-1 inputs by prefixing stage-0 prompt ids to its outputs."""
-    engine_inputs: list[OmniTokensPrompt] = []
-    for source_output in source_outputs:
-        output = source_output.outputs[0]
-        multi_modal_data = output.multimodal_output
-        if multi_modal_data is None:
-            raise RuntimeError(f"Missing multimodal_output for request {source_output.request_id}")
-
-        prefix_ids = _ensure_list(source_output.prompt_token_ids)
-        raw_output_ids = _ensure_list(output.cumulative_token_ids)
-        prompt_speech_ids = _prompt_speech_token_ids(multi_modal_data)
-        output_ids = _strip_prompt_prefix(raw_output_ids, prefix_ids)
-        output_ids = _strip_prompt_prefix(output_ids, prompt_speech_ids)
-        additional_info = dict(multi_modal_data)
-        additional_info.setdefault("ids", {})["prompt"] = prefix_ids
-        engine_inputs.append(OmniTokensPrompt(prompt_token_ids=output_ids, additional_information=additional_info))
-    return engine_inputs
-
-
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: dict[str, Any] | None,

@@ -2,7 +2,6 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
-from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
@@ -11,7 +10,6 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
-from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
 
@@ -29,29 +27,6 @@ def _codec_audio_tensors(multimodal_output: OmniPayload | dict[str, Any]) -> lis
     if isinstance(audio, list) and audio:
         return audio
     return None
-
-
-def generator2tokenizer(
-    source_outputs: list[Any],
-    _prompt: OmniTokensPrompt | TextPrompt = None,
-    _requires_multimodal_data: bool = False,
-):
-    tokenizer_inputs = []
-    for generator_output in source_outputs:
-        output = generator_output.outputs[0]
-        audio_tensors = _codec_audio_tensors(output.multimodal_output)
-        if not audio_tensors:
-            raise ValueError("Missing codes.audio in generator multimodal_output")
-        audio_tokens = torch.cat(audio_tensors, dim=-1).flatten().detach().cpu().tolist()
-        tokenizer_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=audio_tokens,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-
-    return tokenizer_inputs
 
 
 def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
