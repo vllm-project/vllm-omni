@@ -1395,7 +1395,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         emb_dim = len(embedding)
         if self._tts_model_type == "ming_tts":
             if emb_dim != 192:
-                logger.warning("speaker_embedding has %d dimensions; Ming dense expects 192", emb_dim)
+                raise ValueError(f"Ming speaker embedding must have 192 dims, got {emb_dim}")
         else:
             dim_err = self._validate_qwen_tts_speaker_embedding_dim(emb_dim)
             if dim_err is not None:
