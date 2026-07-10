@@ -2551,6 +2551,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return False
         if not artifact_key or artifact_key not in self._ref_audio_model_artifact_ready:
             return False
+        # PD-disaggregation with multiple prefill or decode stages: pd's
+        # round_robin dispatch means a follow-up (artifact-only) request may
+        # land on a prefill/decode stage that has never seen this ref_audio,
+        # and its process-local artifact cache misses → RuntimeError in
+        # build_prompt_embeds → the whole stage executor dies. For Qwen3-TTS
+        # the ref_audio artifact is built at *prefill* time, so >1 prefill
+        # stages (e.g. 3p1d) is just as unsafe as >1 decode stages (e.g.
+        # 1p3d). Force-disable artifact-only whenever there is more than one
+        # prefill OR decode stage, so every request carries the full ref_audio
+        # payload and each stage can build the artifact locally on first hit.
+        # Single-stage PD (1p1d) and non-PD deployments are unaffected.
+        try:
+            pd_prefill_ids = getattr(self.engine_client, "_pd_prefill_ids", None)
+            if isinstance(pd_prefill_ids, list) and len(pd_prefill_ids) > 1:
+                return False
+            pd_decode_ids = getattr(self.engine_client, "_pd_decode_ids", None)
+            if isinstance(pd_decode_ids, list) and len(pd_decode_ids) > 1:
+                return False
+        except Exception:
+            pass
         return (tts_params.get("task_type") or ["CustomVoice"])[0] == "Base"
 
     def _track_ref_audio_artifact_warmup(self, request_id: str, artifact_key: str | None) -> None:

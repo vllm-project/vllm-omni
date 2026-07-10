@@ -246,7 +246,6 @@ class AsyncOmni(EngineClient, OmniBase):
         """Get a random new request ID for this request; at the server level,
         this is usually set by the calling entrypoint, but in direct calls, we
         need to set it explicitly since we do not allow empty IDs.
-
         NOTE: in the upstream vLLM, this is done in the InputProcessor's
         `assign_request_id`.
         """
@@ -389,13 +388,16 @@ class AsyncOmni(EngineClient, OmniBase):
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
-            pd_pair = self._get_pd_separation_pair()
-            if pd_pair is not None:
-                p_id = pd_pair[0]
-                req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
+            bound_prefill_stage_id: int | None = None
+            if self._get_pd_decode_id() is not None and self._get_pd_prefill_ids():
+                p_id = self._pick_prefill_stage()
+                prefill_sp = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
+                req_sp_list[p_id] = prefill_sp
+                # Reuse the single-step prefill params for the slot-0 (LLM) stage so both stages share one step.
+                req_sp_list[0] = prefill_sp
+                bound_prefill_stage_id = p_id
 
-            # Add request(s) to stage 0. For streaming inputs, submit
-            # chunks incrementally through streaming_update.
+            # Submit the request(s) to stage 0; streaming prompts go through the incremental update path.
             if isinstance(prompt, AsyncGenerator):
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
@@ -404,6 +406,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    bound_prefill_stage_id=bound_prefill_stage_id,
                 )
             else:
                 await self.engine.add_request_async(
@@ -413,6 +416,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    bound_prefill_stage_id=bound_prefill_stage_id,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -457,6 +461,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_stage_id: int,
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
+        bound_prefill_stage_id: int | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -495,6 +500,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
                             resumable=True,
+                            bound_prefill_stage_id=bound_prefill_stage_id,
                         )
                         has_submitted_first_chunk = True
                     else:
@@ -597,7 +603,6 @@ class AsyncOmni(EngineClient, OmniBase):
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Read results from the Orchestrator (via the request's asyncio.Queue)
         and yield OmniRequestOutput objects.
-
         The Orchestrator handles all stage-to-stage transfers. This method
         only processes final outputs that arrive on the per-request queue.
         """
@@ -659,7 +664,6 @@ class AsyncOmni(EngineClient, OmniBase):
 
     def _final_output_handler(self) -> None:
         """Start the final output handler if not already running.
-
         This handler reads messages from the Orchestrator output queue and
         routes them to per-request asyncio.Queues.
         """
@@ -669,7 +673,7 @@ class AsyncOmni(EngineClient, OmniBase):
         engine = self.engine
 
         async def _final_output_loop():
-            """Background coroutine that dispatches final outputs to request queues."""
+            """Continuously dispatch final outputs to the per-request output queues."""
             try:
                 while True:
                     msg = await engine.try_get_output_async()
@@ -678,18 +682,12 @@ class AsyncOmni(EngineClient, OmniBase):
                         continue
 
                     if isinstance(msg, dict) and msg.get("type") == "ack":
-                        ack_data = msg.get("ack")
-                        tid = getattr(ack_data, "task_id", "unknown")
-                        logger.info(f"[{self._name}] Intercepted wrapped ACK for task {tid}")
-                        await self.event_resolver.resolve(ack_data)
+                        await self.event_resolver.resolve(msg.get("ack"))
                         continue
                     if isinstance(msg, OmniACK):
-                        logger.info(f"[{self._name}] Intercepted raw ACK object: {msg.task_id}")
                         await self.event_resolver.resolve(msg)
                         continue
                     if hasattr(msg, "task_id"):
-                        tid = getattr(msg, "task_id")
-                        logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
                         await self.event_resolver.resolve(msg)
                         continue
 

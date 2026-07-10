@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1080" viewBox="0 0 1680 1080" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#059669"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#ea580c"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#94a3b8" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="1680" height="1080" fill="#f8fafc"/>
+
+  <!-- Title -->
+  <text x="840" y="48" text-anchor="middle" font-size="34" font-weight="700" fill="#0f172a">Qwen3-TTS  PD + MD  Disaggregation</text>
+  <text x="840" y="80" text-anchor="middle" font-size="19" fill="#475569">Prefill/Decode (PD) split  +  MTP/AR split (MD)  &#183;  2 MTP : 1 AR  &#183;  validated on 1P1D (2 GPUs)</text>
+
+  <!-- ============ TOP BAND: PD PIPELINE ============ -->
+  <text x="60" y="128" font-size="20" font-weight="700" fill="#1e293b">1&#160;&#160;PD pipeline&#160;&#8212;&#160;cross-GPU / cross-process stages</text>
+
+  <!-- Stage 0: Prefill -->
+  <rect x="60" y="150" width="330" height="180" rx="14" fill="#eff6ff" stroke="#2563eb" stroke-width="2" filter="url(#shadow)"/>
+  <text x="225" y="182" text-anchor="middle" font-size="20" font-weight="700" fill="#1d4ed8">Stage 0 &#183; Talker PREFILL</text>
+  <text x="225" y="208" text-anchor="middle" font-size="15" fill="#334155">GPU 0  &#183;  worker_type = ar</text>
+  <text x="225" y="230" text-anchor="middle" font-size="15" fill="#334155">is_prefill_only  &#183;  kv_producer</text>
+  <line x1="90" y1="244" x2="360" y2="244" stroke="#bfdbfe" stroke-width="1.5"/>
+  <text x="225" y="268" text-anchor="middle" font-size="14" fill="#475569">text + ref audio &#8594; prompt embeds</text>
+  <text x="225" y="290" text-anchor="middle" font-size="14" fill="#475569">AR talker prefill</text>
+  <text x="225" y="312" text-anchor="middle" font-size="14" fill="#475569">&#8594; builds KV cache</text>
+
+  <!-- KV transfer arrow -->
+  <line x1="390" y1="240" x2="500" y2="240" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+  <text x="445" y="224" text-anchor="middle" font-size="13" font-weight="600" fill="#2563eb">Mooncake</text>
+  <text x="445" y="262" text-anchor="middle" font-size="12" fill="#2563eb">KV transfer</text>
+
+  <!-- Stage 1: Decode (big, MD happens here) -->
+  <rect x="500" y="150" width="640" height="180" rx="14" fill="#f0fdf4" stroke="#059669" stroke-width="2.5" filter="url(#shadow)"/>
+  <text x="820" y="182" text-anchor="middle" font-size="20" font-weight="700" fill="#047857">Stage 1 &#183; Talker DECODE&#160;&#160;(MD split lives here)</text>
+  <text x="820" y="208" text-anchor="middle" font-size="15" fill="#334155">GPU 1  &#183;  worker_type = ar  &#183;  is_decode_only  &#183;  kv_consumer</text>
+  <line x1="530" y1="222" x2="1110" y2="222" stroke="#bbf7d0" stroke-width="1.5"/>
+  <text x="820" y="248" text-anchor="middle" font-size="14" fill="#475569">AR talker decode loop &#8594; per step produces (layer0_code, layer0_embed, last_talker_hidden)</text>
+  <text x="820" y="272" text-anchor="middle" font-size="14" fill="#475569">MTP replicas predict residual codebooks 1..G-1 in parallel &#8594; merge into full codec codes</text>
+  <text x="820" y="304" text-anchor="middle" font-size="13" font-style="italic" fill="#059669">&#8595;&#8595;  see zoom-in below  &#8595;&#8595;</text>
+
+  <!-- SHM arrow -->
+  <line x1="1140" y1="240" x2="1250" y2="240" stroke="#ea580c" stroke-width="2.5" marker-end="url(#arrowOrange)"/>
+  <text x="1195" y="224" text-anchor="middle" font-size="13" font-weight="600" fill="#ea580c">SharedMem</text>
+  <text x="1195" y="262" text-anchor="middle" font-size="12" fill="#ea580c">async chunk</text>
+
+  <!-- Stage 2: Code2Wav -->
+  <rect x="1250" y="150" width="360" height="180" rx="14" fill="#fff7ed" stroke="#ea580c" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1430" y="182" text-anchor="middle" font-size="20" font-weight="700" fill="#c2410c">Stage 2 &#183; Code2Wav</text>
+  <text x="1430" y="208" text-anchor="middle" font-size="15" fill="#334155">GPU 0/2  &#183;  worker_type = generation</text>
+  <text x="1430" y="230" text-anchor="middle" font-size="15" fill="#334155">final_output = audio</text>
+  <line x1="1280" y1="244" x2="1580" y2="244" stroke="#fed7aa" stroke-width="1.5"/>
+  <text x="1430" y="268" text-anchor="middle" font-size="14" fill="#475569">incrementally consume</text>
+  <text x="1430" y="290" text-anchor="middle" font-size="14" fill="#475569">audio_codes (streaming)</text>
+  <text x="1430" y="312" text-anchor="middle" font-size="14" fill="#475569">&#8594; wav byte stream</text>
+
+  <!-- ============ ZOOM-IN: MD SEPARATION inside Decode worker ============ -->
+  <text x="60" y="410" font-size="20" font-weight="700" fill="#1e293b">2&#160;&#160;MD split&#160;&#8212;&#160;inside the single DECODE worker process (GPU 1)</text>
+
+  <!-- worker process container -->
+  <rect x="60" y="430" width="1550" height="530" rx="16" fill="#ffffff" stroke="#059669" stroke-width="2" stroke-dasharray="8 5"/>
+  <text x="86" y="460" font-size="16" font-weight="700" fill="#047857">Decode worker process &#183; GPU 1 &#183; single CUDA context</text>
+
+  <!-- AR talker block -->
+  <rect x="110" y="490" width="360" height="410" rx="14" fill="#f0fdf4" stroke="#059669" stroke-width="2" filter="url(#shadow)"/>
+  <text x="290" y="522" text-anchor="middle" font-size="19" font-weight="700" fill="#047857">AR  Talker  (main)</text>
+  <text x="290" y="548" text-anchor="middle" font-size="14" fill="#334155">autoregressive decode loop</text>
+  <line x1="140" y1="562" x2="440" y2="562" stroke="#bbf7d0" stroke-width="1.5"/>
+  <text x="290" y="590" text-anchor="middle" font-size="14" fill="#475569">step t:</text>
+  <text x="290" y="616" text-anchor="middle" font-size="14" fill="#475569">1. run talker transformer</text>
+  <text x="290" y="640" text-anchor="middle" font-size="14" fill="#475569">2. sample layer0_code</text>
+  <text x="290" y="664" text-anchor="middle" font-size="14" fill="#475569">3. emit hidden state:</text>
+  <rect x="150" y="678" width="280" height="70" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="1.3"/>
+  <text x="290" y="700" text-anchor="middle" font-size="13" fill="#14532d">layer0_code</text>
+  <text x="290" y="720" text-anchor="middle" font-size="13" fill="#14532d">layer0_embed</text>
+  <text x="290" y="740" text-anchor="middle" font-size="13" fill="#14532d">last_talker_hidden</text>
+  <text x="290" y="800" text-anchor="middle" font-size="14" fill="#475569">4. merge residual embeds back</text>
+  <text x="290" y="824" text-anchor="middle" font-size="14" fill="#475569">into inputs_embeds &#8594; next step</text>
+  <text x="290" y="868" text-anchor="middle" font-size="13" font-style="italic" fill="#059669">_talker_mtp_forward() dispatch</text>
+
+  <!-- dispatch splitter -->
+  <text x="560" y="546" text-anchor="middle" font-size="15" font-weight="700" fill="#7c3aed">round-robin</text>
+  <text x="560" y="568" text-anchor="middle" font-size="13" fill="#7c3aed">row % N</text>
+  <!-- arrows to replicas -->
+  <path d="M470 660 C 540 660, 560 560, 640 560" fill="none" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+  <path d="M470 700 C 540 700, 560 790, 640 790" fill="none" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+
+  <!-- MTP replica 0 -->
+  <rect x="640" y="500" width="470" height="130" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2" filter="url(#shadow)"/>
+  <text x="875" y="530" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">MTP replica #0  (code predictor)</text>
+  <text x="875" y="554" text-anchor="middle" font-size="13.5" fill="#334155">CUDA stream 0  &#183;  private graph pool</text>
+  <text x="875" y="578" text-anchor="middle" font-size="13.5" fill="#475569">deepcopy of code_predictor &#183; predicts codebooks 1..G-1</text>
+  <text x="875" y="602" text-anchor="middle" font-size="13.5" fill="#475569">re-prefill / full-AR-loop graph / KV-cache graph</text>
+
+  <!-- MTP replica 1 -->
+  <rect x="640" y="730" width="470" height="130" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2" filter="url(#shadow)"/>
+  <text x="875" y="760" text-anchor="middle" font-size="18" font-weight="700" fill="#1d4ed8">MTP replica #1  (code predictor)</text>
+  <text x="875" y="784" text-anchor="middle" font-size="13.5" fill="#334155">CUDA stream 1  &#183;  private graph pool</text>
+  <text x="875" y="808" text-anchor="middle" font-size="13.5" fill="#475569">deepcopy of code_predictor &#183; predicts codebooks 1..G-1</text>
+  <text x="875" y="832" text-anchor="middle" font-size="13.5" fill="#475569">runs concurrently with replica #0 on its own stream</text>
+
+  <!-- concurrency brace -->
+  <text x="875" y="688" text-anchor="middle" font-size="14" font-weight="600" fill="#2563eb">&#8593; concurrent on separate CUDA streams (VLLM_OMNI_MTP_NUM_REPLICAS=2) &#8595;</text>
+
+  <!-- merge -->
+  <path d="M1110 560 C 1180 560, 1200 660, 1270 660" fill="none" stroke="#059669" stroke-width="2.5" marker-end="url(#arrowGreen)"/>
+  <path d="M1110 790 C 1180 790, 1200 700, 1270 700" fill="none" stroke="#059669" stroke-width="2.5" marker-end="url(#arrowGreen)"/>
+  <text x="1200" y="545" text-anchor="middle" font-size="14" font-weight="700" fill="#059669">merge</text>
+
+  <!-- merge / output block -->
+  <rect x="1270" y="560" width="300" height="240" rx="12" fill="#f0fdf4" stroke="#059669" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1420" y="592" text-anchor="middle" font-size="17" font-weight="700" fill="#047857">Merge &amp; stream</text>
+  <line x1="1295" y1="604" x2="1545" y2="604" stroke="#bbf7d0" stroke-width="1.5"/>
+  <text x="1420" y="632" text-anchor="middle" font-size="13.5" fill="#475569">gather per-row outputs</text>
+  <text x="1420" y="656" text-anchor="middle" font-size="13.5" fill="#475569">stream.wait_stream() sync</text>
+  <text x="1420" y="684" text-anchor="middle" font-size="13.5" fill="#334155">full codec codes =</text>
+  <text x="1420" y="706" text-anchor="middle" font-size="13.5" fill="#334155">layer0 + residual books</text>
+  <text x="1420" y="734" text-anchor="middle" font-size="13.5" fill="#475569">write back inputs_embeds</text>
+  <text x="1420" y="758" text-anchor="middle" font-size="13.5" fill="#475569">push audio_codes &#8594; SHM</text>
+  <text x="1420" y="784" text-anchor="middle" font-size="13" font-style="italic" fill="#ea580c">&#8594; Stage 2 Code2Wav</text>
+
+  <!-- legend / notes -->
+  <rect x="110" y="905" width="1460" height="42" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="128" y="931" font-size="13.5" fill="#334155">
+    <tspan font-weight="700" fill="#1e293b">Key:</tspan>
+    <tspan>  MTP replicas are in-process deepcopy of code_predictor (not separate workers), each on its own CUDA stream + private graph pool;</tspan>
+  </text>
+  <text x="128" y="947" font-size="0" fill="#334155"> </text>
+
+  <!-- bottom note line 2 -->
+  <text x="840" y="1002" text-anchor="middle" font-size="14" fill="#64748b">PD split = cross-GPU stages (Mooncake KV + SharedMemory streaming)&#160;&#160;&#183;&#160;&#160;MD split = intra-worker AR + N&#215;MTP concurrency&#160;&#160;&#183;&#160;&#160;count set by VLLM_OMNI_MTP_NUM_REPLICAS</text>
+  <text x="840" y="1028" text-anchor="middle" font-size="13" fill="#94a3b8">Two orthogonal dimensions of disaggregation combined on Qwen3-TTS.</text>
+</svg>

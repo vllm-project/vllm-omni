@@ -32,18 +32,7 @@ _GeneratorLike = torch.Generator | Sequence[torch.Generator | None] | None
 _UNIFORM_EPS = 1e-20
 
 
-# ===================================================================
-# HF-numerics-compatible layers for code predictor
-# ===================================================================
-#
-# These use plain PyTorch ops (nn.Linear, manual RMSNorm in float32,
-# rotate_half RoPE) to produce outputs numerically identical to the
-# HuggingFace reference. vLLM's fused kernels (RMSNorm, QKVParallel,
-# get_rope) introduce small precision differences that compound across
-# the autoregressive steps of the code predictor, causing severe
-# audio quality degradation.
-#
-# See: https://github.com/vllm-project/vllm-omni/issues/2274
+# [yurain] HF-numerics compatible layers: plain PyTorch ops matching HF output exactly
 
 
 class _RMSNorm(nn.Module):
@@ -474,6 +463,10 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._device_graphs: dict[int | tuple[int, int], tuple] = {}  # (graph, static_output) per bucket
+        # [yurain] private CUDA graph memory pool; None -> use vLLM's shared global pool.
+        # Multi-MTP replicas each get a distinct private pool so their graphs can be
+        # captured/replayed concurrently on separate streams without memory clobbering.
+        self._graph_pool = None
         prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
         prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
         is_npu = current_omni_platform.is_npu()
@@ -536,7 +529,6 @@ class CodePredictorWrapper(nn.Module):
                 # For NPU, use eager + NPU graphs (no torch.compile)
                 self._warmup_buckets()
                 self._capture_npu_graphs()
-                logger.info("code_predictor: eager mode + NPU graphs")
             else:
                 logger.warning_once("code_predictor: torch.compile disabled")
             return
@@ -554,9 +546,6 @@ class CodePredictorWrapper(nn.Module):
 
         if self._wrapper_config.use_cuda_graphs:
             self._capture_cuda_graphs()
-            logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
-        else:
-            logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
 
     def _padded_bsz(self, bsz: int) -> int:
         """Round batch size up to nearest power-of-2 bucket."""
@@ -678,12 +667,6 @@ class CodePredictorWrapper(nn.Module):
                         self._bucket_pos_ids[(bsz, seq_len)] = pos_ids
                         for _ in range(2):
                             self._compiled_model_fwd(proj_buf[:bsz, :seq_len, :], pos_ids)
-            logger.info(
-                "code_predictor: prefix warmup done for buckets %s prefix_buckets=%s seq_lens=%s",
-                self._bucket_sizes,
-                sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else "all",
-                prefix_seq_lens,
-            )
         else:
             for bsz in self._bucket_sizes:
                 pos_ids = (
@@ -692,13 +675,19 @@ class CodePredictorWrapper(nn.Module):
                 self._bucket_pos_ids[bsz] = pos_ids
                 for _ in range(3):
                     self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
-            logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
 
     def _capture_cuda_graphs(self) -> None:
-        """Capture a CUDA graph per bucket using vLLM's global graph pool."""
+        """Capture a CUDA graph per bucket.
+
+        Uses this instance's private pool (``self._graph_pool``) when set,
+        otherwise falls back to vLLM's shared global graph pool. A private
+        pool is required for replicas that are replayed concurrently on
+        separate CUDA streams, since graphs sharing one pool are not safe
+        to replay concurrently (may clobber each other's memory).
+        """
         from vllm.platforms import current_platform
 
-        pool = current_platform.get_global_graph_pool()
+        pool = self._graph_pool or current_platform.get_global_graph_pool()
         max_seq = self._num_groups + 1
         proj_buf = self._proj_buf
 
@@ -728,12 +717,6 @@ class CodePredictorWrapper(nn.Module):
 
                         self._device_graphs[(bsz, seq_len)] = (g, static_output)
 
-            logger.info(
-                "code_predictor: captured prefix CUDA graphs for buckets %s prefix_buckets=%s seq_lens=%s",
-                self._bucket_sizes,
-                sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else "all",
-                prefix_seq_lens,
-            )
         else:
             for bsz in self._bucket_sizes:
                 static_input = proj_buf[:bsz, :max_seq, :]
@@ -744,8 +727,6 @@ class CodePredictorWrapper(nn.Module):
                     static_output = self._compiled_model_fwd(static_input, pos_ids)
 
                 self._device_graphs[bsz] = (g, static_output)
-
-            logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
 
     def _capture_npu_graphs(self) -> None:
         """Capture an NPU graph per bucket using torch_npu's NPUGraph."""
@@ -763,32 +744,9 @@ class CodePredictorWrapper(nn.Module):
 
             self._device_graphs[bsz] = (g, static_output)
 
-        logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
-
     # ------------------------------------------------------------------
     #  Forward -- re-prefill + inline sampling
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _multinomial(
-        probs: torch.Tensor,
-        generator: torch.Generator | None,
-        generators: Sequence[torch.Generator | None] | None,
-    ) -> torch.Tensor:
-        """Sample one code per row, optionally with per-row generators.
-
-        Per-row generators keep explicitly-seeded requests deterministic in a
-        multi-row batch: each row consumes draws only from its own generator,
-        so the transformer forward can stay batched (#4883).
-        """
-        if generators is None:
-            return torch.multinomial(probs, num_samples=1, generator=generator)
-        return torch.cat(
-            [
-                torch.multinomial(probs[row : row + 1], num_samples=1, generator=row_generator)
-                for row, row_generator in enumerate(generators)
-            ]
-        )
 
     @torch.inference_mode()
     def forward(
@@ -838,6 +796,7 @@ class CodePredictorWrapper(nn.Module):
         if stored_mode:
             s_top_k = self._top_k
             s_top_p = self._top_p
+            use_sampling = True
         else:
             use_sampling = do_sample and temperature > 0
             inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0

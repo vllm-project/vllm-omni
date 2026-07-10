@@ -238,16 +238,39 @@ class Orchestrator:
         for stage_id, pool in enumerate(self.stage_pools):
             for replica_id in pool.live_replica_ids():
                 self._orch_monitor.register_replica(stage_id, replica_id)
+        self._downstream_stage_ids: dict[int, list[int]] = self._build_downstream_stage_ids(stage_pools)
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
+        self._pd_prefill_ids: list[int] = []
+        self._pd_decode_ids: list[int] = []
+        self._pd_decode_to_prefill: dict[int, list[int]] = {}
         self._pd_bootstrap_addr: str | None = None
+        self._pd_bootstrap_addr_by_prefill: dict[int, str] = {}
         self._pd_prefill_engine_id: str | None = None
+        self._pd_prefill_engine_id_by_prefill: dict[int, str] = {}
+        self._pd_decode_pick_strategy: str = "round_robin"
+        self._pd_decode_round_robin_idx: int = 0
+        self._pd_decode_inflight: dict[int, int] = {}
+        self._pd_request_to_decode: dict[str, int] = {}
         self._pd_kv_params: dict[str, Any] = {}
         if pd_config is not None:
             self._pd_pair = pd_config.get("pd_pair")
+            self._pd_prefill_ids = list(
+                pd_config.get("prefill_ids") or ([] if self._pd_pair is None else [self._pd_pair[0]])
+            )
+            self._pd_decode_ids = list(
+                pd_config.get("decode_ids") or ([] if self._pd_pair is None else [self._pd_pair[1]])
+            )
+            self._pd_decode_to_prefill = {
+                int(k): list(v) for k, v in dict(pd_config.get("decode_to_prefill") or {}).items()
+            }
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
+            self._pd_bootstrap_addr_by_prefill = dict(pd_config.get("bootstrap_addr_by_prefill") or {})
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
+            self._pd_prefill_engine_id_by_prefill = dict(pd_config.get("prefill_engine_id_by_prefill") or {})
+            self._pd_decode_pick_strategy = str(pd_config.get("decode_pick_strategy") or "round_robin").lower()
+            self._pd_decode_inflight = {d_id: 0 for d_id in self._pd_decode_ids}
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
 
@@ -261,6 +284,39 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+
+    @staticmethod
+    def _build_downstream_stage_ids(stage_pools: list[StagePool]) -> dict[int, list[int]]:
+        """Build src-stage -> downstream-stage mapping from stage metadata.
+
+        Legacy linear pipelines omit ``engine_input_source`` on some stages, so
+        callers still fall back to ``stage_id + 1`` when no explicit mapping is
+        present. Non-linear fan-in/fan-out pipelines (for example 1P3D where
+        stage-1/2/3 all feed stage-4) must use this mapping instead of numeric
+        adjacency.
+        """
+        downstream: dict[int, list[int]] = {}
+        for dst_id, pool in enumerate(stage_pools):
+            sources = list(getattr(pool.stage_client, "engine_input_source", None) or [])
+            for src_id in sources:
+                if not isinstance(src_id, int):
+                    try:
+                        src_id = int(src_id)
+                    except (TypeError, ValueError):
+                        continue
+                downstream.setdefault(src_id, []).append(dst_id)
+        return downstream
+
+    def _resolve_next_stage_id(self, src_stage_id: int) -> int:
+        candidates = self._downstream_stage_ids.get(src_stage_id) or []
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            non_pd_decode = [stage_id for stage_id in candidates if not self._is_pd_decode_stage(stage_id)]
+            if len(non_pd_decode) == 1:
+                return non_pd_decode[0]
+            raise RuntimeError(f"[Orchestrator] Ambiguous downstream stages for stage-{src_stage_id}: {candidates}")
+        return src_stage_id + 1
 
     def _init_metrics_state(
         self,
@@ -291,7 +347,7 @@ class Orchestrator:
         self._running_counter = running_counter
         self._transfer_emitter = transfer_emitter
 
-        # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
+        # [# Flat engine_idx ↔ (stage, replica) maps. The reverse map is
         # consulted at record() time to translate the orchestrator's
         # (stage_id, replica_id) loop variables into an engine_idx the
         # underlying PrometheusStatLogger can address.
@@ -434,7 +490,12 @@ class Orchestrator:
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
-        stage_id = 0
+        # [yurain] M-P-N-D PD: route to the caller-picked prefill stage
+        bound_p = getattr(msg, "bound_prefill_stage_id", None)
+        if bound_p is not None and 0 <= bound_p < len(self.stage_pools):
+            stage_id = bound_p
+        else:
+            stage_id = 0
         request_id = msg.request_id
         prompt = msg.prompt
         original_prompt = msg.original_prompt
@@ -483,7 +544,8 @@ class Orchestrator:
             prompt_text=msg.output_prompt_text,
         )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        # [yurain] async_chunk prewarm must fire on req's ENTRY stage
+        if self.async_chunk and (stage_id == 0 or self._is_pd_prefill_stage(stage_id)) and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
@@ -825,8 +887,61 @@ class Orchestrator:
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
             self._pd_kv_params.pop(request_id, None)
+            self._release_pd_decode_for_request(request_id)
             if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
                 self._running_counter.decrement()
+
+    def _is_pd_prefill_stage(self, stage_id: int) -> bool:
+        return stage_id in self._pd_prefill_ids
+
+    def _is_pd_decode_stage(self, stage_id: int) -> bool:
+        return stage_id in self._pd_decode_ids
+
+    def _pd_decode_already_submitted(self, req_state: OrchestratorRequestState) -> bool:
+        return any(d_id in req_state.stage_submit_ts for d_id in self._pd_decode_ids)
+
+    def _peek_pd_decode_for_request(self, req_id: str) -> int | None:
+        return self._pd_request_to_decode.get(req_id)
+
+    def _release_pd_decode_for_request(self, req_id: str) -> int | None:
+        stage_id = self._pd_request_to_decode.pop(req_id, None)
+        if stage_id is None:
+            return None
+        cur = self._pd_decode_inflight.get(stage_id, 0)
+        self._pd_decode_inflight[stage_id] = max(0, cur - 1)
+        return stage_id
+
+    def _pick_pd_decode_stage(self, req_id: str, bound_prefill_id: int | None) -> int:
+        if not self._pd_decode_ids:
+            raise RuntimeError("[Orchestrator][PD] No decode stage is configured")
+        existing = self._peek_pd_decode_for_request(req_id)
+        if existing is not None:
+            return existing
+
+        candidates = list(self._pd_decode_ids)
+        if bound_prefill_id is not None:
+            filtered = [d_id for d_id in candidates if bound_prefill_id in self._pd_decode_to_prefill.get(d_id, [])]
+            if filtered:
+                candidates = filtered
+            else:
+                logger.warning(
+                    "[Orchestrator][PD] No decode stage references bound prefill stage-%s; using all decode stages %s",
+                    bound_prefill_id,
+                    candidates,
+                )
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        elif self._pd_decode_pick_strategy == "least_inflight":
+            chosen = min(candidates, key=lambda d_id: (self._pd_decode_inflight.get(d_id, 0), d_id))
+        else:
+            idx = self._pd_decode_round_robin_idx % len(candidates)
+            chosen = candidates[idx]
+            self._pd_decode_round_robin_idx = (self._pd_decode_round_robin_idx + 1) % max(1, len(self._pd_decode_ids))
+
+        self._pd_request_to_decode[req_id] = chosen
+        self._pd_decode_inflight[chosen] = self._pd_decode_inflight.get(chosen, 0) + 1
+        return chosen
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -922,17 +1037,23 @@ class Orchestrator:
                 )
             )
 
-        if self._pd_pair is not None and finished and stage_id == self._pd_pair[0]:
+        if self._is_pd_prefill_stage(stage_id) and finished:
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is not None:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
+        pd_ready_to_forward = self._is_pd_prefill_stage(stage_id)
+        next_already_submitted = (
+            self._pd_decode_already_submitted(req_state)
+            if pd_ready_to_forward
+            else self._next_stage_already_submitted(stage_id, req_state)
+        )
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
             and not self.async_chunk
-            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+            and (not next_already_submitted or req_state.streaming.enabled)
         ):
             if (
                 finished
@@ -966,7 +1087,19 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
-        return (stage_id + 1) in req_state.stage_submit_ts
+        return self._resolve_next_stage_id(stage_id) in req_state.stage_submit_ts
+
+    @staticmethod
+    def _with_omni_source_stage(prompt: dict[str, Any], src_stage_id: int) -> dict[str, Any]:
+        enriched = dict(prompt)
+        additional_info = enriched.get("additional_information")
+        if isinstance(additional_info, dict):
+            additional_info = dict(additional_info)
+        else:
+            additional_info = {}
+        additional_info["omni_source_stage_id"] = [str(src_stage_id)]
+        enriched["additional_information"] = additional_info
+        return enriched
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
@@ -1054,7 +1187,7 @@ class Orchestrator:
             return
 
         stage_id = deferred["stage_id"]
-        if (stage_id + 1) in parent_state.stage_submit_ts:
+        if self._next_stage_already_submitted(stage_id, parent_state):
             return
 
         await self._forward_to_next_stage(
@@ -1069,8 +1202,8 @@ class Orchestrator:
         stage_id: int,
         raw_outputs: EngineCoreOutputs,
     ) -> None:
-        """Forward split requests once stage-0 KV is ready."""
-        if self.async_chunk:
+        """Forward split requests once prefill-stage KV is ready."""
+        if self.async_chunk and not self._is_pd_prefill_stage(stage_id):
             return
 
         for raw_output in raw_outputs.outputs:
@@ -1087,15 +1220,22 @@ class Orchestrator:
                 continue
             if stage_id >= req_state.final_stage_id:
                 continue
-            if (stage_id + 1) in req_state.stage_submit_ts:
+            if self._is_pd_prefill_stage(stage_id):
+                if self._pd_decode_already_submitted(req_state):
+                    continue
+            elif self._next_stage_already_submitted(stage_id, req_state):
                 continue
+
+            if self._is_pd_prefill_stage(stage_id):
+                self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
+                req_state.pd_prefill_multimodal_output = getattr(raw_output, "multimodal_output", None)
 
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
                 self._cfg_tracker.defer_parent(req_id, raw_output, stage_id)
             else:
                 await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
 
-    def _build_pd_decode_params(self, req_id: str, sp: Any) -> Any:
+    def _build_pd_decode_params(self, req_id: str, sp: Any, prefill_stage_id: int | None = None) -> Any:
         """Build decode-side sampling params with KV transfer params for PD routing.
 
         Clones the sampling params and injects kv_transfer_params that tell the
@@ -1116,11 +1256,21 @@ class Orchestrator:
             "transfer_id": f"xfer-{req_id}",
         }
 
-        if self._pd_bootstrap_addr:
-            decode_kv_params["remote_bootstrap_addr"] = self._pd_bootstrap_addr
+        bootstrap_addr = None
+        if prefill_stage_id is not None:
+            bootstrap_addr = self._pd_bootstrap_addr_by_prefill.get(prefill_stage_id)
+        if bootstrap_addr is None:
+            bootstrap_addr = self._pd_bootstrap_addr
+        if bootstrap_addr:
+            decode_kv_params["remote_bootstrap_addr"] = bootstrap_addr
 
-        if self._pd_prefill_engine_id:
-            decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
+        prefill_engine_id = None
+        if prefill_stage_id is not None:
+            prefill_engine_id = self._pd_prefill_engine_id_by_prefill.get(prefill_stage_id)
+        if prefill_engine_id is None:
+            prefill_engine_id = self._pd_prefill_engine_id
+        if prefill_engine_id:
+            decode_kv_params["remote_engine_id"] = prefill_engine_id
 
         # Overlay params from prefill side (includes remote_request_id set by monkey patch).
         decode_kv_params.update(kv_prefill_params)
@@ -1187,13 +1337,27 @@ class Orchestrator:
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
-        next_logical = src_stage_id + 1
+        pd_prefill_forward = self._is_pd_prefill_stage(src_stage_id) and self._pd_decode_ids
+        if pd_prefill_forward:
+            next_logical = self._pick_pd_decode_stage(req_id, src_stage_id)
+            if next_logical in req_state.final_output_stage_ids:
+                other_decode_finals = req_state.final_output_stage_ids.intersection(self._pd_decode_ids) - {
+                    next_logical
+                }
+                if other_decode_finals:
+                    req_state.final_output_stage_ids.difference_update(other_decode_finals)
+        else:
+            next_logical = self._resolve_next_stage_id(src_stage_id)
         next_pool = self.stage_pools[next_logical]
         next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
-        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
+        already_submitted = (
+            next_logical in req_state.stage_submit_ts
+            if pd_prefill_forward
+            else self._next_stage_already_submitted(src_stage_id, req_state)
+        )
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
         _t_submit_start = _time.perf_counter()
 
@@ -1320,8 +1484,8 @@ class Orchestrator:
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
-        if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
-            params = self._build_pd_decode_params(req_id, params)
+        if pd_prefill_forward:
+            params = self._build_pd_decode_params(req_id, params, prefill_stage_id=src_stage_id)
 
             # Use the original user prompt for the decode stage (not processed embeddings)
             original_prompt = req_state.prompt
@@ -1365,6 +1529,16 @@ class Orchestrator:
                 request_id=req_id,
                 tx_ms=_tx_ms,
             )
+            if self.async_chunk:
+                for downstream_stage_id in self._downstream_stage_ids.get(next_logical, []):
+                    if downstream_stage_id not in req_state.stage_submit_ts:
+                        await self._prewarm_async_chunk_stage(
+                            req_id,
+                            req_state.prompt,
+                            req_state,
+                            downstream_stage_id,
+                            source_stage_id=next_logical,
+                        )
             return
 
         if req_state.pd_prefill_multimodal_output is not None:
@@ -1436,6 +1610,8 @@ class Orchestrator:
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
+            if isinstance(next_input, dict):
+                next_input = self._with_omni_source_stage(next_input, src_stage_id)
             request = self._build_next_stage_request(
                 req_id,
                 next_logical,
@@ -1471,81 +1647,123 @@ class Orchestrator:
         if req_state.final_stage_id <= 0:
             return
 
-        prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
+        for next_stage_id in range(1, req_state.final_stage_id + 1):
+            if self._is_pd_decode_stage(next_stage_id):
+                continue
+            # [yurain] skip PD prefill siblings in async_chunk prewarm; KV always flows via Mooncake
+            if self._is_pd_prefill_stage(next_stage_id):
+                continue
+            input_sources = list(
+                getattr(
+                    self.stage_pools[next_stage_id].stage_client,
+                    "engine_input_source",
+                    None,
+                )
+                or []
+            )
+            if any(self._is_pd_decode_stage(src_id) for src_id in input_sources):
+                continue
+            await self._prewarm_async_chunk_stage(
+                request_id,
+                stage0_request,
+                req_state,
+                next_stage_id,
+                source_stage_id=next_stage_id - 1,
+            )
+
+    async def _prewarm_async_chunk_stage(
+        self,
+        request_id: str,
+        source_request: Any,
+        req_state: OrchestratorRequestState,
+        next_stage_id: int,
+        *,
+        source_stage_id: int,
+    ) -> None:
+        """Pre-submit one async-chunk receiver stage after its producer is known."""
+        prompt_token_ids = getattr(source_request, "prompt_token_ids", None)
+        if prompt_token_ids is None and isinstance(req_state.prompt, dict):
+            prompt_token_ids = req_state.prompt.get("prompt_token_ids")
         if prompt_token_ids is None:
             logger.warning(
-                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage0 prompt_token_ids missing",
+                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage%d prompt_token_ids missing",
                 request_id,
+                source_stage_id,
             )
             return
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
-            next_pool = self.stage_pools[next_stage_id]
-            params = req_state.sampling_params_list[next_stage_id]
+        next_pool = self.stage_pools[next_stage_id]
+        params = req_state.sampling_params_list[next_stage_id]
 
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
-            _t_submit_start = _time.perf_counter()
+        _t_submit_start = _time.perf_counter()
 
-            if next_pool.stage_type == "diffusion":
-                await next_pool.submit_initial(
-                    request_id,
-                    req_state,
-                    req_state.prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
-                            request_id=request_id,
-                        )
-                    },
-                )
-            else:
-                import copy
-
-                from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
-
-                try:
-                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
-                except Exception:
-                    next_prompt_len = max(1, len(prompt_token_ids))
-
-                original_prompt = req_state.prompt
-                if isinstance(original_prompt, dict):
-                    base_input = copy.deepcopy(original_prompt)
-                else:
-                    base_input = {}
-
-                base_input["prompt_token_ids"] = [0] * next_prompt_len
-                base_input["multi_modal_data"] = None
-                base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
-                request = build_engine_core_request_from_tokens(
-                    request_id=request_id,
-                    prompt=base_input,
-                    params=params,
-                    model_config=next_pool.stage_vllm_config.model_config,
-                    resumable=downstream_resumable,
-                )
-                request.external_req_id = request.request_id
-                await next_pool.submit_initial(
-                    request_id,
-                    req_state,
-                    request,
-                    prompt_text=None,
-                )
-
-            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
-            # replica is stage 0's bound replica (single-replica thinker in
-            # all current configs); fall back to 0 if unknown.
-            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
-            self._emit_tx_edge(
-                from_stage=next_stage_id - 1,
-                from_replica=src_replica if src_replica is not None else 0,
-                to_stage=next_stage_id,
-                to_pool=next_pool,
-                request_id=request_id,
-                tx_ms=_tx_ms,
+        if next_pool.stage_type == "diffusion":
+            await next_pool.submit_initial(
+                request_id,
+                req_state,
+                req_state.prompt,
+                submit_kwargs={
+                    "kv_sender_info": self._build_kv_sender_info(
+                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [source_stage_id]),
+                        request_id=request_id,
+                    )
+                },
             )
+        else:
+            import copy
+
+            from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
+
+            try:
+                next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+            except Exception:
+                next_prompt_len = max(1, len(prompt_token_ids))
+
+            original_prompt = req_state.prompt
+            if isinstance(original_prompt, dict):
+                base_input = copy.deepcopy(original_prompt)
+            else:
+                base_input = {}
+
+            base_input["prompt_token_ids"] = [0] * next_prompt_len
+            base_input["multi_modal_data"] = None
+            base_input["mm_processor_kwargs"] = None
+            base_input = self._with_omni_source_stage(base_input, source_stage_id)
+            downstream_resumable = bool(getattr(source_request, "resumable", req_state.streaming.enabled))
+            request = build_engine_core_request_from_tokens(
+                request_id=request_id,
+                prompt=base_input,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                resumable=downstream_resumable,
+            )
+            request.external_req_id = request.request_id
+            await next_pool.submit_initial(
+                request_id,
+                req_state,
+                request,
+                prompt_text=None,
+            )
+
+        req_state.stage_submit_ts[next_stage_id] = _time.time()
+        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+        src_replica = self.stage_pools[source_stage_id].get_bound_replica_id(request_id)
+        logger.info(
+            "[Orchestrator] async_chunk prewarm req=%s stage-%d->stage-%d prompt_len=%d source_replica=%s",
+            request_id,
+            source_stage_id,
+            next_stage_id,
+            len(prompt_token_ids),
+            src_replica,
+        )
+        self._emit_tx_edge(
+            from_stage=source_stage_id,
+            from_replica=src_replica if src_replica is not None else 0,
+            to_stage=next_stage_id,
+            to_pool=next_pool,
+            request_id=request_id,
+            tx_ms=_tx_ms,
+        )
 
     def _build_kv_sender_info(
         self,
