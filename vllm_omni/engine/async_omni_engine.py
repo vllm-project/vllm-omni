@@ -31,7 +31,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.stage_config import load_deploy_config, strip_parent_engine_args
+from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -69,21 +69,6 @@ logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
-
-
-def _deploy_trust_remote_code(deploy_config_path: str | None) -> bool | None:
-    """Return deploy-level trust_remote_code without resolving full stages."""
-    if deploy_config_path is None:
-        return None
-    try:
-        return load_deploy_config(deploy_config_path).trust_remote_code
-    except Exception as exc:
-        logger.debug(
-            "Unable to read trust_remote_code from deploy config %s: %s",
-            deploy_config_path,
-            exc,
-        )
-        return None
 
 
 # ============================================================================
@@ -297,8 +282,6 @@ class AsyncOmniEngine:
         # restriction beforehand. TODO (Alex) make this cleaner and refactor
         # stage config resolution to remove kwargs hacks.
         deploy_config_path = kwargs.get("deploy_config")
-        if _deploy_trust_remote_code(deploy_config_path) is True and not trust_remote_code:
-            trust_remote_code = True
         self.endpoint_restrictions = StageConfigFactory.get_pipeline_endpoint_restrictions(
             model=model,
             trust_remote_code=trust_remote_code,

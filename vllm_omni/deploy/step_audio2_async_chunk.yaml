@@ -22,7 +22,7 @@ stages:
       repetition_penalty: 1.05
 
   - stage_id: 1
-    devices: "3"
+    devices: "1"
     max_num_seqs: 1
     gpu_memory_utilization: 0.3
     enforce_eager: true

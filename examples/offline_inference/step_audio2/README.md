@@ -257,8 +257,8 @@ python end2end.py --query-type text_to_audio \
 
 The default configuration (`vllm_omni/deploy/step_audio2.yaml`) uses:
 
-- **Stage 0 (Thinker)**: GPUs 0-3 with tensor parallel size 4, 80% memory
-- **Stage 1 (Token2Wav)**: GPU 3, 30% memory
+- **Stage 0 (Thinker)**: GPUs 0-1 with tensor parallel size 2, 80% memory
+- **Stage 1 (Token2Wav)**: GPU 1, 30% memory
 
 For **single GPU** setup, edit a deploy config copy to use `devices: "0"` for both stages.
 

@@ -8,10 +8,10 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-
 WAN2_2_TI2V_DIT_FP8_PIPELINE = PipelineConfig(
     model_type="wan2_2_ti2v_dit_fp8",
     model_arch="WanPipeline",
+    diffusers_class_name="WanPipeline",
     stages=(
         StagePipelineConfig(
             stage_id=0,

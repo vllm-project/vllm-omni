@@ -8,10 +8,10 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-
 HUNYUAN_VIDEO_15_DIT_FP8_PIPELINE = PipelineConfig(
     model_type="hunyuan_video_15_dit_fp8",
     model_arch="HunyuanVideo15Pipeline",
+    diffusers_class_name="HunyuanVideo15Pipeline",
     stages=(
         StagePipelineConfig(
             stage_id=0,

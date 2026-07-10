@@ -803,7 +803,7 @@ stages:
             ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", "mimo_audio"),
-            ("step_audio2.yaml", "step_audio2", 2, "audio", "step_audio2"),
+            ("step_audio2.yaml", "step_audio_2", 2, "audio", "step_audio_2"),
             ("step_audio2_asr.yaml", "step_audio2_asr", 1, "text", "step_audio2_asr"),
             ("step_audio2_async_chunk.yaml", "step_audio2_async_chunk", 2, "audio", "step_audio2_async_chunk"),
             ("hunyuan_video_15_dit_fp8.yaml", "hunyuan_video_15_dit_fp8", 1, "video", "hunyuan_video_15_dit_fp8"),
@@ -831,13 +831,47 @@ stages:
         if deploy.trust_remote_code is not None:
             assert {s.yaml_engine_args.get("trust_remote_code") for s in stages} == {deploy.trust_remote_code}
 
-    def test_async_engine_reads_deploy_trust_remote_code(self, tmp_path):
-        deploy_path = tmp_path / "deploy.yaml"
-        deploy_path.write_text("trust_remote_code: true\nstages: []\n", encoding="utf-8")
+    @pytest.mark.parametrize(
+        ("config_json", "model_index", "expected_pipeline"),
+        [
+            ({"model_type": "step_audio_2"}, None, "step_audio2"),
+            (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15_dit_fp8"),
+            (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v_dit_fp8"),
+        ],
+    )
+    def test_migrated_models_are_discovered_without_explicit_deploy(
+        self,
+        config_json,
+        model_index,
+        expected_pipeline,
+    ):
+        def get_model_file(filename, _model, revision=None):
+            del revision
+            if filename == "config.json":
+                return config_json
+            if filename == "model_index.json":
+                return model_index
+            return None
 
-        from vllm_omni.engine.async_omni_engine import _deploy_trust_remote_code
+        with (
+            patch.object(StageConfigFactory, "get_hf_config", return_value=None),
+            patch("vllm_omni.config.config_factory.get_hf_file_to_dict", side_effect=get_model_file),
+        ):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                model="/models/unrelated-checkpoint-name",
+                trust_remote_code=False,
+            )
 
-        assert _deploy_trust_remote_code(str(deploy_path)) is True
+        assert pipeline is not None
+        assert pipeline.model_type == expected_pipeline
+
+    @pytest.mark.parametrize("deploy_name", ["step_audio2.yaml", "step_audio2_async_chunk.yaml"])
+    def test_step_audio2_deploy_configs_fit_two_gpus(self, deploy_name):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+
+        assert deploy.stages[0].devices == "0,1"
+        assert deploy.stages[0].tensor_parallel_size == 2
+        assert deploy.stages[1].devices == "1"
 
     def test_no_bundled_legacy_stage_config_yamls(self):
         stage_config_dir = Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
