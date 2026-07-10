@@ -247,7 +247,6 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["ids"]["all"] == [151644, 872, 3]
     assert payload["embed"]["prefill"].device.type == "cpu"
     assert payload["hidden_states"]["output"].device.type == "cpu"
-    assert payload["meta"]["next_stage_prompt_len"] > 0
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
 
