@@ -313,6 +313,8 @@ def resolve_model_config_path(model: str) -> str:
 
 def load_stage_configs_from_model(
     model: str,
+    *,
+    trust_remote_code: bool,
     base_engine_args: dict | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
@@ -327,6 +329,7 @@ def load_stage_configs_from_model(
 
     Args:
         model: Model name or path (used to determine model_type)
+        trust_remote_code: Whether to trust remote code while resolving the model config.
         base_engine_args: Base engine args to merge as CLI overrides.
         deploy_config_path: Optional explicit deploy config path.
         stage_overrides: Per-stage overrides from --stage-overrides.
@@ -338,6 +341,7 @@ def load_stage_configs_from_model(
         base_engine_args = {}
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
+    cli_overrides["trust_remote_code"] = trust_remote_code
     if stage_overrides:
         for stage_id_str, overrides in stage_overrides.items():
             for key, val in overrides.items():
@@ -349,6 +353,7 @@ def load_stage_configs_from_model(
     # migrate the engine/runtime consumers and replace this legacy resolver.
     stages = StageConfigFactory.create_legacy_stage_configs_from_model(
         model,
+        trust_remote_code=trust_remote_code,
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
     )
@@ -507,6 +512,8 @@ def load_and_resolve_stage_configs(
     model: str,
     stage_configs_path: str | None,
     kwargs: dict | None,
+    *,
+    trust_remote_code: bool,
     default_stage_cfg_factory: Any = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
@@ -517,6 +524,7 @@ def load_and_resolve_stage_configs(
         model: Model name or path
         stage_configs_path: Optional path to legacy YAML (stage_args format)
         kwargs: Engine arguments to merge with stage configs
+        trust_remote_code: Whether to trust remote code while resolving the model config.
         default_stage_cfg_factory: Optional callable that takes no args and returns
             default stage config list when no configs are found
         deploy_config_path: Optional path to deploy YAML (new format).
@@ -557,6 +565,7 @@ def load_and_resolve_stage_configs(
         config_path = deploy_config_path
         stage_configs = load_stage_configs_from_model(
             model,
+            trust_remote_code=trust_remote_code,
             base_engine_args=kwargs,
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
@@ -571,6 +580,7 @@ def load_and_resolve_stage_configs(
         config_path = resolve_model_config_path(model)
         stage_configs = load_stage_configs_from_model(
             model,
+            trust_remote_code=trust_remote_code,
             base_engine_args=kwargs,
             stage_overrides=stage_overrides,
         )

@@ -266,32 +266,16 @@ class StageConfigFactory:
                 return pipeline_cfg
         return None
 
-    @staticmethod
-    def _get_trust_remote_code(cli_overrides: dict[str, Any]) -> bool:
-        trust_remote_code = cli_overrides.get("trust_remote_code", False)
-        return False if trust_remote_code is None else bool(trust_remote_code)
-
-    @staticmethod
-    def _get_default_deploy_key(model_type: str | None, pipeline_cfg: PipelineConfig) -> str:
-        """Use the resolved pipeline key when HF reports an unregistered type.
-
-        For example, MiMo Audio reports ``model_type="qwen2"`` but resolves
-        through its HF architecture to the ``mimo_audio`` pipeline and deploy
-        config.
-        """
-        if model_type in OMNI_PIPELINES:
-            return model_type
-        return pipeline_cfg.model_type
-
     @classmethod
     def create_from_model(
         cls,
         model: str,
+        *,
+        trust_remote_code: bool,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None,
     ) -> VllmOmniConfig | None:
         """Build the structured Omni config for a model/deploy pair."""
-        trust_remote_code = cls._get_trust_remote_code(cli_overrides)
         pipeline_cfg = cls.get_pipeline_config(
             model=model,
             trust_remote_code=trust_remote_code,
@@ -300,12 +284,13 @@ class StageConfigFactory:
         if pipeline_cfg is None:
             return None
 
-        model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
-        deploy_key = cls._get_default_deploy_key(model_type, pipeline_cfg)
-        registry_cli_overrides = {**cli_overrides, "model": model}
-        return VllmOmniConfig.from_registry(
-            deploy_key,
-            resolved_pipeline=pipeline_cfg,
+        registry_cli_overrides = {
+            **cli_overrides,
+            "trust_remote_code": trust_remote_code,
+            "model": model,
+        }
+        return VllmOmniConfig.from_pipeline_config(
+            pipeline_cfg,
             deploy_config_path=deploy_config_path,
             cli_overrides=registry_cli_overrides,
         )
@@ -314,6 +299,8 @@ class StageConfigFactory:
     def create_legacy_stage_configs_from_model(
         cls,
         model: str,
+        *,
+        trust_remote_code: bool,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None,
     ) -> list[StageConfig] | None:
@@ -323,7 +310,6 @@ class StageConfigFactory:
         RFC #4021 will replace this transitional path as runtime consumers move
         to VllmOmniConfig.
         """
-        trust_remote_code = cls._get_trust_remote_code(cli_overrides)
         pipeline_cfg = cls.get_pipeline_config(
             model=model,
             trust_remote_code=trust_remote_code,
@@ -332,12 +318,14 @@ class StageConfigFactory:
         if pipeline_cfg is None:
             return None
 
-        model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
-        deploy_key = cls._get_default_deploy_key(model_type, pipeline_cfg)
+        legacy_cli_overrides = {
+            **cli_overrides,
+            "trust_remote_code": trust_remote_code,
+        }
         return cls._create_legacy_from_registry(
-            deploy_key,
+            pipeline_cfg.model_type,
             pipeline_cfg,
-            cli_overrides,
+            legacy_cli_overrides,
             deploy_config_path,
         )
 

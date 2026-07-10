@@ -375,12 +375,6 @@ class TestStageConfig:
 class TestStageConfigFactory:
     """Tests for StageConfigFactory class."""
 
-    def test_get_trust_remote_code_defaults_false(self):
-        assert StageConfigFactory._get_trust_remote_code({}) is False
-        assert StageConfigFactory._get_trust_remote_code({"trust_remote_code": None}) is False
-        assert StageConfigFactory._get_trust_remote_code({"trust_remote_code": False}) is False
-        assert StageConfigFactory._get_trust_remote_code({"trust_remote_code": True}) is True
-
     def test_default_diffusion_no_yaml(self):
         """Test single-stage diffusion works without YAML config (@ZJY0516)."""
         kwargs = {
@@ -668,12 +662,18 @@ class TestPipelineRegistration:
                     deploy_config_path=str(deploy_path),
                 )
             with pytest.raises(KeyError, match="missing_pipeline"):
-                StageConfigFactory.create_from_model("fake/model", {}, str(deploy_path))
+                StageConfigFactory.create_from_model(
+                    "fake/model",
+                    trust_remote_code=False,
+                    cli_overrides={},
+                    deploy_config_path=str(deploy_path),
+                )
             with pytest.raises(KeyError, match="missing_pipeline"):
                 StageConfigFactory.create_legacy_stage_configs_from_model(
                     "fake/model",
-                    {},
-                    str(deploy_path),
+                    trust_remote_code=False,
+                    cli_overrides={},
+                    deploy_config_path=str(deploy_path),
                 )
 
     def test_resolve_pipeline_matches_hf_architecture_fallback(self, clean_pipeline_registry):
@@ -820,7 +820,12 @@ class TestPipelineRegistration:
             model_type = "qwen3_tts"
 
         with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
-            omni_config = StageConfigFactory.create_from_model("fake/model", {}, None)
+            omni_config = StageConfigFactory.create_from_model(
+                "fake/model",
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=None,
+            )
 
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.pipeline_config is OMNI_PIPELINES["qwen3_tts"]
@@ -831,7 +836,12 @@ class TestPipelineRegistration:
             model_type = "dreamzero"
 
         with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
-            omni_config = StageConfigFactory.create_from_model("fake/model", {}, None)
+            omni_config = StageConfigFactory.create_from_model(
+                "fake/model",
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=None,
+            )
 
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
@@ -854,13 +864,20 @@ class TestPipelineRegistration:
         fake_config = FakeConfig()
         with (
             patch("vllm_omni.config.config_factory.get_config", return_value=fake_config),
-            patch.object(VllmOmniConfig, "from_registry") as mock_create,
+            patch.object(VllmOmniConfig, "from_pipeline_config") as mock_create,
         ):
-            StageConfigFactory.create_from_model("fake/model", {}, None)
+            StageConfigFactory.create_from_model(
+                "fake/model",
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=None,
+            )
             mock_create.assert_called_once()
-            assert mock_create.call_args.args == (new_model_type,)
-            assert mock_create.call_args.kwargs["resolved_pipeline"] is pipe_cfg
-            assert mock_create.call_args.kwargs["cli_overrides"] == {"model": "fake/model"}
+            assert mock_create.call_args.args == (pipe_cfg,)
+            assert mock_create.call_args.kwargs["cli_overrides"] == {
+                "trust_remote_code": False,
+                "model": "fake/model",
+            }
         assert pipe_cfg.model_type == new_model_type
 
     def test_resolver_registration(self, clean_pipeline_registry):
@@ -887,20 +904,41 @@ class TestPipelineRegistration:
         # Create the model
         fake_config = FakeConfig()
         with (
-            patch("vllm_omni.config.config_factory.get_config", return_value=fake_config),
-            patch.object(VllmOmniConfig, "from_registry") as mock_create,
+            patch("vllm_omni.config.config_factory.get_config", return_value=fake_config) as mock_get_config,
+            patch.object(VllmOmniConfig, "from_pipeline_config") as mock_create,
         ):
-            StageConfigFactory.create_from_model("fake/model", {}, None)
+            StageConfigFactory.create_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                cli_overrides={},
+                deploy_config_path=None,
+            )
             mock_create.assert_called_once()
-            assert mock_create.call_args.args == (new_model_type,)
-            assert mock_create.call_args.kwargs["resolved_pipeline"].model_type == resolved_type
-            assert mock_create.call_args.kwargs["cli_overrides"] == {"model": "fake/model"}
+            assert mock_create.call_args.args[0].model_type == resolved_type
+            assert mock_create.call_args.kwargs["cli_overrides"] == {
+                "trust_remote_code": True,
+                "model": "fake/model",
+            }
+            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True)
+
+        with patch.object(StageConfigFactory, "_create_legacy_from_registry", return_value=[]) as mock_legacy:
+            StageConfigFactory.create_legacy_stage_configs_from_model(
+                "fake/model",
+                trust_remote_code=True,
+                cli_overrides={},
+                deploy_config_path=None,
+            )
+
+        assert mock_legacy.call_args.args[0] == resolved_type
+        assert mock_legacy.call_args.args[1].model_type == resolved_type
+        assert mock_legacy.call_args.args[2]["trust_remote_code"] is True
 
     def test_resolve_when_autodetect_resolves_none(self):
         """Regression test for: https://github.com/vllm-project/vllm-omni/issues/4726"""
         deploy_path = get_deploy_config_path("ming_tts.yaml")
         resolved_config = StageConfigFactory.create_from_model(
             model="inclusionAI/Ming-omni-tts-0.5B",
+            trust_remote_code=False,
             cli_overrides={},
             deploy_config_path=deploy_path,
         )
@@ -924,11 +962,17 @@ class TestPipelineRegistration:
             architectures = ("UnregisteredArch",)
 
         with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
-            omni_config = StageConfigFactory.create_from_model("fake/model", {}, str(deploy_path))
+            omni_config = StageConfigFactory.create_from_model(
+                "fake/model",
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=str(deploy_path),
+            )
             legacy_configs = StageConfigFactory.create_legacy_stage_configs_from_model(
                 "fake/model",
-                {},
-                str(deploy_path),
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=str(deploy_path),
             )
 
         assert omni_config is not None

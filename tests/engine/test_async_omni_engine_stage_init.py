@@ -745,6 +745,7 @@ def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(m
     _config_path, stage_configs = engine._resolve_stage_configs(
         model="dummy-model",
         kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
+        trust_remote_code=False,
     )
 
     diffusion_attention_config = stage_configs[0].engine_args.diffusion_attention_config
@@ -778,6 +779,7 @@ def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
     _config_path, stage_configs = engine._resolve_stage_configs(
         model="dummy-model",
         kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
+        trust_remote_code=False,
     )
 
     assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
@@ -804,6 +806,7 @@ def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stag
     _config_path, stage_configs = engine._resolve_stage_configs(
         model="dummy-model",
         kwargs={"diffusion_attention_backend": "TORCH_SDPA"},
+        trust_remote_code=False,
     )
 
     assert stage_configs[0].engine_args.attention_config == {"backend": "FLASH_ATTN"}

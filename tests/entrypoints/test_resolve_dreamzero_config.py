@@ -36,7 +36,10 @@ def test_dreamzero_config_sets_model_class_and_policy_config(monkeypatch):
         lambda _model: True,
     )
 
-    stage_configs = load_stage_configs_from_model("GEAR-Dreams/DreamZero-DROID")
+    stage_configs = load_stage_configs_from_model(
+        "GEAR-Dreams/DreamZero-DROID",
+        trust_remote_code=False,
+    )
     engine_args = stage_configs[0].engine_args
 
     assert engine_args.model_class_name == "DreamZeroPipeline"

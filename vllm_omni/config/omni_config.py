@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Structured vLLM-Omni configuration classes.
 
-This module is additive for Phase 2 of RFC #4021.  ``VllmOmniConfig.from_registry``
-builds the structured view directly from the pipeline registry and deploy config
-so parity can be proven before later PRs cut consumers over to these classes.
+This module is additive for Phase 2 of RFC #4021.
+``VllmOmniConfig.from_pipeline_config`` builds the structured view from an
+already-resolved pipeline and deploy config so parity can be proven before
+later PRs cut consumers over to these classes.
 """
 
 from __future__ import annotations
@@ -16,11 +17,9 @@ from pathlib import Path
 from typing import Any, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field
-from transformers import PretrainedConfig
 from vllm.config.utils import config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _STAGE_DEPLOY_FIELDS,
@@ -230,12 +229,6 @@ def _resolve_deploy_path(model_type: str, deploy_config_path: str | None = None)
         if candidate.exists():
             return candidate
     return deploy_path
-
-
-def _registered_pipeline_keys() -> list[str]:
-    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-
-    return sorted(OMNI_PIPELINES)
 
 
 @config
@@ -1219,56 +1212,40 @@ class VllmOmniConfig:
         raise KeyError(f"no stage {stage_id}")
 
     @classmethod
-    def from_registry(
+    def from_pipeline_config(
         cls,
-        model_type: str,
-        hf_config: PretrainedConfig | None = None,
+        pipeline_cfg: PipelineConfig,
         deploy_config_path: str | None = None,
         cli_overrides: dict[str, Any] | None = None,
-        resolved_pipeline: PipelineConfig | None = None,
     ) -> VllmOmniConfig:
-        """Create a structured config from a registered pipeline and deploy YAML."""
+        """Create a structured config from a resolved pipeline and deploy YAML."""
         if cli_overrides is None:
             cli_overrides = {}
 
-        deploy_path = _resolve_deploy_path(model_type, deploy_config_path)
+        deploy_path = _resolve_deploy_path(pipeline_cfg.model_type, deploy_config_path)
         loaded_deploy_config_path = str(deploy_path) if deploy_path.exists() else None
         if loaded_deploy_config_path is not None:
             deploy = load_deploy_config(deploy_path)
         else:
             deploy = DeployConfig()
 
-        pipeline_key = model_type if resolved_pipeline is not None else deploy.pipeline or model_type
-        if resolved_pipeline is None and pipeline_key not in _registered_pipeline_keys():
-            raise KeyError(
-                f"Pipeline {pipeline_key!r} not in registry "
-                f"(resolved from {deploy_path.name!r}). Available: "
-                f"{_registered_pipeline_keys()}"
-            )
-        pipeline = resolved_pipeline
-        if pipeline is None:
-            pipeline = resolve_pipeline_config(pipeline_key, hf_config)
-            if pipeline is None:
-                raise ValueError(f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig")
-
-        deploy_with_cli_overrides = copy.deepcopy(deploy)
         if cli_overrides.get("async_chunk") is not None:
-            deploy_with_cli_overrides.async_chunk = bool(cli_overrides["async_chunk"])
+            deploy.async_chunk = bool(cli_overrides["async_chunk"])
         for name in _PIPELINE_DEPLOY_CLI_FIELDS:
             if cli_overrides.get(name) is not None:
-                setattr(deploy_with_cli_overrides, name, _copy_value(cli_overrides[name]))
+                setattr(deploy, name, _copy_value(cli_overrides[name]))
 
-        deploy_for_registry = _apply_platform_overrides(deploy_with_cli_overrides)
-        if len(pipeline.stages) <= 1:
-            deploy_for_registry.async_chunk = False
-        _validate_async_chunk_support(pipeline, deploy_for_registry)
-        deploy_by_id = {stage.stage_id: stage for stage in deploy_for_registry.stages}
+        deploy = _apply_platform_overrides(deploy)
+        if len(pipeline_cfg.stages) <= 1:
+            deploy.async_chunk = False
+        _validate_async_chunk_support(pipeline_cfg, deploy)
+        deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
         model = cli_overrides.get("model")
 
         stage_configs = tuple(
             _build_stage_config(
-                pipeline,
-                deploy_for_registry,
+                pipeline_cfg,
+                deploy,
                 topology,
                 deploy_by_id.get(topology.stage_id),
                 _stage_engine_values(
@@ -1277,7 +1254,7 @@ class VllmOmniConfig:
                 ),
                 model=model,
             )
-            for topology in pipeline.stages
+            for topology in pipeline_cfg.stages
         )
 
         orchestrator_config = VllmOmniOrchestratorConfig(
@@ -1285,7 +1262,7 @@ class VllmOmniConfig:
             **_orchestrator_cli_overrides(cli_overrides),
         )
         return cls(
-            pipeline_config=pipeline,
+            pipeline_config=pipeline_cfg,
             stage_configs=stage_configs,
             orchestrator_config=orchestrator_config,
         )
