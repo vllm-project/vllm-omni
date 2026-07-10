@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
@@ -43,6 +45,10 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 LINGBOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _CAMERA_SPATIAL_FOLD = 8
+_MAX_PIXEL_AREA = 480 * 832
+_MAX_RAW_FRAMES = 117
+_MAX_SEQUENCE_LENGTH = 512
+_ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
 
 
 @dataclass(frozen=True)
@@ -56,33 +62,40 @@ class _LingBotRequestInputs:
     num_latent_frames: int
     output_type: str
     max_sequence_length: int
+    flow_shift: float
     generator: torch.Generator | None
     seed: int | None
 
 
-def _shifted_flow_sigma(
-    timestep: int | float,
+def _positive_finite_flow_shift(value: object) -> float:
+    try:
+        flow_shift = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("flow_shift must be a positive finite number.") from exc
+    if not math.isfinite(flow_shift) or flow_shift <= 0:
+        raise ValueError("flow_shift must be a positive finite number.")
+    return flow_shift
+
+
+def _build_shifted_flow_sigma_lookup(
     *,
     flow_shift: float,
     num_train_timesteps: int,
-) -> float:
-    """Return the Self-Forcing flow sigma associated with a model timestep."""
+    timesteps: tuple[int, ...],
+) -> tuple[float, ...]:
+    """Resolve all DMD timesteps against one request's shifted sigma grid."""
 
+    flow_shift = _positive_finite_flow_shift(flow_shift)
     if num_train_timesteps <= 0:
         raise ValueError("num_train_timesteps must be positive")
-    if flow_shift <= 0:
-        raise ValueError("flow_shift must be positive")
-    normalized_timestep = float(timestep) / float(num_train_timesteps)
-    if not 0.0 <= normalized_timestep <= 1.0:
-        raise ValueError(f"timestep must be between 0 and {num_train_timesteps}, got {timestep}")
-    # SelfForcingFlowMatchScheduler first shifts a dense [1, 0) sigma grid,
-    # then resolves a model timestep by nearest lookup on that shifted grid.
-    # The incoming DMD timestep is already in that public, shifted coordinate;
-    # applying ``flow_shift`` directly to it would shift the value twice.
-    base_sigmas = torch.linspace(1.0, 0.0, num_train_timesteps + 1, dtype=torch.float32)[:-1]
-    shifted_sigmas = flow_shift * base_sigmas / (1.0 + (flow_shift - 1.0) * base_sigmas)
-    index = torch.argmin((shifted_sigmas - normalized_timestep).abs())
-    return float(shifted_sigmas[index].item())
+    if any(timestep < 0 or timestep > num_train_timesteps for timestep in timesteps):
+        raise ValueError(f"timesteps must be between 0 and {num_train_timesteps}")
+    base_sigmas = torch.linspace(1.0, 0.0, num_train_timesteps + 1, dtype=torch.float64)[:-1]
+    scaled_sigmas = flow_shift * base_sigmas
+    shifted_sigmas = scaled_sigmas / ((1.0 - base_sigmas) + scaled_sigmas)
+    normalized_timesteps = torch.tensor(timesteps, dtype=shifted_sigmas.dtype) / num_train_timesteps
+    indices = (shifted_sigmas[:, None] - normalized_timesteps[None, :]).abs().argmin(dim=0)
+    return tuple(float(value) for value in shifted_sigmas[indices].tolist())
 
 
 def _fold_camera_embedding(
@@ -164,6 +177,9 @@ class LingBotWorldCausalDMDPipeline(
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         local_files_only = os.path.exists(model)
+        model_config = getattr(od_config, "model_config", None) or {}
+        configured_action_root = model_config.get("lingbot_action_root")
+        self._online_action_root = configured_action_root or os.environ.get(_ACTION_ROOT_ENV)
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -210,7 +226,7 @@ class LingBotWorldCausalDMDPipeline(
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
         configured_shift = getattr(od_config, "flow_shift", None)
-        self._flow_shift = float(5.0 if configured_shift is None else configured_shift)
+        scheduler_shift = _positive_finite_flow_shift(5.0 if configured_shift is None else configured_shift)
         scheduler_keys = {
             "num_train_timesteps",
             "solver_order",
@@ -228,11 +244,40 @@ class LingBotWorldCausalDMDPipeline(
             "final_sigmas_type",
         }
         scheduler_kwargs = {name: value for name, value in scheduler_config.items() if name in scheduler_keys}
-        scheduler_kwargs["shift"] = self._flow_shift
+        scheduler_kwargs["shift"] = scheduler_shift
         self.scheduler = FlowUniPCMultistepScheduler(**scheduler_kwargs)
 
         self.vae_scale_factor_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
+
+    def _resolve_online_action_path(self, action_path: str | os.PathLike) -> str:
+        if not self._online_action_root:
+            raise ValueError(
+                "sampling_params.extra_args.action_path requires a trusted action root configured by "
+                f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+            )
+        try:
+            root = Path(self._online_action_root).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise ValueError("The configured LingBot trusted action root is unavailable.") from None
+        if not root.is_dir():
+            raise ValueError("The configured LingBot trusted action root must be a directory.")
+
+        candidate = Path(action_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            candidate = candidate.resolve(strict=True)
+            candidate.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError(
+                "sampling_params.extra_args.action_path must be contained by the trusted action root."
+            ) from None
+        if not candidate.is_dir():
+            raise ValueError(
+                "sampling_params.extra_args.action_path must identify a directory in the trusted action root."
+            )
+        return str(candidate)
 
     def _parse_request(self, req: DiffusionRequestBatch) -> _LingBotRequestInputs:
         if req.num_reqs != 1 or len(req.prompts) != 1:
@@ -291,6 +336,15 @@ class LingBotWorldCausalDMDPipeline(
         action_path = extra_action_path if extra_action_path is not None else prompt_action_path
         if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
             raise ValueError("action_path is required in sampling_params.extra_args or prompt.additional_information.")
+        if extra_action_path is not None:
+            action_path = self._resolve_online_action_path(action_path)
+        else:
+            action_path = str(action_path)
+
+        request_flow_shift = (
+            extra_args["flow_shift"] if "flow_shift" in extra_args else getattr(self.scheduler.config, "shift", 5.0)
+        )
+        flow_shift = _positive_finite_flow_shift(request_flow_shift)
 
         height = getattr(sampling, "height", None)
         width = getattr(sampling, "width", None)
@@ -321,6 +375,8 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError(f"height must be divisible by {height_divisor}, got {height}.")
         if width % width_divisor:
             raise ValueError(f"width must be divisible by {width_divisor}, got {width}.")
+        if height * width > _MAX_PIXEL_AREA:
+            raise ValueError("height * width pixel area must not exceed 480 * 832.")
 
         num_inference_steps = getattr(sampling, "num_inference_steps", None)
         if num_inference_steps is None:
@@ -334,6 +390,8 @@ class LingBotWorldCausalDMDPipeline(
         num_frames = getattr(sampling, "num_frames", None)
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or num_frames <= 0:
             raise ValueError(f"num_frames must be a positive integer, got {num_frames!r}.")
+        if num_frames > _MAX_RAW_FRAMES:
+            raise ValueError(f"num_frames must not exceed {_MAX_RAW_FRAMES}.")
         temporal_factor = self.vae_scale_factor_temporal
         if (num_frames - 1) % temporal_factor:
             raise ValueError(
@@ -348,16 +406,25 @@ class LingBotWorldCausalDMDPipeline(
                 f"got num_frames={num_frames}, latent_frames={num_latent_frames}, block_frames={block_frames}."
             )
 
+        max_sequence_length = getattr(sampling, "max_sequence_length", None)
+        if max_sequence_length is None:
+            max_sequence_length = _MAX_SEQUENCE_LENGTH
+        if isinstance(max_sequence_length, bool) or not isinstance(max_sequence_length, int):
+            raise ValueError(f"max_sequence_length must be exactly {_MAX_SEQUENCE_LENGTH}.")
+        if max_sequence_length != _MAX_SEQUENCE_LENGTH:
+            raise ValueError(f"max_sequence_length must be exactly {_MAX_SEQUENCE_LENGTH}.")
+
         return _LingBotRequestInputs(
             prompt=prompt.strip(),
             image=image,
-            action_path=str(action_path),
+            action_path=action_path,
             height=height,
             width=width,
             num_frames=num_frames,
             num_latent_frames=num_latent_frames,
             output_type=getattr(sampling, "output_type", None) or "np",
-            max_sequence_length=int(getattr(sampling, "max_sequence_length", None) or 512),
+            max_sequence_length=max_sequence_length,
+            flow_shift=flow_shift,
             generator=getattr(sampling, "generator", None),
             seed=getattr(sampling, "seed", None),
         )
@@ -435,10 +502,10 @@ class LingBotWorldCausalDMDPipeline(
     def _prepare_camera(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
         try:
             trajectory = load_camera_trajectory(inputs.action_path)
-        except OSError as exc:
+        except OSError:
             raise ValueError(
-                f"Unable to load camera trajectory from action_path={inputs.action_path!r}: {exc}"
-            ) from exc
+                "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
+            ) from None
         available_frames = int(trajectory.poses.shape[0])
         if available_frames < inputs.num_frames:
             raise ValueError(
@@ -513,6 +580,7 @@ class LingBotWorldCausalDMDPipeline(
         prompt_embeds: torch.Tensor,
         cache,
         start_frame: int,
+        sigma_lookup: tuple[float, ...],
         generator: torch.Generator | None,
         progress_bar,
     ) -> torch.Tensor:
@@ -524,7 +592,6 @@ class LingBotWorldCausalDMDPipeline(
             condition.shape[4],
         )
         current_latents = self._randn(block_shape, generator=generator, dtype=condition.dtype)
-        num_train_timesteps = int(getattr(self.scheduler.config, "num_train_timesteps", 1000))
         for step_index, timestep_value in enumerate(LINGBOT_DMD_TIMESTEPS):
             set_forward_context_denoise_step_idx(step_index)
             timestep = torch.full((1,), float(timestep_value), device=self.device, dtype=torch.float32)
@@ -543,18 +610,10 @@ class LingBotWorldCausalDMDPipeline(
                     "transformer flow prediction shape must match the 16-channel noise latent, "
                     f"got {tuple(flow_prediction.shape)} and {tuple(current_latents.shape)}."
                 )
-            sigma = _shifted_flow_sigma(
-                timestep_value,
-                flow_shift=self._flow_shift,
-                num_train_timesteps=num_train_timesteps,
-            )
+            sigma = sigma_lookup[step_index]
             x0 = current_latents - sigma * flow_prediction
             if step_index + 1 < len(LINGBOT_DMD_TIMESTEPS):
-                next_sigma = _shifted_flow_sigma(
-                    LINGBOT_DMD_TIMESTEPS[step_index + 1],
-                    flow_shift=self._flow_shift,
-                    num_train_timesteps=num_train_timesteps,
-                )
+                next_sigma = sigma_lookup[step_index + 1]
                 noise = self._randn(current_latents.shape, generator=generator, dtype=current_latents.dtype)
                 current_latents = (1.0 - next_sigma) * x0 + next_sigma * noise
             else:
@@ -592,11 +651,17 @@ class LingBotWorldCausalDMDPipeline(
         input_ids = text_inputs.input_ids.to(self.device)
         attention_mask = text_inputs.attention_mask.to(self.device)
         prompt_embeds = self.text_encoder(input_ids, attention_mask).last_hidden_state
-        return prompt_embeds.to(device=self.device, dtype=dtype)
+        prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
+        return prompt_embeds * attention_mask.unsqueeze(-1).to(dtype=prompt_embeds.dtype)
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         inputs = self._parse_request(req)
+        sigma_lookup = _build_shifted_flow_sigma_lookup(
+            flow_shift=inputs.flow_shift,
+            num_train_timesteps=int(getattr(self.scheduler.config, "num_train_timesteps", 1000)),
+            timesteps=LINGBOT_DMD_TIMESTEPS,
+        )
         dtype = self.transformer.dtype
         prompt_embeds = self.encode_prompt(
             inputs.prompt,
@@ -630,6 +695,7 @@ class LingBotWorldCausalDMDPipeline(
                         prompt_embeds=prompt_embeds,
                         cache=cache,
                         start_frame=start_frame,
+                        sigma_lookup=sigma_lookup,
                         generator=generator,
                         progress_bar=progress_bar,
                     )

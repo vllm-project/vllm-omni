@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-import ast
 import gc
 import importlib.util
+import math
 import sys
 import types
 import weakref
@@ -160,8 +160,8 @@ class _StubVAE(_FakePretrained):
             z_dim=16,
             scale_factor_temporal=4,
             scale_factor_spatial=8,
-            latents_mean=[0.0] * 16,
-            latents_std=[1.0] * 16,
+            latents_mean=[float(index) - 3.0 for index in range(16)],
+            latents_std=[1.0 + index / 4.0 for index in range(16)],
         )
         self.encode_inputs: list[torch.Tensor] = []
         self.decode_inputs: list[torch.Tensor] = []
@@ -209,7 +209,7 @@ class _SamplingParams:
         seed: int | None = 17,
         generator: torch.Generator | None = None,
         output_type: str | None = "latent",
-        max_sequence_length: int | None = 8,
+        max_sequence_length: int | None = 512,
         extra_args: dict | None = None,
     ) -> None:
         self.height = height
@@ -325,7 +325,7 @@ def _load_pipeline_module():
     )
 
     def load_camera_trajectory(action_path):
-        assert action_path in {"actions", "prompt-actions"}
+        assert action_path
         return trajectory
 
     def interpolate_camera_trajectory(value, num_frames):
@@ -462,6 +462,7 @@ def _od_config(**overrides):
         "dtype": torch.float32,
         "flow_shift": None,
         "quantization_config": None,
+        "model_config": {},
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -480,11 +481,11 @@ def _prompt(*, action_path: str | None = None, images=None):
     return prompt
 
 
-def _pipeline(module, *, transformer=None):
-    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_od_config())
+def _pipeline(module, *, transformer=None, od_config=None):
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=od_config or _od_config())
     if transformer is not None:
         pipeline.transformer = transformer
-    pipeline.encode_prompt = lambda *args, **kwargs: torch.ones(1, 8, 8)
+    pipeline.encode_prompt = lambda *args, **kwargs: torch.ones(1, 512, 8)
     return pipeline
 
 
@@ -496,14 +497,122 @@ def _request(*, sampling=None, prompt=None, num_reqs: int = 1):
     )
 
 
-def _registry_models() -> dict:
-    tree = ast.parse(_REGISTRY_PATH.read_text())
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "_DIFFUSION_MODELS" for target in node.targets
-        ):
-            return ast.literal_eval(node.value)
-    raise AssertionError("_DIFFUSION_MODELS assignment not found")
+def _independent_sigma_oracle(timestep: int, *, flow_shift: float, num_train_timesteps: int = 1000) -> float:
+    """Closed-form inverse plus local lattice search, independent of production lookup code."""
+
+    target = timestep / num_train_timesteps
+    base = target / (flow_shift - (flow_shift - 1.0) * target)
+    continuous_index = num_train_timesteps * (1.0 - base)
+    candidates = {
+        min(num_train_timesteps - 1, max(0, int(math.floor(continuous_index)) + offset)) for offset in (-1, 0, 1, 2)
+    }
+
+    def shifted(index: int) -> float:
+        sigma = 1.0 - index / num_train_timesteps
+        return flow_shift * sigma / (1.0 + (flow_shift - 1.0) * sigma)
+
+    return min((shifted(index) for index in candidates), key=lambda sigma: abs(sigma - target))
+
+
+def _resolve_pipeline_through_real_registry(pipeline_module):
+    @dataclass(frozen=True)
+    class LazyRegisteredModel:
+        module_name: str
+        class_name: str
+
+    class ModelRegistry:
+        def __init__(self, models):
+            self.models = models
+
+        def _try_load_model_cls(self, architecture):
+            registered = self.models.get(architecture)
+            if registered is None:
+                return None
+            module = importlib.import_module(registered.module_name)
+            return getattr(module, registered.class_name)
+
+    stub_modules: dict[str, types.ModuleType] = {}
+    for package in (
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.model_loader",
+        "vllm.model_executor.models",
+        "vllm_omni",
+        "vllm_omni.diffusion",
+        "vllm_omni.diffusion.distributed",
+        "vllm_omni.diffusion.distributed.autoencoders",
+        "vllm_omni.diffusion.hooks",
+        "vllm_omni.diffusion.utils",
+        "vllm_omni.diffusion.models",
+        "vllm_omni.diffusion.models.wan2_2",
+    ):
+        stub_modules[package] = _make_package(package)
+
+    @contextmanager
+    def no_op_context(*args, **kwargs):
+        del args, kwargs
+        yield
+
+    stub_modules.update(
+        {
+            "vllm.logger": _module("vllm.logger", init_logger=lambda name: SimpleNamespace()),
+            "vllm.model_executor.model_loader.utils": _module(
+                "vllm.model_executor.model_loader.utils", configure_quant_config=lambda *args: None
+            ),
+            "vllm.model_executor.models.registry": _module(
+                "vllm.model_executor.models.registry",
+                _LazyRegisteredModel=LazyRegisteredModel,
+                _ModelRegistry=ModelRegistry,
+            ),
+            "vllm_omni.diffusion.config": _module(
+                "vllm_omni.diffusion.config", set_current_diffusion_config=no_op_context
+            ),
+            "vllm_omni.diffusion.data": _module("vllm_omni.diffusion.data", OmniDiffusionConfig=object),
+            "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor": _module(
+                "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor",
+                DistributedVaeMixin=object,
+            ),
+            "vllm_omni.diffusion.distributed.sp_plan": _module(
+                "vllm_omni.diffusion.distributed.sp_plan",
+                SequenceParallelConfig=SimpleNamespace,
+                get_sp_plan_from_model=lambda model: None,
+            ),
+            "vllm_omni.diffusion.forward_context": _module(
+                "vllm_omni.diffusion.forward_context",
+                get_forward_context=lambda: SimpleNamespace(),
+            ),
+            "vllm_omni.diffusion.hooks.sequence_parallel": _module(
+                "vllm_omni.diffusion.hooks.sequence_parallel",
+                apply_sequence_parallel=lambda *args: None,
+            ),
+            "vllm_omni.diffusion.utils.tf_utils": _module(
+                "vllm_omni.diffusion.utils.tf_utils", find_module_with_attr=lambda *args: None
+            ),
+            "vllm_omni.platforms": _module(
+                "vllm_omni.platforms",
+                current_omni_platform=SimpleNamespace(get_diffusion_packed_modules_mapping=lambda model: None),
+            ),
+            "vllm_omni.diffusion.models.wan2_2.pipeline_lingbot_world": pipeline_module,
+        }
+    )
+    previous = {name: sys.modules.get(name) for name in stub_modules}
+    sys.modules.update(stub_modules)
+    spec = importlib.util.spec_from_file_location("_lingbot_registry_under_test", _REGISTRY_PATH)
+    assert spec is not None and spec.loader is not None
+    registry_module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = registry_module
+    try:
+        spec.loader.exec_module(registry_module)
+        resolved = registry_module.DiffusionModelRegistry._try_load_model_cls("LingBotWorldCausalDMDPipeline")
+        entry = registry_module._DIFFUSION_MODELS["LingBotWorldCausalDMDPipeline"]
+    finally:
+        sys.modules.pop(spec.name, None)
+        for name, old_module in previous.items():
+            if old_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old_module
+    return resolved, entry
 
 
 def test_component_discovery_uses_official_checkpoint_contract() -> None:
@@ -549,9 +658,12 @@ def test_noise_uses_device_safe_diffusers_helper() -> None:
 
 
 @pytest.mark.parametrize("source", ["extra", "prompt"])
-def test_action_path_resolves_from_exactly_one_supported_source(source: str) -> None:
+def test_action_path_resolves_from_exactly_one_supported_source(source: str, tmp_path: Path) -> None:
     module = _load_pipeline_module()
-    pipeline = _pipeline(module)
+    action_root = tmp_path / "trusted-actions"
+    contained_action = action_root / "actions"
+    contained_action.mkdir(parents=True)
+    pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": str(action_root)}))
     sampling = _SamplingParams(extra_args={"action_path": "actions"} if source == "extra" else {})
     prompt = _prompt(action_path="prompt-actions" if source == "prompt" else None)
     original_extra = dict(sampling.extra_args)
@@ -559,7 +671,7 @@ def test_action_path_resolves_from_exactly_one_supported_source(source: str) -> 
 
     parsed = pipeline._parse_request(_RequestBatch(prompt, sampling))
 
-    assert parsed.action_path == ("actions" if source == "extra" else "prompt-actions")
+    assert parsed.action_path == (str(contained_action.resolve()) if source == "extra" else "prompt-actions")
     assert sampling.extra_args == original_extra
     assert prompt == original_prompt
 
@@ -574,6 +686,68 @@ def test_action_path_rejects_missing_or_ambiguous_sources(extra_action, prompt_a
 
     with pytest.raises(ValueError, match=message):
         _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path=prompt_action), sampling))
+
+
+def test_online_action_path_requires_a_trusted_root() -> None:
+    module = _load_pipeline_module()
+    sampling = _SamplingParams(extra_args={"action_path": "actions"})
+
+    with pytest.raises(ValueError, match="lingbot_action_root|VLLM_OMNI_LINGBOT_ACTION_ROOT"):
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
+
+
+@pytest.mark.parametrize("escape_kind", ["traversal", "absolute", "symlink"])
+def test_online_action_path_rejects_escape_from_trusted_root(escape_kind: str, tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    root = tmp_path / "trusted"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if escape_kind == "traversal":
+        action_path = "../outside"
+    elif escape_kind == "absolute":
+        action_path = str(outside)
+    else:
+        (root / "escape-link").symlink_to(outside, target_is_directory=True)
+        action_path = "escape-link"
+    pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": str(root)}))
+
+    with pytest.raises(ValueError, match="trusted.*root|contained"):
+        pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": action_path})))
+
+
+def test_online_action_path_uses_environment_root_fallback(monkeypatch, tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    root = tmp_path / "trusted"
+    action_dir = root / "forward"
+    action_dir.mkdir(parents=True)
+    monkeypatch.setenv("VLLM_OMNI_LINGBOT_ACTION_ROOT", str(root))
+    pipeline = _pipeline(module)
+
+    parsed = pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": "forward"})))
+
+    assert parsed.action_path == str(action_dir.resolve())
+
+
+def test_online_action_path_error_suppresses_path_bearing_filesystem_cause(tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    root = tmp_path / "trusted"
+    root.mkdir()
+    pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": str(root)}))
+
+    with pytest.raises(ValueError, match="trusted action root") as exc_info:
+        pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": "does-not-exist"})))
+
+    assert str(root) not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_offline_prompt_action_path_remains_a_local_path_without_trusted_root() -> None:
+    module = _load_pipeline_module()
+
+    parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="offline/actions"), _SamplingParams()))
+
+    assert parsed.action_path == "offline/actions"
 
 
 @pytest.mark.parametrize(
@@ -599,6 +773,40 @@ def test_request_validation_rejects_unsupported_contracts(request_batch, message
         _pipeline(module)._parse_request(request_batch)
 
 
+def test_resource_limits_accept_exact_documented_boundaries() -> None:
+    module = _load_pipeline_module()
+    sampling = _SamplingParams(height=480, width=832, num_frames=117, max_sequence_length=512)
+
+    parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="offline-actions"), sampling))
+
+    assert (parsed.height, parsed.width, parsed.num_frames, parsed.max_sequence_length) == (480, 832, 117, 512)
+
+
+@pytest.mark.parametrize(
+    ("sampling", "message"),
+    [
+        (_SamplingParams(height=480, width=848), "pixel area|480.*832"),
+        (_SamplingParams(num_frames=129), "num_frames.*117"),
+        (_SamplingParams(max_sequence_length=511), "max_sequence_length.*512"),
+        (_SamplingParams(max_sequence_length=513), "max_sequence_length.*512"),
+        (_SamplingParams(max_sequence_length=512.0), "max_sequence_length.*512"),
+    ],
+)
+def test_resource_limits_reject_oversize_before_any_component_call(sampling, message: str) -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    calls: list[str] = []
+    pipeline.encode_prompt = lambda *args, **kwargs: calls.append("text")
+    pipeline._prepare_condition = lambda *args, **kwargs: calls.append("vae")
+    pipeline._prepare_camera = lambda *args, **kwargs: calls.append("camera")
+    pipeline._allocate_request_cache = lambda *args, **kwargs: calls.append("cache")
+
+    with pytest.raises(ValueError, match=message):
+        pipeline(_RequestBatch(_prompt(action_path="offline-actions"), sampling))
+
+    assert calls == []
+
+
 def test_request_validation_rejects_insufficient_camera_frames() -> None:
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
@@ -611,12 +819,15 @@ def test_request_validation_rejects_insufficient_camera_frames() -> None:
         pipeline(_request())
 
 
-def test_camera_load_error_names_action_path() -> None:
+def test_camera_load_error_is_actionable_without_echoing_path_contents() -> None:
     module = _load_pipeline_module()
     module.load_camera_trajectory = lambda path: (_ for _ in ()).throw(FileNotFoundError(f"missing {path}/poses.npy"))
 
-    with pytest.raises(ValueError, match="action_path.*prompt-actions"):
+    with pytest.raises(ValueError, match="camera trajectory.*action_path") as exc_info:
         _pipeline(module)(_request())
+
+    assert "prompt-actions" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
 
 
 def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> None:
@@ -629,8 +840,12 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
     assert result.output.shape == (1, 16, 3, 2, 2)
     first_input = transformer.calls[0]["hidden_states"]
     assert first_input.shape == (1, 36, 3, 2, 2)
-    torch.testing.assert_close(first_input[:, 16:32, 0], torch.full((1, 16, 2, 2), 2.0))
-    torch.testing.assert_close(first_input[:, 16:32, 1:], torch.zeros(1, 16, 2, 2, 2))
+    mean = torch.tensor(pipeline.vae.config.latents_mean).view(1, 16, 1, 1)
+    std = torch.tensor(pipeline.vae.config.latents_std).view(1, 16, 1, 1)
+    expected_first = (torch.full((1, 16, 2, 2), 2.0) - mean) / std
+    expected_future = (torch.zeros(1, 16, 2, 2, 2) - mean.unsqueeze(2)) / std.unsqueeze(2)
+    torch.testing.assert_close(first_input[:, 16:32, 0], expected_first)
+    torch.testing.assert_close(first_input[:, 16:32, 1:], expected_future)
     torch.testing.assert_close(first_input[:, 32:36, 0], torch.ones(1, 4, 2, 2))
     torch.testing.assert_close(first_input[:, 32:36, 1:], torch.zeros(1, 4, 2, 2, 2))
 
@@ -660,14 +875,10 @@ def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
     generator = torch.Generator(device="cpu").manual_seed(17)
     current = torch.randn((1, 16, 3, 2, 2), generator=generator)
     for index, timestep in enumerate(module.LINGBOT_DMD_TIMESTEPS):
-        sigma = module._shifted_flow_sigma(timestep, flow_shift=5.0, num_train_timesteps=1000)
+        sigma = _independent_sigma_oracle(timestep, flow_shift=5.0)
         x0 = current - sigma
         if index + 1 < len(module.LINGBOT_DMD_TIMESTEPS):
-            next_sigma = module._shifted_flow_sigma(
-                module.LINGBOT_DMD_TIMESTEPS[index + 1],
-                flow_shift=5.0,
-                num_train_timesteps=1000,
-            )
+            next_sigma = _independent_sigma_oracle(module.LINGBOT_DMD_TIMESTEPS[index + 1], flow_shift=5.0)
             noise = torch.randn(current.shape, generator=generator)
             current = (1.0 - next_sigma) * x0 + next_sigma * noise
         else:
@@ -681,11 +892,118 @@ def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
     torch.testing.assert_close(transformer.calls[-1]["hidden_states"][:, :16], result.output)
 
 
-def test_dmd_sigma_lookup_does_not_apply_flow_shift_twice() -> None:
+@pytest.mark.parametrize("flow_shift", [5.0, 2.5])
+def test_dmd_sigma_lookup_matches_independent_oracle(flow_shift: float) -> None:
     module = _load_pipeline_module()
 
-    assert module._shifted_flow_sigma(1000, flow_shift=5.0, num_train_timesteps=1000) == 1.0
-    assert module._shifted_flow_sigma(750, flow_shift=5.0, num_train_timesteps=1000) == pytest.approx(0.75)
+    lookup = module._build_shifted_flow_sigma_lookup(
+        flow_shift=flow_shift,
+        num_train_timesteps=1000,
+        timesteps=module.LINGBOT_DMD_TIMESTEPS,
+    )
+
+    expected = tuple(
+        _independent_sigma_oracle(timestep, flow_shift=flow_shift) for timestep in module.LINGBOT_DMD_TIMESTEPS
+    )
+    assert lookup == pytest.approx(expected, abs=1e-7)
+
+
+@pytest.mark.parametrize("flow_shift", [1e-300, 1e300])
+def test_dmd_sigma_lookup_stays_finite_for_extreme_finite_flow_shifts(flow_shift: float) -> None:
+    module = _load_pipeline_module()
+
+    lookup = module._build_shifted_flow_sigma_lookup(
+        flow_shift=flow_shift,
+        num_train_timesteps=1000,
+        timesteps=module.LINGBOT_DMD_TIMESTEPS,
+    )
+
+    assert all(math.isfinite(sigma) and 0.0 <= sigma <= 1.0 for sigma in lookup)
+    assert lookup[0] == 1.0
+
+
+def test_request_flow_shift_override_has_precedence_without_mutating_scheduler() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module, od_config=_od_config(flow_shift=3.0))
+
+    default_inputs = pipeline._parse_request(_request())
+    sampling = _SamplingParams(extra_args={"flow_shift": 2.0})
+    override_inputs = pipeline._parse_request(_RequestBatch(_prompt(action_path="prompt-actions"), sampling))
+
+    assert default_inputs.flow_shift == 3.0
+    assert override_inputs.flow_shift == 2.0
+    assert sampling.extra_args == {"flow_shift": 2.0}
+    assert pipeline.scheduler.config.shift == 3.0
+
+
+@pytest.mark.parametrize("flow_shift", [0, -1, float("nan"), float("inf"), "invalid"])
+def test_request_flow_shift_must_be_positive_and_finite(flow_shift) -> None:
+    module = _load_pipeline_module()
+    sampling = _SamplingParams(extra_args={"flow_shift": flow_shift})
+
+    with pytest.raises(ValueError, match="flow_shift.*positive.*finite"):
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="prompt-actions"), sampling))
+
+
+def test_flow_shift_is_request_local_and_sigma_lookup_is_built_once_per_request() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    calls: list[float] = []
+    original_builder = module._build_shifted_flow_sigma_lookup
+
+    def recording_builder(*, flow_shift, num_train_timesteps, timesteps):
+        calls.append(flow_shift)
+        return original_builder(
+            flow_shift=flow_shift,
+            num_train_timesteps=num_train_timesteps,
+            timesteps=timesteps,
+        )
+
+    module._build_shifted_flow_sigma_lookup = recording_builder
+
+    def generate(flow_shift=None):
+        extra_args = {} if flow_shift is None else {"flow_shift": flow_shift}
+        return pipeline(
+            _RequestBatch(
+                _prompt(action_path="prompt-actions"),
+                _SamplingParams(num_frames=21, extra_args=extra_args),
+            )
+        ).output
+
+    default_before = generate()
+    shifted_two = generate(2.0)
+    shifted_seven = generate(7.0)
+    default_after = generate()
+
+    torch.testing.assert_close(default_before, default_after)
+    assert not torch.equal(default_before, shifted_two)
+    assert not torch.equal(shifted_two, shifted_seven)
+    assert calls == [5.0, 2.0, 7.0, 5.0]
+    assert pipeline.scheduler.config.shift == 5.0
+
+
+def test_encode_prompt_zeroes_padded_umt5_states_to_exactly_512_tokens() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    attention_mask = torch.zeros(1, 512, dtype=torch.long)
+    attention_mask[:, :3] = 1
+    pipeline.tokenizer = lambda *args, **kwargs: SimpleNamespace(
+        input_ids=torch.arange(512).view(1, 512),
+        attention_mask=attention_mask,
+    )
+    raw_states = torch.arange(512 * 8, dtype=torch.float32).view(1, 512, 8) + 1.0
+    pipeline.text_encoder = lambda input_ids, mask: SimpleNamespace(last_hidden_state=raw_states.clone())
+
+    encoded = module.LingBotWorldCausalDMDPipeline.encode_prompt(
+        pipeline,
+        "move",
+        max_sequence_length=512,
+        dtype=torch.float32,
+    )
+
+    assert encoded.shape == (1, 512, 8)
+    torch.testing.assert_close(encoded[:, :3], raw_states[:, :3])
+    torch.testing.assert_close(encoded[:, 3:], torch.zeros_like(encoded[:, 3:]))
 
 
 def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumulated_latents() -> None:
@@ -715,6 +1033,13 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     assert not hasattr(pipeline, "cache")
     assert not hasattr(pipeline, "transformer_cache")
     assert pipeline.vae.decode_inputs[0].shape == (1, 16, 6, 2, 2)
+    normalized_latents = torch.cat(
+        (transformer.calls[4]["hidden_states"][:, :16], transformer.calls[9]["hidden_states"][:, :16]),
+        dim=2,
+    )
+    mean = torch.tensor(pipeline.vae.config.latents_mean).view(1, 16, 1, 1, 1)
+    std = torch.tensor(pipeline.vae.config.latents_std).view(1, 16, 1, 1, 1)
+    torch.testing.assert_close(pipeline.vae.decode_inputs[0], normalized_latents * std + mean)
     transformer.calls.clear()
     gc.collect()
     assert cache_ref() is None
@@ -734,9 +1059,11 @@ def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
 
     module.allocate_lingbot_cache = allocate
 
-    with pytest.raises(RuntimeError, match="forced transformer failure"):
+    with pytest.raises(RuntimeError, match="forced transformer failure") as exc_info:
         pipeline(_request())
 
+    exc_info.value.__traceback__ = None
+    del exc_info
     transformer.calls.clear()
     gc.collect()
     assert len(cache_refs) == 1
@@ -747,9 +1074,10 @@ def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
 
 def test_registry_and_wan_exports_resolve_official_pipeline_class_name() -> None:
     module = _load_pipeline_module()
-    entry = _registry_models().get("LingBotWorldCausalDMDPipeline")
+    resolved, entry = _resolve_pipeline_through_real_registry(module)
 
     assert entry == ("wan2_2", "pipeline_lingbot_world", "LingBotWorldCausalDMDPipeline")
+    assert resolved is module.LingBotWorldCausalDMDPipeline
     assert module.LingBotWorldCausalDMDPipeline.__name__ == "LingBotWorldCausalDMDPipeline"
     wan_init = _WAN_INIT_PATH.read_text()
     assert "from .pipeline_lingbot_world import" in wan_init
