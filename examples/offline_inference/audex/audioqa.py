@@ -14,11 +14,11 @@ holding the ``<so_embedding>`` placeholder (expanded by the processor to
 Examples:
 
     # Transcribe WAVs (ASR):
-    python examples/offline_inference/audio_language/audex/audioqa.py \\
+    python examples/offline_inference/audex/audioqa.py \\
         --audio-files a.wav b.wav
 
     # Free-form audio QA:
-    python examples/offline_inference/audio_language/audex/audioqa.py \\
+    python examples/offline_inference/audex/audioqa.py \\
         --audio-files a.wav --question "What language is being spoken?"
 """
 
@@ -37,7 +37,7 @@ TARGET_SR = 16_000
 # The model root's default deploy yaml is the TTS pipeline; audio
 # understanding needs the single-stage thinker-only pipeline, so default to it.
 _DEFAULT_DEPLOY_CONFIG = str(
-    Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / "nemotron_labs_audex_thinker_only.yaml"
+    Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "nemotron_labs_audex_thinker_only.yaml"
 )
 
 

@@ -10,7 +10,7 @@ transcribe-tts-output.
 
 Example:
 
-    python examples/offline_inference/text_to_speech/audex/offline_benchmark_audex.py \
+    python examples/offline_inference/audex/offline_benchmark_audex.py \
         --num-samples 16 --batch-size 8 --output-dir results/audex_bench
 """
 

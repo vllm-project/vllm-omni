@@ -14,7 +14,7 @@ TTS pass (``modalities: ["audio"]``) streams codec frames into code2wav.
 
 Example:
 
-    python examples/offline_inference/speech_to_speech/audex/cascade.py \\
+    python examples/offline_inference/audex/cascade.py \\
         --audio-file question.wav --output results/answer.wav
 """
 
@@ -36,7 +36,7 @@ ASR_QUESTION = "Transcribe the input speech."
 # The model root's default deploy yaml is the TTS-only pipeline; the cascade
 # needs the audio-capable 2-stage full pipeline, so default to it.
 _DEFAULT_DEPLOY_CONFIG = str(
-    Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / "nemotron_labs_audex_full.yaml"
+    Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "nemotron_labs_audex_full.yaml"
 )
 
 

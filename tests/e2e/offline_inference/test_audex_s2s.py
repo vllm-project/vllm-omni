@@ -12,12 +12,11 @@ from __future__ import annotations
 
 import os
 import time
-from pathlib import Path
 
 import numpy as np
 import pytest
-import soundfile as sf
 import torch
+from vllm.assets.audio import AudioAsset
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
@@ -27,8 +26,6 @@ from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
 MODEL = "nvidia/Nemotron-Labs-Audex-2B"
 MODEL_DIR_ENV = "VLLM_OMNI_AUDEX_MODEL_DIR"
 SAMPLE_RATE = 16_000
-
-_ASSET = Path(__file__).resolve().parents[2] / "assets" / "audex" / "asr_weather_en.wav"
 
 ASR_PROMPT = (
     "<|im_start|>user\n<so_embedding>\nTranscribe the input speech.<|im_end|>\n<|im_start|>assistant\n<think></think>"
@@ -80,7 +77,8 @@ def _concat_audio(audio_val) -> np.ndarray:
 def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -> None:
     """ASR → chat → TTS over one deployment; text passes never emit audio."""
     real_weights = run_level in {"advanced_model", "full_model"}
-    audio, sr = sf.read(str(_ASSET), dtype="float32")
+    # Spoken question: vLLM's public audio asset (downloaded on first use).
+    audio, sr = AudioAsset("mary_had_lamb").audio_and_sample_rate
 
     # Pass 1 — ASR (text-final).
     asr_outputs = omni_runner.omni.generate(

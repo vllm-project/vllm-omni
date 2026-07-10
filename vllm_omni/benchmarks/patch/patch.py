@@ -45,7 +45,6 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextDataset,
 )
-from vllm_omni.benchmarks.data_modules.audex_tta_dataset import AudexTTADataset
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.metrics import definitions as defs
@@ -232,7 +231,6 @@ def get_samples(args, tokenizer):
         "seed-tts-design",
         "ttsd",
         "sound-effect",
-        "audex-tta",
     )
 
     # Check if we need to handle omni-related backends/datasets
@@ -352,7 +350,6 @@ def get_samples(args, tokenizer):
             "seed-tts-design": SeedTTSDesignDataset,
             "ttsd": TTSDDataset,
             "sound-effect": SoundEffectDataset,
-            "audex-tta": AudexTTADataset,
         }
         DatasetCls = _cls_map[args.dataset_name]
         dataset = DatasetCls(
@@ -367,10 +364,7 @@ def get_samples(args, tokenizer):
         out_len = getattr(args, "output_len", None)
         if out_len is None:
             out_len = getattr(args, "hf_output_len", None)
-        if out_len is None and DatasetCls is not AudexTTADataset:
-            # Historical forced default for the seed-tts family. audex-tta
-            # keeps out_len None so its sample() applies the dataset's own
-            # DEFAULT_OUTPUT_LEN (4200, the documented TTA cap), not 2048.
+        if out_len is None:
             out_len = SeedTTSDataset.DEFAULT_OUTPUT_LEN
         return dataset.sample(
             tokenizer=tokenizer,

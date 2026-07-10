@@ -17,7 +17,7 @@ Start the server first, e.g.:
 
 Then:
 
-    python examples/online_serving/speech_to_speech/audex/client.py \\
+    python examples/online_serving/audex/client.py \\
         --audio-file question.wav --port 8098 --output answer.wav
 """
 

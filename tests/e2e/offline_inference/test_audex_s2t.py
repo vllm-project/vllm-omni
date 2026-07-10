@@ -3,9 +3,9 @@
 """Offline E2E smoke test for Audex audio understanding (thinker-only).
 
 Single-stage ``nemotron_labs_audex_thinker_only`` pipeline on
-``checkpoint_folder_full``: WAV (+ instruction) in, text out. The vendored
-asset was synthesized by the Audex TTS pipeline itself, so its transcript is
-known exactly.
+``checkpoint_folder_full``: WAV (+ instruction) in, text out. The input clip
+is vLLM's public ``mary_had_lamb`` audio asset (downloaded on first use), so
+its transcript is known.
 
 WER is a trend metric (recorded in the assertion message, no numeric hard
 gate); the hard gates are structural: non-empty, non-degenerate text.
@@ -14,10 +14,9 @@ gate); the hard gates are structural: non-empty, non-degenerate text.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
-import soundfile as sf
+from vllm.assets.audio import AudioAsset
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
@@ -26,8 +25,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 MODEL = "nvidia/Nemotron-Labs-Audex-2B"
 MODEL_DIR_ENV = "VLLM_OMNI_AUDEX_MODEL_DIR"
 
-_ASSET = Path(__file__).resolve().parents[2] / "assets" / "audex" / "asr_weather_en.wav"
-_REFERENCE = "the weather is so good today let us go hiking in the mountains"
+_REFERENCE = "mary had a little lamb its fleece was white as snow"
 
 ASR_PROMPT = (
     "<|im_start|>user\n<so_embedding>\nTranscribe the input speech.<|im_end|>\n<|im_start|>assistant\n<think></think>"
@@ -70,8 +68,8 @@ def _wer(hyp: str, ref: str) -> float:
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_asr_smoke(omni_runner: OmniRunner, run_level: str) -> None:
-    """Transcribing the vendored WAV yields coherent, non-degenerate text."""
-    audio, sr = sf.read(str(_ASSET), dtype="float32")
+    """Transcribing the public audio asset yields coherent, non-degenerate text."""
+    audio, sr = AudioAsset("mary_had_lamb").audio_and_sample_rate
     outputs = omni_runner.omni.generate([{"prompt": ASR_PROMPT, "multi_modal_data": {"audio": (audio, sr)}}])
 
     assert len(outputs) == 1

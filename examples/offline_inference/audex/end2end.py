@@ -9,16 +9,16 @@ Pass the HF repo ROOT as --model; per-stage subfolders resolve automatically.
 
 Examples:
 
-    python examples/offline_inference/text_to_speech/audex/end2end.py \\
+    python examples/offline_inference/audex/end2end.py \\
         --texts "The weather is so good today." \\
         --output-dir results/audex_wavs
 
     # TSV corpus (utt_id<TAB>text per line), all requests in flight at once:
-    python examples/offline_inference/text_to_speech/audex/end2end.py \\
+    python examples/offline_inference/audex/end2end.py \\
         --texts-file corpus.tsv --output-dir results/audex_wavs
 
     # One request at a time:
-    python examples/offline_inference/text_to_speech/audex/end2end.py \\
+    python examples/offline_inference/audex/end2end.py \\
         --texts-file corpus.tsv --sequential --output-dir results/audex_wavs
 """
 
