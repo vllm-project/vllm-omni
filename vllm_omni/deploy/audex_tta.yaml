@@ -14,7 +14,7 @@
 #   * Stage 1's model is the EXTERNAL hf-audio XCodec1 checkpoint (override
 #     with a local path here or via XCODEC1_PATH); its tokenizer is borrowed
 #     from the thinker checkpoint automatically.
-pipeline: nemotron_labs_audex_tta
+pipeline: audex_tta
 async_chunk: false
 
 connectors:

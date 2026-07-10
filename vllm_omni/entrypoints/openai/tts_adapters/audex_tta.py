@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audex (Nemotron-Labs-Audex-2B) text-to-audio serving adapter.
 
-Caption → general audio through the ``nemotron_labs_audex_tta`` pipeline.
+Caption → general audio through the ``audex_tta`` pipeline.
 The adapter builds the TTA prompt; the serving layer completes the request
 after the final request id exists: the RVQ phase-mask contract
 (``extra_args["tta_rvq"]``) and the CFG pair contract (official default

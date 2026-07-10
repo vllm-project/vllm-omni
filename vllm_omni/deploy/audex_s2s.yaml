@@ -7,7 +7,7 @@
 # passes finish at stage 0; only audio-modality requests stream codec frames
 # into code2wav. CFG applies to the TTS pass via extra_params.cfg_scale
 # (recommended 1.5; 1.0 = off).
-pipeline: nemotron_labs_audex_full
+pipeline: audex_s2s
 async_chunk: true
 
 connectors:

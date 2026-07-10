@@ -41,7 +41,7 @@ def _concat_audio(audio_val) -> np.ndarray:
     return np.asarray(audio_val, dtype=np.float32).reshape(-1)
 
 
-_audex_deployment = get_deploy_config_path("nemotron_labs_audex.yaml")
+_audex_deployment = get_deploy_config_path("audex_tts.yaml")
 # Collection must not download anything: pass the repo id (or a local
 # override) and let the engine's stage-init path resolve/download the
 # required snapshot subset at execution time (ensure_audex_snapshot).

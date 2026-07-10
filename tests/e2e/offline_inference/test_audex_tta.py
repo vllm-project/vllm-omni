@@ -3,7 +3,7 @@
 """Offline E2E smoke test for Audex text-to-audio (TTA).
 
 Caption → RVQ-phase-masked <audiocodec_*> tokens → XCodec1 waveform through
-the ``nemotron_labs_audex_tta`` pipeline. RVQ phase validity is enforced by
+the ``audex_tta`` pipeline. RVQ phase validity is enforced by
 the mask logits processor (unit-tested against the official validator); the
 hard gates here are decode-side: non-silent, finite audio at the documented
 sample rate. CFG runs at the official TTA default (3.0).
@@ -40,7 +40,7 @@ CAPTIONS = (
     "Footsteps crunching through fresh snow.",
 )
 
-_audex_deployment = get_deploy_config_path("nemotron_labs_audex_tta.yaml")
+_audex_deployment = get_deploy_config_path("audex_tta.yaml")
 _audex_model = os.environ.get(MODEL_DIR_ENV) or MODEL
 _OMNI_RUNNER_PARAMS = [
     pytest.param(

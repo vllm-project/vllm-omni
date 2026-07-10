@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """E2E online tests for Audex (Nemotron-Labs-Audex-2B) text-to-audio.
 
-Covers /v1/audio/speech through the ``nemotron_labs_audex_tta`` deployment:
+Covers /v1/audio/speech through the ``audex_tta`` deployment:
 the ``audex_tta`` adapter builds the caption prompt and the serving layer
 injects the RVQ phase contract plus the official default guidance
 (cfg_scale 3.0) server-side.
@@ -28,7 +28,7 @@ audex_tta_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("nemotron_labs_audex_tta.yaml"),
+            stage_config_path=get_deploy_config_path("audex_tta.yaml"),
             server_args=["--trust-remote-code"],
         ),
         id="audex_tta",

@@ -99,7 +99,7 @@ _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
 _INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
-# audex_omni covers the nemotron_labs_audex_full S2S deployment, whose
+# audex_omni covers the audex_s2s S2S deployment, whose
 # TTS pass uses the same /v1/audio/speech surface.
 _AUDEX_TTS_MODEL_STAGES = {"audex_thinker", "audex_omni"}
 _AUDEX_TTA_MODEL_STAGES = {"audex_tta_thinker"}
@@ -692,7 +692,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             worker_type = getattr(engine_args, "worker_type", None)
             if model_stage in _TTS_MODEL_STAGES:
                 # The audio-capable Audex thinker is only speech-capable when
-                # deployed WITH the speech decoder (nemotron_labs_audex_full);
+                # deployed WITH the speech decoder (audex_s2s);
                 # the thinker-only deployment is text-final and must not
                 # accept /v1/audio/speech requests.
                 if model_stage == "audex_omni" and "audex_code2wav" not in all_stages:

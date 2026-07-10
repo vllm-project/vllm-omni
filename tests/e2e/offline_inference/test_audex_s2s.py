@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Offline E2E test for the Audex cascaded speech-to-speech pipeline.
 
-One ``nemotron_labs_audex_full`` deployment serves all three official
+One ``audex_s2s`` deployment serves all three official
 passes. The routing contract is the hard gate here: text-modality passes
 (ASR, chat) finish at stage 0 and must never produce stage-1 audio; the
 audio-modality TTS pass streams through the causal speech decoder.
@@ -31,7 +31,7 @@ ASR_PROMPT = (
     "<|im_start|>user\n<so_embedding>\nTranscribe the input speech.<|im_end|>\n<|im_start|>assistant\n<think></think>"
 )
 
-_audex_deployment = get_deploy_config_path("nemotron_labs_audex_full.yaml")
+_audex_deployment = get_deploy_config_path("audex_s2s.yaml")
 _audex_model = os.environ.get(MODEL_DIR_ENV) or MODEL
 _OMNI_RUNNER_PARAMS = [
     pytest.param(

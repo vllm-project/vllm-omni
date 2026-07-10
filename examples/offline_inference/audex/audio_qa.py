@@ -3,7 +3,7 @@
 """Offline Audex (Nemotron-Labs-Audex-2B) audio understanding example.
 
 Speech (or general audio) + text instruction → text, through the
-single-stage ``nemotron_labs_audex_thinker_only`` pipeline: NV-Whisper
+single-stage ``audex_thinker_only`` pipeline: NV-Whisper
 encoder + relu2 projector + 2B dense LM on ``checkpoint_folder_full``.
 
 The prompt format mirrors the official audioqa script: a ChatML user turn
@@ -14,11 +14,11 @@ holding the ``<so_embedding>`` placeholder (expanded by the processor to
 Examples:
 
     # Transcribe WAVs (ASR):
-    python examples/offline_inference/audex/audioqa.py \\
+    python examples/offline_inference/audex/audio_qa.py \\
         --audio-files a.wav b.wav
 
     # Free-form audio QA:
-    python examples/offline_inference/audex/audioqa.py \\
+    python examples/offline_inference/audex/audio_qa.py \\
         --audio-files a.wav --question "What language is being spoken?"
 """
 
@@ -36,9 +36,7 @@ ASR_QUESTION = "Transcribe the input speech."
 TARGET_SR = 16_000
 # The model root's default deploy yaml is the TTS pipeline; audio
 # understanding needs the single-stage thinker-only pipeline, so default to it.
-_DEFAULT_DEPLOY_CONFIG = str(
-    Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "nemotron_labs_audex_thinker_only.yaml"
-)
+_DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "audex_thinker_only.yaml")
 
 
 def build_prompt(question: str) -> str:
@@ -54,7 +52,7 @@ def parse_args():
         "--deploy-config",
         type=str,
         default=_DEFAULT_DEPLOY_CONFIG,
-        help="Deploy yaml (defaults to the nemotron_labs_audex_thinker_only pipeline).",
+        help="Deploy yaml (defaults to the audex_thinker_only pipeline).",
     )
     return parser.parse_args()
 

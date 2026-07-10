@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Offline E2E smoke test for Audex audio understanding (thinker-only).
 
-Single-stage ``nemotron_labs_audex_thinker_only`` pipeline on
+Single-stage ``audex_thinker_only`` pipeline on
 ``checkpoint_folder_full``: WAV (+ instruction) in, text out. The input clip
 is vLLM's public ``mary_had_lamb`` audio asset (downloaded on first use), so
 its transcript is known.
@@ -31,7 +31,7 @@ ASR_PROMPT = (
     "<|im_start|>user\n<so_embedding>\nTranscribe the input speech.<|im_end|>\n<|im_start|>assistant\n<think></think>"
 )
 
-_audex_deployment = get_deploy_config_path("nemotron_labs_audex_thinker_only.yaml")
+_audex_deployment = get_deploy_config_path("audex_thinker_only.yaml")
 _audex_model = os.environ.get(MODEL_DIR_ENV) or MODEL
 _OMNI_RUNNER_PARAMS = [
     pytest.param(

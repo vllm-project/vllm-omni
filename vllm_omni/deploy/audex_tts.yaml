@@ -19,6 +19,7 @@
 #     stage 0 — at max_num_seqs 8 that means at most 4 guided requests
 #     decode concurrently; raise max_num_seqs if CFG-heavy traffic needs
 #     more parallelism.
+pipeline: audex_tts
 async_chunk: true
 
 connectors:

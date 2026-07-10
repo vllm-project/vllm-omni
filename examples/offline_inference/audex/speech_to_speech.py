@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Offline Audex (Nemotron-Labs-Audex-2B) cascaded speech-to-speech example.
 
-The official three-pass cascade over ONE ``nemotron_labs_audex_full``
+The official three-pass cascade over ONE ``audex_s2s``
 deployment:
 
   1. ASR pass  (audio + "Transcribe the input speech." → transcript, text)
@@ -14,7 +14,7 @@ TTS pass (``modalities: ["audio"]``) streams codec frames into code2wav.
 
 Example:
 
-    python examples/offline_inference/audex/cascade.py \\
+    python examples/offline_inference/audex/speech_to_speech.py \\
         --audio-file question.wav --output results/answer.wav
 """
 
@@ -35,9 +35,7 @@ SAMPLE_RATE = 16_000
 ASR_QUESTION = "Transcribe the input speech."
 # The model root's default deploy yaml is the TTS-only pipeline; the cascade
 # needs the audio-capable 2-stage full pipeline, so default to it.
-_DEFAULT_DEPLOY_CONFIG = str(
-    Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "nemotron_labs_audex_full.yaml"
-)
+_DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "audex_s2s.yaml")
 
 
 def parse_args():
@@ -49,7 +47,7 @@ def parse_args():
         "--deploy-config",
         type=str,
         default=_DEFAULT_DEPLOY_CONFIG,
-        help="Deploy yaml (defaults to the nemotron_labs_audex_full pipeline).",
+        help="Deploy yaml (defaults to the audex_s2s pipeline).",
     )
     parser.add_argument(
         "--cfg-scale",

@@ -16,7 +16,7 @@ XCODEC1_PATH / the default hf-audio repo.
 
 Example:
 
-    python examples/offline_inference/audex/tta_end2end.py \\
+    python examples/offline_inference/audex/text_to_audio.py \\
         --captions "Heavy rain falling on a tin roof." \\
         --output-dir results/audex_tta_wavs
 """
@@ -41,9 +41,7 @@ from vllm_omni.model_executor.models.audex.tta import build_tta_phase_token_ids
 SAMPLE_RATE = 16_000
 # The model root's default deploy yaml is the TTS pipeline; TTA prompts and
 # RVQ sampling params require the dedicated TTA pipeline, so default to it.
-_DEFAULT_DEPLOY_CONFIG = str(
-    Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "nemotron_labs_audex_tta.yaml"
-)
+_DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "audex_tta.yaml")
 DEFAULT_CAPTIONS = (
     "Heavy rain falling on a tin roof.",
     "A dog barking in the distance while birds chirp.",
@@ -67,7 +65,7 @@ def parse_args():
         "--deploy-config",
         type=str,
         default=_DEFAULT_DEPLOY_CONFIG,
-        help="Deploy yaml (defaults to the nemotron_labs_audex_tta pipeline).",
+        help="Deploy yaml (defaults to the audex_tta pipeline).",
     )
     parser.add_argument(
         "--xcodec1-path",

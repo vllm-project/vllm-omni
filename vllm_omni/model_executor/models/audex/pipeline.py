@@ -26,8 +26,8 @@ AUDEX_SPEECHGEN_END_TOKEN_ID = 131076
 # <audiogen_end> stops TTA generation (pinned in tests via models/audex/tta.py).
 AUDEX_AUDIOGEN_END_TOKEN_ID = 131074
 
-AUDEX_PIPELINE = PipelineConfig(
-    model_type="nemotron_labs_audex",
+AUDEX_TTS_PIPELINE = PipelineConfig(
+    model_type="audex_tts",
     model_arch="NemotronDenseForCausalLM",
     stages=(
         StagePipelineConfig(
@@ -78,8 +78,8 @@ AUDEX_PIPELINE = PipelineConfig(
 # pass (output modality "audio", final_stage_id 1) traverses the streaming
 # speech decoder — text-modality passes finish at stage 0 and never reach
 # the codec path. The cascade itself is orchestrated by the client/example.
-AUDEX_FULL_PIPELINE = PipelineConfig(
-    model_type="nemotron_labs_audex_full",
+AUDEX_S2S_PIPELINE = PipelineConfig(
+    model_type="audex_s2s",
     model_arch="NemotronDenseAudexForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -132,7 +132,7 @@ AUDEX_FULL_PIPELINE = PipelineConfig(
 # audio-capable full checkpoint — speech (+ text instruction) in, text out.
 # Modeled on the ming_flash_omni / qwen2_5_omni thinker-only pipelines.
 AUDEX_THINKER_ONLY_PIPELINE = PipelineConfig(
-    model_type="nemotron_labs_audex_thinker_only",
+    model_type="audex_thinker_only",
     model_arch="NemotronDenseAudexForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -154,7 +154,7 @@ AUDEX_THINKER_ONLY_PIPELINE = PipelineConfig(
 
 
 AUDEX_TTA_PIPELINE = PipelineConfig(
-    model_type="nemotron_labs_audex_tta",
+    model_type="audex_tta",
     model_arch="NemotronDenseForCausalLM",
     stages=(
         StagePipelineConfig(

@@ -26,7 +26,7 @@ audex_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("nemotron_labs_audex.yaml"),
+            stage_config_path=get_deploy_config_path("audex_tts.yaml"),
             server_args=["--trust-remote-code"],
         ),
         id="audex",

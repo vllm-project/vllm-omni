@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cascaded Audex speech-to-speech client (mirrors the official web demo).
 
-Runs the official three passes against ONE ``nemotron_labs_audex_full``
+Runs the official three passes against ONE ``audex_s2s``
 server:
 
   1. ASR  — /v1/chat/completions with the WAV as ``input_audio`` content
@@ -13,7 +13,7 @@ Start the server first, e.g.:
 
     vllm-omni serve nvidia/Nemotron-Labs-Audex-2B --omni --port 8098 \\
         --trust-remote-code \\
-        --stage-configs-path vllm_omni/deploy/nemotron_labs_audex_full.yaml
+        --stage-configs-path vllm_omni/deploy/audex_s2s.yaml
 
 Then:
 

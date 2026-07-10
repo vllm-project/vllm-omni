@@ -192,6 +192,11 @@ class StageConfigFactory:
         # Resolve deploy config path
         if deploy_config_path is None:
             deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
+            # Alias keys (an HF ``model_type`` registered as a pointer to a
+            # differently-named pipeline, e.g. nemotron_labs_audex ->
+            # audex_tts) keep their default yaml under the PIPELINE's name.
+            if not deploy_path.exists() and pipeline_cfg.model_type != model_type:
+                deploy_path = _DEPLOY_DIR / f"{pipeline_cfg.model_type}.yaml"
         else:
             deploy_path = Path(deploy_config_path)
 
