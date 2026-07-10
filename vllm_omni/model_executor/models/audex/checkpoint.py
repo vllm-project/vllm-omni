@@ -50,13 +50,18 @@ _AUDIOGEN_INDEX_FILE = "checkpoint_folder_audiogen/model.safetensors.index.json"
 
 
 def _download_audiogen_index(model: str) -> str:
-    """Resolve the audiogen dedup index to a local path (tiny file)."""
+    """Resolve the audiogen dedup index to a local path (tiny, cache-first).
+
+    Cache-first keeps warm-cache boots offline-safe and avoids a Hub
+    metadata round trip per stage-engine boot; a cache miss falls back to
+    the network.
+    """
     from huggingface_hub import hf_hub_download
 
     try:
-        return hf_hub_download(model, _AUDIOGEN_INDEX_FILE)
-    except Exception:
         return hf_hub_download(model, _AUDIOGEN_INDEX_FILE, local_files_only=True)
+    except Exception:
+        return hf_hub_download(model, _AUDIOGEN_INDEX_FILE)
 
 
 def _dedup_shard_patterns(model: str) -> list[str]:
@@ -75,8 +80,9 @@ def _dedup_shard_patterns(model: str) -> list[str]:
             return [f"{_WEIGHT_SOURCE_FOLDER}/{shard}" for shard in shards]
     except Exception as exc:
         logger.warning(
-            "Could not resolve the audiogen dedup shards for %s (%s); downloading all full-checkpoint shards",
+            "Could not resolve the audiogen dedup shards for %s from %s (%s); downloading all full-checkpoint shards",
             model,
+            _AUDIOGEN_INDEX_FILE,
             exc,
         )
     return [f"{_WEIGHT_SOURCE_FOLDER}/model-*.safetensors"]
