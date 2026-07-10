@@ -356,6 +356,96 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
     action payload under the top-level `action` field; sync `/v1/videos/sync`
     returns raw MP4 bytes and does not expose action metadata in the response body.
 
+### 1x RTX 5090 32GB (low-VRAM online serving)
+
+#### Environment
+
+- OS: Ubuntu 22.04+
+- GPU: NVIDIA GeForce RTX 5090 32GB
+- Driver / runtime: NVIDIA driver 570.211.01, CUDA 12.9
+- Python: 3.12
+- torch: 2.11.0+cu129
+- vLLM version: 0.24.0
+- vLLM-Omni version or commit: v0.24.0 (`d4a869fe5e2e`)
+
+#### Command
+
+The BF16 single-GPU server needs layerwise offload on an RTX 5090 32GB. The same
+command **without** `--enable-layerwise-offload` loaded the model but failed the
+startup dummy run with CUDA OOM after using 31.09 GiB; only 33 MiB was free while
+allocating another 40 MiB.
+
+```bash
+MODEL=/path/to/Cosmos3-Nano
+
+CUDA_VISIBLE_DEVICES=0 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_ATTENTION_BACKEND=CUDNN_ATTN \
+vllm serve "$MODEL" \
+  --omni \
+  --host 0.0.0.0 --port 8000 \
+  --num-gpus 1 \
+  --model-class-name Cosmos3OmniDiffusersPipeline \
+  --no-guardrails \
+  --enable-layerwise-offload \
+  --init-timeout 1800
+```
+
+#### Verification
+
+The following reduced-size low-VRAM validation requests were run on the same
+server. They validate the 32GB consumer GPU deployment path, including API
+success, decoded outputs, latency, peak GPU memory, and visual output quality.
+They are **not** a full 720p / 189-frame quality validation.
+
+```bash
+# Text-to-image -> /v1/images/generations (512x512, 20 steps; base64 PNG)
+curl -sS -X POST http://localhost:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/path/to/Cosmos3-Nano",
+    "prompt": "A photorealistic red sports car on a city street at golden hour, cinematic lighting.",
+    "negative_prompt": "blurry, distorted, low quality",
+    "size": "512x512", "n": 1, "response_format": "b64_json",
+    "num_inference_steps": 20, "guidance_scale": 7.0, "seed": 42
+  }' | python -c "import sys,json,base64; open('cosmos3_rtx5090_t2i_512.png','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+
+# Text-to-video -> /v1/videos/sync (512x512, 33 frames @ 24fps, 20 steps)
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "model=/path/to/Cosmos3-Nano" \
+  -F "prompt=A red sports car drives through a rainy neon city at night, cinematic lighting, smooth camera motion." \
+  -F "negative_prompt=blurry, distorted, low quality" \
+  -F "size=512x512" -F "num_frames=33" -F "fps=24" \
+  -F "num_inference_steps=20" -F "guidance_scale=6.0" \
+  -F "max_sequence_length=4096" -F "flow_shift=3.0" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":false}' \
+  -F "seed=123" \
+  -o cosmos3_rtx5090_t2v_512_33f.mp4
+```
+
+#### Notes
+
+- **Validated profile:** 1x RTX 5090 32GB, BF16, guardrails off, layerwise
+  offload on, CUDNN attention.
+
+  | Scenario | Request profile | Client-side E2E latency | Peak GPU memory (`nvidia-smi`) | Output validation |
+  |---|---|---:|---:|---|
+  | T2I | 512x512, 20 steps, guidance 7.0 | 9.72 s | 19931 MiB (~19.5 GiB) | 512x512 RGB PNG; fixed-seed output visually matched the prompt |
+  | T2V | 512x512, 33 frames @ 24fps, 20 steps, guidance 6.0 | 11.74 s | 23241 MiB (~22.7 GiB) | H.264 MP4, 512x512, 33 frames; fixed-seed output was readable |
+
+- **Startup memory:** with layerwise offload enabled, GPU memory after warmup was
+  about 19.4 GiB by `nvidia-smi`; vLLM-Omni logged 17.58 GiB process-scoped GPU
+  memory after model loading, before the startup warmup request.
+- **Baseline boundary:** without `--enable-layerwise-offload`, the same BF16
+  single-GPU command loaded the model but failed the startup dummy run with CUDA
+  OOM. This is the tested reason the RTX 5090 32GB recipe enables layerwise
+  offload.
+- **Known limitations:** this setup depends on CPU offload bandwidth and was
+  validated at reduced resolution/frame count. I2V, V2V, T2V with sound, action,
+  and the full 720p / 189-frame parameters remain unvalidated for this GPU class;
+  use the H200/B300 recipe above for those full-size settings.
+
 ### 1x GPU (Offline generation)
 
 #### Environment
