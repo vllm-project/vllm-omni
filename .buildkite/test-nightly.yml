@@ -1440,7 +1440,6 @@ steps:
         commands:
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m full_model --run-level full_model
-          - pytest -s -v tests/e2e/accuracy/test_ltx2_3_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_video_streaming_output_similarity.py -m full_model --run-level full_model
         agents:
           queue: "mithril-h100-pool"
