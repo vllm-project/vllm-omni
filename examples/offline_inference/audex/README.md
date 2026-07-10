@@ -88,3 +88,20 @@ python examples/offline_inference/audex/speech_to_speech.py \
 
 Online-serving counterparts (server + HTTP clients) live in
 `examples/online_serving/audex/`.
+
+## 30B-A3B (nvidia/Nemotron-Labs-Audex-30B-A3B)
+
+The same four scripts serve the 30B MoE checkpoint (hybrid Mamba + MoE
+NemotronH thinker; identical token space and decoder). The 30B REQUIRES an
+explicit 30B deploy yaml — the model root's default resolution lands on the
+2B-tuned configs:
+
+    python examples/offline_inference/audex/text_to_speech.py \
+        --model nvidia/Nemotron-Labs-Audex-30B-A3B \
+        --deploy-config vllm_omni/deploy/audex_tts_30b.yaml
+
+Per-mode yamls: `audex_{tts,tta,thinker_only,s2s}_30b.yaml`. Defaults fit a
+single H100 80 GB (thinker + decoder share the card; prefix caching is off —
+hybrid Mamba); if long sequences OOM, set `tensor_parallel_size: 2` on
+stage 0. First run downloads ~60 GB. Verified on a single H100 80 GB: ~61 GiB
+weights + healthy KV headroom; TP2 was not needed.

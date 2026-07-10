@@ -76,3 +76,14 @@ python client.py --mode s2s --port 8098 \
 
 Offline counterparts (no HTTP, one `Omni` engine per script) live in
 `examples/offline_inference/audex/`.
+
+## 30B-A3B (nvidia/Nemotron-Labs-Audex-30B-A3B)
+
+`SIZE=30b` switches run_server.sh to the 30B yamls and model id:
+
+    SIZE=30b ./run_server.sh                 # 30B tts on port 8097
+    SIZE=30b MODE=s2s PORT=8098 ./run_server.sh
+
+Pass `--model nvidia/Nemotron-Labs-Audex-30B-A3B` to the client — the server
+validates the model id and 404s on a mismatch. Single-H100 defaults; see the
+yaml comments for the TP2 fallback. First launch downloads ~60 GB.
