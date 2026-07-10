@@ -310,7 +310,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        # The stage-level ``model_arch`` override may be blank so the class
+        # resolves from the checkpoint's own ``architectures`` (e.g. the Audex
+        # TTA/TTS thinker stages, which bind dense on the 2B and NemotronH on
+        # the 30B-A3B). Gate on the RESOLVED architectures, not only the raw
+        # override — otherwise a blank-override producer stage never creates
+        # its worker connector and the sync full-payload flush silently never
+        # runs (downstream stage starves on connector input).
+        stage_archs = set(getattr(self.model_config, "architectures", None) or ())
+        model_arch_override = getattr(self.model_config, "model_arch", None)
+        if model_arch_override:
+            stage_archs.add(model_arch_override)
+        if stage_archs & _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
