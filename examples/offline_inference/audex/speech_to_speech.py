@@ -12,7 +12,8 @@ deployment:
 Text passes carry ``modalities: ["text"]`` and finish at stage 0; only the
 TTS pass (``modalities: ["audio"]``) streams codec frames into code2wav.
 
-Example:
+Example (without --audio-file, vLLM's public ``mary_had_lamb`` asset is
+used as the spoken input):
 
     python examples/offline_inference/audex/speech_to_speech.py \\
         --audio-file question.wav --output results/answer.wav
@@ -27,6 +28,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
+from vllm.assets.audio import AudioAsset
 
 from vllm_omni import Omni
 from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt, build_null_prompt
@@ -41,7 +43,12 @@ _DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" /
 def parse_args():
     parser = argparse.ArgumentParser(description="Offline Audex cascaded S2S")
     parser.add_argument("--model", type=str, default="nvidia/Nemotron-Labs-Audex-2B")
-    parser.add_argument("--audio-file", type=str, required=True, help="Spoken question (WAV).")
+    parser.add_argument(
+        "--audio-file",
+        type=str,
+        default=None,
+        help="Spoken question (WAV). Defaults to vLLM's mary_had_lamb audio asset.",
+    )
     parser.add_argument("--output", type=str, default="results/audex_s2s_answer.wav")
     parser.add_argument(
         "--deploy-config",
@@ -112,9 +119,12 @@ def main():
         root = ensure_audex_snapshot(args.model, profile="full")
         tokenizer = AutoTokenizer.from_pretrained(str(Path(root) / "checkpoint_folder_full"))
 
-    audio, sr = sf.read(args.audio_file, dtype="float32")
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
+    if args.audio_file:
+        audio, sr = sf.read(args.audio_file, dtype="float32")
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+    else:
+        audio, sr = AudioAsset("mary_had_lamb").audio_and_sample_rate
 
     # Pass 1 — ASR (text-final; never touches the speech decoder).
     transcript = _clean(

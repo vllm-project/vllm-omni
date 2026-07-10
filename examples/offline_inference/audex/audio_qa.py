@@ -11,7 +11,8 @@ holding the ``<so_embedding>`` placeholder (expanded by the processor to
 750 embedding positions per 30 s clip) plus the instruction, with a closed
 ``<think></think>`` priming.
 
-Examples:
+Examples (without --audio-files, vLLM's public ``mary_had_lamb`` asset is
+transcribed):
 
     # Transcribe WAVs (ASR):
     python examples/offline_inference/audex/audio_qa.py \\
@@ -29,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+from vllm.assets.audio import AudioAsset
 
 from vllm_omni import Omni
 
@@ -46,7 +48,13 @@ def build_prompt(question: str) -> str:
 def parse_args():
     parser = argparse.ArgumentParser(description="Offline Audex audio understanding")
     parser.add_argument("--model", type=str, default="nvidia/Nemotron-Labs-Audex-2B")
-    parser.add_argument("--audio-files", type=str, nargs="+", required=True)
+    parser.add_argument(
+        "--audio-files",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Input clips. Defaults to vLLM's mary_had_lamb audio asset.",
+    )
     parser.add_argument("--question", type=str, default=ASR_QUESTION)
     parser.add_argument(
         "--deploy-config",
@@ -72,9 +80,12 @@ def main():
     engine = Omni(model=args.model, deploy_config=args.deploy_config, trust_remote_code=True)
 
     prompt_text = build_prompt(args.question)
+    if args.audio_files:
+        clips = [_load_audio(path) for path in args.audio_files]
+    else:
+        clips = [AudioAsset("mary_had_lamb").audio_and_sample_rate]
     prompts = []
-    for path in args.audio_files:
-        audio, sr = _load_audio(path)
+    for audio, sr in clips:
         prompts.append(
             {
                 "prompt": prompt_text,
@@ -94,9 +105,10 @@ def main():
         return int(match.group(1)) if match else 0
 
     ordered = sorted(outputs, key=_req_index)
-    for path, req_output in zip(args.audio_files, ordered):
+    names = [Path(p).name for p in args.audio_files] if args.audio_files else ["mary_had_lamb"]
+    for name, req_output in zip(names, ordered):
         text = req_output.outputs[0].text if req_output.outputs else ""
-        print(f"{Path(path).name}: {text.strip()}")
+        print(f"{name}: {text.strip()}")
 
 
 if __name__ == "__main__":
