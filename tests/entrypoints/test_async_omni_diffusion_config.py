@@ -33,6 +33,26 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_forwards_runtime_v2_settings():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "model_class_name": "QwenImagePipeline",
+            "enable_runtime_v2": True,
+            "runtime_v2_denoise_chunk_size": 4,
+            "runtime_v2_scheduler_policy": "fcfs",
+            "stage_init_timeout": 777,
+        }
+    )[0]
+
+    expected = {
+        "enable_runtime_v2": True,
+        "runtime_v2_denoise_chunk_size": 4,
+        "runtime_v2_scheduler_policy": "fcfs",
+        "stage_init_timeout": 777,
+    }
+    assert {key: stage_cfg["engine_args"][key] for key in expected} == expected
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
@@ -359,3 +379,27 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
 
     assert not hasattr(stage_configs[0].engine_args, "additional_config")
     assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_resolve_stage_configs_omits_default_stage_init_timeout(mocker):
+    captured = {}
+
+    def _fake(model, stage_configs_path, kwargs, **kw):
+        captured["kwargs"] = kwargs
+        return ("dummy.yaml", [])
+
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=_fake,
+    )
+
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine.stage_init_timeout = 300
+    engine._resolve_stage_configs("dummy-model", {"stage_configs_path": "dummy.yaml"})
+    assert "stage_init_timeout" not in captured["kwargs"]
+
+    engine.stage_init_timeout = 900
+    engine._resolve_stage_configs("dummy-model", {"stage_configs_path": "dummy.yaml"})
+    assert captured["kwargs"]["stage_init_timeout"] == 900

@@ -31,6 +31,37 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert not explicit["async_chunk"]
 
 
+def test_serve_parser_accepts_runtime_v2_flags_and_marks_them_explicit() -> None:
+    """``vllm serve ... --enable-runtime-v2`` (+ the two ``--runtime-v2-*`` knobs)
+    must parse and be forwarded as explicit kwargs. Without registering them on
+    the serve parser, argparse rejects the flags before the value reaches the
+    engine, so runtime_v2 could only be enabled from Python."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+
+    argv = [
+        "serve",
+        "fake-model",
+        "--omni",
+        "--enable-runtime-v2",
+        "--runtime-v2-denoise-chunk-size",
+        "4",
+        "--runtime-v2-scheduler-policy",
+        "fcfs",
+    ]
+    args = parser.parse_args(argv)
+    assert args.enable_runtime_v2 is True
+    assert args.runtime_v2_denoise_chunk_size == 4
+    assert args.runtime_v2_scheduler_policy == "fcfs"
+
+    explicit = args.get_explicit_kwargs_dict()
+    assert explicit["enable_runtime_v2"] is True
+    assert explicit["runtime_v2_denoise_chunk_size"] == 4
+    assert explicit["runtime_v2_scheduler_policy"] == "fcfs"
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

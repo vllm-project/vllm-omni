@@ -751,3 +751,29 @@ def test_diffusion_config_field_classification_covers_current_fields():
         "distributed_executor_backend",
     } <= omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
+
+
+def test_runtime_v2_structured_config_projection_and_forwarding():
+    from types import SimpleNamespace
+
+    from vllm_omni.config.omni_config import _stage_cli_overrides
+    from vllm_omni.config.stage_config import StageExecutionType
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    settings = {
+        "enable_runtime_v2": True,
+        "runtime_v2_denoise_chunk_size": 4,
+        "runtime_v2_scheduler_policy": "fcfs",
+        "stage_init_timeout": 900,
+    }
+    diffusion_topo = SimpleNamespace(stage_id=1, execution_type=StageExecutionType.DIFFUSION)
+    assert _stage_cli_overrides(diffusion_topo, settings) == settings
+
+    llm_topo = SimpleNamespace(stage_id=0, execution_type=StageExecutionType.LLM_AR)
+    assert not set(settings) & set(_stage_cli_overrides(llm_topo, settings))
+
+    projection = omni_config_module._DiffusionConfigProjection.from_kwargs(**settings)
+    runtime = OmniDiffusionConfig.from_kwargs(model_class_name="QwenImagePipeline", **settings)
+    for key, value in settings.items():
+        assert getattr(projection, key) == value
+        assert getattr(runtime, key) == value

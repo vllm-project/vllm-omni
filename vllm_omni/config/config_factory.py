@@ -24,6 +24,7 @@ from vllm_omni.config.stage_config import (
     StageConfig,
     StageType,
     build_stage_runtime_overrides,
+    forward_runtime_v2_settings_to_diffusion_stage,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -342,6 +343,9 @@ class StageConfigFactory:
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+            forward_runtime_v2_settings_to_diffusion_stage(
+                stage.stage_type, explicit_overrides, stage.runtime_overrides
+            )
 
         return stages
 

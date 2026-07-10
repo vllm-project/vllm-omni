@@ -467,6 +467,9 @@ class OrchestratorArgs:
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
+    enable_runtime_v2: bool = False
+    runtime_v2_denoise_chunk_size: int = 1
+    runtime_v2_scheduler_policy: str = "fcfs"
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True

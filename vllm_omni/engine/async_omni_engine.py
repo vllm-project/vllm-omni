@@ -223,6 +223,9 @@ class AsyncOmniEngine:
         self.model = model
         self.tokenizer = tokenizer
         self.diffusion_batch_size = diffusion_batch_size
+        # Named parameters are absent from **kwargs; retain this one so the
+        # runtime_v2 worker pool receives the outer stage's startup timeout.
+        self.stage_init_timeout = int(stage_init_timeout)
         # Cached by get_diffusion_od_config().
         self._diffusion_od_config_view: Any = None
         startup_timeout = int(init_timeout)
@@ -1016,6 +1019,10 @@ class AsyncOmniEngine:
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
+            "enable_runtime_v2": kwargs.get("enable_runtime_v2", False),
+            "runtime_v2_denoise_chunk_size": kwargs.get("runtime_v2_denoise_chunk_size", 1),
+            "runtime_v2_scheduler_policy": kwargs.get("runtime_v2_scheduler_policy", "fcfs"),
+            "stage_init_timeout": kwargs.get("stage_init_timeout", 300),
             "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
@@ -1154,11 +1161,20 @@ class AsyncOmniEngine:
             else:
                 stage_overrides = stage_overrides_json
 
+        # A default 300 must not override an explicit deploy-YAML value; only a
+        # non-default constructor value is a real runtime override.
+        stage_init_timeout = getattr(self, "stage_init_timeout", 300)
+        configured_kwargs = dict(base_kwargs)
+        if stage_init_timeout != 300:
+            configured_kwargs["stage_init_timeout"] = stage_init_timeout
+
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
-            base_kwargs,
-            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+            configured_kwargs,
+            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(
+                {**kwargs, "stage_init_timeout": stage_init_timeout}
+            ),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
         )

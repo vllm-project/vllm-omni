@@ -557,6 +557,23 @@ class OmniServeCommand(CLISubcommand):
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
         omni_config_group.add_argument(
+            "--enable-runtime-v2",
+            action="store_true",
+            help="Enable the runtime_v2 task-centric diffusion scheduler (PR1: single-group FCFS Qwen-Image).",
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-denoise-chunk-size",
+            type=int,
+            default=1,
+            help="runtime_v2: number of denoise steps dispatched per DIT_STEP_CHUNK task (default: 1).",
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-scheduler-policy",
+            type=str,
+            default="fcfs",
+            help="runtime_v2: global scheduler policy (default: 'fcfs').",
+        )
+        omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
             type=float,
             default=0.0,

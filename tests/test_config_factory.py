@@ -30,6 +30,7 @@ from vllm_omni.config.stage_config import (
     _deep_merge_stage,
     _resolve_scheduler,
     build_stage_runtime_overrides,
+    forward_runtime_v2_settings_to_diffusion_stage,
     load_deploy_config,
     merge_pipeline_deploy,
     pipeline_cfg_resolver,
@@ -144,6 +145,41 @@ class TestStageConfig:
         assert omega_config.runtime.devices == "0,1"
         # max_batch_size is migrated to engine_args.max_num_seqs
         assert omega_config.engine_args.max_num_seqs == 64
+
+    def test_runtime_v2_settings_reach_only_diffusion_engine_args(self):
+        settings = {
+            "enable_runtime_v2": True,
+            "runtime_v2_denoise_chunk_size": 4,
+            "runtime_v2_scheduler_policy": "fcfs",
+            "stage_init_timeout": 900,
+        }
+        overrides: dict = {}
+        forward_runtime_v2_settings_to_diffusion_stage(StageType.DIFFUSION, settings, overrides)
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            runtime_overrides=overrides,
+        )
+        omega_config = config.to_omegaconf()
+        for key, value in settings.items():
+            assert getattr(omega_config.engine_args, key) == value
+
+        llm_overrides: dict = {}
+        forward_runtime_v2_settings_to_diffusion_stage(StageType.LLM, settings, llm_overrides)
+        assert llm_overrides == {}
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "stage_0_enable_runtime_v2",
+            "stage_0_runtime_v2_denoise_chunk_size",
+            "stage_0_runtime_v2_scheduler_policy",
+        ],
+    )
+    def test_runtime_v2_settings_are_top_level_only(self, key):
+        with pytest.raises(ValueError, match="top level"):
+            build_stage_runtime_overrides(0, {key: True}, internal_keys=frozenset())
 
     def test_to_omegaconf_max_batch_size_deprecation(self):
         """Test that runtime.max_batch_size emits a FutureWarning."""

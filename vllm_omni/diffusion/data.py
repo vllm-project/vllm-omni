@@ -779,6 +779,13 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Runtime v2 settings
+    enable_runtime_v2: bool = False
+    runtime_v2_denoise_chunk_size: int = 1
+    runtime_v2_scheduler_policy: str = "fcfs"
+    # Startup timeout for the runtime_v2 worker pool.
+    stage_init_timeout: int = 300
+
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
 

@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -28,6 +28,32 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+
+# runtime_v2 is a pipeline-level opt-in; per-stage forms are ambiguous and are
+# rejected below.
+_RUNTIME_V2_TOPLEVEL_FLAGS = frozenset(
+    {
+        "enable_runtime_v2",
+        "runtime_v2_denoise_chunk_size",
+        "runtime_v2_scheduler_policy",
+    }
+)
+
+_DIFFUSION_STAGE_TOPLEVEL_FORWARD = _RUNTIME_V2_TOPLEVEL_FLAGS | frozenset({"stage_init_timeout"})
+
+
+def forward_runtime_v2_settings_to_diffusion_stage(
+    stage_type: Any,
+    cli_overrides: Mapping[str, Any],
+    runtime_overrides: dict[str, Any],
+) -> None:
+    """Forward pipeline-level runtime_v2 settings to a diffusion stage."""
+    if StageType(stage_type) != StageType.DIFFUSION:
+        return
+    for key in _DIFFUSION_STAGE_TOPLEVEL_FORWARD:
+        value = cli_overrides.get(key)
+        if value is not None:
+            runtime_overrides[key] = value
 
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
@@ -81,6 +107,12 @@ def build_stage_runtime_overrides(
         if match is not None:
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
+            if param_name in _RUNTIME_V2_TOPLEVEL_FLAGS:
+                raise ValueError(
+                    f"Per-stage override {key!r} is not supported: runtime_v2 opt-in "
+                    f"must be set at the top level (e.g. Omni(..., enable_runtime_v2=True)), "
+                    f"not per stage."
+                )
             if override_stage_id == stage_id and param_name not in internal_keys:
                 result[param_name] = value
             continue
