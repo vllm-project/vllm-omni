@@ -1123,6 +1123,38 @@ class AsyncOmniEngine:
 
         return result
 
+    @staticmethod
+    def _inject_stage_cache_backend(cfg: Any, kwargs: dict[str, Any]) -> None:
+        """Propagate the top-level diffusion cache backend/config into a stage.
+
+        Deploy-YAML stages build their engine args from a fixed allowlist and
+        default ``cache_backend`` to ``"none"``; the top-level ``cache_backend``
+        (e.g. ``--cache-backend tea_cache``) and its ``cache_config`` are not in
+        that allowlist, so without this they never reach the diffusion stage and
+        the cache silently no-ops. Only fills in when the stage hasn't set its
+        own value, so an explicit per-stage YAML setting still wins.
+        """
+        cache_backend = kwargs.get("cache_backend")
+        if cache_backend is None or cache_backend == "none":
+            return
+        stage_backend = getattr(cfg.engine_args, "cache_backend", None)
+        injected = stage_backend in (None, "none")
+        if injected:
+            cfg.engine_args.cache_backend = cache_backend
+        # Only propagate the top-level cache_config to a stage that will actually
+        # use the top-level backend: either we just injected it, or the stage
+        # already selected the same backend. Otherwise a config meant for the
+        # top-level backend would be attached to a different per-stage backend.
+        if not injected and stage_backend != cache_backend:
+            return
+        # On the deploy-YAML path ``kwargs["cache_config"]`` is the raw CLI JSON
+        # string; normalize it (parse + apply defaults) so the stage receives a
+        # dict, matching the single-engine path. Otherwise OmniDiffusionConfig
+        # drops a str config back to its defaults and the value is lost.
+        cache_config = AsyncOmniEngine._normalize_cache_config(cache_backend, kwargs.get("cache_config"))
+        if cache_config is not None and getattr(cfg.engine_args, "cache_config", None) in (None, {}):
+            cfg.engine_args.cache_config = cache_config
+
     def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
@@ -1181,6 +1213,11 @@ class AsyncOmniEngine:
                     current_additional_config = getattr(cfg.engine_args, "additional_config", None)
                     if current_additional_config in (None, {}):
                         cfg.engine_args.additional_config = additional_config
+                # Inject the top-level diffusion cache backend/config into the
+                # diffusion stage. Without this, ``--cache-backend`` (and its
+                # ``cache_config``) is silently dropped under a deploy YAML, since
+                # per-stage engine args default ``cache_backend`` to "none".
+                self._inject_stage_cache_backend(cfg, kwargs)
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]
