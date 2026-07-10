@@ -34,6 +34,19 @@ audex_tta_server_params = [
         id="audex_tta",
     )
 ]
+# 30B-A3B variant: opt-in (pulls ~60 GB); enable with AUDEX_E2E_30B=1.
+_AUDEX_30B_MODEL = os.environ.get("VLLM_OMNI_AUDEX_30B_MODEL_DIR") or "nvidia/Nemotron-Labs-Audex-30B-A3B"
+if os.environ.get("AUDEX_E2E_30B") == "1":
+    audex_tta_server_params.append(
+        pytest.param(
+            OmniServerParams(
+                model=_AUDEX_30B_MODEL,
+                stage_config_path=get_deploy_config_path("audex_tta_30b.yaml"),
+                server_args=["--trust-remote-code"],
+            ),
+            id="online_tta_30b",
+        )
+    )
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

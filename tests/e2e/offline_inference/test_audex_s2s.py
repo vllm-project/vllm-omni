@@ -10,7 +10,9 @@ audio-modality TTS pass streams through the causal speech decoder.
 
 from __future__ import annotations
 
+import copy
 import os
+import re
 import time
 
 import numpy as np
@@ -31,6 +33,27 @@ ASR_PROMPT = (
     "<|im_start|>user\n<so_embedding>\nTranscribe the input speech.<|im_end|>\n<|im_start|>assistant\n<think></think>"
 )
 
+# Official chat-pass recipe (examples/offline_inference/audex/speech_to_speech.py,
+# mirroring the official cascaded web demo). The formatting-instruction prefix is
+# load-bearing on the 30B-A3B: without it a bare transcript turn is treated as a
+# TTS request and the model emits literal <speechcodec_N> tokens instead of text.
+SYSTEM_PROMPT = "You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools."
+TEXT_INSTRUCTION = (
+    "SYSTEM & FORMATTING INSTRUCTION: You are Audex, created by NVIDIA based on the Nemotron-Cascade-2 architecture. "
+    "You may output your reasoning, followed by your final response. "
+    "You may format your reasoning block however you like. "
+    "However, your final response must strictly follow these rules: "
+    "* Write in plain, unformatted prose like a book or newspaper article. "
+    "* Do not use markdown, bullet points, lists, or headers. "
+    "* Standard numbers, abbreviations, and symbols are acceptable. "
+    "* [CRITICAL] You must press enter after every single sentence, placing each sentence on its own separate line."
+)
+CHAT_MAX_TOKENS = 2048  # official --text-max-tokens default
+# The official demo samples this pass unseeded; some trajectories deliberate
+# past the token budget without ever closing the think block, so retry a few
+# deterministic seeds until one closes.
+CHAT_SEEDS = (0, 1, 2)
+
 _audex_deployment = get_deploy_config_path("audex_s2s.yaml")
 _audex_model = os.environ.get(MODEL_DIR_ENV) or MODEL
 _OMNI_RUNNER_PARAMS = [
@@ -39,6 +62,15 @@ _OMNI_RUNNER_PARAMS = [
         id="s2s_full",
     ),
 ]
+# 30B-A3B variant: opt-in (pulls ~60 GB); enable with AUDEX_E2E_30B=1.
+_AUDEX_30B_MODEL = os.environ.get("VLLM_OMNI_AUDEX_30B_MODEL_DIR") or "nvidia/Nemotron-Labs-Audex-30B-A3B"
+if os.environ.get("AUDEX_E2E_30B") == "1":
+    _OMNI_RUNNER_PARAMS.append(
+        pytest.param(
+            (_AUDEX_30B_MODEL, get_deploy_config_path("audex_s2s_30b.yaml"), {"async_chunk": True}),
+            id="s2s_30b",
+        )
+    )
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
@@ -60,6 +92,56 @@ def _wer(hyp: str, ref: str) -> float:
             cur = min(rows[j] + 1, rows[j - 1] + 1, prev + (ref_word != hyp_word))
             prev, rows[j] = rows[j], cur
     return rows[-1] / len(ref_words)
+
+
+def _chat_prompt(user_text: str) -> str:
+    # Official chat-pass recipe: system prompt + formatting instruction
+    # prefixed to the user text, thinking ENABLED via an open <think> block
+    # (chat_template.jinja with enable_thinking=True renders
+    # "<|im_start|>assistant\n<think>\n"). Priming the block open keeps the
+    # reasoning inside <think>...</think> so _extract_final_response can drop
+    # it; with a closed block the 30B leaks the reasoning as plain text.
+    return (
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{TEXT_INSTRUCTION}\n\n{user_text}<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"
+    )
+
+
+def _extract_final_response(text: str) -> str:
+    # Mirror the official demo's extract_spoken_answer: keep only what
+    # follows the LAST closing think tag, falling back to the full text when
+    # the model skipped reasoning or never closed the block. Benign no-op for
+    # the 2B, whose answers carry no think block.
+    if "</think>" in text:
+        answer = text.rsplit("</think>", 1)[-1].strip()
+        if answer:
+            return answer
+    return text.strip()
+
+
+def _chat_params(runner: OmniRunner, seed: int):
+    # Official demo text-pass sampling (--text-temperature 1.0, --text-top-p
+    # 0.95, --text-max-tokens 2048). The yaml stage-0 defaults (temperature
+    # 0.1, top_k 80) are TTS-thinker settings; under near-greedy decoding the
+    # 30B loops inside its reasoning block until the token budget runs out
+    # and never emits </think>.
+    params = copy.deepcopy(runner.omni.resolve_sampling_params_list(None))
+    stage0 = params[0]
+    stage0.temperature = 1.0
+    stage0.top_p = 0.95
+    stage0.top_k = -1
+    stage0.max_tokens = CHAT_MAX_TOKENS
+    stage0.seed = seed
+    return params
+
+
+def _chat_once(runner: OmniRunner, prompt: str, seed: int) -> tuple[str, bool]:
+    (req_output,) = runner.omni.generate([{"prompt": prompt, "modalities": ["text"]}], _chat_params(runner, seed))
+    out = req_output.outputs[0]
+    text = (out.text or "").strip()
+    truncated = getattr(out, "finish_reason", None) == "length" or len(out.token_ids or []) >= CHAT_MAX_TOKENS
+    return text, truncated
 
 
 def _concat_audio(audio_val) -> np.ndarray:
@@ -97,10 +179,19 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
     stage1_audio = _concat_audio(mm.get("audio")) if "audio" in mm else np.zeros((0,), dtype=np.float32)
     assert stage1_audio.size == 0, "Text-modality ASR pass produced stage-1 audio (routing regression)"
 
-    # Pass 2 — chat (text-final).
-    chat_prompt = f"<|im_start|>user\n{transcript or 'Hello.'}<|im_end|>\n<|im_start|>assistant\n<think></think>"
-    chat_outputs = omni_runner.omni.generate([{"prompt": chat_prompt, "modalities": ["text"]}])
-    answer = (chat_outputs[0].outputs[0].text or "").strip()
+    # Pass 2 — chat (text-final; official recipe, see _chat_prompt). The raw
+    # completion is <reasoning...></think><answer>; speak only the final
+    # response. Retry with the next seed only when the budget ran out before
+    # the reasoning block closed (a natural stop without </think> is a
+    # complete answer); if every seed spins, keep the full text (official
+    # demo behavior).
+    chat_prompt = _chat_prompt(transcript or "Hello.")
+    raw = ""
+    for seed in CHAT_SEEDS:
+        raw, truncated = _chat_once(omni_runner, chat_prompt, seed)
+        if "</think>" in raw or not truncated:
+            break
+    answer = _extract_final_response(raw)
 
     if real_weights:
         assert transcript, "ASR pass produced an empty transcript"
@@ -108,8 +199,11 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
 
     # Pass 3 — TTS (audio-final; streams through code2wav). Both final
     # stages may emit an output record; collect the audio-bearing one.
-    tts_text = answer if answer else "The weather is nice today."
-    tts_prompt = {"prompt": build_cond_prompt(tts_text[:200]), "modalities": ["audio"]}
+    # The formatting instruction puts every sentence on its own line;
+    # flatten to plain prose for the TTS thinker.
+    tts_text = re.sub(r"\s+", " ", answer).strip() if answer else "The weather is nice today."
+    tts_text = tts_text[:200]
+    tts_prompt = {"prompt": build_cond_prompt(tts_text), "modalities": ["audio"]}
     tts_outputs = omni_runner.omni.generate([tts_prompt])
     assert tts_outputs, "TTS pass returned no outputs"
     speech = np.zeros((0,), dtype=np.float32)

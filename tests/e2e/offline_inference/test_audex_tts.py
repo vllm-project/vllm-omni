@@ -52,6 +52,15 @@ _OMNI_RUNNER_PARAMS = [
         id="async_chunk",
     ),
 ]
+# 30B-A3B variant: opt-in (pulls ~60 GB); enable with AUDEX_E2E_30B=1.
+_AUDEX_30B_MODEL = os.environ.get("VLLM_OMNI_AUDEX_30B_MODEL_DIR") or "nvidia/Nemotron-Labs-Audex-30B-A3B"
+if os.environ.get("AUDEX_E2E_30B") == "1":
+    _OMNI_RUNNER_PARAMS.append(
+        pytest.param(
+            (_AUDEX_30B_MODEL, get_deploy_config_path("audex_tts_30b.yaml"), {"async_chunk": True}),
+            id="tts_30b",
+        )
+    )
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
@@ -101,7 +110,9 @@ def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, con
     from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
     from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
 
-    root = ensure_audex_snapshot(_audex_model)
+    # Resolve the ACTIVE param's model (2B or 30B), not the module default:
+    # the null prompt must be built with the same tokenizer the engine uses.
+    root = ensure_audex_snapshot(runner.model_name)
     tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"))
     params = copy.deepcopy(runner.omni.resolve_sampling_params_list(None))
     stage0 = params[0]

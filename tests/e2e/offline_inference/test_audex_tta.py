@@ -48,6 +48,15 @@ _OMNI_RUNNER_PARAMS = [
         id="tta_full_payload",
     ),
 ]
+# 30B-A3B variant: opt-in (pulls ~60 GB); enable with AUDEX_E2E_30B=1.
+_AUDEX_30B_MODEL = os.environ.get("VLLM_OMNI_AUDEX_30B_MODEL_DIR") or "nvidia/Nemotron-Labs-Audex-30B-A3B"
+if os.environ.get("AUDEX_E2E_30B") == "1":
+    _OMNI_RUNNER_PARAMS.append(
+        pytest.param(
+            (_AUDEX_30B_MODEL, get_deploy_config_path("audex_tta_30b.yaml"), {"async_chunk": False}),
+            id="tta_30b",
+        )
+    )
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
