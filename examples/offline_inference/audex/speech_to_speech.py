@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import re
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,23 @@ from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt, buil
 
 SAMPLE_RATE = 16_000
 ASR_QUESTION = "Transcribe the input speech."
+SYSTEM_PROMPT = "You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools."
+# The official cascaded web demo (inference_scripts_vllm/unified_s2s_scripts/
+# cascaded_s2s_web_server.py, DEFAULT_TEXT_PROMPT) always prefixes the chat
+# pass's user text with this formatting instruction. It is load-bearing on
+# the 30B-A3B: without it a bare transcript turn is treated as a TTS request
+# and the model emits literal <speechcodec_N> tokens instead of a text
+# answer (the system prompt alone does not prevent this).
+TEXT_INSTRUCTION = (
+    "SYSTEM & FORMATTING INSTRUCTION: You are Audex, created by NVIDIA based on the Nemotron-Cascade-2 architecture. "
+    "You may output your reasoning, followed by your final response. "
+    "You may format your reasoning block however you like. "
+    "However, your final response must strictly follow these rules: "
+    "* Write in plain, unformatted prose like a book or newspaper article. "
+    "* Do not use markdown, bullet points, lists, or headers. "
+    "* Standard numbers, abbreviations, and symbols are acceptable. "
+    "* [CRITICAL] You must press enter after every single sentence, placing each sentence on its own separate line."
+)
 # The model root's default deploy yaml is the TTS-only pipeline; the cascade
 # needs the audio-capable 2-stage full pipeline, so default to it.
 _DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "audex_s2s.yaml")
@@ -66,7 +84,15 @@ def parse_args():
 
 
 def _chat_prompt(user_text: str) -> str:
-    return f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n<think></think>"
+    # Official chat-pass recipe: system prompt + formatting instruction
+    # prefixed to the user text, thinking disabled via a closed <think>
+    # block (chat_template.jinja renders the same generation prompt for
+    # enable_thinking=False).
+    return (
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{TEXT_INSTRUCTION}\n\n{user_text}<|im_end|>\n"
+        "<|im_start|>assistant\n<think></think>"
+    )
 
 
 def _asr_prompt() -> str:
@@ -153,7 +179,9 @@ def main():
     # Pass 3 — TTS (audio-final; streams through code2wav). Both final
     # stages of the pipeline may emit an output record for the request;
     # collect the audio-bearing one.
-    tts_prompt = build_cond_prompt(answer)
+    # The formatting instruction puts every sentence on its own line;
+    # flatten to plain prose for the TTS thinker.
+    tts_prompt = build_cond_prompt(re.sub(r"\s+", " ", answer).strip())
     outputs = engine.generate(
         [{"prompt": tts_prompt, "modalities": ["audio"]}],
         _tts_params(engine, args.cfg_scale, tts_prompt, tokenizer),

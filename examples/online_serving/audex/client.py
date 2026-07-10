@@ -34,6 +34,23 @@ from pathlib import Path
 import requests
 
 ASR_QUESTION = "Transcribe the input speech."
+SYSTEM_PROMPT = "You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools."
+# The official cascaded web demo (inference_scripts_vllm/unified_s2s_scripts/
+# cascaded_s2s_web_server.py, DEFAULT_TEXT_PROMPT) always prefixes the chat
+# pass's user text with this formatting instruction. It is load-bearing on
+# the 30B-A3B: without it a bare transcript turn is treated as a TTS request
+# and the model emits literal <speechcodec_N> tokens instead of a text
+# answer (the system prompt alone does not prevent this).
+TEXT_INSTRUCTION = (
+    "SYSTEM & FORMATTING INSTRUCTION: You are Audex, created by NVIDIA based on the Nemotron-Cascade-2 architecture. "
+    "You may output your reasoning, followed by your final response. "
+    "You may format your reasoning block however you like. "
+    "However, your final response must strictly follow these rules: "
+    "* Write in plain, unformatted prose like a book or newspaper article. "
+    "* Do not use markdown, bullet points, lists, or headers. "
+    "* Standard numbers, abbreviations, and symbols are acceptable. "
+    "* [CRITICAL] You must press enter after every single sentence, placing each sentence on its own separate line."
+)
 DEFAULT_TEXT = "Hello there! This is the Audex text to speech pipeline."
 DEFAULT_CAPTION = "Heavy rain falling on a tin roof."
 # Official quality settings; 1.0 disables guidance.
@@ -190,7 +207,13 @@ def main():
     if not transcript:
         raise SystemExit("ASR pass produced an empty transcript; aborting cascade")
 
-    answer = _strip_think(_chat(base_url, args.model, [{"role": "user", "content": transcript}], args.max_tokens))
+    # Official chat-pass recipe: system prompt + formatting instruction
+    # prefixed to the transcript (see TEXT_INSTRUCTION above).
+    chat_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"{TEXT_INSTRUCTION}\n\n{transcript}"},
+    ]
+    answer = _strip_think(_chat(base_url, args.model, chat_messages, args.max_tokens))
     print(f"[2/3] answer     : {answer}")
     if not answer:
         raise SystemExit("Chat pass produced an empty answer; aborting cascade")
