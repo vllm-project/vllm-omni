@@ -4,6 +4,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 import numpy as np
+import PIL.Image as PILImage
 import torch
 from torch import nn
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
@@ -26,7 +27,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerProcessingInfo,
     check_interleaved_audio_video,
     merge_interleaved_embeddings,
 )
@@ -34,7 +34,13 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin as Qwen2_5OmniConditionalGenerationMixinBase,
 )
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
+    Qwen2_5OmniThinkerMultiModalDataParser as _Qwen2_5OmniThinkerMultiModalDataParserBase,
+)
+from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerMultiModalProcessor as _Qwen2_5OmniThinkerMultiModalProcessorBase,
+)
+from vllm.model_executor.models.qwen2_5_omni_thinker import (
+    Qwen2_5OmniThinkerProcessingInfo as _Qwen2_5OmniThinkerProcessingInfoBase,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VisionTransformer,
@@ -56,12 +62,13 @@ from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.parse import MultiModalDataItems, VideoProcessorItems
 from vllm.multimodal.processing.processor import (
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.utils.collection_utils import is_list_of
 
 from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config,
@@ -74,10 +81,142 @@ except (ImportError, ModuleNotFoundError):
 logger = init_logger(__name__)
 
 
+def _presampled_videos_hf_kwargs(
+    mm_data: Mapping[str, object],
+    mm_kwargs: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Adjust HF video kwargs for videos pre-sampled by vLLM's video loader.
+
+    When ``video_metadata`` is present (emitted by
+    ``Qwen2_5OmniVideoProcessorItems``), the frames were already sampled
+    according to ``media_io_kwargs``, so the HF processor must not re-sample
+    them, and it needs the sampled fps (instead of its default) to compute
+    ``video_second_per_grid`` correctly. Otherwise the audio/video temporal
+    alignment breaks under ``use_audio_in_video=True``.
+    """
+    video_metadata = mm_data.get("video_metadata")
+    if not video_metadata:
+        return mm_kwargs
+
+    mm_kwargs = dict(mm_kwargs)
+    videos_kwargs = dict(mm_kwargs.get("videos_kwargs") or {})
+    videos_kwargs["do_sample_frames"] = False
+
+    def _compute_sampled_video_fps(metadata) -> float | None:
+        duration = getattr(metadata, "duration", None)
+        indices = getattr(metadata, "frames_indices", None)
+        if not duration or not indices or duration <= 0:
+            return None
+        return len(indices) / float(duration)
+
+    # An explicit user-provided fps takes precedence.
+    if "fps" not in videos_kwargs:
+        fps_values = [_compute_sampled_video_fps(m) for m in video_metadata]
+        # HF accepts a single fps per call and uses it for every video's
+        # video_second_per_grid.
+        known_fps = [fps for fps in fps_values if fps is not None]
+        unique_fps = set(known_fps)
+        if len(unique_fps) == 1:
+            videos_kwargs["fps"] = known_fps[0]
+        elif len(unique_fps) > 1:
+            logger.warning(
+                f"Mixed sampled FPS {sorted(unique_fps)} in one request; HF accepts a single fps, using {known_fps[0]}."
+            )
+            videos_kwargs["fps"] = known_fps[0]
+
+    mm_kwargs["videos_kwargs"] = videos_kwargs
+    return mm_kwargs
+
+
+class Qwen2_5OmniVideoProcessorItems(VideoProcessorItems):
+    """Video items that carry the loader's ``(frames, metadata)`` tuples.
+
+    The tuples are kept in ``data`` so that mm hashing and cache-miss
+    re-parsing retain the metadata; ``get_processor_data`` unpacks them into
+    the ``videos`` + ``video_metadata`` arguments of the HF processor.
+    """
+
+    def get_processor_data(self) -> Mapping[str, object]:
+        from transformers.video_utils import VideoMetadata
+
+        videos = [frames for frames, _ in self.data]
+        video_metadata = [
+            VideoMetadata(**{k: v for k, v in metadata.items() if k != "do_sample_frames"}) for _, metadata in self.data
+        ]
+        return {"videos": videos, "video_metadata": video_metadata}
+
+
+class Qwen2_5OmniThinkerMultiModalDataParser(_Qwen2_5OmniThinkerMultiModalDataParserBase):
+    def _parse_video_data(self, data):
+        if data is None or isinstance(data, dict) or self.is_embeddings(data):
+            return super()._parse_video_data(data)
+
+        # Normalize to a list of per-video items (same as the base parser).
+        if (is_list_of(data, PILImage.Image) and len(data) > 0) or (
+            isinstance(data, (np.ndarray, torch.Tensor)) and data.ndim == 4
+        ):
+            data_items = [data]
+        elif isinstance(data, (np.ndarray, torch.Tensor)):
+            data_items = [elem for elem in data]
+        elif isinstance(data, tuple) and len(data) == 2:
+            data_items = [data]
+        else:
+            data_items = data
+
+        videos_with_metadata = [self._get_video_with_metadata(item) for item in data_items]
+
+        # Metadata is optional: videos fetched by vLLM's media connector
+        # arrive as (frames, metadata) tuples, while plain arrays (e.g.
+        # offline `multi_modal_data` or dummy profiling inputs) carry no
+        # metadata and parse as before.
+        if any(metadata is None for _, metadata in videos_with_metadata):
+            return super()._parse_video_data(data)
+
+        return Qwen2_5OmniVideoProcessorItems(
+            videos_with_metadata,
+            metadata=[metadata for _, metadata in videos_with_metadata],
+        )
+
+
+class Qwen2_5OmniThinkerProcessingInfo(_Qwen2_5OmniThinkerProcessingInfoBase):
+    def get_data_parser(self):
+        feature_extractor = self.get_feature_extractor()
+
+        return Qwen2_5OmniThinkerMultiModalDataParser(
+            spatial_merge_size=self.get_hf_config().vision_config.spatial_merge_size,
+            target_sr=feature_extractor.sampling_rate,
+            target_channels=self.get_target_channels(),
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
+
+
 class Qwen2_5OmniThinkerMultiModalProcessor(
     _Qwen2_5OmniThinkerMultiModalProcessorBase,
 ):
     """Override to fix use_audio_in_video detection when mm cache returns None."""
+
+    def _cached_apply_hf_processor(self, inputs, timing_ctx):
+        # If use_audio_in_video, process video and audio together; otherwise,
+        # skip cache to avoid errors.
+        # Prevents partial cache hits from causing processing failures.
+        if inputs.hf_processor_mm_kwargs.get("use_audio_in_video"):
+            return self._apply_hf_processor(inputs, timing_ctx)
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ):
+        mm_kwargs = _presampled_videos_hf_kwargs(mm_data, mm_kwargs)
+        return super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
+        )
 
     def _maybe_apply_prompt_updates(
         self,
