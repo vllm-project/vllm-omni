@@ -34,12 +34,10 @@ def get_cuda_graph_config():
             "stages": {
                 0: {
                     "max_num_seqs": 1,
-                    "gpu_memory_utilization": 0.2,
                     "enforce_eager": True,
                     "async_scheduling": False,
                 },
                 1: {
-                    "gpu_memory_utilization": 0.2,
                     "enforce_eager": True,
                     "async_scheduling": False,
                 },
