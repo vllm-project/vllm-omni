@@ -69,7 +69,16 @@ def parse_args() -> argparse.Namespace:
         "--stage-configs-path",
         type=str,
         default=None,
-        help="Path to a YAML file containing stage configurations for Omni.",
+        help="[Deprecated] Path to a legacy stage_args-format YAML. Prefer --deploy-config.",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a deploy YAML (new pipeline/stages format). Required for multi-stage "
+            "text-to-image pipelines whose deploy config is not auto-loaded."
+        ),
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
@@ -155,7 +164,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        help="Disable torch.compile and force eager execution.",
+        default=None,
+        help=(
+            "Disable torch.compile and force eager execution. Left unset (None) "
+            "so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML value wins."
+        ),
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -221,8 +235,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+        default=None,
+        help=(
+            "Number of GPUs used for tensor parallelism (TP) inside the DiT. "
+            "Left unset so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML (or engine default of 1) wins. "
+            "Passing it always overrides the deploy YAML."
+        ),
     )
     parser.add_argument(
         "--enable-expert-parallel",
@@ -410,10 +429,8 @@ def main():
         "ring_degree": args.ring_degree,
         "ulysses_mode": args.ulysses_mode,
         "cfg_parallel_size": args.cfg_parallel_size,
-        "tensor_parallel_size": args.tensor_parallel_size,
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
-        "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
         "log_stats": args.log_stats,
@@ -425,8 +442,14 @@ def main():
         **lora_args,
         **quant_kwargs,
     }
+    if args.tensor_parallel_size is not None:
+        omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
+    if args.enforce_eager is not None:
+        omni_kwargs["enforce_eager"] = args.enforce_eager
     if args.stage_configs_path:
         omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
@@ -451,8 +474,9 @@ def main():
     print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
+    tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
     print(
-        f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
+        f"  Parallel configuration: tensor_parallel_size={tp_display}, "
         f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
         f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
@@ -522,8 +546,8 @@ def main():
         diffusion_params.extra_args.update({k: v for k, v in user_extra.items() if v is not None})
 
     if lora_request:
-        diffusion_params.extra_args["lora_request"] = lora_request
-        diffusion_params.extra_args["lora_scale"] = args.lora_scale
+        diffusion_params.lora_request = lora_request
+        diffusion_params.lora_scale = args.lora_scale
 
     # Build per-stage sampling params for multi-stage models (e.g. BAGEL),
     # or wrap single diffusion params for single-stage models.
@@ -589,6 +613,12 @@ def main():
         if images:
             break
 
+    # Fallback: generation-stage pipelines (e.g. MammothModa2's AR->DiT) return the
+    # generated image as a tensor under multimodal_output instead of populating the
+    # `images` field that diffusion-stage pipelines fill.
+    if not images:
+        images = _images_from_multimodal_output(outputs)
+
     if not images:
         raise ValueError("No images found in request_output")
 
@@ -604,6 +634,37 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
+
+
+def _images_from_multimodal_output(outputs: list[Any]) -> list[Any]:
+    """Extract PIL images from multimodal_output tensors.
+
+    Generation-stage pipelines (e.g. MammothModa2's AR->DiT) return the generated
+    image as a tensor (normalized to [-1, 1], CHW) under ``multimodal_output``
+    rather than populating the ``images`` field. Convert any such tensors to PIL.
+    """
+    from PIL import Image
+
+    pil_images: list[Any] = []
+    for output in outputs:
+        req_out = getattr(output, "request_output", output)
+        for completion in getattr(req_out, "outputs", None) or []:
+            # multimodal_output is a MultimodalPayload (a Mapping) keyed by modality,
+            # matching how omni examples (ming_flash_omni / magi_human / dynin) read it.
+            mm = getattr(completion, "multimodal_output", None) or {}
+            if "image" not in mm:
+                continue
+            payload = mm["image"]
+            for tensor in payload if isinstance(payload, list) else [payload]:
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                img = tensor.detach().to("cpu", dtype=torch.float32)
+                if img.ndim == 4:
+                    img = img[0]
+                img = (img / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
+                img = img.permute(1, 2, 0).contiguous().numpy()
+                pil_images.append(Image.fromarray(img))
+    return pil_images
 
 
 if __name__ == "__main__":

@@ -40,11 +40,21 @@ def get_batch_token_config(default_path):
     Uses the new flat-stage schema (``stages.<id>.<field>``); the legacy
     ``stage_args.<id>.engine_args.<field>`` path no longer applies because
     the deploy YAML doesn't nest engine fields under ``engine_args:``.
+
+    Note:
+        64 was the original value but caused a GPU hang (NVIDIA watchdog killed
+        the process after ~2 s) when 5 concurrent requests arrived, due to an
+        upstream scheduler change (``throttle_prefills`` API in vLLM commit
+        0b131b16c). 512 was first tried but caused output quality degradation for
+        long audio (~120 s) inputs. 2048 gives the scheduler enough token budget
+        to handle 5 concurrent requests even with multi-second audio prefill,
+        while still being well below the default 32768.
+        If the upstream scheduler changes again, this value may need adjustment.
     """
     return modify_stage_config(
         default_path,
         updates={
-            "stages": {0: {"max_num_batched_tokens": 64}, 1: {"max_num_batched_tokens": 64}},
+            "stages": {0: {"max_num_batched_tokens": 2048}, 1: {"max_num_batched_tokens": 2048}},
         },
     )
 

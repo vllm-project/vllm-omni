@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
@@ -46,53 +48,174 @@ class StageConfigFactory:
     """
 
     @classmethod
-    def create_from_model(
+    def get_pipeline_endpoint_restrictions(
         cls,
         model: str,
-        cli_overrides: dict[str, Any] | None = None,
-        deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
-    ) -> list[StageConfig] | None:
-        """Load pipeline + deploy config, merge with CLI overrides.
+        trust_remote_code: bool,
+        deploy_config_path: str | None,
+    ) -> tuple[EndpointRestriction, ...]:
+        """Given a model string, determine the corresponding endpoint restrictions.
 
-        Checks OMNI_PIPELINES first, since supported models should be explicitly
-        registered. If a model is not registered in OMNI_PIPELINES, tries to fall
-        back to using the Transformers config & finding pipelines that have overlapping
-        supported architectures.
+        Args:
+            model: Model name or path.
+            trust_remote_code: Whether to trust remote code for HF config loading.
+            deploy_config_path: Optional path to the deploy config for the pipeline.
+
+        Returns:
+            A tuple of model specific endpoint restrictions.
         """
-        if cli_overrides is None:
-            cli_overrides = {}
+        pipeline_cfg = StageConfigFactory.get_pipeline_config(
+            model=model,
+            trust_remote_code=trust_remote_code,
+            deploy_config_path=deploy_config_path,
+        )
+        return pipeline_cfg.endpoint_restrictions if pipeline_cfg else ()
 
-        trust_remote_code = cli_overrides.get("trust_remote_code", True)
-        if trust_remote_code is None:
-            trust_remote_code = False
+    @classmethod
+    @functools.cache
+    def get_hf_config(cls, model: str, trust_remote_code: bool) -> PretrainedConfig | None:
+        """Fetch the HF config (if it exists) from the model directory.
 
-        # --- New path: check pipeline registry by model_type first ---
-        model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
+        Args:
+            model: Model name or path.
+            trust_remote_code: Whether to trust remote code for HF config loading.
+
+        Returns:
+            the model's config or None.
+        """
+        hf_config = None
+        try:
+            return get_config(model, trust_remote_code=trust_remote_code)
+        except Exception as e:
+            logger.debug(f"`get_config` failed with exception {e}; inferred HF config is None")
+        return hf_config
+
+    @classmethod
+    @functools.cache
+    def try_infer_model_type(cls, model: str, trust_remote_code: bool) -> str | None:
+        """Auto-detect model_type from model directory and apply any model
+        specific patches to get the correct model_type str. If we are unable
+        to infer it from the model directory, we fall back to the PipelineConfig.
+
+        Args:
+            model: Model name or path.
+            trust_remote_code: Whether to trust remote code for HF config loading.
+
+        Returns:
+            model_type as a string; may be None on failure.
+        """
+        model_type = cls._try_infer_model_type(
+            model=model,
+            trust_remote_code=trust_remote_code,
+        )
         if model_type == "vla":
             if _looks_like_dreamzero(model):
                 model_type = "dreamzero"
+        return model_type
 
+    @classmethod
+    def _try_infer_model_type(cls, model: str, trust_remote_code: bool) -> str | None:
+        """Auto-detect model_type from model directory.
+
+        Args:
+            model: Model name or path.
+            trust_remote_code: Whether to trust remote code for HF config loading.
+
+        Returns:
+            model_type as a string; may be None on failure.
+        """
+        hf_config = cls.get_hf_config(
+            model=model,
+            trust_remote_code=trust_remote_code,
+        )
+        if hf_config is not None:
+            return hf_config.model_type
+
+        # Fallback: read config.json directly for custom model types that
+        # are not registered with transformers (e.g. qwen3_tts).
+        try:
+            config_dict = get_hf_file_to_dict("config.json", model, revision=None)
+            if config_dict:
+                if "model_type" in config_dict:
+                    return config_dict["model_type"]
+                # VoxCPM2-style configs use singular ``architecture`` rather
+                # than HF's standard ``model_type`` / ``architectures``. Accept
+                # it as a fallback so the pipeline registry can still match.
+                if "architecture" in config_dict and isinstance(config_dict["architecture"], str):
+                    return config_dict["architecture"]
+        except Exception as e:
+            logger.debug(f"Failed to auto-detect model type for {model}: {e}")
+
+        # Fallback for diffusers-style models: check model_index.json.
+        # Some models (e.g. GLM-Image) have no root config.json but ship a
+        # model_index.json with _class_name that maps to a pipeline key via
+        # PipelineConfig.diffusers_class_name.
+        try:
+            model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+            if model_index and "_class_name" in model_index:
+                class_name = model_index["_class_name"]
+                for obj in OMNI_PIPELINES.values():
+                    # If we have a resolver, call it with the optional hf_config
+                    # to get the default pipeline config for this key
+                    pipeline_cfg = obj(hf_config) if callable(obj) else obj
+                    if pipeline_cfg is not None and pipeline_cfg.diffusers_class_name == class_name:
+                        logger.info(
+                            "Detected pipeline %r from model_index.json (_class_name=%r)",
+                            pipeline_cfg.model_type,
+                            class_name,
+                        )
+                        return pipeline_cfg.model_type
+        except Exception as e:
+            logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
+
+        # Final fallback: some models (e.g. CosyVoice3) ship an empty
+        # config.json and rely on naming conventions. Match the model path
+        # basename against registered pipeline keys — longest match wins
+        # so "cosyvoice3" (length 10) beats "cosyvoice" (length 9).
+        model_lower = model.lower().replace("-", "").replace("_", "")
+        best: str | None = None
+        best_len = 0
+        for registered_key in OMNI_PIPELINES.keys():
+            candidate = registered_key.lower().replace("-", "").replace("_", "")
+            if candidate and candidate in model_lower and len(candidate) > best_len:
+                best = registered_key
+                best_len = len(candidate)
+        if best is not None:
+            return best
+
+        return None
+
+    @classmethod
+    @functools.cache
+    def get_pipeline_config(
+        cls,
+        model: str,
+        trust_remote_code: bool,
+        deploy_config_path: str | None = None,
+    ) -> PipelineConfig | None:
+        """Resolve the PipelineConfig for a model path/name."""
+        model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
+        hf_config = cls.get_hf_config(model=model, trust_remote_code=trust_remote_code)
+
+        # Resolve the deploy config & check if the user set the pipeline;
+        # If the pipeline is explicitly set, it takes highest priority
+        deploy_config_pipe = cls._get_deploy_override_pipe_config(hf_config, deploy_config_path)
+        if deploy_config_pipe is not None:
+            return deploy_config_pipe
+
+        # Pipeline isn't set in the yaml spec, so we need infer it ourselves.
         if model_type and model_type in OMNI_PIPELINES:
             pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
             if pipeline_cfg is not None:
-                return cls._create_from_registry(
-                    model_type,
-                    pipeline_cfg,
-                    cli_overrides,
-                    deploy_config_path,
-                )
+                return pipeline_cfg
 
-        # --- HF architecture fallback: some models report a generic
-        # model_type that collides with another model. Match by the
-        # hf_architectures declared on each registered PipelineConfig.
         if hf_config is not None:
-            logger.warning("Inferred model type %s is not registered to an Omni pipeline", model_type)
+            if model_type is not None:
+                logger.warning("Inferred model type %s is not registered to an Omni pipeline", model_type)
             hf_archs = set(getattr(hf_config, "architectures", []) or [])
             if hf_archs:
                 for registered in OMNI_PIPELINES.values():
                     pipeline_cfg = registered if isinstance(registered, PipelineConfig) else registered(hf_config)
-                    # Resolvers that get configs of the incorrect type should return None
                     if pipeline_cfg is None:
                         continue
                     predicate = pipeline_cfg.hf_config_predicate
@@ -113,18 +236,61 @@ class StageConfigFactory:
                                 pipeline_cfg.model_type,
                             )
                             continue
-
                     if isinstance(pipeline_cfg, PipelineConfig) and hf_archs.intersection(
                         pipeline_cfg.hf_architectures
                     ):
-                        return cls._create_from_registry(
-                            pipeline_cfg.model_type,
-                            pipeline_cfg,
-                            cli_overrides,
-                            deploy_config_path,
-                        )
-        # Not in the pipeline registry — let the caller fall back to the
-        # legacy ``stage_configs/*.yaml`` path (resolve_model_config_path).
+                        return pipeline_cfg
+        return None
+
+    @classmethod
+    def _get_deploy_override_pipe_config(
+        cls,
+        hf_config: PretrainedConfig | None,
+        deploy_config_path: str | None,
+    ) -> PipelineConfig | None:
+        """Load the deploy config and extract + resolve its pipeline field."""
+        if deploy_config_path is None:
+            return None
+
+        deploy_path = Path(deploy_config_path)
+        if deploy_path.exists():
+            deploy_cfg = load_deploy_config(deploy_path)
+            if deploy_cfg.pipeline is not None:
+                return cls.resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
+        return None
+
+    @classmethod
+    def create_from_model(
+        cls,
+        model: str,
+        *,
+        trust_remote_code: bool = False,
+        cli_overrides: dict[str, Any] | None = None,
+        deploy_config_path: str | None = None,
+        **deprecated_kwargs: Any,
+    ) -> list[StageConfig] | None:
+        """Load pipeline + deploy config, merge with CLI overrides.
+
+        Checks OMNI_PIPELINES first, since supported models should be explicitly
+        registered. If a model is not registered in OMNI_PIPELINES, tries to fall
+        back to using the Transformers config & finding pipelines that have overlapping
+        supported architectures.
+        """
+        if cli_overrides is None:
+            cli_overrides = {}
+
+        pipeline_cfg = cls.get_pipeline_config(
+            model=model,
+            trust_remote_code=trust_remote_code,
+            deploy_config_path=deploy_config_path,
+        )
+        if pipeline_cfg is not None:
+            return cls._create_from_registry(
+                pipeline_cfg.model_type,
+                pipeline_cfg,
+                cli_overrides,
+                deploy_config_path,
+            )
         return None
 
     @classmethod
@@ -241,79 +407,6 @@ class StageConfigFactory:
         return [config_dict]
 
     @classmethod
-    def _auto_detect_model_type(cls, model: str, trust_remote_code: bool = True) -> tuple[str | None, Any]:
-        """Auto-detect model_type from model directory.
-
-        Args:
-            model: Model name or path.
-            trust_remote_code: Whether to trust remote code for HF config loading.
-
-        Returns:
-            Tuple of (model_type, hf_config). Both may be None on failure.
-        """
-        hf_config = None
-
-        try:
-            hf_config = get_config(model, trust_remote_code=trust_remote_code)
-            return hf_config.model_type, hf_config
-        except Exception as e:
-            logger.debug(f"`get_config` failed for {e}; Falling back to raw config.json path")
-
-        # Fallback: read config.json directly for custom model types that
-        # are not registered with transformers (e.g. qwen3_tts).
-        try:
-            config_dict = get_hf_file_to_dict("config.json", model, revision=None)
-            if config_dict:
-                if "model_type" in config_dict:
-                    return config_dict["model_type"], None
-                # VoxCPM2-style configs use singular ``architecture`` rather
-                # than HF's standard ``model_type`` / ``architectures``. Accept
-                # it as a fallback so the pipeline registry can still match.
-                if "architecture" in config_dict and isinstance(config_dict["architecture"], str):
-                    return config_dict["architecture"], None
-        except Exception as e:
-            logger.debug(f"Failed to auto-detect model type for {model}: {e}")
-
-        # Fallback for diffusers-style models: check model_index.json.
-        # Some models (e.g. GLM-Image) have no root config.json but ship a
-        # model_index.json with _class_name that maps to a pipeline key via
-        # PipelineConfig.diffusers_class_name.
-        try:
-            model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
-            if model_index and "_class_name" in model_index:
-                class_name = model_index["_class_name"]
-                for obj in OMNI_PIPELINES.values():
-                    # If we have a resolver, call it with the optional hf_config
-                    # to get the default pipeline config for this key
-                    pipeline_cfg = obj(hf_config) if callable(obj) else obj
-                    if pipeline_cfg is not None and pipeline_cfg.diffusers_class_name == class_name:
-                        logger.info(
-                            "Detected pipeline %r from model_index.json (_class_name=%r)",
-                            pipeline_cfg.model_type,
-                            class_name,
-                        )
-                        return pipeline_cfg.model_type, None
-        except Exception as e:
-            logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
-
-        # Final fallback: some models (e.g. CosyVoice3) ship an empty
-        # config.json and rely on naming conventions. Match the model path
-        # basename against registered pipeline keys — longest match wins
-        # so "cosyvoice3" (length 10) beats "cosyvoice" (length 9).
-        model_lower = model.lower().replace("-", "").replace("_", "")
-        best: str | None = None
-        best_len = 0
-        for registered_key in OMNI_PIPELINES.keys():
-            candidate = registered_key.lower().replace("-", "").replace("_", "")
-            if candidate and candidate in model_lower and len(candidate) > best_len:
-                best = registered_key
-                best_len = len(candidate)
-        if best is not None:
-            return best, None
-
-        return None, None
-
-    @classmethod
     def _merge_cli_overrides(
         cls,
         stage: StageConfig,
@@ -333,6 +426,7 @@ class StageConfigFactory:
         """Given a model type, resolve to the pipeline to be used. If the pipeline
         maps to a callable we resolve based on the HF config."""
         if model_type not in OMNI_PIPELINES:
+            logger.warning("Model type %s is not registered to OMNI_PIPELINES", model_type)
             return None
         obj = OMNI_PIPELINES[model_type]
         return obj(hf_config) if callable(obj) else obj

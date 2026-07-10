@@ -38,13 +38,13 @@ class _ToyKernel:
 
 def _make_fp8_toy_module(out_features: int = 16, in_features: int = 32):
     """Return a module whose weight is ``qweight.t()`` (non-contiguous) and whose
-    ``quant_method`` is an ``Fp8OnlineLinearMethod`` with a ``_ToyKernel``.
+    ``quant_method`` is an ``Fp8LinearMethod`` with a ``_ToyKernel``.
     """
-    from vllm.model_executor.layers.quantization.fp8 import Fp8OnlineLinearMethod
+    from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 
     # Create the quant-method instance without calling __init__ (avoids
     # heavyweight upstream config dependencies).  isinstance() still works.
-    qm = object.__new__(Fp8OnlineLinearMethod)
+    qm = object.__new__(Fp8LinearMethod)
     qm.fp8_linear = _ToyKernel()
 
     # randn does not support float8 on CPU; zeros does and the test only

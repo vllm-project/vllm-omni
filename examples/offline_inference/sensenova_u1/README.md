@@ -38,9 +38,9 @@ python end2end.py --modality text2text \
 python end2end.py --prompt "A futuristic cityscape at sunset" \
                   --width 2048 --height 1024 --think
 
-# Text-to-image with Cache-DiT acceleration
+# Text-to-image with cache acceleration (cache_dit or tea_cache)
 python end2end.py --prompt "A cute cat" \
-                  --cache-backend cache_dit \
+                  --cache-backend tea_cache
 ```
 
 > **Note**: Default configuration works on a single **NVIDIA A100 (80GB)** or **H100** GPU.
@@ -139,7 +139,7 @@ python end2end.py \
 | `--tensor-parallel-size` | 1 | Number of GPUs for tensor parallelism |
 | `--enforce-eager` | False | Disable torch.compile |
 | `--enable-cpu-offload` | False | Enable module-wise (sequential) CPU offload to reduce peak VRAM |
-| `--cache-backend` | None | Set to `cache_dit` for Cache-DiT acceleration |
+| `--cache-backend` | None | Set to `cache_dit` or `tea_cache` for image generation acceleration |
 | `--enable-cache-dit-summary` | False | Print Cache-DiT cache statistics after generation |
 
 ## Reducing GPU Memory Usage
@@ -211,4 +211,4 @@ The img2img counterpart lives at
 ## Online Serving
 
 For OpenAI-compatible API serving, see
-[`examples/online_serving/sensenova_u1/`](../../examples/online_serving/sensenova_u1/).
+[`examples/online_serving/sensenova_u1/`](../../online_serving/sensenova_u1/README.md).

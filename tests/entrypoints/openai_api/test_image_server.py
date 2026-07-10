@@ -13,7 +13,6 @@ import json
 from argparse import Namespace
 from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -25,19 +24,12 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import (
-    _check_max_generated_image_size,
-    _DiffusionServingModels,
-    _load_input_images,
-    router,
-)
+from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
-from vllm_omni.entrypoints.openai.protocol.videos import UrlImageReference
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -190,7 +182,6 @@ def mock_async_diffusion(mocker: MockerFixture):
             self.captured_sampling_params_list = None
             self.captured_prompt = None
             self.generate_calls = 0
-            self.model_config = SimpleNamespace(allowed_local_media_path="", allowed_media_domains=None)
 
         async def generate(self, **kwargs):
             self.generate_calls += 1
@@ -280,10 +271,6 @@ def async_omni_test_client():
         def get_diffusion_od_config(self):
             return self.od_config
 
-        @property
-        def model_config(self):
-            return SimpleNamespace(allowed_local_media_path="", allowed_media_domains=None)
-
     app = FastAPI()
     app.include_router(router)
 
@@ -347,10 +334,6 @@ def async_omni_rgba_test_client():
 
         def get_diffusion_od_config(self):
             return self.od_config
-
-        @property
-        def model_config(self):
-            return SimpleNamespace(allowed_local_media_path="", allowed_media_domains=None)
 
     app = FastAPI()
     app.include_router(router)
@@ -416,10 +399,6 @@ def async_omni_stage_configs_only_client():
         def get_diffusion_od_config(self):
             return self.od_config
 
-        @property
-        def model_config(self):
-            return SimpleNamespace(allowed_local_media_path="", allowed_media_domains=None)
-
     app = FastAPI()
     app.include_router(router)
 
@@ -456,24 +435,9 @@ def streaming_image_edit_client():
                 SamplingParams(temperature=0.1),
                 OmniDiffusionSamplingParams(),
             ]
-            stage_clients = [
-                SimpleNamespace(stage_type="llm", is_comprehension=True),
-                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
-            ]
-            stage_vllm_configs = [
-                SimpleNamespace(
-                    model_config=SimpleNamespace(
-                        allowed_local_media_path="",
-                        allowed_media_domains=None,
-                    ),
-                ),
-                None,
-            ]
             self.engine = SimpleNamespace(
                 stage_configs=stage_configs,
                 default_sampling_params_list=default_sampling_params_list,
-                stage_clients=stage_clients,
-                stage_vllm_configs=stage_vllm_configs,
             )
             self.default_sampling_params_list = default_sampling_params_list
             self.captured_sampling_params_list = None
@@ -764,10 +728,6 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
 
         def get_diffusion_od_config(self):
             return self.od_config
-
-        @property
-        def model_config(self):
-            return SimpleNamespace(allowed_local_media_path="", allowed_media_domains=None)
 
     app = FastAPI()
     app.include_router(router)
@@ -1284,7 +1244,7 @@ def test_parameter_validation():
 
     # Invalid layers for layered models (must stay within the backend-supported range)
     with pytest.raises(ValueError):
-        ImageGenerationRequest(prompt="test", layers=2)
+        ImageGenerationRequest(prompt="test", layers=1)
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
@@ -1703,13 +1663,13 @@ def test_image_edit_invalid_layers(async_omni_test_client):
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": 2,
+            "layers": 1,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
     # Test layers above the supported range
     response = async_omni_test_client.post(
@@ -1723,7 +1683,7 @@ def test_image_edit_invalid_layers(async_omni_test_client):
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
 
 def test_image_edit_resolution_and_size_conflict(async_omni_test_client):
@@ -2176,107 +2136,3 @@ def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_on
         assert captured_prompt["prompt"].count("<img>") == 2, (
             f"N=2 reference images must emit 2 <img> placeholders in AR prompt; got {captured_prompt[KEY].count(IMG)} -- prompt: {captured_prompt[KEY]!r}"
         )
-
-
-# ---------------------------------------------------------------------------
-# MediaConnector / SSRF protection tests
-# ---------------------------------------------------------------------------
-
-
-_DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(make_test_image_bytes((8, 8))).decode()}"
-
-
-def _make_upload_image():
-    upload = MagicMock()
-    upload.file = True
-    upload.read = AsyncMock(return_value=make_test_image_bytes((8, 8)))
-    return upload
-
-
-class TestLoadInputImagesMediaConnector:
-    """SSRF protection via MediaConnector for _load_input_images and
-    decode_input_reference."""
-
-    @staticmethod
-    def _config(
-        domains=None,  # allow all domains
-        local_path="",  # disallow all local paths
-    ):
-        return SimpleNamespace(
-            allowed_local_media_path=local_path,
-            allowed_media_domains=domains,
-        )
-
-    @pytest.mark.parametrize(
-        "domains, url",
-        [
-            # restricted + data url from allowlisted domain → accept (data: bypasses domain check)
-            (["example.com"], _DATA_IMAGE_URL),
-            # unrestricted + data url → accept
-            (None, _DATA_IMAGE_URL),
-            # restricted + file upload → accept (UploadFile bypasses MediaConnector)
-            (["example.com"], _make_upload_image()),
-        ],
-        ids=[
-            "restricted-data-url",
-            "unrestricted-data-url",
-            "restricted-file-upload",
-        ],
-    )
-    @pytest.mark.asyncio
-    async def test_accepted_inputs(self, domains, url):
-        config = self._config(domains=domains)
-
-        images = await _load_input_images([url], config)
-        assert len(images) == 1
-        assert isinstance(images[0], Image.Image)
-
-        if isinstance(url, str):
-            ref = UrlImageReference(image_url=url)
-            image = await decode_input_reference(ref, None, None, config)
-            assert isinstance(image, Image.Image)
-
-    @pytest.mark.asyncio
-    async def test_http_url_rejected_by_domain_filter(self):
-        """An http(s) URL whose domain is not in the allowlist must be rejected."""
-        config = self._config(domains=["example.com"])
-        http_url = "https://blocked.example.org/image.png"
-
-        with pytest.raises(ValueError):
-            await _load_input_images([http_url], config)
-
-        ref = UrlImageReference(image_url=http_url)
-        with pytest.raises(ValueError):
-            await decode_input_reference(ref, None, None, config)
-
-    @pytest.mark.parametrize(
-        "allow_path",
-        [True, False],
-        ids=["allowed-path", "disallowed-path"],
-    )
-    @pytest.mark.asyncio
-    async def test_file_uri_path_restriction(self, tmp_path, allow_path):
-        """file:// URIs are gated by allowed_local_media_path."""
-
-        img_path = tmp_path / "test.png"
-        img_path.write_bytes(make_test_image_bytes((8, 8)))
-        file_uri = img_path.as_uri()
-        config = self._config(local_path=str(tmp_path) if allow_path else "")
-
-        # --- _load_input_images ---
-        if allow_path:
-            images = await _load_input_images([file_uri], config)
-            assert len(images) == 1
-            assert isinstance(images[0], Image.Image)
-        else:
-            with pytest.raises(ValueError):
-                await _load_input_images([file_uri], config)
-
-        # --- decode_input_reference ---
-        ref = UrlImageReference(image_url=file_uri)
-        if allow_path:
-            image = await decode_input_reference(ref, None, None, config)
-            assert isinstance(image, Image.Image)
-        else:
-            with pytest.raises(ValueError):
-                await decode_input_reference(ref, None, None, config)

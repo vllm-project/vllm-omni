@@ -30,6 +30,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
@@ -204,6 +205,7 @@ class AsyncOmniEngine:
     _log_stats: bool = False
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
+    _enable_orch_monitor: bool = False
 
     def __init__(
         self,
@@ -215,6 +217,7 @@ class AsyncOmniEngine:
         transfer_emitter: Any = None,
         log_stats: bool = False,
         tokenizer: str | None = None,
+        trust_remote_code: bool = False,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -233,6 +236,7 @@ class AsyncOmniEngine:
         # replica) vllm:* wrap stays registered but reads zero. Respects the
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
+        self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -271,6 +275,17 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
+        # Stage resolution pops deploy_config, so get the pipeline endpoint
+        # restriction beforehand. TODO (Alex) make this cleaner and refactor
+        # stage config resolution to remove kwargs hacks.
+        deploy_config_path = kwargs.get("deploy_config")
+        self.endpoint_restrictions = StageConfigFactory.get_pipeline_endpoint_restrictions(
+            model=model,
+            trust_remote_code=trust_remote_code,
+            deploy_config_path=deploy_config_path,
+        )
+
+        kwargs["trust_remote_code"] = trust_remote_code
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
         self.num_stages = len(self.stage_configs)
@@ -425,6 +440,7 @@ class AsyncOmniEngine:
                 running_counter=self._running_counter,
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
+                enable_orch_monitor=self._enable_orch_monitor,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -953,6 +969,7 @@ class AsyncOmniEngine:
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
+            vae_parallel_mode = normalized_kwargs.get("vae_parallel_mode") or "tile"
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
@@ -971,6 +988,7 @@ class AsyncOmniEngine:
                 ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
+                vae_parallel_mode=vae_parallel_mode,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
@@ -998,6 +1016,7 @@ class AsyncOmniEngine:
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
+            "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
             "cache_backend": cache_backend,

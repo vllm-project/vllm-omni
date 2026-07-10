@@ -390,7 +390,7 @@ def initialize_model(
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
-            model.vae.set_parallel_size(vae_pp_size)
+            model.vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import base64
 import dataclasses
 import io
 import json
@@ -19,6 +20,7 @@ from numbers import Integral
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
+import httpx
 import numpy as np
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
@@ -64,7 +66,7 @@ from vllm.entrypoints.serve.disagg.serving import ServingTokens
 # Keep a fallback for older/newer upstream layouts during rebase windows.
 from vllm.entrypoints.serve.instrumentator.basic import base
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
-from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
     process_lora_modules,
@@ -83,13 +85,13 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
-from vllm.multimodal.media import MediaConnector
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
@@ -258,7 +260,7 @@ async def _get_vllm_config(engine_client: EngineClient) -> Any:
     return getattr(engine_client, "vllm_config", None)
 
 
-def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
+def _remove_route_from_app(app, path: str, methods: frozenset[str] | None = None):
     """Remove a route from the app by path and optionally by methods.
 
     OMNI: used to override upstream /v1/chat/completions with omni behavior.
@@ -508,6 +510,12 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        # After initializing the app state, shut down any endpoints that are model specific
+        if hasattr(engine_client, "endpoint_restrictions"):
+            shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
+        else:
+            logger.warning("engine client has no endpoint restrictions attribute")
+
         # Start background processes
         await STORAGE_MANAGER.start()
 
@@ -750,7 +758,7 @@ async def omni_init_app_state(
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
         # OMNI: tokenization endpoints are not supported in pure diffusion mode.
-        state.openai_serving_tokenization = None
+        state.serving_tokenization = None
 
         # Use for_diffusion method to create chat handler
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
@@ -805,19 +813,6 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
-
-    # Propagate enable_in_reasoning to the API-server process. The engine core
-    # runs in a separate process, so the contextvar that backs
-    # `get_current_vllm_config_or_none()` is None on this stack. Tool parsers
-    # call `get_enable_structured_outputs_in_reasoning()` during request
-    # handling and need to see the real flag, otherwise they silently fall
-    # back to False and mismatch the engine-side bitmask gating.
-    if vllm_config is not None:
-        from vllm.tool_parsers.structural_tag_registry import (
-            set_enable_structured_outputs_in_reasoning,
-        )
-
-        set_enable_structured_outputs_in_reasoning(vllm_config.structured_outputs_config.enable_in_reasoning)
 
     # Get supported tasks
     supported_tasks: set[str] = {"generate"}
@@ -899,12 +894,8 @@ async def omni_init_app_state(
     )
     await state.openai_serving_models.init_static_loras()
 
-    # NOTE: kept aligned with vllm 0.20 `init_app_state`:
-    # - dropped the `io_processor` kwarg (no longer accepted by 0.20);
-    #   io_processor stays on `engine_client` and downstream serving classes
-    #   read it from there.
-    # - pass `reasoning_parser` so render-time `adjust_request` runs for
-    #   reasoning models (matches `vllm.entrypoints.openai.api_server`).
+    # NOTE: kept aligned with upstream `init_app_state`:
+    # Use OpenAIServingRender (replaces the old OnlineRenderer + OnlineDerenderer + ServingRender split).
     state.openai_serving_render = OpenAIServingRender(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
@@ -1030,8 +1021,7 @@ async def omni_init_app_state(
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
         else None
     )
-    state.openai_serving_tokenization = OpenAIServingTokenization(
-        engine_client,
+    state.serving_tokenization = ServingTokenization(
         state.openai_serving_models,
         state.openai_serving_render,
         request_logger=request_logger,
@@ -1171,7 +1161,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1262,7 +1252,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1300,7 +1290,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
 async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -1316,7 +1306,10 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
             return _error_response_to_json_response(result)
-        return JSONResponse(content=result.model_dump())
+        # exclude_none so optional per-item fields are omitted rather than
+        # serialized as null: errored items drop `usage`/`audio_data`/`media_type`,
+        # successful items drop `error`. Matches the documented batch response shape.
+        return JSONResponse(content=result.model_dump(exclude_none=True))
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
     except ValueError as e:
@@ -1340,7 +1333,7 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
 async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
     handler = OmniAudioGenerate(raw_request)
     if handler is None:
-        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
             raise HTTPException(
                 status_code=HTTPStatus.NOT_FOUND.value,
@@ -2036,23 +2029,17 @@ async def edit_images(
         # Match the offline path: RGB normalize when the caller opts into
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
-        pil_images = await _load_input_images(
-            input_images_list,
-            engine_client.model_config,
-            normalize_rgb=normalize_edit_images_rgb,
-        )
+        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # Mask role is different (alpha channel matters); never normalize.
-            loaded = await _load_input_images([mask_image], engine_client.model_config, normalize_rgb=False)
+            loaded = await _load_input_images([mask_image], normalize_rgb=False)
             prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images(
-                [reference_image], engine_client.model_config, normalize_rgb=normalize_edit_images_rgb
-            )
+            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
@@ -2539,41 +2526,41 @@ def _extract_images_from_result(result: Any) -> list[Any]:
 
 async def _load_input_images(
     inputs: list[str],
-    model_config: Any,
     *,
     normalize_rgb: bool = True,
 ) -> list[Image.Image]:
-    """Load images from data URIs, http(s) URLs, file:// URIs, or UploadFiles.
-
-    http(s) and ``file:`` URLs are fetched through vLLM's ``MediaConnector`` which
-    respects ``--allowed-media-domains`` and ``--allowed-local-media-path``
-    to prevent SSRF.
     """
-
+    convert to PIL.Image.Image list
+    """
     if isinstance(inputs, str):
         inputs = [inputs]
-
-    connector = MediaConnector(
-        allowed_local_media_path=model_config.allowed_local_media_path,
-        allowed_media_domains=model_config.allowed_media_domains,
-    )
 
     images: list[Image.Image] = []
 
     for inp in inputs:
-        if isinstance(inp, str):
-            # http(s), data: and file: all handled by MediaConnector
+        # 1. URL + base64
+        if isinstance(inp, str) and inp.startswith("data:image"):
             try:
-                # Use RGBA to preserve alpha for transparent PNG.
-                result = await connector.fetch_image_async(
-                    inp,
-                    image_mode="RGBA",
-                )
-                images.append(result.media)
+                _, b64_data = inp.split(",", 1)
+                image_bytes = base64.b64decode(b64_data)
+                img = Image.open(io.BytesIO(image_bytes))
+                images.append(img)
             except Exception as e:
-                raise ValueError(f"Failed to load image: {e}") from e
+                raise ValueError(f"Invalid base64 image: {e}")
+
+        # 2. URL
+        elif isinstance(inp, str) and inp.startswith("http"):
+            async with httpx.AsyncClient(timeout=60) as client:
+                try:
+                    resp = await client.get(inp)
+                    resp.raise_for_status()
+                    img = Image.open(io.BytesIO(resp.content))
+                    images.append(img)
+                except Exception as e:
+                    raise ValueError(f"Failed to download image from URL {inp}: {e}")
+
+        # 3. UploadFile
         elif hasattr(inp, "file"):
-            # UploadFile
             try:
                 img_data = await inp.read()
                 img = Image.open(io.BytesIO(img_data))
@@ -3025,7 +3012,6 @@ async def _parse_video_form(
             request.image_reference,
             request.video_reference,
             input_reference_bytes,
-            model_config=handler._engine_client.model_config,
             max_video_frames=decode_spec.max_frames,
             video_keep=decode_spec.keep,
         )
@@ -3037,15 +3023,8 @@ async def _parse_video_form(
 
     reference_audio: ReferenceAudio | None = None
     if request.audio_reference is not None:
-        audio_connector = MediaConnector(
-            allowed_local_media_path=handler._engine_client.model_config.allowed_local_media_path,
-            allowed_media_domains=handler._engine_client.model_config.allowed_media_domains,
-        )
         try:
-            audio_path = await decode_audio_url(
-                request.audio_reference.audio_url,
-                audio_connector,
-            )
+            audio_path = await decode_audio_url(request.audio_reference.audio_url)
         except InvalidInputReferenceError as exc:
             raise HTTPException(400, detail=str(exc)) from exc
         reference_audio = ReferenceAudio(path=audio_path)

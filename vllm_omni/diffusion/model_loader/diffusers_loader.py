@@ -18,7 +18,6 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
-    download_gguf,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -41,6 +40,39 @@ from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
+
+
+# download_gguf was removed from upstream vLLM (commit 6635279d8).
+# Inlined from the last upstream version before the GGUF plugin migration.
+def download_gguf(
+    repo_id: str,
+    quant_type: str,
+    cache_dir: str | None = None,
+    revision: str | None = None,
+    ignore_patterns: str | list[str] | None = None,
+) -> str:
+    allow_patterns = [
+        f"*-{quant_type}.gguf",
+        f"*-{quant_type}-*.gguf",
+        f"*/*-{quant_type}.gguf",
+        f"*/*-{quant_type}-*.gguf",
+    ]
+    folder = download_weights_from_hf(
+        model_name_or_path=repo_id,
+        cache_dir=cache_dir,
+        allow_patterns=allow_patterns,
+        revision=revision,
+        ignore_patterns=ignore_patterns,
+    )
+    local_files: list[str] = []
+    for pattern in allow_patterns:
+        glob_pattern = os.path.join(folder, pattern)
+        local_files.extend(glob.glob(glob_pattern))
+    if not local_files:
+        raise ValueError(f"Downloaded GGUF files not found in {folder} for quant_type {quant_type}")
+    local_files.sort(key=lambda x: (x.count("-"), x))
+    return local_files[0]
+
 
 logger = init_logger(__name__)
 

@@ -79,6 +79,7 @@ def test_create_chat_completion_converts_value_error_to_error_response(mocker: M
     serving_chat.renderer.get_tokenizer.return_value = mocker.MagicMock()
     serving_chat.reasoning_parser_cls = None
     serving_chat.tool_parser = None
+    serving_chat.parser_cls = None
     serving_chat.use_harmony = False
     serving_chat.enable_auto_tools = False
     serving_chat.exclude_tools_when_tool_choice_none = False
@@ -86,8 +87,9 @@ def test_create_chat_completion_converts_value_error_to_error_response(mocker: M
     serving_chat.chat_template = None
     serving_chat.chat_template_content_format = "string"
     serving_chat.default_chat_template_kwargs = {}
-    serving_chat._validate_chat_template = mocker.MagicMock(return_value=None)
-    serving_chat._prepare_extra_chat_template_kwargs = mocker.MagicMock(return_value={})
+    serving_chat.openai_serving_render = mocker.MagicMock()
+    serving_chat.openai_serving_render.validate_chat_template.return_value = None
+    serving_chat._effective_chat_template_kwargs = mocker.MagicMock(return_value={})
     serving_chat._preprocess_chat = mocker.AsyncMock(
         side_effect=ValueError("Invalid speaker 'uncle_fu'. Supported: ethan, vivian")
     )

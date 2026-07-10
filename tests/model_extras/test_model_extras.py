@@ -128,6 +128,102 @@ def test_magi_human_extra_registry_declares_request_and_response_params() -> Non
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_ming_flash_omni_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("MingImagePipeline") == frozenset(
+        {
+            "height",
+            "width",
+            "steps",
+            "cfg",
+            "seed",
+            "byte5_text",
+            "negative_prompt",
+        }
+    )
+    assert get_extra_output_params("MingImagePipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("MingImagePipeline") is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ming_flash_omni_declared_extra_args_route_into_sampling_params() -> None:
+    params = OmniDiffusionSamplingParams()
+    declared = get_extra_body_params("MingImagePipeline")
+    apply_declared_extra_args(
+        params,
+        declared,
+        {
+            "steps": 6,
+            "cfg": 1.5,
+            "byte5_text": ["理解与生成统一"],
+            "negative_prompt": "ugly, blurry",
+            "unknown": "ignored",
+        },
+    )
+    assert params.extra_args == {
+        "steps": 6,
+        "cfg": 1.5,
+        "byte5_text": ["理解与生成统一"],
+        "negative_prompt": "ugly, blurry",
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ming_flash_omni_text_to_image_prompt_builder() -> None:
+    assert build_text_to_image_prompt(
+        "MingImagePipeline",
+        prompt="Please draw a cute cat.",
+        negative_prompt="ugly, blurry",
+        height=512,
+        width=768,
+    ) == {
+        "prompt": "Please draw a cute cat.",
+        "modalities": ["image"],
+        "mm_processor_kwargs": {
+            "modalities": ["image"],
+            "target_h": 512,
+            "target_w": 768,
+        },
+        "negative_prompt": "ugly, blurry",
+    }
+    # target_h/w are omitted when height/width are not supplied so the
+    # pipeline's 1024x1024 default still applies.
+    assert build_text_to_image_prompt(
+        "MingImagePipeline",
+        prompt="Draw a poster.",
+        negative_prompt=None,
+    ) == {
+        "prompt": "Draw a poster.",
+        "modalities": ["image"],
+        "mm_processor_kwargs": {"modalities": ["image"]},
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ming_flash_omni_image_to_image_prompt_builder() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+    result = build_image_to_image_prompt(
+        "MingImagePipeline",
+        prompt="Change the background to a sandy beach at sunset.",
+        negative_prompt=None,
+        input_image=dummy_image,
+        height=256,
+        width=256,
+    )
+    assert result["modalities"] == ["img2img"]
+    assert result["multi_modal_data"]["img2img"] is dummy_image
+    assert result["mm_processor_kwargs"] == {
+        "modalities": ["img2img"],
+        "target_h": 256,
+        "target_w": 256,
+    }
+    assert "negative_prompt" not in result
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
     assert build_text_to_image_prompt(
         "Cosmos3OmniDiffusersPipeline",
@@ -145,6 +241,47 @@ def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
         prompt="a red sports car",
         negative_prompt=None,
     ) == {"prompt": "a red sports car", "modalities": ["image"]}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_audiox_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("AudioXPipeline") == frozenset(
+        {
+            "audiox_task",
+            "seconds_start",
+            "seconds_total",
+            "sigma_min",
+            "sigma_max",
+            "cfg_rescale",
+            "video_path",
+            "audio_path",
+        }
+    )
+    assert get_extra_output_params("AudioXPipeline") == frozenset({"audiox_task"})
+    assert should_init_extra_args_for_non_diffusion_stages("AudioXPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_audiox_declared_extra_args_route_into_sampling_params() -> None:
+    params = OmniDiffusionSamplingParams()
+    declared = get_extra_body_params("AudioXPipeline")
+    apply_declared_extra_args(
+        params,
+        declared,
+        {
+            "audiox_task": "t2a",
+            "seconds_total": 10.0,
+            "sigma_min": 0.03,
+            "unknown": "ignored",
+        },
+    )
+    assert params.extra_args == {
+        "audiox_task": "t2a",
+        "seconds_total": 10.0,
+        "sigma_min": 0.03,
+    }
 
 
 @pytest.mark.core_model
@@ -334,4 +471,46 @@ def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
         "existing": 1,
         "cfg_text_scale": 4.0,
         "think": False,
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("MammothModa2DiTPipeline") == frozenset(
+        {
+            "text_guidance_scale",
+            "cfg_range",
+            "num_inference_steps",
+        }
+    )
+    assert get_extra_output_params("MammothModa2DiTPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("MammothModa2DiTPipeline") is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_mammothmoda2_text_to_image_prompt_builder() -> None:
+    # Image dims are converted to the AR grid (width/16 x height/16); the negative
+    # prompt is ignored (MammothModa2 t2i uses CFG, not an explicit negative path).
+    assert build_text_to_image_prompt(
+        "MammothModa2DiTPipeline",
+        prompt="a cat",
+        negative_prompt="blurry",
+        height=512,
+        width=768,
+    ) == {
+        "prompt": (
+            "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
+            "<|im_start|>user\na cat<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "<|image start|>48*32<|image token|>"
+        ),
+        "additional_information": {
+            "omni_task": ["t2i"],
+            "ar_width": [48],
+            "ar_height": [32],
+            "image_height": [512],
+            "image_width": [768],
+        },
     }
