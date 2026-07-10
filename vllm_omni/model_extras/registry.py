@@ -34,6 +34,10 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.ltx2_3 import (
+    LTX23_EXTRA_BODY_PARAMS,
+    LTX23_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -182,6 +186,14 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "init_extra_args_for_non_diffusion_stages": MING_FLASH_OMNI_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
         "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
+    },
+    "LTX23Pipeline": {
+        "extra_body_params": LTX23_EXTRA_BODY_PARAMS,
+        "extra_output_params": LTX23_EXTRA_OUTPUT_PARAMS,
+    },
+    "LTX23ImageToVideoPipeline": {
+        "extra_body_params": LTX23_EXTRA_BODY_PARAMS,
+        "extra_output_params": LTX23_EXTRA_OUTPUT_PARAMS,
     },
 }
 
