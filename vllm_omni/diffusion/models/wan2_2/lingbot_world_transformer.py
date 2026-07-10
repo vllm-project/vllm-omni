@@ -101,6 +101,45 @@ def _projection_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
 
+def _validate_cache_storage(
+    cache: LingBotAttentionCache,
+    *,
+    batch_size: int,
+    num_local_heads: int,
+    head_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    cache_name: str,
+) -> int:
+    if cache.key.ndim != 4 or cache.value.ndim != 4:
+        raise ValueError(f"{cache_name} cache key and value storage must both be rank 4.")
+    if cache.key.shape != cache.value.shape:
+        raise ValueError(f"{cache_name} cache key and value tensors must have identical shapes.")
+
+    expected_shape = (batch_size, num_local_heads, head_dim)
+    actual_shape = (cache.key.shape[0], cache.key.shape[2], cache.key.shape[3])
+    if actual_shape != expected_shape:
+        raise ValueError(
+            f"{cache_name} cache batch/head shape {actual_shape} does not match attention shape {expected_shape}."
+        )
+    if cache.key.device != cache.value.device or cache.key.device != device:
+        raise ValueError(f"{cache_name} cache key/value device must match the attention input device.")
+    if cache.key.dtype != cache.value.dtype or cache.key.dtype != dtype:
+        raise ValueError(f"{cache_name} cache key/value dtype must match the attention input dtype.")
+
+    capacity = cache.key.shape[1]
+    if capacity <= 0:
+        raise ValueError(f"{cache_name} cache capacity must be positive.")
+    return capacity
+
+
+def _validate_metadata_integer(name: str, value: int | None, *, allow_none: bool = False) -> None:
+    if allow_none and value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Cache metadata {name} must be an integer{' or None' if allow_none else ''}.")
+
+
 def _select_rotary_chunk(
     rotary_emb: tuple[torch.Tensor, torch.Tensor],
     *,
@@ -199,15 +238,44 @@ class LingBotSelfAttention(nn.Module):
             skip_sequence_parallel=True,
         )
 
-    def _validate_cache(self, cache: LingBotAttentionCache, key: torch.Tensor) -> None:
-        expected_shape = (key.shape[0], self.num_local_heads, self.head_dim)
-        actual_shape = (cache.key.shape[0], cache.key.shape[2], cache.key.shape[3])
-        if actual_shape != expected_shape:
-            raise ValueError(f"Cache batch/head shape {actual_shape} does not match attention shape {expected_shape}.")
-        if cache.key.shape != cache.value.shape:
-            raise ValueError("Cache key and value tensors must have identical shapes.")
-        if cache.key.device != key.device or cache.key.dtype != key.dtype:
-            raise ValueError("Cache device and dtype must match the projected key/value tensors.")
+    def _validate_cache(self, cache: LingBotAttentionCache, hidden_states: torch.Tensor) -> None:
+        capacity = _validate_cache_storage(
+            cache,
+            batch_size=hidden_states.shape[0],
+            num_local_heads=self.num_local_heads,
+            head_dim=self.head_dim,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+            cache_name="Self-attention",
+        )
+        _validate_metadata_integer("end", cache.end)
+        _validate_metadata_integer("absolute_end", cache.absolute_end)
+        _validate_metadata_integer("last_start", cache.last_start, allow_none=True)
+        _validate_metadata_integer("sink_end", cache.sink_end)
+
+        if not 0 <= cache.end <= capacity:
+            raise ValueError(f"Self-attention cache end={cache.end} must be within [0, {capacity}].")
+        if not 0 <= cache.sink_end <= cache.end:
+            raise ValueError("Self-attention cache sink_end must be within the retained cache span.")
+        if cache.sink_end > self.sink_tokens:
+            raise ValueError("Self-attention cache sink_end exceeds the configured sink token count.")
+        if cache.absolute_end < 0:
+            raise ValueError("Self-attention cache absolute_end must be non-negative.")
+
+        if cache.last_start is None:
+            if cache.end != 0 or cache.absolute_end != 0 or cache.sink_end != 0:
+                raise ValueError("An uninitialized self-attention cache must have zeroed metadata.")
+            return
+
+        if cache.last_start < 0:
+            raise ValueError("Self-attention cache last_start must be non-negative.")
+        if cache.absolute_end <= cache.last_start:
+            raise ValueError("Self-attention cache absolute_end must follow last_start.")
+        if cache.end == 0 or cache.end > cache.absolute_end:
+            raise ValueError("Initialized self-attention cache physical end is inconsistent with its absolute end.")
+        latest_chunk_tokens = cache.absolute_end - cache.last_start
+        if latest_chunk_tokens > cache.end:
+            raise ValueError("Self-attention cache no longer retains the complete latest chunk.")
 
     def _update_cache(
         self,
@@ -220,7 +288,6 @@ class LingBotSelfAttention(nn.Module):
             raise ValueError(f"current_start must be non-negative, got {current_start}.")
         if key.shape[1] == 0:
             raise ValueError("The current attention chunk must contain at least one token.")
-        self._validate_cache(cache, key)
 
         chunk_tokens = key.shape[1]
         capacity = cache.key.shape[1]
@@ -246,12 +313,14 @@ class LingBotSelfAttention(nn.Module):
             next_value = torch.cat((cache.value[:, :prefix_end], value), dim=1)
         else:
             if current_start < cache.last_start:
-                raise ValueError(
-                    f"current_start={current_start} precedes the latest chunk start {cache.last_start}."
-                )
+                raise ValueError(f"current_start={current_start} precedes the latest chunk start {cache.last_start}.")
             if current_start < cache.absolute_end:
                 raise ValueError(
                     f"current_start={current_start} overlaps cached tokens ending at {cache.absolute_end}."
+                )
+            if current_start > cache.absolute_end:
+                raise ValueError(
+                    f"New chunks must be contiguous: current_start={current_start}, expected {cache.absolute_end}."
                 )
 
             incoming_sink_tokens = max(0, min(chunk_tokens, self.sink_tokens - current_start))
@@ -267,9 +336,7 @@ class LingBotSelfAttention(nn.Module):
             new_local_value = value[:, incoming_sink_tokens:]
             local_capacity = capacity - next_sink_end
             if new_local_key.shape[1] > local_capacity:
-                raise ValueError(
-                    "The configured cache cannot retain all sink tokens and the full current chunk."
-                )
+                raise ValueError("The configured cache cannot retain all sink tokens and the full current chunk.")
             retained_local_tokens = min(
                 old_local_key.shape[1],
                 local_capacity - new_local_key.shape[1],
@@ -305,6 +372,12 @@ class LingBotSelfAttention(nn.Module):
         current_start: int,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        if hidden_states.ndim != 3:
+            raise ValueError("Self-attention hidden_states must be rank 3 [batch, tokens, dim].")
+        if current_start < 0:
+            raise ValueError(f"current_start must be non-negative, got {current_start}.")
+        self._validate_cache(cache, hidden_states)
+
         query = self.norm_q(self.q(hidden_states))
         key = self.norm_k(self.k(hidden_states))
         value = self.v(hidden_states)
@@ -398,6 +471,30 @@ class LingBotCrossAttention(nn.Module):
             disable_kv_quant=True,
         )
 
+    def _validate_cache(self, cache: LingBotAttentionCache, hidden_states: torch.Tensor) -> None:
+        capacity = _validate_cache_storage(
+            cache,
+            batch_size=hidden_states.shape[0],
+            num_local_heads=self.num_local_heads,
+            head_dim=self.head_dim,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+            cache_name="Cross-attention",
+        )
+        _validate_metadata_integer("end", cache.end)
+        _validate_metadata_integer("absolute_end", cache.absolute_end)
+        _validate_metadata_integer("last_start", cache.last_start, allow_none=True)
+        _validate_metadata_integer("sink_end", cache.sink_end)
+
+        if not 1 <= cache.end <= capacity:
+            raise ValueError(f"Cross-attention cache end={cache.end} must be within [1, {capacity}].")
+        if cache.absolute_end != cache.end:
+            raise ValueError("Cross-attention cache absolute_end must equal end.")
+        if cache.last_start != 0:
+            raise ValueError("Cross-attention cache last_start must be zero.")
+        if cache.sink_end != 0:
+            raise ValueError("Cross-attention cache cannot contain sink tokens.")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -405,12 +502,29 @@ class LingBotCrossAttention(nn.Module):
         *,
         cache: LingBotAttentionCache | None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
+        if hidden_states.ndim != 3:
+            raise ValueError("Cross-attention hidden_states must be rank 3 [batch, tokens, dim].")
+        if cache is not None:
+            self._validate_cache(cache, hidden_states)
+
         query = self.norm_q(self.q(hidden_states))
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
 
         if cache is None:
             if encoder_hidden_states is None:
                 raise ValueError("encoder_hidden_states are required when the cross-attention cache is empty.")
+            if encoder_hidden_states.ndim != 3:
+                raise ValueError("encoder_hidden_states must be rank 3 [batch, tokens, dim].")
+            if encoder_hidden_states.shape[0] != hidden_states.shape[0]:
+                raise ValueError("encoder_hidden_states batch size must match hidden_states.")
+            if encoder_hidden_states.shape[1] == 0:
+                raise ValueError("encoder_hidden_states must contain at least one token.")
+            if encoder_hidden_states.shape[2] != self.dim:
+                raise ValueError(f"encoder_hidden_states width must equal dim={self.dim}.")
+            if encoder_hidden_states.device != hidden_states.device:
+                raise ValueError("encoder_hidden_states device must match hidden_states.")
+            if encoder_hidden_states.dtype != hidden_states.dtype:
+                raise ValueError("encoder_hidden_states dtype must match hidden_states.")
             key = self.norm_k(self.k(encoder_hidden_states))
             value = self.v(encoder_hidden_states)
             key = key.unflatten(2, (self.num_local_heads, self.head_dim))
@@ -428,3 +542,31 @@ class LingBotCrossAttention(nn.Module):
 
         output = self.attn(query, key, value)
         return self.o(output.flatten(2, 3)), cache
+
+
+class LingBotAttentionBlock(nn.Module):
+    """Checkpoint namespace container for LingBot self- and cross-attention."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        *,
+        sink_tokens: int = 0,
+        eps: float = 1e-6,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.self_attn = LingBotSelfAttention(
+            dim,
+            num_heads,
+            sink_tokens=sink_tokens,
+            eps=eps,
+            prefix=_projection_prefix(prefix, "self_attn"),
+        )
+        self.cross_attn = LingBotCrossAttention(
+            dim,
+            num_heads,
+            eps=eps,
+            prefix=_projection_prefix(prefix, "cross_attn"),
+        )
