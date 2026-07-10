@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import Generator, Iterable
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -77,6 +77,10 @@ def download_gguf(
 logger = init_logger(__name__)
 
 
+class _CheckpointAdapter(Protocol):
+    def adapt(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterable[tuple[str, torch.Tensor]]: ...
+
+
 def _natural_sort_key(filepath: str) -> list:
     """Natural sort key for filenames with numeric components, e.g.
     model-00001-of-00005.safetensors -> ['model-', 1, '-of-', 5, '.safetensors']."""
@@ -137,7 +141,7 @@ class DiffusersPipelineLoader:
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
-    def __init__(self, load_config: LoadConfig, od_config: OmniDiffusionConfig):
+    def __init__(self, load_config: LoadConfig, od_config: OmniDiffusionConfig) -> None:
         self.load_config = load_config
         self.od_config = od_config
         self.quant_config = od_config.quantization_config
@@ -291,7 +295,7 @@ class DiffusersPipelineLoader:
         model: nn.Module,
         source: "ComponentSource",
         use_safetensors: bool,
-    ):
+    ) -> _CheckpointAdapter | None:
         return get_checkpoint_adapter(
             model=model,
             source=source,

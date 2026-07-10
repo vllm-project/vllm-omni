@@ -872,7 +872,7 @@ class OmniDiffusionConfig:
             f"Failed to find available port after {max_attempts} attempts (started from port {original_port})"
         )
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if self.request_batch_max_wait_ms < 0:

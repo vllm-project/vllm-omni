@@ -33,6 +33,7 @@ factories: :func:`build_fp8_blockwise_w8a16_config`,
 import json
 import os
 import re
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -136,7 +137,7 @@ class Fp8BlockwiseW8A16LinearMethod(LinearMethodBase):
     path (no fused kernel), which is the guaranteed-correct route on sm_120.
     """
 
-    def __init__(self, quant_config) -> None:
+    def __init__(self, quant_config: QuantizationConfig) -> None:
         self.quant_config = quant_config
         self.block = tuple(getattr(quant_config, "weight_block_size", BLOCK))
 
@@ -144,11 +145,11 @@ class Fp8BlockwiseW8A16LinearMethod(LinearMethodBase):
         self,
         layer: torch.nn.Module,
         input_size_per_partition: int,
-        output_partition_sizes: list,
+        output_partition_sizes: list[int],
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
-        **extra_weight_attrs,
+        **extra_weight_attrs: Any,
     ) -> None:
         del input_size, output_size
         output_size_per_partition = sum(output_partition_sizes)
@@ -265,7 +266,7 @@ def build_fp8_blockwise_w8a16_config() -> QuantizationConfig:
         def is_target_module(self, prefix: str) -> bool:
             return is_target_prefix(prefix)
 
-        def is_layer_excluded(self, prefix: str, *args, **kwargs) -> bool:
+        def is_layer_excluded(self, prefix: str, *args: Any, **kwargs: Any) -> bool:
             # Invert vLLM's exclusion default: quantize ONLY the MLP targets; every
             # other Linear is excluded -> UnquantizedLinearMethod (BF16). *args/**kwargs
             # tolerate base-signature drift across vLLM builds.

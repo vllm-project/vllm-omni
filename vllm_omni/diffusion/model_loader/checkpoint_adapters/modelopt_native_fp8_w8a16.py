@@ -47,6 +47,7 @@ from .modelopt_native import (
     SCALE_SUFFIX,
     SIDECAR_FILENAME,
     WEIGHT_SUFFIX,
+    BlockwiseQuantSpec,
     CheckpointIntegrityError,
     ModelOptNativeFp8CheckpointAdapter,
     TensorInfo,
@@ -87,7 +88,7 @@ def assert_scale_finite(name: str, tensor: torch.Tensor) -> None:
 _ALLOWED_QUANT_FAMILIES = ("mlp", "mlp_moe_gen", "lm_head")
 
 
-def assert_target_family(spec) -> None:
+def assert_target_family(spec: BlockwiseQuantSpec) -> None:
     """Fail-fast: every declared quantized pattern is in the W8A16 target family.
 
     Defends a sidecar whose manifest *declares* a forbidden family (e.g. ``self_attn.*``),
@@ -106,7 +107,7 @@ def assert_target_family(spec) -> None:
 class ModelOptNativeFp8W8A16CheckpointAdapter:
     """Streams the FP8-blockwise checkpoint W8A16-resident (MLP resident, lm_head BF16)."""
 
-    def __init__(self, spec, source_prefix: str, target_dtype: torch.dtype) -> None:
+    def __init__(self, spec: BlockwiseQuantSpec, source_prefix: str, target_dtype: torch.dtype) -> None:
         assert_target_family(spec)  # fail-fast before any weight is routed resident
         self._spec = spec
         self._prefix = source_prefix

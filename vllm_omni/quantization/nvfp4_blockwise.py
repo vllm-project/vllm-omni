@@ -24,6 +24,7 @@ this config via :func:`maybe_build_nvfp4_blockwise_config` at construction time.
 """
 
 import re
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -43,7 +44,7 @@ def is_target_prefix(prefix: str) -> bool:
     return bool(_TARGET_RE.search(prefix))
 
 
-def _load_base_config_cls():
+def _load_base_config_cls() -> type[QuantizationConfig]:
     """Import the vLLM ModelOpt NVFP4 config lazily (only when serving NVFP4)."""
     from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 
@@ -64,7 +65,7 @@ def build_nvfp4_blockwise_w4a16_config() -> QuantizationConfig:
         def is_target_module(self, prefix: str) -> bool:
             return is_target_prefix(prefix)
 
-        def is_layer_excluded(self, prefix: str, *args, **kwargs) -> bool:
+        def is_layer_excluded(self, prefix: str, *args: Any, **kwargs: Any) -> bool:
             # Invert vLLM's exclusion default: quantize ONLY the MLP targets;
             # every other Linear is excluded -> UnquantizedLinearMethod (BF16).
             # *args/**kwargs tolerate the base signature (some vLLM builds pass
