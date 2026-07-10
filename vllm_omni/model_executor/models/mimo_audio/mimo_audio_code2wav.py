@@ -23,6 +23,7 @@ from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_
 from vllm_omni.model_executor.models.mimo_audio.cuda_graph_decoder_wrapper import CUDAGraphMiMoDecoderWrapper
 from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import MiMoAudioTokenizer
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -442,8 +443,7 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
-        device_str = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device_str)
+        self.device = current_omni_platform.get_torch_device()
         self.sample_rate = getattr(config, "audio_sample_rate", 24000)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.name_or_path, trust_remote_code=True)

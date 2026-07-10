@@ -586,8 +586,17 @@ class TestDistributedReceive:
                 return_value=0,
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=None),
         ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
+            assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         mgr.receive_multi_kv_cache.assert_called_once()
         assert mgr.receive_multi_kv_cache.call_args.args[2] == torch.device("cpu")
@@ -642,6 +651,15 @@ class TestDistributedReceive:
                 return_value=1,
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=None),
         ):
             assert mgr.receive_multi_kv_cache_distributed(req) is True
 
@@ -666,7 +684,27 @@ class TestDistributedReceive:
         world_group = _MockBroadcastGroup(world_size=2, rank_in_group=1)
         mgr.receive_multi_kv_cache = MagicMock(return_value=True)
 
-        with patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group):
+        with (
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=None),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=None),
+        ):
             assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         mgr.receive_multi_kv_cache.assert_called_once_with(req, None, torch.device("cpu"))
@@ -722,7 +760,7 @@ class TestDistributedReceive:
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
         ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
+            assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         # Verify behavior based on role
         if is_owner:
@@ -817,7 +855,7 @@ class TestDistributedReceive:
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
         ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
+            assert mgr.receive_multi_kv_cache_distributed(req, target_device=torch.device("cpu")) is True
 
         # Verify behavior based on role
         if role == "owner":

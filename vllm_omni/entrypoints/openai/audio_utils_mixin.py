@@ -24,12 +24,8 @@ class AudioMixin:
         audio_tensor = audio_obj.audio_tensor
         sample_rate = audio_obj.sample_rate
         response_format = audio_obj.response_format.lower()
-        stream_format = audio_obj.stream_format
         base64_encode = audio_obj.base64_encode
         speed = audio_obj.speed
-
-        if stream_format != "audio":
-            raise ValueError(f"Unsupported stream format: {stream_format}")
 
         if soundfile is None:
             raise ImportError(
@@ -96,12 +92,16 @@ class AudioMixin:
             else:
                 waveform = torch.from_numpy(audio_tensor).unsqueeze(0)
 
-            # Match librosa.stft defaults: n_fft=2048, hop_length=n_fft//4
-            n_fft = 2048
+            # Use a speech-sized analysis window. The previous 2048-sample
+            # window is tuned for music and can smear short consonants after
+            # aggressive compression, which makes ASR transcript checks flaky.
+            n_fft = 768
             hop_length = n_fft // 4
+            window = torch.hann_window(n_fft, device=waveform.device, dtype=waveform.dtype)
             to_spec = torchaudio.transforms.Spectrogram(
                 n_fft=n_fft,
                 hop_length=hop_length,
+                window_fn=lambda *_args, **_kwargs: window,
                 power=None,
             )
             stretch = torchaudio.transforms.TimeStretch(
@@ -111,6 +111,7 @@ class AudioMixin:
             to_wave = torchaudio.transforms.InverseSpectrogram(
                 n_fft=n_fft,
                 hop_length=hop_length,
+                window_fn=lambda *_args, **_kwargs: window,
             )
 
             spec = to_spec(waveform)

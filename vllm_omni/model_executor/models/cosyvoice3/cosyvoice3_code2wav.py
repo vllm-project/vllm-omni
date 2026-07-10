@@ -11,8 +11,6 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -175,47 +173,24 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_token_len = torch.tensor([prompt_token.shape[1]], device=device, dtype=torch.int32)
         prompt_feat_len = torch.tensor([prompt_feat.shape[1]], device=device, dtype=torch.int32)
 
-        with nullcontext():
-            feat, _ = self.flow_model.inference(
-                token=token,
-                token_len=token_len,
-                prompt_token=prompt_token,
-                prompt_token_len=prompt_token_len,
-                prompt_feat=prompt_feat,
-                prompt_feat_len=prompt_feat_len,
-                embedding=embedding,
-                streaming=streaming,
-                finalize=finalize,
-                n_timesteps=n_timesteps,
-            )
+        feat, _ = self.flow_model.inference(
+            token=token,
+            token_len=token_len,
+            prompt_token=prompt_token,
+            prompt_token_len=prompt_token_len,
+            prompt_feat=prompt_feat,
+            prompt_feat_len=prompt_feat_len,
+            embedding=embedding,
+            streaming=streaming,
+            finalize=finalize,
+            n_timesteps=n_timesteps,
+        )
 
         trim_mel = max(0, int(token_offset_tokens)) * int(self.token_mel_ratio)
         if trim_mel > 0:
             feat = feat[:, :, trim_mel:]
 
         return feat
-
-    @staticmethod
-    def _fade_speech(
-        speech: torch.Tensor,
-        prev_speech: torch.Tensor,
-    ) -> torch.Tensor:
-        """Blend previous speech tail into current speech head."""
-        if speech.numel() == 0 or prev_speech.numel() == 0:
-            return speech
-        overlap = min(int(speech.shape[-1]), int(prev_speech.shape[-1]))
-        if overlap <= 0:
-            return speech
-        window = torch.hamming_window(2 * overlap, periodic=False, dtype=speech.dtype, device=speech.device)
-        fade_in = window[:overlap].view(1, -1)
-        fade_out = window[overlap:].view(1, -1)
-        blended_head = (
-            speech[:, :overlap] * fade_in
-            + prev_speech[:, -overlap:].to(device=speech.device, dtype=speech.dtype) * fade_out
-        )
-        if overlap == int(speech.shape[-1]):
-            return blended_head
-        return torch.cat([blended_head, speech[:, overlap:]], dim=-1)
 
     @torch.inference_mode()
     def forward_streaming(
@@ -238,17 +213,16 @@ class CosyVoice3Code2Wav(nn.Module):
         suffix. That preserves causal look-right handling without double
         trimming or duplicated overlap at chunk boundaries.
         """
-        with nullcontext():
-            feat = self._forward_mel(
-                token=token,
-                prompt_token=prompt_token,
-                prompt_feat=prompt_feat,
-                embedding=embedding,
-                n_timesteps=n_timesteps,
-                token_offset_tokens=token_offset_tokens,
-                streaming=True,
-                finalize=finalize,
-            )
+        feat = self._forward_mel(
+            token=token,
+            prompt_token=prompt_token,
+            prompt_feat=prompt_feat,
+            embedding=embedding,
+            n_timesteps=n_timesteps,
+            token_offset_tokens=token_offset_tokens,
+            streaming=True,
+            finalize=finalize,
+        )
         hift_weight = self.hift.m_source.l_linear.weight
         chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
 
@@ -268,8 +242,7 @@ class CosyVoice3Code2Wav(nn.Module):
         if tts_mel.shape[-1] == 0:
             tts_speech = torch.zeros((chunk_mel.shape[0], 1, 0), device=chunk_mel.device, dtype=chunk_mel.dtype)
         else:
-            with nullcontext():
-                tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
+            tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
 
         tts_speech = tts_speech.reshape(tts_speech.shape[0], -1)
         speech_offset = max(0, min(speech_offset, int(tts_speech.shape[-1])))

@@ -10,8 +10,7 @@
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
-#     set true to disable that path in eager mode. NPU platform flips stage 0 to true where
-#     cudagraph is not yet verified.
+#     set true to disable that path in eager mode.
 async_chunk: true
 
 connectors:
@@ -55,7 +54,10 @@ stages:
       temperature: 0.9
       top_k: 50
       max_tokens: 4096
-      seed: 42
+      # Official qwen-tts generates the talker with min_new_tokens=2; without
+      # it, checkpoints that sample codec EOS on the first frame return empty
+      # audio (HTTP 400). See #4962.
+      min_tokens: 2
       repetition_penalty: 1.05
     subtalker_sampling_params:
       do_sample: true
@@ -86,11 +88,10 @@ stages:
       top_p: 1.0
       top_k: -1
       max_tokens: 65536
-      seed: 42
       repetition_penalty: 1.0
 
 platforms:
   npu:
     stages:
       - stage_id: 0
-        enforce_eager: true
+        enforce_eager: false

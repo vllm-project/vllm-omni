@@ -22,12 +22,15 @@ generation.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
 
 import numpy as np
 import torch
+
+from vllm_omni.platforms import current_omni_platform
 
 __all__ = [
     "UnsupportedInputError",
@@ -162,6 +165,67 @@ def _build_delay_pattern(codes: torch.Tensor) -> torch.Tensor:
 _ENCODER_CACHE: Any | None = None
 _K2_OMNIVOICE_REPO = "k2-fsa/OmniVoice"
 _K2_OMNIVOICE_SUBDIR = "audio_tokenizer"
+_AUDIO_TOKENIZER_PATH_ENVS = (
+    "HIGGS_AUDIO_TOKENIZER_PATH",
+    "HIGGS_AUDIO_V2_TOKENIZER_PATH",
+)
+
+
+def _is_higgs_audio_tokenizer_config(config_path: str) -> bool:
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return config.get("model_type") == "higgs_audio_v2_tokenizer"
+
+
+def _normalize_audio_tokenizer_dir(path: str) -> str | None:
+    if not path:
+        return None
+    expanded = os.path.abspath(os.path.expanduser(path))
+    config_path = os.path.join(expanded, "config.json")
+    if os.path.isfile(config_path) and _is_higgs_audio_tokenizer_config(config_path):
+        return expanded
+    nested = os.path.join(expanded, _K2_OMNIVOICE_SUBDIR)
+    nested_config_path = os.path.join(nested, "config.json")
+    if os.path.isfile(nested_config_path) and _is_higgs_audio_tokenizer_config(nested_config_path):
+        return nested
+    return None
+
+
+def _resolve_audio_tokenizer_dir() -> str | None:
+    """Resolve the Higgs codec encoder dir without requiring online HF access.
+
+    Voice cloning runs in the API server process. Production H20 jobs are often
+    offline, so prefer explicit local directories and already-populated HF cache
+    before falling back to ``snapshot_download``.
+    """
+    for env_name in _AUDIO_TOKENIZER_PATH_ENVS:
+        candidate = _normalize_audio_tokenizer_dir(os.getenv(env_name, ""))
+        if candidate is not None:
+            return candidate
+
+    from huggingface_hub import try_to_load_from_cache
+
+    cached_config = try_to_load_from_cache(
+        repo_id=_K2_OMNIVOICE_REPO,
+        filename=f"{_K2_OMNIVOICE_SUBDIR}/config.json",
+    )
+    if isinstance(cached_config, str) and os.path.isfile(cached_config):
+        candidate = _normalize_audio_tokenizer_dir(os.path.dirname(cached_config))
+        if candidate is not None:
+            return candidate
+
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    safe = _K2_OMNIVOICE_REPO.replace("/", "--")
+    snapshots_dir = os.path.join(HF_HUB_CACHE, f"models--{safe}", "snapshots")
+    if os.path.isdir(snapshots_dir):
+        for rev in os.listdir(snapshots_dir):
+            candidate = _normalize_audio_tokenizer_dir(os.path.join(snapshots_dir, rev))
+            if candidate is not None:
+                return candidate
 
 
 def _load_audio_tokenizer():
@@ -180,15 +244,20 @@ def _load_audio_tokenizer():
 
     Only the ``audio_tokenizer/`` subdirectory (~806 MB) is downloaded.
     """
-    from huggingface_hub import snapshot_download
     from transformers import HiggsAudioV2TokenizerModel
 
-    repo_path = snapshot_download(
-        _K2_OMNIVOICE_REPO,
-        allow_patterns=[f"{_K2_OMNIVOICE_SUBDIR}/*"],
-    )
-    audio_tokenizer_dir = os.path.join(repo_path, _K2_OMNIVOICE_SUBDIR)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    audio_tokenizer_dir = _resolve_audio_tokenizer_dir()
+    if audio_tokenizer_dir is None:
+        from huggingface_hub import snapshot_download
+
+        repo_path = snapshot_download(
+            _K2_OMNIVOICE_REPO,
+            allow_patterns=[f"{_K2_OMNIVOICE_SUBDIR}/*"],
+        )
+        audio_tokenizer_dir = _normalize_audio_tokenizer_dir(repo_path)
+        if audio_tokenizer_dir is None:
+            raise RuntimeError(f"Downloaded {_K2_OMNIVOICE_REPO} does not contain a valid Higgs audio tokenizer")
+    device = current_omni_platform.get_torch_device()
     model = HiggsAudioV2TokenizerModel.from_pretrained(audio_tokenizer_dir).to(device)
     return model.eval()
 

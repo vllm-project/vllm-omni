@@ -24,12 +24,31 @@ from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import BasePipelineUtils, get_pipeline_utils
+from vllm_omni.diffusion.models.diffusers_adapter.quantization_utils import (
+    apply_diffusers_quantization_config,
+    convert_diffusers_quantization_config,
+    ensure_supported_diffusers_quantization,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniPromptType, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
+
+_DIFFUSERS_CONFIG_LOAD_KWARGS = {
+    "cache_dir",
+    "dduf_entries",
+    "force_download",
+    "local_dir",
+    "local_dir_use_symlinks",
+    "local_files_only",
+    "proxies",
+    "revision",
+    "subfolder",
+    "token",
+    "user_agent",
+}
 
 
 class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
@@ -46,6 +65,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     batching mode.
     """
 
+    supports_request_batch = False
     supports_step_execution: bool = False
 
     def __init__(self, *, od_config: OmniDiffusionConfig, device: torch.device | None = None):
@@ -79,12 +99,19 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             "torch_dtype": dtype,
             **self.od_config.diffusers_load_kwargs,
         }
-        logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
+        convert_diffusers_quantization_config(load_kwargs)
 
         pipeline_class = self.od_config.diffusers_pipeline_cls
         pipeline_class_name = pipeline_class.__name__ if pipeline_class is not None else None
         self._pipeline_utils = get_pipeline_utils(pipeline_class_name)
         self._pipeline_utils.update_load_kwargs(self.od_config, load_kwargs)
+        component_names = (
+            self._load_diffusers_component_names(model_id, load_kwargs)
+            if self.od_config.quantization_config is not None and "quantization_config" not in load_kwargs
+            else {}
+        )
+        apply_diffusers_quantization_config(self.od_config, load_kwargs, component_names)
+        logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
 
         self._pipeline = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
         self._pipeline_utils.apply_post_load_updates(self._pipeline, self.od_config)
@@ -151,9 +178,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # Forward pass
     # ------------------------------------------------------------------
 
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Full delegation to diffusers ``pipeline.__call__()``."""
-
         kwargs = self._build_call_kwargs(req)
         logger.debug(f"Calling diffusers pipeline with kwargs: {kwargs}")
 
@@ -190,10 +216,38 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 "Eager execution is not supported with the diffusers backend. "
                 "Use a native pipeline for continuous batching mode."
             )
-        if self.od_config.quantization_config is not None:
-            raise NotImplementedError(
-                "Quantization is not supported with the diffusers backend. Use a native pipeline for quantization."
+        if (
+            self.od_config.quantization_config is not None
+            and "quantization_config" not in self.od_config.diffusers_load_kwargs
+        ):
+            ensure_supported_diffusers_quantization(self.od_config.quantization_config)
+            if self.od_config.diffusers_load_kwargs.get("dduf_file"):
+                raise NotImplementedError(
+                    "Diffusers backend quantization conversion does not support "
+                    "diffusers_load_kwargs.dduf_file yet. The preflight component "
+                    "discovery would need to mirror Diffusers' DDUF config loading. "
+                    "Use diffusers_load_kwargs.quantization_config for a native "
+                    "Diffusers quantization config, or omit dduf_file for vLLM-Omni "
+                    "quantization conversion."
+                )
+
+    def _load_diffusers_component_names(
+        self,
+        model_id: str,
+        load_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        config_load_kwargs = {k: load_kwargs[k] for k in _DIFFUSERS_CONFIG_LOAD_KWARGS if k in load_kwargs}
+        pipeline_config = DiffusionPipeline.load_config(model_id, **config_load_kwargs)
+        return {
+            name: value
+            for name, value in pipeline_config.items()
+            if (
+                isinstance(value, list)
+                and len(value) > 0
+                and value[0] is not None
+                and (name not in load_kwargs or load_kwargs[name] is not None)
             )
+        }
 
     # ------------------------------------------------------------------
     # Wrap settings, inputs, and outputs
@@ -280,8 +334,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 f"{dict(zip(attention_backend_attempts, attempt_errors))}"
             )
 
-    def _build_call_kwargs(self, req: OmniDiffusionRequest) -> dict[str, Any]:
-        """Translate ``OmniDiffusionRequest`` into diffusers ``__call__`` kwargs."""
+    def _build_call_kwargs(self, req: DiffusionRequestBatch) -> dict[str, Any]:
+        """Translate a ``DiffusionRequestBatch`` into diffusers ``__call__`` kwargs."""
         sampling = req.sampling_params
         input_kwargs = self._extract_input(req.prompts)
 

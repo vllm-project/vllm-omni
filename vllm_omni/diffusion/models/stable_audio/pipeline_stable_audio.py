@@ -29,14 +29,14 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportAudioOutput
+from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
     StableAudioDiTModel,
     StableAudioSchedulerWrapper,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -65,7 +65,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
+class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -77,12 +77,19 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         prefix: Weight prefix for loading (default: "")
     """
 
+    supports_request_batch = False
+
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the
     # ``multimodal_output`` payload includes the sample rate (mirrors the
     # contract introduced for AudioX in #2077).
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 44100
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = ["projection_model"]
 
     def __init__(
         self,
@@ -378,37 +385,21 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        audio_end_in_s: float | None = None,
-        audio_start_in_s: float = 0.0,
-        guidance_scale: float = 7.0,
-        num_waveforms_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        output_type: str = "np",
-    ) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """
         Generate audio from text prompt.
 
         Args:
-            req: OmniDiffusionRequest containing generation parameters
-            prompt: Text prompt for audio generation
-            negative_prompt: Negative prompt for CFG
-            audio_end_in_s: Audio end time in seconds (max ~47s for stable-audio-open-1.0)
-            audio_start_in_s: Audio start time in seconds
-            guidance_scale: CFG scale
-            num_waveforms_per_prompt: Number of audio outputs per prompt
-            generator: Random generator for reproducibility
-            latents: Pre-generated latents
-            prompt_embeds: Pre-computed prompt embeddings
-            negative_prompt_embeds: Pre-computed negative prompt embeddings
-            output_type: Output format ("np", "pt", or "latent")
+            req: OmniDiffusionRequest containing generation parameters.
+                The `req.sampling_params.extra_args` can include the following keys:
+                - audio_start_in_s (`float`, *optional*, defaults to 0.0):
+                    Start time of the audio in seconds.
+                - audio_end_in_s (`float`, *optional*):
+                    End time of the audio in seconds.
+                - num_waveforms_per_prompt (`int`, *optional*, defaults to 1):
+                    Number of audio outputs per prompt.
+                - output_type (`str`, *optional*, defaults to "np"):
+                    Output format ("np", "pt", or "latent").
 
         Returns:
             DiffusionOutput containing generated audio
@@ -416,28 +407,33 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         # Extract from request
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
             negative_prompt = None
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
-        num_inference_steps = req.sampling_params.num_inference_steps
-        if num_inference_steps is None:
-            num_inference_steps = 100  # Default steps
-        num_inference_steps = req.sampling_params.num_inference_steps
-        if num_inference_steps is None:
-            num_inference_steps = 50  # Default steps
+
+        prompt_embeds = None
+        negative_prompt_embeds = None
+
+        num_inference_steps = req.sampling_params.num_inference_steps or 50
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
+        else:
+            guidance_scale = 7.0
 
-        if generator is None:
-            generator = req.sampling_params.generator
+        generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+        latents = req.sampling_params.latents
 
         # Get audio duration from request extra params or defaults
-        audio_start_in_s = req.sampling_params.extra_args.get("audio_start_in_s", audio_start_in_s)
-        audio_end_in_s = req.sampling_params.extra_args.get("audio_end_in_s", audio_end_in_s)
+        audio_start_in_s: float = req.sampling_params.extra_args.get("audio_start_in_s", 0.0)
+        audio_end_in_s: float | None = req.sampling_params.extra_args.get("audio_end_in_s", None)
+        num_waveforms_per_prompt: int = req.sampling_params.extra_args.get(
+            "num_waveforms_per_prompt", req.sampling_params.num_outputs_per_prompt or 1
+        )
+        output_type = req.sampling_params.output_type or "np"
 
         # Calculate audio length
         downsample_ratio = self.vae.hop_length
@@ -467,12 +463,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         )
 
         # Determine batch size
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
+        batch_size = len(prompt)
 
         device = self.device
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -493,7 +484,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             audio_start_in_s,
             audio_end_in_s,
             device,
-            do_classifier_free_guidance and (negative_prompt is not None or negative_prompt_embeds is not None),
+            do_classifier_free_guidance and negative_prompt is not None,
             batch_size,
         )
 
@@ -508,7 +499,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         )
 
         # Handle CFG without negative prompt
-        if do_classifier_free_guidance and negative_prompt_embeds is None and negative_prompt is None:
+        if do_classifier_free_guidance and negative_prompt is None:
             negative_text_audio_duration_embeds = torch.zeros_like(text_audio_duration_embeds)
             text_audio_duration_embeds = torch.cat(
                 [negative_text_audio_duration_embeds, text_audio_duration_embeds],
@@ -600,9 +591,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         # Trim to requested length
         audio = audio[:, :, waveform_start:waveform_end]
 
-        return DiffusionOutput(
-            output=audio, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return DiffusionOutput(output=audio, stage_durations=stage_durations)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

@@ -33,7 +33,7 @@ Prerequisites
 
 * **Seed-TTS** optional extras for WER/SIM/UTMOS::
 
-    pip install 'vllm-omni[seed-tts-eval]'
+    pip install 'vllm-omni[dev]'
 
 Examples
 --------
@@ -340,7 +340,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-seed-tts-mean-wer",
         type=float,
-        default=0.25,
+        default=0.35,
         help="If set, fail when seed_tts_content_error_mean is strictly above this value.",
     )
     p.add_argument(

@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 def _make_request() -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[{"prompt": "a cup of coffee on a table"}],
+        prompt={"prompt": "a cup of coffee on a table"},
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         request_id="request-test",
     )
@@ -22,7 +22,7 @@ def _make_request() -> OmniDiffusionRequest:
 def test_request_id_is_required():
     with pytest.raises(TypeError, match="request_id"):
         OmniDiffusionRequest(
-            prompts=[{"prompt": "a cup of coffee on a table"}],
+            prompt={"prompt": "a cup of coffee on a table"},
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         )
 
@@ -37,7 +37,7 @@ def test_request_ids_identity_list_is_removed():
 def test_request_id_must_be_non_empty():
     with pytest.raises(ValueError, match="request_id must be a non-empty string"):
         OmniDiffusionRequest(
-            prompts=[{"prompt": "a cup of coffee on a table"}],
+            prompt={"prompt": "a cup of coffee on a table"},
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
             request_id="",
         )
@@ -45,7 +45,7 @@ def test_request_id_must_be_non_empty():
 
 def test_dummy_run_request_is_identified_by_reserved_request_id():
     req = OmniDiffusionRequest(
-        prompts=[{"prompt": "dummy run"}],
+        prompt={"prompt": "dummy run"},
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         request_id=DUMMY_DIFFUSION_REQUEST_ID,
     )

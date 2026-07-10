@@ -18,7 +18,7 @@ from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
@@ -66,6 +66,7 @@ tts_async_chunk_server_params = [
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_zh_001(omni_server, openai_client) -> None:
     """
@@ -88,6 +89,7 @@ def test_voice_clone_zh_001(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_voice_clone_zh_002(omni_server, openai_client) -> None:
     """
@@ -102,6 +104,7 @@ def test_voice_clone_zh_002(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt("zh"),
         "stream": True,
+        "stream_format": "audio",
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
@@ -110,6 +113,7 @@ def test_voice_clone_zh_002(omni_server, openai_client) -> None:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_en_001(omni_server, openai_client) -> None:
     """

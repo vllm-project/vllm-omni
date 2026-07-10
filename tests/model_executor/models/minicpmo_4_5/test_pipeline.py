@@ -19,9 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
-    _PIPELINE_REGISTRY,
     PipelineConfig,
     StageExecutionType,
 )
@@ -34,13 +33,13 @@ _PIPELINE_KEY = "minicpmo_4_5"
 
 class TestRegistryDeclaration:
     def test_declared_in_omni_pipelines(self) -> None:
-        assert _PIPELINE_KEY in _OMNI_PIPELINES
+        assert _PIPELINE_KEY in OMNI_PIPELINES
 
     def test_visible_in_central_registry(self) -> None:
-        assert _PIPELINE_KEY in _PIPELINE_REGISTRY
+        assert _PIPELINE_KEY in OMNI_PIPELINES
 
     def test_lazy_load_returns_pipeline_config(self) -> None:
-        pipeline = _PIPELINE_REGISTRY[_PIPELINE_KEY]
+        pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         assert isinstance(pipeline, PipelineConfig)
         assert pipeline.model_type == _PIPELINE_KEY
         assert pipeline.model_arch == "MiniCPMO45OmniForConditionalGeneration"
@@ -49,7 +48,7 @@ class TestRegistryDeclaration:
 class TestPipelineTopology:
     @pytest.fixture(scope="class")
     def pipeline(self) -> PipelineConfig:
-        return _PIPELINE_REGISTRY[_PIPELINE_KEY]
+        return OMNI_PIPELINES[_PIPELINE_KEY]
 
     def test_two_stages(self, pipeline: PipelineConfig) -> None:
         assert len(pipeline.stages) == 2
@@ -99,7 +98,7 @@ class TestArchAliases:
 
     @pytest.fixture(scope="class")
     def pipeline(self) -> PipelineConfig:
-        return _PIPELINE_REGISTRY[_PIPELINE_KEY]
+        return OMNI_PIPELINES[_PIPELINE_KEY]
 
     def test_shared_minicpmo_alias_present(self, pipeline: PipelineConfig) -> None:
         # MiniCPM-o 4.5 ships ``architectures=["MiniCPMO"]`` in its HF config.
@@ -123,7 +122,7 @@ class TestHfConfigPredicate:
 
     @pytest.fixture(scope="class")
     def predicate(self):
-        pipeline = _PIPELINE_REGISTRY[_PIPELINE_KEY]
+        pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         assert pipeline.hf_config_predicate is not None, (
             "MiniCPM-o 4.5 pipeline must declare hf_config_predicate to "
             "avoid misrouting MiniCPM-o 2.6 checkpoints into the 4.5 path."
