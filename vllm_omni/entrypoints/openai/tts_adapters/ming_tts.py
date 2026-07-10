@@ -25,9 +25,18 @@ class MingTTSAdapter(ARTTSAdapter):
         ref_audio_source = request.ref_audio
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
         if ref_audio_source is None and voice_lower in server.uploaded_speakers:
-            ref_audio_source = server._get_uploaded_audio_data(request.voice)
-            if request.ref_text is None:
-                request.ref_text = server.uploaded_speakers[voice_lower].get("ref_text")
+            speaker_info = server.uploaded_speakers[voice_lower]
+            if speaker_info.get("embedding_source") == "direct":
+                if request.speaker_embedding is None:
+                    request.speaker_embedding = server._get_uploaded_speaker_embedding(request.voice)
+                if request.speaker_embedding is None:
+                    raise ValueError(f"Speaker embedding for uploaded voice '{request.voice}' is missing")
+            else:
+                ref_audio_source = server._get_uploaded_audio_data(request.voice)
+                if not ref_audio_source:
+                    raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing")
+                if request.ref_text is None:
+                    request.ref_text = speaker_info.get("ref_text")
         ref_audio_data = None
         if isinstance(ref_audio_source, list):
             ref_audio_data = await server._resolve_ref_audio_many(ref_audio_source)
