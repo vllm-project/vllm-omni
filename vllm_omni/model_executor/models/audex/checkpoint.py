@@ -28,7 +28,6 @@ _SNAPSHOT_PROFILE_PATTERNS = {
         "config.json",
         "checkpoint_folder_audiogen/*",
         "audex_causal_speech_decoder/*",
-        f"{_WEIGHT_SOURCE_FOLDER}/model-00001-of-00002.safetensors",
     ],
     # TTA reuses the audiogen thinker; waveform decode happens in the
     # external XCodec1 checkpoint (see ensure_xcodec1_snapshot), so the
@@ -36,7 +35,6 @@ _SNAPSHOT_PROFILE_PATTERNS = {
     "tta": [
         "config.json",
         "checkpoint_folder_audiogen/*",
-        f"{_WEIGHT_SOURCE_FOLDER}/model-00001-of-00002.safetensors",
     ],
     # The audio-capable full checkpoint: both weight shards, audio
     # preprocessor assets, chat template, and remote-code modeling files.
@@ -47,6 +45,41 @@ _SNAPSHOT_PROFILE_PATTERNS = {
 }
 
 XCODEC1_DEFAULT_REPO = "hf-audio/xcodec-hubert-general-balanced"
+
+_AUDIOGEN_INDEX_FILE = "checkpoint_folder_audiogen/model.safetensors.index.json"
+
+
+def _download_audiogen_index(model: str) -> str:
+    """Resolve the audiogen dedup index to a local path (tiny file)."""
+    from huggingface_hub import hf_hub_download
+
+    try:
+        return hf_hub_download(model, _AUDIOGEN_INDEX_FILE)
+    except Exception:
+        return hf_hub_download(model, _AUDIOGEN_INDEX_FILE, local_files_only=True)
+
+
+def _dedup_shard_patterns(model: str) -> list[str]:
+    """Shards under the full checkpoint referenced by the audiogen index.
+
+    The audiogen folder deduplicates its LM weights into
+    ``checkpoint_folder_full`` shards (1 of 2 on the 2B, a subset of 14 on
+    the 30B-A3B); the ``tts``/``tta`` profiles must download exactly those.
+    Falls back to every full-checkpoint shard when the index is unreadable.
+    """
+    try:
+        with open(_download_audiogen_index(model)) as f:
+            weight_map = json.load(f).get("weight_map", {})
+        shards = sorted(set(weight_map.values()))
+        if shards:
+            return [f"{_WEIGHT_SOURCE_FOLDER}/{shard}" for shard in shards]
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve the audiogen dedup shards for %s (%s); downloading all full-checkpoint shards",
+            model,
+            exc,
+        )
+    return [f"{_WEIGHT_SOURCE_FOLDER}/model-*.safetensors"]
 
 
 def ensure_audex_snapshot(model: str, profile: str = "tts") -> str:
@@ -66,6 +99,10 @@ def ensure_audex_snapshot(model: str, profile: str = "tts") -> str:
         raise ValueError(
             f"Unknown Audex snapshot profile {profile!r}; expected one of {sorted(_SNAPSHOT_PROFILE_PATTERNS)}"
         )
+
+    patterns = list(patterns)
+    if profile in ("tts", "tta"):
+        patterns += _dedup_shard_patterns(model)
 
     from huggingface_hub import snapshot_download
 
