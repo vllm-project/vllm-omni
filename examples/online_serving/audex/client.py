@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import re
 from pathlib import Path
 
 import requests
@@ -95,6 +96,11 @@ def _chat(base_url: str, model: str, messages: list[dict], max_tokens: int) -> s
             # stage — routing ASR/chat through code2wav instead of stopping
             # at stage 0.
             "modalities": ["text"],
+            # The checkpoint's chat template supports the thinking toggle;
+            # disable it so answers are direct (the offline examples do the
+            # same by priming a closed <think></think>). _strip_think below
+            # remains as a safety net for templates without the kwarg.
+            "chat_template_kwargs": {"enable_thinking": False},
         },
         timeout=300,
     )
@@ -122,6 +128,15 @@ def _audio_question(audio_b64: str, question: str) -> list[dict]:
             ],
         }
     ]
+
+
+def _tts_text(answer: str) -> str:
+    # The chat answer may carry markdown markup that makes the TTS thinker
+    # stop almost immediately; speak a cleaned, length-capped version (the
+    # offline example caps the same way).
+    text = re.sub(r"[*#_`]+", "", answer)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:200]
 
 
 def _strip_think(text: str) -> str:
@@ -180,7 +195,7 @@ def main():
     if not answer:
         raise SystemExit("Chat pass produced an empty answer; aborting cascade")
 
-    _speech(base_url, args.model, answer, cfg_scale, out_path)
+    _speech(base_url, args.model, _tts_text(answer), cfg_scale, out_path)
     print(f"[3/3] speech     : {out_path.stat().st_size} bytes -> {out_path}")
 
 
