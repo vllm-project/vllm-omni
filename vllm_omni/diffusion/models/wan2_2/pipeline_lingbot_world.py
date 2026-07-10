@@ -68,9 +68,11 @@ class _LingBotRequestInputs:
 
 
 def _positive_finite_flow_shift(value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError("flow_shift must be a positive finite number.")
     try:
         flow_shift = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("flow_shift must be a positive finite number.") from exc
     if not math.isfinite(flow_shift) or flow_shift <= 0:
         raise ValueError("flow_shift must be a positive finite number.")
@@ -90,7 +92,8 @@ def _build_shifted_flow_sigma_lookup(
         raise ValueError("num_train_timesteps must be positive")
     if any(timestep < 0 or timestep > num_train_timesteps for timestep in timesteps):
         raise ValueError(f"timesteps must be between 0 and {num_train_timesteps}")
-    base_sigmas = torch.linspace(1.0, 0.0, num_train_timesteps + 1, dtype=torch.float64)[:-1]
+    # Mirror FlowUniPC's ``1 - reversed(alpha)`` lattice: [N-1, ..., 0] / N.
+    base_sigmas = torch.arange(num_train_timesteps - 1, -1, -1, dtype=torch.float64) / num_train_timesteps
     scaled_sigmas = flow_shift * base_sigmas
     shifted_sigmas = scaled_sigmas / ((1.0 - base_sigmas) + scaled_sigmas)
     normalized_timesteps = torch.tensor(timesteps, dtype=shifted_sigmas.dtype) / num_train_timesteps
