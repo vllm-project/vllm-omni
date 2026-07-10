@@ -37,6 +37,7 @@ th {
 | `Krea2Pipeline` | Krea 2 (Raw + Turbo) | `krea/Krea-2-Raw`, `krea/Krea-2-Turbo` | ✅︎ | | | |
 | `WanPipeline` | Wan2.1-T2V, Wan2.2-T2V, Wan2.2-TI2V | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-T2V-14B-Diffusers`, `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
+| `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22S2VPipeline` | Wan2.2-S2V | `Wan-AI/Wan2.2-S2V-14B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Wan22VACEPipeline` | Wan2.1-VACE | `Wan-AI/Wan2.1-VACE-1.3B-diffusers`, `Wan-AI/Wan2.1-VACE-14B-diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
@@ -97,3 +98,14 @@ th {
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+LingBot-World 2.0 v1 is limited to the 14B causal-fast checkpoint, one first-frame image plus a
+camera directory, fixed four-step DMD sampling, and request-local history. Its DiT path is TP-aware,
+but v1 does not support sequence/Ulysses parallelism, Cache-DiT/TeaCache, VAE parallelism,
+cross-request or streaming session state, runtime events, causal-pretrain, or the 1.3B checkpoint.
+The repository includes an opt-in H100/CUDA E2E entry; the table remains experimental until a
+real-checkpoint GPU run is recorded, and no AMD GPU, Ascend NPU, or Intel GPU support is claimed.
+
+The [LingBot-World checkpoint](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers)
+is separately licensed under CC BY-NC-SA and restricted to non-commercial use. The vLLM-Omni
+integration code is licensed under Apache-2.0.
