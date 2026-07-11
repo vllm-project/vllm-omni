@@ -25,13 +25,13 @@ RUN apt-get update && \
     rm -rf /var/cache/apt/* && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip config set global.index-url ${PIP_INDEX_URL} && \
-    pip config set global.trusted-host "$(echo ${PIP_INDEX_URL} | awk -F/ '{print $3}')"
+RUN python3 -m pip config set global.index-url ${PIP_INDEX_URL} && \
+    if [ "${PIP_INDEX_URL#http://}" != "${PIP_INDEX_URL}" ]; then pip config set global.trusted-host "$(echo ${PIP_INDEX_URL} | awk -F/ '{print $3}')"; fi
 
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
-    pip install -v \
+    python3 -m pip install -v \
       "pytest>=7.0.0" \
       "pytest-asyncio>=0.21.0" \
       "pytest-cov>=4.0.0" \
@@ -43,7 +43,7 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "opencv-python>=4.12.0.88" \
       "imageio[ffmpeg]>=0.6.0" \
       --default-timeout=60 && \
-    pip install -v -e /vllm-workspace/vllm-omni/ --no-build-isolation \
+    python3 -m pip install -v -e /vllm-workspace/vllm-omni/ --no-build-isolation \
       --default-timeout=60
 
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
