@@ -34,7 +34,6 @@ _UNIFORM_EPS = 1e-20
 
 if current_omni_platform.is_npu():
     import torch_npu
-    from vllm_ascend.ascend_forward_context import get_forward_context
 
 
 # ===================================================================
@@ -964,11 +963,7 @@ class CodePredictorWrapper(nn.Module):
             # Use captured device graph if available, otherwise call compiled fn.
             device_graph_entry = self._device_graphs.get(graph_key)
 
-            # The talker MTP ACL graph owns the outer capture. Replaying a
-            # nested code-predictor NPUGraph on that capture stream is not
-            # supported by ACL, so capture the eager model path instead.
-            in_outer_graph_capture = current_omni_platform.is_npu() and get_forward_context().capturing
-            if device_graph_entry is not None and not in_outer_graph_capture:
+            if device_graph_entry is not None:
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
             else:
