@@ -478,7 +478,7 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help=(
                 "JSON string for diffusion quantization_config. "
-                'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
+                'Example: \'{"method":"fp8","activation_scheme":"dynamic"}\'.'
             ),
         )
         omni_config_group.add_argument(
