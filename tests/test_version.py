@@ -56,3 +56,26 @@ def test_warning_contains_version_strings():
     msg = str(record[0].message)
     assert "0.19.0rc2.dev21" in msg
     assert "0.18.0" in msg
+
+
+def test_omni_plugin_loader_invokes_vllm_general_plugins_first(monkeypatch):
+    import vllm.plugins as vllm_plugins
+
+    import vllm_omni.plugins as omni_plugins
+
+    calls = []
+    monkeypatch.setattr(omni_plugins, "omni_plugins_loaded", False)
+    monkeypatch.setattr(vllm_plugins, "load_general_plugins", lambda: calls.append("vllm"))
+    monkeypatch.setattr(
+        omni_plugins,
+        "load_omni_plugins_by_group",
+        lambda group: {"omni": lambda: calls.append(group)},
+    )
+
+    omni_plugins.load_omni_general_plugins()
+
+    assert calls == ["vllm", omni_plugins.OMNI_DEFAULT_PLUGINS_GROUP]
+
+    omni_plugins.load_omni_general_plugins()
+
+    assert calls == ["vllm", omni_plugins.OMNI_DEFAULT_PLUGINS_GROUP]
