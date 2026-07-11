@@ -216,10 +216,7 @@ def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dic
     return result
 
 
-def _resolve_deploy_path(model_type: str, deploy_config_path: str | None = None) -> Path:
-    if deploy_config_path is None:
-        return _DEPLOY_DIR / f"{model_type}.yaml"
-
+def _resolve_deploy_path(deploy_config_path: str) -> Path:
     deploy_path = Path(deploy_config_path)
     if not deploy_path.exists() and deploy_path.parent == Path("."):
         bare_name = deploy_path.name
@@ -229,6 +226,26 @@ def _resolve_deploy_path(model_type: str, deploy_config_path: str | None = None)
         if candidate.exists():
             return candidate
     return deploy_path
+
+
+def _get_deploy_config(
+    pipeline_cfg: PipelineConfig,
+    user_deploy_config: DeployConfig | None,
+    deploy_config_path: str | None,
+) -> tuple[DeployConfig, str | None]:
+    """Select user-provided, pipeline-default, or empty deploy settings."""
+    if user_deploy_config is not None:
+        loaded_path = str(_resolve_deploy_path(deploy_config_path)) if deploy_config_path is not None else None
+        return copy.deepcopy(user_deploy_config), loaded_path
+
+    config_path = deploy_config_path or pipeline_cfg.default_deploy_config_path
+    if config_path is None:
+        return DeployConfig(), None
+
+    resolved_path = _resolve_deploy_path(config_path)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Deploy config not found: {resolved_path}")
+    return load_deploy_config(resolved_path), str(resolved_path)
 
 
 @config
@@ -1215,6 +1232,8 @@ class VllmOmniConfig:
     def from_pipeline_config(
         cls,
         pipeline_cfg: PipelineConfig,
+        *,
+        user_deploy_config: DeployConfig | None = None,
         deploy_config_path: str | None = None,
         cli_overrides: dict[str, Any] | None = None,
     ) -> VllmOmniConfig:
@@ -1222,12 +1241,11 @@ class VllmOmniConfig:
         if cli_overrides is None:
             cli_overrides = {}
 
-        deploy_path = _resolve_deploy_path(pipeline_cfg.model_type, deploy_config_path)
-        loaded_deploy_config_path = str(deploy_path) if deploy_path.exists() else None
-        if loaded_deploy_config_path is not None:
-            deploy = load_deploy_config(deploy_path)
-        else:
-            deploy = DeployConfig()
+        deploy, loaded_deploy_config_path = _get_deploy_config(
+            pipeline_cfg,
+            user_deploy_config,
+            deploy_config_path,
+        )
 
         if cli_overrides.get("async_chunk") is not None:
             deploy.async_chunk = bool(cli_overrides["async_chunk"])

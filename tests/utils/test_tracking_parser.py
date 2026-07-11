@@ -603,7 +603,6 @@ def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
     stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -620,7 +619,6 @@ def test_omitted_default_not_in_runtime_overrides(mock_stages):
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
     stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -642,7 +640,6 @@ def test_config_file_args_reach_runtime_overrides(mock_stages):
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
     stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -660,7 +657,6 @@ def test_per_stage_override_routes_correctly(mock_stages):
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
     stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -682,7 +678,6 @@ def test_explicit_args_omitted_from_yaml(mock_stages):
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
     stages, _ = StageConfigFactory._create_legacy_from_registry(
-        _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,

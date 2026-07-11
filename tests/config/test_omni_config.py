@@ -55,10 +55,9 @@ def _stable_test_platform(monkeypatch):
     monkeypatch.setattr(platform, "device_type", "cpu", raising=False)
 
 
-def _load_default_deploy(model_type: str) -> DeployConfig:
-    deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
-    if deploy_path.exists():
-        return load_deploy_config(deploy_path)
+def _load_default_deploy(pipeline: PipelineConfig) -> DeployConfig:
+    if pipeline.default_deploy_config_path is not None:
+        return load_deploy_config(_DEPLOY_DIR / pipeline.default_deploy_config_path)
     return DeployConfig()
 
 
@@ -85,7 +84,7 @@ def _from_pipeline_key(
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
 def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(model_type: str):
     pipeline = _resolve_pipeline_or_skip(model_type)
-    legacy_deploy = _load_default_deploy(pipeline.model_type)
+    legacy_deploy = _load_default_deploy(pipeline)
 
     legacy_stages = merge_pipeline_deploy(pipeline, legacy_deploy)
     omni_config = VllmOmniConfig.from_pipeline_config(pipeline)
@@ -603,7 +602,7 @@ def test_from_pipeline_config_preserves_diffusion_parallel_mask_sp_padding(tmp_p
 
 def test_from_pipeline_config_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
-    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("qwen3_tts"))[0]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
     omni_stage = _from_pipeline_key("qwen3_tts").stage_by_id(legacy_stage.stage_id)
 
@@ -628,19 +627,11 @@ def test_from_pipeline_config_uses_hf_config_for_callable_resolver():
 
     assert omni_config.pipeline_config.model_type == "qwen3_omni_moe_thinker_only"
     assert len(omni_config.stage_configs) == 1
-    assert omni_config.orchestrator_config.deploy_config_path == str(_DEPLOY_DIR / "qwen3_omni_moe_thinker_only.yaml")
+    assert omni_config.orchestrator_config.deploy_config_path is None
 
     thinker = omni_config.stage_configs[0]
     assert thinker.model_stage == "thinker"
-    assert thinker.scheduler_config.max_num_batched_tokens == 32768
-    assert thinker.scheduler_config.max_num_seqs == 64
-    assert thinker.cache_config.gpu_memory_utilization == 0.9
-    assert thinker.runtime_config.devices == "0"
-    assert thinker.model_config.default_sampling_params == {
-        "temperature": 0.0,
-        "max_tokens": 2048,
-        "detokenize": True,
-    }
+    assert thinker.model_config.default_sampling_params == {"detokenize": True}
 
 
 def test_from_pipeline_config_accepts_pre_resolved_pipeline():
@@ -649,6 +640,25 @@ def test_from_pipeline_config_accepts_pre_resolved_pipeline():
     omni_config = VllmOmniConfig.from_pipeline_config(resolved_pipeline)
 
     assert omni_config.pipeline_config is resolved_pipeline
+
+
+def test_from_pipeline_config_prefers_loaded_user_deploy_config(monkeypatch):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    user_deploy_config = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0, max_num_seqs=7)],
+    )
+    monkeypatch.setattr(
+        omni_config_module,
+        "load_deploy_config",
+        lambda _path: pytest.fail("default deploy config should not be loaded"),
+    )
+
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=user_deploy_config,
+    )
+
+    assert omni_config.stage_by_id(0).scheduler_config.max_num_seqs == 7
 
 
 def test_from_pipeline_config_uses_resolved_deploy_pipeline():
@@ -671,7 +681,7 @@ def test_from_pipeline_config_uses_resolved_deploy_pipeline():
 
 def test_from_pipeline_config_matches_to_omegaconf_diffusion_parallel_config():
     pipeline = _resolve_pipeline_or_skip("hunyuan_image3_dit")
-    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("hunyuan_image3_dit"))[0]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
     omni_stage = _from_pipeline_key("hunyuan_image3_dit").stage_by_id(legacy_stage.stage_id)
 
@@ -699,7 +709,7 @@ def test_from_pipeline_config_matches_build_engine_args_dict_behavior_for_repres
 
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
-    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("qwen3_tts"))[0]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
     legacy_engine_args = build_engine_args_dict(
         omega_stage,

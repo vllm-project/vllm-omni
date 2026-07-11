@@ -198,12 +198,12 @@ class StageConfigFactory:
         return None
 
     @classmethod
-    @functools.cache
     def get_pipeline_config(
         cls,
         model: str,
         trust_remote_code: bool,
         deploy_config_path: str | None = None,
+        user_deploy_config: DeployConfig | None = None,
     ) -> PipelineConfig | None:
         """Resolve the PipelineConfig for a model path/name."""
         model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
@@ -211,7 +211,9 @@ class StageConfigFactory:
 
         # Resolve the deploy config & check if the user set the pipeline;
         # If the pipeline is explicitly set, it takes highest priority
-        deploy_config_pipe = cls._get_deploy_override_pipe_config(hf_config, deploy_config_path)
+        if user_deploy_config is None:
+            user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
+        deploy_config_pipe = cls._get_deploy_override_pipe_config(hf_config, user_deploy_config)
         if deploy_config_pipe is not None:
             return deploy_config_pipe
 
@@ -258,24 +260,33 @@ class StageConfigFactory:
     def _get_deploy_override_pipe_config(
         cls,
         hf_config: PretrainedConfig | None,
-        deploy_config_path: str | None,
+        deploy_config: DeployConfig | None,
     ) -> PipelineConfig | None:
-        """Load the deploy config and extract + resolve its pipeline field."""
-        if deploy_config_path is None:
+        """Resolve an explicit pipeline override from a loaded deploy config."""
+        if deploy_config is None or deploy_config.pipeline is None:
             return None
 
+        pipeline_cfg = resolve_pipeline_config(deploy_config.pipeline, hf_config)
+        if pipeline_cfg is None:
+            raise KeyError(
+                f"Pipeline {deploy_config.pipeline!r} from deploy config is not registered "
+                f"to OMNI_PIPELINES. Available: {sorted(OMNI_PIPELINES)}"
+            )
+        return pipeline_cfg
+
+    @staticmethod
+    def _load_user_deploy_config(deploy_config_path: str | None) -> DeployConfig | None:
+        """Load an explicit deploy YAML once for resolution and construction."""
+        if deploy_config_path is None:
+            return None
         deploy_path = Path(deploy_config_path)
-        if deploy_path.exists():
-            deploy_cfg = load_deploy_config(deploy_path)
-            if deploy_cfg.pipeline is not None:
-                pipeline_cfg = resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
-                if pipeline_cfg is None:
-                    raise KeyError(
-                        f"Pipeline {deploy_cfg.pipeline!r} from deploy config {deploy_path} "
-                        f"is not registered to OMNI_PIPELINES. Available: {sorted(OMNI_PIPELINES)}"
-                    )
-                return pipeline_cfg
-        return None
+        if not deploy_path.exists() and deploy_path.parent == Path("."):
+            candidate = _DEPLOY_DIR / deploy_path
+            if candidate.exists():
+                deploy_path = candidate
+        if not deploy_path.exists():
+            raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
+        return load_deploy_config(deploy_path)
 
     @classmethod
     def create_from_model(
@@ -287,10 +298,12 @@ class StageConfigFactory:
         deploy_config_path: str | None,
     ) -> VllmOmniConfig | None:
         """Build the structured Omni config for a model/deploy pair."""
+        user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
         pipeline_cfg = cls.get_pipeline_config(
             model=model,
             trust_remote_code=trust_remote_code,
             deploy_config_path=deploy_config_path,
+            user_deploy_config=user_deploy_config,
         )
         if pipeline_cfg is None:
             return None
@@ -302,6 +315,7 @@ class StageConfigFactory:
         }
         return VllmOmniConfig.from_pipeline_config(
             pipeline_cfg,
+            user_deploy_config=user_deploy_config,
             deploy_config_path=deploy_config_path,
             cli_overrides=registry_cli_overrides,
         )
@@ -322,10 +336,12 @@ class StageConfigFactory:
         RFC #4021 will replace this transitional path as runtime consumers move
         to VllmOmniConfig.
         """
+        user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
         pipeline_cfg = cls.get_pipeline_config(
             model=model,
             trust_remote_code=trust_remote_code,
             deploy_config_path=deploy_config_path,
+            user_deploy_config=user_deploy_config,
         )
         if pipeline_cfg is None:
             return None, None
@@ -335,20 +351,20 @@ class StageConfigFactory:
             "trust_remote_code": trust_remote_code,
         }
         return cls._create_legacy_from_registry(
-            pipeline_cfg.model_type,
             pipeline_cfg,
             legacy_cli_overrides,
             deploy_config_path,
+            user_deploy_config=user_deploy_config,
             strategy_specs=strategy_specs,
         )
 
     @classmethod
     def _create_legacy_from_registry(
         cls,
-        registry_key: str,
         pipeline_cfg: PipelineConfig,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
+        user_deploy_config: DeployConfig | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
     ) -> tuple[list[StageConfig], str | None]:
         """Create current runtime StageConfigs from registry + deploy YAML.
@@ -360,20 +376,17 @@ class StageConfigFactory:
         load-balancer policy (``None`` when no strategy set one) travels with the
         stages instead of through a mutable out-param.
         """
-        # Resolve deploy config path
-        if deploy_config_path is None:
-            deploy_path = _DEPLOY_DIR / f"{registry_key}.yaml"
+        if user_deploy_config is not None:
+            deploy_cfg = user_deploy_config
         else:
-            deploy_path = Path(deploy_config_path)
-
-        if not deploy_path.exists():
-            logger.warning(
-                "Deploy config not found: %s — using pipeline defaults only",
-                deploy_path,
-            )
-            deploy_cfg = DeployConfig()
-        else:
-            deploy_cfg = load_deploy_config(deploy_path)
+            config_path = deploy_config_path or pipeline_cfg.default_deploy_config_path
+            if config_path is None:
+                deploy_cfg = DeployConfig()
+            else:
+                resolved_path = Path(config_path)
+                if not resolved_path.exists() and resolved_path.parent == Path("."):
+                    resolved_path = _DEPLOY_DIR / resolved_path
+                deploy_cfg = load_deploy_config(resolved_path)
 
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:

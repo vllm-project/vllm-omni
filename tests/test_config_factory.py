@@ -55,7 +55,6 @@ def clear_config_factory_caches():
     yield
     StageConfigFactory.get_hf_config.cache_clear()
     StageConfigFactory.try_infer_model_type.cache_clear()
-    StageConfigFactory.get_pipeline_config.cache_clear()
 
 
 Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
@@ -549,6 +548,7 @@ class TestPipelineDiscovery:
         )
         assert isinstance(pipeline, PipelineConfig)
         assert pipeline.model_type == "qwen3_omni_moe"
+        assert pipeline.default_deploy_config_path == "qwen3_omni_moe.yaml"
         assert len(pipeline.stages) == 3  # thinker + talker + code2wav
 
     def test_registry_resolver_qwen3_omni_thinker_only(self):
@@ -559,7 +559,18 @@ class TestPipelineDiscovery:
         )
         assert isinstance(pipeline, PipelineConfig)
         assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
+        assert pipeline.default_deploy_config_path is None
         assert len(pipeline.stages) == 1  # thinker only
+
+    @pytest.mark.parametrize(
+        "pipeline",
+        [registered for registered in OMNI_PIPELINES.values() if isinstance(registered, PipelineConfig)],
+        ids=lambda pipeline: pipeline.model_type,
+    )
+    def test_registered_default_deploy_config_exists(self, pipeline):
+        if pipeline.default_deploy_config_path is None:
+            return
+        assert Path(get_deploy_config_path(pipeline.default_deploy_config_path)).is_file()
 
     def test_registry_returns_none_for_unknown(self):
         """Unknown model_types aren't found and resolve to `None`."""
@@ -929,9 +940,8 @@ class TestPipelineRegistration:
                 deploy_config_path=None,
             )
 
-        assert mock_legacy.call_args.args[0] == resolved_type
-        assert mock_legacy.call_args.args[1].model_type == resolved_type
-        assert mock_legacy.call_args.args[2]["trust_remote_code"] is True
+        assert mock_legacy.call_args.args[0].model_type == resolved_type
+        assert mock_legacy.call_args.args[1]["trust_remote_code"] is True
 
     def test_resolve_when_autodetect_resolves_none(self):
         """Regression test for: https://github.com/vllm-project/vllm-omni/issues/4726"""
@@ -980,6 +990,31 @@ class TestPipelineRegistration:
         assert legacy_configs is not None
         assert len(legacy_configs) == 1
         assert legacy_configs[0].yaml_engine_args["model_arch"] == "DeployOnlyArch"
+
+    def test_structured_path_loads_explicit_deploy_config_once(self, clean_pipeline_registry, tmp_path):
+        pipeline_key = "single_load_pipeline"
+        register_pipeline(PipelineConfig(model_type=pipeline_key))
+        deploy_path = tmp_path / "single_load.yaml"
+        deploy_path.write_text(f"pipeline: {pipeline_key}\n", encoding="utf-8")
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "unregistered"
+
+        with (
+            patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()),
+            patch(
+                "vllm_omni.config.config_factory.load_deploy_config",
+                wraps=load_deploy_config,
+            ) as mock_load,
+        ):
+            StageConfigFactory.create_from_model(
+                "fake/model",
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=str(deploy_path),
+            )
+
+        mock_load.assert_called_once_with(deploy_path)
 
     def test_deploy_override_uses_correct_endpoint_restrictions(self, clean_pipeline_registry, tmp_path):
         """Ensure endpoint restrictions must come from the final pipeline
@@ -2027,7 +2062,6 @@ class TestAuraOmniDeploy:
         pipeline_cfg = resolve_pipeline_config("aura_omni")
 
         stages, _ = StageConfigFactory._create_legacy_from_registry(
-            "qwen3_tts",
             pipeline_cfg,
             cli_overrides={},
             deploy_config_path=str(Path(__file__).parent.parent / "vllm_omni" / "deploy" / "aura_omni.yaml"),
@@ -2249,7 +2283,6 @@ class TestSentinelDefaultPrecedence:
             Q3_OMNI_ALL_STAGES_HF_CONFIG,
         )
         stages, _ = StageConfigFactory._create_legacy_from_registry(
-            "qwen3_omni_moe",
             pipeline_cfg,
             cli_overrides=cli_overrides,
         )
