@@ -31,7 +31,7 @@ RUN pip config set global.index-url ${PIP_INDEX_URL} && \
 RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
-    pip install -v \
+    python3 -m pip install -v \
       "pytest>=7.0.0" \
       "pytest-asyncio>=0.21.0" \
       "pytest-cov>=4.0.0" \
