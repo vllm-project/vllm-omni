@@ -123,7 +123,7 @@ class _Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbed
 class _Qwen3TTSCode2Wav310P(qwen3_tts_code2wav.Qwen3TTSCode2Wav):
     """Qwen3-TTS Code2Wav specialized for the 310P NPU path."""
 
-    def _decoder_runtime_dtype(self, device: torch.device) -> torch.dtype:
+    def _npu_decoder_runtime_dtype(self, device: torch.device) -> torch.dtype:
         return _RUNTIME_DTYPE
 
 

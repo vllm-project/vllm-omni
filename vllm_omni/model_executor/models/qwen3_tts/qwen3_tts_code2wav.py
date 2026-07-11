@@ -26,7 +26,6 @@ logger = init_logger(__name__)
 
 _REF_CONTEXT_CACHE_MAX_ENTRIES = 4096
 _REF_CONTEXT_CACHE_MAX_BYTES = 64 * 1024 * 1024
-_ACL_FORMAT_FRACTAL_Z = 4
 
 
 def _codec_ids_from_payload_or_input(
@@ -580,29 +579,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             },
         )
 
-    def _decoder_runtime_dtype(self, device: torch.device) -> torch.dtype:
-        return torch.float32
-
-    def _prepare_npu_decoder_weights(self) -> None:
-        import torch_npu
-        from vllm_ascend.utils import maybe_trans_nz
-
-        linear_count = 0
-        conv_count = 0
-        with torch.no_grad():
-            # Pack linear and convolution weights once for NPU decode.
-            for module in self.decoder.modules():
-                if isinstance(module, nn.Linear):
-                    module.weight.data = maybe_trans_nz(module.weight.data)
-                    linear_count += 1
-                elif isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)) and module.groups == 1:
-                    module.weight.data = torch_npu.npu_format_cast(
-                        module.weight.data.contiguous(), _ACL_FORMAT_FRACTAL_Z
-                    )
-                    conv_count += 1
-
-        logger.info("Prepared NPU code2wav weights: linear=%d conv=%d", linear_count, conv_count)
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # The primary weights iterator contains no Code2Wav parameters.
         # Drain it so callers don't hang on an unconsumed generator.
@@ -626,9 +602,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         ).load_weights(subfolder_weights)
 
         device = self.vllm_config.device_config.device
-        self.decoder.to(device=device, dtype=self._decoder_runtime_dtype(device))
-        if device.type == "npu":
-            self._prepare_npu_decoder_weights()
+        self.decoder.to(device=device, dtype=torch.float32)
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(self.decoder, "precompute_snake_caches"):
