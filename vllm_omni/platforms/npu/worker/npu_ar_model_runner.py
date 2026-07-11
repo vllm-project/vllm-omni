@@ -46,6 +46,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -902,7 +903,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
-        seq_len = hidden_states.shape[0]
+        hidden_seq_len = int(hidden_states.shape[0])
+        scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -921,6 +923,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 logits_vocab = logits.shape[-1]
                 if self.input_batch.vocab_size > logits_vocab:
                     smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
+
+        # Drop min-tokens stop ids the head cannot emit (e.g. the text
+        # tokenizer EOS folded into all_stop_token_ids on a narrow codec
+        # talker head); they would index_put_ out of bounds (#4962).
+        if logits is not None:
+            sanitize_min_tokens_stop_ids(
+                self.input_batch.sampling_metadata.logitsprocs,
+                logits.shape[-1],
+            )
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -1141,7 +1152,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                                 start=start,
                                 end=end,
                                 pass_lists_through=False,
-                                seq_len=seq_len,
+                                seq_len=hidden_seq_len,
+                                scheduled_seq_len=scheduled_seq_len,
                             )
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))

@@ -121,6 +121,31 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                try:
+                    importlib.import_module("kernels")
+                    logger.info("Using HuggingFace kernels-backed attention backend '%s'", backend_upper)
+                except ImportError:
+                    if backend_upper == "FLASH_ATTN_HUB":
+                        logger.warning(
+                            "HuggingFace `kernels` library is not available. Falling back to local FLASH_ATTN."
+                        )
+                        backend_upper = "FLASH_ATTN"
+                    elif backend_upper == "FLASH_ATTN_3_HUB":
+                        logger.warning(
+                            "HuggingFace `kernels` library is not available. Falling back to local FLASH_ATTN."
+                        )
+                        backend_upper = "FLASH_ATTN"
+
+            if backend_upper == "FLASH_ATTN_3_HUB":
+                fa3_hub_supported = compute_capability is not None and compute_capability.major >= 9
+                if not fa3_hub_supported:
+                    logger.warning(
+                        "FLASH_ATTN_3_HUB requires a Hopper-class GPU with compute capability >= 9.0. "
+                        "Falling back to FLASH_ATTN_HUB."
+                    )
+                    backend_upper = "FLASH_ATTN_HUB"
+
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
                 if not compute_supported:
                     logger.warning(
@@ -224,16 +249,8 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
-        """Copied from upstream CudaPlatformBase with inductor-aware logic.
-
-        When inductor is active (compiling) use native as the default;
-        otherwise prefer vllm_c kernels where available.
-        """
-        from vllm.config.compilation import CompilationMode
-
-        cc = vllm_config.compilation_config
-        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
-        default = ["native"] if using_inductor else ["vllm_c", "native"]
+        """Prefer ``vllm_c`` CUDA kernels over ``native`` for diffusion IR ops."""
+        default = ["vllm_c", "native"]
 
         # Use oink if enabled for rms_norm
         # TODO(Laurawly/luka): remove this env var,

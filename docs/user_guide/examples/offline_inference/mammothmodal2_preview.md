@@ -22,7 +22,7 @@ Text-to-image now runs through the shared offline image example
 ```bash
 python examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_image_summarize.py \
   --model ./MammothModa2-Preview \
-  --stage-config ./vllm_omni/model_executor/stage_configs/mammoth_moda2_ar.yaml \
+  --deploy-config ./vllm_omni/deploy/mammoth_moda2_ar.yaml \
   --question "Summarize this image." \
   --image ./image.png
 ```
