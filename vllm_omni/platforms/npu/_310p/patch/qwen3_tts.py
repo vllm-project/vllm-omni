@@ -289,44 +289,15 @@ class _Qwen3TTSTalkerCodePredictor310P(
             talker_config=talker_config,
             prefix=prefix,
         )
-        self._static_310p_ready = False
         self._projected_codec_embed_weight = None
-
-    def _prepare_static_weights_310p(self) -> None:
-        if self._static_310p_ready:
-            return
-
-        self._lm_heads_list = list(self.lm_head)
-        self._codec_embeds_list = list(self.model.codec_embedding)
-
-        with torch.no_grad():
-            if not self._wrapper_config.use_parallel_embedding:
-                self._projected_codec_embed_weight = torch.stack(
-                    [self.small_to_mtp_projection(embed.weight).detach() for embed in self._codec_embeds_list],
-                    dim=0,
-                ).contiguous()
-
-        self._static_310p_ready = True
-
-    def _write_projected_codec_embed(
-        self,
-        proj_buf: torch.Tensor,
-        bsz: int,
-        step: int,
-        code: torch.Tensor,
-    ) -> None:
-        if self._projected_codec_embed_weight is not None:
-            proj_buf[:bsz, step + 1, :].copy_(
-                F.embedding(code.reshape(-1), self._projected_codec_embed_weight[step - 1])
-            )
-            return
-
-        new_embed = self._codec_embeds_list[step - 1](code)
-        proj_buf[:bsz, step + 1, :].copy_(self.small_to_mtp_projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1))
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
-        self._prepare_static_weights_310p()
+        with torch.no_grad():
+            self._projected_codec_embed_weight = torch.stack(
+                [self.small_to_mtp_projection(embed.weight).detach() for embed in self.model.codec_embedding],
+                dim=0,
+            ).contiguous()
         return loaded
 
     @torch.inference_mode()
@@ -341,20 +312,7 @@ class _Qwen3TTSTalkerCodePredictor310P(
         top_p: float = 1.0,
         generator: torch.Generator | None = None,
         generators: Sequence[torch.Generator | None] | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if layer0_code.device.type != "npu":
-            return super().forward(
-                layer0_code,
-                layer0_embed,
-                last_talker_hidden,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                generator=generator,
-                generators=generators,
-            )
-
+    ) -> torch.Tensor:
         bsz = int(layer0_code.shape[0])
         if generators is not None and len(generators) != bsz:
             raise ValueError(f"generators must have one entry per row: got {len(generators)} for batch {bsz}")
@@ -391,39 +349,18 @@ class _Qwen3TTSTalkerCodePredictor310P(
             initial_embeds = initial_embeds.to(dtype)
         proj_buf[:bsz, :2, :].copy_(projection(initial_embeds))
 
-        stored_mode = self._wrapper_config.sampling_mode == "stored"
-        if stored_mode:
-            s_top_k = self._top_k
-            s_top_p = self._top_p
-        else:
-            use_sampling = do_sample and temperature > 0
-            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
-            if use_sampling and top_p != 1.0:
-                raise NotImplementedError(
-                    "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
-                )
+        use_sampling = do_sample and temperature > 0
+        inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+        if use_sampling and top_p != 1.0:
+            raise NotImplementedError(
+                "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+            )
+        top_k_tensor = (
+            torch.full((bsz,), top_k, dtype=torch.int32, device=device) if use_sampling and top_k > 0 else None
+        )
 
-        top_k_tensor = None
-        top_p_tensor = None
-        if stored_mode:
-            top_k_hint = s_top_k if s_top_k > 0 else None
-            if s_top_k > 0:
-                top_k_tensor = torch.full((bsz,), s_top_k, dtype=torch.int32, device=device)
-            if s_top_p < 1.0:
-                top_p_tensor = torch.full((bsz,), s_top_p, dtype=dtype, device=device)
-        elif use_sampling:
-            top_k_hint = top_k if top_k > 0 else None
-            if top_k > 0:
-                top_k_tensor = torch.full((bsz,), top_k, dtype=torch.int32, device=device)
-        else:
-            top_k_hint = None
-
-        if self._wrapper_config.return_proj_buf:
-            all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
-            all_codes[:, 0] = layer0_code.reshape(bsz, -1)[:, :1]
-        else:
-            all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
-            all_codes[:, 0] = layer0_code.reshape(bsz)
+        all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
+        all_codes[:, 0] = layer0_code.reshape(bsz)
 
         for step in range(1, num_groups):
             graph_key: int | tuple[int, int] = padded_bsz
@@ -451,34 +388,21 @@ class _Qwen3TTSTalkerCodePredictor310P(
 
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
-            if stored_mode:
-                if top_k_tensor is not None or top_p_tensor is not None:
-                    logits = apply_top_k_top_p(logits, p=top_p_tensor, k=top_k_tensor, top_k=top_k_hint)
-                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+            if use_sampling:
+                scaled = logits * inv_temperature
+                if top_k_tensor is not None:
+                    scaled = apply_top_k_top_p(scaled, p=None, k=top_k_tensor, top_k=top_k)
+                probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
                 code = random_sample(probs, npu_generators)
             else:
-                if use_sampling:
-                    scaled = logits * inv_temperature
-                    if top_k_tensor is not None:
-                        scaled = apply_top_k_top_p(scaled, p=None, k=top_k_tensor, top_k=top_k_hint)
-                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = random_sample(probs, npu_generators)
-                else:
-                    code = logits.argmax(dim=-1, keepdim=True)
+                code = logits.argmax(dim=-1, keepdim=True)
 
-            if self._wrapper_config.return_proj_buf:
-                code = code.unsqueeze(-1)
+            all_codes[:, step] = code.reshape(bsz)
+            if step < num_groups - 1:
+                proj_buf[:bsz, step + 1, :].copy_(
+                    F.embedding(code.reshape(-1), self._projected_codec_embed_weight[step - 1])
+                )
 
-            if self._wrapper_config.return_proj_buf:
-                all_codes[:, step] = code
-            else:
-                all_codes[:, step] = code.reshape(bsz)
-
-            if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
-                self._write_projected_codec_embed(proj_buf, bsz, step, code)
-
-        if self._wrapper_config.return_proj_buf:
-            return all_codes, proj_buf[:bsz].clone()
         return all_codes
 
 
