@@ -19,7 +19,7 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate text-to-video with the LingBot dense preset.")
+    parser = argparse.ArgumentParser(description="Generate text-to-video with a LingBot-Video checkpoint.")
     parser.add_argument("--model", default="/home/models/lingbot-video-dense-1.3b")
     parser.add_argument("--prompt", default="a robotic arm picks up a red block")
     parser.add_argument("--negative-prompt", default="")

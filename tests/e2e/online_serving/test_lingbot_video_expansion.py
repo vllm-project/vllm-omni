@@ -4,8 +4,9 @@
 """
 L4 expansion coverage for ``robbyant/lingbot-video-dense-1.3b``.
 
-This is intentionally T2V-only. T2I, I2V, TI2V, MoE, and multi-GPU feature
-rows should be added in follow-up PRs when those paths are implemented.
+This file remains dense-only. Basic single-GPU MoE serving is covered by
+``test_lingbot_video_moe.py``; T2I, I2V, TI2V, and multi-GPU feature rows
+belong in follow-up PRs.
 """
 
 import json

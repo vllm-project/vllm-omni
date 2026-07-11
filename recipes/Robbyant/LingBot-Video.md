@@ -1,48 +1,54 @@
 # LingBot-Video
 
-> Native dense text-to-video serving for `robbyant/lingbot-video-dense-1.3b`
+> Native dense and MoE text-to-video serving for LingBot-Video
 
 ## Summary
 
 - Vendor: Robbyant
-- Model: `robbyant/lingbot-video-dense-1.3b`
+- Models: `robbyant/lingbot-video-dense-1.3b` and `robbyant/lingbot-video-moe-30b-a3b`
 - Task: Text-to-video generation
 - Mode: Offline generation and online serving with the OpenAI-compatible `/v1/videos` API
 - Maintainer: Community
 
 ## When to use this recipe
 
-Use this recipe when you want to run the dense LingBot-Video checkpoint with
-vLLM-Omni's native pipeline. The runtime path does not import the upstream
-`lingbot_video` Python package; it loads the checkpoint components directly
-with the in-tree `LingBotVideoPipeline`, dense DiT transformer, shared FlowUniPC
-scheduler, Qwen3-VL text encoder, and Wan VAE.
+Use this recipe when you want to run a dense or MoE LingBot-Video checkpoint
+with vLLM-Omni's native pipeline. The runtime path does not import the upstream
+`lingbot_video` Python package; it loads checkpoint components directly with
+the in-tree `LingBotVideoPipeline`, dense or routed-MoE DiT blocks, shared
+FlowUniPC scheduler, Qwen3-VL text encoder, and Wan VAE.
 
-This recipe is intentionally text-to-video only. Text-to-image, image-conditioned
-video, TI2V, MoE checkpoints, and fused-expert kernels are not covered here.
+This first MoE integration is intentionally text-to-video and single-GPU only.
+It targets the base BF16 checkpoint without its optional refiner or additional
+parallel, cache, quantized, or expert-kernel backends.
 
 ## References
 
 - Dense checkpoint: <https://huggingface.co/robbyant/lingbot-video-dense-1.3b>
+- MoE checkpoint: <https://huggingface.co/robbyant/lingbot-video-moe-30b-a3b>
 - Upstream project: <https://github.com/Robbyant/lingbot-video>
 - Related offline example: [`examples/offline_inference/text_to_video/text_to_video_lingbot.py`](../../examples/offline_inference/text_to_video/text_to_video_lingbot.py)
 - Related online video API docs: [`docs/serving/videos_api.md`](../../docs/serving/videos_api.md)
 
 ## Hardware Support
 
-This recipe documents the CUDA single-GPU dense checkpoint path. Multi-GPU
-parallelism, Cache-DiT, CPU offload, and the LingBot MoE path are not validated
-for this model in this PR.
+This recipe documents the CUDA single-GPU dense and BF16 MoE checkpoint paths.
+Multi-GPU parallelism, Cache-DiT, quantization, and CPU offload are not
+validated for LingBot-Video in this PR.
 
 ## GPU
 
-### 1 x NVIDIA L20X / A100 / H100
+### 1 x NVIDIA L20X
 
-The dense 1.3B checkpoint has been smoke-tested on a single NVIDIA L20X at a
-small validation shape (`192x320`, 9 frames, 2 steps). Use a larger GPU or lower
-resolution/frame count if your target workload runs out of memory.
+Both checkpoints have been smoke-tested on one NVIDIA L20X at `192x320`,
+9 frames, and 2 steps. The MoE smoke reserved approximately `67.70 GiB` of GPU
+memory, so use a GPU with at least about 70 GiB of available memory for this
+small validation shape. Larger resolutions, frame counts, or concurrent
+requests require additional headroom.
 
-#### Offline T2V
+The MoE path is validated with BF16 expert weights.
+
+#### Dense offline T2V
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -60,7 +66,25 @@ python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
   --fps 24
 ```
 
-#### Online Serving
+#### MoE offline T2V
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
+  --model robbyant/lingbot-video-moe-30b-a3b \
+  --prompt "a robotic arm picks up a red block" \
+  --output lingbot_moe_t2v.mp4 \
+  --height 192 \
+  --width 320 \
+  --num-frames 9 \
+  --num-inference-steps 2 \
+  --guidance-scale 3.0 \
+  --flow-shift 3.0 \
+  --seed 42 \
+  --fps 24
+```
+
+#### Online serving
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -69,6 +93,19 @@ vllm serve robbyant/lingbot-video-dense-1.3b \
   --model-class-name LingBotVideoPipeline \
   --port 8091
 ```
+
+For the MoE checkpoint, use the same single-GPU pipeline:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+vllm serve robbyant/lingbot-video-moe-30b-a3b \
+  --omni \
+  --model-class-name LingBotVideoPipeline \
+  --port 8091
+```
+
+When serving MoE, replace the request's `model` form value below with
+`robbyant/lingbot-video-moe-30b-a3b`.
 
 After the server is ready, submit a text-to-video job:
 
@@ -123,7 +160,7 @@ Local dense smoke run:
 - Request generation time: `0.2923s`
 - Peak reserved GPU memory: `14548 MiB`
 
-Local parity harness against the upstream repository:
+Local dense parity harness against the upstream repository:
 
 - Shape: `[9, 192, 320, 3]`
 - MAE: `0.0065238`
@@ -131,13 +168,35 @@ Local parity harness against the upstream repository:
 - PSNR: `41.77 dB`
 - Native request time: `0.2875s`
 
-Do not treat these as production benchmarks; they are draft-PR validation
-numbers for the small dense smoke configuration.
+Local MoE validation on one NVIDIA L20X used checkpoint revision
+`f2e538f64afe00cc4ae674db2aeb52e2945edfd5`:
+
+- Loaded all `977` transformer state keys and `30,084,506,176` parameters.
+- Router weights and correction biases stayed in FP32; routed and shared
+  expert weights loaded in BF16.
+- The complete 48-layer transformer forward returned finite
+  `[1, 16, 1, 8, 8]` BF16 output.
+- With both implementations using matched math SDPA backends, the complete
+  native transformer matched the upstream implementation bitwise
+  (`max_abs=0`, `mean_abs=0`).
+- An isolated sparse MoE block exercising the router, grouped experts, scatter
+  restore, and shared expert also matched the upstream implementation bitwise.
+- The native pipeline generated a 9-frame `192x320` MP4 in 2 steps with
+  `69326 MiB` (`67.70 GiB`) peak reserved GPU memory.
+- The online `/v1/videos` smoke created, polled, and downloaded the generated
+  MP4 successfully (`1 passed`).
+
+Do not treat these as production benchmarks; they are functional smoke plus
+controlled numerical-parity evidence for small validation inputs.
 
 ## Known Limitations
 
-- T2V only. T2I, I2V, and TI2V are not claimed by this PR.
-- Dense checkpoint only. MoE/fused-expert support belongs in a separate PR.
-- No Cache-DiT, TeaCache, tensor parallelism, sequence parallelism, CFG
-  parallelism, HSDP, CPU offload, or VAE patch parallelism validation yet.
+- T2V base-transformer inference only. T2I, I2V, TI2V, and the checkpoint's
+  optional `refiner/` transformer are not supported by this PR.
+- Only the BF16 MoE checkpoint is validated in this first integration.
+- No HSDP, tensor, sequence, expert, or CFG parallelism is claimed.
+- No Cache-DiT, TeaCache, CPU offload, VAE patch parallelism, or quantized
+  inference is claimed.
+- Optional Triton, SGLang, FP8, and alternative fused-expert backends from the
+  upstream project are not included.
 - Only one request per LingBot pipeline batch is currently supported.
