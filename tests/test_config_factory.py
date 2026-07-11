@@ -16,6 +16,7 @@ from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
 from vllm_omni.config.stage_config import (
     DeployConfig,
@@ -37,6 +38,15 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def clear_config_factory_caches():
+    """Clear cached classmethods from the StageConfigFactory to prevent test pollution."""
+    yield
+    StageConfigFactory.get_hf_config.cache_clear()
+    StageConfigFactory.try_infer_model_type.cache_clear()
+    StageConfigFactory.get_pipeline_config.cache_clear()
 
 
 Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
@@ -666,6 +676,43 @@ class TestPipelineRegistration:
         assert resolved_config is not None
         assert len(resolved_config) > 0
 
+    def test_deploy_override_uses_correct_endpoint_restrictions(self, clean_pipeline_registry, tmp_path):
+        """Ensure endpoint restrictions must come from the final pipeline
+        after deploy config overrides, not the auto-detected pipeline.
+        """
+        # Register two pipeline configs, where one has an endpoint restriction, and one doesn't
+        restriction = EndpointRestriction(
+            OmniServingCapability.COMPLETIONS,
+            "pipeline_a blocks completions",
+        )
+        pipe_a = PipelineConfig(model_type="detect_type", endpoint_restrictions=(restriction,))
+        pipe_b = PipelineConfig(model_type="override_type", endpoint_restrictions=())
+        register_pipeline(pipe_a)
+        register_pipeline(pipe_b)
+
+        # Create a config with the autodetected type, and write the
+        # deploy config specifying the override type to a temp path
+        class FakeConfig(PretrainedConfig):
+            model_type = "detect_type"
+
+        deploy_yaml = tmp_path / "override.yaml"
+        deploy_yaml.write_text("pipeline: override_type\n")
+
+        # Get the endpoint restrictions, passing the deploy config with the override
+        # type + patching the config for the detected type. Ensure that the endpoint
+        # restrictions correspond to the type in the deploy config.
+        with patch(
+            "vllm_omni.config.config_factory.get_config",
+            return_value=FakeConfig(),
+        ):
+            restrictions = StageConfigFactory.get_pipeline_endpoint_restrictions(
+                model="fake/model",
+                trust_remote_code=False,
+                deploy_config_path=str(deploy_yaml),
+            )
+
+        assert restrictions == ()
+
 
 class TestResolveScheduler:
     def test_all_execution_types_handled(self):
@@ -748,6 +795,32 @@ stages:
         deploy = load_deploy_config(deploy_path)
         runtime_config = deploy.stages[0].engine_extras["hf_overrides"]["voxcpm2_runtime_config"]
         assert runtime_config == expected_runtime_config
+
+    @pytest.mark.parametrize(
+        ("deploy_name", "pipeline_name", "stage_count", "final_output_type"),
+        [
+            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image"),
+            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text"),
+            ("omnivoice.yaml", "omnivoice", 1, "audio"),
+        ],
+    )
+    def test_load_new_registry_backed_deploy_configs(
+        self,
+        deploy_name: str,
+        pipeline_name: str,
+        stage_count: int,
+        final_output_type: str,
+    ):
+        deploy_path = Path(get_deploy_config_path(deploy_name))
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.pipeline == pipeline_name
+
+        with patch("vllm_omni.platforms.current_omni_platform") as platform:
+            platform.device_name = "cuda"
+            stages = merge_pipeline_deploy(OMNI_PIPELINES[pipeline_name], deploy)
+        assert len(stages) == stage_count
+        assert stages[-1].final_output is True
+        assert stages[-1].final_output_type == final_output_type
 
     def test_merge_pipeline_deploy(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
