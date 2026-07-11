@@ -123,7 +123,7 @@ After inserting the extra thinker stage, renumber the remaining stages:
     runtime:
       devices: "2"
     engine_input_source: [1]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
+    sync_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_token_only
 
   - stage_id: 3
     runtime:
@@ -131,7 +131,7 @@ After inserting the extra thinker stage, renumber the remaining stages:
     engine_args:
       max_num_seqs: 1
     engine_input_source: [2]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
+    sync_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_token_only
 ```
 
 Compared with the default Qwen3-Omni config:

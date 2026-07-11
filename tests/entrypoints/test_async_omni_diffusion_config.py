@@ -343,7 +343,7 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
     )
     mocker.patch(
         "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
-        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage]),
+        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage], None),
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)

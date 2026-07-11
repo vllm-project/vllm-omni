@@ -591,7 +591,7 @@ def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
     ns = p.parse_args(["--max-num-seqs", "999"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages, _ = StageConfigFactory._create_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
@@ -608,7 +608,7 @@ def test_omitted_default_not_in_runtime_overrides(mock_stages):
     ns = p.parse_args([])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages, _ = StageConfigFactory._create_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
@@ -630,7 +630,7 @@ def test_config_file_args_reach_runtime_overrides(mock_stages):
         ns = p.parse_args(["--config", "fake.yaml"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages, _ = StageConfigFactory._create_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
@@ -648,7 +648,7 @@ def test_per_stage_override_routes_correctly(mock_stages):
     ns = p.parse_args(["--stage-0-gpu-memory-utilization", "0.42"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages, _ = StageConfigFactory._create_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,
@@ -670,7 +670,7 @@ def test_explicit_args_omitted_from_yaml(mock_stages):
     ns = p.parse_args(["--enforce-eager"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
+    stages, _ = StageConfigFactory._create_from_registry(
         _TEST_MODEL,
         _TEST_PIPELINE,
         explicit_kwargs,

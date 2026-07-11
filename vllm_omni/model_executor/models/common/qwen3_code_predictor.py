@@ -28,6 +28,9 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+_GeneratorLike = torch.Generator | Sequence[torch.Generator | None] | None
+_UNIFORM_EPS = 1e-20
+
 
 # ===================================================================
 # HF-numerics-compatible layers for code predictor
@@ -605,6 +608,30 @@ class CodePredictorWrapper(nn.Module):
                 values.add(parsed)
         return values
 
+    @staticmethod
+    def _normalize_generators(
+        generator: _GeneratorLike, batch_size: int
+    ) -> torch.Generator | list[torch.Generator | None] | None:
+        if generator is None or isinstance(generator, torch.Generator):
+            return generator
+
+        row_generators = list(generator)
+        if len(row_generators) != batch_size:
+            raise ValueError(f"Expected {batch_size} per-row generators, but got {len(row_generators)}.")
+        return row_generators
+
+    @classmethod
+    def _sample_codes_gumbel(cls, logits: torch.Tensor, generator: _GeneratorLike = None) -> torch.Tensor:
+        """Sample ``logits`` via Gumbel-max with optional per-row generators."""
+        row_generators = cls._normalize_generators(generator, int(logits.shape[0]))
+        u = torch.empty_like(logits, dtype=torch.float32)
+        if isinstance(row_generators, list):
+            for row, row_generator in enumerate(row_generators):
+                u[row : row + 1].uniform_(_UNIFORM_EPS, 1.0 - _UNIFORM_EPS, generator=row_generator)
+        else:
+            u.uniform_(_UNIFORM_EPS, 1.0 - _UNIFORM_EPS, generator=row_generators)
+        return (logits.float() - torch.log(-torch.log(u))).argmax(dim=-1, keepdim=True)
+
     def _prefix_seq_lens(self, max_seq: int) -> list[int]:
         all_seq_lens = list(range(2, max_seq))
         if not self._prefix_graph_seq_lens:
@@ -780,6 +807,7 @@ class CodePredictorWrapper(nn.Module):
         bsz = int(layer0_code.shape[0])
         if generators is not None and len(generators) != bsz:
             raise ValueError(f"generators must have one entry per row: got {len(generators)} for batch {bsz}")
+        sample_generator: _GeneratorLike = generators if generators is not None else generator
         num_groups = self._num_groups
         device = layer0_code.device
 
@@ -856,9 +884,20 @@ class CodePredictorWrapper(nn.Module):
 
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
-            # Sample next code
+            # Sample next code via Gumbel-max.
+            #
+            # ``argmax_i(logits_i + Gumbel_i)`` with
+            # ``Gumbel_i = -log(-log(u_i)), u_i ~ Uniform(0, 1)`` is
+            # distributionally identical to sampling from ``softmax(logits)``.
+            # In this file the motivations are practical rather than graph
+            # related: it is measurably cheaper than ``softmax + multinomial``
+            # on the B x 2048 shapes used here, it stays well-defined for
+            # degenerate masked rows with a surviving finite entry (and is more
+            # defensive than ``multinomial`` around fully-masked/NaN inputs),
+            # and the helper below can honor either one batch generator or one
+            # generator per seeded row.
             if stored_mode:
-                # "stored" mode: top-k -> top-p -> softmax -> multinomial
+                # "stored" mode: top-k -> top-p -> Gumbel-max
                 if s_top_k > 0:
                     topk_vals, _ = logits.topk(s_top_k, dim=-1)
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
@@ -869,17 +908,15 @@ class CodePredictorWrapper(nn.Module):
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                code = self._multinomial(probs, generator, generators)
+                code = self._sample_codes_gumbel(logits, generator=sample_generator)
             else:
-                # "per_call" mode: temperature-scaled + top-k
+                # "per_call" mode: temperature-scaled + top-k -> Gumbel-max
                 if use_sampling:
                     scaled = logits * inv_temperature
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = self._multinomial(probs, generator, generators)
+                    code = self._sample_codes_gumbel(scaled, generator=sample_generator)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 
