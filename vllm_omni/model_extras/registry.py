@@ -46,6 +46,17 @@ from vllm_omni.model_extras.mammothmodal2_preview import (
 from vllm_omni.model_extras.mammothmodal2_preview import (
     build_text_to_image_prompt as build_mammothmoda2_text_to_image_prompt,
 )
+from vllm_omni.model_extras.ming_flash_omni import (
+    MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
+    MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
+    MING_FLASH_OMNI_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.ming_flash_omni import (
+    build_image_to_image_prompt as build_ming_flash_omni_image_to_image_prompt,
+)
+from vllm_omni.model_extras.ming_flash_omni import (
+    build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
+)
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -164,6 +175,13 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_output_params": MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
         "init_extra_args_for_non_diffusion_stages": MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
         "text_to_image_prompt_builder": build_mammothmoda2_text_to_image_prompt,
+    },
+    "MingImagePipeline": {
+        "extra_body_params": MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
+        "extra_output_params": MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MING_FLASH_OMNI_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
 }
 

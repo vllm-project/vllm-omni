@@ -35,7 +35,7 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 10
+    max_num_seqs: 64
     gpu_memory_utilization: 0.3
     trust_remote_code: true
     # Prefix caching on by default. The HS opt-out (talker only consumes the
@@ -43,9 +43,9 @@ stages:
     # PR make per-step bookkeeping negligible, and any text repetition across
     # requests (same voice or shared ref_audio) is a net throughput win.
     # Disable explicitly if memory headroom is tight on a single-GPU deploy.
-    enable_prefix_caching: true
+    enable_prefix_caching: false
     async_scheduling: true
-    max_num_batched_tokens: 512
+    max_num_batched_tokens: 32768
     max_model_len: 4096
     devices: "0"
     output_connectors:
@@ -54,7 +54,10 @@ stages:
       temperature: 0.9
       top_k: 50
       max_tokens: 4096
-      seed: 42
+      # Official qwen-tts generates the talker with min_new_tokens=2; without
+      # it, checkpoints that sample codec EOS on the first frame return empty
+      # audio (HTTP 400). See #4962.
+      min_tokens: 2
       repetition_penalty: 1.05
     subtalker_sampling_params:
       do_sample: true
@@ -64,7 +67,7 @@ stages:
 
   - stage_id: 1
     # Tuned for Base voice clone; CustomVoice / VoiceDesign are TTFA-optimal at 1.
-    max_num_seqs: 10
+    max_num_seqs: 64
     gpu_memory_utilization: 0.3
     enforce_eager: false
     trust_remote_code: true
@@ -85,7 +88,6 @@ stages:
       top_p: 1.0
       top_k: -1
       max_tokens: 65536
-      seed: 42
       repetition_penalty: 1.0
 
 platforms:
@@ -93,3 +95,8 @@ platforms:
     stages:
       - stage_id: 0
         enforce_eager: false
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        compilation_config:
+          cudagraph_mode: PIECEWISE

@@ -157,6 +157,27 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
 
+  - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"
+    depends_on: upload-ready-pipeline
+    steps:
+      - label: "Tiny Model Tests · Diffusion (base)"
+        commands:
+          - timeout 15m pytest -sv tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
+        agents:
+          # Ready label only runs the cases that don't need parallelism for tiny
+          # model tests, which is usually just a smoke test for TTI and I2I
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Engine&Model Executor Test"
     depends_on: upload-ready-pipeline
     commands:
