@@ -108,12 +108,13 @@ class _RotaryEmbedding(CustomOp):
         rope_theta = getattr(config, "rope_theta", 10000.0)
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
-        positions = torch.arange(max_seq, dtype=torch.float32)
-        freqs = torch.outer(positions, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        if current_omni_platform.is_npu():
+            max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
+            positions = torch.arange(max_seq, dtype=torch.float32)
+            freqs = torch.outer(positions, inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self.register_buffer("cos_cached", emb.cos(), persistent=False)
+            self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward_npu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.cos_cached[position_ids].to(dtype=x.dtype), self.sin_cached[position_ids].to(dtype=x.dtype)
@@ -186,40 +187,23 @@ class CodePredictorAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.register_buffer("_fusion_causal_mask", torch.empty(0, dtype=torch.bool), persistent=False)
         self._apply_rope = self._apply_native_rope
         self._attention = self._forward_native_attention
         if current_omni_platform.is_npu():
-            self._apply_rope = self._apply_npu_rope
-            self._attention = self._forward_npu_attention
-
-    def _project_qkv(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-        bsz, seq_len, _ = hidden_states.shape
-        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
-        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
-
-        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
-        return q, k, v, bsz, seq_len
-
-    def _ensure_npu_fusion_mask(self) -> torch.Tensor:
-        if self.max_seq > 2048:
-            raise ValueError(
-                "Qwen3-TTS code predictor NPU fusion attention uses a fixed 2048x2048 "
-                f"causal mask, but max_seq={self.max_seq} exceeds the mask size."
-            )
-        if self._fusion_causal_mask.numel() == 0:
+            if self.max_seq > 2048:
+                raise ValueError(
+                    "Qwen3-TTS code predictor NPU fusion attention uses a fixed 2048x2048 "
+                    f"causal mask, but max_seq={self.max_seq} exceeds the mask size."
+                )
             # Ascend SDPA is_causal migration example uses a fixed 2048x2048
             # compressed causal mask with sparse_mode=2.
-            self._fusion_causal_mask = torch.triu(
-                torch.ones(2048, 2048, dtype=torch.bool, device=self._fusion_causal_mask.device),
+            fusion_mask = torch.triu(
+                torch.ones(2048, 2048, dtype=torch.bool),
                 diagonal=1,
             )
-        return self._fusion_causal_mask
+            self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
+            self._apply_rope = self._apply_npu_rope
+            self._attention = self._forward_npu_attention
 
     def _forward_npu_attention(
         self,
@@ -242,7 +226,7 @@ class CodePredictorAttention(nn.Module):
                 .reshape(bsz, self.num_heads, seq_len, self.head_dim)
             )
 
-        mask = self._ensure_npu_fusion_mask()
+        mask = self._fusion_causal_mask
         mask = mask.contiguous()
         q_f = q_f.contiguous()
         k_f = k_f.contiguous()
@@ -312,7 +296,13 @@ class CodePredictorAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        q, k, v, bsz, seq_len = self._project_qkv(hidden_states)
+        bsz, seq_len, _ = hidden_states.shape
+        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
+        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
 
         cos, sin = position_embeddings
         # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
