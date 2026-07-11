@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-# check_model_inputs moved to transformers.utils.generic in transformers>=5.x
-from transformers.utils.generic import check_model_inputs
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     ALL_ATTENTION_FUNCTIONS,
     BaseModelOutputWithPast,
@@ -39,6 +37,9 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextRMSNorm as HFQwen3VLTextRMSNorm,
 )
+
+# check_model_inputs moved to transformers.utils.generic in transformers>=5.x
+from transformers.utils.generic import check_model_inputs
 
 
 class Qwen3VLTextRMSNorm(HFQwen3VLTextRMSNorm):
