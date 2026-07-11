@@ -552,4 +552,8 @@ class Gr00tN1d7Processor(ProcessorMixin):
         return cls(**processor_kwargs, transformers_loading_kwargs=transformers_loading_kwargs)
 
 
-AutoProcessor.register("Gr00tN1d7", Gr00tN1d7Processor)
+# Register with the config CLASS (not a str): transformers>=5.x AutoProcessor.register
+# requires a PretrainedConfig subclass as the mapping key.
+from vllm_omni.diffusion.models.gr00t.configs.gr00t_n1d7 import Gr00tN1d7Config  # noqa: E402
+
+AutoProcessor.register(Gr00tN1d7Config, Gr00tN1d7Processor)
