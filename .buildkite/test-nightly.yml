@@ -650,6 +650,8 @@ steps:
             tests/e2e/online_serving/test_qwen_image_edit_expansion.py
             tests/e2e/online_serving/test_qwen_image_layered_expansion.py
             tests/e2e/online_serving/test_bagel_expansion.py
+            tests/e2e/online_serving/test_krea2_expansion.py
+            tests/e2e/offline_inference/test_krea2_expansion.py
             -m "full_model and diffusion and H100 and not distributed_cuda"
             --run-level "full_model"
         agents:
@@ -693,6 +695,7 @@ steps:
             pytest -sv
             tests/e2e/online_serving/test_qwen_image_expansion.py
             tests/e2e/online_serving/test_qwen_image_edit_expansion.py
+            tests/e2e/offline_inference/test_krea2_expansion.py
             -m "full_model and diffusion and H100 and distributed_cuda"
             --run-level "full_model"
         agents:
