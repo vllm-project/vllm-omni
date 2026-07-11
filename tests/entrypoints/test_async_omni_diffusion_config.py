@@ -371,3 +371,27 @@ def test_default_stage_config_includes_quantization_config():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"quantization_config": quantization_config})[0]
 
     assert stage_cfg["engine_args"]["quantization_config"] == quantization_config
+
+
+def test_resolve_stage_configs_injects_quantization_config_into_diffusion_stage(mocker):
+    fake_diffusion_stage = SimpleNamespace(
+        stage_type="diffusion",
+        engine_args=SimpleNamespace(quantization_config=None),
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        return_value=("dummy.yaml", [fake_diffusion_stage], None),
+    )
+
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "dummy-model",
+        {
+            "stage_configs_path": "dummy.yaml",
+            "quantization_config": {"method": "bitsandbytes"},
+        },
+    )
+
+    assert stage_configs[0].engine_args.quantization_config == {"method": "bitsandbytes"}
