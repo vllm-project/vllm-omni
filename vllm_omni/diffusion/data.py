@@ -515,7 +515,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     client-side. Returns ``None`` if the pipeline can't be determined.
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
-    from vllm_omni.diffusion.model_resolvers.lance import resolve_lance_model_class_name
+    from vllm_omni.diffusion.model_resolvers import resolve_model_class_resolution
 
     if not model:
         return None
@@ -535,30 +535,10 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
         cfg = get_hf_file_to_dict("config.json", model) or {}
     except Exception:
         cfg = {}
-    model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
-
-    if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-        return "BagelPipeline"
-    lance_model_class = resolve_lance_model_class_name(model, cfg)
-    if lance_model_class is not None:
-        return lance_model_class
-    if model_type == "neo_chat":
-        return "SenseNovaU1Pipeline"
-    if "BailingMM2NativeForConditionalGeneration" in architectures or model_type in (
-        "bailingmm_moe_v2_lite",
-        "ming_flash_omni",
-        "ming_flash_omni_thinker",
-    ):
-        return "MingImagePipeline"
-    if model_type == "nextstep":
-        return "NextStep11Pipeline"
-    if model_type == "s2v":
-        return "WanS2VPipeline"
-    if model_type == "vla":
-        from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
-
-        return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+    resolution = resolve_model_class_resolution(model, cfg)
+    if resolution.handled:
+        return resolution.model_class_name
     if len(architectures) == 1:
         return architectures[0]
     return None
@@ -1020,6 +1000,14 @@ class OmniDiffusionConfig:
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
+    def _apply_resolved_model_class(self, model_class_name: str) -> None:
+        # Treat resolver-selected classes as authoritative for known model
+        # families so both resolution entrypoints stay consistent, even if a
+        # caller passed a stale explicit class name before config enrichment.
+        self.model_class_name = model_class_name
+        self.set_tf_model_config(TransformerConfig())
+        self.update_multimodal_support()
+
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.
 
@@ -1028,7 +1016,7 @@ class OmniDiffusionConfig:
         so we fall back to reading that and mapping model_type manually.
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
-        from vllm_omni.diffusion.model_resolvers.lance import resolve_lance_model_class_name
+        from vllm_omni.diffusion.model_resolvers import resolve_model_class_resolution
 
         # Default model_class_name for diffusers adapter
         if self.model_class_name is None and self.diffusion_load_format == "diffusers":
@@ -1079,85 +1067,30 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
-                    # Lance ships its top-level config.json one directory above
-                    # the per-checkpoint subfolders (``Lance_3B/`` or
-                    # ``Lance_3B_Video/``).  Try to recover that case before
-                    # raising.
-                    lance_model_class = resolve_lance_model_class_name(self.model, None)
-                    if lance_model_class is not None:
-                        self.model_class_name = lance_model_class
-                        self.set_tf_model_config(TransformerConfig())
-                        self.update_multimodal_support()
+                    resolution = resolve_model_class_resolution(self.model, None)
+                    if resolution.model_class_name is not None:
+                        self._apply_resolved_model_class(resolution.model_class_name)
                         return
                     raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
-                model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
+                resolution = resolve_model_class_resolution(self.model, cfg)
+                if resolution.model_class_name is not None:
+                    self._apply_resolved_model_class(resolution.model_class_name)
+                elif resolution.handled:
+                    raise
+                elif architectures and len(architectures) == 1:
+                    architecture = architectures[0]
+                    from vllm_omni.diffusion.registry import DiffusionModelRegistry
 
-                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                    self.model_class_name = "BagelPipeline"
-                    self.set_tf_model_config(TransformerConfig())
-                    self.update_multimodal_support()
-                else:
-                    lance_model_class = resolve_lance_model_class_name(self.model, cfg)
-                    if lance_model_class is not None:
-                        # Lance ships a non-HF top-level config.json (model_name only)
-                        # plus per-component subfolders; resolve to the Lance pipeline.
-                        # Also accept --model pointing directly at the ``Lance_3B`` or
-                        # ``Lance_3B_Video`` subfolder by walking up to the repo root.
-                        self.model_class_name = lance_model_class
-                        self.set_tf_model_config(TransformerConfig())
-                        self.update_multimodal_support()
-                    elif model_type == "neo_chat":
-                        self.model_class_name = "SenseNovaU1Pipeline"
-                        self.tf_model_config = TransformerConfig()
-                        self.update_multimodal_support()
-                    elif "BailingMM2NativeForConditionalGeneration" in architectures or model_type in (
-                        "bailingmm_moe_v2_lite",
-                        "ming_flash_omni",
-                        "ming_flash_omni_thinker",
+                    if (
+                        self.model_class_name is None
+                        or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
                     ):
-                        # Ming-flash-omni-2.0 — imagegen stage uses the custom
-                        # ``MingImagePipeline`` (ZImage DiT + Qwen2 connector). See
-                        # vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py.
-                        self.model_class_name = "MingImagePipeline"
-                        self.tf_model_config = TransformerConfig()
-                        self.update_multimodal_support()
-                    elif model_type == "nextstep":
-                        if self.model_class_name is None:
-                            self.model_class_name = "NextStep11Pipeline"
-                        self.set_tf_model_config(TransformerConfig())
-                        self.update_multimodal_support()
-                    elif model_type == "s2v":
-                        if self.model_class_name is None:
-                            self.model_class_name = "WanS2VPipeline"
-                        self.tf_model_config = TransformerConfig()
-                        self.update_multimodal_support()
-                    elif model_type == "Gr00tN1d7" or "Gr00tN1d7" in architectures:
-                        self.model_class_name = "Gr00tN1d7Pipeline"
-                        self.set_tf_model_config(TransformerConfig())
-                        self.update_multimodal_support()
-                    elif model_type == "vla":
-                        from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
-
-                        if _looks_like_dreamzero(self.model):
-                            self.model_class_name = "DreamZeroPipeline"
-                            self.set_tf_model_config(TransformerConfig())
-                            self.update_multimodal_support()
-                        else:
-                            raise
-                    elif architectures and len(architectures) == 1:
-                        architecture = architectures[0]
-                        from vllm_omni.diffusion.registry import DiffusionModelRegistry
-
-                        if (
-                            self.model_class_name is None
-                            or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
-                        ):
-                            self.model_class_name = architecture
-                    else:
-                        raise
+                        self.model_class_name = architecture
+                else:
+                    raise
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
