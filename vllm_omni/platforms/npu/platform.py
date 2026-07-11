@@ -37,8 +37,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
             apply_qwen3_tts_code2wav_patch,
         )
+        from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
+            apply_qwen3_tts_tokenizer_v2_patch,
+        )
 
         apply_qwen3_tts_code2wav_patch()
+        apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
 
     @classmethod
