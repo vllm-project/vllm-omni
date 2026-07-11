@@ -349,15 +349,32 @@ class _Qwen3TTSTalkerCodePredictor310P(
             initial_embeds = initial_embeds.to(dtype)
         proj_buf[:bsz, :2, :].copy_(projection(initial_embeds))
 
-        use_sampling = do_sample and temperature > 0
-        inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
-        if use_sampling and top_p != 1.0:
-            raise NotImplementedError(
-                "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
-            )
-        top_k_tensor = (
-            torch.full((bsz,), top_k, dtype=torch.int32, device=device) if use_sampling and top_k > 0 else None
-        )
+        stored_mode = self._wrapper_config.sampling_mode == "stored"
+        if stored_mode:
+            s_top_k = self._top_k
+            s_top_p = self._top_p
+        else:
+            use_sampling = do_sample and temperature > 0
+            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+            if use_sampling and top_p != 1.0:
+                raise NotImplementedError(
+                    "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+                )
+
+        top_k_tensor = None
+        top_p_tensor = None
+        if stored_mode:
+            top_k_hint = s_top_k if s_top_k > 0 else None
+            if s_top_k > 0:
+                top_k_tensor = torch.full((bsz,), s_top_k, dtype=torch.int32, device=device)
+            if s_top_p < 1.0:
+                top_p_tensor = torch.full((bsz,), s_top_p, dtype=dtype, device=device)
+        elif use_sampling:
+            top_k_hint = top_k if top_k > 0 else None
+            if top_k > 0:
+                top_k_tensor = torch.full((bsz,), top_k, dtype=torch.int32, device=device)
+        else:
+            top_k_hint = None
 
         all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
         all_codes[:, 0] = layer0_code.reshape(bsz)
@@ -388,14 +405,20 @@ class _Qwen3TTSTalkerCodePredictor310P(
 
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
-            if use_sampling:
-                scaled = logits * inv_temperature
-                if top_k_tensor is not None:
-                    scaled = apply_top_k_top_p(scaled, p=None, k=top_k_tensor, top_k=top_k)
-                probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+            if stored_mode:
+                if top_k_tensor is not None or top_p_tensor is not None:
+                    logits = apply_top_k_top_p(logits, p=top_p_tensor, k=top_k_tensor, top_k=top_k_hint)
+                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
                 code = random_sample(probs, npu_generators)
             else:
-                code = logits.argmax(dim=-1, keepdim=True)
+                if use_sampling:
+                    scaled = logits * inv_temperature
+                    if top_k_tensor is not None:
+                        scaled = apply_top_k_top_p(scaled, p=None, k=top_k_tensor, top_k=top_k_hint)
+                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                    code = random_sample(probs, npu_generators)
+                else:
+                    code = logits.argmax(dim=-1, keepdim=True)
 
             all_codes[:, step] = code.reshape(bsz)
             if step < num_groups - 1:
