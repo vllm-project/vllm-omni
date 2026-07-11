@@ -35,7 +35,9 @@ def test_standard_model_families_resolve_model_class(monkeypatch, cfg, expected)
 def test_resolve_model_class_name_falls_back_to_single_architecture(monkeypatch):
     monkeypatch.setattr(
         "vllm.transformers_utils.config.get_hf_file_to_dict",
-        lambda path, _model: None if path == "model_index.json" else {"model_type": "unknown", "architectures": ["FooPipeline"]},
+        lambda path, _model: None
+        if path == "model_index.json"
+        else {"model_type": "unknown", "architectures": ["FooPipeline"]},
     )
 
     assert resolve_model_class_name("fake-model") == "FooPipeline"
