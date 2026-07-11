@@ -102,6 +102,8 @@ class StageDiffusionProc:
         """
         if self._engine is None:
             return False
+        if hasattr(self._engine, "is_backend_dead"):
+            return self._engine.is_backend_dead()
         executor = getattr(self._engine, "executor", None)
         if executor is None:
             return False

@@ -627,6 +627,29 @@ class StageRuntime:
         """Return the master server for local distributed launches, if any."""
         return None
 
+    @staticmethod
+    def _stage_enables_runtime_v2(stage_cfg: Any) -> bool:
+        """Return True when this diffusion stage opts into runtime_v2.
+
+        runtime_v2 requires the engine to run in ``StageDiffusionProc`` instead
+        of the API frontend, so it must not take the inline
+        single-stage/single-replica shortcut. The flag is set on the
+        stage's ``engine_args`` (``enable_runtime_v2``) by the top-level
+        ``Omni(enable_runtime_v2=...)`` opt-in (see
+        ``AsyncOmniEngine._create_default_diffusion_stage_cfg``); it is the same
+        value that ``build_diffusion_config`` surfaces as
+        ``od_config.enable_runtime_v2``. Read it directly (side-effect-free)
+        rather than building the od_config here, which mutates ``engine_args``.
+        """
+        engine_args = getattr(stage_cfg, "engine_args", None)
+        if engine_args is None:
+            return False
+        if hasattr(engine_args, "get"):
+            value = engine_args.get("enable_runtime_v2", False)
+        else:
+            value = getattr(engine_args, "enable_runtime_v2", False)
+        return bool(value)
+
     def _initialize_local_diffusion_replica(
         self,
         plan: ReplicaInitPlan,
@@ -641,13 +664,18 @@ class StageRuntime:
                 if omni_conn_cfg:
                     inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
                 inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self._stage_configs)
+                # runtime_v2 runs the engine in StageDiffusionProc, so force the
+                # non-inline path even when the legacy runtime would use its
+                # single-stage/single-replica shortcut.
+                enable_runtime_v2 = self._stage_enables_runtime_v2(plan.stage_cfg)
+                use_inline = (self._num_stages == 1 and plan.num_replicas == 1) and not enable_runtime_v2
                 client, resources = launch_diffusion_stage_replica(
                     model=self._model,
                     stage_config=plan.stage_cfg,
                     metadata=plan.metadata,
                     stage_init_timeout=stage_init_timeout,
                     batch_size=self._diffusion_batch_size,
-                    use_inline=self._num_stages == 1 and plan.num_replicas == 1,
+                    use_inline=use_inline,
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
                     omni_coordinator_address=self._get_coordinator_address(),

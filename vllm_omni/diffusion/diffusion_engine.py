@@ -173,13 +173,36 @@ class DiffusionEngine:
             self.od_config.step_execution = True
             self.step_execution = True
 
-        executor_class = DiffusionExecutor.get_class(od_config)
-        self.executor = executor_class(od_config)
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
-        self.scheduler.initialize(od_config)
-        self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
+        # runtime_v2 replaces the legacy scheduler/executor behind an opt-in flag.
+        self.enable_runtime_v2 = bool(getattr(od_config, "enable_runtime_v2", False))
+        if getattr(self, "enable_runtime_v2", False):
+            from vllm_omni.diffusion.runtime_v2.runner import RuntimeV2Runner
+
+            logger.info(
+                "runtime_v2 active: enable_runtime_v2=%s denoise_chunk_size=%s scheduler_policy=%s",
+                self.enable_runtime_v2,
+                int(getattr(od_config, "runtime_v2_denoise_chunk_size", 1) or 1),
+                str(getattr(od_config, "runtime_v2_scheduler_policy", "fcfs")),
+            )
+            self.runtime_v2_runner = RuntimeV2Runner(
+                pipeline=None,
+                default_step_chunk_size=int(getattr(od_config, "runtime_v2_denoise_chunk_size", 1) or 1),
+                scheduler_policy=str(getattr(od_config, "runtime_v2_scheduler_policy", "fcfs")),
+                omni_diffusion_config=od_config,
+            )
+            self.scheduler = None
+            self.executor = None
+            self.execute_fn = None
+            self.supports_request_batch = False
+        else:
+            self.runtime_v2_runner = None
+            executor_class = DiffusionExecutor.get_class(od_config)
+            self.executor = executor_class(od_config)
+            self.scheduler: SchedulerInterface = scheduler or (
+                StepScheduler() if self.step_execution else RequestScheduler()
+            )
+            self.scheduler.initialize(od_config)
+            self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
         self.main_loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: threading.Event | None = None
         self.worker_thread: threading.Thread | None = None
@@ -193,16 +216,22 @@ class DiffusionEngine:
         self._cv = threading.Condition(self._rpc_lock)
         self._out_queue: dict[str, asyncio.Future] = {}
         self._out_queue_streaming: dict[str, asyncio.Queue[DiffusionOutput]] = {}
+        self._runtime_v2_inflight: set[str] = set()
+        self._runtime_v2_fatal_error: BaseException | None = None
+        # GlobalScheduler is lock-free. Submit and abort commands are handed to
+        # the busy-loop thread, which is its sole owner.
+        self._runtime_v2_commands: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._closed = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        if self.step_execution:
-            self.execute_fn = self.executor.execute_step
-        elif self.supports_request_batch:
-            self.execute_fn = self.executor.execute_batch
-        else:
-            self.execute_fn = self.executor.execute_request
+        if not self.enable_runtime_v2:
+            if self.step_execution:
+                self.execute_fn = self.executor.execute_step
+            elif self.supports_request_batch:
+                self.execute_fn = self.executor.execute_batch
+            else:
+                self.execute_fn = self.executor.execute_request
 
         if self.supports_request_batch:
             logger.info(
@@ -211,12 +240,14 @@ class DiffusionEngine:
                 getattr(od_config, "request_batch_max_wait_ms", None),
             )
 
-        try:
-            self._dummy_run()
-        except Exception as e:
-            logger.error(f"Dummy run failed: {e}")
-            self.close()
-            raise e
+        # runtime_v2 warms lazily on the first request.
+        if not self.enable_runtime_v2:
+            try:
+                self._dummy_run()
+            except Exception as e:
+                logger.error(f"Dummy run failed: {e}")
+                self.close()
+                raise e
 
     async def _check_and_start_background_loop(self):
         if self._closed:
@@ -375,6 +406,12 @@ class DiffusionEngine:
         )
 
     def _busy_loop(self):
+        # runtime_v2 owns its own scheduler/execution; the legacy
+        # schedule()/execute_fn()/update_from_output() body would dereference the
+        # None legacy attributes, so the worker thread runs the runtime_v2 loop.
+        if getattr(self, "enable_runtime_v2", False):
+            self._runtime_v2_busy_loop()
+            return
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
@@ -439,6 +476,123 @@ class DiffusionEngine:
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _runtime_v2_busy_loop(self) -> None:
+        """Drive the lock-free runtime_v2 runner from one owner thread."""
+        while not self.stop_event.is_set():
+            with self._cv:
+                while (
+                    not self._runtime_v2_inflight and self._runtime_v2_commands.empty() and not self.stop_event.is_set()
+                ):
+                    self._cv.wait(timeout=1.0)
+                if self.stop_event.is_set():
+                    break
+
+            while True:
+                try:
+                    operation, payload = self._runtime_v2_commands.get_nowait()
+                except queue.Empty:
+                    break
+                if operation == "submit":
+                    try:
+                        self.runtime_v2_runner.submit(payload)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("runtime_v2 submit failed for %s", payload.request_id, exc_info=True)
+                        try:
+                            self.runtime_v2_runner.abort_request(payload.request_id)
+                        except Exception as cleanup_exc:  # noqa: BLE001
+                            logger.error("runtime_v2 submit cleanup failed for %s", payload.request_id, exc_info=True)
+                            self._fail_runtime_v2_backend(
+                                cleanup_exc,
+                                list(self._runtime_v2_inflight),
+                            )
+                            break
+                        self._resolve_runtime_v2_request(payload.request_id, DiffusionOutput.from_exception(exc))
+                elif operation == "abort":
+                    try:
+                        self.runtime_v2_runner.abort_request(payload)
+                        output = DiffusionOutput(aborted=True, abort_message=f"Request {payload} aborted.")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("runtime_v2 abort failed for %s", payload, exc_info=True)
+                        self._fail_runtime_v2_backend(exc, list(self._runtime_v2_inflight))
+                        break
+                    self._resolve_runtime_v2_request(payload, output)
+
+            if self.stop_event.is_set():
+                break
+
+            with self._cv:
+                inflight = list(self._runtime_v2_inflight)
+            if not inflight:
+                continue
+
+            try:
+                self.runtime_v2_runner.poll_once(timeout_s=0.05)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("runtime_v2 poll_once failed", exc_info=True)
+                self._fail_runtime_v2_backend(exc, inflight)
+                break
+
+            for rid in inflight:
+                if self.stop_event.is_set():
+                    break
+                try:
+                    status, payload = self.runtime_v2_runner.get_request_status(rid)
+                except Exception as exc:  # noqa: BLE001 - propagate to caller
+                    logger.error("runtime_v2 get_request_status failed for %s", rid, exc_info=True)
+                    self._fail_runtime_v2_backend(exc, inflight)
+                    break
+                if status == "pending":
+                    continue
+                if status == "finished":
+                    try:
+                        output = self._materialize_runtime_v2_output(payload)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("runtime_v2 output materialization failed for %s", rid, exc_info=True)
+                        output = DiffusionOutput.from_exception(exc)
+                else:  # "failed"
+                    output = DiffusionOutput(error=str(payload) if payload is not None else "runtime_v2 request failed")
+                try:
+                    self.runtime_v2_runner.release_request(rid)
+                except Exception:  # noqa: BLE001
+                    logger.debug("runtime_v2 release_request failed for %s", rid, exc_info=True)
+                self._resolve_runtime_v2_request(rid, output)
+
+    def _fail_runtime_v2_backend(
+        self,
+        exc: BaseException,
+        request_ids: Iterable[str],
+    ) -> None:
+        """Latch a control-plane failure and fail every affected request."""
+        self._runtime_v2_fatal_error = exc
+        failure = DiffusionOutput.from_exception(exc)
+        for request_id in dict.fromkeys(request_ids):
+            try:
+                self.runtime_v2_runner.abort_request(request_id)
+            except Exception:  # noqa: BLE001
+                logger.debug("runtime_v2 fatal cleanup failed for %s", request_id, exc_info=True)
+            self._resolve_runtime_v2_request(request_id, failure)
+        self.stop_event.set()
+        with self._cv:
+            self._cv.notify_all()
+
+    def _materialize_runtime_v2_output(self, payload: Any) -> DiffusionOutput:
+        """Materialize a terminal output and release its shared-memory handles."""
+        output = payload if isinstance(payload, DiffusionOutput) else DiffusionOutput(output=payload)
+        if isinstance(output, DiffusionOutput):
+            from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
+
+            unpack_diffusion_output_shm(output)
+        return output
+
+    def _resolve_runtime_v2_request(self, request_id: str, output: DiffusionOutput) -> None:
+        """Resolve a runtime_v2 request future and stop tracking it."""
+        with self._cv:
+            self._runtime_v2_inflight.discard(request_id)
+            fut = self._out_queue.pop(request_id, None)
+        if fut is None:
+            return
+        self._complete_future(fut, output)
 
     def _wait_for_request_batch_admission_locked(self) -> None:
         """Wait for compatible requests to accumulate before scheduling a wave.
@@ -668,6 +822,8 @@ class DiffusionEngine:
         return engine_class(config, scheduler=scheduler)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
+        if getattr(self, "enable_runtime_v2", False):
+            return self._add_request_runtime_v2(request)
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -681,6 +837,27 @@ class DiffusionEngine:
                 self._out_queue_streaming[request_id] = queue
             self._cv.notify_all()
 
+        return request_id
+
+    def _add_request_runtime_v2(self, request: OmniDiffusionRequest) -> str:
+        """Register a request and hand it to the runtime_v2 owner thread."""
+        if self.od_config.streaming_output:
+            raise NotImplementedError("runtime_v2 does not support streaming_output in PR1")
+        if getattr(request, "kv_sender_info", None) is not None:
+            raise NotImplementedError("runtime_v2 (PR1) does not support upstream KV transfer")
+        if getattr(request.sampling_params, "lora_request", None) is not None:
+            raise NotImplementedError("runtime_v2 (PR1) does not support LoRA requests")
+        request_id = request.request_id
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("DiffusionEngine is closed.")
+            if self._runtime_v2_fatal_error is not None:
+                raise RuntimeError("runtime_v2 backend has failed") from self._runtime_v2_fatal_error
+            fut = self.main_loop.create_future()
+            self._out_queue[request_id] = fut
+            self._runtime_v2_inflight.add(request_id)
+            self._runtime_v2_commands.put(("submit", request))
+            self._cv.notify_all()
         return request_id
 
     async def get_result(self, request_id: str) -> DiffusionOutput:
@@ -728,6 +905,8 @@ class DiffusionEngine:
         return self.get_streaming_result(request_id)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        if getattr(self, "enable_runtime_v2", False):
+            raise NotImplementedError("runtime_v2 requires the asynchronous request path")
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -892,6 +1071,12 @@ class DiffusionEngine:
         """
         assert isinstance(method, str), "Only string method names are supported for now"
 
+        if getattr(self, "enable_runtime_v2", False):
+            # The legacy executor does not exist in runtime_v2 mode; the runner's
+            # collective_rpc is not wired in PR1. Fail loudly rather than
+            # dereferencing the None executor.
+            raise NotImplementedError("collective_rpc is not supported in runtime_v2 mode (PR1)")
+
         # If the busy loop hasn't started yet (e.g. during _dummy_run in
         # __init__, or before the first async request after construction),
         # there is no busy-loop thread to drain the RPC queue. Fall back to
@@ -932,6 +1117,15 @@ class DiffusionEngine:
         Mirrors :meth:`async_add_req_and_wait_for_response`: enqueue a task
         keyed by a future and ``await`` the result without blocking the loop.
         """
+        assert isinstance(method, str), "Only string method names are supported for now"
+
+        if getattr(self, "enable_runtime_v2", False):
+            # In runtime_v2 mode the legacy executor / _rpc_queue drain path does
+            # not run (the busy loop is _runtime_v2_busy_loop, which never calls
+            # _process_rpc_queue). Enqueuing here would hang the awaiting caller
+            # forever. Fail fast, mirroring the sync collective_rpc guard.
+            raise NotImplementedError("async_collective_rpc is not supported in runtime_v2 mode (PR1)")
+
         await self._check_and_start_background_loop()
         task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
         aio_fut = asyncio.wrap_future(task.future)
@@ -1021,12 +1215,39 @@ class DiffusionEngine:
         else:
             self._loop_started = False
 
-        self.scheduler.close()
-        self.executor.shutdown()
+        if getattr(self, "enable_runtime_v2", False):
+            # runtime_v2 owns its scheduler + worker pool; shut the runner down
+            # in place of the legacy scheduler.close()/executor.shutdown().
+            self.runtime_v2_runner.shutdown()
+        else:
+            self.scheduler.close()
+            self.executor.shutdown()
         self._shutdown_complete = True
+
+    def is_backend_dead(self) -> bool:
+        if getattr(self, "enable_runtime_v2", False):
+            if getattr(self, "_runtime_v2_fatal_error", None) is not None:
+                return True
+            try:
+                self.runtime_v2_runner.check_health()
+            except Exception:
+                return True
+            return False
+        executor = getattr(self, "executor", None)
+        return bool(executor and (getattr(executor, "_closed", False) or getattr(executor, "is_failed", False)))
 
     def abort(self, request_id: str | Iterable[str]) -> None:
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+
+        if getattr(self, "enable_runtime_v2", False):
+            with self._cv:
+                if self._closed:
+                    return
+                for req_id in request_ids:
+                    if req_id in self._runtime_v2_inflight:
+                        self._runtime_v2_commands.put(("abort", req_id))
+                self._cv.notify_all()
+            return
 
         with self._cv:
             if self._closed:
