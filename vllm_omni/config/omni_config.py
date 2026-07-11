@@ -585,20 +585,35 @@ class _DiffusionConfigProjection:
 
     def _propagate_quantization_from_tf_config(self, tf_config: Any) -> None:
         quant_config = getattr(tf_config, "quant_config", None)
-        if quant_config is None:
-            return
-        quant_method = getattr(tf_config, "quant_method", None)
-        is_checkpoint_fp8 = bool(getattr(quant_config, "is_checkpoint_fp8_serialized", False))
-        is_checkpoint_nvfp4 = bool(getattr(quant_config, "is_checkpoint_nvfp4_serialized", False))
-        should_use_checkpoint_config = (
-            self.quantization_config is None
-            or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
-            or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
+        if quant_config is not None:
+            quant_method = getattr(tf_config, "quant_method", None)
+            is_checkpoint_fp8 = bool(getattr(quant_config, "is_checkpoint_fp8_serialized", False))
+            is_checkpoint_nvfp4 = bool(getattr(quant_config, "is_checkpoint_nvfp4_serialized", False))
+            should_use_checkpoint_config = (
+                self.quantization_config is None
+                or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
+                or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
+            )
+            if should_use_checkpoint_config:
+                self.quantization_config = quant_config
+                if quant_method is not None:
+                    self.additional_config.setdefault("auto_detected_quant_method", quant_method)
+
+        self._propagate_fp8_w8a16_from_model_root()
+
+    def _propagate_fp8_w8a16_from_model_root(self) -> None:
+        from vllm_omni.quantization.fp8_blockwise_w8a16 import (
+            fp8_w8a16_selected,
+            maybe_build_fp8_blockwise_w8a16_config,
         )
-        if should_use_checkpoint_config:
-            self.quantization_config = quant_config
-            if quant_method is not None:
-                self.additional_config.setdefault("auto_detected_quant_method", quant_method)
+
+        resolved_config = maybe_build_fp8_blockwise_w8a16_config(
+            fp8_w8a16_selected(self.model),
+            self.quantization_config,
+        )
+        if resolved_config is not self.quantization_config:
+            self.quantization_config = resolved_config
+            self.additional_config.setdefault("auto_detected_quant_method", "fp8_blockwise_w8a16")
 
     @staticmethod
     def _is_generic_fp8_quant_config(quant_config: object) -> bool:

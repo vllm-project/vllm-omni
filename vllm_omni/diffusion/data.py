@@ -347,6 +347,17 @@ class TransformerConfig:
             if quant_config is not None:
                 quant_method = raw_quant_method if raw_quant_method is not None else quant_config.get_name()
 
+        quant_recipe = params.get("quant_recipe")
+        if isinstance(quant_recipe, str):
+            from vllm_omni.quantization.nvfp4_blockwise import (
+                maybe_build_nvfp4_blockwise_config,
+            )
+
+            resolved_config = maybe_build_nvfp4_blockwise_config(quant_recipe, quant_config)
+            if resolved_config is not quant_config:
+                quant_config = resolved_config
+                quant_method = quant_recipe
+
         return cls(params=params, quant_method=quant_method, quant_config=quant_config)
 
     def to_dict(self) -> dict[str, Any]:
@@ -861,7 +872,7 @@ class OmniDiffusionConfig:
             f"Failed to find available port after {max_attempts} attempts (started from port {original_port})"
         )
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if self.request_batch_max_wait_ms < 0:
@@ -962,22 +973,36 @@ class OmniDiffusionConfig:
             )
 
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
-        if tf_config.quant_config is None:
-            return
-
-        is_checkpoint_fp8 = bool(getattr(tf_config.quant_config, "is_checkpoint_fp8_serialized", False))
-        is_checkpoint_nvfp4 = bool(getattr(tf_config.quant_config, "is_checkpoint_nvfp4_serialized", False))
-        should_use_checkpoint_config = (
-            self.quantization_config is None
-            or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
-            or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
-        )
-        if should_use_checkpoint_config:
-            self.quantization_config = tf_config.quant_config
-            logger.info(
-                "Auto-detected quantization '%s' from model config",
-                tf_config.quant_method,
+        if tf_config.quant_config is not None:
+            is_checkpoint_fp8 = bool(getattr(tf_config.quant_config, "is_checkpoint_fp8_serialized", False))
+            is_checkpoint_nvfp4 = bool(getattr(tf_config.quant_config, "is_checkpoint_nvfp4_serialized", False))
+            should_use_checkpoint_config = (
+                self.quantization_config is None
+                or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
+                or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
             )
+            if should_use_checkpoint_config:
+                self.quantization_config = tf_config.quant_config
+                logger.info(
+                    "Auto-detected quantization '%s' from model config",
+                    tf_config.quant_method,
+                )
+
+        self._propagate_fp8_w8a16_from_model_root()
+
+    def _propagate_fp8_w8a16_from_model_root(self) -> None:
+        from vllm_omni.quantization.fp8_blockwise_w8a16 import (
+            fp8_w8a16_selected,
+            maybe_build_fp8_blockwise_w8a16_config,
+        )
+
+        resolved_config = maybe_build_fp8_blockwise_w8a16_config(
+            fp8_w8a16_selected(self.model),
+            self.quantization_config,
+        )
+        if resolved_config is not self.quantization_config:
+            self.quantization_config = resolved_config
+            self.additional_config.setdefault("auto_detected_quant_method", "fp8_blockwise_w8a16")
 
     @staticmethod
     def _is_generic_fp8_quant_config(quant_config: object) -> bool:

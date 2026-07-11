@@ -132,6 +132,58 @@ def test_qwen_model_class_selects_qwen_gguf_adapter():
     assert adapter.__class__.__name__ == "QwenImageGGUFAdapter"
 
 
+def test_get_weights_iterator_preserves_remote_id_and_passes_resolved_root(monkeypatch, tmp_path):
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+        enable_multithread_weight_load=False,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    resolved_root = tmp_path / "snapshot"
+    transformer_dir = resolved_root / "transformer"
+    transformer_dir.mkdir(parents=True)
+    weight_path = transformer_dir / "model.safetensors"
+    weight_path.write_bytes(b"stub")
+
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="owner/remote-model",
+        subfolder="transformer",
+        revision="rev",
+        prefix="transformer.",
+    )
+    seen = {}
+
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *args, **kwargs: (str(resolved_root), str(transformer_dir), [str(weight_path)], True),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.model_loader.diffusers_loader.safetensors_weights_iterator",
+        lambda *_args, **_kwargs: iter([("weight", torch.ones(2, 2))]),
+    )
+
+    def fake_adapter(_model, adapted_source, use_safetensors):
+        seen["model_or_path"] = adapted_source.model_or_path
+        seen["resolved_model_or_path"] = adapted_source.resolved_model_or_path
+        seen["subfolder"] = adapted_source.subfolder
+        seen["use_safetensors"] = use_safetensors
+        return None
+
+    monkeypatch.setattr(loader, "_get_checkpoint_adapter", fake_adapter)
+
+    out = list(loader._get_weights_iterator(source, model=nn.Linear(2, 2, bias=False)))
+
+    assert out[0][0] == "transformer.weight"
+    assert seen == {
+        "model_or_path": "owner/remote-model",
+        "resolved_model_or_path": str(resolved_root),
+        "subfolder": "transformer",
+        "use_safetensors": True,
+    }
+
+
 class _ConfigAwareModel(nn.Module):
     def __init__(self, *, od_config):
         super().__init__()
