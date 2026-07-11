@@ -21,8 +21,9 @@ logger = init_logger(__name__)
 _WEIGHT_SOURCE_FOLDER = "checkpoint_folder_full"
 
 # Download profiles: each deployment pulls only the repo subset its stages
-# need. "tts" (thinker + streaming decoder + dedup shard) must stay
-# byte-identical to the original single pattern list — a unit test pins it.
+# need. The dedup weight shards are appended per-model at call time from
+# the audiogen index (see _dedup_shard_patterns); the static lists here
+# hold only the model-independent folders.
 _SNAPSHOT_PROFILE_PATTERNS = {
     "tts": [
         "config.json",

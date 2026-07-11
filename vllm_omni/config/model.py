@@ -147,8 +147,8 @@ class OmniModelConfig(ModelConfig):
     @property
     def architectures(self) -> list[str]:
         # Falsy (None or "") means "no stage override": fall back to the
-        # checkpoint config's own architectures. Stage engine args pass ""
-        # when neither the stage nor the pipeline pins an arch.
+        # checkpoint config's own architectures. The stage-config builder
+        # emits None; "" is tolerated for legacy callers.
         if self.model_arch:
             return [self.model_arch]
         return super().architectures

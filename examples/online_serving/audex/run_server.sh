@@ -24,9 +24,12 @@ SIZE="${SIZE:-2b}"
 if [ "$SIZE" = "30b" ]; then
     MODEL="${MODEL:-nvidia/Nemotron-Labs-Audex-30B-A3B}"
     YAML_SUFFIX="_30b"
-else
+elif [ "$SIZE" = "2b" ]; then
     MODEL="${MODEL:-nvidia/Nemotron-Labs-Audex-2B}"
     YAML_SUFFIX=""
+else
+    echo "Unknown SIZE '$SIZE'; expected 2b|30b" >&2
+    exit 1
 fi
 PORT="${PORT:-8097}"
 GPUS="${GPUS:-0}"

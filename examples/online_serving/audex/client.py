@@ -35,12 +35,19 @@ import requests
 
 ASR_QUESTION = "Transcribe the input speech."
 SYSTEM_PROMPT = "You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools."
-# The official cascaded web demo (inference_scripts_vllm/unified_s2s_scripts/
-# cascaded_s2s_web_server.py, DEFAULT_TEXT_PROMPT) always prefixes the chat
-# pass's user text with this formatting instruction. It is load-bearing on
-# the 30B-A3B: without it a bare transcript turn is treated as a TTS request
-# and the model emits literal <speechcodec_N> tokens instead of a text
-# answer (the system prompt alone does not prevent this).
+# The official chat-pass recipe below (SYSTEM_PROMPT + TEXT_INSTRUCTION
+# prefix, reasoning enabled, temp 1.0/top_p 0.95, seed retry) applies to the
+# 30B-A3B ONLY (see is_30b() below and
+# tests/e2e/offline_inference/test_audex_s2s.py, which mirrors this same
+# split). It is load-bearing on the 30B: without the formatting-instruction
+# prefix a bare transcript turn is treated as a TTS request and the model
+# emits literal <speechcodec_N> tokens instead of a text answer (the system
+# prompt alone does not prevent this). The 2B must NOT use this recipe: the
+# official temp-1.0 seed-0 draw measurably hallucinates off-language text on
+# the 2B (yet closes </think> cleanly, so the seed retry never fires) and
+# fails the round-trip WER gate — measured, reproduced byte-identically. The
+# 2B instead keeps its original bare-message / enable_thinking=False /
+# temperature=0.0 recipe.
 TEXT_INSTRUCTION = (
     "SYSTEM & FORMATTING INSTRUCTION: You are Audex, created by NVIDIA based on the Nemotron-Cascade-2 architecture. "
     "You may output your reasoning, followed by your final response. "
@@ -55,6 +62,15 @@ DEFAULT_TEXT = "Hello there! This is the Audex text to speech pipeline."
 DEFAULT_CAPTION = "Heavy rain falling on a tin roof."
 # Official quality settings; 1.0 disables guidance.
 DEFAULT_CFG = {"tts": 1.5, "tta": 3.0, "s2s": 1.5}
+
+
+def is_30b(model: str) -> bool:
+    # Users pass arbitrary repo IDs or local snapshot paths, so this is a
+    # heuristic (not an exact match against the official 30B-A3B repo ID)
+    # — good enough for an example script; keep in sync with the same
+    # branch in examples/offline_inference/audex/speech_to_speech.py and
+    # tests/e2e/offline_inference/test_audex_s2s.py.
+    return "30b" in model.lower()
 
 
 def parse_args():
@@ -242,36 +258,55 @@ def main():
     if not transcript:
         raise SystemExit("ASR pass produced an empty transcript; aborting cascade")
 
-    # Official chat-pass recipe: system prompt + formatting instruction
-    # prefixed to the transcript (see TEXT_INSTRUCTION above), reasoning
-    # enabled, and the official demo's text-pass sampling (its defaults:
-    # --text-temperature 1.0, --text-top-p 0.95, --text-max-tokens 2048).
-    # Near-greedy decoding makes the 30B loop inside its reasoning block
-    # until the token budget runs out without ever closing </think>. Even at
-    # the official temperature some trajectories spin past the budget, so
-    # retry a few deterministic seeds; a natural stop without </think> is a
-    # complete answer (the 2B never reasons), and if every seed spins we
-    # keep the full text like the official demo does.
-    chat_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"{TEXT_INSTRUCTION}\n\n{transcript}"},
-    ]
-    raw = ""
-    for seed in (0, 1, 2):
-        raw, finish_reason = _chat(
+    # The chat-pass recipe is size-conditional (see the TEXT_INSTRUCTION
+    # comment above): the 30B requires the official recipe, the 2B keeps its
+    # original bare-message recipe.
+    if is_30b(args.model):
+        # Official recipe: system prompt + formatting instruction prefixed
+        # to the transcript, reasoning enabled, and the official demo's
+        # text-pass sampling (its defaults: --text-temperature 1.0,
+        # --text-top-p 0.95, --text-max-tokens 2048). Near-greedy decoding
+        # makes the 30B loop inside its reasoning block until the token
+        # budget runs out without ever closing </think>. Even at the
+        # official temperature some trajectories spin past the budget, so
+        # retry a few deterministic seeds; a natural stop without </think>
+        # is a complete answer, and if every seed spins we keep the full
+        # text like the official demo does.
+        chat_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"{TEXT_INSTRUCTION}\n\n{transcript}"},
+        ]
+        raw = ""
+        for seed in (0, 1, 2):
+            raw, finish_reason = _chat(
+                base_url,
+                args.model,
+                chat_messages,
+                max(args.max_tokens, 2048),
+                enable_thinking=True,
+                temperature=1.0,
+                top_p=0.95,
+                seed=seed,
+            )
+            if "</think>" in raw or finish_reason != "length":
+                break
+            print(f"[2/3] chat seed {seed} hit the token budget mid-reasoning; retrying")
+        answer = _extract_final_response(raw)
+    else:
+        # 2B: bare user message (no system/instruction prefix), reasoning
+        # disabled, temperature 0.0, no retry — its original recipe. The
+        # official temp-1.0 seed-0 recipe measurably makes the 2B
+        # hallucinate off-language answers (see the module-level comment).
+        chat_messages = [{"role": "user", "content": transcript}]
+        raw, _ = _chat(
             base_url,
             args.model,
             chat_messages,
-            max(args.max_tokens, 2048),
-            enable_thinking=True,
-            temperature=1.0,
-            top_p=0.95,
-            seed=seed,
+            args.max_tokens,
+            enable_thinking=False,
+            temperature=0.0,
         )
-        if "</think>" in raw or finish_reason != "length":
-            break
-        print(f"[2/3] chat seed {seed} hit the token budget mid-reasoning; retrying")
-    answer = _extract_final_response(raw)
+        answer = _extract_final_response(raw)
     print(f"[2/3] answer     : {answer}")
     if not answer:
         raise SystemExit("Chat pass produced an empty answer; aborting cascade")

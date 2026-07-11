@@ -37,12 +37,18 @@ from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt, buil
 SAMPLE_RATE = 16_000
 ASR_QUESTION = "Transcribe the input speech."
 SYSTEM_PROMPT = "You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools."
-# The official cascaded web demo (inference_scripts_vllm/unified_s2s_scripts/
-# cascaded_s2s_web_server.py, DEFAULT_TEXT_PROMPT) always prefixes the chat
-# pass's user text with this formatting instruction. It is load-bearing on
-# the 30B-A3B: without it a bare transcript turn is treated as a TTS request
-# and the model emits literal <speechcodec_N> tokens instead of a text
-# answer (the system prompt alone does not prevent this).
+# The official chat-pass recipe below (SYSTEM_PROMPT + TEXT_INSTRUCTION
+# prefix, open <think> priming, temp 1.0/top_p 0.95, seed retry) applies to
+# the 30B-A3B ONLY (see is_30b()/_chat_prompt below and
+# tests/e2e/offline_inference/test_audex_s2s.py, which mirrors this same
+# split). It is load-bearing on the 30B: without the formatting-instruction
+# prefix a bare transcript turn is treated as a TTS request and the model
+# emits literal <speechcodec_N> tokens instead of a text answer (the system
+# prompt alone does not prevent this). The 2B must NOT use this recipe: it
+# is long-verified stable on a bare prompt + engine-default sampling, while
+# the official temp-1.0 seed-0 draw hallucinates off-language text (yet
+# closes </think> cleanly, so the seed retry never fires) and fails the
+# round-trip WER gate — measured, reproduced byte-identically.
 TEXT_INSTRUCTION = (
     "SYSTEM & FORMATTING INSTRUCTION: You are Audex, created by NVIDIA based on the Nemotron-Cascade-2 architecture. "
     "You may output your reasoning, followed by your final response. "
@@ -56,6 +62,15 @@ TEXT_INSTRUCTION = (
 # The model root's default deploy yaml is the TTS-only pipeline; the cascade
 # needs the audio-capable 2-stage full pipeline, so default to it.
 _DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "audex_s2s.yaml")
+
+
+def is_30b(model: str) -> bool:
+    # Users pass arbitrary repo IDs or local snapshot paths, so this is a
+    # heuristic (not an exact match against the official 30B-A3B repo ID)
+    # — good enough for an example script; keep in sync with the same
+    # branch in examples/online_serving/audex/client.py and
+    # tests/e2e/offline_inference/test_audex_s2s.py.
+    return "30b" in model.lower()
 
 
 def parse_args():
@@ -221,19 +236,28 @@ def main():
     if not transcript:
         raise SystemExit("ASR pass produced an empty transcript; aborting cascade")
 
-    # Pass 2 — chat answer (text-final). The raw completion is
-    # <reasoning...></think><answer>; speak only the final response. Retry
-    # with the next seed only when the budget ran out before the reasoning
-    # block closed (a natural stop without </think> is a complete answer);
-    # if every seed spins, fall back to the official demo's behavior of
-    # keeping the full text.
-    raw = ""
-    for seed in CHAT_SEEDS:
-        raw, truncated = _chat_once(engine, _chat_prompt(transcript), seed)
-        if "</think>" in raw or not truncated:
-            break
-        print(f"[2/3] chat seed {seed} hit the token budget mid-reasoning; retrying")
-    answer = _extract_final_response(raw)
+    # Pass 2 — chat answer (text-final). The recipe is size-conditional (see
+    # the TEXT_INSTRUCTION comment above): the 30B requires the official
+    # recipe, the 2B regresses under it.
+    if is_30b(args.model):
+        # Official recipe. The raw completion is
+        # <reasoning...></think><answer>; speak only the final response.
+        # Retry with the next seed only when the budget ran out before the
+        # reasoning block closed (a natural stop without </think> is a
+        # complete answer); if every seed spins, fall back to the official
+        # demo's behavior of keeping the full text.
+        raw = ""
+        for seed in CHAT_SEEDS:
+            raw, truncated = _chat_once(engine, _chat_prompt(transcript), seed)
+            if "</think>" in raw or not truncated:
+                break
+            print(f"[2/3] chat seed {seed} hit the token budget mid-reasoning; retrying")
+        answer = _extract_final_response(raw)
+    else:
+        # 2B: bare prompt with a closed think block, engine-default sampling
+        # (yaml near-greedy), no retry; the answer is used as-is.
+        chat_prompt = f"<|im_start|>user\n{transcript}<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        answer = _text_of(engine.generate([{"prompt": chat_prompt, "modalities": ["text"]}]))
     print(f"[2/3] answer     : {answer}")
     if not answer:
         raise SystemExit("Chat pass produced an empty answer; aborting cascade")
