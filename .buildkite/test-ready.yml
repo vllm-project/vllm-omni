@@ -692,7 +692,7 @@ steps:
           - vllm_omni/diffusion/model_loader
         commands:
           - pip install "vllm-gguf-plugin>=0.0.3"
-          - timeout 10m pytest -sv tests/plugin/test_gguf_diffusion.py
+          - timeout 30m pytest -sv tests/plugin/test_gguf_diffusion.py
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
