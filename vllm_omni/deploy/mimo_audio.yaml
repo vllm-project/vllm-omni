@@ -7,7 +7,6 @@
 # --stage-overrides '{"1": {"devices": "1", "max_model_len": 18192, "max_num_batched_tokens": 18192}}'``
 # to the serve CLI.
 async_chunk: true
-pipeline: mimo_audio
 dtype: bfloat16
 
 connectors:

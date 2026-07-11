@@ -802,12 +802,12 @@ stages:
             ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
             ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
-            ("mimo_audio.yaml", "mimo_audio", 2, "audio", "mimo_audio"),
-            ("step_audio2.yaml", "step_audio_2", 2, "audio", "step_audio_2"),
+            ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
+            ("step_audio2.yaml", "step_audio_2", 2, "audio", None),
             ("step_audio2_asr.yaml", "step_audio2_asr", 1, "text", "step_audio2_asr"),
             ("step_audio2_async_chunk.yaml", "step_audio2_async_chunk", 2, "audio", "step_audio2_async_chunk"),
-            ("hunyuan_video_15_dit_fp8.yaml", "hunyuan_video_15_dit_fp8", 1, "video", "hunyuan_video_15_dit_fp8"),
-            ("wan2_2_ti2v_dit_fp8.yaml", "wan2_2_ti2v_dit_fp8", 1, "video", "wan2_2_ti2v_dit_fp8"),
+            ("hunyuan_video_15_dit_fp8.yaml", "hunyuan_video_15_dit_fp8", 1, "video", None),
+            ("wan2_2_ti2v_dit_fp8.yaml", "wan2_2_ti2v_dit_fp8", 1, "video", None),
         ],
     )
     def test_load_new_registry_backed_deploy_configs(

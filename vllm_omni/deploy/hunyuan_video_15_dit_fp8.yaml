@@ -1,7 +1,6 @@
 # HunyuanVideo-1.5 DiT deploy for ModelOpt FP8 checkpoints.
 #
 # Single GPU by default. Increase tensor_parallel_size and devices for multi-GPU TP.
-pipeline: hunyuan_video_15_dit_fp8
 async_chunk: false
 trust_remote_code: true
 distributed_executor_backend: mp

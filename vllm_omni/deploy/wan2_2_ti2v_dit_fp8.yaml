@@ -1,7 +1,6 @@
 # Wan2.2 TI2V-5B DiT deploy for ModelOpt FP8 checkpoints.
 #
 # Single GPU by default. Increase tensor_parallel_size and devices for A14B MoE variants.
-pipeline: wan2_2_ti2v_dit_fp8
 async_chunk: false
 trust_remote_code: true
 distributed_executor_backend: mp

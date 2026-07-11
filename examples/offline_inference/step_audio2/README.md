@@ -108,6 +108,7 @@ Models will be cached in `~/.cache/huggingface/hub/` for future use.
 
 **Available models**:
 - `stepfun-ai/Step-Audio-2-mini` (smaller, faster)
+- `stepfun-ai/Step-Audio2-7B` (larger, better quality)
 
 ### Option 2: Manual Download (for offline use)
 
@@ -155,7 +156,7 @@ python end2end.py --query-type audio_to_text \
 # With specific model
 python end2end.py --query-type audio_to_text \
     --audio-path /path/to/input.wav \
-    --model stepfun-ai/Step-Audio-2-mini
+    --model stepfun-ai/Step-Audio2-7B
 
 # With custom question
 python end2end.py --query-type audio_to_text \
@@ -179,7 +180,7 @@ python end2end.py --query-type text_to_audio \
 # With specific model
 python end2end.py --query-type text_to_audio \
     --text "Hello, this is a test." \
-    --model stepfun-ai/Step-Audio-2-mini
+    --model stepfun-ai/Step-Audio2-7B
 ```
 
 **Note**: Speaker voice is controlled by the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable or the default prompt wav bundled with the model.
@@ -201,7 +202,7 @@ python end2end.py --query-type audio_to_audio \
 # With specific model
 python end2end.py --query-type audio_to_audio \
     --audio-path source.wav \
-    --model stepfun-ai/Step-Audio-2-mini
+    --model stepfun-ai/Step-Audio2-7B
 ```
 
 This mode:
@@ -362,7 +363,7 @@ Complete example from audio to final output:
 # 1. ASR: Transcribe audio
 python end2end.py --query-type audio_to_text \
     --audio-path interview.wav \
-    --model ./models/Step-Audio-2-mini \
+    --model ./models/Step-Audio2-7B \
     --output-dir ./outputs
 
 # 2. Check the transcription
@@ -372,7 +373,7 @@ cat ./outputs/00000_text.txt
 STEP_AUDIO2_DEFAULT_PROMPT_WAV=./speaker_samples/female_voice.wav \
 python end2end.py --query-type text_to_audio \
     --text "The quick brown fox jumps over the lazy dog" \
-    --model ./models/Step-Audio-2-mini \
+    --model ./models/Step-Audio2-7B \
     --output-dir ./outputs
 
 # 4. Listen to the result
