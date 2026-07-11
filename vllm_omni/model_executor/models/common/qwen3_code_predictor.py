@@ -186,8 +186,6 @@ class CodePredictorAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self._apply_rope = self._apply_native_rope
-        self._attention = self._forward_native_attention
         if current_omni_platform.is_npu():
             if self.max_seq > 2048:
                 raise ValueError(
@@ -201,8 +199,6 @@ class CodePredictorAttention(nn.Module):
                 diagonal=1,
             )
             self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
-            self._apply_rope = self._apply_npu_rope
-            self._attention = self._forward_npu_attention
 
     def _forward_npu_attention(
         self,
@@ -255,41 +251,6 @@ class CodePredictorAttention(nn.Module):
             sync=True,
         )[0]
 
-    def _forward_native_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        bsz: int,
-        seq_len: int,
-    ) -> torch.Tensor:
-        return F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale=self.scaling,
-            is_causal=True,
-            enable_gqa=self.is_gqa,
-        )
-
-    def _apply_native_rope(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
-
-    def _apply_npu_rope(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch_npu.npu_rotary_mul(q, cos, sin), torch_npu.npu_rotary_mul(k, cos, sin)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -307,8 +268,21 @@ class CodePredictorAttention(nn.Module):
         # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
         cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
         sin = sin.unsqueeze(1)
-        q, k = self._apply_rope(q, k, cos, sin)
-        attn_out = self._attention(q, k, v, bsz, seq_len)
+        if current_omni_platform.is_npu():
+            q = torch_npu.npu_rotary_mul(q, cos, sin)
+            k = torch_npu.npu_rotary_mul(k, cos, sin)
+            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+        else:
+            q = (q * cos) + (_rotate_half(q) * sin)
+            k = (k * cos) + (_rotate_half(k) * sin)
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=self.scaling,
+                is_causal=True,
+                enable_gqa=self.is_gqa,
+            )
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -346,32 +320,6 @@ class CodePredictorDecoderLayer(nn.Module):
         self.mlp = CodePredictorMLP(config, prefix=f"{prefix}.mlp")
         self.input_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self._post_attention_residual_norm = self._post_attention_residual_norm_native
-        if current_omni_platform.is_npu():
-            self._post_attention_residual_norm = self._post_attention_residual_norm_npu
-
-    def _post_attention_residual_norm_native(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        return hidden_states, residual
-
-    def _post_attention_residual_norm_npu(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, _, residual = torch_npu.npu_add_rms_norm(
-            hidden_states,
-            residual,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.variance_epsilon,
-        )
-        return hidden_states, residual
 
     def forward(
         self,
@@ -381,7 +329,17 @@ class CodePredictorDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings)
-        hidden_states, residual = self._post_attention_residual_norm(hidden_states, residual)
+        if current_omni_platform.is_npu():
+            hidden_states, _, residual = torch_npu.npu_add_rms_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
