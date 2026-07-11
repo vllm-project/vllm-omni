@@ -63,9 +63,6 @@ def build_parallel_attention_strategy(
             )
         return NoParallelAttention()
 
-    # AllGather-KV sequence-parallel (v1: mutually exclusive with Ulysses/Ring).
-    # Each rank holds 1/P of Q; AllGather collects full K/V; single local
-    # attention kernel computes Q_local x K_full. Only valid for causal=False.
     if allgather_degree > 1:
         if causal:
             raise ValueError("AllGather-KV SP only supports non-causal attention.")
@@ -76,11 +73,7 @@ def build_parallel_attention_strategy(
                 f"allgather_degree={allgather_degree})."
             )
         logger.debug(f"Using AllGatherKVParallelAttention (allgather_degree={allgather_degree})")
-        return AllGatherKVParallelAttention(
-            sp_group=sp_group,
-            scatter_idx=scatter_idx,
-            gather_idx=gather_idx,
-        )
+        return AllGatherKVParallelAttention(sp_group=sp_group)
 
     # Ulysses (or Hybrid Ulysses+Ring)
     if ulysses_degree > 1:

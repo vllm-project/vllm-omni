@@ -444,18 +444,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             if plan is None:
                 continue
 
-            # Create SP config for _sp_plan hooks.
-            #
-            # AllGather-KV reuses sequence sharding hooks to split image-token
-            # tensors before attention, but the attention strategy itself is
-            # selected later from parallel_config.allgather_degree.  Map the
-            # AllGather degree to the hook's sequence world here so tensors are
-            # still sharded when ulysses_degree == ring_degree == 1.
+            # AllGather-KV reuses the Ulysses sequence-sharding hooks.
             allgather_degree = getattr(od_config.parallel_config, "allgather_degree", 1)
             if allgather_degree > 1:
                 sp_config = SequenceParallelConfig(
-                    ulysses_degree=allgather_degree,
-                    ring_degree=1,
+                    allgather_degree=allgather_degree,
                 )
                 mode = "allgather_kv"
             else:
@@ -463,13 +456,13 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
                     ulysses_degree=od_config.parallel_config.ulysses_degree,
                     ring_degree=od_config.parallel_config.ring_degree,
                 )
+                # Apply hooks according to the plan
                 mode = (
                     "hybrid"
                     if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
                     else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
                 )
 
-            # Apply hooks according to the plan
             logger.info(
                 f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
                 f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"

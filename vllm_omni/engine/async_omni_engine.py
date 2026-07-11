@@ -963,7 +963,7 @@ class AsyncOmniEngine:
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
             if sequence_parallel_size is None:
-                sequence_parallel_size = ulysses_degree * ring_degree * allgather_degree
+                sequence_parallel_size = allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
 
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=pipeline_parallel_size,

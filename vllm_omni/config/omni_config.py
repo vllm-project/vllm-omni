@@ -364,7 +364,9 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     hsdp_replicate_size: int = Field(default=1, ge=1)
 
     def __post_init__(self) -> None:
-        self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
+        self.sequence_parallel_size = (
+            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+        )
         if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
             raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:

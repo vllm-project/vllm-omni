@@ -31,11 +31,10 @@ import tempfile
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
-    _AllGatherKVCtx,
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
@@ -165,11 +164,15 @@ class _MockAllGatherSPGroup:
         self.ulysses_group = object()
         self.ulysses_world_size = len(gather_chunks[0])
         self.ulysses_rank = rank
+        self.allgather_group = object()
+        self.allgather_world_size = len(gather_chunks[0])
+        self.allgather_rank = rank
         self._gather_chunks = list(gather_chunks)
         self.gathered_input_shapes: list[tuple[int, ...]] = []
 
-    def all_gather(self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False):
+    def all_gather(self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False, group=None):
         assert not separate_tensors
+        assert group is self.allgather_group
         self.gathered_input_shapes.append(tuple(input_.shape))
         chunks = self._gather_chunks.pop(0)
         return torch.cat(chunks, dim=dim)
@@ -228,7 +231,59 @@ def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
     assert torch.equal(metadata_local.attn_mask, expected_rows)
 
 
-def test_allgather_kv_maps_full_attn_spans_to_local_query_rows():
+def test_allgather_kv_slices_rear_joint_dense_mask():
+    rank = 1
+    joint_len = 1
+    img_seq_local = 2
+    img_seq_full = 4
+    key_chunks = [torch.zeros((1, img_seq_local, 1, 1)) for _ in range(2)]
+    value_chunks = [torch.zeros_like(chunk) for chunk in key_chunks]
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(rank=rank, gather_chunks=[key_chunks, value_chunks]),
+    )
+    query = torch.zeros((1, img_seq_local, 1, 1))
+    joint = torch.ones((1, joint_len, 1, 1))
+    mask = torch.arange((img_seq_full + joint_len) ** 2)
+    mask = (mask % 2 == 0).view(1, 1, img_seq_full + joint_len, img_seq_full + joint_len)
+    metadata = AttentionMetadata(
+        attn_mask=mask,
+        joint_query=joint,
+        joint_key=joint,
+        joint_value=joint,
+        joint_strategy="rear",
+    )
+
+    q_local, _, _, metadata_local, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], metadata)
+
+    img_start = rank * img_seq_local
+    expected_rows = torch.cat(
+        [
+            mask[..., img_start : img_start + img_seq_local, :],
+            mask[..., img_seq_full : img_seq_full + joint_len, :],
+        ],
+        dim=-2,
+    )
+    assert q_local.shape[1] == img_seq_local + joint_len
+    assert metadata_local is not None
+    assert torch.equal(metadata_local.attn_mask, expected_rows)
+
+
+def test_allgather_kv_rejects_invalid_joint_strategy():
+    chunks = [[torch.zeros((1, 2, 1, 1)) for _ in range(2)] for _ in range(2)]
+    strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=0, gather_chunks=chunks))
+    joint = torch.ones((1, 1, 1, 1))
+    metadata = AttentionMetadata(
+        joint_query=joint,
+        joint_key=joint,
+        joint_value=joint,
+        joint_strategy="back",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported joint_strategy"):
+        strategy.pre_attention(torch.zeros((1, 2, 1, 1)), chunks[0][0], chunks[1][0], metadata)
+
+
+def test_allgather_kv_preserves_global_spans_and_sets_query_ranges():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(
             rank=1,
@@ -242,9 +297,7 @@ def test_allgather_kv_maps_full_attn_spans_to_local_query_rows():
     key = torch.zeros((1, 2, 1, 1))
     value = torch.zeros((1, 2, 1, 1))
     joint = torch.ones((1, 1, 1, 1))
-    mask = torch.ones((1, 1, 5, 5), dtype=torch.bool)
     metadata = AttentionMetadata(
-        attn_mask=mask,
         joint_query=joint,
         joint_key=joint,
         joint_value=joint,
@@ -259,7 +312,11 @@ def test_allgather_kv_maps_full_attn_spans_to_local_query_rows():
     _, _, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
 
     assert metadata_out is not None
-    assert metadata_out.full_attn_spans == [[(0, 1), (1, 3)]]
+    assert metadata_out.full_attn_spans == [[(0, 1), (2, 5)]]
+    assert metadata_out.query_ranges == (
+        QueryRange(0, 1, 0),
+        QueryRange(1, 3, 3),
+    )
 
 
 def test_allgather_kv_allows_empty_full_attn_spans():
@@ -281,9 +338,10 @@ def test_allgather_kv_allows_empty_full_attn_spans():
 
     assert metadata_out is not None
     assert metadata_out.full_attn_spans == [[]]
+    assert metadata_out.query_ranges == (QueryRange(0, 2, 0),)
 
 
-def test_allgather_kv_gathers_compressed_kv_then_repeats_locally():
+def test_allgather_kv_keeps_gathered_kv_compressed():
     rank = 0
     img_seq_local = 2
     kv_heads = 2
@@ -300,116 +358,50 @@ def test_allgather_kv_gathers_compressed_kv_then_repeats_locally():
     strategy = AllGatherKVParallelAttention(sp_group)
 
     query = torch.zeros((1, img_seq_local, q_heads, 1))
-    metadata = AttentionMetadata(extra={"kv_repeat_num": repeat_num})
-
-    _, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], metadata)
+    _, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], None)
 
     assert sp_group.gathered_input_shapes == [
         (1, img_seq_local, kv_heads, 1),
         (1, img_seq_local, kv_heads, 1),
     ]
-    assert k_full.shape == (1, img_seq_local * 2, q_heads, 1)
-    assert v_full.shape == (1, img_seq_local * 2, q_heads, 1)
-    expected_key = torch.cat(key_chunks, dim=1).repeat_interleave(repeat_num, dim=2)
-    expected_value = torch.cat(value_chunks, dim=1).repeat_interleave(repeat_num, dim=2)
+    assert k_full.shape == (1, img_seq_local * 2, kv_heads, 1)
+    assert v_full.shape == (1, img_seq_local * 2, kv_heads, 1)
+    expected_key = torch.cat(key_chunks, dim=1)
+    expected_value = torch.cat(value_chunks, dim=1)
     torch.testing.assert_close(k_full, expected_key)
     torch.testing.assert_close(v_full, expected_value)
 
 
-def test_allgather_kv_post_attention_returns_local_shard_no_joint():
-    """post_attention with joint_len=0 returns the attention output unchanged."""
-    strategy = AllGatherKVParallelAttention(
-        _MockAllGatherSPGroup(
-            rank=0,
-            gather_chunks=[
-                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
-                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
-            ],
-        ),
-    )
-    attn_output = torch.arange(1 * 2 * 3 * 4, dtype=torch.float32).view(1, 2, 3, 4)
-    ctx = _AllGatherKVCtx(
-        name=strategy.name,
-        joint_len=0,
-        joint_strategy="front",
-        img_seq_local=2,
-    )
-
-    out = strategy.post_attention(attn_output, ctx)
-
-    assert out.shape == attn_output.shape
-    torch.testing.assert_close(out, attn_output)
-
-
-def test_allgather_kv_post_attention_returns_local_shard_front_joint():
-    """post_attention with joint_strategy='front' keeps joint at the front.
-
-    The attention output arrives as [joint, img_local]; post_attention splits
-    it back into the same order so downstream layers see the joint prefix
-    preserved.
-    """
-    strategy = AllGatherKVParallelAttention(
-        _MockAllGatherSPGroup(
-            rank=0,
-            gather_chunks=[
-                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
-                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
-            ],
-        ),
-    )
-    joint_len = 1
+def test_allgather_kv_compressed_gqa_matches_explicit_repeat():
+    torch.manual_seed(0)
+    rank = 1
+    batch_size = 1
     img_seq_local = 2
-    joint_slice = torch.full((1, joint_len, 3, 4), 7.0)
-    img_slice = torch.full((1, img_seq_local, 3, 4), 9.0)
-    attn_output = torch.cat([joint_slice, img_slice], dim=1)
-    ctx = _AllGatherKVCtx(
-        name=strategy.name,
-        joint_len=joint_len,
-        joint_strategy="front",
-        img_seq_local=img_seq_local,
-    )
-
-    out = strategy.post_attention(attn_output, ctx)
-
-    assert out.shape == attn_output.shape
-    torch.testing.assert_close(out, attn_output)
-    torch.testing.assert_close(out[:, :joint_len], joint_slice)
-    torch.testing.assert_close(out[:, joint_len:], img_slice)
-
-
-def test_allgather_kv_post_attention_returns_local_shard_rear_joint():
-    """post_attention with joint_strategy='rear' keeps joint at the back.
-
-    The attention output arrives as [img_local, joint]; post_attention splits
-    it back into the same order so the joint suffix is preserved.
-    """
+    q_heads = 4
+    kv_heads = 2
+    head_dim = 3
+    query = torch.randn(batch_size, img_seq_local, q_heads, head_dim)
+    key_chunks = [torch.randn(batch_size, img_seq_local, kv_heads, head_dim) for _ in range(2)]
+    value_chunks = [torch.randn_like(chunk) for chunk in key_chunks]
     strategy = AllGatherKVParallelAttention(
-        _MockAllGatherSPGroup(
-            rank=0,
-            gather_chunks=[
-                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
-                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
-            ],
-        ),
-    )
-    joint_len = 1
-    img_seq_local = 2
-    joint_slice = torch.full((1, joint_len, 3, 4), 7.0)
-    img_slice = torch.full((1, img_seq_local, 3, 4), 9.0)
-    attn_output = torch.cat([img_slice, joint_slice], dim=1)
-    ctx = _AllGatherKVCtx(
-        name=strategy.name,
-        joint_len=joint_len,
-        joint_strategy="rear",
-        img_seq_local=img_seq_local,
+        _MockAllGatherSPGroup(rank=rank, gather_chunks=[key_chunks, value_chunks]),
     )
 
-    out = strategy.post_attention(attn_output, ctx)
+    q_local, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], None)
+    output_gqa = torch.nn.functional.scaled_dot_product_attention(
+        q_local.transpose(1, 2),
+        k_full.transpose(1, 2),
+        v_full.transpose(1, 2),
+        enable_gqa=True,
+    )
+    repeat_num = q_heads // kv_heads
+    output_reference = torch.nn.functional.scaled_dot_product_attention(
+        q_local.transpose(1, 2),
+        k_full.repeat_interleave(repeat_num, dim=2).transpose(1, 2),
+        v_full.repeat_interleave(repeat_num, dim=2).transpose(1, 2),
+    )
 
-    assert out.shape == attn_output.shape
-    torch.testing.assert_close(out, attn_output)
-    torch.testing.assert_close(out[:, :img_seq_local], img_slice)
-    torch.testing.assert_close(out[:, img_seq_local:], joint_slice)
+    torch.testing.assert_close(output_gqa, output_reference)
 
 
 @pytest.mark.parametrize(

@@ -62,6 +62,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_allgather_parallel_world_size,
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
@@ -942,6 +943,7 @@ class ImageKVCacheManager:
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
+        self.allgather_size = get_allgather_parallel_world_size()
         self.sp_rank = get_sequence_parallel_rank()
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -1109,7 +1111,7 @@ class ImageKVCacheManager:
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
         repeat_num = head_num_per_rank // kv_head_num_per_rank
-        use_allgather_kv = self.sp_size > 1 and getattr(self.attn.parallel_strategy, "name", None) == "allgather_kv"
+        keep_kv_compressed = self.allgather_size > 1
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
@@ -1151,7 +1153,7 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        if not use_allgather_kv:
+        if not keep_kv_compressed:
             key = repeat_kv(key, repeat_num)
             value = repeat_kv(value, repeat_num)
             if self.sp_size > 1:
@@ -1175,7 +1177,6 @@ class ImageKVCacheManager:
                 joint_strategy="front",
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
-                extra={"kv_repeat_num": repeat_num} if use_allgather_kv else {},
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)

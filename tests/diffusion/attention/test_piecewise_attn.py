@@ -19,7 +19,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
+    mapped_piecewise_attn,
     piecewise_attn,
 )
 
@@ -124,3 +126,52 @@ def test_piecewise_span_fully_before_qstart():
     )
     expected = _full_reference(query, key, value, global_spans, q_start, q_end, softmax_scale)
     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_mapped_piecewise_noncontiguous_query_matches_full_mask():
+    torch.manual_seed(0)
+    B, H, D, Sk = 1, 2, 8, 8
+    key = torch.randn(B, Sk, H, D, device=DEVICE)
+    value = torch.randn(B, Sk, H, D, device=DEVICE)
+    query = torch.randn(B, 4, H, D, device=DEVICE)
+    spans = [(2, 7)]
+    query_ranges = (
+        QueryRange(0, 1, 0),
+        QueryRange(1, 4, 4),
+    )
+    softmax_scale = D**-0.5
+
+    got = mapped_piecewise_attn(
+        query,
+        key,
+        value,
+        full_attn_spans=[spans],
+        query_ranges=query_ranges,
+        softmax_scale=softmax_scale,
+        attn_func=_sdpa_attn_func,
+    )
+    expected = torch.cat(
+        [
+            _full_reference(query[:, :1], key, value, spans, 0, 1, softmax_scale),
+            _full_reference(query[:, 1:], key, value, spans, 4, 7, softmax_scale),
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_mapped_piecewise_rejects_incomplete_query_ranges():
+    query = torch.zeros(1, 3, 1, 2)
+    key = torch.zeros(1, 3, 1, 2)
+    value = torch.zeros_like(key)
+
+    with pytest.raises(ValueError, match="cover local query contiguously"):
+        mapped_piecewise_attn(
+            query,
+            key,
+            value,
+            full_attn_spans=[[]],
+            query_ranges=(QueryRange(1, 3, 1),),
+            softmax_scale=1.0,
+            attn_func=_sdpa_attn_func,
+        )

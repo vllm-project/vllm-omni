@@ -14,12 +14,24 @@ Per segment:
 
 from __future__ import annotations
 
-from typing import Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
+
+import torch
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 
 
 class Segment(NamedTuple):
     start: int
     end: int
+    mode: Literal["causal", "full"]
+
+
+class MappedSegment(NamedTuple):
+    q_start: int
+    q_end: int
+    kv_end: int
     mode: Literal["causal", "full"]
 
 
@@ -54,6 +66,26 @@ def build_segments(full_attn_spans, query_offset, query_len):
         segs.append(Segment(cur, q_end, "causal"))
 
     return segs
+
+
+def build_mapped_segments(full_attn_spans, query_offset, query_len):
+    q_end = query_offset + query_len
+    segments: list[MappedSegment] = []
+    cur = query_offset
+
+    for span_start, span_end in full_attn_spans:
+        overlap_start = max(span_start, query_offset)
+        overlap_end = min(span_end, q_end)
+        if overlap_start >= overlap_end:
+            continue
+        if cur < overlap_start:
+            segments.append(MappedSegment(cur, overlap_start, overlap_start, "causal"))
+        segments.append(MappedSegment(overlap_start, overlap_end, span_end, "full"))
+        cur = overlap_end
+
+    if cur < q_end:
+        segments.append(MappedSegment(cur, q_end, q_end, "causal"))
+    return segments
 
 
 def _check_homogeneous(
@@ -95,4 +127,39 @@ def piecewise_attn(
             softmax_scale=softmax_scale,
         )
         out[:, q_s:q_e] = out_seg
+    return out
+
+
+def mapped_piecewise_attn(
+    query,
+    key,
+    value,
+    full_attn_spans: list[list[tuple[int, int]]],
+    query_ranges: tuple[QueryRange, ...],
+    softmax_scale: float,
+    attn_func,
+):
+    _check_homogeneous(full_attn_spans)
+    spans = full_attn_spans[0]
+    out = torch.empty_like(query)
+    covered = 0
+
+    for query_range in query_ranges:
+        query_len = query_range.local_end - query_range.local_start
+        if query_range.local_start != covered or query_len < 0:
+            raise ValueError("query_ranges must cover local query contiguously")
+        for segment in build_mapped_segments(spans, query_range.global_start, query_len):
+            q_start = query_range.local_start + segment.q_start - query_range.global_start
+            q_end = query_range.local_start + segment.q_end - query_range.global_start
+            out[:, q_start:q_end] = attn_func(
+                query[:, q_start:q_end],
+                key[:, : segment.kv_end],
+                value[:, : segment.kv_end],
+                causal=(segment.mode == "causal"),
+                softmax_scale=softmax_scale,
+            )
+        covered = query_range.local_end
+
+    if covered != query.shape[1]:
+        raise ValueError("query_ranges must cover the full local query")
     return out
