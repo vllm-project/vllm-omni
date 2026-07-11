@@ -317,6 +317,10 @@ class Qwen3VLWithExpertModel(nn.Module):
             "mrope_interleaved": True,
             "mrope_section": [24, 20, 20],
             "rope_type": "default",
+            # transformers>=5.x: rope_theta must live inside rope_parameters. Setting
+            # rope_scaling replaces rope_parameters wholesale, which otherwise drops the
+            # Qwen3-VL default theta (500000.0) and breaks RoPE init with KeyError.
+            "rope_theta": 500000.0,
         }
         vlm_config_hf.text_config.tie_word_embeddings = True
         vlm_config_hf.tie_word_embeddings = True
@@ -515,7 +519,10 @@ class InternVLAA1(nn.Module):
         image_token_id = self.qwen3_vl_with_expert.und_expert.config.image_token_id
         pixel_values = pixel_values.view(-1, pixel_values.shape[-1])
         image_grid_thw = image_grid_thw.view(-1, 3)
-        image_embs, _ = self.qwen3_vl_with_expert.und_expert.visual(pixel_values, image_grid_thw)
+        # transformers>=5.x: Qwen3VLVisionModel returns BaseModelOutputWithDeepstackFeatures
+        # instead of an (image_embeds, deepstack) tuple. pooler_output is the MERGED image
+        # embeddings (post-merger); deepstack_features are discarded as before.
+        image_embs = self.qwen3_vl_with_expert.und_expert.visual(pixel_values, image_grid_thw).pooler_output
 
         embs = self.qwen3_vl_with_expert.und_expert.get_input_embeddings()(lang_tokens)
         batch_size, seq_len, hidden_dim = embs.shape
@@ -642,8 +649,17 @@ class InternVLAA1(nn.Module):
         attention_mask = pad_masks.to(lang_tokens)
         if image_grid_thw is not None:
             image_grid_thw = image_grid_thw.view(-1, 3)
+        # transformers>=5.x get_rope_index requires mm_token_type_ids (text=0, image=1,
+        # video=2) as the 2nd positional arg; build it from the (padded) token ids.
+        cfg = self.qwen3_vl_with_expert.und_expert.config
+        mm_token_type_ids = torch.zeros_like(padded_lang_tokens)
+        mm_token_type_ids[padded_lang_tokens == cfg.image_token_id] = 1
+        video_token_id = getattr(cfg, "video_token_id", None)
+        if video_token_id is not None:
+            mm_token_type_ids[padded_lang_tokens == video_token_id] = 2
         return self.qwen3_vl_with_expert.und_expert.model.get_rope_index(
             padded_lang_tokens,
+            mm_token_type_ids,
             image_grid_thw,
             attention_mask=attention_mask,
         )
