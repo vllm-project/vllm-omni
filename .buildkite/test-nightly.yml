@@ -598,6 +598,38 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+  - group: ":card_index_dividers: Tiny Model Tests [Multi-GPU]"
+    key: nightly-tiny-model-test-group
+    depends_on: upload-nightly-pipeline
+    if: >-
+      build.env("NIGHTLY") == "1" ||
+      build.pull_request.labels includes "nightly-test"
+    steps:
+      - label: ":full_moon: Tiny Model Tests · Diffusion (Multi-GPU accelerations)"
+        timeout_in_minutes: 30
+        # NOTE: Single-GPU (core_model) tiny model tests run on the ready label,
+        # so nightly only adds the multi-GPU parallelism configurations.
+        #
+        # This is a bit confusing, but `full_model` is used to mark the multigpu tests, and
+        # --run-level `core_model` is used to indicate that we should use tiny model weights
+        # for the CI, since these tests should pass irrespective of whether or not we use
+        # the full weights or not.
+        commands:
+          - timeout 25m pytest -sv tests/model_tests/diffusion -m 'full_model and cuda' --run-level "core_model"
+        agents:
+          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
   # Diffusion X2I suite: x2i / x2a / x2t and related non-video paths; x2v is only in "Diffusion X2V Model Test" below.
   - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
     key: nightly-diffusion-x2iat-group

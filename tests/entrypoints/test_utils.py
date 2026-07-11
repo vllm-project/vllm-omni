@@ -319,9 +319,9 @@ class TestLoadAndResolveStageConfigs:
         """Ensure that dtype survives default stage creation."""
         kwargs = {"dtype": torch.float32}
         mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path", return_value=None)
-        mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=[])
+        mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=([], None))
 
-        config_path, stage_configs = load_and_resolve_stage_configs(
+        config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="black-forest-labs/FLUX.2-klein-4B",
             stage_configs_path=None,
             kwargs=kwargs,
@@ -353,10 +353,10 @@ class TestLoadAndResolveStageConfigs:
         ]
         load_stage_configs = mocker.patch(
             "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
-            return_value=returned_stage_configs,
+            return_value=(returned_stage_configs, None),
         )
 
-        config_path, stage_configs = load_and_resolve_stage_configs(
+        config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="dummy-model",
             stage_configs_path=str(deploy_path),
             kwargs={},
@@ -369,6 +369,7 @@ class TestLoadAndResolveStageConfigs:
             base_engine_args={},
             deploy_config_path=str(deploy_path),
             stage_overrides=None,
+            strategy_config_path=None,
         )
         assert config_path == str(deploy_path)
         assert len(stage_configs) == 2
