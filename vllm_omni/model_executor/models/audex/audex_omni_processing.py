@@ -148,9 +148,7 @@ class AudexProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": 1}
 
-    def get_mm_max_tokens_per_item(
-        self, seq_len: int, mm_counts: Mapping[str, int] | None = None
-    ) -> Mapping[str, int]:
+    def get_mm_max_tokens_per_item(self, seq_len: int, mm_counts: Mapping[str, int] | None = None) -> Mapping[str, int]:
         return {"audio": MAX_AUDIO_TOKENS}
 
     def sound_token_ids(self) -> tuple[int, int, int]:
