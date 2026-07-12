@@ -341,7 +341,7 @@ def test_allgather_kv_allows_empty_full_attn_spans():
     assert metadata_out.query_ranges == (QueryRange(0, 2, 0),)
 
 
-def test_allgather_kv_keeps_gathered_kv_compressed():
+def test_allgather_kv_gathers_compressed_kv_then_repeats_locally():
     rank = 0
     img_seq_local = 2
     kv_heads = 2
@@ -358,50 +358,19 @@ def test_allgather_kv_keeps_gathered_kv_compressed():
     strategy = AllGatherKVParallelAttention(sp_group)
 
     query = torch.zeros((1, img_seq_local, q_heads, 1))
-    _, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], None)
+    metadata = AttentionMetadata(extra={"kv_repeat_num": repeat_num})
+    _, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], metadata)
 
     assert sp_group.gathered_input_shapes == [
         (1, img_seq_local, kv_heads, 1),
         (1, img_seq_local, kv_heads, 1),
     ]
-    assert k_full.shape == (1, img_seq_local * 2, kv_heads, 1)
-    assert v_full.shape == (1, img_seq_local * 2, kv_heads, 1)
-    expected_key = torch.cat(key_chunks, dim=1)
-    expected_value = torch.cat(value_chunks, dim=1)
+    assert k_full.shape == (1, img_seq_local * 2, q_heads, 1)
+    assert v_full.shape == (1, img_seq_local * 2, q_heads, 1)
+    expected_key = torch.cat(key_chunks, dim=1).repeat_interleave(repeat_num, dim=2)
+    expected_value = torch.cat(value_chunks, dim=1).repeat_interleave(repeat_num, dim=2)
     torch.testing.assert_close(k_full, expected_key)
     torch.testing.assert_close(v_full, expected_value)
-
-
-def test_allgather_kv_compressed_gqa_matches_explicit_repeat():
-    torch.manual_seed(0)
-    rank = 1
-    batch_size = 1
-    img_seq_local = 2
-    q_heads = 4
-    kv_heads = 2
-    head_dim = 3
-    query = torch.randn(batch_size, img_seq_local, q_heads, head_dim)
-    key_chunks = [torch.randn(batch_size, img_seq_local, kv_heads, head_dim) for _ in range(2)]
-    value_chunks = [torch.randn_like(chunk) for chunk in key_chunks]
-    strategy = AllGatherKVParallelAttention(
-        _MockAllGatherSPGroup(rank=rank, gather_chunks=[key_chunks, value_chunks]),
-    )
-
-    q_local, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], None)
-    output_gqa = torch.nn.functional.scaled_dot_product_attention(
-        q_local.transpose(1, 2),
-        k_full.transpose(1, 2),
-        v_full.transpose(1, 2),
-        enable_gqa=True,
-    )
-    repeat_num = q_heads // kv_heads
-    output_reference = torch.nn.functional.scaled_dot_product_attention(
-        q_local.transpose(1, 2),
-        k_full.repeat_interleave(repeat_num, dim=2).transpose(1, 2),
-        v_full.repeat_interleave(repeat_num, dim=2).transpose(1, 2),
-    )
-
-    torch.testing.assert_close(output_gqa, output_reference)
 
 
 @pytest.mark.parametrize(

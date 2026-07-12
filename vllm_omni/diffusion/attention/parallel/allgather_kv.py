@@ -13,6 +13,7 @@ from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.group_coordinator import (
     SequenceParallelGroupCoordinator,
 )
+from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -78,6 +79,10 @@ class AllGatherKVParallelAttention:
                 v_full = torch.cat([v_img_full, joint_v], dim=1)
         else:
             k_full, v_full = k_img_full, v_img_full
+
+        kv_repeat_num = int(attn_metadata.extra.get("kv_repeat_num", 1)) if attn_metadata is not None else 1
+        k_full = repeat_kv(k_full, kv_repeat_num)
+        v_full = repeat_kv(v_full, kv_repeat_num)
 
         if joint_q is not None:
             if joint_strategy == "front":
