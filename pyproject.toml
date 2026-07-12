@@ -311,6 +311,7 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+nd = "nd"  # einsum dim label (e.g. "n,d->nd")
 # Step-Audio reasoning parser streams `</think>` tokens split across chunks
 # (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
 # parser logic and tests and is not a typo of "the"/"this".

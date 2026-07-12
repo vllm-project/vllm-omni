@@ -5,10 +5,40 @@
 
 import numpy as np
 import torch
-from torchaudio.functional import melscale_fbanks
+from torchaudio.functional import melscale_fbanks, resample
 
 from vllm_omni.metrics import definitions as _metric_defs
 from vllm_omni.outputs import OmniRequestOutput
+
+
+def load_wav_mono(
+    path: str,
+    target_sr: int,
+) -> np.ndarray:
+    """Load a WAV file as a mono float32 numpy array at ``target_sr``.
+
+    Drop-in replacement for ``librosa.load(path, sr=target_sr)`` using
+    ``soundfile`` for I/O and ``torchaudio.functional.resample`` for
+    sample-rate conversion (avoids the banned ``librosa`` dependency).
+
+    Args:
+        path: Path to a readable audio file.
+        target_sr: Desired sample rate in Hz. If the file is already at
+            this rate, no resampling is performed.
+
+    Returns:
+        Mono waveform as a 1-D ``float32`` numpy array at ``target_sr``.
+    """
+    import soundfile as sf
+
+    wav, src_sr = sf.read(path, dtype="float32", always_2d=False)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=-1)
+    if src_sr != target_sr:
+        wav_t = torch.from_numpy(wav).unsqueeze(0)
+        wav_t = resample(wav_t, src_sr, target_sr)
+        wav = wav_t.squeeze(0).numpy()
+    return wav.astype(np.float32, copy=False)
 
 
 def mel_filter_bank(

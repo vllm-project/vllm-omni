@@ -311,6 +311,22 @@ _OMNI_MODELS = {
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
     ),
+    # Chatterbox TTS
+    "ChatterboxTurboT3ForGeneration": (
+        "chatterbox",
+        "chatterbox_t3",
+        "ChatterboxTurboT3ForGeneration",
+    ),
+    "ChatterboxT3ForGeneration": (
+        "chatterbox",
+        "chatterbox_t3",
+        "ChatterboxT3ForGeneration",
+    ),
+    "ChatterboxS3Gen": (
+        "chatterbox",
+        "chatterbox_s3gen",
+        "ChatterboxS3Gen",
+    ),
     ## IndexTTS2
     "IndexTTS2TalkerForConditionalGeneration": (
         "indextts2",

@@ -145,6 +145,9 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
                 "vllm_omni.entrypoints.openai",
                 "vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts",
                 "vllm_omni.experimental",  # optional serving deps not installed in docs build
+                # Vendored S3Gen sources are excluded from api-autonav (mkdocs.yml), so the
+                # README must not emit cross-reference links to them or strict mode aborts.
+                "vllm_omni.model_executor.models.chatterbox.s3gen_core",
             ]
             if any(module_path.startswith(prefix) for prefix in excluded_prefixes):
                 continue
