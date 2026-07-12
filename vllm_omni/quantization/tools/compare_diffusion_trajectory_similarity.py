@@ -280,7 +280,6 @@ def _build_quantization_config(
     quantization: str | None,
     quantization_config_json: str | None,
     ignored_layers: str | None,
-    gguf_model: str | None,
 ) -> dict[str, Any] | None:
     explicit = _load_json_arg(quantization_config_json)
     if explicit is not None:
@@ -292,8 +291,6 @@ def _build_quantization_config(
     ignored = _split_csv(ignored_layers)
     if ignored:
         config["ignored_layers"] = ignored
-    if gguf_model is not None:
-        config["gguf_model"] = gguf_model
     return config
 
 
@@ -305,7 +302,6 @@ def _build_variant_config(args: argparse.Namespace, variant: str) -> VariantConf
         quantization=quantization,
         quantization_config_json=getattr(args, f"{variant}_quantization_config_json"),
         ignored_layers=ignored_layers,
-        gguf_model=getattr(args, f"{variant}_gguf_model"),
     )
     return VariantConfig(
         label=variant,
@@ -554,8 +550,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-ignored-layers", help="Comma-separated reference ignored layer patterns.")
     parser.add_argument("--candidate-ignored-layers", help="Comma-separated candidate ignored layer patterns.")
     parser.add_argument("--ignored-layers", help="Alias for --candidate-ignored-layers.")
-    parser.add_argument("--reference-gguf-model", help="Reference GGUF file or HF reference when using gguf.")
-    parser.add_argument("--candidate-gguf-model", help="Candidate GGUF file or HF reference when using gguf.")
     parser.add_argument("--reference-load-format", default="default", help="Reference diffusion load format.")
     parser.add_argument("--candidate-load-format", default="default", help="Candidate diffusion load format.")
     parser.add_argument("--prompt", default="a cup of coffee on the table")

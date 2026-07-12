@@ -739,7 +739,7 @@ def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(m
     monkeypatch.setattr(
         engine_mod,
         "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(
@@ -772,7 +772,7 @@ def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
     monkeypatch.setattr(
         engine_mod,
         "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(
@@ -798,7 +798,7 @@ def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stag
     monkeypatch.setattr(
         engine_mod,
         "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg]),
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(
