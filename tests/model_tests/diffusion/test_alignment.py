@@ -56,6 +56,7 @@ EXCLUDED_MODELS = [
     "NextStep11Pipeline",
     "FluxPipeline",
     "FluxDMD2Pipeline",
+    "Krea2Pipeline",
     "QwenImageDMD2Pipeline",
     "OmniGen2Pipeline",
     "HeliosPipeline",
