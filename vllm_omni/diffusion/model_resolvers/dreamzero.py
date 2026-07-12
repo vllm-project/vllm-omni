@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+from vllm_omni.diffusion.model_resolvers.types import ModelConfigLike
 
 
-def is_dreamzero_model_family(cfg: Mapping[str, Any] | None) -> bool:
+def is_dreamzero_model_family(cfg: ModelConfigLike | None) -> bool:
     if cfg is None:
         return False
     return cfg.get("model_type") == "vla"
@@ -14,8 +13,12 @@ def is_dreamzero_model_family(cfg: Mapping[str, Any] | None) -> bool:
 
 def resolve_dreamzero_model_class_name(
     model: str | None,
-    cfg: Mapping[str, Any] | None,
+    cfg: ModelConfigLike | None,
 ) -> str | None:
+    """Resolve DreamZero model class from VLA-family configs.
+
+    ``cfg`` is expected to include ``model_type`` when available.
+    """
     if not is_dreamzero_model_family(cfg):
         return None
 

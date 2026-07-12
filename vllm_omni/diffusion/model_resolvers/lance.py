@@ -7,8 +7,8 @@ that package's heavy pipeline modules from shared config code.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
-from typing import Any
+
+from vllm_omni.diffusion.model_resolvers.types import ModelConfigLike
 
 
 def looks_like_lance_subfolder(model: str | None) -> bool:
@@ -21,9 +21,13 @@ def looks_like_lance_subfolder(model: str | None) -> bool:
 
 def resolve_lance_model_class_name(
     model: str | None,
-    cfg: Mapping[str, Any] | None,
+    cfg: ModelConfigLike | None,
 ) -> str | None:
-    """Resolve Lance to its pipeline class when config/path markers match."""
+    """Resolve Lance to its pipeline class when config/path markers match.
+
+    ``cfg`` is expected to be a model config view containing optional fields
+    such as ``model_type``, ``architectures``, or ``model_name``.
+    """
     if cfg is None:
         return "LancePipeline" if looks_like_lance_subfolder(model) else None
 

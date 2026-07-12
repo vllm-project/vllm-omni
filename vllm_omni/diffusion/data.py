@@ -515,6 +515,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     client-side. Returns ``None`` if the pipeline can't be determined.
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
+
     from vllm_omni.diffusion.model_resolvers import resolve_model_class_resolution
 
     if not model:
@@ -1000,10 +1001,14 @@ class OmniDiffusionConfig:
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
-    def _apply_resolved_model_class(self, model_class_name: str) -> None:
-        # Treat resolver-selected classes as authoritative for known model
-        # families so both resolution entrypoints stay consistent, even if a
-        # caller passed a stale explicit class name before config enrichment.
+    def _apply_resolved_model_class(self, model_class_name: str, *, override_existing: bool = True) -> None:
+        # Some families document ``--model-class-name`` as an explicit override
+        # (for example NextStep and Wan S2V), so preserve the caller-provided
+        # value when requested instead of replacing it with the inferred class.
+        if not override_existing and self.model_class_name is not None:
+            self.update_multimodal_support()
+            return
+
         self.model_class_name = model_class_name
         self.set_tf_model_config(TransformerConfig())
         self.update_multimodal_support()
@@ -1016,6 +1021,7 @@ class OmniDiffusionConfig:
         so we fall back to reading that and mapping model_type manually.
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
+
         from vllm_omni.diffusion.model_resolvers import resolve_model_class_resolution
 
         # Default model_class_name for diffusers adapter
@@ -1077,7 +1083,14 @@ class OmniDiffusionConfig:
                 architectures = cfg.get("architectures") or []
                 resolution = resolve_model_class_resolution(self.model, cfg)
                 if resolution.model_class_name is not None:
-                    self._apply_resolved_model_class(resolution.model_class_name)
+                    preserve_explicit_model_class = resolution.model_class_name in {
+                        "NextStep11Pipeline",
+                        "WanS2VPipeline",
+                    }
+                    self._apply_resolved_model_class(
+                        resolution.model_class_name,
+                        override_existing=not preserve_explicit_model_class,
+                    )
                 elif resolution.handled:
                     raise
                 elif architectures and len(architectures) == 1:

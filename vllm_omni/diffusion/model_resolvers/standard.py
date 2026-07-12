@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+from vllm_omni.diffusion.model_resolvers.types import ModelConfigLike
 
 
 def resolve_standard_model_class_name(
     model: str | None,
-    cfg: Mapping[str, Any] | None,
+    cfg: ModelConfigLike | None,
 ) -> str | None:
+    """Resolve straightforward model families by config markers.
+
+    ``cfg`` is expected to be a model config view with optional keys such as
+    ``model_type`` and ``architectures``.
+    """
     del model  # Reserved for future path-based standard-family resolution.
     if cfg is None:
         return None

@@ -43,7 +43,7 @@ def test_resolve_model_class_name_falls_back_to_single_architecture(monkeypatch)
     assert resolve_model_class_name("fake-model") == "FooPipeline"
 
 
-def test_nextstep_enrich_config_overrides_stale_explicit_model_class(monkeypatch):
+def test_nextstep_enrich_config_preserves_explicit_model_class_name(monkeypatch):
     monkeypatch.setattr(
         "vllm.transformers_utils.config.get_hf_file_to_dict",
         lambda path, _model: None if path == "model_index.json" else {"model_type": "nextstep", "architectures": []},
@@ -51,10 +51,27 @@ def test_nextstep_enrich_config_overrides_stale_explicit_model_class(monkeypatch
 
     od_config = OmniDiffusionConfig(
         model="bytedance-research/NextStep-1-Large",
-        model_class_name="StalePipeline",
+        model_class_name="UserProvidedPipeline",
     )
     proc = StageDiffusionProc(od_config.model, od_config)
 
     proc._enrich_config()
 
-    assert od_config.model_class_name == "NextStep11Pipeline"
+    assert od_config.model_class_name == "UserProvidedPipeline"
+
+
+def test_s2v_enrich_config_preserves_explicit_model_class_name(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_hf_file_to_dict",
+        lambda path, _model: None if path == "model_index.json" else {"model_type": "s2v", "architectures": []},
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="Wan-AI/Wan2.2-S2V-14B",
+        model_class_name="UserProvidedPipeline",
+    )
+    proc = StageDiffusionProc(od_config.model, od_config)
+
+    proc._enrich_config()
+
+    assert od_config.model_class_name == "UserProvidedPipeline"
