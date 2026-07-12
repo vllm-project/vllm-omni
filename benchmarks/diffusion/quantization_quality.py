@@ -192,6 +192,23 @@ def _output_fps(args) -> int:
     return 24
 
 
+def _prepare_video_frames_for_export(frames):
+    """Normalize integer NumPy video frames for diffusers' float-only exporter."""
+    array = np.asarray(frames)
+    if array.ndim == 4 and np.issubdtype(array.dtype, np.integer):
+        return list(array.astype(np.float32) / np.iinfo(array.dtype).max)
+    return list(array) if isinstance(frames, np.ndarray) and array.ndim == 4 else frames
+
+
+def _save_video(frames, output_path: Path, fps: int) -> None:
+    try:
+        from diffusers.utils import export_to_video
+
+        export_to_video(_prepare_video_frames_for_export(frames), str(output_path), fps=fps)
+    except ImportError:
+        np.save(output_path.with_suffix(".npy"), frames)
+
+
 def _generate_image(omni, args, prompt, seed):
     """Generate a single image and return (PIL.Image, time_seconds, memory_gib)."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -348,13 +365,7 @@ def run_benchmark(args):
     for i, prompt in enumerate(prompts):
         out = baseline_outputs[prompt][0]
         if is_video:
-            try:
-                from diffusers.utils import export_to_video
-
-                frames_list = list(out) if isinstance(out, np.ndarray) and out.ndim == 4 else out
-                export_to_video(frames_list, str(bl_dir / f"prompt_{i}.mp4"), fps=_output_fps(args))
-            except ImportError:
-                np.save(bl_dir / f"prompt_{i}.npy", out)
+            _save_video(out, bl_dir / f"prompt_{i}.mp4", fps=_output_fps(args))
         else:
             out.save(bl_dir / f"prompt_{i}.png")
 
@@ -395,13 +406,7 @@ def run_benchmark(args):
             qt_out = qt_outputs[prompt][0]
             if is_video:
                 lpips_score = compute_lpips_video(bl_out, qt_out, net=args.lpips_net)
-                try:
-                    from diffusers.utils import export_to_video
-
-                    frames_list = list(qt_out) if isinstance(qt_out, np.ndarray) and qt_out.ndim == 4 else qt_out
-                    export_to_video(frames_list, str(qt_dir / f"prompt_{i}.mp4"), fps=_output_fps(args))
-                except ImportError:
-                    np.save(qt_dir / f"prompt_{i}.npy", qt_out)
+                _save_video(qt_out, qt_dir / f"prompt_{i}.mp4", fps=_output_fps(args))
             else:
                 lpips_score = compute_lpips_images([bl_out], [qt_out], net=args.lpips_net)[0]
                 qt_out.save(qt_dir / f"prompt_{i}.png")

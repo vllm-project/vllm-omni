@@ -488,6 +488,18 @@ def test_benchmark_output_fps_uses_magi_human_native_rate():
     assert _output_fps(SimpleNamespace(fps=30, model_type="magi-human")) == 30
 
 
+def test_benchmark_video_export_normalizes_uint8_frames():
+    from benchmarks.diffusion.quantization_quality import _prepare_video_frames_for_export
+
+    frames = np.array([[[[0, 127, 255]]]], dtype=np.uint8)
+
+    prepared = _prepare_video_frames_for_export(frames)
+
+    assert len(prepared) == 1
+    assert prepared[0].dtype == np.float32
+    np.testing.assert_allclose(prepared[0], [[[0.0, 127 / 255, 1.0]]])
+
+
 _marks = hardware_marks(res={"cuda": "H100"})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
