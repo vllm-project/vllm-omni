@@ -1043,6 +1043,7 @@ class AsyncOmniEngine:
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
+            "quantization_config": kwargs.get("quantization_config", None),
             "diffusion_kv_cache_dtype": kwargs.get("diffusion_kv_cache_dtype", None),
             "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
             "diffusion_kv_cache_skip_layers": kwargs.get("diffusion_kv_cache_skip_layers", None),
@@ -1233,7 +1234,7 @@ class AsyncOmniEngine:
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
                         )
-                quantization_config = kwargs.get("diffusion_quantization_config")
+                quantization_config = kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")
@@ -1567,16 +1568,18 @@ class AsyncOmniEngine:
         # and can cause CUDA OOM for subsequent engine instances (especially
         # large models like BAGEL-7B-MoT whose weights alone consume ~134 GiB).
         #
-        # Discard mode (level=2) is correct at shutdown: there is no benefit to
-        # keeping a CPU backup when the engine is being torn down.
+        # CuMemAllocator.sleep() is NOT idempotent — calling it on already-
+        # slept entries causes CUDA_ERROR_INVALID_VALUE at cumem_allocator
+        # cuMemRelease (double-free of the memory handle).  Use release_pools()
+        # instead, which is the designed cleanup path: it drops MemPool refs
+        # and lets the destructor/free path handle asleep entries correctly
+        # (returns a null handle so the C extension skips unmap/release).
         try:
             from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
 
             if cumem_available:
                 allocator = CuMemAllocator.get_instance()
-                # Sleep at level 2 discards all pool memory from the GPU
-                # without creating CPU backups — cheapest and fastest.
-                allocator.sleep()
+                allocator.release_pools()
                 logger.debug("[AsyncOmniEngine] Released CuMem memory pool during shutdown")
         except Exception:
             pass
