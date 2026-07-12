@@ -12,6 +12,10 @@ from vllm_omni.model_executor.models.common.ming.fm import Solver
 from vllm_omni.model_executor.models.ming_tts.constants import (
     AGGREGATOR_HIDDEN_SIZE,
     HISTORY_PATCH_SIZE,
+    KEY_DECODE_STEP,
+    KEY_LATENT_HISTORY,
+    KEY_NEXT_EMBEDS,
+    KEY_REQUEST_ID,
     LATENT_DIM,
     LLM_HIDDEN_SIZE,
     LLM_VOCAB_SIZE,
@@ -20,7 +24,13 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     VAE_PATCH_SIZE,
 )
 from vllm_omni.model_executor.models.ming_tts.flowloss_head import FlowLoss
+from vllm_omni.model_executor.models.ming_tts.ming_tts import MingTTSForConditionalGeneration
 from vllm_omni.model_executor.models.ming_tts.ming_tts_llm import MingLLMModel
+from vllm_omni.model_executor.models.ming_tts.patch_emission import (
+    MING_STOP_REASON_CONTINUE,
+    MING_STOP_REASON_KEY,
+    MING_STOP_REASON_MAX_DECODE_STEPS,
+)
 from vllm_omni.model_executor.models.ming_tts.validation import validate_ming_tts_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -187,3 +197,81 @@ def test_ming_compute_logits_text_mode_delegates_to_backbone():
 
     assert torch.equal(model.model.hidden_states, hidden_states)
     assert torch.equal(logits, torch.ones((2, 3)))
+
+
+def _make_ming_stage0_model():
+    model = object.__new__(MingTTSForConditionalGeneration)
+    model.model_stage = "llm"
+    model.ming_config = SimpleNamespace(
+        history_patch_size=HISTORY_PATCH_SIZE,
+        latent_dim=LATENT_DIM,
+        llm_hidden_size=LLM_HIDDEN_SIZE,
+    )
+    model._decode_state_cache = {}
+    return model
+
+
+def test_ming_decode_preprocess_prefers_local_gpu_cache():
+    model = _make_ming_stage0_model()
+    request_id = "req-1"
+    cached_history = torch.full((HISTORY_PATCH_SIZE, LATENT_DIM), 7.0)
+    cached_next = torch.full((1, LLM_HIDDEN_SIZE), 3.0)
+    model._decode_state_cache[request_id] = {
+        KEY_LATENT_HISTORY: cached_history,
+        KEY_NEXT_EMBEDS: cached_next,
+    }
+
+    _, input_embeds, update = MingTTSForConditionalGeneration._decode_preprocess(
+        model,
+        input_ids=torch.tensor([1]),
+        input_embeds=torch.zeros((1, LLM_HIDDEN_SIZE)),
+        **{
+            KEY_REQUEST_ID: request_id,
+            KEY_DECODE_STEP: 4,
+            KEY_LATENT_HISTORY: torch.zeros((HISTORY_PATCH_SIZE, LATENT_DIM)),
+            KEY_NEXT_EMBEDS: torch.zeros((1, LLM_HIDDEN_SIZE)),
+        },
+    )
+
+    assert torch.equal(update[KEY_LATENT_HISTORY], cached_history)
+    assert torch.equal(input_embeds[0], cached_next[0])
+
+
+def test_ming_postprocess_updates_and_clears_local_cache():
+    model = _make_ming_stage0_model()
+    request_id = "req-2"
+    next_history = torch.randn(HISTORY_PATCH_SIZE, LATENT_DIM)
+    next_embeds = torch.randn(1, LLM_HIDDEN_SIZE)
+    pending = {
+        KEY_LATENT_HISTORY: next_history,
+        KEY_NEXT_EMBEDS: next_embeds,
+        MING_STOP_REASON_KEY: MING_STOP_REASON_CONTINUE,
+    }
+    model.model = SimpleNamespace(pop_postprocess_update=lambda req_id: pending if req_id == request_id else {})
+
+    update = MingTTSForConditionalGeneration.postprocess(
+        model,
+        hidden_states=torch.ones((1, LLM_HIDDEN_SIZE)),
+        **{KEY_REQUEST_ID: request_id, KEY_DECODE_STEP: 1},
+    )
+
+    assert torch.equal(update[KEY_LATENT_HISTORY], next_history)
+    assert torch.equal(update[KEY_NEXT_EMBEDS], next_embeds)
+    assert request_id in model._decode_state_cache
+    assert torch.equal(model._decode_state_cache[request_id][KEY_LATENT_HISTORY], next_history)
+
+    terminal_pending = {
+        KEY_LATENT_HISTORY: next_history,
+        KEY_NEXT_EMBEDS: next_embeds,
+        MING_STOP_REASON_KEY: MING_STOP_REASON_MAX_DECODE_STEPS,
+    }
+    model.model = SimpleNamespace(
+        pop_postprocess_update=lambda req_id: terminal_pending if req_id == request_id else {}
+    )
+    MingTTSForConditionalGeneration.postprocess(
+        model,
+        hidden_states=torch.ones((1, LLM_HIDDEN_SIZE)),
+        **{KEY_REQUEST_ID: request_id, KEY_DECODE_STEP: 2},
+    )
+
+    assert request_id not in model._decode_state_cache

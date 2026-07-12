@@ -38,7 +38,7 @@ from .config_ming_tts import (
     KEY_TEXT_MODE,
     MingTTSConfig,
 )
-from .patch_emission import MING_STOP_REASON_KEY
+from .patch_emission import MING_STOP_REASON_CONTINUE, MING_STOP_REASON_KEY
 from .prompt_encoder import _resolve_prompt_latents
 
 
@@ -64,6 +64,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         self.requires_raw_input_tokens = False
         self.model_stage = vllm_config.model_config.model_stage
         self._prompt_encoder = None
+        self._decode_state_cache: dict[str, dict[str, torch.Tensor]] = {}
 
         if self.model_stage == "llm":
             self.model = init_vllm_registered_model(vllm_config=vllm_config, architectures=["MingLLMModel"])
@@ -71,6 +72,10 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             self.has_postprocess = True
             self.set_custom_preprocess(self.preprocess)
             self.set_custom_postprocess(self.postprocess)
+            self.gpu_resident_buffer_keys: set[str] = {
+                KEY_LATENT_HISTORY,
+                KEY_NEXT_EMBEDS,
+            }
         elif self.model_stage == "audio_vae":
             self.model = init_vllm_registered_model(vllm_config=vllm_config, architectures=["MingAudioVAEModel"])
             self.requires_raw_input_tokens = True
@@ -138,19 +143,28 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         if not pending or not isinstance(pending.get("ming_latent_patch"), torch.Tensor):
             return {}
 
+        next_history = pending[KEY_LATENT_HISTORY].detach().contiguous()
+        next_embeds = pending[KEY_NEXT_EMBEDS].detach().contiguous()
+        stop_reason = pending.get(MING_STOP_REASON_KEY)
         update = {
-            KEY_LATENT_HISTORY: pending[KEY_LATENT_HISTORY].detach().to("cpu").contiguous(),
-            KEY_NEXT_EMBEDS: pending[KEY_NEXT_EMBEDS].detach().to("cpu").contiguous(),
+            KEY_LATENT_HISTORY: next_history,
+            KEY_NEXT_EMBEDS: next_embeds,
             KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0)) + 1,
         }
         stop_prob = _take_scalar(pending.get("ming_stop_prob"), 0)
         if stop_prob is not None:
             update[KEY_LAST_STOP_PROB] = stop_prob
-        stop_reason = pending.get(MING_STOP_REASON_KEY)
         if isinstance(stop_reason, str):
             update[MING_STOP_REASON_KEY] = stop_reason
         if isinstance(req_id, str):
             update[KEY_REQUEST_ID] = req_id
+            if stop_reason == MING_STOP_REASON_CONTINUE:
+                self._decode_state_cache[req_id] = {
+                    KEY_LATENT_HISTORY: next_history,
+                    KEY_NEXT_EMBEDS: next_embeds,
+                }
+            else:
+                self._decode_state_cache.pop(req_id, None)
         return update
 
     def _prefill_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: Any):
@@ -172,7 +186,8 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             device=input_embeds.device,
             dtype=torch.float32,
         )
-        update[KEY_LATENT_HISTORY] = history.detach().to("cpu").contiguous()
+        history = history.detach().contiguous()
+        update[KEY_LATENT_HISTORY] = history
 
         speaker_embedding = info_dict.get(KEY_SPEAKER_EMBEDDING, info_dict.get("speaker_embedding"))
         speaker_embeddings = None
@@ -205,6 +220,8 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         request_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
         if request_id is not None:
             update[KEY_REQUEST_ID] = request_id
+            if isinstance(request_id, str):
+                self._decode_state_cache[request_id] = {KEY_LATENT_HISTORY: history}
         _copy_runtime_controls(update, info_dict)
         return input_ids, input_embeds, update
 
@@ -217,18 +234,23 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             return input_ids, input_embeds, update
 
         update: dict[str, Any] = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
-        history = info_dict.get(KEY_LATENT_HISTORY)
+        request_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
+        cached_state = self._decode_state_cache.get(request_id) if isinstance(request_id, str) else None
+        history = (
+            cached_state.get(KEY_LATENT_HISTORY) if cached_state is not None else info_dict.get(KEY_LATENT_HISTORY)
+        )
         if isinstance(history, torch.Tensor):
-            update[KEY_LATENT_HISTORY] = history.detach().to("cpu").contiguous()
+            history_tensor = history.detach().contiguous()
+            update[KEY_LATENT_HISTORY] = history_tensor
         else:
-            zero_history = torch.zeros(
+            history_tensor = torch.zeros(
                 (self.ming_config.history_patch_size, self.ming_config.latent_dim),
                 device=input_embeds.device,
                 dtype=torch.float32,
             )
-            update[KEY_LATENT_HISTORY] = zero_history.detach().to("cpu").contiguous()
+            update[KEY_LATENT_HISTORY] = history_tensor.detach().contiguous()
 
-        next_embeds = info_dict.get(KEY_NEXT_EMBEDS)
+        next_embeds = cached_state.get(KEY_NEXT_EMBEDS) if cached_state is not None else info_dict.get(KEY_NEXT_EMBEDS)
         if isinstance(next_embeds, torch.Tensor) and input_ids.numel() == 1:
             if not torch.isfinite(next_embeds).all():
                 raise RuntimeError("Non-finite next_embeds before decode preprocess write.")
@@ -243,9 +265,13 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             if not torch.isfinite(input_embeds[0]).all():
                 raise RuntimeError("Non-finite backbone input_embeds after decode preprocess write.")
 
-        request_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
         if request_id is not None:
             update[KEY_REQUEST_ID] = request_id
+            if isinstance(request_id, str):
+                state = self._decode_state_cache.setdefault(request_id, {})
+                state[KEY_LATENT_HISTORY] = update[KEY_LATENT_HISTORY]
+                if isinstance(next_embeds, torch.Tensor):
+                    state[KEY_NEXT_EMBEDS] = next_embeds.detach().contiguous()
         _copy_runtime_controls(update, info_dict)
         return input_ids, input_embeds, update
 
