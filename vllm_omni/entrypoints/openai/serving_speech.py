@@ -82,6 +82,11 @@ _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
+# CosyVoice3 talker expects its reference transcript wrapped in the model
+# instruction template; without the delimiter the talker re-speaks the
+# reference (issue #4644). Matches the offline example/test and upstream demo.
+_COSYVOICE3_PROMPT_DELIMITER = "<|endofprompt|>"
+_COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DELIMITER}"
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
@@ -447,6 +452,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None) == "fish_speech_slow_ar"
         )
         self._fish_speech_tokenizer = None
+        self._covo_audio_tokenizer = None
         # Cached per process: the CosyVoice3 Qwen tokenizer + resolved model
         # path used for dynamic-token sizing. Without this, every request
         # re-ran snapshot_download + reloaded the tokenizer (~100 ms on the
@@ -3063,6 +3069,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "multi_modal_data": {"audio": [(audio.audio_array, audio.sampling_rate)]},
             }
 
+    # ---- Step-Audio2 helpers ----
+
+    def _build_step_audio2_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        """Build prompt for Step-Audio2 TTS.
+
+        Constructs the chat prompt with ``<tts_start>`` as the last token
+        of the assistant turn (without ``<|im_end|>``), so the thinker
+        continues generating audio tokens.
+        """
+        system_prompt = getattr(request, "instructions", None) or "You are a voice assistant. Read the text aloud."
+        text = request.input
+
+        raw_prompt = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{text}<|im_end|>\n"
+            f"<|im_start|>assistant\n<tts_start>"
+        )
+        return {"prompt": raw_prompt}
+
     # ---- Fish Speech helpers ----
 
     def _build_fish_speech_prompt(
@@ -3130,6 +3158,66 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = additional_information
         return prompt
+
+    # ---- CosyVoice3 helpers ----
+
+    async def _build_cosyvoice3_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        has_inline_ref_audio: bool = False,
+    ) -> dict[str, Any]:
+        """Build prompt for CosyVoice3."""
+        wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+        audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
+
+        ref_text = request.ref_text or ""
+        if _COSYVOICE3_PROMPT_DELIMITER not in ref_text:
+            ref_text = f"{_COSYVOICE3_PROMPT_PREFIX}{ref_text}"
+        mm_kwargs: dict[str, Any] = {
+            "prompt_text": ref_text,
+            "sample_rate": sr,
+        }
+        if request.voice:
+            voice_lower = request.voice.lower()
+            if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                mm_kwargs["voice_name"] = voice_lower
+                mm_kwargs["voice_created_at"] = self._voice_created_at(voice_lower)
+
+        return {
+            "prompt": request.input,
+            "multi_modal_data": {"audio": audio_data},
+            "mm_processor_kwargs": mm_kwargs,
+        }
+
+    # ---- Covo-Audio helpers ----
+
+    def _build_covo_audio_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        """Build a chat-style prompt for Covo-Audio-Chat."""
+        from transformers import AutoTokenizer
+
+        from vllm_omni.model_executor.models.covo_audio.prompt_utils import (
+            build_covo_audio_prompt_token_ids,
+        )
+
+        if self._covo_audio_tokenizer is None:
+            model_name = self.engine_client.model_config.model
+            try:
+                self._covo_audio_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load Covo-Audio tokenizer from '{model_name}': {exc}") from exc
+
+        prompt_ids = build_covo_audio_prompt_token_ids(
+            self._covo_audio_tokenizer,
+            request.input,
+        )
+        return {"prompt_token_ids": prompt_ids}
 
     def _apply_cosyvoice3_dynamic_tokens(
         self,

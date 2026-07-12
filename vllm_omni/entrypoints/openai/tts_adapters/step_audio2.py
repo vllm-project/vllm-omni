@@ -31,24 +31,5 @@ class StepAudio2Adapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        """Build prompt for Step-Audio2 TTS.
-
-        Constructs the chat prompt with ``<tts_start>`` as the last token
-        of the assistant turn (without ``<|im_end|>``), so the thinker
-        continues generating audio tokens.
-
-        Prompt format::
-            <|im_start|>system\\n{system_prompt}<|im_end|>\\n
-            <|im_start|>user\\n{input_text}<|im_end|>\\n
-            <|im_start|>assistant\\n<tts_start>
-        """
-        system_prompt = getattr(request, "instructions", None) or "You are a voice assistant. Read the text aloud."
-        text = request.input
-
-        raw_prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{text}<|im_end|>\n"
-            f"<|im_start|>assistant\n<tts_start>"
-        )
-        prompt = {"prompt": raw_prompt}
+        prompt = self.ctx.server._build_step_audio2_prompt(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="step_audio2")
