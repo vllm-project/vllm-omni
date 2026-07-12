@@ -57,15 +57,18 @@ When archive/push intent is present, **after** HTML generation:
 ```bash
 gh auth status   # required before push
 export KANBAN_REPO_ROOT="${KANBAN_REPO_ROOT:-~/vllm-omni-kanban}"   # confirm with user first
+export KANBAN_ASSETS_DIR="${KANBAN_ASSETS_DIR:-$KANBAN_REPO_ROOT/docs/assets/charts}"   # required for Days failing column
 
 # 1) Generate report (no push) — default output uses UTC today in filename/title
 python scripts/nightly_local_log_report.py \
-  --kanban-repo-root "$KANBAN_REPO_ROOT"
+  --kanban-repo-root "$KANBAN_REPO_ROOT" \
+  --kanban-assets-dir "$KANBAN_ASSETS_DIR"
 
 # Or pin archive date explicitly:
 # python scripts/nightly_local_log_report.py \
 #   --report-date 2026-06-26 \
-#   --kanban-repo-root "$KANBAN_REPO_ROOT"
+#   --kanban-repo-root "$KANBAN_REPO_ROOT" \
+#   --kanban-assets-dir "$KANBAN_ASSETS_DIR"
 
 # 2) Archive + stage (separate command; prints preview, no push)
 python scripts/push_report_to_kanban.py \
@@ -93,6 +96,7 @@ Ask for or infer:
 - **Report date for filename/title:** UTC **today** when generating (scripts default automatically). **Never** copy from `nightly_jobs_YYYYMMDD-HHMMSS` log dir suffixes.
 - Buildkite token in the environment (`BUILDKITE_TOKEN` or `BUILDKITE_API_TOKEN`) unless the user explicitly wants `--no-buildkite`.
 - Kanban repo root for baseline comparison: default **`~/vllm-omni-kanban`** ([confirm with user](references/confirm-laptop-path-defaults.md)) or `--kanban-repo-root`.
+- **Kanban assets dir for `*_history.json`** (drives the **Daily focus "Days failing" column** and per-model perf baseline table): **must be passed explicitly** as `--kanban-assets-dir "$KANBAN_REPO_ROOT/docs/assets/charts"`. `--kanban-repo-root` does **not** auto-derive `assets_dir`; if omitted, `_compute_history_fail_lookup` reads an empty dir and every focus row shows `Days failing = —`. (Discovered 2026-07-09: a full nightly run had 113 fail-status focus rows but all showed `—` because `kanban_cfg.assets_dir` was `None`.)
 - Optional pinned Buildkite build: `--buildkite-build N`.
 - Optional local logs: default **`REPO_ROOT=~/vllm-omni`** ([confirm with user](references/confirm-laptop-path-defaults.md)) with `logs/nightly_jobs`, or pass `--log-dir`.
 
@@ -100,11 +104,13 @@ Ask for or infer:
 
 ```bash
 export KANBAN_REPO_ROOT="${KANBAN_REPO_ROOT:-~/vllm-omni-kanban}"
+export KANBAN_ASSETS_DIR="${KANBAN_ASSETS_DIR:-$KANBAN_REPO_ROOT/docs/assets/charts}"
 export REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
 export BUILDKITE_TOKEN=...   # optional; omit with --no-buildkite
 python scripts/prepare_kanban_before_report.py
 python scripts/nightly_local_log_report.py \
-  --kanban-repo-root "$KANBAN_REPO_ROOT"
+  --kanban-repo-root "$KANBAN_REPO_ROOT" \
+  --kanban-assets-dir "$KANBAN_ASSETS_DIR"
 ```
 
 ### Release Quick Path
@@ -137,7 +143,7 @@ python scripts/compose_full_report.py \
 
 The **Development** variant shares the **Test Result** layout with `--kind release` but **drops Test conclusion + Issue tracking** and replaces **Metrics overview** with a 4-row snapshot focused on outstanding defect inventory + latest CI verdicts + unassigned-owner triage. Each H200/H800/A100 section in **Test Result** also gains a `#### Performance Data Comparison` subsection (read-only kanban usage — see below).
 
-**Document body layout (Development variant):** The Development HTML/Markdown **starts directly at the `## Metrics overview` section** — there is no leading multi-bullet descriptive preamble (no release/development comparison paragraph, no section-ordering bullet list, no CSS-class explainer). Only a single `* **Report date (UTC):** YYYY-MM-DD*` line sits between the H1 title and the first section so the date is unambiguous in the rendered output. Section ordering remains: Metrics overview → Test Result → Failure Analysis → Performance Data Comparison → Open issues.
+**Document body layout (Development variant):** The Development HTML/Markdown **starts directly at the `## Metrics overview` section** — there is no leading multi-bullet descriptive preamble (no release/development comparison paragraph, no section-ordering bullet list, no CSS-class explainer). Only a single `* **Report date (UTC):** YYYY-MM-DD*` line sits between the H1 title and the first section so the date is unambiguous in the rendered output. Section ordering remains: Metrics overview → Test Result → Failure Analysis → Performance Data Comparison → Open issues → **Bugfix Monitor** (last 7 days of `[Bugfix]` PRs on `vllm-project/vllm-omni`, split into Open / Closed `<details>` sub-folds, with a per-PR "needs more tests?" verdict).
 
 Ask for or infer:
 - Buildkite token in the environment (`BUILDKITE_TOKEN` or `BUILDKITE_API_TOKEN`) — required unless using `--preview`.
@@ -225,17 +231,23 @@ From **this** skill directory (after [fetch](../vllm-omni-local-test/references/
 ```bash
 export REPO_ROOT="${REPO_ROOT:-~/vllm-omni}"
 export KANBAN_REPO_ROOT="${KANBAN_REPO_ROOT:-~/vllm-omni-kanban}"
+export KANBAN_ASSETS_DIR="${KANBAN_ASSETS_DIR:-$KANBAN_REPO_ROOT/docs/assets/charts}"
 python scripts/prepare_kanban_before_report.py
 export BUILDKITE_TOKEN=...   # optional; omit with --no-buildkite
 python scripts/nightly_local_log_report.py \
-  --kanban-repo-root "$KANBAN_REPO_ROOT"
+  --kanban-repo-root "$KANBAN_REPO_ROOT" \
+  --kanban-assets-dir "$KANBAN_ASSETS_DIR"
 python scripts/nightly_local_log_report.py \
   --kanban-repo-root "$KANBAN_REPO_ROOT" \
+  --kanban-assets-dir "$KANBAN_ASSETS_DIR" \
   --kanban-refresh-from-raw
-python scripts/nightly_local_log_report.py --no-buildkite
+python scripts/nightly_local_log_report.py \
+  --kanban-repo-root "$KANBAN_REPO_ROOT" \
+  --kanban-assets-dir "$KANBAN_ASSETS_DIR" \
+  --no-buildkite
 ```
 
-Other flags: `--title`, `--buildkite-build`, `--kanban-repo-root`, `--kanban-raw-root`, `--kanban-refresh-from-raw`, `--kanban-expected-remote`, `--kanban-expected-branch`. **Markdown** (only if the user explicitly asks): `--markdown-report`, `--to-stdout markdown`. See `python scripts/nightly_local_log_report.py --help`.
+Other flags: `--title`, `--buildkite-build`, `--kanban-repo-root`, `--kanban-assets-dir` (required for the Days failing column — see Nightly Quick Path), `--kanban-raw-root`, `--kanban-refresh-from-raw`, `--kanban-expected-remote`, `--kanban-expected-branch`. **Markdown** (only if the user explicitly asks): `--markdown-report`, `--to-stdout markdown`. See `python scripts/nightly_local_log_report.py --help`.
 
 ## Release report (Buildkite, HTML)
 

@@ -794,6 +794,85 @@ def _wrap_failure_analysis_h4_in_details(html_fragment: str) -> str:
     return _wrap_section_h4_in_details(html_fragment, "Failure Analysis")
 
 
+_BUGFIX_MONITOR_H3_RE = re.compile(
+    r"<h3>\s*(Open|Closed)\s+bugfix\s+PRs\s*\([^)]+\)\s*</h3>",
+    re.IGNORECASE,
+)
+
+
+def _wrap_bugfix_monitor_h3_in_details(html_fragment: str) -> str:
+    """Wrap ``### Open bugfix PRs (N)`` / ``### Closed bugfix PRs (N)`` headings
+    inside **Bugfix Monitor** as collapsible ``<details>`` blocks (the custom
+    markdown→HTML converter doesn't preserve raw ``<details>`` HTML, so we
+    emit ``### h3`` headings and post-process the body to wrap them).
+
+    Each h3 becomes a fold; its body content is the tables that follow until
+    the next h3 (or end of the section). The wrapper reuses the same
+    ``report-subcard`` CSS class so the styling matches the rest of the report.
+    """
+    # Locate the actual ``<h2 class="release-section-h2">Bugfix Monitor`` heading
+    # by matching the *complete* h2 element up to and including the closing
+    # ``</h2>`` so the regex is bounded to a single h2 (the inner label text
+    # is what we actually want to match). The non-greedy ``.*?`` inside the
+    # ico span is safe; the ``</h2>`` at the tail anchors the match.
+    h2_match = re.search(
+        r'<h2 class="release-section-h2"[^>]*>'
+        r"(?:(?!</h2>).)*?"
+        r'<span class="release-section-h2-label">\s*Bugfix Monitor[^<]*</span>'
+        r"(?:(?!</h2>).)*?"
+        r"</h2>",
+        html_fragment,
+        re.DOTALL,
+    )
+    if not h2_match:
+        return html_fragment
+    # The enclosing <section class="panel release-section-card"> is the most
+    # recent one before the h2 — rfind the full class string so we don't
+    # accidentally pick up the intro section.
+    sec_start = html_fragment.rfind('<section class="panel release-section-card', 0, h2_match.start())
+    if sec_start < 0:
+        return html_fragment
+    # The regex match is bounded to the full ``<h2 …>…</h2>`` element, so
+    # ``h2_match.end()`` points one past the closing ``</h2>``.
+    head_end = h2_match.end()
+    # _balanced_outer_section_end returns the index one past the matching
+    # ``</section>``. The body sits between ``</h2>`` and that closing tag.
+    sec_close = _balanced_outer_section_end(html_fragment, sec_start)
+    if sec_close is None:
+        return html_fragment
+    prefix = html_fragment[:sec_start]
+    head = html_fragment[sec_start:head_end]
+    body = html_fragment[head_end : sec_close - len("</section>")]
+    tail = html_fragment[sec_close - len("</section>") :]
+
+    parts = re.split(r"(?=<h3\b)", body)
+    out = [prefix, head]
+    if parts and parts[0].strip():
+        out.append(parts[0])
+    for p in parts[1:]:
+        stripped = p.strip()
+        hm = re.match(r"(?s)(<h3[^>]*>[\s\S]*?</h3>)([\s\S]*)", stripped)
+        if not hm:
+            if stripped:
+                out.append(p)
+            continue
+        h3_el, rest = hm.group(1), hm.group(2)
+        title_text = re.sub(r"<[^>]+>", "", h3_el).strip()
+        if not _BUGFIX_MONITOR_H3_RE.search(h3_el):
+            out.append(p)
+            continue
+        out.append(
+            '<details class="report-subcard release-h-fold release-bugfix-monitor-fold" open>'
+            '<summary class="report-subcard-summary">'
+            f'<span class="report-subcard-title">{html.escape(title_text)}</span>'
+            "</summary>"
+            f'<div class="report-subcard-body">{rest.strip()}</div>'
+            "</details>"
+        )
+    out.append(tail)
+    return "".join(out)
+
+
 def _wrap_h5_blocks_in_details(fragment: str) -> str:
     fragment = fragment.strip()
     if not fragment or "<h5" not in fragment:
@@ -1587,6 +1666,7 @@ def convert_release_report_markdown(
     body = _wrap_summary_section_in_details(body)
     body = _wrap_failure_analysis_h4_in_details(body)
     body = _wrap_pdc_h4_in_details(body)
+    body = _wrap_bugfix_monitor_h3_in_details(body)
     body = _fold_release_report_section_cards(body)
     archive_markdown = materialize_release_conclusion_in_markdown(
         md,

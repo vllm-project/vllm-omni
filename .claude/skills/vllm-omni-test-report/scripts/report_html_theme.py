@@ -537,6 +537,18 @@ table.summary tr.regression-streak--3d td.regression-streak--3d {
   font-weight: 700;
   border-left: 3px solid #ef4444;
 }
+/* Days-failing cell capped at "3 days+" (>= 4 actual streak). Purple marks
+   "chronic regression" — escalated beyond the normal red --3d bucket because
+   the streak has lasted longer than the visible 3-day cap. */
+table.summary tr.regression-streak--3d-plus td {
+  background-color: #ede9fe !important;
+}
+table.summary tr.regression-streak--3d-plus td.regression-streak--3d-plus {
+  background-color: #c4b5fd !important;
+  color: #4c1d95;
+  font-weight: 750;
+  border-left: 3px solid #7c3aed;
+}
 @media (prefers-color-scheme: dark) {
   table.summary tr.regression-streak--1d td {
     background-color: rgba(250, 204, 21, 0.18) !important;
@@ -561,6 +573,14 @@ table.summary tr.regression-streak--3d td.regression-streak--3d {
     background-color: rgba(239, 68, 68, 0.5) !important;
     color: #fecaca;
     border-left-color: #ef4444;
+  }
+  table.summary tr.regression-streak--3d-plus td {
+    background-color: rgba(124, 58, 237, 0.18) !important;
+  }
+  table.summary tr.regression-streak--3d-plus td.regression-streak--3d-plus {
+    background-color: rgba(124, 58, 237, 0.5) !important;
+    color: #ddd6fe;
+    border-left-color: #a78bfa;
   }
 }
 section.job-fail {

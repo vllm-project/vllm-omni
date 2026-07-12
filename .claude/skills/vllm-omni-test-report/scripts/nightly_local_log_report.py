@@ -1818,7 +1818,7 @@ _FOCUS_TABLE_HEADERS = (
     "Status",
     "Days failing",
 )
-_CONSEC_FAIL_DAY_MAX = 3
+_CONSEC_FAIL_DAY_MAX = 5
 _CONSEC_FAIL_THRESHOLD_PCT = 6.0
 _CONSEC_FAIL_LOOKUP_LIMIT_PER_FILE = 5000
 
@@ -2023,14 +2023,38 @@ def _consec_fail_days_from_history(
 
 
 def _format_consec_fail_days(days: int) -> str:
-    """Format consecutive-failure count for table cell display."""
+    """Format consecutive-failure count for table cell display.
+
+    Display rule:
+      - 0 days  → "—"  (no streak, ignore)
+      - 1 day   → "1 day"
+      - 2 days  → "2 days"
+      - 3 days  → "3 days"  (boundary: still show the exact count)
+      - >= 4 days → "3 days+"  (cap at 3 to keep the table cell compact;
+        the underlying ``consec_fail_days`` counter still grows so the CSS
+        streak class escalates correctly)
+    """
     if days <= 0:
         return "—"
-    return f"{days} day{'s' if days != 1 else ''}"
+    if days == 1:
+        return "1 day"
+    if days >= 4:
+        return "3 days+"
+    return f"{days} days"
 
 
 def _consec_fail_color_class(days: int) -> str:
-    """Map consecutive-failure count to the CSS modifier class."""
+    """Map consecutive-failure count to the CSS modifier class.
+
+    Display rule (also mirrored by :func:`_format_consec_fail_days`):
+      - 0       → ``""``                 (no streak)
+      - 1       → ``regression-streak--1d``  (yellow, single day)
+      - 2       → ``regression-streak--2d``  (orange, two days)
+      - 3       → ``regression-streak--3d``  (red, exactly three days)
+      - >= 4    → ``regression-streak--3d-plus``  (purple, **3 days+** cap)
+    """
+    if days >= 4:
+        return "regression-streak--3d-plus"
     if days >= 3:
         return "regression-streak--3d"
     if days == 2:

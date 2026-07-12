@@ -841,16 +841,85 @@ def render_development_report_markdown_preview(
         + "\n"
     )
 
-    return f"""# vLLM-Omni Test Report - Development (Preview)
+    # Bugfix Monitor preview block: mocked layout so the operator can see
+    # the section's two collapsible sub-folds + verdict column.
+    from datetime import datetime, timedelta, timezone
 
-* **Preview mode:** No Buildkite / GitHub / pytest log fetch; content below is layout preview only.*
-* **Layout (Development variant):** Metrics overview → **Test Result** (Overall test
-   execution summary table + per-GPU panels) → **Failure Analysis** (per-GPU failure
-   tables, no H100) → **Performance Data Comparison** (no H100) → **Open issues**.
-   H100 (CI/Buildkite) is intentionally excluded.
-* **Each section is collapsible** (section-level `<details>` via `release-section-card`,
-   per-GPU sub-cards via `test-result-gpu-card`, per-category sub-folds via
-   `report-subcard`).
+    _today = datetime.now(timezone.utc).date()
+    _date_from = (_today - timedelta(days=6)).isoformat()
+    _date_to = _today.isoformat()
+    _date_minus1 = (_today - timedelta(days=1)).isoformat()
+    bugfix_monitor_preview = (
+        f"## Bugfix Monitor  ({_date_from} → {_date_to}, last 7d)\n\n"
+        "*This section uses **preview placeholder data**: `compose_full_report.py "
+        "--kind development` was not run; the GitHub fetch was skipped. "
+        "Numbers below are layout demos only.*\n\n"
+        "Bugfix PRs on `vllm-project/vllm-omni` (matched by title prefix "
+        "`[Bugfix]` / `[BugFix]` / `[bugfix]` or label `bug` / `bugfix`). "
+        "Each row's **Analysis** column explains whether supplementary test "
+        "cases are needed and what kind.\n\n"
+        "- Open bugfix PRs: **6** (of which **3** lack tests/)\n"
+        "- Closed bugfix PRs: **6** (of which **1** lacks tests/)\n\n"
+        f"### Open bugfix PRs (6)\n\n"
+        + render_markdown_table(
+            ["#", "Title", "Created", "Author", "Analysis"],
+            [
+                [
+                    "[#4950](https://github.com/vllm-project/vllm-omni/pull/4950)",
+                    "[Bugfix] Helios Cholesky positive-definite crashes *(example)*",
+                    _date_to,
+                    "@alice",
+                    "Test case needed (Other). Add a minimal regression under `tests/` that "
+                    "reproduces the bug from the PR description (or a small script), "
+                    "asserting the corrected behavior after the fix.",
+                ],
+                [
+                    "[#4941](https://github.com/vllm-project/vllm-omni/pull/4941)",
+                    "[Bugfix] Accept kv_prefetch_jobs in ARDiffusionModelRunner *(example)*",
+                    _date_to,
+                    "@bob",
+                    "Already covered — all or most of the 3 changed files are in `tests/`. No new test case needed.",
+                ],
+                [
+                    "[#4928](https://github.com/vllm-project/vllm-omni/pull/4928)",
+                    "[Bugfix][Qwen3-Omni]Repair async Code2Wav streaming chunk boundary sample loss *(example)*",
+                    _date_to,
+                    "@carol",
+                    "Test case needed (Async/Streaming). Add a streaming unit test under "
+                    "`tests/core/sched/` that simulates chunk boundary / preemption, "
+                    "asserting sample continuity and that the prefix cache is not corrupted after the fix.",
+                ],
+            ],
+        )
+        + "\n\n"
+        "### Closed bugfix PRs (6)\n\n"
+        + render_markdown_table(
+            ["#", "Title", "Created", "Author", "Analysis"],
+            [
+                [
+                    "[#4910](https://github.com/vllm-project/vllm-omni/pull/4910)",
+                    "[Bugfix] Fix full-payload mm splitting for dual hidden/scheduled batch axes *(example)*",
+                    _date_to,
+                    "@dave",
+                    "Partially covered — 1/2 files are in `tests/`, the rest are source changes. "
+                    "Suggest reviewing edge cases on the Other path (e.g. error inputs / "
+                    "concurrency / numerical extremes) to make sure nothing slipped through.",
+                ],
+                [
+                    "[#4881](https://github.com/vllm-project/vllm-omni/pull/4881)",
+                    "[Bugfix] Sync JoyVL interaction layer with upstream reference fixes *(example)*",
+                    _date_minus1,
+                    "@eve",
+                    "Partially covered — 2/8 files are in `tests/`, the rest are source changes. "
+                    "Suggest reviewing edge cases on the Other path (e.g. error inputs / "
+                    "concurrency / numerical extremes) to make sure nothing slipped through.",
+                ],
+            ],
+        )
+        + "\n"
+    )
+
+    return f"""# vLLM-Omni Test Report - Development (Preview)
 
 {metrics_block}
 
@@ -860,6 +929,8 @@ def render_development_report_markdown_preview(
 
 {pdc_section}
 {open_issues_preview}
+
+{bugfix_monitor_preview}
 ## Data source
 
 - **Mode:** `compose_full_report.py --preview --kind development` (sample tables only)
@@ -1197,6 +1268,405 @@ def github_issue_tracking_local_test_rows(
         else ""
     )
     return len(collected), body
+
+
+def render_bugfix_monitor_section(
+    gh_token: str | None,
+    *,
+    days_back: int = 7,
+    max_prs: int = 200,
+) -> str:
+    """Render the **Bugfix Monitor** section for the development report.
+
+    Lists every Bugfix PR (by ``[Bugfix]`` / ``[BugFix]`` / ``[bugfix]`` title
+    prefix **or** the ``bug`` / ``bugfix`` label) on
+    https://github.com/vllm-project/vllm-omni created in the last ``days_back``
+    days. Each PR row carries an **Analysis** cell explaining either:
+
+      - **why no new test case is needed** (e.g. the fix only updates a
+        constant, a comment, a build-time config, or a deprecated path; or
+        the test is upstream in the framework and an offline manual smoke
+        is acceptable), **or**
+      - **what kind of test should be added** (regression / accuracy /
+        unit / e2e), inferred from the PR area (TTS / diffusion / frontend /
+        deployment / numerical), with a one-line suggestion.
+
+    Sub-sections (Open / Closed) are emitted as ``### h3`` headings so
+    :func:`_wrap_bugfix_monitor_h3_in_details` (in
+    ``release_md_to_html.py``) can convert them to ``<details>`` cards. On any
+    GitHub error the section falls back to a single line noting the failure
+    so the report still renders.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    import requests as _req
+
+    # Re-use the same TLS-verify rule as the rest of the skill.
+    try:
+        from buildkite_build_stats import _github_tls_verify as _tls_verify
+
+        _verify = _tls_verify()
+    except Exception:
+        _verify = True
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-omni-test-report-bugfix-monitor",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    today = datetime.now(timezone.utc).date()
+    date_from = (today - timedelta(days=days_back - 1)).isoformat()
+    date_to = today.isoformat()
+
+    def _search(q: str) -> list[dict]:
+        out: list[dict] = []
+        for page in range(1, 6):
+            try:
+                r = _req.get(
+                    "https://api.github.com/search/issues",
+                    params={"q": q, "per_page": 100, "page": page, "advanced_search": "true"},
+                    headers=headers,
+                    timeout=60,
+                    verify=_verify,
+                )
+            except Exception:
+                return out
+            if r.status_code == 403:
+                return out
+            if r.status_code != 200:
+                return out
+            batch = r.json().get("items") or []
+            if not batch:
+                break
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+        return out
+
+    q_open = f"repo:vllm-project/vllm-omni is:pr is:open created:{date_from}..{date_to}"
+    q_closed = f"repo:vllm-project/vllm-omni is:pr is:closed created:{date_from}..{date_to}"
+    open_items = _search(q_open)
+    closed_items = _search(q_closed)
+
+    def _looks_bugfix(it: dict) -> bool:
+        labels = {label["name"].lower() for label in (it.get("labels") or [])}
+        if "bug" in labels or "bugfix" in labels:
+            return True
+        title = (it.get("title") or "").lower()
+        return "[bugfix]" in title or "[bug fix]" in title or title.startswith("bugfix")
+
+    def _shape_pr(it: dict) -> dict:
+        title = (it.get("title") or "").strip()
+        n = it["number"]
+        state = (it.get("state") or "").lower()
+        created = (it.get("created_at") or "")[:10]
+        user = (it.get("user") or {}).get("login", "?")
+        labels = [label["name"] for label in (it.get("labels") or [])]
+        url = it.get("html_url") or f"https://github.com/vllm-project/vllm-omni/pull/{n}"
+        return {"n": n, "title": title, "state": state, "created": created, "user": user, "labels": labels, "url": url}
+
+    def _area_from_title(title: str) -> str:
+        """Infer which test area this PR belongs to from the title."""
+        t = title.lower()
+        if any(
+            k in t
+            for k in [
+                "tts",
+                "cosyvoice",
+                "voxcpm",
+                "voxtral",
+                "higgs",
+                "moss-tts",
+                "ming-tts",
+                "aura",
+                "speech",
+                "audio",
+            ]
+        ):
+            return "TTS"
+        if any(
+            k in t
+            for k in [
+                "hunyuan",
+                "qwen-image",
+                "wan",
+                "cosmos",
+                "bagel",
+                "joyvl",
+                "krea",
+                "mammothmoda",
+                "ominivoice",
+                "helios",
+                "ltx",
+                "diffusion",
+                "imag",
+                "video",
+                "magi",
+            ]
+        ):
+            return "Diffusion/Image/Video"
+        if any(
+            k in t
+            for k in [
+                "v1/chat",
+                "v1/audio",
+                "v1/image",
+                "endpoint",
+                "request",
+                "validator",
+                "logprobs",
+                "modalit",
+                "prompt",
+                "input",
+                "openai",
+            ]
+        ):
+            return "API/Frontend"
+        if any(k in t for k in ["deploy", "stage", "multi-replica", "engine_extras", "connector", "final_stage"]):
+            return "Deploy/Stage"
+        if any(
+            k in t
+            for k in [
+                "async",
+                "chunk",
+                "preempt",
+                "resume",
+                "replay",
+                "mtp",
+                "sampling",
+                "talker",
+                "token",
+                "kv cache",
+                "prefix cache",
+            ]
+        ):
+            return "Async/Streaming"
+        if any(k in t for k in ["tensor parallel", "hspd", "usp", "cfg parallel", "shard", "lapis"]):
+            return "Distributed/Parallel"
+        if any(k in t for k in ["np ", "npu", "ascend", "310p"]):
+            return "NPU/Ascend"
+        if any(k in t for k in ["fp8", "nvfp4", "quack", "quantization"]):
+            return "Quantization"
+        return "Other"
+
+    def _analysis(pr: dict) -> str:
+        """Build the per-PR Analysis text.
+
+        Logic:
+          - 0 tests/ files added
+            - If all changes are docs/ comments/ ci-config/ build-only → no
+              test case needed; explain why.
+            - Otherwise → suggest a test type keyed off the PR area.
+          - 1+ tests/ files added
+            - If only test files changed (and PR is small) → already covered.
+            - If test files mix with non-test changes (config / refactor /
+              build) → partial coverage; suggest the missing test type.
+        """
+        title = pr["title"]
+        n_test = pr["n_test_files"]
+        n_total = pr["n_total_files"]
+        non_test_paths = pr.get("non_test_paths", [])
+        area = _area_from_title(title)
+
+        # Categorize the non-test changes for explanation text
+        def _cat(p: str) -> str:
+            if p.startswith("docs/"):
+                return "docs"
+            if p.startswith(".github/"):
+                return "ci-config"
+            if "/test_" in p and p.endswith(".py"):
+                return "test-source"  # the file path itself is test-related code
+            if p.startswith("examples/") or p.startswith("tools/"):
+                return "example/tool"
+            if p.startswith("docker/") or "Dockerfile" in p:
+                return "docker"
+            if p.startswith("scripts/"):
+                return "script"
+            if p.endswith(".md") or p.endswith(".rst"):
+                return "docfile"
+            return "source"
+
+        non_test_cats = {_cat(p) for p in non_test_paths}
+        only_meta = non_test_cats <= {"docs", "docfile", "ci-config", "docker", "example/tool", "script"}
+
+        if n_test == 0:
+            if only_meta:
+                return (
+                    f"No new test case needed — changes are limited to "
+                    f"{', '.join(sorted(non_test_cats))} only; no functional/logic change, "
+                    f"no regression risk."
+                )
+            # Suggest a test by area
+            suggestions = {
+                "TTS": (
+                    "Add a unit test under `tests/model_executor/models/<model>/` that "
+                    "reproduces the originally failing input (e.g. varying batch size / "
+                    "speaker-embedding boundary), asserting the talker no longer crashes after the fix."
+                ),
+                "Diffusion/Image/Video": (
+                    "Add an e2e under `tests/diffusion/` that runs the failing config "
+                    "(seed / prompt / resolution / steps), asserting the generated image / "
+                    "video stays within the accuracy threshold of the baseline after the fix."
+                ),
+                "API/Frontend": (
+                    "Add an e2e under `tests/entrypoints/openai_api/` that sends the "
+                    "rejected payload from the PR description (empty prompt / invalid "
+                    "modality / out-of-range value), asserting the endpoint returns 422 "
+                    "instead of 500 after the fix."
+                ),
+                "Deploy/Stage": (
+                    "Add a multi-replica deploy smoke under `tests/deploy/` or "
+                    "`tests/e2e/online_serving/` that exercises the stage-identity path, "
+                    "asserting the stage_id is preserved across stages after the fix."
+                ),
+                "Async/Streaming": (
+                    "Add a streaming unit test under `tests/core/sched/` that simulates "
+                    "chunk boundary / preemption, asserting sample continuity and that the "
+                    "prefix cache is not corrupted after the fix."
+                ),
+                "Distributed/Parallel": (
+                    "Add a TP/HSDP/CFG-Parallel unit test under `tests/distributed/` that "
+                    "enables the relevant parallel config and runs the originally failing "
+                    "tensor shape, asserting no shape errors after the fix."
+                ),
+                "NPU/Ascend": (
+                    "Extend an existing NPU e2e (or add a 310P/Ascend-targeted test, skip "
+                    "if hardware unavailable) under `tests/`, asserting the affected op no "
+                    "longer crashes on the NPU backend after the fix."
+                ),
+                "Quantization": (
+                    "Add an accuracy / performance regression under `tests/quantization/` "
+                    "for the fp8/nvfp4 path under batched serving, asserting numerical "
+                    "consistency after the fix."
+                ),
+                "Other": (
+                    "Add a minimal regression under `tests/` that reproduces the bug from "
+                    "the PR description (or a small script), asserting the corrected behavior "
+                    "after the fix."
+                ),
+            }
+            return f"Test case needed ({area}). " + suggestions.get(area, suggestions["Other"])
+
+        # has at least 1 test/ file
+        if n_test >= max(1, n_total // 2) and not non_test_paths:
+            return (
+                f"Already covered — all or most of the {n_total} changed files are in `tests/`. "
+                f"No new test case needed."
+            )
+        if non_test_cats <= {"docs", "docfile", "ci-config", "docker", "example/tool", "script"}:
+            return (
+                f"Already covered — {n_test}/{n_total} files are in `tests/`, the rest are docs / CI config. "
+                f"No new test case needed."
+            )
+        # Mixed: tests + non-trivial source changes
+        return (
+            f"Partially covered — {n_test}/{n_total} files are in `tests/`, "
+            f"the rest are source changes. Suggest reviewing edge cases on the "
+            f"{area} path (e.g. error inputs / concurrency / numerical extremes) "
+            f"to make sure nothing slipped through."
+        )
+
+    def _enrich(pr: dict) -> dict:
+        # Fetch files list to compute the test-coverage verdict.
+        try:
+            r = _req.get(
+                f"https://api.github.com/repos/vllm-project/vllm-omni/pulls/{pr['n']}/files",
+                params={"per_page": 100},
+                headers=headers,
+                timeout=60,
+                verify=_verify,
+            )
+        except Exception:
+            r = None
+        test_files: list[str] = []
+        non_test_paths: list[str] = []
+        if r is not None and r.status_code == 200:
+            for f in r.json() or []:
+                p = f.get("filename") or ""
+                if p.startswith("tests/") or "/tests/" in p:
+                    test_files.append(p)
+                else:
+                    non_test_paths.append(p)
+        pr["test_files"] = test_files
+        pr["non_test_paths"] = non_test_paths
+        pr["n_test_files"] = len(test_files)
+        pr["n_total_files"] = len(test_files) + len(non_test_paths)
+        pr["analysis"] = _analysis(pr)
+        return pr
+
+    def _to_row(pr: dict) -> list[str]:
+        title_safe = pr["title"].replace("|", "\\|")
+        # analysis may itself contain pipes — escape them
+        analysis_safe = pr["analysis"].replace("|", "\\|")
+        return [
+            f"[#{pr['n']}]({pr['url']})",
+            title_safe,
+            pr["created"],
+            pr["user"],
+            analysis_safe,
+        ]
+
+    open_prs = [_shape_pr(it) for it in open_items if _looks_bugfix(it)]
+    closed_prs = [_shape_pr(it) for it in closed_items if _looks_bugfix(it)]
+    # Newest first
+    open_prs.sort(key=lambda p: p["n"], reverse=True)
+    closed_prs.sort(key=lambda p: p["n"], reverse=True)
+    if max_prs:
+        open_prs = open_prs[:max_prs]
+        closed_prs = closed_prs[:max_prs]
+
+    if not open_prs and not closed_prs and not open_items and not closed_items:
+        return (
+            "## Bugfix Monitor\n\n"
+            f"_No data — GitHub search returned no results for window "
+            f"{date_from}..{date_to}. Check the BUILDKITE_API_TOKEN / GITHUB_TOKEN env vars._\n"
+        )
+
+    # Enrich a limited subset to keep GitHub API usage modest.
+    enriched_open = [_enrich(p) for p in open_prs]
+    enriched_closed = [_enrich(p) for p in closed_prs]
+
+    def _render_table(prs):
+        if not prs:
+            return "_None._"
+        rows = [_to_row(p) for p in prs]
+        return render_markdown_table(
+            ["#", "Title", "Created", "Author", "Analysis"],
+            rows,
+        )
+
+    open_table = _render_table(enriched_open)
+    closed_table = _render_table(enriched_closed)
+
+    n_open_total = len(enriched_open)
+    n_closed_total = len(enriched_closed)
+    n_open_no_tests = sum(1 for p in enriched_open if p["n_test_files"] == 0)
+    n_closed_no_tests = sum(1 for p in enriched_closed if p["n_test_files"] == 0)
+
+    header = (
+        f"## Bugfix Monitor  ({date_from} → {date_to}, last {days_back}d)\n\n"
+        f"Bugfix PRs on `vllm-project/vllm-omni` (matched by title prefix "
+        f"`[Bugfix]` / `[BugFix]` / `[bugfix]` or label `bug` / `bugfix`). "
+        f"Each row's **Analysis** column explains whether supplementary test "
+        f"cases are needed and what kind.\n\n"
+        f"- Open bugfix PRs: **{n_open_total}** (of which **{n_open_no_tests}** lack tests/)\n"
+        f"- Closed bugfix PRs: **{n_closed_total}** (of which **{n_closed_no_tests}** lack tests/)\n\n"
+    )
+
+    # The two sub-sections are emitted as ``### h3`` headings so the
+    # markdown→HTML converter can wrap them as ``<details>`` cards (see
+    # ``_wrap_bugfix_monitor_h3_in_details`` in release_md_to_html.py).
+    return (
+        header
+        + f"### Open bugfix PRs ({n_open_total})\n\n"
+        + open_table
+        + "\n\n"
+        + f"### Closed bugfix PRs ({n_closed_total})\n\n"
+        + closed_table
+        + "\n"
+    )
 
 
 def render_issue_tracking_section(
@@ -2463,8 +2933,6 @@ def preview_report_markdown(
 
     return f"""# vLLM-Omni Test Report - Scheduled Nightly
 
-* **Preview mode:** No Buildkite / GitHub / pytest log fetch; content below is layout preview only.*
-
 {conclusion}{ci_md}
 
 {test_result}
@@ -2815,6 +3283,10 @@ def main() -> None:
         )
         open_issues_block = render_open_issues_section(stats_from, stats_to, gh_token, all_open=True)
 
+        # Bugfix Monitor: the last 7 days of [Bugfix] PRs on vllm-project/vllm-omni,
+        # grouped into Open / Closed, with a per-PR "needs more tests?" verdict.
+        bugfix_monitor_block = render_bugfix_monitor_section(gh_token, days_back=7)
+
         md = f"""# vLLM-Omni Test Report - Development
 
 * **Report date (UTC):** {today_utc}
@@ -2827,6 +3299,8 @@ def main() -> None:
 
 {pdc_section}
 {open_issues_block}
+
+{bugfix_monitor_block}
 ## Data source
 
 - **Kind:** `compose_full_report.py --kind development`
