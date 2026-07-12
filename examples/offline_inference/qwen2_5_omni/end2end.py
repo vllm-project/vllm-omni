@@ -553,6 +553,39 @@ def parse_args():
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Optional explicit deploy YAML (otherwise the bundled default is used).",
+    )
+    parser.add_argument(
+        "--strategy-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional composable-parallel strategy.yaml mapping role -> parallel axes "
+            "(e.g. tp / stage_replica). Overlaid onto the merged stage configs."
+        ),
+    )
+    parser.add_argument(
+        "--stage-overrides",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON of per-stage overrides applied on top of the default "
+            'deploy config, e.g. \'{"0": {"devices": "0,1"}}\' to give the '
+            "thinker a 2-GPU pool. Lets you run a strategy on the bundled default "
+            "deploy config without writing a bespoke deploy YAML."
+        ),
+    )
+    parser.add_argument(
+        "--omni-lb-policy",
+        type=str,
+        default=None,
+        choices=["random", "round-robin", "least-queue-length"],
+        help="StagePool load-balancer policy for replicated stages (orchestrator-level knob).",
+    )
     return parser.parse_args()
 
 

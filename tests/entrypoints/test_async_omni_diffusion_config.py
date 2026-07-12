@@ -343,7 +343,7 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
     )
     mocker.patch(
         "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
-        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage]),
+        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage], None),
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
@@ -359,3 +359,15 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
 
     assert not hasattr(stage_configs[0].engine_args, "additional_config")
     assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_default_stage_config_includes_quantization_config():
+    """Ensure structured quantization_config survives default diffusion-stage creation."""
+    quantization_config = {
+        "method": "example_quant",
+        "weights": "weights.bin",
+    }
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"quantization_config": quantization_config})[0]
+
+    assert stage_cfg["engine_args"]["quantization_config"] == quantization_config

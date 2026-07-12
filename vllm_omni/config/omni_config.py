@@ -551,7 +551,7 @@ class _DiffusionConfigProjection:
             elif isinstance(self.quantization_config, str):
                 self.quantization_config = build_quant_config(self.quantization_config)
             elif isinstance(self.quantization_config, Mapping):
-                self.quantization_config = build_quant_config(dict(self.quantization_config))
+                self.quantization_config = dict(self.quantization_config)
             else:
                 raise TypeError(
                     "quantization_config must be str, dict, QuantizationConfig, or None, "
