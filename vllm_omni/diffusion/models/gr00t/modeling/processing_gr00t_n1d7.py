@@ -19,6 +19,7 @@ from transformers.utils import cached_file
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.gr00t.configs.embodiment_configs import ModalityConfig
+from vllm_omni.diffusion.models.gr00t.configs.gr00t_n1d7 import Gr00tN1d7Config
 from vllm_omni.diffusion.models.gr00t.dataio.embodiment_tags import EmbodimentTag
 from vllm_omni.diffusion.models.gr00t.dataio.state_action.state_action_processor import StateActionProcessor
 from vllm_omni.diffusion.models.gr00t.dataio.utils import parse_modality_configs, to_json_serializable
@@ -552,4 +553,9 @@ class Gr00tN1d7Processor(ProcessorMixin):
         return cls(**processor_kwargs, transformers_loading_kwargs=transformers_loading_kwargs)
 
 
-AutoProcessor.register("Gr00tN1d7", Gr00tN1d7Processor)
+# transformers >= 5.5 requires the config *class* (not a model_type string) as the
+# first arg to AutoProcessor.register — it does `key.__module__` internally. Passing
+# the string "Gr00tN1d7" raises AttributeError: 'str' object has no attribute
+# '__module__'. Match the AutoModel.register(Gr00tN1d7Config, ...) call in
+# modeling/gr00t_n1d7.py.
+AutoProcessor.register(Gr00tN1d7Config, Gr00tN1d7Processor)
