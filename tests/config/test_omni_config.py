@@ -420,6 +420,7 @@ def test_sub_config_fields_match_rfc_scopes():
         "sequence_parallel_size",
         "ulysses_degree",
         "ring_degree",
+        "allgather_degree",
         "ulysses_mode",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
