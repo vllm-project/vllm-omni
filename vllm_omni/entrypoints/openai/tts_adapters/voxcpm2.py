@@ -19,7 +19,25 @@ class VoxCPM2Adapter(ARTTSAdapter):
     name = "voxcpm2"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
-        return self.ctx.server._validate_voxcpm2_request(request)
+        """Validate VoxCPM2 request parameters. Returns error message or None."""
+        server = self.ctx.server
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        if request.voice is not None:
+            request.voice = request.voice.lower()
+            available_voices = set(server.uploaded_speakers) | set(server.precomputed_speakers) | {"default"}
+            if request.voice not in available_voices:
+                supported = ", ".join(sorted(available_voices)) or "none"
+                return f"Invalid voice '{request.voice}'. Supported: {supported}"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < self.max_new_tokens_min:
+                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
+            if request.max_new_tokens > self.max_new_tokens_max:
+                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
+
+        return None
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

@@ -1549,7 +1549,7 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest.model_validate({"input": "Hello", "speaker": "UTESF", "task_type": "Base"})
         assert req.voice == "UTESF"
         mocker.patch("pathlib.Path.exists", return_value=True)
-        result = speech_server._validate_qwen_tts_request(req)
+        result = speech_server._validate_tts_request(req)
         assert result is None
 
     # ── uploaded voice with embedding ──
@@ -1684,7 +1684,7 @@ class TestTTSMethods:
 
         # Validation should pass (file exists)
         mocker.patch("pathlib.Path.exists", return_value=True)
-        err = speech_server._validate_qwen_tts_request(req)
+        err = speech_server._validate_tts_request(req)
         assert err is None, f"Validation failed: {err}"
 
         # Build params should auto-set ref_audio from stored file
@@ -1722,7 +1722,7 @@ class TestTTSMethods:
 
         # Validation should pass
         mocker.patch("pathlib.Path.exists", return_value=True)
-        err = speech_server._validate_qwen_tts_request(req)
+        err = speech_server._validate_tts_request(req)
         assert err is None, f"Validation failed: {err}"
 
         # Build params should use embedding, NOT audio
@@ -3221,25 +3221,25 @@ class TestCosyVoice3Serving:
 
     def test_validate_cosyvoice3_empty_input(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="", ref_audio="data:audio/wav;base64,abc", ref_text="hello")
-        error = cosyvoice3_server._get_tts_adapter().validate(request)
+        error = cosyvoice3_server._validate_tts_request(request)
         assert error is not None
         assert "empty" in error.lower()
 
     def test_validate_cosyvoice3_missing_ref_audio(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_text="hello")
-        error = cosyvoice3_server._get_tts_adapter().validate(request)
+        error = cosyvoice3_server._validate_tts_request(request)
         assert error is not None
         assert "ref_audio" in error.lower()
 
     def test_validate_cosyvoice3_missing_ref_text(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
-        error = cosyvoice3_server._get_tts_adapter().validate(request)
+        error = cosyvoice3_server._validate_tts_request(request)
         assert error is not None
         assert "ref_text" in error.lower()
 
     def test_validate_cosyvoice3_invalid_ref_audio_format(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="/local/path.wav", ref_text="hello")
-        error = cosyvoice3_server._get_tts_adapter().validate(request)
+        error = cosyvoice3_server._validate_tts_request(request)
         assert error is not None
         assert "url" in error.lower() or "format" in error.lower()
 
@@ -3249,7 +3249,7 @@ class TestCosyVoice3Serving:
             ref_audio="data:audio/wav;base64,abc123",
             ref_text="Reference transcript",
         )
-        error = cosyvoice3_server._get_tts_adapter().validate(request)
+        error = cosyvoice3_server._validate_tts_request(request)
         assert error is None
 
     def test_validate_cosyvoice3_max_new_tokens_range(self, cosyvoice3_server):
@@ -3259,7 +3259,7 @@ class TestCosyVoice3Serving:
             ref_text="hello",
             max_new_tokens=0,
         )
-        error = cosyvoice3_server._get_tts_adapter().validate(request)
+        error = cosyvoice3_server._validate_tts_request(request)
         assert error is not None
         assert "max_new_tokens" in error
 
@@ -3325,13 +3325,13 @@ def glm_tts_server(mocker: MockerFixture):
 class TestGLMTTSServing:
     def test_validate_glm_tts_requires_ref_audio(self, glm_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
-        error = glm_tts_server._validate_glm_tts_request(request)
+        error = glm_tts_server._validate_tts_request(request)
         assert error is not None
         assert "ref_audio" in error
 
     def test_validate_glm_tts_requires_ref_text(self, glm_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
-        error = glm_tts_server._validate_glm_tts_request(request)
+        error = glm_tts_server._validate_tts_request(request)
         assert error is not None
         assert "ref_text" in error
 
@@ -3438,7 +3438,7 @@ class TestTTSAsyncOffloading:
 
     def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server, mocker: MockerFixture):
         """Qwen3 TTS path should call _estimate_prompt_len_async."""
-        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
         qwen3_tts_server._build_tts_params = mocker.MagicMock(
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )
@@ -3455,7 +3455,7 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server.engine_client.default_sampling_params_list = [
             SimpleNamespace(max_tokens=2048, seed=42, extra_args=None)
         ]
-        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
         qwen3_tts_server._build_tts_params = mocker.MagicMock(
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )
@@ -3505,7 +3505,7 @@ class TestTTSAsyncOffloading:
 
     def test_prepare_speech_generation_treats_sse_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
         """stream_format=sse should request delta-style multimodal outputs."""
-        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
         qwen3_tts_server._build_tts_params = mocker.MagicMock(
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )
@@ -3522,7 +3522,7 @@ class TestTTSAsyncOffloading:
 
     def test_prepare_speech_generation_treats_stream_true_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
         """stream=True should request delta-style multimodal outputs for SSE streaming."""
-        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
         qwen3_tts_server._build_tts_params = mocker.MagicMock(
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )
@@ -3539,7 +3539,7 @@ class TestTTSAsyncOffloading:
 
     def test_prepare_speech_generation_treats_audio_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
         """stream_format=audio should request delta-style multimodal outputs."""
-        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
         qwen3_tts_server._build_tts_params = mocker.MagicMock(
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )
@@ -3559,7 +3559,7 @@ class TestTTSAsyncOffloading:
     ):
         """Full-payload TTS streaming should not request delta multimodal outputs."""
         qwen3_tts_server.engine_client.model_config.async_chunk = False
-        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
         qwen3_tts_server._build_tts_params = mocker.MagicMock(
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )
