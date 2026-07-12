@@ -188,6 +188,38 @@ def _generate_single_stage_video(
         return num_frames_produced, peak_mem
 
 
+def _generate_magi_human_video(quantization: str | None = None) -> tuple[int, float]:
+    """Generate MagiHuman video+audio and return video frame count and worker peak memory."""
+    omni_kwargs: dict[str, Any] = {"model_type": "magi-human"}
+    if quantization:
+        omni_kwargs["quantization"] = quantization
+
+    with OmniRunner("SII-GAIR/daVinci-MagiHuman-Base-1080p", **omni_kwargs) as runner:
+        outputs = runner.omni.generate(
+            "A woman speaks calmly to the camera in a sunlit garden.",
+            OmniDiffusionSamplingParams(
+                height=256,
+                width=448,
+                num_inference_steps=8,
+                seed=42,
+                extra_args={"seconds": 1},
+            ),
+        )
+
+        first = outputs[0]
+        assert first.images, "MagiHuman did not return generated video frames"
+        frames = first.images[0]
+        assert getattr(frames, "ndim", 0) == 4
+        assert frames.shape[0] > 0
+
+        peak_memory_mb = getattr(first, "peak_memory_mb", None)
+        if peak_memory_mb:
+            peak_mem = float(peak_memory_mb) / 1024.0
+        else:
+            peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
+        return int(frames.shape[0]), peak_mem
+
+
 def _generate_bagel_image(
     quantization_config: str | None = None,
     num_inference_steps: int = 15,
@@ -372,6 +404,20 @@ def test_single_stage_ltx2_fp8_uses_less_memory():
 
     print(f"LTX-2 BF16 peak memory: {mem_bf16:.2f} GiB")
     print(f"LTX-2 FP8 peak memory:  {mem_fp8:.2f} GiB")
+    assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
+
+
+@hardware_test(res={"cuda": "H100"})
+def test_magi_human_fp8_uses_less_memory():
+    """MagiHuman online FP8 should generate video and use less memory than BF16."""
+    frames_bf16, mem_bf16 = _generate_magi_human_video()
+    torch.accelerator.empty_cache()
+
+    frames_fp8, mem_fp8 = _generate_magi_human_video(quantization="fp8")
+
+    assert frames_bf16 == frames_fp8
+    print(f"MagiHuman BF16 peak memory: {mem_bf16:.2f} GiB")
+    print(f"MagiHuman FP8 peak memory:  {mem_fp8:.2f} GiB")
     assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
 
 

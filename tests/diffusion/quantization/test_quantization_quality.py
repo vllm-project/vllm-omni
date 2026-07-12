@@ -36,7 +36,7 @@ import importlib.util
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -82,6 +82,9 @@ class QualityTestConfig:
     gpu: str = "H100"  # minimum GPU requirement
     negative_prompt: str = ""
     guidance_scale: float | None = None
+    model_type: str | None = None
+    extra_args: dict[str, object] = field(default_factory=dict)
+    require_memory_reduction: bool = False
 
     def baseline_ref(self) -> str:
         return self.baseline_model or self.model or ""
@@ -203,6 +206,23 @@ QUALITY_CONFIGS = [
         num_frames=25,
         num_inference_steps=8,
     ),
+    QualityTestConfig(
+        id="fp8_magi_human",
+        model="SII-GAIR/daVinci-MagiHuman-Base-1080p",
+        model_type="magi-human",
+        quantization="fp8",
+        task="t2v",
+        prompt=(
+            "A cinematic close-up of a woman speaking calmly to the camera in a sunlit garden. "
+            "A gentle breeze moves her hair and soft birdsong is audible in the background."
+        ),
+        max_lpips=0.10,
+        height=256,
+        width=448,
+        num_inference_steps=8,
+        extra_args={"seconds": 5},
+        require_memory_reduction=True,
+    ),
 ]
 
 
@@ -305,15 +325,17 @@ def _generate_video(omni, config: QualityTestConfig):
         OmniDiffusionSamplingParams(
             height=config.height,
             width=config.width,
+            seed=config.seed,
             generator=generator,
             num_inference_steps=config.num_inference_steps,
             num_frames=config.num_frames,
             guidance_scale=config.guidance_scale,
+            extra_args=config.extra_args,
         ),
     )
 
-    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
     first = outputs[0]
+    peak_mem = _extract_peak_memory_gib(first)
     if hasattr(first, "request_output") and isinstance(first.request_output, list):
         inner = first.request_output[0]
         if isinstance(inner, OmniRequestOutput) and hasattr(inner, "images"):
@@ -349,6 +371,31 @@ def _generate_video(omni, config: QualityTestConfig):
         # strip the leading batch dim
         frames_array = frames_array[0]
     return frames_array, peak_mem
+
+
+def _extract_peak_memory_gib(output) -> float:
+    fallback = torch.accelerator.max_memory_allocated() / (1024**3)
+    candidates = [output]
+    request_output = getattr(output, "request_output", None)
+    if isinstance(request_output, list):
+        candidates.extend(request_output)
+    elif request_output is not None:
+        candidates.append(request_output)
+
+    for candidate in candidates:
+        peak_memory_mb = getattr(candidate, "peak_memory_mb", None)
+        if peak_memory_mb:
+            return float(peak_memory_mb) / 1024.0
+    return fallback
+
+
+def _build_omni(config: QualityTestConfig, quantization=None):
+    kwargs = {"model": config.quantized_ref()}
+    if config.model_type is not None:
+        kwargs["model_type"] = config.model_type
+    if quantization is not None:
+        kwargs["quantization"] = quantization
+    return kwargs
 
 
 def _compute_lpips(baseline, quantized, task: str) -> float:
@@ -433,6 +480,14 @@ def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch
     assert peak_mem == 0.0
 
 
+def test_benchmark_output_fps_uses_magi_human_native_rate():
+    from benchmarks.diffusion.quantization_quality import _output_fps
+
+    assert _output_fps(SimpleNamespace(fps=None, model_type="magi-human")) == 25
+    assert _output_fps(SimpleNamespace(fps=None, model_type=None)) == 24
+    assert _output_fps(SimpleNamespace(fps=30, model_type="magi-human")) == 30
+
+
 _marks = hardware_marks(res={"cuda": "H100"})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
@@ -459,7 +514,10 @@ def test_quantization_quality(config: QualityTestConfig):
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
 
     # --- BF16 baseline ---
-    omni_bl = Omni(model=config.baseline_ref())
+    baseline_kwargs = {"model": config.baseline_ref()}
+    if config.model_type is not None:
+        baseline_kwargs["model_type"] = config.model_type
+    omni_bl = Omni(**baseline_kwargs)
     baseline_out, bl_mem = generate_fn(omni_bl, config)
     omni_bl.shutdown()
     del omni_bl
@@ -469,9 +527,12 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- Quantized ---
     quantization = config.quantization_ref()
     if quantization is None:
-        omni_qt = Omni(model=config.quantized_ref())
+        quantized_kwargs = {"model": config.quantized_ref()}
+        if config.model_type is not None:
+            quantized_kwargs["model_type"] = config.model_type
+        omni_qt = Omni(**quantized_kwargs)
     else:
-        omni_qt = Omni(model=config.quantized_ref(), quantization_config=quantization)
+        omni_qt = Omni(**_build_omni(config, quantization))
     quant_out, qt_mem = generate_fn(omni_qt, config)
     omni_qt.shutdown()
     del omni_qt
@@ -481,6 +542,10 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- Similarity metrics ---
     lpips_score = _compute_lpips(baseline_out, quant_out, config.task)
     psnr_score, mae_score = _compute_psnr_and_mae(baseline_out, quant_out, config.task)
+    if config.require_memory_reduction:
+        assert qt_mem < bl_mem, (
+            f"Quantized memory ({qt_mem:.2f} GiB) should be lower than BF16 ({bl_mem:.2f} GiB) for {config.id}"
+        )
     assert lpips_score <= config.max_lpips, (
         f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} "
         f"for {config.quantization_ref() or 'pre-quantized checkpoint'} on {config.quantized_ref()}"

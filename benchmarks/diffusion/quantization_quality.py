@@ -44,6 +44,16 @@ LTX-2 example (text-to-video; audio output is generated but not scored by LPIPS)
         --height 704 --width 1216 \
         --num-frames 121 --num-inference-steps 40 --seed 42
 
+MagiHuman example (text-to-video+audio; LPIPS scores video frames only):
+    python benchmarks/diffusion/quantization_quality.py \
+        --model SII-GAIR/daVinci-MagiHuman-Base-1080p \
+        --model-type magi-human \
+        --task t2v \
+        --quantization fp8 \
+        --prompts "A woman speaks to the camera in a sunlit garden." \
+        --height 256 --width 448 \
+        --seconds 5 --num-inference-steps 8 --seed 52
+
 Multiple quantization methods:
     python benchmarks/diffusion/quantization_quality.py \
         --model Tongyi-MAI/Z-Image-Turbo \
@@ -67,6 +77,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+
+def _extract_peak_memory_gib(output, fallback_gib: float) -> float:
+    """Return worker-reported peak memory when the engine runs out of process."""
+    candidates = [output]
+    request_output = getattr(output, "request_output", None)
+    if isinstance(request_output, list):
+        candidates.extend(request_output)
+    elif request_output is not None:
+        candidates.append(request_output)
+
+    for candidate in candidates:
+        peak_memory_mb = getattr(candidate, "peak_memory_mb", None)
+        if peak_memory_mb:
+            return float(peak_memory_mb) / 1024.0
+    return fallback_gib
 
 
 def compute_lpips_images(
@@ -150,9 +176,20 @@ def _build_omni_kwargs(args, quantization=None):
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
     }
+    if args.model_type is not None:
+        kwargs["model_type"] = args.model_type
     if quantization:
-        kwargs["quantization_config"] = quantization
+        kwargs["quantization"] = quantization
     return kwargs
+
+
+def _output_fps(args) -> int:
+    """Return the native FPS when the model type provides one."""
+    if args.fps is not None:
+        return args.fps
+    if args.model_type == "magi-human":
+        return 25
+    return 24
 
 
 def _generate_image(omni, args, prompt, seed):
@@ -192,15 +229,27 @@ def _generate_video(omni, args, prompt, seed):
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
     torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
+    extra_args = {}
+    if args.seconds is not None:
+        extra_args["seconds"] = args.seconds
+    if args.sr_height is not None:
+        extra_args["sr_height"] = args.sr_height
+    if args.sr_width is not None:
+        extra_args["sr_width"] = args.sr_width
+    if args.sr_num_inference_steps is not None:
+        extra_args["sr_num_inference_steps"] = args.sr_num_inference_steps
+
     outputs = omni.generate(
         {"prompt": prompt, "negative_prompt": ""},
         OmniDiffusionSamplingParams(
             height=args.height,
             width=args.width,
+            seed=seed,
             generator=generator,
             guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps,
             num_frames=args.num_frames,
+            extra_args=extra_args,
         ),
     )
     elapsed = time.perf_counter() - start
@@ -241,7 +290,7 @@ def _generate_video(omni, args, prompt, seed):
         if frames_array.ndim == 5:
             frames_array = frames_array[0]
 
-    return frames_array, elapsed, peak_mem
+    return frames_array, elapsed, _extract_peak_memory_gib(first, peak_mem)
 
 
 def _free_gpu_memory():
@@ -288,6 +337,7 @@ def run_benchmark(args):
 
     bl_avg_time = np.mean([v[1] for v in baseline_outputs.values()])
     bl_mem = baseline_outputs[prompts[0]][2]  # use first prompt's memory
+    video_frame_count = len(baseline_outputs[prompts[0]][0]) if is_video else None
     omni_bl.shutdown()
     del omni_bl
     _free_gpu_memory()
@@ -302,7 +352,7 @@ def run_benchmark(args):
                 from diffusers.utils import export_to_video
 
                 frames_list = list(out) if isinstance(out, np.ndarray) and out.ndim == 4 else out
-                export_to_video(frames_list, str(bl_dir / f"prompt_{i}.mp4"), fps=args.fps)
+                export_to_video(frames_list, str(bl_dir / f"prompt_{i}.mp4"), fps=_output_fps(args))
             except ImportError:
                 np.save(bl_dir / f"prompt_{i}.npy", out)
         else:
@@ -349,7 +399,7 @@ def run_benchmark(args):
                     from diffusers.utils import export_to_video
 
                     frames_list = list(qt_out) if isinstance(qt_out, np.ndarray) and qt_out.ndim == 4 else qt_out
-                    export_to_video(frames_list, str(qt_dir / f"prompt_{i}.mp4"), fps=args.fps)
+                    export_to_video(frames_list, str(qt_dir / f"prompt_{i}.mp4"), fps=_output_fps(args))
                 except ImportError:
                     np.save(qt_dir / f"prompt_{i}.npy", qt_out)
             else:
@@ -387,7 +437,7 @@ def run_benchmark(args):
         f"seed={args.seed}, LPIPS ({args.lpips_net})"
     )
     if is_video:
-        lines.append(f"Video: {args.num_frames} frames")
+        lines.append(f"Video: {video_frame_count} frames")
     lines.append("")
     lines.append("### Summary")
     lines.append("")
@@ -443,6 +493,11 @@ def parse_args():
     )
     parser.add_argument("--model", required=True, help="Model name or local path.")
     parser.add_argument(
+        "--model-type",
+        default=None,
+        help="Optional vLLM-Omni model type override, for example magi-human.",
+    )
+    parser.add_argument(
         "--task",
         default="t2i",
         choices=["t2i", "t2v"],
@@ -465,7 +520,21 @@ def parse_args():
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--num-frames", type=int, default=81, help="Number of video frames (t2v only).")
-    parser.add_argument("--fps", type=int, default=24, help="Video FPS for saving (t2v only).")
+    parser.add_argument("--seconds", type=int, default=None, help="MagiHuman output duration in seconds.")
+    parser.add_argument("--sr-height", type=int, default=None, help="MagiHuman SR output height.")
+    parser.add_argument("--sr-width", type=int, default=None, help="MagiHuman SR output width.")
+    parser.add_argument(
+        "--sr-num-inference-steps",
+        type=int,
+        default=None,
+        help="MagiHuman SR denoising steps.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Video FPS for saving (defaults to 25 for MagiHuman and 24 otherwise).",
+    )
     parser.add_argument("--guidance-scale", type=float, default=4.0, help="CFG scale (used for video).")
     parser.add_argument("--output-dir", type=str, default="./quant_bench_output", help="Directory to save outputs.")
     parser.add_argument(
