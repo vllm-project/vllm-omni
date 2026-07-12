@@ -58,6 +58,7 @@ DEFAULT_TEMPERATURE = 0.0
 
 # Connector / Stage-2 streaming defaults (runtime tuning)
 LATENT_CHUNK_SIZE = 25
+INITIAL_LATENT_CHUNK_SIZE = 4
 LATENT_LEFT_CONTEXT = 0
 MAX_DECODE_STEPS = 200
 
