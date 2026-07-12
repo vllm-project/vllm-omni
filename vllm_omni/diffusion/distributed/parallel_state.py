@@ -561,7 +561,7 @@ def set_seq_parallel_pg(
             ranges.
 
     Returns:
-        ulyssess_pg (torch.distributed.ProcessGroup): The Ulysses process group
+        ulysses_pg (torch.distributed.ProcessGroup): The Ulysses process group
             for this rank.
         ring_pg (torch.distributed.ProcessGroup): The Ring process group for
             this rank.
@@ -587,7 +587,7 @@ def set_seq_parallel_pg(
         if len(sp_group_ranks) * sp_size != world_size or any(len(ranks) != sp_size for ranks in sp_group_ranks):
             raise ValueError(f"Invalid sp_group_ranks: expected {world_size // sp_size} groups of size {sp_size}.")
 
-        ulyssess_pg = ring_pg = allgather_pg = None
+        ulysses_pg = ring_pg = allgather_pg = None
         for group_ranks in sp_group_ranks:
             group = torch.distributed.new_group(group_ranks)
             if rank in group_ranks:
@@ -595,13 +595,13 @@ def set_seq_parallel_pg(
         for singleton_rank in range(world_size):
             group = torch.distributed.new_group([singleton_rank])
             if rank == singleton_rank:
-                ulyssess_pg = group
+                ulysses_pg = group
         for singleton_rank in range(world_size):
             group = torch.distributed.new_group([singleton_rank])
             if rank == singleton_rank:
                 ring_pg = group
-        assert ulyssess_pg is not None and ring_pg is not None and allgather_pg is not None
-        return ulyssess_pg, ring_pg, allgather_pg
+        assert ulysses_pg is not None and ring_pg is not None and allgather_pg is not None
+        return ulysses_pg, ring_pg, allgather_pg
 
     sp_size = sp_ring_degree * sp_ulysses_degree
     dp_size = world_size // sp_size
@@ -636,7 +636,7 @@ def set_seq_parallel_pg(
                     ulysses_ranks = group_ranks[i * sp_ulysses_degree : (i + 1) * sp_ulysses_degree]
                     group = torch.distributed.new_group(ulysses_ranks)
                     if rank in ulysses_ranks:
-                        ulyssess_pg = group
+                        ulysses_pg = group
                         local_ulysses = list(ulysses_ranks)
                 for i in range(num_ring_pgs):
                     ring_ranks = group_ranks[i::num_ring_pgs]
@@ -656,7 +656,7 @@ def set_seq_parallel_pg(
                     ulysses_ranks = group_ranks[i::num_ulysses_pgs]
                     group = torch.distributed.new_group(ulysses_ranks)
                     if rank in ulysses_ranks:
-                        ulyssess_pg = group
+                        ulysses_pg = group
                         local_ulysses = list(ulysses_ranks)
         if local_sp_group is not None:
             logger.info(
@@ -679,7 +679,7 @@ def set_seq_parallel_pg(
                     )
                     group = torch.distributed.new_group(ulysses_ranks)
                     if rank in ulysses_ranks:
-                        ulyssess_pg = group
+                        ulysses_pg = group
 
                 for i in range(num_ring_pgs):
                     ring_ranks = list(range(i + offset, sp_size + offset, num_ring_pgs))
@@ -700,7 +700,7 @@ def set_seq_parallel_pg(
                     ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
                     group = torch.distributed.new_group(ulysses_ranks)
                     if rank in ulysses_ranks:
-                        ulyssess_pg = group
+                        ulysses_pg = group
 
     allgather_pg = None
     for singleton_rank in range(world_size):
@@ -708,7 +708,7 @@ def set_seq_parallel_pg(
         if rank == singleton_rank:
             allgather_pg = group
     assert allgather_pg is not None
-    return ulyssess_pg, ring_pg, allgather_pg
+    return ulysses_pg, ring_pg, allgather_pg
 
 
 def initialize_model_parallel(
