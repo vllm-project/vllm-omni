@@ -89,7 +89,7 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --quantization bitsandbytes
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `method` | str | - | Quantization method (`"bitsandbytes"` or alias `"bnb"`) |
+| `method` | str | - | Quantization method (`"bitsandbytes"`) |
 | `quant_type` | str | `"nf4"` | 4-bit data type: `"nf4"` (recommended) or `"fp4"` |
 | `compress_statistics` | bool | `True` | Double-quantize block scaling statistics for better accuracy |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16/FP16 |

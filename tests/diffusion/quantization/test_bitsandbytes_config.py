@@ -31,13 +31,6 @@ def test_bitsandbytes_config_creation():
     assert config.get_name() == "bitsandbytes"
 
 
-def test_bnb_alias_config_creation():
-    """Test that the bnb alias resolves to the diffusion BitsAndBytes config."""
-    config = build_quant_config("bnb")
-    assert config is not None
-    assert config.get_name() == "bitsandbytes"
-
-
 def test_bitsandbytes_config_with_custom_params():
     """Test BitsAndBytes config with custom parameters."""
     config = build_quant_config(
@@ -55,7 +48,6 @@ def test_bitsandbytes_config_with_custom_params():
 def test_supported_methods():
     """Test that supported methods list includes bitsandbytes."""
     assert "bitsandbytes" in SUPPORTED_QUANTIZATION_METHODS
-    assert "bnb" in SUPPORTED_QUANTIZATION_METHODS
 
 
 def test_quantization_integration():

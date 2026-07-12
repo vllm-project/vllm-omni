@@ -142,7 +142,6 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "int8": _build_int8,
     "bitsandbytes": _build_bitsandbytes,
-    "bnb": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
