@@ -57,6 +57,23 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     )
 
 
+def enable_mammoth_moda2_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Enable TeaCache for MammothModa2's DiT stage."""
+    teacache_config = TeaCacheConfig(
+        transformer_type="MammothModa2Transformer2DModel",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    transformer = pipeline.gen_transformer
+    apply_teacache_hook(transformer, teacache_config)
+    pipeline.transformer = transformer
+
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
 def enable_sensenova_u1_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     """Enable TeaCache for SenseNova-U1 denoising forwards."""
     teacache_config = TeaCacheConfig(
@@ -124,6 +141,7 @@ CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
+    "MammothModa2DiTPipeline": enable_mammoth_moda2_teacache,
     "MiniMaxH3Pipeline": enable_minimax_h3_teacache,
     "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
 }

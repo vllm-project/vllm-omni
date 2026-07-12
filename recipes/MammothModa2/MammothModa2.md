@@ -21,9 +21,9 @@ pipeline-declared `extra_body` contract.
 MammothModa2's DiT stage runs in the shared diffusion runtime in request mode.
 The first integration intentionally supports one request and one image per
 forward only (`max_num_seqs: 1`, `num_outputs_per_prompt: 1`). Request-level
-batching, step execution, continuous batching, cache acceleration,
-compilation, quantization, parallelism, and offload are not enabled by this
-recipe.
+batching, step execution, continuous batching, compilation, quantization,
+parallelism, and offload are not enabled by this recipe. TeaCache acceleration
+is supported for the DiT stage.
 
 Image size, seed, guidance, and denoising steps use the standard diffusion
 request fields. `cfg_range` remains a MammothModa2-specific `extra_body`
@@ -100,7 +100,32 @@ sets the relative step range `[start, end]` over which CFG is applied (default
 `[0.0, 1.0]`). For compatibility, `text_guidance_scale` and
 `num_inference_steps` remain accepted `extra_body` aliases and, when non-null,
 take precedence over the standard request fields. Model extras are filtered
-against the declared `extra_body_params` (see
+against the declared `extra_body_params`.
+
+TeaCache can be enabled for the DiT stage with the same user-facing sampling
+parameters:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ./MammothModa2-Preview \
+  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
+  --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
+  --height 1024 \
+  --width 1024 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --cache-backend tea_cache \
+  --extra-body '{"cfg_range": [0.0, 1.0]}' \
+  --output mammoth_t2i_teacache.png
+```
+
+The bundled MammothModa2 TeaCache coefficients are a Lumina2 bootstrap because
+MammothModa2's DiT uses Lumina-style timestep/caption embedding, refiners, and
+joint transformer layers. Treat them as conservative defaults; run model-specific
+quality/speed validation before replacing them with MammothModa2-fitted
+coefficients.
+
+The model-specific keys are declared in
 [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)),
 so unknown MammothModa2 extras may be dropped.
 

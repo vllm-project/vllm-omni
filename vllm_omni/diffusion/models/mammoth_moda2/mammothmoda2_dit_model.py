@@ -768,7 +768,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         ar_image_hidden_states: torch.Tensor | None = None,
         ar_image_attention_mask: torch.Tensor | None = None,
         return_dict: bool = False,
+        teacache_branch: str | None = None,
     ) -> torch.Tensor:
+        # Consumed by TeaCacheHook/extractor before this plain forward runs.
+        del teacache_branch
+
         batch_size, height, width = self._validate_inputs(
             hidden_states, text_hidden_states, text_attention_mask, ref_image_hidden_states, return_dict
         )

@@ -83,6 +83,16 @@ _MODEL_COEFFICIENTS = {
     ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
+    # MammothModa2 DiT transformer coefficients.
+    # Bootstrap from the Lumina2 TeaCache reference implementation because
+    # MammothModa2 uses a Lumina-style DiT layout; tune with real traces later.
+    "MammothModa2Transformer2DModel": [
+        230.18285552,
+        -135.50601985,
+        28.25086844,
+        -2.50689114,
+        0.16368154,
+    ],
     # MiniMax-H3 FL2VA coefficients.
     "MiniMaxH3DiTModel": [
         2.283704065852778e03,
