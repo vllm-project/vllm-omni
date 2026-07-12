@@ -258,6 +258,55 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
 
 
+def test_omni_non_default_args_include_omni_cli_fields(monkeypatch: pytest.MonkeyPatch):
+    """Ensure Omni startup logging diffs against Omni parser defaults."""
+    import vllm.entrypoints.utils as vllm_entrypoint_utils
+    from vllm.entrypoints.openai import api_server as openai_api_server
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "/tmp/model",
+            "--omni",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "18001",
+            "--usp",
+            "2",
+            "--ring-degree",
+            "4",
+            "--cfg-parallel-size",
+            "2",
+        ]
+    )
+    args.model = args.model_tag
+
+    logged: list[dict[str, object]] = []
+
+    def _capture(msg: str, payload: dict[str, object]) -> None:
+        assert msg == "non-default args: %s"
+        logged.append(payload)
+
+    monkeypatch.setattr(vllm_entrypoint_utils.logger, "info", _capture)
+    openai_api_server.log_non_default_args(args)
+
+    payload = logged[-1]
+
+    assert payload["model_tag"] == "/tmp/model"
+    assert payload["model"] == "/tmp/model"
+    assert payload["host"] == "127.0.0.1"
+    assert payload["port"] == 18001
+    assert payload["omni"] is True
+    assert payload["ulysses_degree"] == 2
+    assert payload["ring_degree"] == 4
+    assert payload["cfg_parallel_size"] == 2
+
+
 def test_serve_cli_accepts_diffusion_attention_backend():
     """Ensure diffusion serve CLI exposes the shorthand backend flag."""
     parser = TrackingArgumentParser()

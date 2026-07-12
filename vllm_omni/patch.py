@@ -1,9 +1,12 @@
 import logging
 import os
 import sys
+from argparse import Namespace
 from functools import cached_property
 
 import torch
+import vllm.entrypoints.openai.api_server as _vllm_openai_api_server
+import vllm.entrypoints.utils as _vllm_entrypoint_utils
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
@@ -22,6 +25,7 @@ from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEn
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
 
@@ -417,3 +421,48 @@ def _patch_fp8_use_quack_fused_bias():
 
 
 _patch_fp8_use_quack_fused_bias()
+
+
+# =============================================================================
+# Patch OpenAI startup non-default args logging for Omni CLI
+# =============================================================================
+# WHY: Omni extends the serve CLI with additional overridable flags, but
+# upstream startup logging diffs against the upstream serve parser defaults
+# only, so omni-only args never appear in `non-default args: {...}`. Rebuild
+# the baseline from Omni's full serve parser to keep the upstream log format
+# while including Omni CLI overrides.
+#
+# REMOVAL: Remove this patch once upstream vLLM supports passing the parser
+# (or parser defaults) into this log path, so the startup diff can be computed
+# against the full Omni-aware CLI schema without patching the OpenAI server.
+_original_openai_log_non_default_args = _vllm_openai_api_server.log_non_default_args
+
+
+def _build_omni_serve_default_namespace() -> TrackingNamespace:
+    """Build the Omni serve parser's default namespace."""
+    from vllm_omni.entrypoints.cli.serve import OmniServeCommand
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    return parser.parse_args(["serve"])
+
+
+def _patched_openai_log_non_default_args(args: Namespace) -> None:
+    """Use Omni's parser defaults for --omni startup logging."""
+    if not getattr(args, "omni", False) or not isinstance(args, TrackingNamespace):
+        _original_openai_log_non_default_args(args)
+        return
+
+    default_args = _build_omni_serve_default_namespace()
+    non_default_args: dict[str, object] = {}
+    for arg, default in vars(default_args).items():
+        if not hasattr(args, arg):
+            continue
+        current = getattr(args, arg)
+        if current != default:
+            non_default_args[arg] = current
+    _vllm_entrypoint_utils.logger.info("non-default args: %s", non_default_args)
+
+
+_vllm_openai_api_server.log_non_default_args = _patched_openai_log_non_default_args
