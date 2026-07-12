@@ -3264,17 +3264,12 @@ class TestCosyVoice3Serving:
         assert "max_new_tokens" in error
 
     def test_prepare_speech_generation_cosyvoice3(self, cosyvoice3_server, mocker: MockerFixture):
-        adapter = cosyvoice3_server._get_tts_adapter()
-        adapter.build = mocker.AsyncMock(
-            return_value=PreparedRequest(
-                prompt={
-                    "prompt": "Hello",
-                    "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
-                    "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
-                },
-                tts_params={},
-                model_type="cosyvoice3",
-            )
+        cosyvoice3_server._build_cosyvoice3_prompt = mocker.AsyncMock(
+            return_value={
+                "prompt": "Hello",
+                "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
+                "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
+            }
         )
         cosyvoice3_server._apply_cosyvoice3_dynamic_tokens = mocker.MagicMock(side_effect=lambda spl, req: spl)
 
@@ -3288,7 +3283,7 @@ class TestCosyVoice3Serving:
         assert request_id.startswith("speech-")
         assert generator == "generator"
         assert tts_params == {}
-        adapter.build.assert_awaited_once()
+        cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
 
 
 # ---- GLM-TTS Serving Tests ----
