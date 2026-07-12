@@ -3,7 +3,7 @@ import asyncio
 import torch
 from fastapi import Request
 from fastapi.responses import Response
-from vllm.entrypoints.openai.engine.serving import OpenAIServing
+from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 

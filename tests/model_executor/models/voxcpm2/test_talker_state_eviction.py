@@ -52,6 +52,10 @@ def _make_bare_talker():
     talker._cfm_buffers = None
     talker._last_audio_output_req_ids = []
     talker._batched_fsq_fusion_max_batch = 32
+    # Added in VoxCPM2TalkerForConditionalGeneration.__init__; set to
+    # default (False) to avoid AttributeError when test exercises forward
+    # path that checks this flag.
+    talker._enable_unified_decode_graph = False
     return talker
 
 
@@ -329,23 +333,27 @@ class TestDecodeBatchContract:
 
         for (expected_res, expected_meta), (actual_res, actual_meta) in zip(expected, actual, strict=True):
             torch.testing.assert_close(actual_res, expected_res)
-            torch.testing.assert_close(actual_meta["new_lm_hidden"], expected_meta["new_lm_hidden"])
+            torch.testing.assert_close(actual_meta.new_lm_hidden, expected_meta.new_lm_hidden)
         assert [state.decode_step_count for state in batch_states] == [1, 1]
 
     def test_batch_decode_matches_per_request_state_updates(self) -> None:
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+            _DecodeResidualMeta,
+        )
+
         seq_talker = self._make_decode_talker()
         batch_talker = self._make_decode_talker()
 
         seq_states = [self._make_decode_state("req-0", 0.0), self._make_decode_state("req-1", 10.0)]
         batch_states = [self._make_decode_state("req-0", 0.0), self._make_decode_state("req-1", 10.0)]
         metas = [
-            {"new_lm_hidden": torch.tensor([[1.0, 2.0, 3.0, 4.0]])},
-            {"new_lm_hidden": torch.tensor([[5.0, 6.0, 7.0, 8.0]])},
+            _DecodeResidualMeta(new_lm_hidden=torch.tensor([[1.0, 2.0, 3.0, 4.0]])),
+            _DecodeResidualMeta(new_lm_hidden=torch.tensor([[5.0, 6.0, 7.0, 8.0]])),
         ]
         batch_out = torch.tensor([[0.5, 1.0, 1.5, 2.0], [2.5, 3.0, 3.5, 4.0]])
 
         for state, meta, res_out in zip(seq_states, metas, batch_out, strict=True):
-            seq_talker._finish_decode(state, meta, res_out.unsqueeze(0), torch.device("cpu"))
+            seq_talker._finish_decode(state, meta, res_out.unsqueeze(0))
 
         batch_talker._finish_decode_batch(
             [(state, False, meta) for state, meta in zip(batch_states, metas, strict=True)],
@@ -360,12 +368,16 @@ class TestDecodeBatchContract:
             torch.testing.assert_close(actual.last_audio_patch_gpu, expected.last_audio_patch_gpu)
 
     def test_batch_decode_preserves_per_request_cfm_rng_order(self) -> None:
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+            _DecodeResidualMeta,
+        )
+
         talker = self._make_decode_talker()
         talker._enable_batched_cfm = False
         states = [self._make_decode_state("req-0", 0.0), self._make_decode_state("req-1", 10.0)]
         metas = [
-            {"new_lm_hidden": torch.tensor([[1.0, 2.0, 3.0, 4.0]])},
-            {"new_lm_hidden": torch.tensor([[5.0, 6.0, 7.0, 8.0]])},
+            _DecodeResidualMeta(new_lm_hidden=torch.tensor([[1.0, 2.0, 3.0, 4.0]])),
+            _DecodeResidualMeta(new_lm_hidden=torch.tensor([[5.0, 6.0, 7.0, 8.0]])),
         ]
         batch_out = torch.tensor([[0.5, 1.0, 1.5, 2.0], [2.5, 3.0, 3.5, 4.0]])
 

@@ -144,7 +144,7 @@ def _build_serving_chat():
         engine_client=mock_engine,
         models=models,
         response_role="assistant",
-        openai_serving_render=mock_render,
+        online_renderer=mock_render,
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",

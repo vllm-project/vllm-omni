@@ -28,6 +28,12 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+# Keys whose values may arrive as scalar tensors (e.g. sample rate) but
+# represent metadata, not concatenatable data.  When these appear in
+# ``MultimodalPayload.tensors`` they must be relocated to ``.metadata``
+# before consolidation so the tensor concatenation path does not attempt
+# a dimensioned cat on a 0-d tensor.
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate"})
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -211,6 +217,18 @@ class OmniRequestState(RequestState):
         except (ValueError, KeyError):
             modality = OutputModality.TEXT
         strategy = get_accumulation_strategy(modality)
+
+        # Move known metadata scalar tensors (e.g. sample rate) from
+        # tensors to metadata so they are handled by the REPLACE path
+        # below instead of failing tensor concatenation.
+        for key in _METADATA_TENSOR_KEYS:
+            v = self.mm_accumulated.tensors.pop(key, None)
+            if v is not None:
+                if isinstance(v, list):
+                    # Keep the last value (REPLACE semantics)
+                    self.mm_accumulated.metadata[key] = v[-1]
+                else:
+                    self.mm_accumulated.metadata[key] = v
 
         try:
             for k, v in list(self.mm_accumulated.tensors.items()):
