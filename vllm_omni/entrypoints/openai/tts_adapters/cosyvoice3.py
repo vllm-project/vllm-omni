@@ -9,6 +9,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, Prepare
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
+
 @register_tts_adapter
 class CosyVoice3Adapter(ARTTSAdapter):
     stage_keys = frozenset({"cosyvoice3_talker"})

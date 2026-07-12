@@ -3080,6 +3080,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Constructs the chat prompt with ``<tts_start>`` as the last token
         of the assistant turn (without ``<|im_end|>``), so the thinker
         continues generating audio tokens.
+
+        Prompt format::
+            <|im_start|>system\\n{system_prompt}<|im_end|>\\n
+            <|im_start|>user\\n{input_text}<|im_end|>\\n
+            <|im_start|>assistant\\n<tts_start>
         """
         system_prompt = getattr(request, "instructions", None) or "You are a voice assistant. Read the text aloud."
         text = request.input
@@ -3167,10 +3172,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         *,
         has_inline_ref_audio: bool = False,
     ) -> dict[str, Any]:
-        """Build prompt for CosyVoice3."""
+        """Build prompt for CosyVoice3.
+
+        CosyVoice3 uses multimodal input with reference audio for voice cloning.
+        The prompt format matches the offline example: text prompt + audio data
+        + mm_processor_kwargs with prompt_text.
+        """
+        # Resolve reference audio
         wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
         audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
 
+        # Wrap the reference transcript in the CosyVoice3 instruction template
+        # so the talker emits target-only speech (see _COSYVOICE3_PROMPT_PREFIX).
+        # Skip if the caller already supplied a formatted prompt_text.
         ref_text = request.ref_text or ""
         if _COSYVOICE3_PROMPT_DELIMITER not in ref_text:
             ref_text = f"{_COSYVOICE3_PROMPT_PREFIX}{ref_text}"
@@ -3178,6 +3192,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "prompt_text": ref_text,
             "sample_rate": sr,
         }
+        # Pass voice metadata for caching in the processor
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
@@ -3186,7 +3201,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return {
             "prompt": request.input,
-            "multi_modal_data": {"audio": audio_data},
+            "multi_modal_data": {
+                "audio": audio_data,
+            },
             "mm_processor_kwargs": mm_kwargs,
         }
 
@@ -3196,7 +3213,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
     ) -> dict[str, Any]:
-        """Build a chat-style prompt for Covo-Audio-Chat."""
+        """Build a chat-style prompt for Covo-Audio-Chat.
+
+        Covo-Audio requires a specific system prompt that instructs the model
+        to interleave text and audio tokens in its output.  We render the
+        messages through the chat template and pass prompt_token_ids so that
+        the engine does not need to re-tokenize.
+        """
         from transformers import AutoTokenizer
 
         from vllm_omni.model_executor.models.covo_audio.prompt_utils import (
