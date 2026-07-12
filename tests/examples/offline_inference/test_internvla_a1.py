@@ -19,7 +19,7 @@ from tests.helpers.mark import hardware_test
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-EXAMPLE_SCRIPT = REPO_ROOT / "examples" / "offline_inference" / "internvla_a1" / "end2end.py"
+EXAMPLE_SCRIPT = REPO_ROOT / "examples" / "offline_inference" / "observation_to_action" / "observation_to_action.py"
 
 
 def _required_env(name: str) -> str:
@@ -52,6 +52,8 @@ def test_internvla_a1_offline_open_loop(run_level: str) -> None:
         cmd = [
             sys.executable,
             str(EXAMPLE_SCRIPT),
+            "--model-class-name",
+            "InternVLAA1Pipeline",
             "--model-dir",
             model_dir,
             "--dataset-dir",

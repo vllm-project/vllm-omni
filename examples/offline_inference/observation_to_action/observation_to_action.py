@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Shared observation-to-action offline example.
+
+Robot / VLA policies build observation tensors, run diffusion (or AR) inference,
+then post-process predicted action chunks. Model-specific hooks live in
+``vllm_omni.model_extras`` (observation_builder / action_processor /
+eval_context_loader / open_loop_runner).
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -8,50 +18,54 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
 _WORKSPACE_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _WORKSPACE_ROOT.parents[2]
 if str(_REPO_ROOT) not in sys.path:
-    # Keep the shared helper import clean by doing script-only path bootstrap here.
     sys.path.insert(0, str(_REPO_ROOT))
 
-from internvla_a1_common import (  # noqa: E402
-    A2DOpenLoopDataset,
-    collate_open_loop_samples,
-    make_shared_noise,
-    run_open_loop_evaluation,
-    select_indices,
-    tensor_dtype,
-    tensor_sha256,
-)
-
 from vllm_omni.diffusion.data import OmniDiffusionConfig  # noqa: E402
-from vllm_omni.diffusion.models.internvla_a1 import (  # noqa: E402
-    InternVLAA1Config,
-    InternVLAA1TrainMetadata,
-)
-from vllm_omni.diffusion.models.internvla_a1.config import OBS_STATE  # noqa: E402
 from vllm_omni.diffusion.registry import initialize_model  # noqa: E402
 from vllm_omni.diffusion.request import OmniDiffusionRequest  # noqa: E402
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args  # noqa: E402
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch  # noqa: E402
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams  # noqa: E402
-from vllm_omni.model_extras import get_extra_body_params  # noqa: E402
+from vllm_omni.model_extras import (  # noqa: E402
+    build_observations,
+    get_extra_body_params,
+    load_eval_context,
+    process_actions,
+    run_open_loop,
+)
+from vllm_omni.model_extras.internvla_a1_dataset import select_indices  # noqa: E402
 
-MODEL_CLASS_NAME = "InternVLAA1Pipeline"
+
+def _parse_json_object(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("--extra-body must be a JSON object.")
+    return value
 
 
-def _required_path_arg(env_name: str, cli_value: str | None) -> str:
+def _required_path_arg(env_name: str, cli_value: str | None, flag_name: str) -> str:
     value = cli_value or os.getenv(env_name)
     if not value:
-        raise ValueError(f"Missing required path: set --{env_name.lower().replace('_', '-')} or {env_name}.")
+        raise ValueError(f"Missing required path: set {flag_name} or {env_name}.")
     return value
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run vLLM InternVLA-A1 inference on a few samples.")
+    parser = argparse.ArgumentParser(description="Run observation-to-action offline inference.")
+    parser.add_argument(
+        "--model-class-name",
+        default="InternVLAA1Pipeline",
+        help="Pipeline class registered in model_extras (default: InternVLAA1Pipeline).",
+    )
     parser.add_argument("--model-dir")
     parser.add_argument("--dataset-dir")
     parser.add_argument("--num-samples", type=int, default=1)
@@ -66,7 +80,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strict-load", action="store_true")
     parser.add_argument("--num-steps", type=int, default=None)
     parser.add_argument("--decode-image", action="store_true")
-    parser.add_argument("--output-dir", default="outputs/internvla_a1/vllm_infer")
+    parser.add_argument(
+        "--extra-body",
+        type=_parse_json_object,
+        default=None,
+        help="JSON object for declared extra_body knobs, e.g. '{\"num_steps\": 2}'.",
+    )
+    parser.add_argument("--output-dir", default="outputs/observation_to_action/vllm_infer")
     parser.add_argument("--skip-plots", action="store_true")
     parser.add_argument("--benchmark-forward", action="store_true")
     parser.add_argument("--warmup-iters", type=int, default=3)
@@ -74,11 +94,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_od_config(args: argparse.Namespace, processor_model_name: str) -> OmniDiffusionConfig:
+def _merge_extra_body(args: argparse.Namespace) -> dict[str, Any]:
+    user_extra: dict[str, Any] = {}
+    if args.extra_body:
+        user_extra.update(args.extra_body)
+    if args.num_steps is not None and "num_steps" not in user_extra:
+        user_extra["num_steps"] = args.num_steps
+    if args.decode_image and "decode_image" not in user_extra:
+        user_extra["decode_image"] = True
+    return user_extra
+
+
+def build_od_config(
+    args: argparse.Namespace,
+    *,
+    model_class_name: str,
+    processor_model_name: str,
+) -> OmniDiffusionConfig:
     return OmniDiffusionConfig(
         model=str(Path(args.model_dir).resolve()),
-        model_class_name=MODEL_CLASS_NAME,
-        dtype=tensor_dtype(args.dtype),
+        model_class_name=model_class_name,
+        dtype=torch.bfloat16 if args.dtype == "bfloat16" else torch.float32,
         custom_pipeline_args={
             "device": args.device,
             "dtype": args.dtype,
@@ -92,82 +128,14 @@ def build_od_config(args: argparse.Namespace, processor_model_name: str) -> Omni
     )
 
 
-def build_dataset(args: argparse.Namespace) -> tuple[A2DOpenLoopDataset, InternVLAA1Config, InternVLAA1TrainMetadata]:
-    model_dir = Path(args.model_dir)
-    config = InternVLAA1Config.from_pretrained(model_dir)
-    config.device = args.device
-    config.dtype = args.dtype
-    config.compile_model = args.compile_model
-    config.attn_implementation = args.attn_implementation
-    config.enable_regional_compile = args.enable_regional_compile
-
-    train_meta = InternVLAA1TrainMetadata.from_pretrained(model_dir)
-    with open(model_dir / "stats.json", encoding="utf-8") as f:
-        train_stats = json.load(f)["a2d"]
-
-    dataset = A2DOpenLoopDataset(
-        args.dataset_dir,
-        config=config,
-        train_stats=train_stats,
-    )
-    return dataset, config, train_meta
-
-
-def run_one_path(
-    pipeline,
-    dataset: A2DOpenLoopDataset,
-    config: InternVLAA1Config,
-    args: argparse.Namespace,
-    indices: list[int],
-) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    for index in indices:
-        sample = dataset.get_sample(index)
-        batch_inputs, _ = collate_open_loop_samples([sample], device=args.device, dtype=tensor_dtype(args.dtype))
-        noise = make_shared_noise(
-            args.seed,
-            index,
-            (
-                batch_inputs[OBS_STATE].shape[0],
-                config.chunk_size,
-                config.max_action_dim,
-            ),
-            args.device,
-        )
-        pred = run_pipeline_forward(
-            pipeline,
-            batch_inputs,
-            noise,
-            request_id=f"internvla-a1-sample-{index}",
-            num_steps=args.num_steps,
-            decode_image=args.decode_image,
-        )
-        pred = pred[:, :, : dataset.physical_action_dim].to(torch.float32).cpu()
-        results.append(
-            {
-                "path": "registry",
-                "index": index,
-                "episode_index": sample.episode_index,
-                "task": sample.task,
-                "seed": args.seed,
-                "shape": list(pred.shape),
-                "mean": float(pred.mean().item()),
-                "std": float(pred.std().item()),
-                "action_sha256": tensor_sha256(pred),
-                "first_action_prefix": pred[0, 0, :8].tolist(),
-            }
-        )
-    return results
-
-
 def run_pipeline_forward(
     pipeline,
+    *,
+    model_class_name: str,
     batch_inputs: dict[str, torch.Tensor],
     noise: torch.Tensor,
     request_id: str,
-    *,
-    num_steps: int | None = None,
-    decode_image: bool = False,
+    user_extra: dict[str, Any],
 ) -> torch.Tensor:
     sampling_params = OmniDiffusionSamplingParams(
         extra_args={
@@ -177,11 +145,8 @@ def run_pipeline_forward(
     )
     apply_declared_extra_args(
         sampling_params,
-        get_extra_body_params(MODEL_CLASS_NAME),
-        {
-            "num_steps": num_steps,
-            "decode_image": decode_image,
-        },
+        get_extra_body_params(model_class_name),
+        user_extra,
     )
     output = pipeline.forward(
         DiffusionRequestBatch(
@@ -197,7 +162,7 @@ def run_pipeline_forward(
     if output.error:
         raise RuntimeError(output.error)
     if output.output is None:
-        raise RuntimeError("InternVLAA1Pipeline.forward returned no output tensor.")
+        raise RuntimeError(f"{model_class_name}.forward returned no output tensor.")
     return output.output
 
 
@@ -220,36 +185,93 @@ def _latency_summary(values_ms: list[float]) -> dict[str, float]:
     }
 
 
+def run_one_path(
+    pipeline,
+    *,
+    model_class_name: str,
+    context: dict[str, Any],
+    args: argparse.Namespace,
+    indices: list[int],
+    user_extra: dict[str, Any],
+) -> list[dict[str, object]]:
+    dataset = context["dataset"]
+    config = context["config"]
+    results: list[dict[str, object]] = []
+    for index in indices:
+        obs = build_observations(
+            model_class_name,
+            dataset=dataset,
+            config=config,
+            index=index,
+            seed=args.seed,
+            device=args.device,
+            dtype=context["torch_dtype"],
+        )
+        pred = run_pipeline_forward(
+            pipeline,
+            model_class_name=model_class_name,
+            batch_inputs=obs["batch_inputs"],
+            noise=obs["noise"],
+            request_id=f"observation-to-action-sample-{index}",
+            user_extra=user_extra,
+        )
+        processed = process_actions(
+            model_class_name,
+            pred=pred,
+            dataset=dataset,
+            sample=obs["sample"],
+            index=index,
+            seed=args.seed,
+        )
+        results.append(
+            {
+                "path": "registry",
+                "index": processed["index"],
+                "episode_index": processed["episode_index"],
+                "task": processed["task"],
+                "seed": processed["seed"],
+                "shape": processed["shape"],
+                "mean": processed["mean"],
+                "std": processed["std"],
+                "action_sha256": processed["action_sha256"],
+                "first_action_prefix": processed["first_action_prefix"],
+            }
+        )
+    return results
+
+
 def benchmark_forward(
     pipeline,
-    dataset: A2DOpenLoopDataset,
-    config: InternVLAA1Config,
+    *,
+    model_class_name: str,
+    context: dict[str, Any],
     args: argparse.Namespace,
     index: int,
     output_dir: Path,
+    user_extra: dict[str, Any],
 ) -> dict[str, object]:
-    sample = dataset.get_sample(index)
-    batch_inputs, _ = collate_open_loop_samples([sample], device=args.device, dtype=tensor_dtype(args.dtype))
-    noise = make_shared_noise(
-        args.seed,
-        index,
-        (
-            batch_inputs[OBS_STATE].shape[0],
-            config.chunk_size,
-            config.max_action_dim,
-        ),
-        args.device,
+    dataset = context["dataset"]
+    config = context["config"]
+    obs = build_observations(
+        model_class_name,
+        dataset=dataset,
+        config=config,
+        index=index,
+        seed=args.seed,
+        device=args.device,
+        dtype=context["torch_dtype"],
     )
+    sample = obs["sample"]
 
     _synchronize(args.device)
     cold_start_begin = time.perf_counter()
     pred = run_pipeline_forward(
         pipeline,
-        batch_inputs,
-        noise,
-        request_id=f"internvla-a1-benchmark-{index}-cold",
-        num_steps=args.num_steps,
-        decode_image=args.decode_image,
+        model_class_name=model_class_name,
+        batch_inputs=obs["batch_inputs"],
+        noise=obs["noise"],
+        request_id=f"observation-to-action-benchmark-{index}-cold",
+        user_extra=user_extra,
     )
     _synchronize(args.device)
     cold_start_ms = (time.perf_counter() - cold_start_begin) * 1000.0
@@ -260,11 +282,11 @@ def benchmark_forward(
         begin = time.perf_counter()
         _ = run_pipeline_forward(
             pipeline,
-            batch_inputs,
-            noise,
-            request_id=f"internvla-a1-benchmark-{index}-warmup-{iter_idx}",
-            num_steps=args.num_steps,
-            decode_image=args.decode_image,
+            model_class_name=model_class_name,
+            batch_inputs=obs["batch_inputs"],
+            noise=obs["noise"],
+            request_id=f"observation-to-action-benchmark-{index}-warmup-{iter_idx}",
+            user_extra=user_extra,
         )
         _synchronize(args.device)
         warmup_ms.append((time.perf_counter() - begin) * 1000.0)
@@ -275,18 +297,26 @@ def benchmark_forward(
         begin = time.perf_counter()
         _ = run_pipeline_forward(
             pipeline,
-            batch_inputs,
-            noise,
-            request_id=f"internvla-a1-benchmark-{index}-iter-{iter_idx}",
-            num_steps=args.num_steps,
-            decode_image=args.decode_image,
+            model_class_name=model_class_name,
+            batch_inputs=obs["batch_inputs"],
+            noise=obs["noise"],
+            request_id=f"observation-to-action-benchmark-{index}-iter-{iter_idx}",
+            user_extra=user_extra,
         )
         _synchronize(args.device)
         benchmark_ms.append((time.perf_counter() - begin) * 1000.0)
 
-    pred = pred[:, :, : dataset.physical_action_dim].to(torch.float32).cpu()
+    processed = process_actions(
+        model_class_name,
+        pred=pred,
+        dataset=dataset,
+        sample=sample,
+        index=index,
+        seed=args.seed,
+    )
     summary = {
         "mode": "forward_latency",
+        "model_class_name": model_class_name,
         "model_dir": str(Path(args.model_dir).resolve()),
         "dataset_dir": str(Path(args.dataset_dir).resolve()),
         "sample_index": index,
@@ -296,11 +326,11 @@ def benchmark_forward(
         "dtype": args.dtype,
         "attn_implementation": args.attn_implementation,
         "enable_regional_compile": args.enable_regional_compile,
-        "num_steps": args.num_steps,
-        "decode_image": args.decode_image,
+        "num_steps": user_extra.get("num_steps"),
+        "decode_image": bool(user_extra.get("decode_image", False)),
         "warmup_iters": args.warmup_iters,
         "benchmark_iters": args.benchmark_iters,
-        "output_shape": list(pred.shape),
+        "output_shape": processed["shape"],
         "cold_start_ms": cold_start_ms,
         "warmup_summary": _latency_summary(warmup_ms) if warmup_ms else {},
         "benchmark_summary": _latency_summary(benchmark_ms) if benchmark_ms else {},
@@ -314,67 +344,95 @@ def benchmark_forward(
 
 def main() -> None:
     args = parse_args()
-    args.model_dir = _required_path_arg("INTERNVLA_A1_MODEL_DIR", args.model_dir)
-    args.dataset_dir = _required_path_arg("INTERNVLA_A1_DATASET_DIR", args.dataset_dir)
+    model_class_name = args.model_class_name
+
+    # InternVLA path env defaults (other models can use --model-dir/--dataset-dir directly).
+    if model_class_name == "InternVLAA1Pipeline":
+        args.model_dir = _required_path_arg("INTERNVLA_A1_MODEL_DIR", args.model_dir, "--model-dir")
+        args.dataset_dir = _required_path_arg("INTERNVLA_A1_DATASET_DIR", args.dataset_dir, "--dataset-dir")
+    else:
+        args.model_dir = _required_path_arg("OBSERVATION_TO_ACTION_MODEL_DIR", args.model_dir, "--model-dir")
+        args.dataset_dir = _required_path_arg("OBSERVATION_TO_ACTION_DATASET_DIR", args.dataset_dir, "--dataset-dir")
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset, config, train_meta = build_dataset(args)
+    user_extra = _merge_extra_body(args)
+
+    context = load_eval_context(
+        model_class_name,
+        model_dir=args.model_dir,
+        dataset_dir=args.dataset_dir,
+        device=args.device,
+        dtype=args.dtype,
+        compile_model=args.compile_model,
+        attn_implementation=args.attn_implementation,
+        enable_regional_compile=args.enable_regional_compile,
+    )
+    dataset = context["dataset"]
     indices = select_indices(dataset, args.num_samples)
-    od_config = build_od_config(args, train_meta.processor_model_name)
+    od_config = build_od_config(
+        args,
+        model_class_name=model_class_name,
+        processor_model_name=context["processor_model_name"],
+    )
 
     eval_summaries: dict[str, object] = {}
     pipeline = initialize_model(od_config)
     if args.benchmark_forward:
         benchmark_forward(
-            pipeline=pipeline,
-            dataset=dataset,
-            config=config,
+            pipeline,
+            model_class_name=model_class_name,
+            context=context,
             args=args,
             index=indices[0],
             output_dir=output_dir,
+            user_extra=user_extra,
         )
         return
+
     results = run_one_path(
-        pipeline=pipeline,
-        dataset=dataset,
-        config=config,
+        pipeline,
+        model_class_name=model_class_name,
+        context=context,
         args=args,
         indices=indices,
+        user_extra=user_extra,
     )
     if args.num_episodes > 0:
-        eval_summaries["registry"] = run_open_loop_evaluation(
-            mode="vllm_registry",
+        eval_summaries["registry"] = run_open_loop(
+            model_class_name,
             policy=pipeline,
-            config=config,
             dataset=dataset,
-            train_meta=train_meta,
-            collate_samples=collate_open_loop_samples,
+            config=context["config"],
+            train_meta=context["train_meta"],
             run_sample_actions=lambda policy, batch_inputs, noise: run_pipeline_forward(
                 policy,
-                batch_inputs,
-                noise,
-                request_id="internvla-a1-open-loop",
-                num_steps=args.num_steps,
-                decode_image=args.decode_image,
+                model_class_name=model_class_name,
+                batch_inputs=batch_inputs,
+                noise=noise,
+                request_id="observation-to-action-open-loop",
+                user_extra=user_extra,
             ),
             num_episodes=args.num_episodes,
             seed=args.seed,
             device=args.device,
-            dtype=tensor_dtype(args.dtype),
+            dtype=context["torch_dtype"],
             output_dir=output_dir / "registry",
             skip_plots=args.skip_plots,
+            mode="vllm_registry",
         )
 
     summary = {
         "mode": "registry",
+        "model_class_name": model_class_name,
         "model_dir": str(Path(args.model_dir).resolve()),
         "dataset_dir": str(Path(args.dataset_dir).resolve()),
         "device": args.device,
         "dtype": args.dtype,
         "attn_implementation": args.attn_implementation,
         "enable_regional_compile": args.enable_regional_compile,
-        "num_steps": args.num_steps,
-        "decode_image": args.decode_image,
+        "num_steps": user_extra.get("num_steps"),
+        "decode_image": bool(user_extra.get("decode_image", False)),
         "seed": args.seed,
         "indices": indices,
         "results": results,

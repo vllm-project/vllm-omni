@@ -7,15 +7,17 @@
 - Vendor: InternRobotics
 - Model: `Jia-Zeng/InternVLA-A1-3B-FineTuned-Place_Markpen`
 - Task: Vision-Language-Action (VLA) robot action prediction
-- Mode: Offline inference through the InternVLA-A1 direct pipeline example
+- Mode: Offline inference through the shared `observation_to_action` example
 - Maintainer: Community
 
 ## When to use this recipe
 
 Use this recipe when you need to run InternVLA-A1 on local robot observation
 datasets and compare predicted action chunks against ground truth trajectories.
-The example uses the direct `InternVLAA1Pipeline` path because InternVLA-A1
-inputs are pre-built robot observations, not standard text/image/video prompts.
+InternVLA-A1 inputs are pre-built robot observations (not text/image/video
+prompts), so it uses the standard
+[`observation_to_action`](../../examples/offline_inference/observation_to_action)
+task example with model-specific hooks in `vllm_omni/model_extras/internvla_a1.py`.
 
 ## References
 
@@ -23,7 +25,7 @@ inputs are pre-built robot observations, not standard text/image/video prompts.
 - Model checkpoint: <https://huggingface.co/Jia-Zeng/InternVLA-A1-3B-FineTuned-Place_Markpen>
 - Dataset: <https://huggingface.co/datasets/InternRobotics/InternData-A1>
 - Cosmos tokenizer checkpoints: <https://huggingface.co/tenstep/Cosmos-Tokenizer-CI8x8-SafeTensors>
-- Offline example: [`examples/offline_inference/internvla_a1`](../../examples/offline_inference/internvla_a1)
+- Offline example: [`examples/offline_inference/observation_to_action`](../../examples/offline_inference/observation_to_action)
 - Pipeline: `vllm_omni.diffusion.models.internvla_a1.pipeline_internvla_a1.InternVLAA1Pipeline`
 - Param contract: `vllm_omni/model_extras/internvla_a1.py`
 - E2E test: [`tests/examples/offline_inference/test_internvla_a1.py`](../../tests/examples/offline_inference/test_internvla_a1.py)
@@ -60,9 +62,23 @@ export INTERNVLA_A1_COSMOS_DIR=/path/to/Cosmos-Tokenizer-CI8x8-SafeTensor
 Run one sample:
 
 ```bash
-bash examples/offline_inference/internvla_a1/run.sh \
+bash examples/offline_inference/observation_to_action/run.sh \
   --num-samples 1 \
   --num-episodes 0 \
+  --dtype bfloat16 \
+  --attn-implementation eager
+```
+
+Or call the shared script directly with `--extra-body`:
+
+```bash
+python examples/offline_inference/observation_to_action/observation_to_action.py \
+  --model-class-name InternVLAA1Pipeline \
+  --model-dir "$INTERNVLA_A1_MODEL_DIR" \
+  --dataset-dir "$INTERNVLA_A1_DATASET_DIR" \
+  --num-samples 1 \
+  --num-episodes 0 \
+  --extra-body '{"num_steps": 2}' \
   --dtype bfloat16 \
   --attn-implementation eager
 ```
@@ -70,7 +86,7 @@ bash examples/offline_inference/internvla_a1/run.sh \
 Run a one-episode open-loop evaluation:
 
 ```bash
-bash examples/offline_inference/internvla_a1/run.sh \
+bash examples/offline_inference/observation_to_action/run.sh \
   --num-episodes 1 \
   --dtype bfloat16 \
   --attn-implementation eager
@@ -94,7 +110,7 @@ Expected artifacts include `summary.json`, `registry/log.json`, and optional
 #### Notes
 
 - Memory usage: reference collection used 1x H200 with `bfloat16` and eager attention.
-- The direct offline example keeps tensor payloads (`batch_inputs`, `noise`) in
+- The shared example keeps tensor payloads (`batch_inputs`, `noise`) in
   `sampling_params.extra_args`; request-time knobs are routed through declared
   `extra_body` params.
 - Declared knobs:

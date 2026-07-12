@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +17,7 @@ import torch
 import torch.nn.functional as F
 import torchvision
 
-from vllm_omni.diffusion.models.internvla_a1.config import (  # noqa: E402
+from vllm_omni.diffusion.models.internvla_a1.config import (
     OBS_IMAGES,
     OBS_STATE,
     OBS_TASK,
