@@ -15,7 +15,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
     Unpack,
     apply_rotary_pos_emb,
-    check_model_inputs,
     create_causal_mask,
     deprecate_kwarg,
     eager_attention_forward,
@@ -38,6 +37,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextRMSNorm as HFQwen3VLTextRMSNorm,
 )
+from transformers.utils.generic import check_model_inputs
 
 
 class Qwen3VLTextRMSNorm(HFQwen3VLTextRMSNorm):
@@ -78,13 +78,10 @@ class Qwen3VLTextAttention(HFQwen3VLTextAttention):
 
         if past_key_values is not None:
             if use_cache:
-                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx, cache_kwargs
-                )
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
             else:
-                key_states = torch.cat([past_key_values[self.layer_idx][0], key_states], dim=2)
-                value_states = torch.cat([past_key_values[self.layer_idx][1], value_states], dim=2)
+                key_states = torch.cat([past_key_values.layers[self.layer_idx].keys, key_states], dim=2)
+                value_states = torch.cat([past_key_values.layers[self.layer_idx].values, value_states], dim=2)
 
         attention_interface = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -176,9 +173,8 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
 
         attention_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
@@ -230,7 +226,7 @@ class Qwen3VLModel(HFQwen3VLModel):
 
 class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
     _checkpoint_conversion_mapping = {}
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = HFQwen3VLForConditionalGeneration._tied_weights_keys
     accepts_loss_kwargs = False
     config: Qwen3VLConfig
 
@@ -239,6 +235,14 @@ class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
+
+    @property
+    def language_model(self):
+        return self.model.language_model
+
+    @property
+    def visual(self):
+        return self.model.visual
 
 
 __all__ = [
