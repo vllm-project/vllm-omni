@@ -87,8 +87,8 @@ def _minimal_images_gen_json(omni_server: OmniServer) -> dict[str, object]:
         pytest.param(
             {"true_cfg_scale": 21.0}, ("true_cfg_scale", "less_than_equal", "20"), id="true_cfg_scale_above_max"
         ),
-        pytest.param({"layers": 2}, ("layers", "value_error", "3", "10"), id="layers_below_min"),
-        pytest.param({"layers": 11}, ("layers", "value_error", "3", "10"), id="layers_above_max"),
+        pytest.param({"layers": 1}, ("layers", "value_error", "2", "10"), id="layers_below_min"),
+        pytest.param({"layers": 11}, ("layers", "value_error", "2", "10"), id="layers_above_max"),
         pytest.param({"seed": -1}, ("seed", "greater_than_equal", "0"), id="seed_negative", marks=_SKIP_ISSUE_3649),
         pytest.param(
             {"seed": 2**32},
