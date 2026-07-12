@@ -1249,6 +1249,86 @@ def extract_sensenova_u1_context(
     )
 
 
+def extract_cosmos3_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    video_shape: tuple[int, int, int],
+    fps: float | None = None,
+    action_latents: torch.Tensor | None = None,
+    action_domain_ids: torch.Tensor | None = None,
+    action_noisy_mask: torch.Tensor | None = None,
+    action_start_frame_offset: int = 1,
+    action_fps: float | None = None,
+    sound_latents: torch.Tensor | None = None,
+    noisy_frame_mask: torch.Tensor | None = None,
+    control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+    transfer_share_vision_temporal_positions: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for Cosmos3VFMTransformer.
+
+    Delegates to the transformer's shared GEN-pathway helpers
+    (``_gen_preprocess`` / ``_run_gen_layers`` / ``_gen_postprocess``) — the
+    same code ``forward`` runs. Cosmos3 has no adaLN, so the first GEN layer's
+    input RMSNorm output serves as TeaCache's similarity signal; TeaCache
+    caches only the GEN pathway (the UND K/V cache is pipeline-owned), and the
+    cached residual covers the full packed GEN sequence.
+
+    Arguments mirror ``Cosmos3VFMTransformer.forward`` exactly.
+
+    Returns:
+        CacheContext with all information needed for generic caching
+    """
+    if not hasattr(module, "gen_layers") or len(module.gen_layers) == 0:
+        raise ValueError("Module must have gen_layers")
+    if kwargs:
+        raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+
+    prep = module._gen_preprocess(
+        hidden_states,
+        timestep,
+        text_ids,
+        text_mask,
+        video_shape,
+        fps=fps,
+        action_latents=action_latents,
+        action_domain_ids=action_domain_ids,
+        action_noisy_mask=action_noisy_mask,
+        action_start_frame_offset=action_start_frame_offset,
+        action_fps=action_fps,
+        sound_latents=sound_latents,
+        noisy_frame_mask=noisy_frame_mask,
+        control_latents=control_latents,
+        transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+    )
+
+    # Cosmos3 has no adaLN modulation; the timestep embedding was added to
+    # every noisy GEN token in _gen_preprocess, so the first GEN layer's input
+    # RMSNorm output carries the timestep signal the cache discriminator needs.
+    modulated_input = module.gen_layers[0].input_layernorm(prep.hidden_gen)
+
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        """Execute all Cosmos3 GEN decoder layers (single-stream pathway)."""
+        return (module._run_gen_layers(prep.hidden_gen, prep.freqs_cos, prep.freqs_sin),)
+
+    def postprocess(hidden: torch.Tensor) -> Any:
+        """Unpatchify/unpack GEN outputs into the model's return format."""
+        return module._gen_postprocess(hidden, prep)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=prep.hidden_gen,
+        encoder_hidden_states=None,  # UND text conditioning enters via cached K/V
+        temb=prep.time_embed,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1265,6 +1345,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "LongCatImageTransformer2DModel": extract_longcat_context,
     "FluxTransformer2DModel": extract_flux_context,
     "SenseNovaU1ForCausalLM": extract_sensenova_u1_context,
+    "Cosmos3VFMTransformer": extract_cosmos3_context,
     # Future models:
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,
 }

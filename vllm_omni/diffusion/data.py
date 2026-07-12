@@ -372,7 +372,7 @@ class DiffusionCacheConfig:
     It can be initialized from a dictionary and accessed via attributes.
 
     Common parameters:
-        - TeaCache: rel_l1_thresh, coefficients (optional)
+        - TeaCache: rel_l1_thresh, coefficients (optional), num_warmup_steps
         - cache-dit: Fn_compute_blocks, Bn_compute_blocks, max_warmup_steps,
                     residual_diff_threshold, enable_taylorseer, taylorseer_order,
                     scm_steps_mask_policy, scm_steps_policy
@@ -396,6 +396,8 @@ class DiffusionCacheConfig:
     # Default: 0.2 provides ~1.5x speedup with minimal quality loss (optimal balance)
     rel_l1_thresh: float = 0.2
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
+    # First N denoising steps that always compute the full transformer
+    num_warmup_steps: int = 0
 
     # MagCache parameters [mag_cache only]
     # Default: 0.24 threshold for accumulated magnitude error

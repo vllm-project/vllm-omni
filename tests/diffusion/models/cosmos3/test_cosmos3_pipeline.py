@@ -211,7 +211,7 @@ def make_cosmos3_pipeline():
         pipeline._guidance_scale = None
         pipeline._num_timesteps = None
         pipeline._cosmos3_branch_caches = None
-        pipeline._cache_dit_requires_paired_cfg = False
+        pipeline._cache_backend_requires_paired_cfg = False
         pipeline._sound_tokenizer = None
         pipeline.progress_bar = passthrough_progress_bar
         return pipeline
@@ -1041,6 +1041,68 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
 
 
+def test_diffuse_resets_teacache_hook_per_run(make_cosmos3_pipeline) -> None:
+    """T2I batch>1 re-runs diffuse within one request; each run must reset the
+    TeaCache hook state, not just the UND K/V cache."""
+    from unittest.mock import Mock
+
+    pipeline = make_cosmos3_pipeline()
+    registry = Mock()
+    pipeline.transformer._hook_registry = registry
+    latents = torch.zeros(1, 2, 1, 1, 1)
+
+    for _ in range(2):
+        pipeline.diffuse(
+            latents=latents,
+            timesteps=torch.tensor([7]),
+            cond_ids=_ids(2),
+            cond_mask=_mask(),
+            uncond_ids=_ids(1),
+            uncond_mask=_mask(),
+            guidance_scale=1.0,
+            shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+        )
+
+    assert registry.reset_hook.call_count == 2
+    registry.reset_hook.assert_called_with("teacache")
+
+
+def test_diffuse_transfer_bypasses_teacache(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
+    """Transfer's heterogeneous multi-branch forwards must run with the
+    TeaCache bypass flag set, and clear it afterwards."""
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    flags_at_call = []
+    original_forward = pipeline.transformer.forward
+
+    def spy_forward(*args, **kwargs):
+        flags_at_call.append(getattr(pipeline.transformer, "_teacache_disabled", False))
+        return original_forward(*args, **kwargs)
+
+    pipeline.transformer.forward = spy_forward
+
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        control_guidance=1.5,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert flags_at_call and all(flags_at_call)  # bypass active for every branch forward
+    assert pipeline.transformer._teacache_disabled is False  # cleared afterwards
+
+
 def test_diffuse_transfer_skips_idle_cfg_branches(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     latents = torch.zeros(1, 2, 1, 1, 1)
     velocity_mask = torch.ones(1, 1, 1, 1, 1)
@@ -1290,7 +1352,7 @@ def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -
     """
     pipeline = make_cosmos3_pipeline()
     # Marker normally set by ``enable_cache_for_cosmos3`` when cache-dit is on.
-    pipeline._cache_dit_requires_paired_cfg = True
+    pipeline._cache_backend_requires_paired_cfg = True
     latents = torch.zeros(1, 2, 1, 1, 1)
 
     result = pipeline.diffuse(

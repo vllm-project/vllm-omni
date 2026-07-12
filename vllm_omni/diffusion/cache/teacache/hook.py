@@ -60,6 +60,7 @@ class TeaCacheHook(ModelHook):
         """
         super().__init__()
         self.config = config
+        self.num_warmup_steps = config.num_warmup_steps
         self.rescale_func = np.poly1d(config.coefficients)
         self.state_manager = StateManager(TeaCacheState)
         self.extractor_fn = None
@@ -114,6 +115,11 @@ class TeaCacheHook(ModelHook):
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
 
+        # Multi-branch loops with heterogeneous shapes (e.g. Cosmos3 transfer)
+        # set this flag to run the full model without touching cache state.
+        if getattr(module, "_teacache_disabled", False):
+            return ctx.postprocess(ctx.run_transformer_blocks()[0])
+
         # ============================================================================
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
@@ -128,7 +134,10 @@ class TeaCacheHook(ModelHook):
                 cfg_rank = get_classifier_free_guidance_rank()
                 cache_branch = "negative" if cfg_rank > 0 else "positive"
             else:
-                # No CFG-parallel: use forward counter to alternate branches
+                # No CFG-parallel: use forward counter to alternate branches.
+                # Assumes strictly paired cond/uncond forwards (see
+                # _cache_backend_requires_paired_cfg); an unpaired forward
+                # flips the branch labels for the rest of the run.
                 cache_branch = "negative" if self._forward_cnt % 2 == 1 else "positive"
         else:
             cache_branch = "positive"
@@ -193,7 +202,7 @@ class TeaCacheHook(ModelHook):
         Determine whether to compute full transformer or reuse cached residual.
 
         This implements the core TeaCache algorithm:
-        1. Always compute first timestep
+        1. Always compute the first timestep and any configured warmup steps
         2. For intermediate steps:
            - Compute relative L1 distance between current and previous modulated inputs
            - Apply polynomial rescaling with model-specific coefficients
@@ -207,6 +216,11 @@ class TeaCacheHook(ModelHook):
         Returns:
             True to compute full transformer, False to reuse cached residual
         """
+        # Warmup window (official TeaCache ret_steps behavior): always compute
+        if state.cnt < self.num_warmup_steps:
+            state.accumulated_rel_l1_distance = 0.0
+            return True
+
         # First timestep: always compute
         if state.cnt == 0:
             state.accumulated_rel_l1_distance = 0.0

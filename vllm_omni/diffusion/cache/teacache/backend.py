@@ -46,6 +46,7 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
         transformer_type="Bagel",
         rel_l1_thresh=config.rel_l1_thresh,
         coefficients=config.coefficients,
+        num_warmup_steps=config.num_warmup_steps,
     )
     transformer = pipeline.bagel
     apply_teacache_hook(transformer, teacache_config)
@@ -63,6 +64,7 @@ def enable_sensenova_u1_teacache(pipeline: Any, config: DiffusionCacheConfig) ->
         transformer_type="SenseNovaU1ForCausalLM",
         rel_l1_thresh=config.rel_l1_thresh,
         coefficients=config.coefficients,
+        num_warmup_steps=config.num_warmup_steps,
     )
     transformer = pipeline.denoising_transformer
     apply_teacache_hook(transformer, teacache_config)
@@ -81,6 +83,7 @@ def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> 
         transformer_type="Flux2Klein",
         rel_l1_thresh=config.rel_l1_thresh,
         coefficients=config.coefficients,
+        num_warmup_steps=config.num_warmup_steps,
     )
     transformer = pipeline.transformer
 
@@ -92,11 +95,34 @@ def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> 
     )
 
 
+def enable_cosmos3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """
+    Enable TeaCache for Cosmos3 (``num_warmup_steps=12`` is recommended; see
+    the TeaCache user guide).
+    """
+    transformer = pipeline.transformer
+    teacache_config = TeaCacheConfig(
+        transformer_type=transformer.__class__.__name__,
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+        num_warmup_steps=config.num_warmup_steps,
+    )
+    apply_teacache_hook(transformer, teacache_config)
+    pipeline._cache_backend_requires_paired_cfg = True
+
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"num_warmup_steps={teacache_config.num_warmup_steps}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
 CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
     "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
+    "Cosmos3OmniDiffusersPipeline": enable_cosmos3_teacache,
 }
 
 
@@ -151,6 +177,7 @@ class TeaCacheBackend(CacheBackend):
                     transformer_type=transformer_type,
                     rel_l1_thresh=self.config.rel_l1_thresh,
                     coefficients=self.config.coefficients,
+                    num_warmup_steps=self.config.num_warmup_steps,
                 )
             except Exception as e:
                 logger.error(f"Failed to create TeaCacheConfig: {e}")

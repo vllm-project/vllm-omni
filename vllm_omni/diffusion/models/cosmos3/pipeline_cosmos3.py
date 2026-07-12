@@ -813,11 +813,9 @@ class Cosmos3OmniDiffusersPipeline(
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
         self._robolab_transform = None
 
-        # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
-        # this pipeline. Tells the sequential-CFG loop to keep paired
-        # cond/uncond forwards so cache-dit's has_separate_cfg step accounting
-        # stays in sync.
-        self._cache_dit_requires_paired_cfg = False
+        # Set True by the cache-dit/TeaCache enablers; tells the sequential-CFG
+        # loop to keep paired cond/uncond forwards (see _cache_requires_paired_cfg).
+        self._cache_backend_requires_paired_cfg = False
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -1050,20 +1048,14 @@ class Cosmos3OmniDiffusersPipeline(
             return False
 
     def _cache_requires_paired_cfg(self) -> bool:
-        """Whether the sequential-CFG denoising loop must keep paired forwards.
+        """Whether sequential CFG must keep cond/uncond paired every step.
 
-        cache-dit wraps the GEN pathway with ``has_separate_cfg=True`` and
-        distinguishes the conditional vs unconditional passes purely by the
-        parity of its transformer-forward counter.  The T2I ``guidance_interval``
-        optimization that skips the uncond pass outside the interval would
-        desync that accounting (cond passes get mislabeled as uncond and the
-        per-generation step counter drifts).  ``enable_cache_for_cosmos3`` sets
-        the marker below when it enables cache-dit on this pipeline; the loop
-        then keeps both passes and neutralizes CFG via scale=1.0 instead.
-
-        Returns False when cache-dit is not active, preserving the skip speedup.
+        cache-dit and TeaCache label CFG branches by forward-call parity; the
+        T2I ``guidance_interval`` uncond skip would desync that accounting.
+        Cache enablers set ``_cache_backend_requires_paired_cfg``; the loop then
+        runs both passes and applies ``scale=1.0`` outside the interval.
         """
-        return self._cache_dit_requires_paired_cfg
+        return self._cache_backend_requires_paired_cfg
 
     @staticmethod
     def _get_sp_param(sp: OmniDiffusionSamplingParams, key: str, default: Any = None) -> Any:
@@ -2198,6 +2190,16 @@ class Cosmos3OmniDiffusersPipeline(
         cfg_parallel = self._cfg_parallel_active() and do_cfg
         step_scheduler = scheduler if scheduler is not None else self.scheduler
         self.transformer.reset_cache()
+        # T2I batch>1 re-runs this loop within one request, so reset TeaCache
+        # state here; the per-request backend refresh alone would leak
+        # warmup counters and residuals across samples.
+        registry = getattr(self.transformer, "_hook_registry", None)
+        if registry is not None:
+            registry.reset_hook("teacache")
+        # The TeaCache hook keys its per-CFG-branch cache state off this
+        # attribute; while True it requires strictly paired cond/uncond
+        # forwards (see _cache_backend_requires_paired_cfg).
+        self.transformer.do_true_cfg = do_cfg
 
         def _cfg_active_at(t: torch.Tensor) -> bool:
             if guidance_interval is None:
@@ -2517,6 +2519,9 @@ class Cosmos3OmniDiffusersPipeline(
 
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
+        # Transfer runs heterogeneous multi-branch forwards per step, which
+        # doesn't fit TeaCache's single-state/parity model; bypass caching.
+        self.transformer._teacache_disabled = True
         try:
             for t in self.progress_bar(timesteps):
                 timestep = t.unsqueeze(0)
@@ -2621,6 +2626,7 @@ class Cosmos3OmniDiffusersPipeline(
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
         finally:
+            self.transformer._teacache_disabled = False
             self._cosmos3_branch_caches = None
             self.transformer.reset_cache()
         return latents

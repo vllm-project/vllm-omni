@@ -970,7 +970,7 @@ def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> RefreshCacheCo
     # (has_separate_cfg=True above), so that skip would desync its per-generation
     # step accounting. Still do both cond/uncond CFG steps when cache-dit is active.
     # CFG is instead neutralized via scale=1.0 outside the interval.
-    pipeline._cache_dit_requires_paired_cfg = True
+    pipeline._cache_backend_requires_paired_cfg = True
     block_adapter = CacheDiTBackend.maybe_build_block_adapter(pipeline)
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 

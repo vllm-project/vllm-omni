@@ -12,7 +12,7 @@ Ported from the TRT-LLM integration (tekit branch user/shreyasm/cosmos3).
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -952,6 +952,26 @@ class Cosmos3GenSPPrepare(nn.Module):
         return hidden_gen, freqs_cos, freqs_sin
 
 
+class _GenPrepared(NamedTuple):
+    """GEN-pathway state produced by ``Cosmos3VFMTransformer._gen_preprocess``."""
+
+    hidden_gen: torch.Tensor
+    freqs_cos: torch.Tensor
+    freqs_sin: torch.Tensor
+    time_embed: torch.Tensor
+    t: int
+    h: int
+    w: int
+    s_video: int
+    s_control: int
+    s_action: int
+    s_sound: int
+    has_control: bool
+    has_action: bool
+    has_sound: bool
+    action_domain_ids: torch.Tensor | None
+
+
 class Cosmos3VFMTransformer(nn.Module):
     """Cosmos3 VFM Transformer: UND language model + GEN denoising layers.
 
@@ -1446,6 +1466,49 @@ class Cosmos3VFMTransformer(nn.Module):
         """
         if kwargs:
             raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+        prep = self._gen_preprocess(
+            hidden_states,
+            timestep,
+            text_ids,
+            text_mask,
+            video_shape,
+            fps=fps,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            action_noisy_mask=action_noisy_mask,
+            action_start_frame_offset=action_start_frame_offset,
+            action_fps=action_fps,
+            sound_latents=sound_latents,
+            noisy_frame_mask=noisy_frame_mask,
+            control_latents=control_latents,
+            transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+        )
+        hidden_gen = self._run_gen_layers(prep.hidden_gen, prep.freqs_cos, prep.freqs_sin)
+        return self._gen_postprocess(hidden_gen, prep)
+
+    def _gen_preprocess(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
+        sound_latents: torch.Tensor | None = None,
+        noisy_frame_mask: torch.Tensor | None = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
+    ) -> _GenPrepared:
+        """Prepare the packed GEN sequence up to (but excluding) the GEN layers.
+
+        Shared by ``forward`` and the TeaCache extractor (``extract_cosmos3_context``);
+        change the GEN input path here so both stay in sync.
+        """
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
         text_lengths = text_mask.sum(dim=1)
@@ -1608,6 +1671,32 @@ class Cosmos3VFMTransformer(nn.Module):
         )
         freqs_cos, freqs_sin = self.cached_freqs_gen
         hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+
+        return _GenPrepared(
+            hidden_gen=hidden_gen,
+            freqs_cos=freqs_cos,
+            freqs_sin=freqs_sin,
+            time_embed=time_embed,
+            t=t,
+            h=h,
+            w=w,
+            s_video=s_video,
+            s_control=s_control,
+            s_action=s_action,
+            s_sound=s_sound,
+            has_control=has_control,
+            has_action=has_action,
+            has_sound=has_sound,
+            action_domain_ids=action_domain_ids,
+        )
+
+    def _run_gen_layers(
+        self,
+        hidden_gen: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the GEN decoder layers (shared by ``forward`` and the TeaCache extractor)."""
         freqs_gen = (freqs_cos, freqs_sin)
 
         if len(self.gen_layers) == len(self.cached_kv):
@@ -1632,6 +1721,20 @@ class Cosmos3VFMTransformer(nn.Module):
                 )
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
+
+        return hidden_gen
+
+    def _gen_postprocess(
+        self,
+        hidden_gen: torch.Tensor,
+        prep: _GenPrepared,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Gather, norm, and project GEN outputs back to latent space (shared
+        by ``forward`` and the TeaCache extractor)."""
+        t, h, w = prep.t, prep.h, prep.w
+        s_video, s_control, s_action, s_sound = prep.s_video, prep.s_control, prep.s_action, prep.s_sound
+        has_control, has_action, has_sound = prep.has_control, prep.has_action, prep.has_sound
+        action_domain_ids = prep.action_domain_ids
 
         hidden_gen = self.gen_sp_gather(hidden_gen)
 

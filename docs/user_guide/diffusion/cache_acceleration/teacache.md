@@ -109,7 +109,14 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --cache-backend tea_cache
 vllm serve Qwen/Qwen-Image --omni --port 8091 \
   --cache-backend tea_cache \
   --cache-config '{"rel_l1_thresh": 0.2}'
+
+# Video models with early-clustered schedules (e.g. Cosmos3): add a warmup window
+vllm serve nvidia/Cosmos3-Nano --omni --port 8091 \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh": 0.2, "num_warmup_steps": 12}'
 ```
+
+Cosmos3 transfer requests bypass TeaCache automatically (multi-branch control denoising is incompatible with residual caching).
 
 ---
 
@@ -121,6 +128,7 @@ In `OmniDiffusionConfig`
 |-----------|------|---------|-------------|
 | `rel_l1_thresh` | float | `0.2` | Similarity threshold for cache reuse. Lower values prioritize quality (less caching), higher values prioritize speed (more caching). Suggested range: 0.1-0.8 |
 | `coefficients` | list[float] \| None | `None` | Polynomial coefficients for rescaling L1 distance. Must contain exactly 5 elements if provided. If `None`, uses model-specific defaults based on transformer type. |
+| `num_warmup_steps` | int | `0` | Number of initial denoising steps (per CFG branch) that always compute the full transformer before caching may engage. Recommended for video models whose schedules cluster early timesteps; caching those steps causes scene drift. **Use `12` for Cosmos3.** |
 
 Users can find the default model coefficients in [`vllm_omni/diffusion/cache/teacache/config.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/cache/teacache/config.py), for example:
 

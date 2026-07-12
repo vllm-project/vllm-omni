@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
 import os
 from typing import Any
 
@@ -132,11 +133,18 @@ class StableAudioAdapter(DefaultAdapter):
     model_class_name = "StableAudioPipeline"
 
 
+class Cosmos3Adapter(DefaultAdapter):
+    """Adapter for Cosmos3 (Nano/Super) coefficient estimation."""
+
+    model_class_name = "Cosmos3OmniDiffusersPipeline"
+
+
 _MODEL_ADAPTERS: dict[str, type] = {
     "Bagel": BagelAdapter,
     "StableAudio": StableAudioAdapter,
     "Flux2": Flux2Adapter,
     "LongCat": LongCatAdapter,
+    "Cosmos3": Cosmos3Adapter,
 }
 
 _EPSILON = 1e-6
@@ -200,13 +208,16 @@ class TeaCacheCoefficientEstimator:
 
     def collect_from_prompt(self, prompt: str, **generate_kwargs):
         self.hook.start_collection()
+        sp_kwargs: dict[str, Any] = {"num_inference_steps": 20, "seed": 42}
+        valid_fields = {f.name for f in dataclasses.fields(OmniDiffusionSamplingParams)}
+        unknown = set(generate_kwargs) - valid_fields
+        if unknown:
+            raise ValueError(f"Unknown OmniDiffusionSamplingParams fields: {sorted(unknown)}")
+        sp_kwargs.update(generate_kwargs)
         req = OmniDiffusionRequest(
             prompt=prompt,
             request_id="teacache-coefficient-estimator",
-            sampling_params=OmniDiffusionSamplingParams(
-                num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
-                seed=generate_kwargs.get("seed", 42),
-            ),
+            sampling_params=OmniDiffusionSamplingParams(**sp_kwargs),
         )
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
