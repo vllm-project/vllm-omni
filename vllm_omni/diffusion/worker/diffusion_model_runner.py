@@ -92,6 +92,51 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
+def validate_pp_step_execution(pipeline: object, od_config: object, pp_world_size: int) -> None:
+    """Enforce the grouped-only PP contract.
+
+    A pipeline that wires PP only into its grouped step-execution path sets
+    ``requires_step_execution_for_pp=True``; for it, ``pipeline_parallel_size>1``
+    requires ``step_execution=True`` (else the monolithic path runs stages with no
+    intermediate-tensor passing). Raises ``ValueError`` on violation.
+    """
+    if (
+        pp_world_size > 1
+        and not getattr(od_config, "step_execution", False)
+        and getattr(pipeline, "requires_step_execution_for_pp", False)
+    ):
+        model_name = getattr(od_config, "model_class_name", type(pipeline).__name__)
+        raise ValueError(
+            "pipeline_parallel_size>1 requires step_execution=True for "
+            f"{model_name}: its pipeline parallelism is implemented only in the "
+            "grouped step-execution path. Set step_execution=True "
+            "(or pipeline_parallel_size=1)."
+        )
+
+
+def validate_microbatch_axes(pipeline: object, od_config: object) -> None:
+    """Enforce the per-pipeline supported microbatch axes.
+
+    A pipeline declares the microbatch axes it implements via
+    ``supported_microbatch_axes`` (a frozenset). Any enabled ``microbatch_axes``
+    axis outside that set is rejected at load time -- a pipeline that has not opted
+    in rejects any non-empty ``microbatch_axes`` rather than silently
+    misbehaving. Raises ``ValueError`` on violation.
+    """
+    parallel_config = getattr(od_config, "parallel_config", None)
+    policies = set(getattr(parallel_config, "microbatch_axes", []) or [])
+    if not policies:
+        return
+    supported = set(getattr(pipeline, "supported_microbatch_axes", frozenset()))
+    unknown = policies - supported
+    if unknown:
+        model_name = getattr(od_config, "model_class_name", type(pipeline).__name__)
+        raise ValueError(
+            f"{model_name} does not support microbatch axes {sorted(unknown)}; "
+            f"supported: {sorted(supported)}. Adjust microbatch_axes."
+        )
+
+
 class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
@@ -228,6 +273,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
+
+        # Some pipelines implement PP only in the grouped step-execution path; fail
+        # fast for a PP>1 deploy that leaves step_execution off.
+        pp_size = getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1)
+        validate_pp_step_execution(self.pipeline, self.od_config, pp_size)
+        # Reject any enabled microbatch axis the pipeline does not implement.
+        validate_microbatch_axes(self.pipeline, self.od_config)
 
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(self.od_config, device=self.device)

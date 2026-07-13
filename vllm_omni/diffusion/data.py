@@ -7,7 +7,7 @@ import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import diffusers
 import torch
@@ -138,6 +138,10 @@ def parse_kv_cache_skip_selector(
     return values
 
 
+# Valid microbatch axes (validated at runtime in __post_init__).
+MicrobatchAxis = Literal["cfg", "requests"]
+
+
 @config
 @dataclass
 class DiffusionParallelConfig:
@@ -180,6 +184,23 @@ class DiffusionParallelConfig:
 
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
+
+    microbatch_axes: list[MicrobatchAxis] = field(default_factory=list)
+    """Pipeline-parallel microbatching axes to enable.
+
+    Treated as a set (order-insensitive, no duplicates); empty (the default) disables
+    microbatching. Each pipeline declares which axes it implements via
+    ``supported_microbatch_axes`` and rejects the rest at load time -- see there for the
+    axes a given pipeline honors. Example axes: ``"cfg"`` (split the CFG branches),
+    ``"requests"`` (split request chunks of ``microbatch_requests``).
+    """
+
+    microbatch_requests: int = 1
+    """Requests per microbatch -- applies only when the "requests" axis is enabled.
+
+    Trades batch efficiency (larger -> fewer, fatter forwards) against pipeline fill
+    (smaller -> more microbatches; 1 = max pipelining). Ignored otherwise.
+    """
 
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
@@ -229,6 +250,17 @@ class DiffusionParallelConfig:
         assert self.cfg_parallel_size in [1, 2, 3], (
             f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
         )
+        assert isinstance(self.microbatch_axes, list), (
+            "microbatch_axes must be a list of axes (e.g. [] or ['cfg', 'requests']), "
+            f"but got {type(self.microbatch_axes).__name__} {self.microbatch_axes!r}"
+        )
+        _valid_axes = get_args(MicrobatchAxis)
+        for _axis in self.microbatch_axes:
+            assert _axis in _valid_axes, f"microbatch_axes entries must each be one of {_valid_axes}, but got {_axis!r}"
+        assert len(set(self.microbatch_axes)) == len(self.microbatch_axes), (
+            f"microbatch_axes must not contain duplicate axes, but got {self.microbatch_axes!r}"
+        )
+        assert self.microbatch_requests >= 1, f"microbatch_requests must be >= 1, but got {self.microbatch_requests}"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "

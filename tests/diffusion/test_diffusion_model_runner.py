@@ -10,7 +10,10 @@ import torch
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_model_runner import (
+    DiffusionModelRunner,
+    validate_pp_step_execution,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 pytestmark = [pytest.mark.diffusion]
@@ -699,3 +702,53 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
             ),
         ),
     ], ERROR_MESSAGE
+
+
+class _PPGuardPipeline:
+    """Minimal pipeline carrying only the grouped-only PP contract flag."""
+
+    def __init__(self, requires_step_execution_for_pp):
+        self.requires_step_execution_for_pp = requires_step_execution_for_pp
+
+
+def _od_config(step_execution):
+    return SimpleNamespace(step_execution=step_execution, model_class_name="HunyuanImage3Pipeline")
+
+
+def test_validate_pp_step_execution_raises_for_grouped_only_pp_without_step_execution():
+    pipeline = _PPGuardPipeline(requires_step_execution_for_pp=True)
+    with pytest.raises(ValueError, match="step_execution=True"):
+        validate_pp_step_execution(pipeline, _od_config(step_execution=False), pp_world_size=2)
+
+
+def test_validate_pp_step_execution_allows_step_execution():
+    pipeline = _PPGuardPipeline(requires_step_execution_for_pp=True)
+    # step_execution=True satisfies the contract -> no raise.
+    validate_pp_step_execution(pipeline, _od_config(step_execution=True), pp_world_size=2)
+
+
+def test_validate_pp_step_execution_allows_single_pp_stage():
+    pipeline = _PPGuardPipeline(requires_step_execution_for_pp=True)
+    # pp_world_size == 1 -> guard is irrelevant -> no raise.
+    validate_pp_step_execution(pipeline, _od_config(step_execution=False), pp_world_size=1)
+
+
+def test_validate_pp_step_execution_ignores_pipelines_without_flag():
+    # A pipeline that wires PP into its monolithic path (flag False/absent) is unaffected.
+    validate_pp_step_execution(
+        _PPGuardPipeline(requires_step_execution_for_pp=False),
+        _od_config(step_execution=False),
+        pp_world_size=4,
+    )
+    validate_pp_step_execution(SimpleNamespace(), _od_config(step_execution=False), pp_world_size=4)
+
+
+def test_hunyuan_image3_pipeline_declares_grouped_only_pp_contract():
+    # HunyuanImage3 opts into the grouped-only PP contract via a duck-typed flag.
+    # (Pipelines that don't set it default to False through getattr in the guard,
+    # covered by test_validate_pp_step_execution_ignores_pipelines_without_flag.)
+    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
+        HunyuanImage3Pipeline,
+    )
+
+    assert HunyuanImage3Pipeline.requires_step_execution_for_pp is True
