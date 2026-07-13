@@ -116,7 +116,7 @@ class _RotaryEmbedding(CustomOp):
             self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward_npu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.cos_cached[position_ids], self.sin_cached[position_ids]
+        return self.cos_cached[position_ids].to(dtype=x.dtype), self.sin_cached[position_ids].to(dtype=x.dtype)
 
     def forward_cuda(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward_native(x, position_ids)

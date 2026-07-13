@@ -175,6 +175,8 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         k = torch_npu.npu_rotary_mul(k, cos, sin)
 
         real_tokens = int(bsz) * int(seq_len)
+        output_dtype = q.dtype
+
         # 310P flash attention consumes token-major fp16 inputs with 16-token
         # alignment; seq_lens carries the padding information.
         q_f = aligned_16(q.transpose(1, 2).reshape(real_tokens, self.num_heads, self.head_dim))
@@ -199,7 +201,7 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
             out=out,
         )
         attn_out = out[:real_tokens].reshape(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        return self.o_proj(attn_out.transpose(1, 2).reshape(bsz, seq_len, -1))
+        return self.o_proj(attn_out.to(output_dtype).transpose(1, 2).reshape(bsz, seq_len, -1))
 
 
 class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDecoderLayer):
@@ -255,6 +257,7 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
             self._attention_mask_310p = torch_npu.npu_format_cast(nd_to_nz_2d(mask), ACL_FORMAT_FRACTAL_NZ)
             self._attention_mask_310p_device = inputs_embeds.device
 
+        input_dtype = inputs_embeds.dtype
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
@@ -264,7 +267,7 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
                 attention_mask=self._attention_mask_310p,
             )
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        return hidden_states.to(input_dtype)
 
 
 class _Qwen3TTSTalkerCodePredictor310P(
@@ -337,8 +340,8 @@ class _Qwen3TTSTalkerCodePredictor310P(
         proj_buf[:padded_bsz].zero_()
         initial_embeds = torch.cat(
             (
-                last_talker_hidden,
-                layer0_embed,
+                last_talker_hidden.reshape(bsz, 1, -1),
+                layer0_embed.reshape(bsz, 1, -1),
             ),
             dim=1,
         )
@@ -374,7 +377,7 @@ class _Qwen3TTSTalkerCodePredictor310P(
             top_k_hint = None
 
         all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
-        all_codes[:, 0] = layer0_code[:, 0]
+        all_codes[:, 0] = layer0_code.reshape(bsz)
 
         for step in range(1, num_groups):
             graph_key: int | tuple[int, int] = padded_bsz
@@ -415,11 +418,13 @@ class _Qwen3TTSTalkerCodePredictor310P(
                     probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
                     code = random_sample(probs, npu_generators)
                 else:
-                    code = logits.argmax(dim=-1)
+                    code = logits.argmax(dim=-1, keepdim=True)
 
-            all_codes[:, step] = code
+            all_codes[:, step] = code.reshape(bsz)
             if step < num_groups - 1:
-                proj_buf[:bsz, step + 1, :].copy_(F.embedding(code, self._projected_codec_embed_weight[step - 1]))
+                proj_buf[:bsz, step + 1, :].copy_(
+                    F.embedding(code.reshape(-1), self._projected_codec_embed_weight[step - 1])
+                )
 
         return all_codes
 
