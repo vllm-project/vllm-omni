@@ -28,9 +28,9 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 [vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni is a framework that extends its support for omni-modality model inference and serving:
 
-- **Omni-modality**: Text, image, video, and audio data processing
+- **Omni-modality**: Text, image, audio, video, and action data processing
 - **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
-- **Heterogeneous outputs**: from traditional text generation to multimodal outputs
+- **Heterogeneous outputs**: from traditional text generation to multimodal and action outputs
 
 <p align="center">
   <picture>
@@ -55,8 +55,10 @@ vLLM-Omni is flexible and easy to use with:
 
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
-- Omni-modality models (e.g. Qwen2.5-Omni, Qwen3-Omni)
-- Multi-modality generation models (e.g. Qwen-Image)
+- Omni-modality models (e.g. Qwen3-Omni, Cosmos3, HunyuanImage, BAGEL)
+- TTS models (e.g. Qwen3-TTS, VoxCPM2, Ming-Omni-TTS, CosyVoice3)
+- Diffusion models — image, video, and audio generation (e.g. Qwen-Image, Wan2.2, FLUX)
+- Robot-policy and action models (e.g. GR00T-N1.7, DreamZero-DROID, InternVLA-A1, Cosmos3 action policy)
 
 For more information, checkout the following:
 

@@ -9,13 +9,8 @@ KV stack on CPU (block bookkeeping only, no GPU tensors).
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import KVCacheSpecKind, get_kv_cache_spec_kind
+from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import RequestStatus
-
-try:
-    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
-except ModuleNotFoundError:
-    KVCacheSpecRegistry = None
-    from vllm.v1.core.single_type_kv_cache_manager import spec_manager_map
 
 from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ARDiffusionKVCache,
@@ -53,10 +48,7 @@ def test_spec_registration_resolves_to_chunk_window_manager():
     # Without explicit registration the MRO walk would fall back to the parent
     # SlidingWindowManager; assert the subclass manager wins.
     spec = make_spec()
-    if KVCacheSpecRegistry is not None:
-        assert KVCacheSpecRegistry.get_manager_class(spec) is ChunkWindowManager
-    else:
-        assert spec_manager_map[type(spec)] is ChunkWindowManager
+    assert KVCacheSpecRegistry.get_manager_class(spec) is ChunkWindowManager
 
 
 def test_spec_kind_is_sliding_window():
