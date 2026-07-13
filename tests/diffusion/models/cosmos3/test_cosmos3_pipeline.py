@@ -20,6 +20,16 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def test_pipeline_declares_layerwise_offload_components() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    assert Cosmos3OmniDiffusersPipeline._dit_modules == ["transformer.language_model", "transformer"]
+    assert Cosmos3OmniDiffusersPipeline._encoder_modules == []
+    assert Cosmos3OmniDiffusersPipeline._vae_modules == ["vae"]
+    assert Cosmos3OmniDiffusersPipeline._resident_modules == []
+    assert hasattr(Cosmos3OmniDiffusersPipeline, "enable_omni_model_cpu_offload")
+
+
 class StubScheduler:
     def __init__(
         self,
