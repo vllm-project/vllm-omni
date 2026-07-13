@@ -72,9 +72,12 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```bash
     pytest -s -v -m "full_model and distributed_cuda and L4"  --run-level=full_model
     ```
-    Note: To run performance tests (defaults to ``test_qwen_omni.json``; use ``--test-config-file tests/dfx/perf/tests/test_tts.json`` for TTS):
+    Note: ``run_benchmark.py`` and ``run_diffusion_benchmark.py`` accept an optional ``--test-config-file``. If omitted, each loads every ``*.json`` under ``tests/dfx/perf/tests/`` and pytest ``-m`` filters by each case's ``mark``:
     ```bash
-    pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
+    pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "tts" --collect-only
+    pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "diffusion" --collect-only
+    pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
+      --test-config-file tests/dfx/perf/tests/test_tts.json
     ```
     The latest L4 (nightly) test commands use the `full_model` marker and `--run-level full_model` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml) and [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml)). Example:
 

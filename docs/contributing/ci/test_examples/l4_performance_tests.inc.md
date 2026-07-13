@@ -1,8 +1,12 @@
-When you want to add L4-level ***performance test*** cases, you can refer to the following format for case addition in `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, or diffusion configs such as `tests/dfx/perf/tests/test_*_vllm_omni.json` (selected via `pytest ... run_benchmark.py --test-config-file <path>`):
+When you want to add L4-level ***performance test*** cases, you can refer to the following format for case addition in `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, or diffusion configs such as `tests/dfx/perf/tests/test_*_vllm_omni.json` (selected via `pytest ... run_benchmark.py` / `run_diffusion_benchmark.py` with optional `--test-config-file`, or bulk-loaded from `tests/dfx/perf/tests/*.json` and filtered with `-m`):
 
 ```JSON
 {
     "test_name": "test_qwen3_omni",
+    "mark": {
+        "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2},
+        "marks": ["full_model", "omni"]
+    },
     "server_params": {
         "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         "stage_config_name": "qwen3_omni.yaml"
@@ -33,8 +37,49 @@ When you want to add L4-level ***performance test*** cases, you can refer to the
 | Field            | Required | Description                                                     |
 | ---------------- | -------- | --------------------------------------------------------------- |
 | test_name        | Yes      | Unique identifier for the test case                             |
+| mark             | No       | Pytest marks for this case (see **`mark` field** below)         |
 | server_params    | Yes      | Server-side configuration parameters                            |
 | benchmark_params | Yes      | Benchmark running parameters (supports multiple configurations) |
+
+**`mark` field**
+
+Optional top-level field on each perf JSON case. `run_benchmark.py` and `run_diffusion_benchmark.py` read it via `tests.dfx.conftest.resolve_pytest_marks` and attach the marks to the corresponding `pytest.param` for that run, so you can filter with `-m` (for example `-m "full_model and H100 and diffusion"`).
+
+Supported shapes:
+
+| Form | Example | Effect |
+| ---- | ------- | ------ |
+| Object | `"mark": {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}, "marks": ["full_model", "diffusion"]}` | `hardware_marks` via `hardware_marks(...)`; `marks` list becomes pytest marks |
+
+Recommended for L4 perf cases (matches CI selection tags):
+
+```JSON
+{
+    "test_name": "test_bagel_single_device_single_stage_t2i",
+    "mark": {
+        "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1},
+        "marks": ["full_model", "diffusion"]
+    },
+    "server_type": "vllm-omni",
+    "server_params": { "...": "..." },
+    "benchmark_params": [ { "...": "..." } ]
+}
+```
+
+HunyuanImage local-weight cases add `"local_model"` to `marks`.
+
+Benchmark result filenames include the hardware label from ``mark.hardware_marks.res`` (e.g. ``result_test_qwen3_omni_H100_random_...json`` for omni/tts; ``diffusion_result_test_bagel_vllm_omni_H100_<timestamp>.json`` for diffusion — one aggregate per source JSON, whether passed via ``--test-config-file`` or bulk-loaded).
+
+Filter locally / in CI:
+
+```bash
+pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and H100 and diffusion"
+pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json \
+  -m "full_model and H100 and diffusion"
+```
+
+See also [Markers for Tests](./tests_markers.md) for registered hardware markers (`H100`, `L4`, `cuda`, …).
 
 **`server_params` Configuration**
 

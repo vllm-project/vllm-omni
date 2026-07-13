@@ -708,13 +708,13 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 ### 3.2 Testing Content and Scope
 
 -   ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
--   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs in the form `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` via `--test-config-file`) to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
+-   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs in the form `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` or `run_diffusion_benchmark.py` via `--test-config-file`) to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization. Each JSON case may declare an optional top-level **`mark`** object with `hardware_marks` and a `marks` string list; the runners apply those marks to the parametrized run so CI / local pytest can filter with `-m` (for example `-m "full_model and H100 and diffusion"`). Details are in the Performance Tests example below.
 -   ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
 ### 3.3 Test Directory and Execution Files
 
 -   ***Functional Testing***: Same directories as L3.
--   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`)
+-   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`). Optional per-case `mark` for pytest selection is documented in Section 3.4 Performance Tests.
 -   ***Documentation Example Tests***:
 -   -   `tests/example/online_serving/test_{model_name}.py`
     -   `tests/example/offline_inference/test_{model_name}.py`
