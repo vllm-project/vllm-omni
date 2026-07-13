@@ -30,6 +30,7 @@ from torch import nn
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import DistributedAutoencoderKLLTX2Video
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -44,7 +45,6 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, spli
 
 from . import ltx2_3_guidance as guidance_ops
 from . import ltx2_3_latent_preparation as latent_prep
-from .ltx2_3_connector import install_ltx23_official_connector_processors
 from .ltx2_3_denoise_scheduling import LTX23SchedulerMixin
 from .ltx2_3_guidance_parallel import LTX23GuidanceParallelMixin
 from .ltx2_3_misc import (
@@ -58,8 +58,37 @@ from .ltx2_3_misc import (
     detect_vocoder_output_sample_rate as _detect_vocoder_output_sample_rate,
 )
 from .ltx2_3_recipes import LTX23PipelineRecipe
+from .ltx2_3_transformer import LTX2AudioVideoAttnProcessor
 
 logger = init_logger(__name__)
+
+
+def _install_connector_attention_backend(connectors: LTX2TextConnectors) -> None:
+    """Run Diffusers connector projections through the Omni attention stack."""
+    for connector_name in ("video_connector", "audio_connector"):
+        connector = getattr(connectors, connector_name, None)
+        if connector is None:
+            continue
+        for block_idx, block in enumerate(getattr(connector, "transformer_blocks", ())):
+            attn = getattr(block, "attn1", None)
+            if attn is None:
+                continue
+
+            attn.attn = Attention(
+                num_heads=attn.heads,
+                head_size=attn.head_dim,
+                num_kv_heads=attn.inner_kv_dim // attn.head_dim,
+                softmax_scale=attn.head_dim**-0.5,
+                causal=False,
+                prefix=f"connectors.{connector_name}.transformer_blocks.{block_idx}.attn1",
+                skip_sequence_parallel=True,
+                disable_kv_quant=True,
+            )
+            processor = LTX2AudioVideoAttnProcessor()
+            if hasattr(attn, "set_processor"):
+                attn.set_processor(processor)
+            else:
+                attn.processor = processor
 
 
 def _is_output_rank() -> bool:
@@ -271,7 +300,7 @@ class LTX23PipelineBase(
             local_files_only=local_files_only,
             torch_dtype=dtype,
         )
-        install_ltx23_official_connector_processors(self.connectors)
+        _install_connector_attention_backend(self.connectors)
 
         # --- VAE, Audio VAE ---
         self.vae = from_pretrained_with_prefetch(

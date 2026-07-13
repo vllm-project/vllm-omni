@@ -427,7 +427,7 @@ class LTX2AudioVideoAttnProcessor:
         encoder_hidden_states: torch.Tensor | None,
         is_self_attention: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if is_self_attention and attn.to_qkv is not None:
+        if is_self_attention and getattr(attn, "to_qkv", None) is not None:
             qkv, _ = attn.to_qkv(hidden_states)
             q_heads = getattr(attn, "query_num_heads", attn.heads)
             kv_heads = getattr(attn, "kv_num_heads", attn.heads)
@@ -457,7 +457,10 @@ class LTX2AudioVideoAttnProcessor:
         if rope is None:
             return None
         cos, sin = rope
-        tp_size = get_tensor_model_parallel_world_size()
+        try:
+            tp_size = get_tensor_model_parallel_world_size()
+        except AssertionError:
+            tp_size = 1
         if tp_size <= 1:
             return rope
         tp_rank = get_tensor_model_parallel_rank()
