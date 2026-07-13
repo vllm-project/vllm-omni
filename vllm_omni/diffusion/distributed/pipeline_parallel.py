@@ -17,6 +17,21 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 
 
+def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    """Normalize prediction to tuple form."""
+    return pred if isinstance(pred, tuple) else (pred,)
+
+
+def _unwrap(pred: tuple[torch.Tensor, ...]) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Unwrap single-element tuple to plain tensor; keep multi-element as tuple."""
+    return pred[0] if len(pred) == 1 else pred
+
+
+def _slice_pred(pred: tuple[torch.Tensor, ...], output_slice: int) -> tuple[torch.Tensor, ...]:
+    """Slice each element along dim 1."""
+    return tuple(p[:, :output_slice] for p in pred)
+
+
 class AsyncLatents:
     """Transparent async wrapper returned by scheduler_step on rank 0.
 
@@ -237,23 +252,26 @@ class PipelineParallelMixin:
         if cfg_parallel_ready:
             # All-gather the single-branch prediction across the CFG group and combine
             # on all CFG ranks so every last PP rank has an identical noise_pred.
-            local_pred = noise_preds[0]
+            local_pred = _wrap(noise_preds[0])
             if output_slice is not None:
-                local_pred = local_pred[:, :output_slice]
-            gathered = get_cfg_group().all_gather(local_pred, separate_tensors=True)
-            return self.combine_cfg_noise(gathered[0], gathered[1], true_cfg_scale, cfg_normalize)
+                local_pred = _slice_pred(local_pred, output_slice)
+            gathered = [get_cfg_group().all_gather(p, separate_tensors=True) for p in local_pred]
+            positive_noise_pred = tuple(g[0] for g in gathered)
+            negative_noise_pred = tuple(g[1] for g in gathered)
+            return self.combine_cfg_noise(positive_noise_pred, negative_noise_pred, true_cfg_scale, cfg_normalize)
 
         # Sequential CFG or no-CFG path.
         if do_true_cfg:
-            pos, neg = noise_preds[0], noise_preds[1]
+            pos = _wrap(noise_preds[0])
+            neg = _wrap(noise_preds[1])
             if output_slice is not None:
-                pos = pos[:, :output_slice]
-                neg = neg[:, :output_slice]
+                pos = _slice_pred(pos, output_slice)
+                neg = _slice_pred(neg, output_slice)
             return self.combine_cfg_noise(pos, neg, true_cfg_scale, cfg_normalize)
-        pred = noise_preds[0]
+        pred = _wrap(noise_preds[0])
         if output_slice is not None:
-            pred = pred[:, :output_slice]
-        return pred
+            pred = _slice_pred(pred, output_slice)
+        return _unwrap(pred)
 
     def scheduler_step_maybe_with_cfg(
         self,

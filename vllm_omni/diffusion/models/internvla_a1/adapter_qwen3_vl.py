@@ -15,10 +15,10 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
     Unpack,
     apply_rotary_pos_emb,
-    check_model_inputs,
+    capture_outputs,
     create_causal_mask,
-    deprecate_kwarg,
     eager_attention_forward,
+    merge_with_config_defaults,
 )
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalGeneration,
@@ -38,6 +38,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextRMSNorm as HFQwen3VLTextRMSNorm,
 )
+from transformers.utils.deprecation import deprecate_kwarg
 
 
 class Qwen3VLTextRMSNorm(HFQwen3VLTextRMSNorm):
@@ -134,7 +135,8 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
 
         self.post_init()
 
-    @check_model_inputs
+    @merge_with_config_defaults
+    @capture_outputs
     def forward(
         self,
         input_ids: torch.LongTensor = None,
