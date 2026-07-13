@@ -3,8 +3,17 @@
 
 import pytest
 from vllm.config import CompilationConfig, CompilationMode, DeviceConfig, VllmConfig
+from vllm.platforms import current_platform
 
-from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+# Importing CudaOmniPlatform pulls in vllm.platforms.cuda, which imports the
+# CUDA-only ``vllm._C_stable_libtorch`` extension at module top level. That
+# extension is absent on non-CUDA builds (e.g. XPU), so skip the whole module
+# there before the import can crash collection. ``is_cuda()`` resolves the
+# platform without importing cuda.py.
+if not current_platform.is_cuda():
+    pytest.skip("CUDA-only IR op priority tests", allow_module_level=True)
+
+from vllm_omni.platforms.cuda.platform import CudaOmniPlatform  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
