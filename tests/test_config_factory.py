@@ -19,6 +19,7 @@ from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCap
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
+    _DEPLOY_DIR,
     DeployConfig,
     PipelineConfig,
     StageConfig,
@@ -548,7 +549,7 @@ class TestPipelineDiscovery:
         )
         assert isinstance(pipeline, PipelineConfig)
         assert pipeline.model_type == "qwen3_omni_moe"
-        assert pipeline.default_deploy_config_path == "qwen3_omni_moe.yaml"
+        assert pipeline.default_deploy_config_name == "qwen3_omni_moe.yaml"
         assert len(pipeline.stages) == 3  # thinker + talker + code2wav
 
     def test_registry_resolver_qwen3_omni_thinker_only(self):
@@ -559,7 +560,7 @@ class TestPipelineDiscovery:
         )
         assert isinstance(pipeline, PipelineConfig)
         assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
-        assert pipeline.default_deploy_config_path is None
+        assert pipeline.default_deploy_config_name is None
         assert len(pipeline.stages) == 1  # thinker only
 
     @pytest.mark.parametrize(
@@ -568,9 +569,9 @@ class TestPipelineDiscovery:
         ids=lambda pipeline: pipeline.model_type,
     )
     def test_registered_default_deploy_config_exists(self, pipeline):
-        if pipeline.default_deploy_config_path is None:
+        if pipeline.default_deploy_config_name is None:
             return
-        assert Path(get_deploy_config_path(pipeline.default_deploy_config_path)).is_file()
+        assert Path(get_deploy_config_path(pipeline.default_deploy_config_name)).is_file()
 
     def test_registry_returns_none_for_unknown(self):
         """Unknown model_types aren't found and resolve to `None`."""
@@ -1015,6 +1016,23 @@ class TestPipelineRegistration:
             )
 
         mock_load.assert_called_once_with(deploy_path)
+
+    def test_legacy_default_deploy_name_ignores_cwd(self, monkeypatch, tmp_path):
+        default_name = "pipeline_default.yaml"
+        (tmp_path / default_name).write_text("stages: []\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        pipeline = PipelineConfig(
+            model_type="pipeline_with_default",
+            default_deploy_config_name=default_name,
+        )
+
+        with patch(
+            "vllm_omni.config.config_factory.load_deploy_config",
+            return_value=DeployConfig(),
+        ) as mock_load:
+            StageConfigFactory._create_legacy_from_registry(pipeline, {})
+
+        mock_load.assert_called_once_with(_DEPLOY_DIR / default_name)
 
     def test_deploy_override_uses_correct_endpoint_restrictions(self, clean_pipeline_registry, tmp_path):
         """Ensure endpoint restrictions must come from the final pipeline

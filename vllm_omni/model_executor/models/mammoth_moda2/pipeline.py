@@ -18,7 +18,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.mammoth_moda2"
 
 MAMMOTH_MODA2_PIPELINE = PipelineConfig(
     model_type="mammoth_moda2",
-    default_deploy_config_path="mammoth_moda2.yaml",
+    default_deploy_config_name="mammoth_moda2.yaml",
     model_arch="MammothModa2ForConditionalGeneration",
     hf_architectures=("Mammothmoda2Model", "MammothModa2ForConditionalGeneration"),
     stages=(
@@ -50,7 +50,7 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
 # Single-stage AR variant for understanding / summarization tasks
 MAMMOTH_MODA2_AR_PIPELINE = PipelineConfig(
     model_type="mammoth_moda2_ar",
-    default_deploy_config_path="mammoth_moda2_ar.yaml",
+    default_deploy_config_name="mammoth_moda2_ar.yaml",
     model_arch="MammothModa2ForConditionalGeneration",
     stages=(
         StagePipelineConfig(

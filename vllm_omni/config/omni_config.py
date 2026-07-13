@@ -238,14 +238,17 @@ def _get_deploy_config(
         loaded_path = str(_resolve_deploy_path(deploy_config_path)) if deploy_config_path is not None else None
         return copy.deepcopy(user_deploy_config), loaded_path
 
-    config_path = deploy_config_path or pipeline_cfg.default_deploy_config_path
-    if config_path is None:
-        return DeployConfig(), None
+    if deploy_config_path is not None:
+        resolved_path = _resolve_deploy_path(deploy_config_path)
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"Deploy config not found: {resolved_path}")
+        return load_deploy_config(resolved_path), str(resolved_path)
 
-    resolved_path = _resolve_deploy_path(config_path)
-    if not resolved_path.exists():
-        raise FileNotFoundError(f"Deploy config not found: {resolved_path}")
-    return load_deploy_config(resolved_path), str(resolved_path)
+    if pipeline_cfg.default_deploy_config_name is not None:
+        default_path = _DEPLOY_DIR / pipeline_cfg.default_deploy_config_name
+        return load_deploy_config(default_path), str(default_path)
+
+    return DeployConfig(), None
 
 
 @config

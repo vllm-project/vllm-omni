@@ -56,8 +56,8 @@ def _stable_test_platform(monkeypatch):
 
 
 def _load_default_deploy(pipeline: PipelineConfig) -> DeployConfig:
-    if pipeline.default_deploy_config_path is not None:
-        return load_deploy_config(_DEPLOY_DIR / pipeline.default_deploy_config_path)
+    if pipeline.default_deploy_config_name is not None:
+        return load_deploy_config(_DEPLOY_DIR / pipeline.default_deploy_config_name)
     return DeployConfig()
 
 
@@ -659,6 +659,28 @@ def test_from_pipeline_config_prefers_loaded_user_deploy_config(monkeypatch):
     )
 
     assert omni_config.stage_by_id(0).scheduler_config.max_num_seqs == 7
+
+
+def test_from_pipeline_config_default_deploy_name_ignores_cwd(monkeypatch, tmp_path):
+    default_name = "pipeline_default.yaml"
+    (tmp_path / default_name).write_text("stages: []\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    pipeline = PipelineConfig(
+        model_type="pipeline_with_default",
+        default_deploy_config_name=default_name,
+    )
+    loaded_paths = []
+
+    def _load_deploy_config(path):
+        loaded_paths.append(Path(path))
+        return DeployConfig()
+
+    monkeypatch.setattr(omni_config_module, "load_deploy_config", _load_deploy_config)
+
+    omni_config = VllmOmniConfig.from_pipeline_config(pipeline)
+
+    assert omni_config.orchestrator_config.deploy_config_path == str(_DEPLOY_DIR / default_name)
+    assert loaded_paths == [_DEPLOY_DIR / default_name]
 
 
 def test_from_pipeline_config_uses_resolved_deploy_pipeline():

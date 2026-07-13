@@ -378,15 +378,13 @@ class StageConfigFactory:
         """
         if user_deploy_config is not None:
             deploy_cfg = user_deploy_config
+        elif deploy_config_path is not None:
+            deploy_cfg = cls._load_user_deploy_config(deploy_config_path)
+            assert deploy_cfg is not None
+        elif pipeline_cfg.default_deploy_config_name is not None:
+            deploy_cfg = load_deploy_config(_DEPLOY_DIR / pipeline_cfg.default_deploy_config_name)
         else:
-            config_path = deploy_config_path or pipeline_cfg.default_deploy_config_path
-            if config_path is None:
-                deploy_cfg = DeployConfig()
-            else:
-                resolved_path = Path(config_path)
-                if not resolved_path.exists() and resolved_path.parent == Path("."):
-                    resolved_path = _DEPLOY_DIR / resolved_path
-                deploy_cfg = load_deploy_config(resolved_path)
+            deploy_cfg = DeployConfig()
 
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:

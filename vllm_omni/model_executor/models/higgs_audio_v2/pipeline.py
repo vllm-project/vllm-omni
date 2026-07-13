@@ -12,7 +12,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.higgs_audio_v2"
 
 HIGGS_AUDIO_V2_PIPELINE = PipelineConfig(
     model_type="higgs_audio_v2",
-    default_deploy_config_path="higgs_audio_v2.yaml",
+    default_deploy_config_name="higgs_audio_v2.yaml",
     model_arch="HiggsAudioV2ForConditionalGeneration",
     hf_architectures=("HiggsAudioV2ForConditionalGeneration",),
     stages=(
