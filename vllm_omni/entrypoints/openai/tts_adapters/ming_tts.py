@@ -90,13 +90,6 @@ class MingTTSAdapter(ARTTSAdapter):
         if request.ref_audio is not None and request.ref_text is not None and not request.ref_text.strip():
             return "'ref_text' must be non-empty when provided with 'ref_audio'"
 
-        # Ming offline ref-audio cases use prompt_waveform without prompt_text;
-        # keep the transcript requirement for other TTS models.
-        if request.ref_audio is not None and request.speaker_embedding is None:
-            uploaded_ref_text = server.uploaded_speakers[voice_lower].get("ref_text") if uploaded_voice else None
-            if not (request.ref_text and request.ref_text.strip()) and not uploaded_ref_text:
-                return "Reference-audio cloning requires non-empty 'ref_text'"
-
         if request.ref_text is not None and request.ref_audio is None and not uploaded_voice:
             return "'ref_text' requires 'ref_audio' or an uploaded voice sample"
 
