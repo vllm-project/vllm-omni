@@ -6,6 +6,19 @@ from torch import nn
 from x_transformers.x_transformers import apply_rotary_pos_emb
 
 
+def _apply_rope_cached(t, cos, sin):
+    """Bit-exact RoPE for ``scale==1`` / interleaved-half.
+    Uses precomputed ``cos``/``sin`` per seq_len to skip per-step trig and cat."""
+    rot_dim = cos.shape[-1]
+    tr = t[..., :rot_dim]
+    x = tr.reshape(*tr.shape[:-1], -1, 2)
+    rot_half = torch.stack((-x[..., 1], x[..., 0]), dim=-1).reshape_as(tr)
+    out = tr * cos + rot_half * sin
+    if rot_dim < t.shape[-1]:  # partial rotary (unused by ming heads); keep general
+        out = torch.cat((out, t[..., rot_dim:]), dim=-1)
+    return out.type(t.dtype)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -66,12 +79,33 @@ class Attention(nn.Module):
         self.to_out.append(nn.Dropout(dropout))
         self.pe_attn_head = pe_attn_head
         self.attn_mask_enabled = attn_mask_enabled
+        # cos/sin cache keyed by seq_len (freqs are deterministic in seq_len).
+        self._rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # TODO: materialize fused weights eagerly outside any torch.compile
+        # scope (e.g. post-weight-load);
+        self._qkv_w: torch.Tensor | None = None
+        self._qkv_b: torch.Tensor | None = None
+
+    def _qkv(self, x):
+        if self._qkv_w is None:
+            self._qkv_w = torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight], dim=0)
+            if self.to_q.bias is not None:
+                self._qkv_b = torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias], dim=0)
+        qkv = F.linear(x, self._qkv_w, self._qkv_b)
+        return qkv.split(self.inner_dim, dim=-1)
+
+    def _rope_cos_sin(self, freqs):
+        seq_len = freqs.shape[-2]
+        cached = self._rope_cache.get(seq_len)
+        if cached is None:
+            f = freqs.unsqueeze(1) if freqs.ndim == 3 else freqs  # b n d -> b 1 n d for 4D q/k
+            cached = (f.cos(), f.sin())
+            self._rope_cache[seq_len] = cached
+        return cached
 
     def forward(self, x, mask=None, rope=None):
         batch_size = x.shape[0]
-        query = self.to_q(x)
-        key = self.to_k(x)
-        value = self.to_v(x)
+        query, key, value = self._qkv(x)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // self.heads
@@ -86,14 +120,21 @@ class Attention(nn.Module):
 
         if rope is not None:
             freqs, xpos_scale = rope
-            q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
-            if self.pe_attn_head is not None:
-                on = self.pe_attn_head
-                query[:, :on, :, :] = apply_rotary_pos_emb(query[:, :on, :, :], freqs, q_xpos_scale)
-                key[:, :on, :, :] = apply_rotary_pos_emb(key[:, :on, :, :], freqs, k_xpos_scale)
+            scale_is_one = xpos_scale is None or (not torch.is_tensor(xpos_scale) and xpos_scale == 1.0)
+            if scale_is_one and self.pe_attn_head is None:
+                # Fast path: cached, cat-free RoPE (bit-exact for scale==1, full rotary).
+                cos, sin = self._rope_cos_sin(freqs)
+                query = _apply_rope_cached(query, cos, sin)
+                key = _apply_rope_cached(key, cos, sin)
             else:
-                query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
-                key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+                q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+                if self.pe_attn_head is not None:
+                    on = self.pe_attn_head
+                    query[:, :on, :, :] = apply_rotary_pos_emb(query[:, :on, :, :], freqs, q_xpos_scale)
+                    key[:, :on, :, :] = apply_rotary_pos_emb(key[:, :on, :, :], freqs, k_xpos_scale)
+                else:
+                    query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
+                    key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
         if self.attn_mask_enabled and mask is not None:
             valid_sample_indices = mask.any(dim=1)
