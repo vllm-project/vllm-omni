@@ -198,29 +198,9 @@ def _requested_audio_duration(
     return num_frames / save_fps + (num_segments - 1) * (num_frames - num_cond_frames) / save_fps
 
 
-def _asset_root() -> Path | None:
-    raw = os.environ.get("LONGCAT_VIDEO_ASSET_ROOT")
-    if raw and Path(raw).exists():
-        return Path(raw)
-    return None
-
-
 def _load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def _resolve_path(path: str | os.PathLike[str] | None, *, asset_root: Path | None) -> str | None:
-    if path is None:
-        return None
-    resolved = Path(path)
-    if resolved.is_absolute():
-        return str(resolved)
-    if asset_root is not None:
-        candidate = asset_root / resolved
-        if candidate.exists():
-            return str(candidate)
-    return str(resolved)
 
 
 def _infer_asset_root_from_path(path: Path | None) -> Path | None:
@@ -229,7 +209,7 @@ def _infer_asset_root_from_path(path: Path | None) -> Path | None:
     resolved = path.resolve() if path.exists() else path
     parts = resolved.parts
     if "assets" not in parts:
-        return None
+        return resolved.parent
     asset_idx = parts.index("assets")
     if asset_idx == 0:
         return None
@@ -428,7 +408,7 @@ def prepare_longcat_video_avatar_model_for_omni(model: str, use_int8: bool = Tru
     return str(model_dir)
 
 
-def _load_image(raw_image: Any, *, asset_root: Path | None) -> Image.Image:
+def _load_image(raw_image: Any) -> Image.Image:
     if isinstance(raw_image, list):
         if not raw_image:
             raise ValueError("LongCat-Video-Avatar received an empty image list.")
@@ -448,10 +428,7 @@ def _load_image(raw_image: Any, *, asset_root: Path | None) -> Image.Image:
             array = (np.clip(array, 0.0, 1.0) * 255).round().astype("uint8")
         return Image.fromarray(array).convert("RGB")
     if isinstance(raw_image, str | os.PathLike):
-        image_path = _resolve_path(raw_image, asset_root=asset_root)
-        if image_path is None:
-            raise ValueError("LongCat-Video-Avatar image path resolved to None.")
-        return Image.open(image_path).convert("RGB")
+        return Image.open(raw_image).convert("RGB")
     raise TypeError(
         f"Unsupported LongCat-Video-Avatar image input type {type(raw_image)}. "
         "Pass a PIL image, numpy array, torch tensor, or file path."
@@ -555,7 +532,6 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             od_config.model,
             allow_patterns=_avatar_model_allow_patterns(self.use_int8),
         )
-        self.asset_root = _asset_root()
         self.save_fps = 25
         self.audio_stride = 1
         self.default_num_frames = 93
@@ -876,12 +852,6 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             latents[:, :, :num_cond_latents] = cond_latents
         return latents
 
-    def _default_input_json(self) -> dict[str, Any]:
-        if self.asset_root is None:
-            return {}
-        default_json = self.asset_root / "assets/avatar/single_example_1.json"
-        return _load_json(default_json) if default_json.exists() else {}
-
     def _resolve_request_inputs(self, req: OmniDiffusionRequest) -> dict[str, Any]:
         first_prompt = req.prompts[0] if req.prompts else {"prompt": ""}
         if isinstance(first_prompt, str):
@@ -899,12 +869,12 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         input_json = extra.get("input_json") or info.get("input_json")
         input_asset_root = None
         if input_json:
-            input_json_path = Path(_resolve_path(input_json, asset_root=self.asset_root))
+            input_json_path = Path(input_json).expanduser()
             sample = _load_json(input_json_path)
             input_asset_root = _infer_asset_root_from_path(input_json_path)
         else:
-            sample = self._default_input_json()
-        asset_roots = tuple(root for root in (input_asset_root, self.asset_root) if root is not None)
+            sample = {}
+        asset_roots = (input_asset_root,) if input_asset_root is not None else ()
         prompt = prompt_text or sample.get("prompt") or ""
         negative_prompt = negative_prompt or extra.get("negative_prompt") or _DEFAULT_NEGATIVE_PROMPT
 
@@ -1830,7 +1800,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                     "LongCat-Video-Avatar multi-speaker generation requires AI2V "
                     "because speaker bounding boxes and masks are defined on a reference image."
                 )
-            image = _load_image(inputs["image"], asset_root=self.asset_root)
+            image = _load_image(inputs["image"])
             ref_target_masks, include_background_silent_audio = _build_multi_speaker_ref_target_masks(
                 image,
                 inputs["bbox"],
@@ -1878,7 +1848,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             if num_segments > 1:
                 output, latent = output
         else:
-            image = image or _load_image(inputs["image"], asset_root=self.asset_root)
+            image = image or _load_image(inputs["image"])
             output, latent, height, width = self._generate_ai2v(
                 image=image,
                 prompt=inputs["prompt"],

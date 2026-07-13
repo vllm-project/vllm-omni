@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Generator
 
 import numpy as np
@@ -16,7 +15,7 @@ from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar impo
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-BASE_MODEL_DIR = os.environ.get("LONGCAT_AVATAR_TEST_BASE_MODEL_DIR")
+MODEL = "meituan-longcat/LongCat-Video-Avatar-1.5"
 PROMPT = "A person speaks calmly while facing the camera."
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 
@@ -79,28 +78,21 @@ def _sampling(
     )
 
 
-def _omni_runner_kwargs() -> dict:
-    additional_config = {
-        "model_type": "avatar-v1.5",
-        "resolution": "480p",
-        "use_distill": True,
-        "use_int8": True,
-    }
-    if BASE_MODEL_DIR:
-        additional_config["base_model_dir"] = BASE_MODEL_DIR
-    return {
-        "model_class_name": "LongCatVideoAvatarPipeline",
-        "additional_config": additional_config,
-    }
-
-
 @pytest.fixture(scope="module")
 def longcat_omni_runner() -> Generator[OmniRunner, None, None]:
-    model = prepare_longcat_video_avatar_model_for_omni(
-        os.environ.get("LONGCAT_AVATAR_TEST_MODEL", "meituan-longcat/LongCat-Video-Avatar-1.5"),
-        use_int8=True,
-    )
-    with OmniRunner(model, seed=42, stage_configs_path=None, **_omni_runner_kwargs()) as runner:
+    model = prepare_longcat_video_avatar_model_for_omni(MODEL, use_int8=True)
+    with OmniRunner(
+        model,
+        seed=42,
+        stage_configs_path=None,
+        model_class_name="LongCatVideoAvatarPipeline",
+        additional_config={
+            "model_type": "avatar-v1.5",
+            "resolution": "480p",
+            "use_distill": True,
+            "use_int8": True,
+        },
+    ) as runner:
         yield runner
 
 

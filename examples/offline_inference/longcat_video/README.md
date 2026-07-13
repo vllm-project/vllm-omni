@@ -27,6 +27,8 @@ python end2end.py \
   --stage at2v \
   --audio /path/to/speech.wav \
   --prompt "A person speaks calmly while facing the camera." \
+  --num-frames 93 \
+  --num-inference-steps 8 \
   --output longcat_avatar_at2v.mp4
 ```
 
@@ -39,8 +41,30 @@ python end2end.py \
   --audio /path/to/speech.wav \
   --image /path/to/reference.jpg \
   --prompt "A person speaks calmly while facing the camera." \
+  --num-frames 93 \
+  --num-inference-steps 8 \
   --output longcat_avatar_ai2v.mp4
 ```
+
+## Sampling Parameters
+
+`end2end.py` maps its generation settings to
+`OmniDiffusionSamplingParams` as follows:
+
+| Parameter | LongCat pipeline value | Description |
+| --- | --- | --- |
+| `sampling_params.num_frames` / `--num-frames` | `num_frames` | Number of frames generated per segment. The default is 93 frames, or about 3.72 seconds at 25 FPS. LongCat normalizes other values to the temporal-VAE-compatible `4k+1` form. |
+| `sampling_params.guidance_scale` | `text_guidance_scale` | Classifier-free guidance applied to the text prompt. Higher values strengthen prompt conditioning. |
+| `sampling_params.guidance_scale_2` | `audio_guidance_scale` | Classifier-free guidance applied to the speech audio. Higher values strengthen audio conditioning. |
+| `sampling_params.num_inference_steps` / `--num-inference-steps` | `steps` | Number of denoising steps. The distilled Avatar path uses 8 steps. |
+| `sampling_params.fps` / `--fps` | `save_fps` | Output frame rate and the rate used to align audio embeddings with video frames. The default is 25 FPS. |
+
+With distilled LoRA enabled (the default), the pipeline uses 8 inference steps
+and sets both guidance scales to `1.0`. With `--no-use-distill`, this example
+sets both guidance scales to `4.0`. For AVC continuation, each segment contains
+`num_frames` frames, but every segment after the first reuses
+`num_cond_frames` conditioning frames. The final unique frame count is
+`num_frames + (num_segments - 1) * (num_frames - num_cond_frames)`.
 
 ## Official Example Assets
 
@@ -252,15 +276,19 @@ python end2end.py \
 - `--build-components-on-gpu`: build large Avatar components directly on GPU for faster startup. This requires more peak VRAM and is disabled by default.
 - `--base-model-dir`: optional local LongCat-Video base model directory for tokenizer, text encoder, and VAE components. Omit it to download the base components from Hugging Face.
 
-> By default, this example builds large Avatar components on CPU before moving
-> them to GPU to reduce model-loading peak VRAM. Observed on Modal H100 with
-> the official 93-frame AI2V example, `use_int8=True`, `use_distill=True`, and
-> 8 inference steps: GPU component build used about 56.8 GiB peak VRAM and
-> loaded in about 33s, while CPU component build used about 41.0 GiB peak VRAM
-> and loaded in about 130s. Denoising still runs on GPU after loading.
->
-> These numbers are intended as memory guidance rather than a benchmark. Use
-> `--build-components-on-gpu` only if startup speed is more important and your
-> GPU has enough memory.
+## Peak GPU Memory
+
+The following LongCat-Video-Avatar-1.5 measurements were observed on a Modal
+H100 while running the official 93-frame AI2V example with the INT8 DiT,
+distilled LoRA, and 8 inference steps:
+
+| Component build | CLI option | Peak GPU memory | Model loading time |
+| --- | --- | ---: | ---: |
+| CPU (default) | None | About 41.0 GiB | About 130s |
+| GPU | `--build-components-on-gpu` | About 56.8 GiB | About 33s |
+
+The reported peak covers the end-to-end example run. CPU component build only
+reduces initialization memory; denoising still runs on GPU. These measurements
+are memory guidance rather than a performance benchmark.
 
 The script saves an mp4 file with the generated frames muxed with the input audio.

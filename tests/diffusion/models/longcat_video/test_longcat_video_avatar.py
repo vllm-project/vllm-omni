@@ -19,6 +19,7 @@ from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar impo
     _avatar_model_allow_patterns,
     _build_multi_speaker_ref_target_masks,
     _default_at2v_shape,
+    _infer_asset_root_from_path,
     _prepare_multi_speaker_audio_arrays,
     _resolve_num_segments,
     prepare_longcat_video_avatar_model_for_omni,
@@ -79,6 +80,21 @@ def test_longcat_video_avatar_prepare_model_adds_omni_metadata(tmp_path):
     assert model_index["_diffusers_version"] == "0.38.0"
     transformer_config = json.loads((model_dir / "transformer" / "config.json").read_text(encoding="utf-8"))
     assert transformer_config == {"model_type": "longcat_avatar"}
+
+
+def test_longcat_video_avatar_infers_repo_root_from_official_asset_path(tmp_path):
+    input_json = tmp_path / "assets" / "avatar" / "single_example_1.json"
+    input_json.parent.mkdir(parents=True)
+    input_json.write_text("{}", encoding="utf-8")
+
+    assert _infer_asset_root_from_path(input_json) == tmp_path
+
+
+def test_longcat_video_avatar_falls_back_to_json_parent_without_official_layout(tmp_path):
+    input_json = tmp_path / "single_example_1.json"
+    input_json.write_text("{}", encoding="utf-8")
+
+    assert _infer_asset_root_from_path(input_json) == tmp_path
 
 
 @pytest.mark.parametrize(
