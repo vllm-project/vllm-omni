@@ -103,7 +103,7 @@ minicpmo = [
 # LongCat-Video-Avatar A2V/AI2V runtime dependencies for vocal
 # separation and loudness normalization.
 longcat-video-avatar = [
-    "audio-separator==0.30.2",
+    "audio-separator==0.44.2",
     "pyloudnorm==0.1.1",
 ]
 
