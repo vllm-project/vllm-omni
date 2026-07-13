@@ -91,9 +91,8 @@ pip install step-audio2
 
 ## Model Setup
 
-Step-Audio2 ships a custom Transformers configuration. Pass
-`--trust-remote-code` after reviewing the model repository when running the
-offline example.
+Step-Audio2 ships a custom Transformers configuration, so this model-specific
+example enables remote code loading when it initializes the model.
 
 ### Option 1: Auto-download from HuggingFace (Recommended)
 

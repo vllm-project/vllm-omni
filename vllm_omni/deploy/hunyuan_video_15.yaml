@@ -1,6 +1,6 @@
-# Wan2.2 TI2V-5B DiT deploy for ModelOpt FP8 checkpoints.
+# HunyuanVideo-1.5 deploy.
 #
-# Single GPU by default. Increase tensor_parallel_size and devices for A14B MoE variants.
+# Single GPU by default. Increase tensor_parallel_size and devices for multi-GPU TP.
 async_chunk: false
 trust_remote_code: true
 distributed_executor_backend: mp
@@ -11,7 +11,8 @@ stages:
     max_num_seqs: 1
     tensor_parallel_size: 1
     enforce_eager: true
-    # Keep VAE tiling on by default for higher resolutions / longer clips.
+    # HunyuanVideo-1.5 peak VRAM is dominated by the single-shot VAE decode of
+    # the full video, so tiling the decode is the main memory lever.
     vae_use_tiling: true
     default_sampling_params:
       seed: 42

@@ -805,9 +805,9 @@ stages:
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
             ("step_audio_2_asr.yaml", "step_audio_2_asr", 1, "text", "step_audio_2_asr"),
-            ("step_audio_2_async_chunk.yaml", "step_audio_2_async_chunk", 2, "audio", "step_audio_2_async_chunk"),
-            ("hunyuan_video_15_dit_fp8.yaml", "hunyuan_video_15_dit_fp8", 1, "video", None),
-            ("wan2_2_ti2v_dit_fp8.yaml", "wan2_2_ti2v_dit_fp8", 1, "video", None),
+            ("step_audio_2_async_chunk.yaml", "step_audio_2", 2, "audio", None),
+            ("hunyuan_video_15.yaml", "hunyuan_video_15", 1, "video", None),
+            ("wan2_2_ti2v.yaml", "wan2_2_ti2v", 1, "video", None),
         ],
     )
     def test_load_new_registry_backed_deploy_configs(
@@ -834,9 +834,9 @@ stages:
     @pytest.mark.parametrize(
         ("config_json", "model_index", "expected_pipeline"),
         [
-            ({"model_type": "step_audio_2"}, None, "step_audio2"),
-            (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15_dit_fp8"),
-            (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v_dit_fp8"),
+            ({"model_type": "step_audio_2"}, None, "step_audio_2"),
+            (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15"),
+            (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v"),
         ],
     )
     def test_migrated_models_are_discovered_without_explicit_deploy(
@@ -872,6 +872,22 @@ stages:
         assert deploy.stages[0].devices == "0,1"
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[1].devices == "1"
+
+    def test_step_audio2_dispatches_sync_and_async_chunk_processors(self):
+        pipeline = StageConfigFactory.resolve_pipeline_config("step_audio_2")
+        assert isinstance(pipeline, PipelineConfig)
+
+        sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
+        assert "custom_process_next_stage_input_func" not in sync_stages[0].yaml_engine_args
+        assert sync_stages[1].custom_process_input_func.endswith("thinker2token2wav")
+
+        async_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+        assert (
+            async_stages[0]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("thinker2token2wav_async_chunk")
+        )
+        assert async_stages[1].custom_process_input_func is None
 
     def test_no_bundled_legacy_stage_config_yamls(self):
         stage_config_dir = Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "stage_configs"

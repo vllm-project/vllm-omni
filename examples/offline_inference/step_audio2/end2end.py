@@ -261,7 +261,7 @@ def main(args):
         "shm_threshold_bytes": args.shm_threshold_bytes,
         "worker_backend": args.worker_backend,
         "ray_address": args.ray_address,
-        "trust_remote_code": args.trust_remote_code,
+        "trust_remote_code": True,
     }
     if stage_config_path is not None:
         omni_kwargs["stage_configs_path"] = stage_config_path
@@ -431,12 +431,6 @@ def parse_args():
         default=None,
         help="Path to a deploy config YAML file (default: use bundled Step-Audio2 deploy config)",
     )
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Allow loading the custom Transformers configuration shipped with the model",
-    )
-
     # Query configuration
     parser.add_argument(
         "--query-type",

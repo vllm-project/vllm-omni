@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Wan2.2 pipeline topologies used by deploy configs."""
+"""Wan2.2 TI2V pipeline topology."""
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -8,8 +8,8 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-WAN2_2_TI2V_DIT_FP8_PIPELINE = PipelineConfig(
-    model_type="wan2_2_ti2v_dit_fp8",
+WAN2_2_TI2V_PIPELINE = PipelineConfig(
+    model_type="wan2_2_ti2v",
     model_arch="WanPipeline",
     diffusers_class_name="WanPipeline",
     stages=(

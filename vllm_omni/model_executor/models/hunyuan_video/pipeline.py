@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HunyuanVideo pipeline topologies used by deploy configs."""
+"""HunyuanVideo-1.5 pipeline topology."""
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -8,8 +8,8 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-HUNYUAN_VIDEO_15_DIT_FP8_PIPELINE = PipelineConfig(
-    model_type="hunyuan_video_15_dit_fp8",
+HUNYUAN_VIDEO_15_PIPELINE = PipelineConfig(
+    model_type="hunyuan_video_15",
     model_arch="HunyuanVideo15Pipeline",
     diffusers_class_name="HunyuanVideo15Pipeline",
     stages=(
