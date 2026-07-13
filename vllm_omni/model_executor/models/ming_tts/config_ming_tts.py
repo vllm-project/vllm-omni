@@ -22,6 +22,7 @@ from .constants import (
     DEFAULT_SIGMA,
     DEFAULT_TEMPERATURE,
     HISTORY_PATCH_SIZE,
+    INITIAL_LATENT_CHUNK_SIZE,
     KEY_CFG,
     KEY_CHUNK_ID,
     KEY_DECODE_STEP,
@@ -239,6 +240,7 @@ class MingTTSConfig:
     max_decode_steps: int = MAX_DECODE_STEPS
 
     latent_chunk_size: int = LATENT_CHUNK_SIZE
+    initial_latent_chunk_size: int = INITIAL_LATENT_CHUNK_SIZE
     latent_left_context: int = LATENT_LEFT_CONTEXT
 
     text_eos_token_id: int = TEXT_EOS_TOKEN_ID

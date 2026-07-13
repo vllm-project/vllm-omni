@@ -392,16 +392,77 @@ class DiffusersPipelineLoader:
 
         return model.eval()
 
+    @staticmethod
+    def _has_online_quant(model: nn.Module) -> bool:
+        """Whether any layer uses an online-quant method that defers weight
+        materialization onto the ``meta`` device (upstream vLLM
+        ``uses_meta_device=True``, e.g. online FP8)."""
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if getattr(quant_method, "uses_meta_device", False):
+                return True
+        return False
+
     def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
         """Process weights after loading for quantization methods.
 
         This handles vLLM's quantization methods that need to process weights
         after loading (e.g., FP8 online quantization from BF16/FP16 weights).
         """
+        # Newer upstream vLLM online-quant methods (uses_meta_device=True) create
+        # weights on the ``meta`` device and materialize them just-in-time as each
+        # layer's weights finish loading (via the layerwise online-process loader).
+        # Any "straggler" layers whose weights were not fully materialized during
+        # load (padded / partially-loaded layers) remain on ``meta``. Upstream's
+        # base_loader calls finalize_layerwise_processing() to materialize them;
+        # the diffusion loader must mirror that, otherwise the module.to() below
+        # raises "Cannot copy out of meta tensor; no data!". This whole meta-device
+        # handling is gated on online quant actually being in use, so that the
+        # proven code path for everything else (in particular FSDP/HSDP-sharded
+        # params, whose per-parameter .data cannot be cross-device reassigned) is
+        # left untouched. Import lazily so older vLLM (no meta-device quant) is
+        # unaffected.
+        has_online_quant = self._has_online_quant(model)
+        if has_online_quant:
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                finalize_layerwise_processing,
+            )
+
+            # model_config is only dereferenced by finalize for vLLM Attention /
+            # MLAAttention layers; diffusion DiT models use their own attention and
+            # have none, so passing None is safe here.
+            finalize_layerwise_processing(model, model_config=None)
+
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None and isinstance(quant_method, QuantizeMethodBase):
-                # Move module to target device for processing if needed
+            if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
+                continue
+
+            if has_online_quant:
+                # Online quant may leave straggler params on the ``meta`` device.
+                # Move only real (non-meta) params onto the target device for
+                # processing and restore them afterward, mirroring upstream vLLM's
+                # device_loading_context — a blanket module.to(target_device) would
+                # raise NotImplementedError on meta params. Online quant initializes
+                # on the accelerator, so params are normally already on the target
+                # device and this loop is a no-op move; the point is to skip meta.
+                original_devices: dict[str, torch.device] = {}
+                for name, param in module.named_parameters():
+                    if param.device.type != "meta" and param.device != target_device:
+                        original_devices[name] = param.device
+                        param.data = param.data.to(target_device)
+
+                quant_method.process_weights_after_loading(module)
+
+                # Restore pre-existing params to their original device; leave any
+                # newly created (e.g. quantized) params on the target device.
+                for name, param in module.named_parameters():
+                    if name in original_devices:
+                        param.data = param.data.to(original_devices[name])
+            else:
+                # No meta params possible here. Preserve the original FSDP/HSDP-aware
+                # whole-module move (module.to()), which correctly handles sharded
+                # DTensor params that per-parameter .data reassignment cannot.
                 module_device = next(module.parameters(), None)
                 if module_device is not None:
                     module_device = module_device.device

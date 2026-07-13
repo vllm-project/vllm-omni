@@ -32,7 +32,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
-from vllm.entrypoints.chat_utils import load_chat_template
+from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.entrypoints.launcher import serve_http, terminate_if_errored
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
@@ -60,12 +60,11 @@ from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
-from vllm.entrypoints.serve.disagg.serving import ServingTokens
+from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
 from vllm.entrypoints.serve.instrumentator.basic import base
-from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
@@ -85,6 +84,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
+from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
@@ -451,7 +451,7 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     # Add process-specific prefix to stdout and stderr.
     decorate_logs("APIServer", skip_if_decorated=True)
 
-    listen_address, sock = setup_openai_server(args)
+    listen_address, sock = setup_openai_server(args, reuse_port=False)
 
     # Unified use of omni_run_server_worker, AsyncOmni automatically handles LLM and Diffusion models
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
@@ -830,6 +830,12 @@ async def omni_init_app_state(
         if tokenizer is None or getattr(tokenizer, "chat_template", None) is None:
             resolved_chat_template = _load_model_chat_template_json(args.model)
 
+    chat_template_config = ChatTemplateConfig(
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        trust_request_chat_template=args.trust_request_chat_template,
+    )
+
     if args.tool_server == "demo":
         tool_server: ToolServer | None = DemoToolServer()
         assert isinstance(tool_server, DemoToolServer)
@@ -895,11 +901,10 @@ async def omni_init_app_state(
     await state.openai_serving_models.init_static_loras()
 
     # NOTE: kept aligned with upstream `init_app_state`:
-    # Use OpenAIServingRender (replaces the old OnlineRenderer + OnlineDerenderer + ServingRender split).
-    state.openai_serving_render = OpenAIServingRender(
+    # Use OnlineRenderer (replaced OpenAIServingRender which was removed upstream).
+    state.online_renderer = OnlineRenderer(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
-        model_registry=state.openai_serving_models.registry,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
@@ -916,7 +921,7 @@ async def omni_init_app_state(
         OpenAIServingResponses(
             engine_client,
             state.openai_serving_models,
-            openai_serving_render=state.openai_serving_render,
+            state.online_renderer,
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -937,7 +942,7 @@ async def omni_init_app_state(
             engine_client,
             state.openai_serving_models,
             args.response_role,
-            openai_serving_render=state.openai_serving_render,
+            online_renderer=state.online_renderer,
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -964,7 +969,7 @@ async def omni_init_app_state(
         OpenAIServingCompletion(
             engine_client,
             state.openai_serving_models,
-            openai_serving_render=state.openai_serving_render,
+            online_renderer=state.online_renderer,
             request_logger=request_logger,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -979,9 +984,7 @@ async def omni_init_app_state(
             state.openai_serving_models,
             supported_tasks=tuple(supported_tasks),
             request_logger=request_logger,
-            chat_template=resolved_chat_template,
-            chat_template_content_format=args.chat_template_content_format,
-            trust_request_chat_template=args.trust_request_chat_template,
+            chat_template_config=chat_template_config,
         )
         if any(task in POOLING_TASKS for task in supported_tasks)
         else None
@@ -991,9 +994,7 @@ async def omni_init_app_state(
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
-            chat_template=resolved_chat_template,
-            chat_template_content_format=args.chat_template_content_format,
-            trust_request_chat_template=args.trust_request_chat_template,
+            chat_template_config=chat_template_config,
         )
         if "embed" in supported_tasks
         else None
@@ -1003,9 +1004,7 @@ async def omni_init_app_state(
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
-            chat_template=resolved_chat_template,
-            chat_template_content_format=args.chat_template_content_format,
-            trust_request_chat_template=args.trust_request_chat_template,
+            chat_template_config=chat_template_config,
         )
         if "classify" in supported_tasks
         else None
@@ -1014,8 +1013,9 @@ async def omni_init_app_state(
         ServingScores(
             engine_client,
             state.openai_serving_models,
+            supported_tasks=tuple(supported_tasks),
             request_logger=request_logger,
-            score_template=resolved_chat_template,
+            chat_template_config=chat_template_config,
             log_error_stack=args.log_error_stack,
         )
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
@@ -1023,7 +1023,7 @@ async def omni_init_app_state(
     )
     state.serving_tokenization = ServingTokenization(
         state.openai_serving_models,
-        state.openai_serving_render,
+        state.online_renderer,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
@@ -1055,7 +1055,7 @@ async def omni_init_app_state(
             engine_client,
             state.openai_serving_models,
             args.response_role,
-            openai_serving_render=state.openai_serving_render,
+            online_renderer=state.online_renderer,
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -1074,7 +1074,7 @@ async def omni_init_app_state(
         ServingTokens(
             engine_client,
             state.openai_serving_models,
-            state.openai_serving_render,
+            state.online_renderer,
             request_logger=request_logger,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
