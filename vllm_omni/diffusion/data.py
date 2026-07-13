@@ -1005,6 +1005,9 @@ class OmniDiffusionConfig:
         # Some families document ``--model-class-name`` as an explicit override
         # (for example NextStep and Wan S2V), so preserve the caller-provided
         # value when requested instead of replacing it with the inferred class.
+        # In that case we also keep the parsed ``TransformerConfig.from_dict``
+        # result from ``config.json`` instead of resetting it to an empty
+        # ``TransformerConfig()`` like the old branch-local code did.
         if not override_existing and self.model_class_name is not None:
             self.update_multimodal_support()
             return
