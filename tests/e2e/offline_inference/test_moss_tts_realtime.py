@@ -95,6 +95,7 @@ def _get_test_config() -> str:
 # ---------------------------------------------------------------------------
 
 pytestmark = [
+    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
     pytest.mark.full_model,
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [(MODEL, _get_test_config())], indirect=True),

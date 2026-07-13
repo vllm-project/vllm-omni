@@ -8,7 +8,6 @@ import torch
 
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
     talker2code2wav_async_chunk,
-    text2flow,
     text2flow_full_payload,
     text2flow_token_only,
 )
@@ -49,29 +48,19 @@ def _transfer_manager(
     )
 
 
-def test_text2flow_supports_batched_source_outputs():
+def test_text2flow_token_only_supports_batched_source_outputs():
     source_outputs = [
         _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[8, 9]])}),
         _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[6, 7]])}),
     ]
 
-    outputs = text2flow(source_outputs=source_outputs, prompt=None)
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
 
     assert len(outputs) == 2
     assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
     assert outputs[1]["prompt_token_ids"] == [4, 5]
     assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
     assert outputs[1]["additional_information"]["ids"]["prompt"] == [20, 21]
-
-
-def test_text2flow_strips_reference_speech_prefix_from_cumulative_ids():
-    source_outputs = [
-        _source_output("req-0", [10, 11], [8, 9, 1, 2, 3], {"speech_token": torch.tensor([[8, 9]])}),
-    ]
-
-    outputs = text2flow(source_outputs=source_outputs, prompt=None)
-
-    assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
 
 
 def test_text2flow_token_only_strips_reference_speech_prefix_from_cumulative_ids():
@@ -91,7 +80,11 @@ def test_text2flow_token_only_strips_reference_speech_prefix_from_cumulative_ids
     assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
 
 
-def test_text2flow_token_only_marks_prompt_trim_for_stop_token_completion():
+def test_text2flow_token_only_does_not_mark_prompt_trim():
+    # The talker prompt is wrapped with the CosyVoice3 instruction template in
+    # _build_cosyvoice3_prompt, so the talker emits target-only speech and no
+    # prompt-trim offset is required; the flow stage trims prompt_feat itself
+    # (issue #4644). Confirm no talker_prefill_offset is set.
     source_outputs = [
         _source_output(
             "req-stop",
@@ -104,7 +97,8 @@ def test_text2flow_token_only_marks_prompt_trim_for_stop_token_completion():
     outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
 
     assert outputs[0]["prompt_token_ids"] == [1, 2, 6562]
-    assert outputs[0]["additional_information"]["meta"]["talker_prefill_offset"] == 2
+    meta = outputs[0]["additional_information"].get("meta") or {}
+    assert "talker_prefill_offset" not in meta
 
 
 def test_text2flow_full_payload_does_not_send_codec_ids():

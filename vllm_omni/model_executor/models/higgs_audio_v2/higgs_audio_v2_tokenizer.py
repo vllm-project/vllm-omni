@@ -22,12 +22,15 @@ generation.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
 
 import numpy as np
 import torch
+
+from vllm_omni.platforms import current_omni_platform
 
 __all__ = [
     "UnsupportedInputError",
@@ -168,14 +171,25 @@ _AUDIO_TOKENIZER_PATH_ENVS = (
 )
 
 
+def _is_higgs_audio_tokenizer_config(config_path: str) -> bool:
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return config.get("model_type") == "higgs_audio_v2_tokenizer"
+
+
 def _normalize_audio_tokenizer_dir(path: str) -> str | None:
     if not path:
         return None
     expanded = os.path.abspath(os.path.expanduser(path))
-    if os.path.isfile(os.path.join(expanded, "config.json")):
+    config_path = os.path.join(expanded, "config.json")
+    if os.path.isfile(config_path) and _is_higgs_audio_tokenizer_config(config_path):
         return expanded
     nested = os.path.join(expanded, _K2_OMNIVOICE_SUBDIR)
-    if os.path.isfile(os.path.join(nested, "config.json")):
+    nested_config_path = os.path.join(nested, "config.json")
+    if os.path.isfile(nested_config_path) and _is_higgs_audio_tokenizer_config(nested_config_path):
         return nested
     return None
 
@@ -199,7 +213,9 @@ def _resolve_audio_tokenizer_dir() -> str | None:
         filename=f"{_K2_OMNIVOICE_SUBDIR}/config.json",
     )
     if isinstance(cached_config, str) and os.path.isfile(cached_config):
-        return os.path.dirname(cached_config)
+        candidate = _normalize_audio_tokenizer_dir(os.path.dirname(cached_config))
+        if candidate is not None:
+            return candidate
 
     from huggingface_hub.constants import HF_HUB_CACHE
 
@@ -238,8 +254,10 @@ def _load_audio_tokenizer():
             _K2_OMNIVOICE_REPO,
             allow_patterns=[f"{_K2_OMNIVOICE_SUBDIR}/*"],
         )
-        audio_tokenizer_dir = os.path.join(repo_path, _K2_OMNIVOICE_SUBDIR)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+        audio_tokenizer_dir = _normalize_audio_tokenizer_dir(repo_path)
+        if audio_tokenizer_dir is None:
+            raise RuntimeError(f"Downloaded {_K2_OMNIVOICE_REPO} does not contain a valid Higgs audio tokenizer")
+    device = current_omni_platform.get_torch_device()
     model = HiggsAudioV2TokenizerModel.from_pretrained(audio_tokenizer_dir).to(device)
     return model.eval()
 

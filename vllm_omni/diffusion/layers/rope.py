@@ -188,6 +188,12 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
+        # All batch elements share the same rotary position encoding.
+        # Strip the batch dim so the underlying op broadcasts over the batch,
+        # consistent with forward_cuda / forward_hip / apply_rotary_emb_mindiesd.
+        if cos.dim() == 3:
+            cos = cos[0]
+            sin = sin[0]
         return apply_rotary_emb_torch(
             x,
             cos,

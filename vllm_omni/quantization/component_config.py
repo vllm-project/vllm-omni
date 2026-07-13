@@ -48,6 +48,30 @@ def resolve_encoder_quant_config(
     return quant_config
 
 
+def safe_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Return *quant_config* only if it is safe for norm/modulation layers.
+
+    Norm and modulation layers (LayerNorm, RMSNorm, AdaLayerNorm, img_mod,
+    txt_mod, etc.) produce precision-sensitive shift/scale/gate values and
+    should not receive FP8 quant configs (see #2728).  Pre-quantized methods
+    like INC/AutoRound W4A16 need the config propagated so packed weights
+    load correctly.
+
+    This is the inverse of :func:`resolve_encoder_quant_config`: that function
+    strips pre-quantized configs from encoders, while this one strips
+    *every config except* pre-quantized configs from norm/mod layers.
+    """
+    if quant_config is None:
+        return None
+    from vllm.model_executor.layers.quantization.inc import INCConfig
+
+    if isinstance(quant_config, INCConfig):
+        return quant_config
+    return None
+
+
 class ComponentQuantizationConfig(QuantizationConfig):
     """Routes quantization to different configs by layer prefix."""
 

@@ -276,6 +276,16 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
     ),
+    "SoulXSingerPipeline": (
+        "soulx_singer",
+        "pipeline_soulx_singer_svs",
+        "PipelineSoulXSingerSVS",
+    ),
+    "SoulXSingerSVCPipeline": (
+        "soulx_singer",
+        "pipeline_soulx_singer_svc",
+        "PipelineSoulXSingerSVC",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -295,6 +305,11 @@ _DIFFUSION_MODELS = {
         "sdxl",
         "pipeline_sdxl",
         "StableDiffusionXLPipeline",
+    ),
+    "Krea2Pipeline": (
+        "krea2",
+        "pipeline_krea2",
+        "Krea2Pipeline",
     ),
 }
 
@@ -380,7 +395,7 @@ def initialize_model(
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
-            model.vae.set_parallel_size(vae_pp_size)
+            model.vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
@@ -489,6 +504,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX23Pipeline": "get_ltx2_post_process_func",
     "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
+    "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
@@ -521,6 +538,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
+    "Krea2Pipeline": "get_krea2_post_process_func",
 }
 
 _DIFFUSION_ACTION_POST_PROCESS_FUNCS = {
@@ -559,6 +577,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
+    "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",
+    "SoulXSingerSVCPipeline": "get_soulxsinger_svc_pre_process_func",
 }
 
 

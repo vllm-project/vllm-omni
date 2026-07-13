@@ -38,7 +38,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",

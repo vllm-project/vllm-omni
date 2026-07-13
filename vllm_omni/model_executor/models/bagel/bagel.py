@@ -587,9 +587,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
-        req_ids: list[str],
-        num_computed_tokens: list[int],
-        num_scheduled_tokens: list[int],
+        req_ids: Sequence[str],
+        num_computed_tokens: Sequence[int],
+        num_scheduled_tokens: Sequence[int],
         input_ids_buffer: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Restore input_ids so _adjust_positions_for_img2img can locate
@@ -599,7 +599,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             input_ids = input_ids_buffer
         return input_ids, positions
 
-    def flush_pending_metadata(self, req_ids: list[str]) -> None:
+    def flush_pending_metadata(self, req_ids: Sequence[str]) -> None:
         """Map pending metadata (batch order) to req_ids after forward().
 
         Guard: if a request already has metadata with ``image_shape``

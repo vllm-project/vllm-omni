@@ -208,6 +208,7 @@ cache/
 .cache/
 diffusion_cache/
 kv_cache/
+!vllm_omni/experimental/ar_diffusion/kv_cache/
 
 # Logs
 logs/
@@ -241,6 +242,7 @@ datasets/
 *.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+!tests/assets/soulxsinger/*.json
 *.jsonl
 *.parquet
 

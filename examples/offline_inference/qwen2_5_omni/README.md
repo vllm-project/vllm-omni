@@ -60,3 +60,24 @@ If media file paths are not provided, the script will use default assets. Suppor
 - `mixed_modalities`: Audio + image + video
 - `use_audio_in_video`: Extract audio from video
 - `text`: Text-only query
+
+### Composable parallelism (strategy configs)
+
+You can shard or replicate a stage with a small composable-parallel
+`strategy.yaml` overlaid onto the **bundled default deploy config** -- no bespoke
+deploy YAML required. Supply the strategy with `--strategy-config` and any matching
+device layout via `--stage-overrides` (explicit kwargs forwarded to `Omni`).
+
+Both examples below require >= 3 GPUs (the thinker uses 2, talker + code2wav share a third):
+
+```bash
+# Tensor-parallel the thinker (TP=2)
+python end2end.py --query-type text --num-prompts 6 \
+    --strategy-config strategy_tp2.yaml \
+    --stage-overrides '{"0": {"devices": "0,1"}, "1": {"devices": "2"}, "2": {"devices": "2"}}'
+
+# Replicate the thinker across 2 engines (round-robin load balancing)
+python end2end.py --query-type text --num-prompts 6 \
+    --strategy-config strategy_stage_replica.yaml \
+    --stage-overrides '{"0": {"devices": "0,1"}, "1": {"devices": "2"}, "2": {"devices": "2"}}'
+```

@@ -294,6 +294,12 @@ _OMNI_MODELS = {
         "modeling_moss_tts_talker",
         "MossTTSRealtimeTalkerForGeneration",
     ),
+    # MossTTSLocalModel: MOSS-TTS-Local-Transformer-v1.5
+    "MossTTSLocalModel": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSLocalTalkerForGeneration",
+    ),
     # Stage-1 codec decoder (shared by all 5 variants)
     "MossTTSCodecDecoder": (
         "moss_tts",
@@ -304,6 +310,17 @@ _OMNI_MODELS = {
         "dynin_omni",
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
+    ),
+    ## IndexTTS2
+    "IndexTTS2TalkerForConditionalGeneration": (
+        "indextts2",
+        "indextts2_talker",
+        "IndexTTS2TalkerForConditionalGeneration",
+    ),
+    "IndexTTS2S2MelDecoder": (
+        "indextts2",
+        "indextts2_s2mel_decoder",
+        "IndexTTS2S2MelDecoder",
     ),
     ## Ming-flash-omni-2.0
     "MingFlashOmniForConditionalGeneration": (

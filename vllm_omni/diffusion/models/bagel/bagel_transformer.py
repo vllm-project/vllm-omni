@@ -39,9 +39,9 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.diffusion.cache.cache_dit_backend import BagelCachedAdapter, CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
-    get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
     get_sequence_parallel_rank,
     get_sp_group,
@@ -1247,7 +1247,7 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
     return pos_ids
 
 
-class Bagel(nn.Module):
+class Bagel(CFGParallelMixin, nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
 
@@ -2078,7 +2078,6 @@ class Bagel(nn.Module):
         Rank 2: img_cfg branch (no image condition), only when cfg_img_scale > 1.0
         """
         cfg_group = get_cfg_group()
-        cfg_rank = get_classifier_free_guidance_rank()
         cfg_world_size = get_classifier_free_guidance_world_size()
         use_cfg_img = cfg_img_scale > 1.0
 
@@ -2101,22 +2100,6 @@ class Bagel(nn.Module):
         x_t = x_t.contiguous()
         cfg_group.broadcast(x_t, src=0)
 
-        # Select this rank's branch inputs
-        if cfg_rank == 0:
-            # Gen branch: use main inputs directly
-            branch_position_ids = packed_position_ids
-            branch_past_key_values = past_key_values
-        elif cfg_rank == 1:
-            # Text CFG branch
-            branch_position_ids = cfg_text_packed_position_ids
-            branch_past_key_values = cfg_text_past_key_values
-        elif cfg_rank == 2:
-            # Image CFG branch
-            branch_position_ids = cfg_img_packed_position_ids
-            branch_past_key_values = cfg_img_past_key_values
-        else:
-            raise RuntimeError(f"Unexpected cfg_rank={cfg_rank} for Bagel 3-branch CFG parallel")
-
         trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
         trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
         trajectory_log_probs: list[torch.Tensor] | None = (
@@ -2137,43 +2120,46 @@ class Bagel(nn.Module):
                 timestep[frame_condition_token_indexes] = 0.0
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
 
-            if use_cfg_this_step:
-                # CFG interval: each rank computes its own branch
-                local_v_t = self.forward_single_branch(
-                    x_t=x_t,
-                    timestep=timestep,
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_vae_position_ids=packed_vae_position_ids,
-                    packed_text_ids=packed_text_ids,
-                    packed_text_indexes=packed_text_indexes,
-                    packed_position_ids=branch_position_ids,
-                    packed_seqlens=packed_seqlens,
-                    past_key_values=branch_past_key_values,
+            # Per-branch kwargs. Branch 0 (gen, full conditioning) is also the
+            # branch used by all ranks when do_true_cfg is False (outside the
+            # CFG interval) — CFGParallelMixin only runs branches_kwargs[0] then,
+            # mirroring the previous "all ranks compute gen inputs, no comm" path.
+            common = dict(
+                x_t=x_t,
+                timestep=timestep,
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                packed_vae_position_ids=packed_vae_position_ids,
+                packed_text_ids=packed_text_ids,
+                packed_text_indexes=packed_text_indexes,
+                packed_seqlens=packed_seqlens,
+            )
+            branches_kwargs = [
+                dict(**common, packed_position_ids=packed_position_ids, past_key_values=past_key_values),
+                dict(
+                    **common, packed_position_ids=cfg_text_packed_position_ids, past_key_values=cfg_text_past_key_values
+                ),
+            ]
+            if use_cfg_img:
+                branches_kwargs.append(
+                    dict(
+                        **common,
+                        packed_position_ids=cfg_img_packed_position_ids,
+                        past_key_values=cfg_img_past_key_values,
+                    )
                 )
 
-                gathered = cfg_group.all_gather(local_v_t, separate_tensors=True)
-                v_t = self._combine_cfg(
-                    gathered[0],
-                    gathered[1],
-                    gathered[2] if (use_cfg_img and len(gathered) > 2) else None,
-                    cfg_text_scale,
-                    cfg_img_scale,
-                    cfg_renorm_type,
-                    cfg_renorm_min,
-                )
-            else:
-                # Outside CFG interval: all ranks compute with gen inputs, no comm
-                v_t = self.forward_single_branch(
-                    x_t=x_t,
-                    timestep=timestep,
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_vae_position_ids=packed_vae_position_ids,
-                    packed_text_ids=packed_text_ids,
-                    packed_text_indexes=packed_text_indexes,
-                    packed_position_ids=packed_position_ids,
-                    packed_seqlens=packed_seqlens,
-                    past_key_values=past_key_values,
-                )
+            # Each rank computes its assigned branch, then all_gather + combine
+            # happen inside the mixin (identical result on every rank).
+            v_t = self.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=use_cfg_this_step,
+                true_cfg_scale={
+                    "cfg_text_scale": cfg_text_scale,
+                    "cfg_img_scale": cfg_img_scale,
+                    "cfg_renorm_type": cfg_renorm_type,
+                    "cfg_renorm_min": cfg_renorm_min,
+                },
+                branches_kwargs=branches_kwargs,
+            )
 
             if scheduler is not None:
                 out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
@@ -2241,6 +2227,45 @@ class Bagel(nn.Module):
             v_t = v_t_ * scale
 
         return v_t
+
+    # ── CFGParallelMixin hooks ──
+    # Bagel mounts CFGParallelMixin (see class declaration) to reuse the shared
+    # N-branch CFG dispatch/all_gather logic in predict_noise_with_multi_branch_cfg.
+    # Only two hooks need model-specific behaviour:
+    #   * predict_noise: one branch == one Bagel forward (per-branch KV cache).
+    #   * combine_multi_branch_cfg_noise: Bagel's renorm-aware 3-branch combine.
+
+    def predict_noise(self, **kwargs) -> torch.Tensor:
+        """Single-branch velocity prediction for CFGParallelMixin.
+
+        Each CFG branch differs only by ``packed_position_ids`` and
+        ``past_key_values`` (carried in ``kwargs``); the heavy lifting is the
+        per-branch ``forward_single_branch`` pass.
+        """
+        return self.forward_single_branch(**kwargs)
+
+    def combine_multi_branch_cfg_noise(
+        self,
+        predictions: list[torch.Tensor],
+        true_cfg_scale: dict[str, float],
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor:
+        """Combine gen/text/img branch velocities via Bagel's renorm CFG.
+
+        ``predictions[0]`` is the gen branch, ``[1]`` the text-CFG branch, and
+        ``[2]`` (when present) the image-CFG branch. ``cfg_normalize`` is unused
+        because renormalization is folded into ``_combine_cfg`` itself.
+        """
+        cfg_img_v_t = predictions[2] if len(predictions) > 2 else None
+        return self._combine_cfg(
+            predictions[0],
+            predictions[1],
+            cfg_img_v_t,
+            true_cfg_scale["cfg_text_scale"],
+            true_cfg_scale["cfg_img_scale"],
+            true_cfg_scale["cfg_renorm_type"],
+            true_cfg_scale["cfg_renorm_min"],
+        )
 
     def forward_single_branch(
         self,

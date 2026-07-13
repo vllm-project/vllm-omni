@@ -12,9 +12,9 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     max_ic_for_chunk_size,
 )
 from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
-    talker2code2wav,
     talker2code2wav_async_chunk,
     talker2code2wav_full_payload,
+    talker2code2wav_token_only,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -368,7 +368,15 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     assert rid in tm.request_payload
 
 
-def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
+def test_non_async_token_only_sizes_placeholder_for_ref_and_audio_frames():
+    """``talker2code2wav_token_only`` only allocates placeholder prompt slots.
+
+    After the connector refactor, actual codec flattening (ref prepend +
+    codebook-major layout) is performed by ``talker2code2wav_full_payload`` on
+    the worker data plane.  The orchestrator hook still derives
+    ``left_context_size`` from stage-0 multimodal_output so Code2Wav can trim
+    reference frames once the connector payload arrives.
+    """
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
     audio_codes = torch.tensor(
         [
@@ -387,12 +395,38 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
         engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
     )
 
-    prompts = talker2code2wav(stage.engine_outputs)
+    prompts = talker2code2wav_token_only(stage.engine_outputs)
 
     assert len(prompts) == 1
     prompt = prompts[0]
     assert prompt["additional_information"] == {"meta": {"left_context_size": 2}}
-    assert prompt["prompt_token_ids"] == [
+    # 2 ref frames + 2 valid audio frames (zero row filtered), 4 quantizers.
+    assert prompt["prompt_token_ids"] == [0] * (_Q * (2 + 2))
+
+
+def test_full_payload_prepends_ref_code_and_flattens_codebook_major():
+    """Worker producer is authoritative for ref prepend + codec flatten."""
+    ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    audio_codes = torch.tensor(
+        [
+            [0, 0, 0, 0],
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+        ],
+        dtype=torch.long,
+    )
+    pooling_output = {
+        "codes.audio": audio_codes,
+        "codes.ref": ref_code,
+        "meta.ref_code_len": 2,
+    }
+    request = SimpleNamespace(request_id="r", output_token_ids=list(range(3)))
+
+    payload = talker2code2wav_full_payload(transfer_manager=None, pooling_output=pooling_output, request=request)
+
+    assert payload is not None
+    assert payload["meta"]["left_context_size"] == 2
+    assert payload["codes"]["audio"].tolist() == [
         9,
         8,
         1,
@@ -433,7 +467,7 @@ def test_non_async_processor_filters_out_of_range_codec_values():
         engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
     )
 
-    prompts = talker2code2wav(stage.engine_outputs)
+    prompts = talker2code2wav_token_only(stage.engine_outputs)
 
     assert len(prompts) == 1
     prompt = prompts[0]
@@ -486,3 +520,32 @@ def test_full_payload_omits_left_context_size_without_ref():
     assert payload["meta"]["finished"].item() is True
     assert "left_context_size" not in payload["meta"]
     assert len(payload["codes"]["audio"]) == _Q * 2
+
+
+@pytest.mark.parametrize(
+    "pooling_output",
+    [
+        pytest.param(SimpleNamespace(codes="not-a-dict"), id="non_dict_output"),
+        pytest.param({}, id="missing_codes_audio"),
+        pytest.param({"codes.audio": torch.zeros((3, _Q), dtype=torch.long)}, id="all_codes_filtered"),
+    ],
+)
+def test_full_payload_emits_empty_finished_payload_on_degenerate_take(pooling_output):
+    """Regression for #4463.
+
+    A degenerate talker take used to return ``None`` from
+    ``talker2code2wav_full_payload``. The connector treats ``None`` as "drop the
+    request", but Stage-1 was already scheduled to receive it, so its wait gate
+    polls to ``connector_get_max_wait`` (~300s) and the orchestrator aborts — one
+    stuck request stalls the whole two-stage pipeline. Each degenerate case
+    (non-dict pooling_output, missing ``codes.audio``, all codec frames dropped by
+    the filter) must instead return an empty-but-finished payload so the gate
+    releases and the request finishes immediately with zero-length audio.
+    """
+    request = SimpleNamespace(request_id="r", output_token_ids=[0, 1, 2])
+
+    payload = talker2code2wav_full_payload(transfer_manager=None, pooling_output=pooling_output, request=request)
+
+    assert payload is not None
+    assert payload["meta"]["finished"].item() is True
+    assert payload["codes"]["audio"].numel() == 0

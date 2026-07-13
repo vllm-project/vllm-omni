@@ -49,6 +49,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     unpad_prompt_conditioning,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -198,7 +199,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             ) from e
 
         model = _s3.load_model("speech_tokenizer_v3_25hz")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = current_omni_platform.get_torch_device()
         model = model.to(device).eval()
         cls._s3_model = (model, _s3, device)
         return cls._s3_model

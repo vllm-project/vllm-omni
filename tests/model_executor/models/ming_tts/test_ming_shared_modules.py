@@ -137,8 +137,12 @@ def test_ming_compute_logits_falls_back_to_dummy_token_id():
 
 def test_ming_forward_non_decode_return_clears_cached_forced_next_token_ids():
     class FakeBackbone:
-        def __call__(self, **kwargs):
-            return kwargs["inputs_embeds"]
+        # MingLLMModel.forward calls the backbone positionally
+        # (input_ids, positions, intermediate_tensors, inputs_embeds) so the
+        # same signature works for both Qwen2Model (``positions``) and
+        # BailingMoeModel (``position_ids``).
+        def __call__(self, input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs):
+            return inputs_embeds
 
     model = _make_ming_logits_model()
     model.model = FakeBackbone()

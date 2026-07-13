@@ -1,19 +1,16 @@
 # --8<-- [start:requirements]
 
-For detailed hardware and software requirements, please refer to the [vllm-ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
+For detailed hardware and software requirements, please refer to the [vLLM-Ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
 # --8<-- [end:requirements]
 # --8<-- [start:installation-release]
 
-The recommended way to use vLLM-Omni on NPU is through the vllm-ascend pre-built Docker images:
+The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built Docker images:
 
 ```bash
-# Update the vllm-ascend image
-# Atlas A2:
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.18.0rc1
-# Atlas A3:
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.18.0rc1-a3
-export IMAGE=quay.io/ascend/vllm-ascend:v0.18.0rc1
+# vLLM-Ascend image
+# Atlas A2: quay.io/atlas-ci/vllm-ascend:v0.24.0
+# Atlas A3: quay.io/atlas-ci/vllm-ascend:v0.24.0-a3
 docker run --rm \
     --name vllm-omni-npu \
     --shm-size=1g \
@@ -31,11 +28,11 @@ docker run --rm \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /root/.cache:/root/.cache \
     -p 8000:8000 \
-    -it $IMAGE bash
+    -it quay.io/atlas-ci/vllm-ascend:0.24.0-a3 bash
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
-git clone -b v0.18.0 https://github.com/vllm-project/vllm-omni.git
+git clone -b v0.24.0 https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 pip install -v -e . --no-build-isolation
 # or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
@@ -87,14 +84,11 @@ Supported images as following.
 Here's an example deployment command that has been verified on 4 x NPUs:
 
 ```bash
-# Atlas A2:
-# export IMAGE=quay.io/ascend/vllm-omni:v0.18.0
-# Atlas A3:
-# export IMAGE=quay.io/ascend/vllm-omni:v0.18.0-a3
-export IMAGE=quay.io/ascend/vllm-omni:v0.18.0
+# Atlas A2: quay.io/ascend/vllm-omni:v0.24.0
+# Atlas A3: quay.io/ascend/vllm-omni:v0.24.0-a3
 docker run --rm \
-    --name vllm-omni-npu \
-    --shm-size=1g \
+    --name vllm-omni-a3 \
+    --shm-size=4g \
     --device /dev/davinci0 \
     --device /dev/davinci1 \
     --device /dev/davinci2 \
@@ -106,10 +100,17 @@ docker run --rm \
     -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
     -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
     -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+    --device /dev/davinci_manager \
+    --device /dev/devmm_svm \
+    --device /dev/hisi_hdc \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
-    -v /root/.cache:/root/.cache \
-    -p 8000:8000 \
-    -it $IMAGE bash
+    -v ~/.cache:/root/.cache \
+    -p 8091:8091 \
+    -it quay.io/ascend/vllm-omni:v0.24.0-a3 bash
 ```
 
 !!! tip

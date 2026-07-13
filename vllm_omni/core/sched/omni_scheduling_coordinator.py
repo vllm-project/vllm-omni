@@ -51,6 +51,9 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         ("Qwen3TTSCode2Wav", "code2wav"),
         # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
         ("CosyVoice3Model", "cosyvoice3_code2wav"),
+        # indextts2: indextts2_talker (Stage 0) -> indextts2_s2mel_decoder
+        # (Stage 1). Stage 1 consumes the complete mel/latent payload.
+        ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
         # dynin: token2text (Stage 0) -> token2image (Stage 1) ->
         # token2audio (Stage 2).  Producer wires via
         # custom_process_next_stage_input_func: *_full_payload in deploy yaml.

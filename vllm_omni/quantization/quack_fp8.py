@@ -15,11 +15,21 @@ _TRUTHY = {"1", "true", "yes", "on"}
 _gemm_interface = None
 
 
-def _is_blackwell() -> bool:
+def _is_quack_capable() -> bool:
+    """quack's CuteDSL FP8 / block-scaled MMA is built on the 5th-gen tensor-core
+    ``tcgen05`` instruction family, which is datacenter-Blackwell only
+    (``sm_100a`` / ``sm_101a`` / ``sm_103a``, compute capability ``10.x``).
+
+    Workstation/consumer Blackwell (``sm_120`` / ``sm_121``, compute capability
+    ``12.x``, e.g. RTX PRO 6000 / RTX 50-series) lacks ``tcgen05``, so quack can
+    never run there — CuteDSL rejects the arch and every GEMM falls back to
+    FlashInfer one call at a time, which is catastrophically slow. Those GPUs
+    have working native FlashInfer FP8 kernels, so default quack off for them.
+    """
     try:
         if not torch.cuda.is_available():
             return False
-        return torch.cuda.get_device_capability()[0] >= 10
+        return torch.cuda.get_device_capability()[0] == 10
     except Exception:  # noqa: BLE001
         return False
 
@@ -28,7 +38,7 @@ def quack_enabled() -> bool:
     override = os.environ.get("VLLM_OMNI_USE_QUACK_FP8")
     if override is not None:
         return override.lower() in _TRUTHY
-    return _is_blackwell()
+    return _is_quack_capable()
 
 
 def _set_persistent_cache_dir() -> None:

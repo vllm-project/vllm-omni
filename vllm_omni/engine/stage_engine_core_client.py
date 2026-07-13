@@ -230,7 +230,7 @@ class StageEngineCoreClientBase(StageClientBase):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         """Add request to the stage engine core."""
-        logger.info(
+        logger.debug(
             "[%s] stage-%s [rep-%s] add request: %s",
             self.__class__.__name__,
             self.stage_id,

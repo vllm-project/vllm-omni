@@ -287,7 +287,7 @@ def _estimate_tts_prompt_len_from_token_ids(
             prompt_len = base_len + max(0, assistant_len - 6)
         else:
             prompt_len = base_len + 1
-        return max(32, min(4096, int(prompt_len)))
+        return int(prompt_len)
 
     if task_type == "Base":
         in_context_mode = not bool(x_vector_only_mode)
@@ -306,10 +306,10 @@ def _estimate_tts_prompt_len_from_token_ids(
                 prompt_len = base_len + max(0, assistant_len - 6)
             else:
                 prompt_len = base_len + 1
-        return max(32, min(4096, int(prompt_len)))
+        return int(prompt_len)
 
     # Defensive fallback for unknown task types.
-    return max(32, min(4096, int(base_len + max(assistant_len, 1))))
+    return int(base_len + max(assistant_len, 1))
 
 
 def aura2tts(

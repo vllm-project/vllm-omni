@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unified OmniConnector and KV cache transfer management."""
 
+import enum
 import json
 import struct
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -13,6 +15,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.platforms import current_omni_platform
 
 from .factory import OmniConnectorFactory
 from .utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec
@@ -32,10 +35,63 @@ from .utils.kv_utils import (
     slice_layer_blocks,
     slice_received_rank_shard,
 )
+from .utils.serialization import OmniSerializer
 
 logger = init_logger(__name__)
 
 LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+class KVPrefetchConsumeError(RuntimeError):
+    """Payload consumed from connector but post-get processing failed — sync retry impossible."""
+
+
+class ReceiveRole(enum.Enum):
+    """How a rank obtains KV: LOCAL pulls its own shard, LEADER pulls then
+    distributes, FOLLOWER receives via collective."""
+
+    LOCAL = "local"
+    LEADER = "leader"
+    FOLLOWER = "follower"
+
+
+@dataclass(frozen=True)
+class _TransferTopoConfig:
+    """Snapshot of the current rank's parallel topology for KV receive routing."""
+
+    role: ReceiveRole
+    tp_active: bool
+    cfg_size: int
+    cfg_rank: int
+    cfg_group: Any
+    sp_size: int
+    sp_rank: int
+    sp_group: Any
+    world: Any
+
+    @property
+    def is_leader(self) -> bool:
+        return self.role == ReceiveRole.LEADER
+
+    @property
+    def is_follower(self) -> bool:
+        return self.role == ReceiveRole.FOLLOWER
+
+    @property
+    def is_local(self) -> bool:
+        return self.role == ReceiveRole.LOCAL
+
+    @property
+    def cfg_active(self) -> bool:
+        return self.cfg_size > 1
+
+    @property
+    def sp_active(self) -> bool:
+        return self.sp_size > 1
+
+
+# Placeholder for the heavy primary KV in the side-payload dict; receiver swaps in the rebuilt object from the blob.
+_KV_PLACEHOLDER = "__kv_placeholder__"
 
 _SAFE_TORCH_DTYPES = {
     name: dtype
@@ -75,6 +131,8 @@ class OmniKVCacheConfig:
     recv_timeout: float = 30.0
     from_tp: int = 1
     to_tp: int = 1
+    enable_kv_async_prefetch: bool = False
+    kv_prefetch_min_free_mem_ratio: float = 0.0
 
 
 @dataclass
@@ -290,7 +348,7 @@ class OmniKVTransferManager:
     - KV cache receiving with timeout
     """
 
-    def __init__(self, config: OmniKVCacheConfig):
+    def __init__(self, config: OmniKVCacheConfig, *, async_prefetch: bool = False):
         self.config = config
         self._connector = None
 
@@ -336,6 +394,19 @@ class OmniKVTransferManager:
         self._sender_base_host: str | None = None
         self._sender_base_zmq_port: int | None = None
 
+        # Prefetch
+        self._async_prefetch = async_prefetch
+        self._prefetch_min_free_mem_ratio: float = max(0.0, config.kv_prefetch_min_free_mem_ratio)
+        # Single-worker: serial mode ensures at most one outstanding prefetch
+        # and avoids stream-creation races on _bg_copy_stream.
+        self._prefetch_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv-prefetch") if async_prefetch else None
+        )
+        self._prefetch_futures: dict[str, Any] = {}
+        self._bg_copy_stream: current_omni_platform.Stream | None = None
+
+        self._topo_config: _TransferTopoConfig | None = None
+
         if config.need_send_cache and config.connector_config:
             try:
                 _ = self.connector
@@ -343,15 +414,22 @@ class OmniKVTransferManager:
             except Exception as e:
                 logger.warning("Failed to eagerly initialize sender connector: %s", e)
 
+    @property
+    def topo_config(self) -> _TransferTopoConfig:
+        """Lazily build the parallel topology snapshot on first access."""
+        if self._topo_config is None:
+            self._topo_config = self._build_topo_config()
+        return self._topo_config
+
     # ------------------------------------------------------------------ #
     #  Factory helpers
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _create(cls, cfg: dict | None) -> "OmniKVTransferManager":
+    def _create(cls, cfg: dict | None, *, async_prefetch: bool = False) -> "OmniKVTransferManager":
         """Create manager from raw config dict."""
         if not cfg or not isinstance(cfg, dict):
-            return cls(OmniKVCacheConfig())
+            return cls(OmniKVCacheConfig(), async_prefetch=async_prefetch)
 
         rank_mapping = cfg.get("rank_mapping", {})
         if not isinstance(rank_mapping, dict):
@@ -369,37 +447,65 @@ class OmniKVTransferManager:
                 recv_timeout=cfg.get("recv_timeout", 30.0),
                 from_tp=int(rank_mapping.get("from_tp", 1)),
                 to_tp=int(rank_mapping.get("to_tp", 1)),
-            )
+                enable_kv_async_prefetch=async_prefetch,
+                kv_prefetch_min_free_mem_ratio=cfg.get("kv_prefetch_min_free_mem_ratio", 0.0),
+            ),
+            async_prefetch=async_prefetch,
         )
+
+    @staticmethod
+    def _receiver_pool_on_device(omni_kv: Any) -> bool:
+        """True when the receiver connector pool is on a device (non-CPU)."""
+        if not isinstance(omni_kv, dict):
+            return False
+        cc = omni_kv.get("connector_config")
+        if not isinstance(cc, dict):
+            return False
+        return str(cc.get("memory_pool_device", "cpu")).lower() != "cpu"
+
+    @classmethod
+    def _resolve_async_prefetch(cls, omni_kv: Any, *, has_companion: bool) -> bool:
+        """Effective prefetch flag: requested by config and not force-disabled."""
+        if not isinstance(omni_kv, dict) or not bool(omni_kv.get("enable_kv_async_prefetch", False)):
+            return False
+        return not (has_companion or cls._receiver_pool_on_device(omni_kv))
 
     @classmethod
     def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
         """Create from model or OmniDiffusion config."""
-        return cls._create(getattr(config, "omni_kv_config", None))
+        omni_kv = getattr(config, "omni_kv_config", None)
+        has_companion = getattr(config, "cfg_kv_collect_func", None) is not None
+        async_prefetch = cls._resolve_async_prefetch(omni_kv, has_companion=has_companion)
+        return cls._create(omni_kv, async_prefetch=async_prefetch)
 
     from_model_config = from_od_config
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any, model_config: Any) -> "OmniKVTransferManager":
         """Create from vllm config with fallback to kv_transfer_config."""
-        # Primary: omni_kv_config from model_config
-        omni_kv = getattr(model_config, "omni_kv_config", None)
-        if isinstance(omni_kv, dict):
-            return cls._create(omni_kv)
+        # Primary: omni_kv_config on model_config — same shape as from_od_config.
+        if isinstance(getattr(model_config, "omni_kv_config", None), dict):
+            return cls.from_od_config(model_config)
 
-        # Fallback: check kv_transfer_config
-        kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
-        if kv_cfg:
-            direct = getattr(kv_cfg, "omni_connector_config", None)
-            if isinstance(direct, dict) and direct:
-                return cls._create({"connector_config": direct})
-            extra = getattr(kv_cfg, "kv_connector_extra_config", None)
-            if isinstance(extra, dict):
-                omni = extra.get("omni_connector_config")
-                if isinstance(omni, dict) and omni:
-                    return cls._create({"connector_config": omni})
-
+        connector_cfg = cls._connector_cfg_from_kv_transfer(getattr(vllm_config, "kv_transfer_config", None))
+        if connector_cfg is not None:
+            return cls._create({"connector_config": connector_cfg})
         return cls(OmniKVCacheConfig())
+
+    @staticmethod
+    def _connector_cfg_from_kv_transfer(kv_cfg: Any) -> dict | None:
+        """Extract the omni connector config dict nested in a kv_transfer_config."""
+        if not kv_cfg:
+            return None
+        direct = getattr(kv_cfg, "omni_connector_config", None)
+        if isinstance(direct, dict) and direct:
+            return direct
+        extra = getattr(kv_cfg, "kv_connector_extra_config", None)
+        if isinstance(extra, dict):
+            omni = extra.get("omni_connector_config")
+            if isinstance(omni, dict) and omni:
+                return omni
+        return None
 
     @property
     def connector(self):
@@ -459,6 +565,88 @@ class OmniKVTransferManager:
 
     get_connector = property(lambda self: self.connector)
 
+    def _build_topo_config(self) -> _TransferTopoConfig:
+        """Build the parallel topology snapshot (called once at init)."""
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_cfg_group,
+            get_classifier_free_guidance_rank,
+            get_classifier_free_guidance_world_size,
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+            get_sp_group,
+            get_world_group,
+        )
+
+        try:
+            world = get_world_group()
+            world_size = world.world_size
+            world_rank = world.rank_in_group
+        except Exception:
+            logger.exception("World group unavailable; defaulting to LOCAL")
+            return _TransferTopoConfig(
+                role=ReceiveRole.LOCAL,
+                tp_active=False,
+                cfg_size=1,
+                cfg_rank=0,
+                cfg_group=None,
+                sp_size=1,
+                sp_rank=0,
+                sp_group=None,
+                world=None,
+            )
+
+        if world_size <= 1:
+            return _TransferTopoConfig(
+                role=ReceiveRole.LOCAL,
+                tp_active=False,
+                cfg_size=1,
+                cfg_rank=0,
+                cfg_group=None,
+                sp_size=1,
+                sp_rank=0,
+                sp_group=None,
+                world=world,
+            )
+
+        tp_active = self._tp_topo.source_tp_size > 1 or self._tp_topo.target_tp_size > 1
+
+        # CFG/SP groups may legitimately be uninitialized on pure-TP or
+        # world-only distributed paths; treat that as "not active" (size 1)
+        # rather than raising, so those paths can still take the local/world
+        # receive route.
+        try:
+            cfg_size = get_classifier_free_guidance_world_size()
+            cfg_rank = get_classifier_free_guidance_rank()
+            cfg_group = get_cfg_group()
+        except Exception:
+            cfg_size, cfg_rank, cfg_group = 1, 0, None  # CFG-parallel not enabled
+
+        try:
+            sp_size = get_sequence_parallel_world_size()
+            sp_rank = get_sequence_parallel_rank()
+            sp_group = get_sp_group()
+        except Exception:
+            sp_size, sp_rank, sp_group = 1, 0, None  # SP not enabled
+
+        if tp_active and cfg_size <= 1 and sp_size <= 1:
+            role = ReceiveRole.LOCAL
+        elif tp_active and (cfg_size > 1 or sp_size > 1):
+            role = ReceiveRole.LEADER if (cfg_rank == 0 and sp_rank == 0) else ReceiveRole.FOLLOWER
+        else:
+            role = ReceiveRole.LEADER if world_rank == 0 else ReceiveRole.FOLLOWER
+
+        return _TransferTopoConfig(
+            role=role,
+            tp_active=tp_active,
+            cfg_size=cfg_size,
+            cfg_rank=cfg_rank,
+            cfg_group=cfg_group,
+            sp_size=sp_size,
+            sp_rank=sp_rank,
+            sp_group=sp_group,
+            world=world,
+        )
+
     def _resolve_sender_info(
         self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None
     ) -> dict[str, Any] | None:
@@ -501,19 +689,6 @@ class OmniKVTransferManager:
                 sender_info,
             )
         return None
-
-    @staticmethod
-    def _clone_received_payload_tensors(data: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(data, dict) or "layer_blocks" not in data:
-            return data
-
-        layer_blocks = data["layer_blocks"]
-        for cache_name in ("key_cache", "value_cache"):
-            cache_list = layer_blocks.get(cache_name, [])
-            for idx, tensor in enumerate(cache_list):
-                if isinstance(tensor, torch.Tensor):
-                    cache_list[idx] = tensor.clone()
-        return data
 
     def _slice_transfer_data_for_target(self, kv_data: KVCacheTransferData, target_rank: int) -> KVCacheTransferData:
         """Pre-slice sender payload for one target rank when sender TP < receiver TP."""
@@ -984,24 +1159,183 @@ class OmniKVTransferManager:
 
         return False, 0, None
 
+    def _resolve_sender_base(self, sender_info: dict[str, Any] | None) -> tuple[str | None, int | None]:
+        """Resolve (host, base_zmq_port) from sender_info."""
+        actual = self._resolve_sender_info(sender_info, sender_stage_id=self.recv_stages[0])
+        if not actual or "host" not in actual:
+            return None, None
+        port = actual.get("zmq_port")
+        return actual.get("host"), (int(port) if port is not None else None)
+
+    def _has_enough_prefetch_device_mem(self, device: torch.device | None) -> bool:
+        """False when free-device-memory fraction is below the prefetch threshold.
+
+        CUDA/NPU only; other platforms report unconstrained (throttle skipped).
+        """
+        ratio = self._prefetch_min_free_mem_ratio
+        if ratio <= 0.0 or device is None:
+            return True
+        try:
+            free, total = current_omni_platform.get_device_memory(device)
+        except Exception:
+            return True
+        return total <= 0 or (free / total) >= ratio
+
+    @staticmethod
+    def _release_pool_buffers(buffers: list[Any]) -> None:
+        """Release all pool buffers in *buffers* and clear the list."""
+        if not buffers:
+            return
+        for buf in buffers:
+            try:
+                buf.release()
+            except Exception:
+                logger.exception("Failed to release KV pool buffer")
+        buffers.clear()
+
+    def start_prefetch(
+        self, kv_prefetch_jobs: dict[str, Any] | None, target_device: torch.device | None = None
+    ) -> None:
+        """Kick off a background KV load (non-blocking). No-op unless prefetch enabled."""
+        if not (self._async_prefetch and self.config.need_recv_cache) or not kv_prefetch_jobs:
+            return
+        # Followers receive via collective distribute; bg pull would consume the owner's payload.
+        if self.topo_config.is_follower:
+            return
+        rid = kv_prefetch_jobs.get("request_id")
+        if not rid:
+            return
+        # Memory pressure → skip prefetch; sync receive handles it.
+        if not self._has_enough_prefetch_device_mem(target_device):
+            logger.warning(
+                "Skip KV prefetch for %s: device free mem below %.2f", rid, self._prefetch_min_free_mem_ratio
+            )
+            return
+        # Serial mode: at most one outstanding prefetch; drop any leftover request's future.
+        for stale_rid in [k for k in self._prefetch_futures if k != rid]:
+            self._discard_future(stale_rid)
+        if rid in self._prefetch_futures:
+            return
+        sender_info = kv_prefetch_jobs.get("kv_sender_info")
+        if not sender_info:
+            # No explicit endpoint → bg receive would target wrong sender under multi-replica.
+            logger.debug("Skip KV prefetch for %s: stub has no kv_sender_info", rid)
+            return
+        try:
+            self._prefetch_futures[rid] = self._prefetch_executor.submit(
+                self._prefetch_payload, rid, sender_info, target_device
+            )
+        except Exception:
+            logger.exception("Failed to submit KV prefetch for %s", rid)
+
+    def _prefetch_payload(
+        self,
+        request_id: str,
+        sender_info: dict[str, Any] | None,
+        target_device: torch.device | None,
+    ) -> tuple[dict[str, Any] | None, int]:
+        """Bg-thread body: get + deserialize + H2D on the dedicated ``_bg_copy_stream``.
+
+        Raises on failure (payload may be consumed → no sync retry).
+        """
+        try:
+            on_device = target_device is not None and target_device.type != "cpu"
+            if on_device:
+                # bg thread doesn't inherit the main thread's current device.
+                torch.accelerator.set_device_index(target_device.index)
+                if self._bg_copy_stream is None:
+                    assert self._prefetch_executor._max_workers == 1
+                    self._bg_copy_stream = current_omni_platform.Stream()
+                with current_omni_platform.stream(self._bg_copy_stream):
+                    data, size = self.receive_kv_cache_for_request(
+                        request_id, target_device=target_device, sender_info=sender_info
+                    )
+            else:
+                data, size = self.receive_kv_cache_for_request(
+                    request_id, target_device=target_device, sender_info=sender_info
+                )
+        except Exception:
+            logger.exception("KV prefetch payload failed for %s (payload may be lost)", request_id)
+            raise
+
+        if data is None:
+            return None, 0
+        return data, size
+
+    def consume_prefetched_kv(self, req: Any) -> tuple[dict[str, Any] | None, int]:
+        """Consume a prefetched KV payload; (None, 0) on miss/recoverable failure.
+
+        Raises ``KVPrefetchConsumeError`` when consumed but post-get failed (no fallback).
+        """
+        request_id = self._resolve_request_id(req)
+        if not request_id:
+            return None, 0
+
+        fut = self._prefetch_futures.pop(request_id, None)
+        # Serial mode: any other request still in the table is an orphan — drop it.
+        for stale_rid in list(self._prefetch_futures):
+            self._discard_future(stale_rid)
+
+        if fut is None:
+            return None, 0
+
+        try:
+            return fut.result()
+        except KVPrefetchConsumeError:
+            logger.exception("KV load failed for %s (payload consumed, cannot retry)", request_id)
+            raise
+        except Exception:
+            logger.exception("KV load failed for %s; falling back to sync receive", request_id)
+            return None, 0
+
+    def _discard_future(self, request_id: str) -> None:
+        """Cancel an unstarted prefetch or attach a callback to drop a running one."""
+        fut = self._prefetch_futures.pop(request_id, None)
+        if fut is None:
+            return
+        if not fut.cancel():
+            fut.add_done_callback(_drop_prefetch_result)
+
+    def shutdown_prefetch(self) -> None:
+        """Cancel pending prefetches and stop the executor (call on teardown)."""
+        for rid in list(self._prefetch_futures):
+            self._discard_future(rid)
+        if self._prefetch_executor is not None:
+            try:
+                self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                logger.exception("Failed to shut down KV prefetch executor")
+            self._prefetch_executor = None
+
+    @staticmethod
+    def _record_stream_for_prefetched(data: dict[str, Any]) -> None:
+        """``record_stream(current_stream)`` on GPU tensors in *data*.
+
+        Protects prefetch-thread tensors from allocator reuse on LEADER collective paths.
+        """
+        if not isinstance(data, dict) or "layer_blocks" not in data:
+            return
+        if current_omni_platform.get_device_count() < 1:
+            return
+        current_stream = current_omni_platform.current_stream()
+        layer_blocks = data["layer_blocks"]
+        for cache_list in (layer_blocks.get("key_cache", []), layer_blocks.get("value_cache", [])):
+            for tensor in cache_list:
+                if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
+                    tensor.record_stream(current_stream)
+
     @torch.inference_mode()
     def receive_kv_cache_for_request(
         self,
         request_id: str,
         target_device: torch.device | None = None,
+        *,
+        sender_info: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, int]:
-        """Receive KV cache for a specific request.
+        """Receive KV cache for *request_id*; returns (data dict, size) or (None, 0).
 
-        This implements the receiving logic from gpu_diffusion_model_runner.py.
-
-        Args:
-            request_id: The request ID to receive KV cache for
-            target_device: Optional device to move tensors to
-
-        Returns:
-            Tuple of (data dict, size) if successful, (None, 0) otherwise
+        ``sender_info`` overrides instance ``_sender_base_*`` (per-call endpoint).
         """
-        # Check if we should receive KV cache based on config
         if not self.config.need_recv_cache:
             logger.debug("Skip receiving KV cache for %s (need_recv_cache=False)", request_id)
             return None, 0
@@ -1031,6 +1365,13 @@ class OmniKVTransferManager:
         )
         pending_pairs = list(recv_key_pairs)
         received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
+        deferred_memory: list[Any] = []
+
+        # Per-call sender_info takes precedence over instance fields.
+        if sender_info is not None:
+            base_host, base_port = self._resolve_sender_base(sender_info)
+        else:
+            base_host, base_port = self._sender_base_host, self._sender_base_zmq_port
 
         logger.info(
             "Wait for KV cache for request %s from stage %s to %s via %s key(s)...",
@@ -1044,16 +1385,21 @@ class OmniKVTransferManager:
             while True:
                 link_start = time.perf_counter()
                 for get_key, from_rank in list(pending_pairs):
-                    # Construct per-rank metadata so the connector queries
-                    # the correct sender endpoint (heterogeneous TP path).
-                    # When from_rank is None (TP<=1), metadata stays None
-                    # and the connector falls back to its default sender.
                     rank_metadata: dict[str, Any] | None = None
-                    if from_rank is not None and self._sender_base_host and self._sender_base_zmq_port is not None:
+                    build_meta = from_rank is not None or sender_info is not None
+                    if build_meta and base_host and base_port is not None:
                         rank_metadata = {
-                            "source_host": self._sender_base_host,
-                            "source_port": self._sender_base_zmq_port + from_rank * KV_RANK_PORT_STRIDE,
+                            "source_host": base_host,
+                            "source_port": base_port + (from_rank or 0) * KV_RANK_PORT_STRIDE,
                         }
+                    elif sender_info is not None:
+                        logger.error(
+                            "KV receive for %s: unresolved per-call sender_info (host=%s, port=%s); aborting",
+                            request_id,
+                            base_host,
+                            base_port,
+                        )
+                        return None, 0
 
                     result = self.connector.get(
                         from_stage=from_stage,
@@ -1065,25 +1411,19 @@ class OmniKVTransferManager:
                         continue
 
                     raw_data, size = result
-                    managed_buffer = None
 
                     if hasattr(raw_data, "tensor") and hasattr(raw_data, "release"):
-                        managed_buffer = raw_data
                         try:
                             buf_tensor = raw_data.tensor
                             if getattr(buf_tensor.device, "type", "cpu") != "cpu":
                                 data = KVCacheTransferData.from_bytes_device(buf_tensor)
                                 raw_data.release()
-                                managed_buffer = None
                             else:
                                 data = KVCacheTransferData.from_bytes(memoryview(buf_tensor.numpy()))
-                                data = self._clone_received_payload_tensors(data)
-                                raw_data.release()
-                                managed_buffer = None
+                                deferred_memory.append(raw_data)
                         except Exception as e:
                             logger.error("Failed to deserialize KV cache from ManagedBuffer: %s", e)
-                            if managed_buffer is not None:
-                                raw_data.release()
+                            raw_data.release()
                             return None, 0
                     elif isinstance(raw_data, (bytes, bytearray)):
                         data = KVCacheTransferData.from_bytes(raw_data)
@@ -1110,20 +1450,27 @@ class OmniKVTransferManager:
                         data = merge_received_rank_shards(ordered_payloads, merger=self.kv_payload_merger)
                     data = slice_received_rank_shard(data, topo, slicer=self.kv_payload_slicer)
 
+                    needs_clone = bool(deferred_memory)
                     try:
                         if isinstance(data, dict) and "layer_blocks" in data:
                             layer_blocks = data["layer_blocks"]
-                            for cache_list in [
+                            cache_lists = [
                                 layer_blocks.get("key_cache", []),
                                 layer_blocks.get("value_cache", []),
-                            ]:
+                            ]
+                            for cache_list in cache_lists:
                                 for i, tensor in enumerate(cache_list):
                                     if not isinstance(tensor, torch.Tensor):
                                         continue
                                     if target_device is not None and tensor.device != target_device:
                                         cache_list[i] = tensor.to(target_device).contiguous()
-                    except Exception:
-                        logger.exception("Failed to move KV cache tensors to target device")
+                                    elif needs_clone:
+                                        cache_list[i] = tensor.clone()
+                    except Exception as exc:
+                        logger.exception("Failed to detach/move KV cache tensors for %s", request_id)
+                        raise KVPrefetchConsumeError(
+                            f"Post-get processing failed for {request_id} (payload already consumed)"
+                        ) from exc
 
                     logger.info(
                         "Successfully received KV cache for %s, %s bytes across %s key(s), wait=%.3fs, link=%.1fms",
@@ -1142,9 +1489,13 @@ class OmniKVTransferManager:
                 time.sleep(poll_interval)
                 poll_interval = min(poll_interval * 2, max_poll_interval)
 
+        except KVPrefetchConsumeError:
+            raise
         except Exception:
             logger.exception("Error receiving KV cache for %s", request_id)
             return None, 0
+        finally:
+            self._release_pool_buffers(deferred_memory)
 
     def apply_kv_cache_to_request(self, req: Any, data: dict[str, Any]) -> None:
         """Apply received KV cache data to a request object.
@@ -1246,130 +1597,253 @@ class OmniKVTransferManager:
 
         return primary_ok
 
+    def _extract_primary_kv_obj(self, kv_payload: dict[str, Any]) -> Any | None:
+        """Return the primary KV object (``SimpleNamespace(key_cache, value_cache)``)."""
+        for key in ("past_key_values", "sp.past_key_values"):
+            obj = kv_payload.get(key)
+            if obj is not None and hasattr(obj, "key_cache"):
+                return obj
+        return None
+
+    def _pack_kv_payload(self, kv_payload: dict[str, Any] | None, device: torch.device) -> torch.Tensor | None:
+        """Pack a KV payload into one uint8 tensor on device
+        Layout: ``[4B side_len][msgpack side_bytes][gpu blob]``.
+        Returns None on failure."""
+        if not kv_payload:
+            return None
+        primary = self._extract_primary_kv_obj(kv_payload)
+        if primary is None:
+            return None
+
+        key_cache = _move_to_device(getattr(primary, "key_cache", []) or [], device)
+        value_cache = _move_to_device(getattr(primary, "value_cache", []) or [], device)
+        if not any(isinstance(t, torch.Tensor) for t in key_cache):
+            return None
+        td = KVCacheTransferData(
+            request_id="",
+            layer_blocks={"key_cache": key_cache, "value_cache": value_cache},
+            block_ids=[],
+            metadata={},
+        )
+        try:
+            blob = td.to_gpu_tensor()
+        except Exception:
+            logger.exception("D2D: failed to pack primary KV; falling back to object transport")
+            return None
+
+        # Side-payload: replace the heavy primary with a sentinel, msgpack the rest.
+        side = dict(kv_payload)
+        for key in ("past_key_values", "sp.past_key_values"):
+            if side.get(key) is primary:
+                side[key] = _KV_PLACEHOLDER
+
+        try:
+            side_bytes = OmniSerializer.serialize(side)
+        except Exception:
+            logger.exception("D2D: failed to serialize side-payload; falling back to object transport")
+            return None
+        side_len = len(side_bytes)
+        side_tensor = torch.frombuffer(bytearray(side_bytes), dtype=torch.uint8).to(device)
+
+        # [4B side_len][side_bytes][blob]
+        header = torch.tensor([side_len], dtype=torch.int32, device=device).view(torch.uint8)
+        combined = torch.cat([header, side_tensor, blob])
+        return combined
+
+    def _unpack_kv_payload(self, combined: torch.Tensor) -> dict[str, Any] | None:
+        """Inverse of :meth:`_pack_kv_payload`."""
+        if combined is None or combined.numel() == 0:
+            return None
+
+        offset = 4
+        side_len = int(combined[:offset].cpu().view(torch.int32).item())
+        if side_len <= 0 and combined.numel() > offset:
+            # Corrupt/zeroed blob (sender-side failure) → treat as miss; raising
+            # would crash only the receiver and desync the group.
+            logger.warning(
+                "D2D: corrupt KV payload (side_len=%d, total_bytes=%d, likely sender-side failure); treating as miss",
+                side_len,
+                combined.numel(),
+            )
+            return None
+        side_bytes = combined[offset : offset + side_len].cpu().numpy().tobytes()
+        offset += side_len
+        side: dict[str, Any] = OmniSerializer.deserialize(side_bytes)
+
+        # Rebuild primary KV from the trailing blob and restore it in place.
+        primary: Any = None
+        blob = combined[offset:]
+        if blob.numel() > 0:
+            from types import SimpleNamespace
+
+            data = KVCacheTransferData.from_bytes_device(blob)
+            lb = data["layer_blocks"]
+            primary = SimpleNamespace(key_cache=lb.get("key_cache"), value_cache=lb.get("value_cache"))
+
+        for key in ("past_key_values", "sp.past_key_values"):
+            if side.get(key) == _KV_PLACEHOLDER:
+                side[key] = primary
+        return side
+
+    def _broadcast_kv_payload(
+        self, group: Any, kv_payload: dict[str, Any] | None, device: torch.device, src: int = 0
+    ) -> dict[str, Any] | None:
+        """Broadcast KV payload via packed tensor; falls back to ``broadcast_object`` on packing failure.
+
+        The packed-tensor path uses a two-phase collective (size then data).
+        Both phases must always be called together — a rank entering only
+        one phase will deadlock the group.
+        """
+        is_src = group.rank_in_group == src
+        if is_src:
+            combined = self._pack_kv_payload(kv_payload, device)
+            if combined is None:
+                group.broadcast_object(kv_payload, src=src)  # packing failed -> object
+                return kv_payload
+            group.broadcast_object(int(combined.numel()), src=src)
+            group.broadcast(combined, src=src)
+            return kv_payload
+
+        size_obj = group.broadcast_object(None, src=src)
+        if size_obj is None or not isinstance(size_obj, int):
+            return size_obj  # src fell back to object
+        combined = torch.empty(size_obj, dtype=torch.uint8, device=device)
+        group.broadcast(combined, src=src)
+        return self._unpack_kv_payload(combined)
+
+    def _send_kv_payload(self, group: Any, kv_payload: dict[str, Any] | None, dst: int, device: torch.device) -> None:
+        """Point-to-point send; falls back to ``send_object`` on packing failure."""
+        combined = self._pack_kv_payload(kv_payload, device)
+        if combined is None:
+            group.send_object(kv_payload, dst)
+            return
+        size = int(combined.numel())
+        group.send_object(size, dst)
+        try:
+            group.send(combined, dst)
+        except Exception:
+            logger.exception("D2D: send(combined) to rank %d failed; sending zero sentinel", dst)
+            combined.zero_()
+            group.send(combined, dst)
+            raise
+
+    def _recv_kv_payload(self, group: Any, src: int, device: torch.device) -> dict[str, Any] | None:
+        """Inverse of :meth:`_send_kv_payload`."""
+        size_or_obj = group.recv_object(src)
+        if not isinstance(size_or_obj, int):
+            return size_or_obj
+        combined = group.recv(torch.Size([size_or_obj]), torch.uint8, src)
+        combined = combined.to(device)
+        return self._unpack_kv_payload(combined)
+
     def receive_multi_kv_cache_distributed(
         self,
         req: Any,
         cfg_kv_collect_func: Callable | None = None,
         target_device: torch.device | None = None,
     ) -> bool:
-        """Distributed wrapper around :meth:`receive_multi_kv_cache`.
-
-        TP-aware path selection:
-        - world size 1: direct receive
-        - TP active, cfg size 1: each rank independently receives
-        - TP active, cfg size > 1: cfg-rank 0 receives, then broadcasts to
-          peers that share the same TP rank
-        - TP inactive: legacy rank-0 receive then world broadcast
-        """
-        from vllm_omni.diffusion.distributed.parallel_state import (
-            get_cfg_group,
-            get_classifier_free_guidance_rank,
-            get_classifier_free_guidance_world_size,
-            get_sequence_parallel_rank,
-            get_sequence_parallel_world_size,
-            get_sp_group,
-            get_world_group,
-        )
-
-        world = get_world_group()
-
-        if world.world_size <= 1:
-            return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
-
-        topo = self._tp_topo
-        tp_active = topo.source_tp_size > 1 or topo.target_tp_size > 1
-        cfg_size = 1
-        cfg_rank = 0
-        cfg_group = None
-        sp_size = 1
-        sp_rank = 0
-        sp_group = None
-        try:
-            cfg_size = get_classifier_free_guidance_world_size()
-            cfg_rank = get_classifier_free_guidance_rank()
-            cfg_group = get_cfg_group()
-        except Exception:
-            cfg_size = 1
-            cfg_rank = 0
-            cfg_group = None
-
-        try:
-            sp_size = get_sequence_parallel_world_size()
-            sp_rank = get_sequence_parallel_rank()
-            sp_group = get_sp_group()
-        except Exception:
-            sp_size = 1
-            sp_rank = 0
-            sp_group = None
-
-        if tp_active and (cfg_size <= 1 and sp_size <= 1):
-            logger.info(
-                "Rank-aware KV receive: rank %s independently receiving (from_tp=%s, to_tp=%s)",
-                topo.local_rank,
-                topo.source_tp_size,
-                topo.target_tp_size,
-            )
-            return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
-
-        if tp_active and (cfg_size > 1 or sp_size > 1):
-            kv_payload: dict[str, object] | None = None
-            is_owner = cfg_rank == 0 and sp_rank == 0
-
-            # step1: only owner need to receive
-            if is_owner:
-                received = self.receive_multi_kv_cache(
-                    req,
-                    cfg_kv_collect_func,
-                    torch.device("cpu"),
-                )
-                if received:
-                    if cfg_size > 1:  # build cfg-local payloads
-                        cfg_rank_payloads = self._build_cfg_rank_local_payloads(
-                            req,
-                            cfg_size,
-                        )
-                        kv_payload = cfg_rank_payloads[0]
-                        # send to other cfg
-                        for dst_cfg_rank in range(1, cfg_size):
-                            cfg_group.send_object(
-                                cfg_rank_payloads[dst_cfg_rank],
-                                dst_cfg_rank,
-                            )
-                    elif sp_size > 1:
-                        kv_payload = self._collect_request_kv_payload(req)
-                else:
-                    # Owner receive failed: send None sentinel to CFG followers to avoid deadlock
-                    if cfg_size > 1:
-                        for dst_cfg_rank in range(1, cfg_size):
-                            cfg_group.send_object(None, dst_cfg_rank)
-            elif sp_rank == 0 and cfg_size > 1:
-                kv_payload = cfg_group.recv_object(0)
-            # sp broadcast
-            if sp_size > 1 and sp_group is not None:
-                kv_payload = sp_group.broadcast_object(
-                    kv_payload,
-                    src=0,
-                )
-
-            if not kv_payload:
-                return False
-
+        """Synchronous receive: fetch → distribute → apply (FOLLOWER skips fetch)."""
+        received = False
+        if not self.topo_config.is_follower:
+            received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
+        kv_payload = self.distribute_kv_cache(req, target_device, received=received)
+        if kv_payload is not None:
             self._apply_request_kv_payload(req, kv_payload, target_device)
-            return True
+        return received or kv_payload is not None
 
-        kv_payload: dict[str, object] | None = None
-        if world.rank_in_group == 0:
-            received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
-            if received:
-                kv_payload = self._collect_request_kv_payload(req)
+    def consume_and_distribute_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
+        """Consume prefetched KV → apply → distribute; sync-receive on miss (no retry on consume-error)."""
+        received = False
+        payload_consumed = False
+        if self._async_prefetch and not self.topo_config.is_follower:
+            try:
+                data, _ = self.consume_prefetched_kv(req)
+                if data is not None:
+                    self._record_stream_for_prefetched(data)
+                    self.apply_kv_cache_to_request(req, data)
+                    received = True
+            except KVPrefetchConsumeError:
+                logger.error(
+                    "KV prefetch consumed payload for %s but post-get failed; request cannot recover",
+                    self._resolve_request_id(req),
+                )
+                payload_consumed = True
+        # Only fall back to sync receive on miss, not when payload was
+        # already consumed from the connector (sync receive would block
+        # until timeout as the data is gone).
+        if not received and not self.topo_config.is_follower and not payload_consumed:
+            logger.debug("KV prefetch miss for %s; falling back to sync receive", self._resolve_request_id(req))
+            received = self.receive_multi_kv_cache(req, None, target_device)
+        kv_payload = self.distribute_kv_cache(req, target_device, received=received)
+        if kv_payload is not None:
+            self._apply_request_kv_payload(req, kv_payload, target_device)
+        return received or kv_payload is not None
 
-        kv_payload = world.broadcast_object(kv_payload, src=0)
+    def _cfg_scatter(
+        self,
+        group: Any,
+        payloads: list[Any],
+        cfg_size: int,
+        device: torch.device | None,
+        request_id: str | None = None,
+    ) -> None:
+        """Scatter one payload per CFG follower."""
+        for dst in range(1, cfg_size):
+            try:
+                self._send_kv_payload(group, payloads[dst], dst, device)
+            except Exception:
+                logger.warning("CFG scatter to rank %d failed for %s; that rank runs without KV", dst, request_id)
+                continue
 
-        if not kv_payload:
-            return False
+    def distribute_kv_cache(
+        self, req: Any, target_device: torch.device | None = None, *, received: bool = False
+    ) -> dict[str, Any] | None:
+        """Distribute KV LEADER→FOLLOWER. No-op for LOCAL/pure TP."""
+        pt = self.topo_config
 
-        self._apply_request_kv_payload(req, kv_payload, target_device)
-        return True
+        # LOCAL: no distribution.
+        if pt.is_local:
+            return None
+
+        device = target_device if target_device is not None else torch.device("cpu")
+        # TP + CFG/SP
+        if pt.tp_active and (pt.cfg_active or pt.sp_active):
+            kv_payload: dict[str, object] | None = None
+            if pt.is_leader:
+                if pt.cfg_active:
+                    payloads = (
+                        self._build_cfg_rank_local_payloads(req, pt.cfg_size) if received else [None] * pt.cfg_size
+                    )
+                    kv_payload = payloads[0]
+                    self._cfg_scatter(pt.cfg_group, payloads, pt.cfg_size, device, self._resolve_request_id(req))
+                elif pt.sp_active:
+                    kv_payload = self._collect_request_kv_payload(req) if received else None
+                if pt.sp_active and pt.sp_group is not None:
+                    kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, device, src=0)
+            elif pt.is_follower:
+                if pt.cfg_active and pt.sp_rank == 0:
+                    kv_payload = self._recv_kv_payload(pt.cfg_group, 0, device)
+                if pt.sp_active and pt.sp_group is not None:
+                    kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, device, src=0)
+            else:
+                logger.error("distribute_kv_cache: unexpected role %s in TP+CFG/SP path", pt.role)
+                return None
+            return kv_payload or None
+
+        # TP inactive, world broadcast
+        kv_payload = None
+        if pt.is_leader and received:
+            kv_payload = self._collect_request_kv_payload(req)
+        kv_payload = self._broadcast_kv_payload(pt.world, kv_payload, device, src=0)
+        return kv_payload or None
+
+
+def _drop_prefetch_result(fut: Any) -> None:
+    try:
+        if not fut.cancelled():
+            fut.result()
+    except Exception:
+        pass
 
 
 def _move_to_device(obj: object, device: torch.device) -> object:

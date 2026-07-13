@@ -140,6 +140,13 @@ class StageRuntime:
         self.stage_pools: list[StagePool] = []
         self._stage_init_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._spawn_device_lock = threading.Lock()
+        # Serialize all LLM replica spawning + handshake across device groups
+        # to prevent ZMQ port-allocation races (get_engine_zmq_addresses) and
+        # CUDA-context conflicts when multiple engine core subprocesses
+        # initialize simultaneously on different GPUs.  Matches the old
+        # AsyncOmniEngine._initialize_llm_replica pattern which used a single
+        # ``llm_stage_launch_lock`` for all replicas.
+        self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
 
     @staticmethod
@@ -559,19 +566,22 @@ class StageRuntime:
                     plan.engine_args_dict,
                     stage_init_timeout,
                 )
-            with launch_stage_replica(
-                vllm_config=vllm_config,
-                executor_class=executor_class,
-                log_stats=False,
-                stage_id=plan.metadata.stage_id,
-                replica_id=plan.replica_id,
-                stage_config=plan.stage_cfg,
-                omni_master_server=self._get_omni_master_server(),
-                omni_coordinator_address=self._get_coordinator_address(),
-                stage_visible_devices=physical_devices,
-                spawn_device_lock=self._spawn_device_lock,
-            ) as resources:
-                pass
+            # Serialize engine-core spawning across all LLM replicas to avoid
+            # ZMQ port-allocation races and simultaneous CUDA context init.
+            with self._replica_launch_lock:
+                with launch_stage_replica(
+                    vllm_config=vllm_config,
+                    executor_class=executor_class,
+                    log_stats=False,
+                    stage_id=plan.metadata.stage_id,
+                    replica_id=plan.replica_id,
+                    stage_config=plan.stage_cfg,
+                    omni_master_server=self._get_omni_master_server(),
+                    omni_coordinator_address=self._get_coordinator_address(),
+                    stage_visible_devices=physical_devices,
+                    spawn_device_lock=self._spawn_device_lock,
+                ) as resources:
+                    pass
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
             if resources is None:

@@ -25,6 +25,8 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 
+from vllm_omni.platforms import current_omni_platform
+
 try:
     from stepaudio2 import Token2wav as _Token2wav
 
@@ -379,7 +381,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 break
         else:
             num_tokens = 1
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
         hidden_size = int(getattr(self, "_hidden_size", 768) or 768)
         return torch.zeros((num_tokens, hidden_size), device=device, dtype=torch.bfloat16)
 

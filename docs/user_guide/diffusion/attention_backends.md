@@ -20,6 +20,8 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
 | `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
+| `FLASH_ATTN_HUB` | FlashAttention 2 from HuggingFace `kernels` library. Useful for train/rollout alignment. |
+| `FLASH_ATTN_3_HUB` | FlashAttention 3 from HuggingFace `kernels` library. CUDA Hopper (sm_90+) only; falls back to `FLASH_ATTN_HUB` on older GPUs. |
 
 
 ## Configuration
@@ -209,6 +211,36 @@ Notes:
 
 - `SAGE_ATTN_3` is only selected on CUDA when `sageattn3` is importable and the GPU is Blackwell-class.
 - SageAttention3's Blackwell kernel assumes `Hq == Hkv`. In vLLM-Omni, GQA/MQA diffusion requests fall back to PyTorch SDPA for correctness.
+
+## HuggingFace Kernels Hub Backends
+
+To achieve perfect numerical consistency between **training** (typically using HuggingFace Diffusers with Hub kernels) and **serving/rollout** (using vLLM-Omni), you can use the Hub-based attention backends. This eliminates numerical drift / sampling divergence caused by executing different local kernel versions during rollout.
+
+The following backend options are supported:
+- `FLASH_ATTN_HUB` (HuggingFace `kernels-community/flash-attn2`)
+- `FLASH_ATTN_3_HUB` (HuggingFace `kernels-community/flash-attn3`, Hopper sm_90+ only)
+
+### Installation
+
+To use these backends, you must install the `kernels` library:
+
+```bash
+pip install kernels==0.14.1
+```
+
+If the `kernels` library is not available in the environment, vLLM-Omni will log a warning and fall back gracefully to the corresponding local backend implementations (`FLASH_ATTN`). On CUDA GPUs below Hopper (compute capability < 9.0), `FLASH_ATTN_3_HUB` falls back to `FLASH_ATTN_HUB`.
+
+### Usage
+
+Select a Hub backend using the global CLI flag or environment variables:
+
+```bash
+# Environment variable
+export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN_HUB
+
+# CLI flag
+vllm-omni serve <model> --diffusion-attention-backend FLASH_ATTN_HUB
+```
 
 ## Usage Examples
 

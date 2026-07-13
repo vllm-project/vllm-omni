@@ -57,6 +57,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     glm_tts,
     higgs_audio_v2,
     higgs_audio_v3,
+    indextts2,
     ming_tts,
     moss_tts,
     omnivoice,

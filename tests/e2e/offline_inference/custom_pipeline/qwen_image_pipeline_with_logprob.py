@@ -21,7 +21,7 @@ from tests.e2e.offline_inference.custom_pipeline.flow_match_sde_scheduler import
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 
 def _maybe_to_cpu(v):
@@ -33,6 +33,8 @@ def _maybe_to_cpu(v):
 # Custom pipeline class for QwenImage that returns log probabilities during the diffusion process.
 # This is for test
 class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
+    supports_request_batch = False
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         self.device = get_local_device()
@@ -211,7 +213,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt_ids: torch.Tensor | list[int] | None = None,
         prompt_mask: torch.Tensor | None = None,
         negative_prompt_ids: torch.Tensor | list[int] | None = None,
@@ -239,8 +241,12 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         sde_type: Literal["sde", "cps"] = "sde",
         logprobs: bool = True,
     ) -> DiffusionOutput:
-        # Extract prompt data from OmniCustomPrompt in req.prompts[0]
-        custom_prompt = req.prompts[0] if req.prompts else {}
+        if req.num_reqs != 1:
+            raise ValueError("QwenImagePipelineWithLogProbForTest supports only single-request forward.")
+        request = req.requests[0]
+
+        # Extract prompt data from OmniCustomPrompt in req.prompt
+        custom_prompt = request.prompt if request.prompt is not None else {}
         if isinstance(custom_prompt, dict):
             prompt_ids = custom_prompt.get("prompt_ids", prompt_ids)
             prompt_mask = custom_prompt.get("prompt_mask", prompt_mask)
@@ -248,7 +254,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
             negative_prompt_mask = custom_prompt.get("negative_prompt_mask", negative_prompt_mask)
 
         # Read sampling params from req.sampling_params
-        sp = req.sampling_params
+        sp = request.sampling_params
         height = sp.height or self.default_sample_size * self.vae_scale_factor
         width = sp.width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = sp.num_inference_steps or num_inference_steps

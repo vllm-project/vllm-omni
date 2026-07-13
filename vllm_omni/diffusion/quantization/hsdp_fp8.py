@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HSDP/FSDP2 compatibility for online FP8 quantization.
 
-vllm's ``Fp8OnlineLinearMethod.process_weights_after_loading`` ends with
+vllm's ``Fp8LinearMethod.process_weights_after_loading`` ends with
 ``layer.weight = qweight.t()`` so that the Cutlass FP8 GEMM kernel sees its
 B operand as column-major ``[K, N]`` (the TN layout required by Hopper FP8
 ``wgmma`` instructions). The resulting tensor is a non-contiguous transpose
@@ -32,7 +32,7 @@ import types
 
 from torch import nn
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.fp8 import Fp8OnlineLinearMethod
+from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 
 logger = init_logger(__name__)
 
@@ -55,7 +55,7 @@ def _build_transposed_get_layer_params(original_bound_method):
 def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
     """Make online-FP8 linear layers in ``model`` FSDP2-compatible.
 
-    For every layer whose ``quant_method`` is an :class:`Fp8OnlineLinearMethod`
+    For every layer whose ``quant_method`` is an :class:`Fp8LinearMethod`
     and whose weight is currently a non-contiguous transpose view, this
     function:
 
@@ -76,7 +76,7 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
     patched_kernel_ids: set[int] = set()
     for module in model.modules():
         qm = getattr(module, "quant_method", None)
-        if not isinstance(qm, Fp8OnlineLinearMethod):
+        if not isinstance(qm, Fp8LinearMethod):
             continue
 
         weight = getattr(module, "weight", None)

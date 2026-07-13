@@ -49,6 +49,7 @@ class SessionManager:
                 key_frames_per_chunk=config.mid_term_key_frames,
                 mid_term_max_tokens=config.mid_term_max_tokens,
                 long_term_max_tokens=config.long_term_max_tokens,
+                max_pixels=config.max_pixels,
             )
         self._delegation = self._build_delegation(config) if config.enable_delegation else None
         self._sessions: dict[str, InteractionSession] = {}

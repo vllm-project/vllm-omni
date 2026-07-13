@@ -1,0 +1,76 @@
+# IndexTTS2 low-latency deploy profile.
+#
+# Stage 0 (GPT2 AR talker) uses vLLM FULL_DECODE_ONLY CUDA graph + FlashInfer
+# attention backend + async_scheduling=false, mirroring the Higgs low-latency
+# profile. This reduces decode launch overhead and per-step scheduling
+# fragmentation for c1-c4 workloads.
+#
+# Usage:
+#   vllm serve IndexTeam/IndexTTS-2 --omni --trust-remote-code \
+#     --deploy-config vllm_omni/deploy/indextts2_low_latency.yaml
+#
+# For 2-GPU testing, copy this file and set stage 1 devices: "1".
+
+async_chunk: false
+trust_remote_code: true
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: false
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+stages:
+  - stage_id: 0
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.6
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    tokenizer: gpt2
+    enforce_eager: false
+    attention_backend: FLASHINFER
+    async_scheduling: false
+    max_num_batched_tokens: 4096
+    max_model_len: 2560
+    devices: "0"
+    compilation_config:
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      cudagraph_num_of_warmups: 1
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.8
+      top_k: 30
+      max_tokens: 1500
+      repetition_penalty: 10.0
+      stop_token_ids: [8193]
+      detokenize: false
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.4
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    tokenizer: gpt2
+    enforce_eager: true
+    async_scheduling: true
+    max_num_batched_tokens: 8192
+    max_model_len: 32768
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    hf_overrides:
+      diffusion_steps: 12
+      s2mel_dit_bf16: true
+      s2mel_vocoder_bf16: true
+      s2mel_vocoder_cuda_graph: true
+      s2mel_dit_cuda_graph: true
+      s2mel_dit_cuda_graph_max_graphs: 4
+      s2mel_vocoder_capture_sizes: [128, 256, 384, 512]
+      s2mel_vocoder_compile_shapes: [256, 384, 512]
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 32767

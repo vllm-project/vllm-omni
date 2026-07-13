@@ -68,10 +68,11 @@ nav:
         - Hybrid Sharded Data Parallel: user_guide/diffusion/parallelism/hsdp.md
         - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
         - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
-        - VAE Patch Parallel: user_guide/diffusion/parallelism/vae_patch_parallel.md
+        - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallelism.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
       - LoRA: user_guide/diffusion/lora.md
       - Custom Pipeline: features/custom_pipeline.md
+      - Request-Level Batching: user_guide/diffusion/request_batching.md
       - Step Execution: user_guide/diffusion/step_execution.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
@@ -118,6 +119,7 @@ nav:
       - design/feature/async_chunk.md
       - design/feature/vae_parallel.md
       - design/feature/diffusion_step_execution.md
+      - design/feature/diffusion_request_level_batching.md
       - design/feature/diffusion_continuous_batching.md
     - Module Design:
       - design/module/ar_module.md

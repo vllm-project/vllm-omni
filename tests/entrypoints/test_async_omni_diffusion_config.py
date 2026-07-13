@@ -284,6 +284,29 @@ def test_serve_cli_accepts_diffusion_attention_backend():
     assert diffusion_attention_config.default.backend == "FLASH_ATTN"
 
 
+def test_serve_cli_accepts_request_batch_max_wait_ms():
+    """Ensure diffusion serve CLI forwards request-batch admission wait to stage config."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--request-batch-max-wait-ms",
+            "250",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+
+    assert args.request_batch_max_wait_ms == 250.0
+    assert stage_cfg["engine_args"]["request_batch_max_wait_ms"] == 250.0
+
+
 def test_serve_cli_accepts_additional_config():
     """Ensure diffusion serve CLI exposes additional_config and forwards it to stage config."""
     parser = TrackingArgumentParser()
@@ -320,7 +343,7 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
     )
     mocker.patch(
         "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
-        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage]),
+        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage], None),
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
@@ -336,3 +359,15 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
 
     assert not hasattr(stage_configs[0].engine_args, "additional_config")
     assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_default_stage_config_includes_quantization_config():
+    """Ensure structured quantization_config survives default diffusion-stage creation."""
+    quantization_config = {
+        "method": "example_quant",
+        "weights": "weights.bin",
+    }
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"quantization_config": quantization_config})[0]
+
+    assert stage_cfg["engine_args"]["quantization_config"] == quantization_config

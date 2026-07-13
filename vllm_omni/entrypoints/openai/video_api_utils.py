@@ -423,16 +423,8 @@ def _coerce_audio_to_numpy(audio: Any) -> np.ndarray:
     return arr.astype(np.float32)
 
 
-def _encode_video_bytes(
-    video: Any,
-    fps: int,
-    audio: Any | None = None,
-    audio_sample_rate: int | None = None,
-    video_codec_options: dict[str, str] | None = None,
-) -> bytes:
-    """Encode a video payload into MP4 bytes, optionally muxing audio."""
-    from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
-
+def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
+    """Convert a video payload into contiguous uint8 frames shaped (F, H, W, 3)."""
     frames = _coerce_video_to_frames(video)
     if not frames:
         raise ValueError("No frames found to encode.")
@@ -448,18 +440,77 @@ def _encode_video_bytes(
         frames_np *= 255.0
         frames_u8 = np.round(frames_np).astype(np.uint8)
 
-    # Ensure contiguous memory layout for faster PyAV muxing
-    frames_u8 = np.ascontiguousarray(frames_u8)
+    return np.ascontiguousarray(frames_u8)
+
+
+def _encode_video_bytes(
+    video: Any,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+) -> bytes:
+    """Encode a video payload into MP4 bytes, optionally muxing audio."""
+    from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
     audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
 
     return mux_video_audio_bytes(
-        frames_u8,
+        _coerce_video_to_uint8_frames(video),
         audio_np,
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or 24000,
         video_codec_options=video_codec_options,
     )
+
+
+class FragmentedMP4VideoEncoder:
+    """Normalize video chunks and append them to one fragmented MP4 stream."""
+
+    def __init__(
+        self,
+        *,
+        fps: int | float,
+        video_codec_options: dict[str, str] | None = None,
+    ) -> None:
+        self._fps = float(fps)
+        self._video_codec_options = video_codec_options
+        self._muxer: Any | None = None
+
+    def encode(self, video: Any) -> bytes:
+        """Encode one generated video chunk and return newly emitted fMP4 bytes."""
+        from vllm_omni.diffusion.utils.media_utils import FragmentedMP4Muxer
+
+        frames_u8 = _coerce_video_to_uint8_frames(video)
+        if self._muxer is None:
+            self._muxer = FragmentedMP4Muxer(
+                width=frames_u8.shape[2],
+                height=frames_u8.shape[1],
+                fps=self._fps,
+                video_codec_options=self._video_codec_options,
+            )
+        return self._muxer.mux_video_frames(frames_u8)
+
+    def close(self) -> bytes:
+        """Close the underlying fMP4 muxer and return trailing bytes, if any."""
+        if self._muxer is None:
+            return b""
+        return self._muxer.close()
+
+
+StreamingVideoFormat = Literal["m4s"]
+
+
+def create_streaming_video_encoder(
+    *,
+    output_format: StreamingVideoFormat,
+    fps: int | float,
+    video_codec_options: dict[str, str] | None = None,
+) -> FragmentedMP4VideoEncoder:
+    """Create an incremental encoder for the requested WebSocket video format."""
+    if output_format == "m4s":
+        return FragmentedMP4VideoEncoder(fps=fps, video_codec_options=video_codec_options)
+    raise ValueError(f"Unsupported streaming video format: {output_format}")
 
 
 def encode_video_base64(

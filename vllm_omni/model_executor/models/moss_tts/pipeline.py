@@ -31,7 +31,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_async_chunk"),
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_delay_async_chunk"),
             sampling_constraints={
                 "detokenize": False,
             },
@@ -62,7 +62,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_async_chunk"),
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(
@@ -80,9 +80,42 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
     ),
 )
 
-# The pipeline config is otherwise the same for all 5 variants; the per-variant
-# differences (n_vq, backbone size, generation strategy) are encoded in the
-# HF config.json and the deploy YAML. Realtime is split out because it has a
-# different talker architecture (MossTTSRealtime vs MossTTSDelayModel).
+MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
+    model_type="moss_tts_local",
+    model_arch="MossTTSLocalModel",  # different talker class: GPT2-style local depth transformer
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="moss_tts_local",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            engine_output_type="latent",
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [151645],
+            },
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="moss_tts_local_codec",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="MossTTSCodecDecoder",
+            sync_process_input_func=f"{_PROC}.talker2codec",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
 
-__all__ = ["MOSS_TTS_PIPELINE", "MOSS_TTS_REALTIME_PIPELINE"]
+# The pipeline config is otherwise the same for all variants; the per-variant
+# differences (n_vq, backbone size, generation strategy) are encoded in the
+# HF config.json and the deploy YAML. Realtime and Local are split out because
+# they have different talker architectures from the delay variant
+# (MossTTSRealtime / MossTTSLocalModel vs MossTTSDelayModel).
+
+__all__ = ["MOSS_TTS_PIPELINE", "MOSS_TTS_REALTIME_PIPELINE", "MOSS_TTS_LOCAL_PIPELINE"]

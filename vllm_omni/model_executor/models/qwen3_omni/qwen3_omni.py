@@ -46,6 +46,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+from vllm_omni.platforms import current_omni_platform
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -1222,7 +1223,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             else (
                 talker_hidden_states.device
                 if isinstance(talker_hidden_states, torch.Tensor)
-                else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                else current_omni_platform.get_torch_device()
             )
         )
 

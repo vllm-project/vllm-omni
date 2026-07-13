@@ -100,12 +100,4 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None: ...
 
-    async def add_batch_request_async(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None: ...
-
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None: ...

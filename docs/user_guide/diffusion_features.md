@@ -61,7 +61,7 @@ Memory optimization methods help reduce GPU memory usage, enabling inference on 
 |--------|-------------|----------|
 | **[CPU Offload](diffusion/cpu_offload_diffusion.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
 | **[Quantization](quantization/overview.md)** | Reduces transformer stages from BF16 to FP8/INT8/etc. | Limited VRAM, minimal accuracy loss    |
-| **[VAE Patch Parallelism](diffusion/parallelism/vae_patch_parallel.md)** | Distributes VAE decode tiling across GPUs | High-resolution generation with reduced VAE memory peak |
+| **[VAE Parallelism](diffusion/parallelism/vae_parallelism.md)** | Distributes VAE decode work across GPUs | High-resolution generation with reduced VAE memory peak |
 
 ### Extensions
 
@@ -75,13 +75,17 @@ Extension methods add specialized capabilities to diffusion models beyond standa
 
 ### Execution Modes
 
-Execution modes control how the diffusion pipeline processes denoise steps.
+Execution modes control how the diffusion pipeline processes requests and
+denoise steps.
 
 | Method | Description | Best For |
 |--------|-------------|----------|
+| **[Request-Level Batching](diffusion/request_batching.md)** | Scheduler batches compatible independent diffusion requests into one pipeline forward pass | Bursty online serving and multi-request throughput |
 | **[Step Execution](diffusion/step_execution.md)** | Per-step denoise execution with mid-request abort support | Request cancellation between denoise steps, fine-grained execution control |
 
-**Note:** Step execution is currently supported by QwenImagePipeline only. See [Supported Models](#supported-models) for details.
+**Note:** Request-level batching is available for pipelines that declare the
+request-batch forward contract. Step execution is currently supported by
+QwenImagePipeline only. See [Supported Models](#supported-models) for details.
 
 ### Quantization Methods
 
@@ -101,7 +105,7 @@ The following tables show which models support each feature:
 
 > Notes:
 
-> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only.
+> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only. Split models like Cosmos3 (no separate text encoder) swap their reasoner/generator components for module-wise offload; see the [CPU Offload Guide](diffusion/cpu_offload_diffusion.md).
 > 2. The **💾Quantization** column is collapsed for readability. See [Quantization Overview](quantization/overview.md) for per-method and per-model support details.
 
 ### ImageGen
@@ -117,19 +121,20 @@ The following tables show which models support each feature:
 | **GLM-Image**            |     ❌     |     ❌      |           ❌           |       ✅        |         ✅         |          ❌          |   ✅    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Hidream-I1-Full**        |     ❌     |     ❌      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **HunyuanImage3**        |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ✅        |        ❌         |
+| **Krea 2**               |     ❌     |     ✅      |           ❌           |       ❌        |         ❌         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LongCat-Image**        |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Image-Edit**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **MagiHuman**            |     ❌     |     ❌      |           ❌           |       ❓        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **MammothModa2(T2I)**    |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Nextstep_1(T2I)**      |     ❓     |     ❓      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
-| **OmniGen2**             |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **OmniGen2**             |     ❌     |     ✅      |           ✅           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Ovis-Image**           |     ❌     |     ✅      |           ❌           |       ✅        |         ❌         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Qwen-Image**           |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ✅        |        ✅         |
 | **Qwen-Image-2512**      |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ✅        |        ✅         |
 | **Qwen-Image-Edit**      |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Qwen-Image-Edit-2509** |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |        ✅ (decode)         |          ✅           |       ❌        |        ❌         |
 | **Qwen-Image-Layered**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
-| **SenseNova-U1**         |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **SenseNova-U1**         |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Stable-Diffusion-XL**  |     ❌     |     ❌      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Stable-Diffusion3.5**  |     ❌     |     ✅      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **Z-Image**              |     ✅     |     ✅      |           ✅           |       ❓        |   ✅ (TP=2 only)   |          ❌          |   ✅    |             ❌             |      ✅ (decode)      |       ✅        |        ❌         |
@@ -139,14 +144,15 @@ The following tables show which models support each feature:
 > Notes:
 > 1. Nextstep_1(T2I) does not support cache acceleration methods such as TeaCache or Cache-DiT.
 > 2. `Tongyi-MAI/Z-Image-Turbo` and `SII-GAIR/daVinci-MagiHuman-Base-1080p` are distilled models with minimal NFEs; CFG-Parallel is not necessary.
-> 3. Cosmos3 T2I uses `Cosmos3OmniDiffusersPipeline` with `modalities=["image"]`. Model-level CPU offload is not supported; use layerwise offload.
+> 3. Cosmos3 T2I uses `Cosmos3OmniDiffusersPipeline` with `modalities=["image"]`. Model-level CPU offload swaps the nested UND reasoner and GEN generator pathways; layerwise offload remains available for blockwise GEN/UND offload.
+> 4. Krea 2 currently supports single-GPU inference plus LoRA, Cache-DiT, HSDP, CPU/layerwise offload, and VAE-patch-parallel (decode). TP/SP/CFG-Parallel are not yet wired. The few-step distilled (Turbo) checkpoint uses `is_distilled=true` (fixed timestep shift `mu=1.15`); generate at 2048x2048 by default with `num_inference_steps≈8` and `guidance_scale=0`. The Raw checkpoint uses 1024x1024, `num_inference_steps=28`, and `guidance_scale=4.5`.
 
 ### VideoGen
 
 | Model                        | ⚡TeaCache | ⚡Cache-DiT | 🔀SP (Ulysses & Ring) | 🔀CFG-Parallel | 🔀Tensor-Parallel | Pipeline-Parallel | 🔀HSDP | 💾CPU Offload (Layerwise) | 💾VAE-Patch-Parallel | 💾Quantization | 🔄Step Execution |
 |------------------------------|:---------:|:----------:|:---------------------:|:--------------:|:-----------------:|:-----------------:|:------:|:-------------------------:|:--------------------:|:--------------:|:----------------:|
 | **Wan2.2**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ✅         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
-| **Wan2.2-S2V**               |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |         ❌         |   ❌    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
+| **Wan2.2-S2V**               |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
 | **Wan2.1-VACE**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ❌    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
@@ -270,7 +276,7 @@ Measured on NVIDIA H800:
 **Memory Optimization:**
 
 - **[CPU Offload Guide](diffusion/cpu_offload_diffusion.md)** - Offload model components to CPU, reduce GPU memory usage
-- **[VAE Patch Parallelism Guide](diffusion/parallelism/vae_patch_parallel.md)** - Distribute VAE decode tiling across GPUs for high-resolution images
+- **[VAE Parallelism Guide](diffusion/parallelism/vae_parallelism.md)** - Distribute VAE decode work across GPUs for high-resolution images and videos
 - **[Quantization Overview](quantization/overview.md)** - Overview of quantization methods for diffusion, multi-stage omni/TTS, and multi-stage diffusion models
 
 **Extensions:**

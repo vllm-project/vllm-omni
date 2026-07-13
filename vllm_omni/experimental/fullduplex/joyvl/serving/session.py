@@ -50,6 +50,7 @@ class InteractionSession:
             delegation=delegation,
             chunk_frames=config.chunk_frames,
             long_term_every_n_chunks=config.long_term_every_n_chunks,
+            long_term_window=config.long_term_memory_window,
             keep_qa_history=config.keep_qa_history,
             frame_seconds=config.frame_seconds,
             enable_delegation=config.enable_delegation,
@@ -74,7 +75,7 @@ class InteractionSession:
         brain = policy.brain
 
         base = t if t is not None else brain.frame_index * self.config.frame_seconds
-        time_ranges = [f"{base + i * self.config.frame_seconds:.1f}s" for i in range(len(frames))]
+        time_ranges = [f"{base + i * self.config.frame_seconds:.1f} seconds" for i in range(len(frames))]
 
         delegation_info = await policy.fold_delegations()
 
@@ -175,5 +176,5 @@ class InteractionSession:
             content.append({"type": "text", "text": f"{USER_QUERY_HEADER}\n{query.strip()}"})
         for tr, url in zip(time_ranges, frames):
             content.append({"type": "text", "text": f"<{tr}>"})
-            content.append({"type": "image_url", "image_url": {"url": url}})
+            content.append({"type": "image_url", "image_url": {"url": url}, "max_pixels": self.config.max_pixels})
         return {"role": "user", "content": content}

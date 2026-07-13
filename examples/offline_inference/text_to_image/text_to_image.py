@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import functools
 import json
 import time
 from pathlib import Path
@@ -38,14 +39,18 @@ def is_nextstep_model(model_name: str) -> bool:
     return False
 
 
-def parse_profiler_config(value: str) -> dict[str, Any]:
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
     try:
         config = json.loads(value)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
     if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
     return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,7 +69,16 @@ def parse_args() -> argparse.Namespace:
         "--stage-configs-path",
         type=str,
         default=None,
-        help="Path to a YAML file containing stage configurations for Omni.",
+        help="[Deprecated] Path to a legacy stage_args-format YAML. Prefer --deploy-config.",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a deploy YAML (new pipeline/stages format). Required for multi-stage "
+            "text-to-image pipelines whose deploy config is not auto-loaded."
+        ),
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
@@ -150,7 +164,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        help="Disable torch.compile and force eager execution.",
+        default=None,
+        help=(
+            "Disable torch.compile and force eager execution. Left unset (None) "
+            "so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML value wins."
+        ),
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -183,16 +202,10 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "int8", "gguf"],
+        choices=["fp8", "int8"],
         help="Quantization method for the transformer. "
-        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8). "
         "Default: None (no quantization, uses BF16).",
-    )
-    parser.add_argument(
-        "--gguf-model",
-        type=str,
-        default=None,
-        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -216,8 +229,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+        default=None,
+        help=(
+            "Number of GPUs used for tensor parallelism (TP) inside the DiT. "
+            "Left unset so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML (or engine default of 1) wins. "
+            "Passing it always overrides the deploy YAML."
+        ),
     )
     parser.add_argument(
         "--enable-expert-parallel",
@@ -269,7 +287,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--extra-body",
-        type=parse_profiler_config,
+        type=functools.partial(parse_json_object, flag_name="--extra-body"),
         default=None,
         help=(
             "Model-specific generation params as a JSON object, e.g. "
@@ -378,14 +396,7 @@ def main():
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
     ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
-    if args.quantization == "gguf":
-        if not args.gguf_model:
-            raise ValueError("--gguf-model is required when --quantization gguf is set.")
-        quant_kwargs["quantization_config"] = {
-            "method": "gguf",
-            "gguf_model": args.gguf_model,
-        }
-    elif args.quantization and ignored_layers:
+    if args.quantization and ignored_layers:
         quant_kwargs["quantization_config"] = {
             "method": args.quantization,
             "ignored_layers": ignored_layers,
@@ -405,10 +416,8 @@ def main():
         "ring_degree": args.ring_degree,
         "ulysses_mode": args.ulysses_mode,
         "cfg_parallel_size": args.cfg_parallel_size,
-        "tensor_parallel_size": args.tensor_parallel_size,
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
-        "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
         "log_stats": args.log_stats,
@@ -420,11 +429,21 @@ def main():
         **lora_args,
         **quant_kwargs,
     }
+    if args.tensor_parallel_size is not None:
+        omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
+    if args.enforce_eager is not None:
+        omni_kwargs["enforce_eager"] = args.enforce_eager
     if args.stage_configs_path:
         omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)
@@ -442,8 +461,9 @@ def main():
     print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
+    tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
     print(
-        f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
+        f"  Parallel configuration: tensor_parallel_size={tp_display}, "
         f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
         f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
@@ -513,8 +533,8 @@ def main():
         diffusion_params.extra_args.update({k: v for k, v in user_extra.items() if v is not None})
 
     if lora_request:
-        diffusion_params.extra_args["lora_request"] = lora_request
-        diffusion_params.extra_args["lora_scale"] = args.lora_scale
+        diffusion_params.lora_request = lora_request
+        diffusion_params.lora_scale = args.lora_scale
 
     # Build per-stage sampling params for multi-stage models (e.g. BAGEL),
     # or wrap single diffusion params for single-stage models.
@@ -580,6 +600,12 @@ def main():
         if images:
             break
 
+    # Fallback: generation-stage pipelines (e.g. MammothModa2's AR->DiT) return the
+    # generated image as a tensor under multimodal_output instead of populating the
+    # `images` field that diffusion-stage pipelines fill.
+    if not images:
+        images = _images_from_multimodal_output(outputs)
+
     if not images:
         raise ValueError("No images found in request_output")
 
@@ -595,6 +621,37 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
+
+
+def _images_from_multimodal_output(outputs: list[Any]) -> list[Any]:
+    """Extract PIL images from multimodal_output tensors.
+
+    Generation-stage pipelines (e.g. MammothModa2's AR->DiT) return the generated
+    image as a tensor (normalized to [-1, 1], CHW) under ``multimodal_output``
+    rather than populating the ``images`` field. Convert any such tensors to PIL.
+    """
+    from PIL import Image
+
+    pil_images: list[Any] = []
+    for output in outputs:
+        req_out = getattr(output, "request_output", output)
+        for completion in getattr(req_out, "outputs", None) or []:
+            # multimodal_output is a MultimodalPayload (a Mapping) keyed by modality,
+            # matching how omni examples (ming_flash_omni / magi_human / dynin) read it.
+            mm = getattr(completion, "multimodal_output", None) or {}
+            if "image" not in mm:
+                continue
+            payload = mm["image"]
+            for tensor in payload if isinstance(payload, list) else [payload]:
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                img = tensor.detach().to("cpu", dtype=torch.float32)
+                if img.ndim == 4:
+                    img = img[0]
+                img = (img / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
+                img = img.permute(1, 2, 0).contiguous().numpy()
+                pil_images.append(Image.fromarray(img))
+    return pil_images
 
 
 if __name__ == "__main__":

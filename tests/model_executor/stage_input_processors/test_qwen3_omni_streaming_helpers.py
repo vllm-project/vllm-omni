@@ -163,7 +163,7 @@ def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
 
     assert payload is not None
     assert payload["codes"]["audio"] == [10, 20, 11, 21, 12, 22]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_talker2code2wav_full_payload_drops_count_matched_terminal_row() -> None:
@@ -204,7 +204,7 @@ def test_talker2code2wav_full_payload_drops_rows_aligned_to_non_codec_ids() -> N
 
     assert payload is not None
     assert payload["codes"]["audio"] == [0, 0, 0]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
@@ -224,7 +224,7 @@ def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
 
     assert payload is not None
     assert payload["codes"]["audio"] == [0, 7, 0, 8, 0, 9]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
@@ -247,7 +247,6 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["ids"]["all"] == [151644, 872, 3]
     assert payload["embed"]["prefill"].device.type == "cpu"
     assert payload["hidden_states"]["output"].device.type == "cpu"
-    assert payload["next_stage_prompt_len"] > 0
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
 
@@ -921,7 +920,6 @@ def test_cosyvoice3_full_payload_replace_keys_present() -> None:
 def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
     """Smoke: ming_flash_omni token-only carries voice metadata."""
     from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
-        thinker2talker,
         thinker2talker_token_only,
     )
 
@@ -939,15 +937,14 @@ def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
 
     src = [_Wrap("hello world")]
     prompt = _Prompt({"voice_name": "ZH_FEMALE", "prompt_text": "ref text"})
-    for func in (thinker2talker, thinker2talker_token_only):
-        out = func(src, prompt=prompt)
-        assert len(out) == 1
-        assert out[0]["prompt_token_ids"] == [0]
-        info = out[0]["additional_information"]
-        assert info["text"] == "hello world"
-        assert info["voice_name"] == "ZH_FEMALE"
-        assert info["prompt_text"] == "ref text"
-        assert info["ming_task"] == "omni"
+    out = thinker2talker_token_only(src, prompt=prompt)
+    assert len(out) == 1
+    assert out[0]["prompt_token_ids"] == [0]
+    info = out[0]["additional_information"]
+    assert info["text"] == "hello world"
+    assert info["voice_name"] == "ZH_FEMALE"
+    assert info["prompt_text"] == "ref text"
+    assert info["ming_task"] == "omni"
 
 
 def test_qwen2_5_omni_thinker2talker_token_only_smoke() -> None:

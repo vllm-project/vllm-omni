@@ -29,6 +29,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
@@ -300,32 +301,32 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         )
 
     def pre_process_func(request: OmniDiffusionRequest):
-        for i, prompt in enumerate(request.prompts):
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
+        prompt = request.prompt
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
 
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            multi_modal_data = prompt.get("multi_modal_data") or {}
-            raw_images = multi_modal_data.get("image")
-            if raw_images is None:
-                raw_images = prompt.get("pil_image")
-            has_images = raw_images is not None and (not isinstance(raw_images, list) or len(raw_images) > 0)
-            if has_images:
-                image_list = raw_images if isinstance(raw_images, list) else [raw_images]
-                cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
-                prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
+        multi_modal_data = prompt.get("multi_modal_data") or {}
+        raw_images = multi_modal_data.get("image")
+        if raw_images is None:
+            raw_images = prompt.get("pil_image")
+        has_images = raw_images is not None and (not isinstance(raw_images, list) or len(raw_images) > 0)
+        if has_images:
+            image_list = raw_images if isinstance(raw_images, list) else [raw_images]
+            cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
+            prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
 
-                bridge_h = prompt.get("height") if isinstance(prompt, dict) else None
-                bridge_w = prompt.get("width") if isinstance(prompt, dict) else None
-                first_image_w, first_image_h = _to_pil_image(image_list[0]).size
-                if request.sampling_params.width is None:
-                    request.sampling_params.width = int(bridge_w or first_image_w)
-                if request.sampling_params.height is None:
-                    request.sampling_params.height = int(bridge_h or first_image_h)
+            bridge_h = prompt.get("height") if isinstance(prompt, dict) else None
+            bridge_w = prompt.get("width") if isinstance(prompt, dict) else None
+            first_image_w, first_image_h = _to_pil_image(image_list[0]).size
+            if request.sampling_params.width is None:
+                request.sampling_params.width = int(bridge_w or first_image_w)
+            if request.sampling_params.height is None:
+                request.sampling_params.height = int(bridge_h or first_image_h)
 
-            request.prompts[i] = prompt
+        request.prompt = prompt
 
         return request
 
@@ -340,6 +341,7 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
+    supports_request_batch = False
     support_image_input = True
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
@@ -485,9 +487,9 @@ class HunyuanImage3Pipeline(
         return self._pipeline
 
     def _validate_step_request(self, state: "DiffusionRequestState") -> None:
-        prompts = state.prompts or []
+        prompt = state.prompt
         sampling = state.sampling
-        if len(prompts) != 1:
+        if prompt is None:
             raise ValueError("HunyuanImage3 step execution currently requires exactly one prompt per request.")
         if sampling.timesteps is not None or sampling.sigmas is not None:
             raise ValueError("HunyuanImage3 step execution does not support custom timesteps or sigmas yet.")
@@ -586,7 +588,7 @@ class HunyuanImage3Pipeline(
     ) -> tuple[list[str], list[str | None], str | None, list[list[JointImageInfo]] | None, str]:
         sampling = state.sampling
         return self._extract_prompt_inputs(
-            state.prompts or [],
+            [state.prompt] if state.prompt is not None else [],
             getattr(sampling, "extra_args", {}) or {},
             request_id=state.request_id,
             allow_cond_image=False,
@@ -2241,7 +2243,7 @@ class HunyuanImage3Pipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] = "",
         image_size="auto",
         height: int = 1024,
@@ -2299,11 +2301,13 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
+        image = outputs[0]
         custom_output = {}
         if any(t is not None for t in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
         return DiffusionOutput(
-            output=outputs[0],
+            output=image,
             custom_output=custom_output,
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            stage_durations=stage_durations,
         )

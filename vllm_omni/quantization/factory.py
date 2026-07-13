@@ -3,8 +3,8 @@
 """Factory for building quantization configs.
 
 build_quant_config() delegates to vLLM's quantization registry.
-The only extension point is _OVERRIDES for methods that need a
-different QuantizationConfig subclass in the OMNI context (e.g. GGUF).
+Out-of-tree integrations can register Omni-specific builders with
+register_quantization_override().
 """
 
 from __future__ import annotations
@@ -81,13 +81,6 @@ from .component_config import ComponentQuantizationConfig  # noqa: E402
 logger = init_logger(__name__)
 
 
-def _build_gguf(**kw: Any) -> QuantizationConfig:
-    """Lazy import to avoid pulling in CUDA/pynvml at module load time."""
-    from .gguf_config import DiffusionGGUFConfig
-
-    return DiffusionGGUFConfig(**kw)
-
-
 def _build_int8(**kw: Any) -> QuantizationConfig:
     """Lazy import for Int8 diffusion config (supports CUDA + NPU)."""
     from .int8_config import DiffusionInt8Config
@@ -140,7 +133,6 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
 
 
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
-    "gguf": _build_gguf,
     "int8": _build_int8,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
@@ -150,7 +142,24 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "auto_round": _build_inc,
 }
 
-SUPPORTED_QUANTIZATION_METHODS: list[str] = list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))
+
+def _compute_supported_quantization_methods() -> list[str]:
+    return list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))
+
+
+SUPPORTED_QUANTIZATION_METHODS: list[str] = _compute_supported_quantization_methods()
+
+
+def _refresh_registered_methods() -> None:
+    SUPPORTED_QUANTIZATION_METHODS[:] = _compute_supported_quantization_methods()
+    global _CACHED_ALIAS_MAP
+    _CACHED_ALIAS_MAP = None
+
+
+def register_quantization_override(method: str, builder: Callable[..., QuantizationConfig]) -> None:
+    """Register an Omni-specific quantization config builder."""
+    _OVERRIDES[_normalize_method_name(method)] = builder
+    _refresh_registered_methods()
 
 
 def _build_reverse_alias_map() -> dict[str, str]:

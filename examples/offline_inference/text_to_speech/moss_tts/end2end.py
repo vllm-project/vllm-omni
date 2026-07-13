@@ -1,11 +1,12 @@
 """Offline inference example for MOSS-TTS variants.
 
-Covers all five models:
-  - OpenMOSS-Team/MOSS-TTS           (8B, general TTS)
-  - OpenMOSS-Team/MOSS-TTSD-v1.0     (8B, dialogue TTS)
-  - OpenMOSS-Team/MOSS-SoundEffect   (8B, sound effect synthesis)
-  - OpenMOSS-Team/MOSS-TTS-Realtime  (1.7B, low-latency streaming)
-  - OpenMOSS-Team/MOSS-VoiceGenerator(1.7B, voice design)
+Covers six models:
+  - OpenMOSS-Team/MOSS-TTS                       (8B, general TTS)
+  - OpenMOSS-Team/MOSS-TTSD-v1.0                 (8B, dialogue TTS)
+  - OpenMOSS-Team/MOSS-SoundEffect               (8B, sound effect synthesis)
+  - OpenMOSS-Team/MOSS-TTS-Realtime              (1.7B, low-latency streaming)
+  - OpenMOSS-Team/MOSS-VoiceGenerator             (1.7B, voice design)
+  - OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 (n_vq=12, 48 kHz stereo)
 
 Usage
 -----
@@ -210,12 +211,18 @@ def run_tts(args: argparse.Namespace) -> None:
         "OpenMOSS-Team/MOSS-SoundEffect": "moss_sound_effect",
         "OpenMOSS-Team/MOSS-TTS-Realtime": "moss_tts_realtime",
         "OpenMOSS-Team/MOSS-VoiceGenerator": "moss_voice_generator",
+        "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5": "moss_tts_local",
     }
     deploy_config = deploy_map.get(args.model, "moss_tts")
 
     is_sound_effect = "SoundEffect" in args.model
     is_voice_gen = "VoiceGenerator" in args.model
     is_realtime = "Realtime" in args.model
+    # Local-v1.5 ships its own AutoProcessor (processor_config.json +
+    # processing_moss_tts.py), so it reuses the same _build_unified_codes
+    # path as the Delay variants below — just a different n_vq/codec.
+    is_local = "Local" in args.model
+    output_sr = 48000 if is_local else 24000
 
     ref_audio = None
     builder_kwargs: dict = {}
@@ -314,27 +321,33 @@ def run_tts(args: argparse.Namespace) -> None:
             wav = mm.get("model_outputs")
         if wav is None:
             continue
+        # Local-v1.5's codec emits stereo chunks shaped (C, T); keep the
+        # channel axis intact (don't flatten) so concatenation below stays
+        # along the time axis. Mono variants stay (T,) as before.
         if isinstance(wav, list):
-            non_empty = [w.reshape(-1) for w in wav if isinstance(w, torch.Tensor) and w.numel() > 0]
+            non_empty = [w for w in wav if isinstance(w, torch.Tensor) and w.numel() > 0]
             if non_empty and t_first_audio is None:
                 t_first_audio = _time.monotonic()
             chunks.extend(non_empty)
         elif isinstance(wav, torch.Tensor) and wav.numel() > 0:
             if t_first_audio is None:
                 t_first_audio = _time.monotonic()
-            chunks.append(wav.reshape(-1))
+            chunks.append(wav)
 
     t_gen_end = _time.monotonic()
     if not chunks:
         print("No audio in output — check model loading logs.")
         return
 
-    wav_t = torch.cat(chunks).float().cpu()
-    sf.write(args.output, wav_t.numpy(), 24000)
-    print(f"Saved {len(wav_t) / 24000:.2f}s of audio to {args.output}")
+    cat_dim = -1 if chunks[0].dim() == 2 else 0
+    wav_t = torch.cat(chunks, dim=cat_dim).float().cpu()
+    n_samples = wav_t.shape[-1]
+    # soundfile wants (T,) mono or (T, C) multi-channel.
+    sf.write(args.output, (wav_t.transpose(0, 1) if wav_t.dim() == 2 else wav_t).numpy(), output_sr)
+    print(f"Saved {n_samples / output_sr:.2f}s of audio to {args.output}")
     ttfa_ms = (t_first_audio - t_gen_start) * 1000.0 if t_first_audio is not None else float("nan")
     gen_total_ms = (t_gen_end - t_gen_start) * 1000.0
-    print(f"TTFA_MS={ttfa_ms:.1f} GEN_TOTAL_MS={gen_total_ms:.1f} AUDIO_S={len(wav_t) / 24000:.2f}")
+    print(f"TTFA_MS={ttfa_ms:.1f} GEN_TOTAL_MS={gen_total_ms:.1f} AUDIO_S={n_samples / output_sr:.2f}")
 
 
 def main() -> None:

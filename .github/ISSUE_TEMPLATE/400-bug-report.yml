@@ -19,6 +19,7 @@ body:
 
       Consider redacting or replacing sensitive values with placeholders like `<YOUR_TOKEN_HERE>` when sharing configuration or code examples.
 - type: textarea
+  id: current-environment
   attributes:
     label: Your current environment
     description: |
@@ -42,6 +43,7 @@ body:
     required: true
 
 - type: textarea
+  id: code-version
   attributes:
     label: Your code version
     description: |
@@ -66,6 +68,7 @@ body:
     required: true
 
 - type: textarea
+  id: bug-description
   attributes:
     label: 🐛 Describe the bug
     description: |

@@ -16,6 +16,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 ---
 
 *Latest News* 🔥
+- [2026/07] We released [0.24.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.24.0) - aligned with the vLLM 0.24 release line, expanding production-ready coverage across TTS, speech, diffusion, image/video generation, and robot-policy serving, with major Omni stage runtime refactoring, diffusion request-level batching, async output materialization, quantization/cache/memory improvements, and broad CUDA/ROCm/XPU/NPU support.
 - [2026/06] We released [0.22.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.22.0) - an **omnimodal world-model** release aligned with vLLM 0.22, featuring [Nvidia Cosmos3](recipes/cosmos3/Cosmos3-Nano.md)/DreamZero world model support, expanded quantization coverage across Blackwell/NPU/XPU, TTS production improvements, new models including MiniCPM-o 4.5, MOSS-TTS, and Lance, plus RL integration with [VeRL-Omni](https://github.com/verl-project/verl-omni).
 - [2026/05] We released [0.20.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.20.0) - refreshes the serving/runtime stack for large-scale omni workloads, and improves diffusion model performance, quantization, and hardware readiness across CUDA, ROCm, MUSA, NPU, and XPU backends.
 - [2026/03] We released [0.18.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.18.0) - strengthens the core runtime through a large entrypoint refactor and scheduler/runtime cleanups, expands unified quantization and diffusion execution, broadens multimodal model coverage, and improves production readiness across audio, omni, image, video, RL, and multi-platform deployments.
@@ -31,9 +32,9 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 [vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni is a framework that extends its support for omni-modality model inference and serving:
 
-- **Omni-modality**: Text, image, video, and audio data processing
+- **Omni-modality**: Text, image, audio, video, and action data processing
 - **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
-- **Heterogeneous outputs**: from traditional text generation to multimodal outputs
+- **Heterogeneous outputs**: from traditional text generation to multimodal and action outputs
 
 <p align="center">
   <picture>
@@ -57,9 +58,10 @@ vLLM-Omni is flexible and easy to use with:
 
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
-- **Omni-modality models** (e.g. Qwen3-Omni, Cosmos, HunyuanImage, BAGEL)
+- **Omni-modality models** (e.g. Qwen3-Omni, Cosmos3, HunyuanImage, BAGEL)
 - **TTS models** (e.g. Qwen3-TTS, VoxCPM2, Ming-Omni-TTS, CosyVoice3)
 - **Diffusion models** — image, video, and audio generation (e.g. Qwen-Image, Wan2.2, FLUX)
+- **Robot-policy and action models** (e.g. GR00T-N1.7, DreamZero-DROID, InternVLA-A1, Cosmos3 action policy)
 
 ## Getting Started
 

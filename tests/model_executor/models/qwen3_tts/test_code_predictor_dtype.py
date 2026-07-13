@@ -18,7 +18,10 @@ import types
 
 import pytest
 import torch
+import torch.nn.functional as F
 from pytest_mock import MockerFixture
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # Direct file import to avoid vllm_omni.__init__ patch dependencies.
 _MODELS = os.path.join(
@@ -339,6 +342,91 @@ class TestCodePredictorDtypeAlignment:
         assert not torch.equal(first[:, 1:], different[:, 1:])
 
 
+class TestCodePredictorPerRowGenerators:
+    """Seeded requests must stay deterministic inside a multi-row batch (#4883)."""
+
+    def _make_predictor(self, mocker: MockerFixture, loaded_target_classes):
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=4)
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+        predictor._wrapper_config.use_cuda_graphs = False
+        return predictor, talker_config
+
+    def test_multinomial_per_row_matches_single_row_draws(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        multinomial = common_mod.CodePredictorWrapper._multinomial
+        torch.manual_seed(7)
+        probs = torch.softmax(torch.randn(3, 64), dim=-1)
+
+        def seeded(seed: int) -> torch.Generator:
+            generator = torch.Generator(device=probs.device)
+            generator.manual_seed(seed)
+            return generator
+
+        batched = multinomial(probs, None, [seeded(11), None, seeded(22)])
+        assert batched.shape == (3, 1)
+        # Each seeded row must reproduce a standalone draw from the same seed,
+        # independent of what the other rows in the batch consume.
+        assert torch.equal(batched[0:1], torch.multinomial(probs[0:1], num_samples=1, generator=seeded(11)))
+        assert torch.equal(batched[2:3], torch.multinomial(probs[2:3], num_samples=1, generator=seeded(22)))
+
+    def test_forward_per_row_generators_are_row_independent(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        predictor, talker_config = self._make_predictor(mocker, loaded_target_classes)
+        hidden = talker_config.hidden_size
+        torch.manual_seed(123)
+        row_embed = torch.randn(1, hidden)
+        row_hidden = torch.randn(1, hidden)
+        # Three identical rows: two share a seed, one differs.
+        layer0_code = torch.zeros(3, dtype=torch.long)
+        layer0_embed = row_embed.expand(3, hidden).contiguous()
+        last_talker_hidden = row_hidden.expand(3, hidden).contiguous()
+
+        def seeded(seed: int) -> torch.Generator:
+            generator = torch.Generator(device=layer0_code.device)
+            generator.manual_seed(seed)
+            return generator
+
+        def run(generators):
+            return predictor(
+                layer0_code=layer0_code,
+                layer0_embed=layer0_embed,
+                last_talker_hidden=last_talker_hidden,
+                do_sample=True,
+                temperature=0.9,
+                top_k=50,
+                top_p=1.0,
+                generators=generators,
+            )
+
+        first = run([seeded(1234), seeded(1234), seeded(4321)])
+        second = run([seeded(1234), seeded(1234), seeded(4321)])
+
+        # Same per-row seeds -> the whole batch reproduces across calls.
+        assert torch.equal(first, second)
+        # Identical inputs + identical seeds -> identical rows within a call.
+        assert torch.equal(first[0], first[1])
+        # A different seed on the same inputs must diverge in the residual layers.
+        assert not torch.equal(first[0, 1:], first[2, 1:])
+
+    def test_forward_rejects_mismatched_generators_length(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        predictor, talker_config = self._make_predictor(mocker, loaded_target_classes)
+        hidden = talker_config.hidden_size
+        with pytest.raises(ValueError, match="one entry per row"):
+            predictor(
+                layer0_code=torch.zeros(2, dtype=torch.long),
+                layer0_embed=torch.randn(2, hidden),
+                last_talker_hidden=torch.randn(2, hidden),
+                generators=[torch.Generator()],
+            )
+
+
 class TestCodePredictorModelDtype:
     """Test the inner model forward with different dtypes."""
 
@@ -457,3 +545,92 @@ class TestCodePredictorWrapperConfig:
             wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
         )
         assert graph_wrapper._prefix_graphs_enabled is True
+
+
+class TestGumbelMaxSampling:
+    """Sanity tests for the shared Gumbel-max sampling helper."""
+
+    @staticmethod
+    def _sample(logits: torch.Tensor, generator=None) -> torch.Tensor:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        return common_mod.CodePredictorWrapper._sample_codes_gumbel(logits, generator=generator)
+
+    def test_gumbel_max_picks_unique_high_logit(self, loaded_target_classes) -> None:
+        """If one logit is dominant, Gumbel-max must always pick it."""
+        torch.manual_seed(0)
+        bsz, vocab = 4, 64
+        logits = torch.full((bsz, vocab), -1e4)
+        logits[:, 7] = 0.0  # only finite entry
+        out = self._sample(logits)
+        assert out.shape == (bsz, 1)
+        assert torch.equal(out.squeeze(-1), torch.full((bsz,), 7, dtype=torch.long))
+
+    def test_gumbel_max_handles_single_finite_entry_rows(self, loaded_target_classes) -> None:
+        """Degenerate rows with one surviving finite entry should still return
+        a valid index instead of tripping multinomial-style asserts."""
+        bsz, vocab = 2, 8
+        logits = torch.full((bsz, vocab), float("-inf"))
+        logits[0, 3] = 0.0
+        logits[1, 5] = 0.0
+        out = self._sample(logits)
+        assert out[0].item() == 3
+        assert out[1].item() == 5
+
+    def test_gumbel_max_generator_makes_results_reproducible(self, loaded_target_classes) -> None:
+        """Same ``Generator.manual_seed`` should produce identical samples."""
+        torch.manual_seed(0)
+        logits = torch.randn(8, 32)
+        g1 = torch.Generator()
+        g1.manual_seed(123)
+        g2 = torch.Generator()
+        g2.manual_seed(123)
+        g3 = torch.Generator()
+        g3.manual_seed(456)
+        s1 = self._sample(logits, generator=g1)
+        s2 = self._sample(logits, generator=g2)
+        s3 = self._sample(logits, generator=g3)
+        assert torch.equal(s1, s2)
+        # Different seeds must (almost surely) yield a different sequence.
+        assert not torch.equal(s1, s3)
+
+    def test_gumbel_max_per_row_generators_match_individual_rows(self, loaded_target_classes) -> None:
+        """A per-row generator list should preserve row independence."""
+        torch.manual_seed(11)
+        logits = torch.randn(3, 16)
+        seeds = [101, 202, 303]
+        batched_generators = []
+        expected_rows = []
+        for row, seed in enumerate(seeds):
+            row_generator = torch.Generator()
+            row_generator.manual_seed(seed)
+            batched_generators.append(row_generator)
+
+            solo_generator = torch.Generator()
+            solo_generator.manual_seed(seed)
+            expected_rows.append(self._sample(logits[row : row + 1], generator=solo_generator))
+
+        batched = self._sample(logits, generator=batched_generators)
+        expected = torch.cat(expected_rows, dim=0)
+        assert torch.equal(batched, expected)
+
+    def test_gumbel_max_rejects_generator_length_mismatch(self, loaded_target_classes) -> None:
+        logits = torch.randn(2, 8)
+        generators = [torch.Generator()]
+        with pytest.raises(ValueError, match="Expected 2 per-row generators"):
+            self._sample(logits, generator=generators)
+
+    def test_gumbel_max_distribution_matches_softmax(self, loaded_target_classes) -> None:
+        """Empirical frequency under Gumbel-max should be close to the
+        softmax probability mass.  Loose tolerance because we draw a
+        finite number of samples."""
+        torch.manual_seed(7)
+        vocab = 16
+        logits = torch.randn(vocab) * 2.0
+        target = F.softmax(logits, dim=-1, dtype=torch.float32)
+
+        n_draws = 20000
+        batched_logits = logits.unsqueeze(0).expand(n_draws, vocab).contiguous()
+        samples = self._sample(batched_logits).squeeze(-1)
+        empirical = torch.bincount(samples, minlength=vocab).float() / n_draws
+        # L1 distance under 0.03 with 20k draws is comfortable for vocab=16.
+        assert (empirical - target).abs().sum().item() < 0.05

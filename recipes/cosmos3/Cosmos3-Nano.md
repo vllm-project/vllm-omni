@@ -367,60 +367,58 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
 
 #### Command
 
-```python
-# cosmos3_offline.py  —  run with:  python cosmos3_offline.py
-import torch
-from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+Cosmos3 runs through the standard task examples; pass model-specific knobs via
+`--extra-body`. Guardrails are on by default — pass `"guardrails": false` for a
+quick local run (install `cosmos-guardrail` + accept the gated repo to enable them).
 
+```bash
+# Text-to-image -> examples/offline_inference/text_to_image
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model nvidia/Cosmos3-Nano \
+  --prompt "A photorealistic red sports car at golden hour, cinematic lighting." \
+  --negative-prompt "blurry, distorted, low quality" \
+  --height 1024 --width 1024 --num-inference-steps 50 --guidance-scale 7.0 \
+  --extra-body '{"flow_shift": 3.0, "guardrails": false}' \
+  --output cosmos3_t2i.png
 
-def main():
-    omni = Omni(
-        model="nvidia/Cosmos3-Nano",
-        model_class_name="Cosmos3OmniDiffusersPipeline",
-        trust_remote_code=True,
-        enforce_eager=True,
-        # Guardrails are disabled here for a quick local run; install
-        # cosmos-guardrail + gated-repo access and drop this to enable them.
-        model_config={"guardrails": False},
-    )
-    gen = torch.Generator(device="cpu").manual_seed(42)
+# Text-to-video -> examples/offline_inference/text_to_video
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model nvidia/Cosmos3-Nano \
+  --prompt "A robot arm is cleaning a plate in the kitchen." \
+  --negative-prompt "blurry, distorted, low quality, jittery, deformed" \
+  --height 720 --width 1280 --num-frames 189 --fps 24 \
+  --num-inference-steps 35 --guidance-scale 6.0 \
+  --extra-body '{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false,
+                 "use_resolution_template": false, "use_duration_template": false}' \
+  --output cosmos3_t2v.mp4
 
-    # Text-to-image (modalities=["image"]). For T2V use modalities=["video"]
-    # plus num_frames/fps; for I2V add multi_modal_data={"image": <PIL.Image>}.
-    outputs = omni.generate(
-        {
-            "prompt": "A photorealistic red sports car at golden hour, cinematic lighting.",
-            "negative_prompt": "blurry, distorted, low quality",
-            "modalities": ["image"],
-        },
-        OmniDiffusionSamplingParams(
-            height=1024, width=1024, generator=gen,
-            guidance_scale=7.0, num_inference_steps=50, num_outputs_per_prompt=1,
-        ),
-    )
-    outputs[0].request_output.images[0].save("cosmos3_t2i.png")
-    omni.close()
-
-
-if __name__ == "__main__":
-    main()
+# Image-to-video -> examples/offline_inference/image_to_video
+# (Cosmos3 bundles example frames under assets/; any RGB image works too.)
+python examples/offline_inference/image_to_video/image_to_video.py \
+  --model nvidia/Cosmos3-Nano \
+  --image /path/to/Cosmos3-Nano/assets/example_i2v_input.jpg \
+  --prompt "The scene comes to life with smooth, natural motion." \
+  --height 720 --width 1280 --num-frames 189 --fps 24 \
+  --num-inference-steps 35 --guidance-scale 6.0 \
+  --extra-body '{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false}' \
+  --output cosmos3_i2v.mp4
 ```
 
 #### Verification
 
 ```bash
-python cosmos3_offline.py
 python -c "from PIL import Image; im=Image.open('cosmos3_t2i.png'); print('image', im.size, im.mode)"
+ffprobe -v error -show_entries stream=codec_type,nb_frames,width,height cosmos3_t2v.mp4
 ```
 
 #### Notes
 
-- Same `Cosmos3OmniDiffusersPipeline` as online; mode is chosen by
-  `prompt["modalities"]` (`["image"]` → T2I, `["video"]` → T2V) plus
-  `num_frames`/`fps`, `multi_modal_data={"image": ...}` for I2V, and
-  `multi_modal_data={"video": [<PIL frames>]}` or a video tensor/array for V2V.
-  For video, frames are returned in `outputs[0].request_output.images` as an
-  `(B, F, H, W, 3)` array.
-- The offline entry must be guarded by `if __name__ == "__main__":` — the engine
-  spawns workers with the `spawn` start method.
+- A single `Cosmos3OmniDiffusersPipeline` serves every mode; the standard examples
+  select it automatically from `model_index.json`. T2I is chosen by the
+  `text_to_image` prompt builder (which marks `modalities=["image"]`); `text_to_video`
+  defaults to T2V; `image_to_video` adds `multi_modal_data={"image": ...}` (I2V).
+  V2V is served online (`/v1/videos/sync`).
+- Model-specific knobs (`flow_shift`, `max_sequence_length`, `condition_*`,
+  `generate_sound`/`sound_duration`, `guardrails`, `action_*`, ...) are declared
+  once in `vllm_omni/model_extras/cosmos3.py` and forwarded through `--extra-body`;
+  unknown keys for the model are dropped.

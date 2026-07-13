@@ -90,14 +90,40 @@ Pass `--deploy-config /path/to/your_deploy.yaml` to any of the commands above to
 
 ### Image generation (text-to-image / img2img)
 
-The diffusion-stage image-generation path is currently only wired through
-the online OpenAI-compatible chat endpoint (`/v1/chat/completions` with
-`"modalities": ["image"]`). For payloads, optional knobs
-(`steps`/`cfg`/`seed`/`byte5_text`/`negative_prompt`), and the img2img
-reference-image flow, see the
-[image-gen section in the online-serving README](../../online_serving/ming_flash_omni/README.md#image-generation-text-to-image).
-`end2end.py` does not yet exercise the imagegen stage; that is tracked as
-follow-up work.
+Image generation is served through the standard task examples.
+The diffusion-stage knobs are declared centrally in `vllm_omni/model_extras/ming_flash_omni.py` and routed via `--extra-body`. With deploy yaml assigned properly, the model can run through the shared example scripts like any other diffusion model:
+
+Text-to-image (offline):
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model Jonathan1909/Ming-flash-omni-2.0 \
+    --deploy-config vllm_omni/deploy/ming_flash_omni_image.yaml \
+    --prompt "Please draw a cute cat." \
+    --height 1024 \
+    --width 1024 \
+    --extra-body '{"steps": 30, "cfg": 2.0, "seed": 42}' \
+    --output ming_flash_omni_t2i.png
+```
+
+Image-to-image (offline):
+```bash
+# Reference image: figures/cases/person_gen_05.png from the upstream Ming repo
+# https://github.com/inclusionAI/Ming/blob/3954fcb880ff5e61ff128bcf7f1ec344d46a6fe3/examples/vllm_demo.py
+wget https://raw.githubusercontent.com/inclusionAI/Ming/3954fcb880ff5e61ff128bcf7f1ec344d46a6fe3/figures/cases/person_gen_05.png
+
+python examples/offline_inference/image_to_image/image_edit.py \
+    --model Jonathan1909/Ming-flash-omni-2.0 \
+    --deploy-config vllm_omni/deploy/ming_flash_omni_image.yaml \
+    --image person_gen_05.png \
+    --prompt "Put a pair of sunglasses on the person." \
+    --extra-args '{"steps": 30, "cfg": 2.0, "seed": 42}' \
+    --output ming_flash_omni_i2i.png
+```
+
+For the online path and the full knob list
+(`steps`/`cfg`/`seed`/`byte5_text`/`negative_prompt`/`height`/`width`), see the
+[image-generation section in the recipe](../../../recipes/inclusionAI/Ming-flash-omni-2.0.md#image-generation-text-to-image--img2img).
 
 ## Online serving
 

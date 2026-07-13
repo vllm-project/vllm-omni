@@ -16,6 +16,22 @@ TEXT_EOS_TOKEN_ID = 151669  # <text_eos>
 
 
 # ---------------------------------------------------------------------------
+# MoE (bailing_moe / Ming-omni-tts-16.8B-A3B) token IDs
+# (confirmed from the bailing tokenizer_config.json — different vocab than the
+# dense Qwen2 tokenizer above). The bailing tokenizer has NO <text_eos>; the
+# audio AR loop terminates purely on the stop-head (see upstream
+# modeling_bailingmm.sample), so <end_of_audio> doubles as the AR stop token.
+# ---------------------------------------------------------------------------
+
+MOE_AUDIO_DUMMY_TOKEN_ID = 126357  # <audioPatch>
+MOE_AUDIO_START_TOKEN_ID = 126358  # <audio>
+MOE_AUDIO_END_TOKEN_ID = 126359  # </audio>
+MOE_AUDIO_EOS_TOKEN_ID = 126356  # <end_of_audio>
+MOE_TEXT_EOS_TOKEN_ID = 126356  # no <text_eos> in bailing; reuse <end_of_audio> as AR stop
+MOE_SPK_TOKEN_ID = 126368  # <spk> — speaker-embedding placeholder (dense uses <|vision_start|>)
+
+
+# ---------------------------------------------------------------------------
 # Architectural constants (confirmed from original config.json)
 # ---------------------------------------------------------------------------
 
@@ -42,6 +58,7 @@ DEFAULT_TEMPERATURE = 0.0
 
 # Connector / Stage-2 streaming defaults (runtime tuning)
 LATENT_CHUNK_SIZE = 25
+INITIAL_LATENT_CHUNK_SIZE = 4
 LATENT_LEFT_CONTEXT = 0
 MAX_DECODE_STEPS = 200
 

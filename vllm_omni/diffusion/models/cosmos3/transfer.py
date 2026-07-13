@@ -6,6 +6,9 @@ The reference Cosmos Framework transfer path accepts one or more control hints
 and packs them before the noisy target video.  This module keeps the vLLM Omni
 pipeline-specific pieces small: request parsing, media normalization, and
 optional on-the-fly edge/blur control generation.
+
+Transfer is a video-output mode. It cannot be combined with T2I, sound
+generation, or action generation.
 """
 
 from __future__ import annotations

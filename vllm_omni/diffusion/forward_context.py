@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import torch
 import vllm.ir
 from vllm.config import VllmConfig
 
@@ -86,6 +87,40 @@ def get_forward_context() -> ForwardContext:
 
 def is_forward_context_available() -> bool:
     return _forward_context is not None
+
+
+def build_local_sp_padding_mask(
+    batch_size: int,
+    local_seq_len: int,
+    device,
+):
+    """Build a per-rank SP padding mask that matches the local shard shape.
+
+    Auto-padding is applied before sequence-parallel sharding, so attention on each
+    rank must receive a mask for its local shard, not for the global padded sequence.
+    """
+    if not is_forward_context_available():
+        return None
+
+    ctx = get_forward_context()
+    if ctx.sp_original_seq_len is None or ctx.sp_padding_size <= 0:
+        return None
+
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        get_sequence_parallel_rank,
+    )
+    from vllm_omni.diffusion.distributed.utils import (
+        build_local_sp_padding_mask as build_local_sp_padding_mask_for_rank,
+    )
+
+    return build_local_sp_padding_mask_for_rank(
+        batch_size=batch_size,
+        local_seq_len=local_seq_len,
+        sp_original_seq_len=ctx.sp_original_seq_len,
+        sp_padding_size=ctx.sp_padding_size,
+        sequence_parallel_rank=get_sequence_parallel_rank(),
+        device=device,
+    )
 
 
 def get_ulysses_mode(*, default: str = "strict") -> str:

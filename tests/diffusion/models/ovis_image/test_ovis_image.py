@@ -24,6 +24,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.ovis_image.pipeline_ovis_image import OvisImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
@@ -166,7 +167,7 @@ def test_basic_generation(ovis_pipeline):
     """Test the forward pass logic."""
     # Setup request
     req = OmniDiffusionRequest(
-        prompts=["A photo of a cat"],
+        prompt="A photo of a cat",
         request_id="ovis-basic",
         sampling_params=OmniDiffusionSamplingParams(
             height=256,
@@ -176,7 +177,7 @@ def test_basic_generation(ovis_pipeline):
         ),
     )
 
-    output = ovis_pipeline(req)
+    output = ovis_pipeline(DiffusionRequestBatch(requests=[req]))
 
     assert output is not None
     assert output.output is not None
@@ -201,12 +202,10 @@ def test_guidance_scale(ovis_pipeline, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(f"{_cfg_parallel}.get_classifier_free_guidance_rank", lambda: 0)
 
     req = OmniDiffusionRequest(
-        prompts=[
-            {
-                "prompt": "A photo of a cat",
-                "negative_prompt": "bad quality",
-            }
-        ],
+        prompt={
+            "prompt": "A photo of a cat",
+            "negative_prompt": "bad quality",
+        },
         request_id="ovis-guidance",
         sampling_params=OmniDiffusionSamplingParams(
             height=256,
@@ -216,7 +215,7 @@ def test_guidance_scale(ovis_pipeline, monkeypatch: pytest.MonkeyPatch):
         ),
     )
 
-    ovis_pipeline(req)
+    ovis_pipeline(DiffusionRequestBatch(requests=[req]))
     assert ovis_pipeline.transformer.call_count >= 2
 
 
@@ -226,7 +225,7 @@ def test_resolution_check(ovis_pipeline):
     """Test resolution divisible validation logic if present."""
     # Pass odd resolution
     req = OmniDiffusionRequest(
-        prompts=["test"],
+        prompt="test",
         request_id="ovis-resolution",
         sampling_params=OmniDiffusionSamplingParams(
             height=250,  # Not divisible by 16 (8*2)
@@ -237,7 +236,7 @@ def test_resolution_check(ovis_pipeline):
     # Should warn but proceed (as per code I read earlier) or resize?
     # The code had `logger.warning(...)`
 
-    output = ovis_pipeline(req)
+    output = ovis_pipeline(DiffusionRequestBatch(requests=[req]))
     assert output is not None
 
 

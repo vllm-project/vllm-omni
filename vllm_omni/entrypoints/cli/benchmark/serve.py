@@ -119,7 +119,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Keep synthesized audio as 24 kHz mono PCM for WER (works with "
         "--backend openai-audio-speech or openai-chat-omni). Scoring follows "
         "zhaochenyang20/seed-tts-eval (Whisper-large-v3 / Paraformer-zh + jiwer). "
-        "Sets SEED_TTS_WER_EVAL=1. Install: pip install 'vllm-omni[seed-tts-eval]'. "
+        "Sets SEED_TTS_WER_EVAL=1. Install: pip install 'vllm-omni[dev]'. "
         "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL.",
     )
     g.add_argument(

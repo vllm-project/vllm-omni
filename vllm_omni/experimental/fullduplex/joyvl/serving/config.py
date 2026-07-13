@@ -26,6 +26,7 @@ class InteractionConfig:
 
     persona: str = "default"
     frame_seconds: float = 1.0
+    max_pixels: int = 262144
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
 
     force_silence_before_query: bool = True
@@ -42,6 +43,7 @@ class InteractionConfig:
     mid_term_key_frames: int = 0
 
     long_term_every_n_chunks: int = 5
+    long_term_memory_window: int = 15
     mid_term_max_tokens: int = 4000
     long_term_max_tokens: int = 4000
     keep_qa_history: bool = True
