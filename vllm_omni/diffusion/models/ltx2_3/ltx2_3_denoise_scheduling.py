@@ -61,6 +61,36 @@ class _VideoAudioScheduler:
         return ((video_out, audio_out),)
 
 
+class _I2VVideoAudioScheduler:
+    """Keep the image-conditioned first video latent frame fixed while stepping audio normally."""
+
+    def __init__(self, pipeline, audio_scheduler, latent_num_frames, latent_height, latent_width):
+        self.video_scheduler = pipeline.scheduler
+        self.audio_scheduler = audio_scheduler
+        self._pipeline = pipeline
+        self._latent_num_frames = latent_num_frames
+        self._latent_height = latent_height
+        self._latent_width = latent_width
+
+    def step(self, noise_pred, t, latents, return_dict=False, generator=None):
+        video_out = self._pipeline._step_video_latents_i2v(
+            noise_pred[0],
+            latents[0],
+            t[0],
+            self._latent_num_frames,
+            self._latent_height,
+            self._latent_width,
+        )
+        audio_out = self.audio_scheduler.step(
+            noise_pred[1],
+            t[1],
+            latents[1],
+            return_dict=False,
+            generator=generator,
+        )[0]
+        return ((video_out, audio_out),)
+
+
 class LTX23SchedulerMixin:
     def _make_video_audio_scheduler(
         self,

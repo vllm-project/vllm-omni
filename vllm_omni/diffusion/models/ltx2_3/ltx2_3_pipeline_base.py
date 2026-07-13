@@ -641,6 +641,20 @@ class LTX23PipelineBase(
     # Latent preparation
     # ------------------------------------------------------------------
 
+    def _resolve_video_latent_shape(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+    ) -> tuple[int, int, int]:
+        return latent_prep.resolve_video_latent_shape(
+            height,
+            width,
+            num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
+
     def prepare_latents(
         self,
         batch_size: int = 1,
@@ -651,37 +665,36 @@ class LTX23PipelineBase(
         noise_scale: float = 0.0,
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
-        generator: torch.Generator | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if latents is not None:
-            if latents.ndim == 5:
-                latents = self._normalize_latents(
-                    latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
-                )
-                latents = self._pack_latents(
-                    latents, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
-                )
-            if latents.ndim != 3:
-                raise ValueError(f"Provided `latents` has shape {latents.shape}, expected [batch, seq, features].")
-            noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
-            latents = noise_scale * noise + (1 - noise_scale) * latents
-            return latents.to(device=device, dtype=dtype)
-
-        height = height // self.vae_spatial_compression_ratio
-        width = width // self.vae_spatial_compression_ratio
-        num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        shape = (
-            batch_size,
-            (num_frames // self.transformer_temporal_patch_size)
-            * (height // self.transformer_spatial_patch_size)
-            * (width // self.transformer_spatial_patch_size),
-            num_channels_latents
-            * self.transformer_temporal_patch_size
-            * self.transformer_spatial_patch_size
-            * self.transformer_spatial_patch_size,
+        num_frames, height, width = self._resolve_video_latent_shape(height, width, num_frames)
+        shape = latent_prep.VideoLatentShape(
+            batch_size=batch_size,
+            num_channels=num_channels_latents,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            patch_size=self.transformer_spatial_patch_size,
+            patch_size_t=self.transformer_temporal_patch_size,
         )
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        latents_mean = latents_std = None
+        scaling_factor = 1.0
+        if latents is not None and latents.ndim == 5:
+            latents_mean = self.vae.latents_mean
+            latents_std = self.vae.latents_std
+            scaling_factor = self.vae.config.scaling_factor
+        latents, _ = latent_prep.prepare_video_latent_state(
+            latents,
+            shape=shape,
+            generator=generator,
+            dtype=dtype,
+            device=device,
+            latents_mean=latents_mean,
+            latents_std=latents_std,
+            scaling_factor=scaling_factor,
+            noise_scale=noise_scale,
+        )
         return latents
 
     def prepare_audio_latents(
@@ -942,9 +955,11 @@ class LTX23PipelineBase(
         self,
         request_inputs: _LTX23RequestInputs,
     ) -> tuple[int, int, int]:
-        latent_num_frames = (request_inputs.num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        latent_height = request_inputs.height // self.vae_spatial_compression_ratio
-        latent_width = request_inputs.width // self.vae_spatial_compression_ratio
+        latent_num_frames, latent_height, latent_width = self._resolve_video_latent_shape(
+            request_inputs.height,
+            request_inputs.width,
+            request_inputs.num_frames,
+        )
         if request_inputs.latents is not None and request_inputs.latents.ndim == 5:
             _, _, latent_num_frames, latent_height, latent_width = request_inputs.latents.shape
         return latent_num_frames, latent_height, latent_width

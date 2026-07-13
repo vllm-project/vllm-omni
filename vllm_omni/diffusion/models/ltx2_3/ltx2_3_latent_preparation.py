@@ -5,7 +5,115 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
+from diffusers.utils.torch_utils import randn_tensor
+
+
+@dataclass(frozen=True)
+class VideoLatentShape:
+    """Unpacked and packed layout for one LTX-2.3 video latent state."""
+
+    batch_size: int
+    num_channels: int
+    num_frames: int
+    height: int
+    width: int
+    patch_size: int
+    patch_size_t: int
+
+    @property
+    def conditioning_mask_shape(self) -> tuple[int, int, int, int, int]:
+        return (self.batch_size, 1, self.num_frames, self.height, self.width)
+
+    @property
+    def packed_shape(self) -> tuple[int, int, int]:
+        return (
+            self.batch_size,
+            (self.num_frames // self.patch_size_t) * (self.height // self.patch_size) * (self.width // self.patch_size),
+            self.num_channels * self.patch_size_t * self.patch_size * self.patch_size,
+        )
+
+
+def resolve_video_latent_shape(
+    height: int,
+    width: int,
+    num_frames: int,
+    *,
+    vae_spatial_compression_ratio: int,
+    vae_temporal_compression_ratio: int,
+) -> tuple[int, int, int]:
+    return (
+        (num_frames - 1) // vae_temporal_compression_ratio + 1,
+        height // vae_spatial_compression_ratio,
+        width // vae_spatial_compression_ratio,
+    )
+
+
+def create_noised_state(
+    latents: torch.Tensor,
+    noise_scale: float | torch.Tensor,
+    generator: torch.Generator | list[torch.Generator] | None = None,
+) -> torch.Tensor:
+    noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+    return noise_scale * noise + (1 - noise_scale) * latents
+
+
+def prepare_video_latent_state(
+    latents: torch.Tensor | None,
+    *,
+    shape: VideoLatentShape,
+    generator: torch.Generator | list[torch.Generator] | None,
+    dtype: torch.dtype | None,
+    device: torch.device | None,
+    latents_mean: torch.Tensor | None,
+    latents_std: torch.Tensor | None,
+    scaling_factor: float,
+    noise_scale: float | torch.Tensor = 1.0,
+    conditioning_mask: torch.Tensor | None = None,
+    noise_packed_latents: bool = True,
+    latents_are_normalized: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Normalize, noise, and pack a video state for T2V or I2V.
+
+    T2V passes no conditioning mask and uses ordinary packed-latent noising.
+    I2V supplies an unpacked first-frame mask and disables noising for caller-
+    provided packed latents, which already encode the full conditioned state.
+    Image-encoded I2V latents can be normalized before temporal repetition and
+    marked as such to avoid repeating the normalization work for every frame.
+    """
+    packed_conditioning_mask = None
+    if conditioning_mask is not None:
+        packed_conditioning_mask = pack_latents(
+            conditioning_mask,
+            patch_size=shape.patch_size,
+            patch_size_t=shape.patch_size_t,
+        ).squeeze(-1)
+
+    if latents is None:
+        if conditioning_mask is not None:
+            raise ValueError("Conditioning mask requires an initial video latent state.")
+        return randn_tensor(shape.packed_shape, generator=generator, device=device, dtype=dtype), None
+
+    if latents.ndim == 5:
+        if not latents_are_normalized:
+            if latents_mean is None or latents_std is None:
+                raise ValueError("5D video latents require VAE normalization statistics.")
+            latents = normalize_latents(latents, latents_mean, latents_std, scaling_factor)
+        latents = create_noised_state(latents, noise_scale, generator)
+        latents = pack_latents(latents, patch_size=shape.patch_size, patch_size_t=shape.patch_size_t)
+    elif latents.ndim == 3:
+        if tuple(latents.shape) != shape.packed_shape:
+            raise ValueError(
+                f"Provided `latents` tensor has shape {latents.shape}, but the expected shape is {shape.packed_shape}."
+            )
+        if noise_packed_latents:
+            latents = create_noised_state(latents, noise_scale, generator)
+    else:
+        raise ValueError(f"Provided `latents` has shape {latents.shape}, expected [batch, seq, features].")
+
+    return latents.to(device=device, dtype=dtype), packed_conditioning_mask
 
 
 def repeat_prompt_tensor_for_outputs(tensor: torch.Tensor, num_videos_per_prompt: int) -> torch.Tensor:

@@ -10,76 +10,41 @@ from typing import Any
 import PIL.Image
 import torch
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
-from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from .pipeline_ltx2_3 import (
-    LTX23Pipeline,
+from . import ltx2_3_latent_preparation as latent_prep
+from .ltx2_3_denoise_scheduling import _I2VVideoAudioScheduler
+from .ltx2_3_misc import _LTX23RequestInputs
+from .ltx2_3_pipeline_base import (
+    LTX23PipelineBase,
     _LTX23DenoiseContext,
     _LTX23ForwardContext,
     _LTX23PromptContext,
-    _LTX23RequestInputs,
     get_ltx2_post_process_func,
 )
+from .ltx2_3_recipes import LTX23_ONE_STAGE_RECIPE
 
 
-class _I2VVideoAudioScheduler:
-    """Composite scheduler for LTX-2.3 I2V latents."""
-
-    def __init__(self, pipeline, audio_scheduler, latent_num_frames, latent_height, latent_width):
-        self.video_scheduler = pipeline.scheduler
-        self.audio_scheduler = audio_scheduler
-        self._pipeline = pipeline
-        self._latent_num_frames = latent_num_frames
-        self._latent_height = latent_height
-        self._latent_width = latent_width
-
-    def step(self, noise_pred, t, latents, return_dict=False, generator=None):
-        video_out = self._pipeline._step_video_latents_i2v(
-            noise_pred[0],
-            latents[0],
-            t[0],
-            self._latent_num_frames,
-            self._latent_height,
-            self._latent_width,
-        )
-        audio_out = self.audio_scheduler.step(
-            noise_pred[1],
-            t[1],
-            latents[1],
-            return_dict=False,
-            generator=generator,
-        )[0]
-        return ((video_out, audio_out),)
-
-
-class LTX23ImageToVideoPipeline(LTX23Pipeline):
+class LTX23ImageToVideoPipeline(LTX23PipelineBase):
     """LTX-2.3 image-to-video pipeline.
 
     This keeps the LTX-2.3 prompt connector, x0-space CFG, sigma prompt
-    modulation, and audio branch semantics from ``LTX23Pipeline`` while
+    modulation, and audio branch semantics from ``LTX23PipelineBase`` while
     reusing the existing LTX image-conditioning contract: the first video
     latent frame is encoded from the input image and remains fixed during
     denoising.
     """
+
+    _ltx23_recipe = LTX23_ONE_STAGE_RECIPE
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_spatial_compression_ratio, resample="bilinear")
 
     support_image_input = True
-
-    @staticmethod
-    def _create_noised_state(
-        latents: torch.Tensor,
-        noise_scale: float | torch.Tensor,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-    ) -> torch.Tensor:
-        noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
-        return noise_scale * noise + (1 - noise_scale) * latents
 
     @staticmethod
     def _resolve_single_prompt_image(raw_image: Any) -> Any:
@@ -121,47 +86,41 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         already represent the full video state including the conditioning first
         frame. Packed 3D latents are assumed to be in transformer token layout.
         """
-        height = height // self.vae_spatial_compression_ratio
-        width = width // self.vae_spatial_compression_ratio
-        num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
-
-        shape = (batch_size, num_channels_latents, num_frames, height, width)
-        mask_shape = (batch_size, 1, num_frames, height, width)
+        num_frames, height, width = self._resolve_video_latent_shape(height, width, num_frames)
+        if latents is not None and latents.ndim == 5:
+            batch_size, _, num_frames, height, width = latents.shape
+        shape = latent_prep.VideoLatentShape(
+            batch_size=batch_size,
+            num_channels=num_channels_latents,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            patch_size=self.transformer_spatial_patch_size,
+            patch_size_t=self.transformer_temporal_patch_size,
+        )
 
         if latents is not None:
+            conditioning_mask = latents.new_zeros(shape.conditioning_mask_shape)
+            conditioning_mask[:, :, 0] = 1.0
+            latents_mean = latents_std = None
+            scaling_factor = 1.0
             if latents.ndim == 5:
-                batch_size, _, num_frames, height, width = latents.shape
-                mask_shape = (batch_size, 1, num_frames, height, width)
-                conditioning_mask = latents.new_zeros(mask_shape)
-                conditioning_mask[:, :, 0] = 1.0
-
-                latents = self._normalize_latents(
-                    latents,
-                    self.vae.latents_mean,
-                    self.vae.latents_std,
-                    self.vae.config.scaling_factor,
-                )
-                latents = self._create_noised_state(latents, noise_scale * (1 - conditioning_mask), generator)
-                latents = self._pack_latents(
-                    latents,
-                    self.transformer_spatial_patch_size,
-                    self.transformer_temporal_patch_size,
-                )
-            else:
-                conditioning_mask = latents.new_zeros(mask_shape)
-                conditioning_mask[:, :, 0] = 1.0
-
-            conditioning_mask = self._pack_latents(
-                conditioning_mask,
-                self.transformer_spatial_patch_size,
-                self.transformer_temporal_patch_size,
-            ).squeeze(-1)
-            if latents.ndim != 3 or latents.shape[:2] != conditioning_mask.shape:
-                raise ValueError(
-                    "Provided `latents` tensor has shape"
-                    f" {latents.shape}, but the expected shape is {conditioning_mask.shape + (num_channels_latents,)}."
-                )
-            return latents.to(device=device, dtype=dtype), conditioning_mask
+                latents_mean = self.vae.latents_mean
+                latents_std = self.vae.latents_std
+                scaling_factor = self.vae.config.scaling_factor
+            return latent_prep.prepare_video_latent_state(
+                latents,
+                shape=shape,
+                generator=generator,
+                dtype=dtype,
+                device=device,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                scaling_factor=scaling_factor,
+                noise_scale=noise_scale * (1 - conditioning_mask),
+                conditioning_mask=conditioning_mask,
+                noise_packed_latents=False,
+            )
 
         if image is None:
             raise ValueError("`image` must be provided when `latents` is None.")
@@ -195,27 +154,29 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         init_latents = torch.cat(init_latents, dim=0).to(dtype)
         if num_videos_per_prompt > 1:
             init_latents = init_latents.repeat_interleave(num_videos_per_prompt, dim=0)
-        init_latents = self._normalize_latents(
+        init_latents = latent_prep.normalize_latents(
             init_latents,
             self.vae.latents_mean,
             self.vae.latents_std,
         )
         init_latents = init_latents.repeat(1, 1, num_frames, 1, 1)
 
-        conditioning_mask = torch.zeros(mask_shape, device=device, dtype=dtype)
+        conditioning_mask = torch.zeros(shape.conditioning_mask_shape, device=device, dtype=dtype)
         conditioning_mask[:, :, 0] = 1.0
-
-        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        latents = init_latents * conditioning_mask + noise * (1 - conditioning_mask)
-
-        conditioning_mask = self._pack_latents(
-            conditioning_mask,
-            self.transformer_spatial_patch_size,
-            self.transformer_temporal_patch_size,
-        ).squeeze(-1)
-        latents = self._pack_latents(latents, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size)
-
-        return latents, conditioning_mask
+        return latent_prep.prepare_video_latent_state(
+            init_latents,
+            shape=shape,
+            generator=generator,
+            dtype=dtype,
+            device=device,
+            latents_mean=None,
+            latents_std=None,
+            scaling_factor=1.0,
+            noise_scale=1 - conditioning_mask,
+            conditioning_mask=conditioning_mask,
+            noise_packed_latents=False,
+            latents_are_normalized=True,
+        )
 
     def check_inputs(
         self,
@@ -331,18 +292,13 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         self,
         request_inputs: _LTX23RequestInputs,
     ) -> tuple[int, int, int]:
-        latent_num_frames = (request_inputs.num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        latent_height = request_inputs.height // self.vae_spatial_compression_ratio
-        latent_width = request_inputs.width // self.vae_spatial_compression_ratio
-        if request_inputs.latents is not None:
-            if request_inputs.latents.ndim == 5:
-                _, _, latent_num_frames, latent_height, latent_width = request_inputs.latents.shape
-            elif request_inputs.latents.ndim != 3:
-                raise ValueError(
-                    f"Provided `latents` tensor has shape {request_inputs.latents.shape}, but the expected shape is "
-                    "either [batch_size, seq_len, num_features] or "
-                    "[batch_size, latent_dim, latent_frames, latent_height, latent_width]."
-                )
+        latent_num_frames, latent_height, latent_width = super()._resolve_video_latent_dimensions(request_inputs)
+        if request_inputs.latents is not None and request_inputs.latents.ndim not in (3, 5):
+            raise ValueError(
+                f"Provided `latents` tensor has shape {request_inputs.latents.shape}, but the expected shape is "
+                "either [batch_size, seq_len, num_features] or "
+                "[batch_size, latent_dim, latent_frames, latent_height, latent_width]."
+            )
         return latent_num_frames, latent_height, latent_width
 
     def _prepare_video_latents_stage(

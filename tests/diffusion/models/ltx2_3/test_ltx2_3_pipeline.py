@@ -80,34 +80,14 @@ def _resolve_request_inputs_for_test(pipe, req, guidance_scale=None):
 
 
 class TestLTX23RequestParsing:
-    def test_official_ltx23_recipes_capture_stage_defaults(self):
-        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import (
-            LTX23_HQ_TWO_STAGE_RECIPE,
-            LTX23_ONE_STAGE_RECIPE,
-            LTX23_STAGE_2_DISTILLED_SIGMAS,
-            LTX23_TWO_STAGE_RECIPE,
-        )
+    def test_official_ltx23_one_stage_recipe_captures_stage_defaults(self):
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import LTX23_ONE_STAGE_RECIPE
 
         assert LTX23_ONE_STAGE_RECIPE.name == "one_stage_official"
         assert (LTX23_ONE_STAGE_RECIPE.height, LTX23_ONE_STAGE_RECIPE.width) == (512, 768)
-        assert LTX23_ONE_STAGE_RECIPE.num_inference_steps == 30
-        assert LTX23_ONE_STAGE_RECIPE.video_guidance.stg_blocks == (28,)
+        assert LTX23_ONE_STAGE_RECIPE.initial_denoise_stage.num_inference_steps == 30
+        assert LTX23_ONE_STAGE_RECIPE.initial_denoise_stage.video_guidance.stg_blocks == (28,)
         assert len(LTX23_ONE_STAGE_RECIPE.stages) == 1
-
-        assert LTX23_TWO_STAGE_RECIPE.name == "two_stage_official"
-        assert (LTX23_TWO_STAGE_RECIPE.height, LTX23_TWO_STAGE_RECIPE.width) == (1024, 1536)
-        assert LTX23_TWO_STAGE_RECIPE.stages[0].width_scale == 0.5
-        assert LTX23_TWO_STAGE_RECIPE.stages[1].sigma_values == LTX23_STAGE_2_DISTILLED_SIGMAS
-        assert LTX23_TWO_STAGE_RECIPE.stages[1].uses_spatial_upsampler
-
-        assert LTX23_HQ_TWO_STAGE_RECIPE.name == "two_stage_hq_official"
-        assert (LTX23_HQ_TWO_STAGE_RECIPE.height, LTX23_HQ_TWO_STAGE_RECIPE.width) == (1088, 1920)
-        assert LTX23_HQ_TWO_STAGE_RECIPE.num_inference_steps == 15
-        assert LTX23_HQ_TWO_STAGE_RECIPE.video_guidance.stg_scale == 0.0
-        assert LTX23_HQ_TWO_STAGE_RECIPE.audio_guidance.rescale_scale == 1.0
-        assert LTX23_HQ_TWO_STAGE_RECIPE.stages[0].sampler == "res2s"
-        assert LTX23_HQ_TWO_STAGE_RECIPE.stages[0].distilled_lora_strength == 0.25
-        assert LTX23_HQ_TWO_STAGE_RECIPE.stages[1].distilled_lora_strength == 0.5
 
     def test_request_input_resolution_uses_official_ltx23_defaults(self):
         from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import LTX23_ONE_STAGE_RECIPE
@@ -132,18 +112,19 @@ class TestLTX23RequestParsing:
         assert resolved.width == LTX23_ONE_STAGE_RECIPE.width
         assert resolved.num_frames == LTX23_ONE_STAGE_RECIPE.num_frames
         assert resolved.frame_rate == LTX23_ONE_STAGE_RECIPE.frame_rate
-        assert resolved.num_inference_steps == LTX23_ONE_STAGE_RECIPE.num_inference_steps
-        assert resolved.guidance_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.cfg_scale
-        assert resolved.guidance_params.video_cfg_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.cfg_scale
-        assert resolved.guidance_params.audio_cfg_scale == LTX23_ONE_STAGE_RECIPE.audio_guidance.cfg_scale
-        assert resolved.guidance_params.video_stg_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.stg_scale
-        assert resolved.guidance_params.audio_stg_scale == LTX23_ONE_STAGE_RECIPE.audio_guidance.stg_scale
-        assert resolved.guidance_params.video_modality_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.modality_scale
-        assert resolved.guidance_params.audio_modality_scale == LTX23_ONE_STAGE_RECIPE.audio_guidance.modality_scale
-        assert resolved.guidance_params.video_rescale_scale == LTX23_ONE_STAGE_RECIPE.video_guidance.rescale_scale
-        assert resolved.guidance_params.audio_rescale_scale == LTX23_ONE_STAGE_RECIPE.audio_guidance.rescale_scale
-        assert resolved.guidance_params.video_stg_blocks == LTX23_ONE_STAGE_RECIPE.video_guidance.stg_blocks
-        assert resolved.guidance_params.audio_stg_blocks == LTX23_ONE_STAGE_RECIPE.audio_guidance.stg_blocks
+        initial_stage = LTX23_ONE_STAGE_RECIPE.initial_denoise_stage
+        assert resolved.num_inference_steps == initial_stage.num_inference_steps
+        assert resolved.guidance_scale == initial_stage.video_guidance.cfg_scale
+        assert resolved.guidance_params.video_cfg_scale == initial_stage.video_guidance.cfg_scale
+        assert resolved.guidance_params.audio_cfg_scale == initial_stage.audio_guidance.cfg_scale
+        assert resolved.guidance_params.video_stg_scale == initial_stage.video_guidance.stg_scale
+        assert resolved.guidance_params.audio_stg_scale == initial_stage.audio_guidance.stg_scale
+        assert resolved.guidance_params.video_modality_scale == initial_stage.video_guidance.modality_scale
+        assert resolved.guidance_params.audio_modality_scale == initial_stage.audio_guidance.modality_scale
+        assert resolved.guidance_params.video_rescale_scale == initial_stage.video_guidance.rescale_scale
+        assert resolved.guidance_params.audio_rescale_scale == initial_stage.audio_guidance.rescale_scale
+        assert resolved.guidance_params.video_stg_blocks == initial_stage.video_guidance.stg_blocks
+        assert resolved.guidance_params.audio_stg_blocks == initial_stage.audio_guidance.stg_blocks
         assert resolved.decode_timestep == LTX23_ONE_STAGE_RECIPE.decode_timestep
         assert resolved.decode_noise_scale == LTX23_ONE_STAGE_RECIPE.decode_noise_scale
 
@@ -157,10 +138,16 @@ class TestLTX23RequestParsing:
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        initial_stage = LTX23_ONE_STAGE_RECIPE.initial_denoise_stage
         pipe._ltx23_recipe = replace(
             LTX23_ONE_STAGE_RECIPE,
-            video_guidance=replace(LTX23_ONE_STAGE_RECIPE.video_guidance, cfg_scale=5.0),
-            audio_guidance=replace(LTX23_ONE_STAGE_RECIPE.audio_guidance, cfg_scale=9.0),
+            stages=(
+                replace(
+                    initial_stage,
+                    video_guidance=replace(initial_stage.video_guidance, cfg_scale=5.0),
+                    audio_guidance=replace(initial_stage.audio_guidance, cfg_scale=9.0),
+                ),
+            ),
         )
         req = DiffusionRequestBatch(
             [
@@ -179,30 +166,38 @@ class TestLTX23RequestParsing:
         assert resolved.guidance_params.audio_cfg_scale == 9.0
 
     def test_request_input_resolution_uses_split_audio_video_recipe_guidance_defaults(self):
-        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import LTX23_HQ_TWO_STAGE_RECIPE
+        from dataclasses import replace
+
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_recipes import LTX23_ONE_STAGE_RECIPE
         from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         pipe = _make_ltx23_request_pipe(LTX23Pipeline)
-        pipe._ltx23_recipe = LTX23_HQ_TWO_STAGE_RECIPE
+        initial_stage = LTX23_ONE_STAGE_RECIPE.initial_denoise_stage
+        video_guidance = replace(initial_stage.video_guidance, rescale_scale=0.45, stg_blocks=())
+        audio_guidance = replace(initial_stage.audio_guidance, rescale_scale=1.0, stg_blocks=())
+        pipe._ltx23_recipe = replace(
+            LTX23_ONE_STAGE_RECIPE,
+            stages=(replace(initial_stage, video_guidance=video_guidance, audio_guidance=audio_guidance),),
+        )
         req = DiffusionRequestBatch(
             [
                 OmniDiffusionRequest(
                     prompt={"prompt": "prompt", "negative_prompt": "negative"},
                     sampling_params=OmniDiffusionSamplingParams(),
-                    request_id="ltx23-hq-guidance-defaults",
+                    request_id="ltx23-split-guidance-defaults",
                 )
             ]
         )
 
         resolved = _resolve_request_inputs_for_test(pipe, req)
 
-        assert resolved.guidance_params.video_rescale_scale == LTX23_HQ_TWO_STAGE_RECIPE.video_guidance.rescale_scale
-        assert resolved.guidance_params.audio_rescale_scale == LTX23_HQ_TWO_STAGE_RECIPE.audio_guidance.rescale_scale
-        assert resolved.guidance_params.video_stg_blocks == LTX23_HQ_TWO_STAGE_RECIPE.video_guidance.stg_blocks
-        assert resolved.guidance_params.audio_stg_blocks == LTX23_HQ_TWO_STAGE_RECIPE.audio_guidance.stg_blocks
+        assert resolved.guidance_params.video_rescale_scale == video_guidance.rescale_scale
+        assert resolved.guidance_params.audio_rescale_scale == audio_guidance.rescale_scale
+        assert resolved.guidance_params.video_stg_blocks == video_guidance.stg_blocks
+        assert resolved.guidance_params.audio_stg_blocks == audio_guidance.stg_blocks
 
     def test_request_input_resolution_allows_ltx23_guidance_overrides(self):
         from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline

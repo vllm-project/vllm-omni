@@ -90,8 +90,11 @@ class LTX23RequestMixin:
     ) -> _LTX23GuidanceParams:
         extra_args = sampling_params.extra_args or {}
         recipe = self._ltx23_recipe
-        video_guidance = recipe.video_guidance
-        audio_guidance = recipe.audio_guidance
+        initial_stage = recipe.initial_denoise_stage
+        video_guidance = initial_stage.video_guidance
+        audio_guidance = initial_stage.audio_guidance
+        if video_guidance is None or audio_guidance is None:
+            raise ValueError(f"LTX-2.3 recipe {recipe.name!r} has no initial-stage guidance defaults.")
         user_guidance_scale = bool(getattr(sampling_params, "guidance_scale_provided", False))
         audio_cfg_default = guidance_scale if user_guidance_scale else audio_guidance.cfg_scale
         guidance_rescale = getattr(sampling_params, "guidance_rescale", None)
@@ -180,13 +183,16 @@ class LTX23RequestMixin:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
         recipe = self._ltx23_recipe
+        initial_stage = recipe.initial_denoise_stage
         height = common_sampling_params.height or height or recipe.height
         width = common_sampling_params.width or width or recipe.width
         num_frames = common_sampling_params.num_frames or num_frames or recipe.num_frames
         frame_rate = common_sampling_params.resolved_frame_rate or frame_rate or recipe.frame_rate
         num_inference_steps = (
-            common_sampling_params.num_inference_steps or num_inference_steps or recipe.num_inference_steps
+            common_sampling_params.num_inference_steps or num_inference_steps or initial_stage.num_inference_steps
         )
+        if num_inference_steps is None:
+            raise ValueError(f"LTX-2.3 recipe {recipe.name!r} has no initial-stage inference-step default.")
         if timesteps is None:
             num_inference_steps = max(int(num_inference_steps), 2)
         elif len(timesteps) < 2:
@@ -204,7 +210,10 @@ class LTX23RequestMixin:
         if common_sampling_params.guidance_scale_provided:
             guidance_scale = common_sampling_params.guidance_scale
         elif guidance_scale is None:
-            guidance_scale = recipe.video_guidance.cfg_scale
+            video_guidance = initial_stage.video_guidance
+            if video_guidance is None:
+                raise ValueError(f"LTX-2.3 recipe {recipe.name!r} has no initial-stage video guidance default.")
+            guidance_scale = video_guidance.cfg_scale
         guidance_params = self._resolve_guidance_params(common_sampling_params, guidance_scale)
         for sampling_params in sampling_params_list[1:]:
             other_guidance_scale = (

@@ -88,10 +88,10 @@ class TestLTX23ImageToVideoForwardStages:
 
 class TestLTX23ImageToVideoPipeline:
     def test_ltx23_i2v_pipeline_reuses_ltx23_semantics(self):
-        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2_3.ltx2_3_pipeline_base import LTX23PipelineBase
         from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
 
-        assert issubclass(LTX23ImageToVideoPipeline, LTX23Pipeline)
+        assert issubclass(LTX23ImageToVideoPipeline, LTX23PipelineBase)
         assert LTX23ImageToVideoPipeline.support_image_input is True
 
     def test_ltx23_i2v_rejects_multi_image_prompt_list(self):
@@ -116,7 +116,7 @@ class TestLTX23ImageToVideoPipeline:
         assert LTX23ImageToVideoPipeline._resolve_additional_image(additional) is image
 
     def test_ltx23_i2v_packed_latents_are_not_noised(self, monkeypatch):
-        import vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3_image2video as ltx23_i2v
+        import vllm_omni.diffusion.models.ltx2_3.ltx2_3_latent_preparation as latent_prep
         from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
 
         pipe = object.__new__(LTX23ImageToVideoPipeline)
@@ -129,7 +129,7 @@ class TestLTX23ImageToVideoPipeline:
         def fake_randn_tensor(shape, generator=None, device=None, dtype=None):
             raise AssertionError("packed I2V latents should not be noised")
 
-        monkeypatch.setattr(ltx23_i2v, "randn_tensor", fake_randn_tensor)
+        monkeypatch.setattr(latent_prep, "randn_tensor", fake_randn_tensor)
 
         latents = torch.tensor([[[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]])
 
@@ -149,9 +149,31 @@ class TestLTX23ImageToVideoPipeline:
         torch.testing.assert_close(conditioning_mask, torch.tensor([[1.0, 0.0, 0.0]]))
         torch.testing.assert_close(out, latents)
 
+    def test_ltx23_i2v_rejects_packed_latents_with_wrong_feature_width(self):
+        from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
+
+        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae_spatial_compression_ratio = 1
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+
+        with pytest.raises(ValueError, match=r"expected shape is \(1, 3, 2\)"):
+            pipe.prepare_latents(
+                image=None,
+                batch_size=1,
+                num_channels_latents=2,
+                height=1,
+                width=1,
+                num_frames=3,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                latents=torch.zeros(1, 3, 3),
+            )
+
     def test_ltx23_i2v_5d_latents_noise_preserves_conditioning_frame(self, monkeypatch):
-        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2 as ltx2
-        import vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3_image2video as ltx23_i2v
+        import vllm_omni.diffusion.models.ltx2_3.ltx2_3_latent_preparation as latent_prep
         from vllm_omni.diffusion.models.ltx2_3.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
 
         pipe = object.__new__(LTX23ImageToVideoPipeline)
@@ -169,8 +191,7 @@ class TestLTX23ImageToVideoPipeline:
         def fake_randn_tensor(shape, generator=None, device=None, dtype=None):
             return torch.ones(shape, device=device, dtype=dtype)
 
-        monkeypatch.setattr(ltx23_i2v, "randn_tensor", fake_randn_tensor)
-        monkeypatch.setattr(ltx2, "randn_tensor", fake_randn_tensor)
+        monkeypatch.setattr(latent_prep, "randn_tensor", fake_randn_tensor)
 
         latents = torch.tensor([[[[[10.0]], [[20.0]], [[30.0]]], [[[11.0]], [[21.0]], [[31.0]]]]])
 
