@@ -10,7 +10,17 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.platforms import current_omni_platform
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.fixture
+def accelerator_device() -> torch.device:
+    """Provide an accelerator device, skipping when none is available."""
+    if current_omni_platform.get_device_count() == 0:
+        pytest.skip("Accelerator required for this test")
+    return current_omni_platform.get_torch_device(0)
 
 
 def _tiny_cosmos3_config(**overrides):
@@ -88,7 +98,7 @@ def test_validate_supported_config_rejects_unsupported_flags(key: str, value) ->
 
 
 def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
-    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3LanguageModel, Cosmos3VFMTransformer
 
     model = object.__new__(Cosmos3VFMTransformer)
     nn.Module.__init__(model)
@@ -104,6 +114,7 @@ def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
     ]
     assert matched == ["language_model.layers.0", "language_model.layers.1", "gen_layers.0"]
     assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
+    assert Cosmos3LanguageModel._layerwise_offload_blocks_attrs == ["layers"]
     assert Cosmos3VFMTransformer._repeated_blocks == ["Cosmos3GenDecoderLayer"]
 
     model.latent_patch_size = 2
@@ -129,6 +140,97 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
+
+
+def test_model_cpu_offload_swaps_back_to_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    class ToyReasonerLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward(self, hidden: torch.Tensor, freqs):
+            del freqs
+            kv = hidden.new_zeros(hidden.shape[0], hidden.shape[1], 1, 1)
+            return hidden + self.weight.to(hidden.dtype), kv, kv
+
+    class ToyGeneratorLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward(self, hidden: torch.Tensor, **kwargs):
+            del kwargs
+            return hidden + self.weight.to(hidden.dtype)
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    model.language_model.layers = nn.ModuleList([ToyReasonerLayer()])
+    model.gen_layers = nn.ModuleList([ToyGeneratorLayer()])
+    model.enable_model_cpu_offload(device=torch.device("cpu"), pin_memory=False)
+
+    assert model._model_cpu_offload_enabled
+    assert set(model._model_cpu_offload_components()) == {"reasoner", "generator"}
+    assert model.device == torch.device("cpu")
+
+    output = model(
+        hidden_states=torch.zeros(1, 2, 1, 2, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+        fps=24.0,
+    )
+
+    assert tuple(output.shape) == (1, 2, 1, 2, 2)
+    # The reasoner runs once then the generator component stays resident for GEN.
+    assert model._active_model_cpu_offload_component == "generator"
+
+    model.disable_model_cpu_offload()
+    assert not model._model_cpu_offload_enabled
+
+
+def test_model_cpu_offload_moves_reasoner_and_generator_between_cpu_and_device(
+    monkeypatch: pytest.MonkeyPatch, accelerator_device: torch.device
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    model.language_model.layers = nn.ModuleList([nn.Linear(2, 2)])
+    model.gen_layers = nn.ModuleList([nn.Linear(2, 2)])
+    model.to(accelerator_device)
+
+    reasoner_param = model.language_model.layers[0].weight
+    generator_param = model.gen_layers[0].weight
+
+    model.enable_model_cpu_offload(device=accelerator_device, pin_memory=False)
+
+    assert model._model_cpu_offload_enabled
+    # On enable, every group is parked on CPU until a phase activates it.
+    assert reasoner_param.device.type == "cpu"
+    assert generator_param.device.type == "cpu"
+
+    model._activate_model_cpu_offload_component("reasoner")
+    assert reasoner_param.device == accelerator_device
+    assert generator_param.device.type == "cpu"
+
+    model._activate_model_cpu_offload_component("generator")
+    assert reasoner_param.device.type == "cpu"
+    assert generator_param.device == accelerator_device
+
+    model.disable_model_cpu_offload()
+    assert not model._model_cpu_offload_enabled
+    # Disable restores both components onto the device.
+    assert reasoner_param.device == accelerator_device
+    assert generator_param.device == accelerator_device
 
 
 def test_forward_accepts_transfer_control_latents(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -197,10 +197,33 @@ class ModelLevelOffloadBackend(OffloadBackend):
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
         self._offload_modules: list[nn.Module] = []  # Track modules with hooks
+        self._custom_pipeline: nn.Module | None = None
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
             logger.warning("ModelLevelOffloadBackend already enabled")
+            return
+
+        # Pipelines with a nested transformer (e.g. Cosmos3's reasoner/generator
+        # pathways) own their own mutual-exclusion swaps and cannot be offloaded
+        # with the generic encoder<->DiT hooks. Delegate to the custom hook.
+        # TODO: Cosmos3 is the only implementer today, so we duck-type the
+        # enable/disable_omni_model_cpu_offload pair via getattr. Once a second
+        # pipeline needs it, formalize this as a Protocol (like
+        # SupportsComponentDiscovery) instead of getattr detection.
+        custom_enable = getattr(pipeline, "enable_omni_model_cpu_offload", None)
+        if callable(custom_enable):
+            custom_enable(
+                device=self.device,
+                pin_memory=self.config.pin_cpu_memory,
+                use_hsdp=self.config.use_hsdp,
+            )
+            self._custom_pipeline = pipeline
+            self.enabled = True
+            logger.info(
+                "Model-level offloading enabled through %s.enable_omni_model_cpu_offload",
+                pipeline.__class__.__name__,
+            )
             return
 
         modules = ModuleDiscovery.discover(pipeline)
@@ -257,6 +280,15 @@ class ModelLevelOffloadBackend(OffloadBackend):
 
     def disable(self) -> None:
         if not self.enabled:
+            return
+
+        if self._custom_pipeline is not None:
+            custom_disable = getattr(self._custom_pipeline, "disable_omni_model_cpu_offload", None)
+            if callable(custom_disable):
+                custom_disable()
+            self._custom_pipeline = None
+            self.enabled = False
+            logger.info("Model-level offloading disabled")
             return
 
         remove_sequential_offload(self._offload_modules)
