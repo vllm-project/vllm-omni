@@ -1,5 +1,5 @@
 # Step-Audio2 ASR deploy: thinker only.
-pipeline: step_audio2_asr
+pipeline: step_audio_2_asr
 async_chunk: false
 trust_remote_code: true
 enable_prefix_caching: false

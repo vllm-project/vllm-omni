@@ -246,10 +246,10 @@ def main(args):
         configs_dir = Path(__file__).parent.parent.parent.parent / "vllm_omni/deploy"
         if args.query_type == "audio_to_text":
             # ASR only needs Thinker (Stage 0), no Token2Wav
-            deploy_config_path = str(configs_dir / "step_audio2_asr.yaml")
+            deploy_config_path = str(configs_dir / "step_audio_2_asr.yaml")
         else:
             # TTS/S2ST need both stages
-            deploy_config_path = str(configs_dir / "step_audio2.yaml")
+            deploy_config_path = str(configs_dir / "step_audio_2.yaml")
 
     omni_kwargs = {
         "model": model_name,

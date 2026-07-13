@@ -1,5 +1,5 @@
 # Step-Audio2 deploy: thinker -> token2wav with async chunk streaming.
-pipeline: step_audio2_async_chunk
+pipeline: step_audio_2_async_chunk
 async_chunk: true
 trust_remote_code: true
 enable_prefix_caching: false

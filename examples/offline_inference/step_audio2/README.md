@@ -222,7 +222,7 @@ python end2end.py --query-type audio_to_text \
 # Use custom deploy configuration
 python end2end.py --query-type audio_to_text \
     --model stepfun-ai/Step-Audio-2-mini \
-    --deploy-config /path/to/step_audio2_asr.yaml
+    --deploy-config /path/to/step_audio_2_asr.yaml
 
 # Multiple prompts (for batch testing)
 python end2end.py --query-type audio_to_text \
@@ -260,7 +260,7 @@ python end2end.py --query-type text_to_audio \
 
 ### Deploy Configuration
 
-The default configuration (`vllm_omni/deploy/step_audio2.yaml`) uses:
+The default configuration (`vllm_omni/deploy/step_audio_2.yaml`) uses:
 
 - **Stage 0 (Thinker)**: GPUs 0-1 with tensor parallel size 2, 80% memory
 - **Stage 1 (Token2Wav)**: GPU 1, 30% memory

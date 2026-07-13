@@ -803,9 +803,9 @@ stages:
             ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
-            ("step_audio2.yaml", "step_audio_2", 2, "audio", None),
-            ("step_audio2_asr.yaml", "step_audio2_asr", 1, "text", "step_audio2_asr"),
-            ("step_audio2_async_chunk.yaml", "step_audio2_async_chunk", 2, "audio", "step_audio2_async_chunk"),
+            ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
+            ("step_audio_2_asr.yaml", "step_audio_2_asr", 1, "text", "step_audio_2_asr"),
+            ("step_audio_2_async_chunk.yaml", "step_audio_2_async_chunk", 2, "audio", "step_audio_2_async_chunk"),
             ("hunyuan_video_15_dit_fp8.yaml", "hunyuan_video_15_dit_fp8", 1, "video", None),
             ("wan2_2_ti2v_dit_fp8.yaml", "wan2_2_ti2v_dit_fp8", 1, "video", None),
         ],
@@ -865,7 +865,7 @@ stages:
         assert pipeline is not None
         assert pipeline.model_type == expected_pipeline
 
-    @pytest.mark.parametrize("deploy_name", ["step_audio2.yaml", "step_audio2_async_chunk.yaml"])
+    @pytest.mark.parametrize("deploy_name", ["step_audio_2.yaml", "step_audio_2_async_chunk.yaml"])
     def test_step_audio2_deploy_configs_fit_two_gpus(self, deploy_name):
         deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
 

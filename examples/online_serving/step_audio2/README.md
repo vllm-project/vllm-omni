@@ -11,14 +11,14 @@ Please refer to [README.md](../../../README.md)
 ```bash
 # Async chunk mode (recommended — lower first-packet latency for TTS)
 vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
-    --deploy-config vllm_omni/deploy/step_audio2_async_chunk.yaml \
+    --deploy-config vllm_omni/deploy/step_audio_2_async_chunk.yaml \
     --trust-remote-code --enforce-eager
 ```
 
 Sequential mode:
 ```bash
 vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
-    --deploy-config vllm_omni/deploy/step_audio2.yaml \
+    --deploy-config vllm_omni/deploy/step_audio_2.yaml \
     --trust-remote-code --enforce-eager
 ```
 
