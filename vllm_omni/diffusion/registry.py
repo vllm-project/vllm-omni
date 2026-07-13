@@ -311,6 +311,11 @@ _DIFFUSION_MODELS = {
         "pipeline_hidream_o1_image",
         "HiDreamO1ImagePipeline",
     ),
+    "HiDreamO1ImagePipeline": (
+        "hidream_o1_image",
+        "pipeline_hidream_o1_image",
+        "HiDreamO1ImagePipeline",
+    ),
     "DreamZeroPipeline": (
         "dreamzero",
         "pipeline_dreamzero",
@@ -555,6 +560,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     # HiDream-O1-Image: key mirrors _DIFFUSION_MODELS above.
     "Qwen3VLForConditionalGeneration": "get_hidream_o1_image_post_process_func",
+    "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
 }

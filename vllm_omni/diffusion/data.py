@@ -527,7 +527,10 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     except Exception:
         model_index = None
     if model_index is not None:
-        return model_index.get("_class_name")
+        model_class_name = model_index.get("_class_name")
+        if model_class_name == "HiDreamO1ImagePipeline":
+            return "Qwen3VLForConditionalGeneration"
+        return model_class_name
     if diffusion_load_format == "diffusers":
         return "DiffusersAdapterPipeline"
 
@@ -1061,6 +1064,8 @@ class OmniDiffusionConfig:
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
+                    if self.model_class_name == "HiDreamO1ImagePipeline":
+                        self.model_class_name = "Qwen3VLForConditionalGeneration"
                 self.update_multimodal_support()
 
                 # Skip transformer config loading for diffusers adapter

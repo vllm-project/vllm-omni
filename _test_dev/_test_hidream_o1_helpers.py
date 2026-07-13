@@ -405,49 +405,70 @@ c8_out = _resolve(None, c8_req)
 assert c8_out == ('a cat', 2560, 1440, 50, 42, 1.0), f'c8 unexpected: {c8_out}'
 print(f'c8 resolve cond-only     : returned 6-tuple {c8_out}')
 
-# Case 9: resolve request-level fail-fast x 6
-# (generator/timesteps/latents/num_outputs=0/num_outputs=2/multi-prompt).
+# Case 9: resolve generator compatibility.
+c9_gen = torch.Generator().manual_seed(7)
+c9_out = _resolve(None, _make_req(seed=7, generator=c9_gen, guidance_scale=5.0))
+assert c9_out == ('a cat', 2048, 2048, 50, 7, 5.0), f'c9 unexpected: {c9_out}'
+
+c9b_req = _make_req(guidance_scale=1.0)
+c9b_req.sampling_params.seed = None
+c9b_req.sampling_params.generator = torch.Generator().manual_seed(11)
+c9b_out = _resolve(None, c9b_req)
+assert c9b_out == ('a cat', 2048, 2048, 50, 11, 1.0), f'c9b unexpected: {c9b_out}'
+
+c9c_err = _assert_raises(
+    ValueError,
+    lambda: _resolve(
+        None,
+        _make_req(seed=5, generator=torch.Generator().manual_seed(6)),
+    ),
+    'seed/generator mismatch',
+)
+assert 'seed/generator mismatch' in str(c9c_err), f'c9c mismatch message: {c9c_err}'
+print(f'c9 generator compat      : explicit seed+generator ok, generator-only seed recovery ok, mismatch rejected')
+
+# Case 10: resolve request-level fail-fast x 5
+# (timesteps/latents/num_outputs=0/num_outputs=2/multi-prompt).
 # CFG (guidance_scale > 1.0 and do_classifier_free_guidance) is now accepted, see c16.
-c9_cases = [
-    ('generator',     lambda: _resolve(None, _make_req(seed=1, generator=torch.Generator()))),
+c10_cases = [
     ('timesteps',     lambda: _resolve(None, _make_req(seed=1, timesteps=torch.tensor([500.0])))),
     ('latents',       lambda: _resolve(None, _make_req(seed=1, latents=torch.zeros(1)))),
     ('num_outputs=0', lambda: _resolve(None, _make_req(seed=1, num_outputs_per_prompt=0))),
     ('num_outputs=2', lambda: _resolve(None, _make_req(seed=1, num_outputs_per_prompt=2))),
     ('multi-prompt',  lambda: _resolve(None, _make_req(prompts=['a', 'b'], seed=1))),
 ]
-for label, fn in c9_cases:
+for label, fn in c10_cases:
     _assert_raises(NotImplementedError, fn, label)
-print(f'c9 resolve fail-fast x 6 : all 6 request-level checks raised NotImplementedError')
+print(f'c10 resolve fail-fast x 5: all 5 unsupported request-level checks raised NotImplementedError')
 
-# Case 10: resolve prompt type validation -- 3 accepted, 4 rejected
-c10_accept = [
+# Case 11: resolve prompt type validation -- 3 accepted, 4 rejected
+c11_accept = [
     ('str',            'hello',            'hello'),
     ("dict prompt=x",  {'prompt': 'x'},    'x'),
     ("dict prompt=''", {'prompt': ''},     ''),
 ]
-c10_reject = [
+c11_reject = [
     ('empty dict',     {}),
     ('pretokenized',   {'prompt_ids': [1, 2]}),
     ('dict prompt=list', {'prompt': [1, 2]}),
     ('list prompt',    [1, 2]),
 ]
-for label, prompt, expected in c10_accept:
+for label, prompt, expected in c11_accept:
     out = _resolve(None, _make_req(prompts=[prompt], seed=1, guidance_scale=1.0))
-    assert out[0] == expected, f'c10 {label}: got {out[0]!r}, expected {expected!r}'
-for label, prompt in c10_reject:
+    assert out[0] == expected, f'c11 {label}: got {out[0]!r}, expected {expected!r}'
+for label, prompt in c11_reject:
     _assert_raises(TypeError, lambda p=prompt: _resolve(None, _make_req(prompts=[p], seed=1, guidance_scale=1.0)), label)
-print(f'c10 resolve prompt type  : 3 accepted (str/dict-x/dict-empty-str) + 4 rejected (TypeError)')
+print(f'c11 resolve prompt type  : 3 accepted (str/dict-x/dict-empty-str) + 4 rejected (TypeError)')
 
-# Case 11: resolve boundary -- h/w <= 0 (ValueError), steps <= 0 (ValueError), seed=None (RuntimeError)
+# Case 12: resolve boundary -- h/w <= 0 (ValueError), steps <= 0 (ValueError), seed=None+generator=None (RuntimeError)
 _assert_raises(ValueError, lambda: _resolve(None, _make_req(height=0, seed=1)), 'h=0')
 _assert_raises(ValueError, lambda: _resolve(None, _make_req(width=-1, seed=1)), 'w=-1')
 _assert_raises(ValueError, lambda: _resolve(None, _make_req(num_inference_steps=0, seed=1)), 'steps=0')
-c11_req = _make_req(seed=1)
-c11_req.sampling_params.seed = None
-c11_err = _assert_raises(RuntimeError, lambda: _resolve(None, c11_req), 'seed=None')
-assert 'request initialization' in str(c11_err), f'c11 seed=None message: {c11_err}'
-print(f'c11 resolve boundary     : h<=0/w<=0/steps<=0 (ValueError) + seed=None (RuntimeError)')
+c12_req = _make_req(seed=1)
+c12_req.sampling_params.seed = None
+c12_err = _assert_raises(RuntimeError, lambda: _resolve(None, c12_req), 'seed=None')
+assert 'request initialization' in str(c12_err), f'c12 seed=None message: {c12_err}'
+print(f'c12 resolve boundary     : h<=0/w<=0/steps<=0 (ValueError) + seed=None+generator=None (RuntimeError)')
 
 @dataclass
 class _ParallelStub:
@@ -464,29 +485,29 @@ def _make_static_stub(model_type='full', dtype=torch.bfloat16, cfg_ps=1):
     stub.od_config = _ConfigStub(parallel_config=_ParallelStub(cfg_parallel_size=cfg_ps))
     return stub
 
-# Case 12: init static fail-fast -- unknown model_type (ValueError), dev/dtype/cfg_parallel (NotImplementedError)
+# Case 13: init static fail-fast -- unknown model_type (ValueError), dev/dtype/cfg_parallel (NotImplementedError)
 _assert_raises(ValueError, lambda: _validate_static(_make_static_stub(model_type='unknown')), 'unknown model_type')
-c12_dev_err = _assert_raises(NotImplementedError, lambda: _validate_static(_make_static_stub(model_type='dev')), 'dev model')
+c13_dev_err = _assert_raises(NotImplementedError, lambda: _validate_static(_make_static_stub(model_type='dev')), 'dev model')
 for kw in ('DEFAULT_TIMESTEPS', 'flash scheduler', 'guidance_scale=0.0'):
-    assert kw in str(c12_dev_err), f'c12 dev error missing keyword {kw!r}: {c12_dev_err}'
+    assert kw in str(c13_dev_err), f'c13 dev error missing keyword {kw!r}: {c13_dev_err}'
 _assert_raises(NotImplementedError, lambda: _validate_static(_make_static_stub(dtype=torch.float16)), 'dtype=float16')
 _assert_raises(NotImplementedError, lambda: _validate_static(_make_static_stub(cfg_ps=2)), 'cfg_parallel=2')
 _validate_static(_make_static_stub())
-print(f'c12 init static config   : unknown/dev/dtype/cfg_parallel raised; full+bf16+cfg=1 accepted')
+print(f'c13 init static config   : unknown/dev/dtype/cfg_parallel raised; full+bf16+cfg=1 accepted')
 
-# Case 13: noise determinism -- same seed twice on CPU is bit-identical
-c13_z1 = _prep_noise(None, 64, 96, seed=42, dtype=torch.float32, device=torch.device('cpu'))
-c13_z2 = _prep_noise(None, 64, 96, seed=42, dtype=torch.float32, device=torch.device('cpu'))
-assert torch.equal(c13_z1, c13_z2), 'c13 noise not deterministic on CPU'
-print(f'c13 noise determinism    : torch.equal on same-seed CPU noise (64x96)')
+# Case 14: noise determinism -- same seed twice on CPU is bit-identical
+c14_z1 = _prep_noise(None, 64, 96, seed=42, dtype=torch.float32, device=torch.device('cpu'))
+c14_z2 = _prep_noise(None, 64, 96, seed=42, dtype=torch.float32, device=torch.device('cpu'))
+assert torch.equal(c14_z1, c14_z2), 'c14 noise not deterministic on CPU'
+print(f'c14 noise determinism    : torch.equal on same-seed CPU noise (64x96)')
 
-# Case 14: noise shape + dtype + std -- 64x96 -> 2x3 patches -> image_len=6, patch_dim=3*32*32=3072
-c14_z = _prep_noise(None, 64, 96, seed=0, dtype=torch.float32, device=torch.device('cpu'))
-assert c14_z.shape == (1, 6, 3072), f'c14 shape {c14_z.shape}'
-assert c14_z.dtype == torch.float32, f'c14 dtype {c14_z.dtype}'
-c14_std = c14_z.std().item()
-assert NOISE_SCALE * 0.8 < c14_std < NOISE_SCALE * 1.2, f'c14 std {c14_std} out of [{NOISE_SCALE*0.8}, {NOISE_SCALE*1.2}]'
-print(f'c14 noise shape+dtype+std: shape=(1,6,3072) dtype=fp32 std={c14_std:.3f} in [{NOISE_SCALE*0.8:.1f}, {NOISE_SCALE*1.2:.1f}]')
+# Case 15: noise shape + dtype + std -- 64x96 -> 2x3 patches -> image_len=6, patch_dim=3*32*32=3072
+c15_z = _prep_noise(None, 64, 96, seed=0, dtype=torch.float32, device=torch.device('cpu'))
+assert c15_z.shape == (1, 6, 3072), f'c15 shape {c15_z.shape}'
+assert c15_z.dtype == torch.float32, f'c15 dtype {c15_z.dtype}'
+c15_std = c15_z.std().item()
+assert NOISE_SCALE * 0.8 < c15_std < NOISE_SCALE * 1.2, f'c15 std {c15_std} out of [{NOISE_SCALE*0.8}, {NOISE_SCALE*1.2}]'
+print(f'c15 noise shape+dtype+std: shape=(1,6,3072) dtype=fp32 std={c15_std:.3f} in [{NOISE_SCALE*0.8:.1f}, {NOISE_SCALE*1.2:.1f}]')
 
 class _ItemCounter:
     """Monkey-patch Tensor.item to count host-sync calls issued from within a with-block."""
@@ -513,34 +534,34 @@ class _FakeModel:
         x_pred = torch.arange(seq_len * self.patch_dim, dtype=torch.float32).reshape(1, seq_len, self.patch_dim)
         return SimpleNamespace(x_pred=x_pred)
 
-# Case 15: _forward_once FakeModel slice correctness + no host sync.
+# Case 16: _forward_once FakeModel slice correctness + no host sync.
 # Sample: text_len=3, image_len=6, total seq_len=9. vinput_mask True at indices 3..8.
-c15_sample = {
+c16_sample = {
     'input_ids':    torch.zeros((1, 3), dtype=torch.long),
     'position_ids': torch.zeros((3, 1, 9), dtype=torch.long),
     'token_types':  torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1, 1]]),
     'vinput_mask':  torch.tensor([[False, False, False, True, True, True, True, True, True]]),
 }
-c15_z_in = torch.zeros((1, 6, 3072), dtype=torch.float32)
-c15_t = torch.tensor(0.5)
-c15_pipe = SimpleNamespace(model=_FakeModel(patch_dim=3072), device=torch.device('cpu'), dtype=torch.bfloat16)
+c16_z_in = torch.zeros((1, 6, 3072), dtype=torch.float32)
+c16_t = torch.tensor(0.5)
+c16_pipe = SimpleNamespace(model=_FakeModel(patch_dim=3072), device=torch.device('cpu'), dtype=torch.bfloat16)
 
-with _ItemCounter() as c15_counter:
-    c15_out = _forward_once(c15_pipe, c15_sample, c15_z_in, c15_t)
-assert c15_out.shape == (1, 6, 3072), f'c15 out shape {c15_out.shape}'
-c15_expected = torch.arange(9 * 3072, dtype=torch.float32).reshape(9, 3072)[3:9].unsqueeze(0)
-assert torch.equal(c15_out, c15_expected), 'c15 slice mismatch'
-assert c15_counter.count == 0, f'c15 _forward_once made {c15_counter.count} host-sync (.item()) calls; expected 0'
-print(f'c15 _forward_once slice  : shape=(1,6,3072) + slice correct + {c15_counter.count} host sync (.item() calls)')
+with _ItemCounter() as c16_counter:
+    c16_out = _forward_once(c16_pipe, c16_sample, c16_z_in, c16_t)
+assert c16_out.shape == (1, 6, 3072), f'c16 out shape {c16_out.shape}'
+c16_expected = torch.arange(9 * 3072, dtype=torch.float32).reshape(9, 3072)[3:9].unsqueeze(0)
+assert torch.equal(c16_out, c16_expected), 'c16 slice mismatch'
+assert c16_counter.count == 0, f'c16 _forward_once made {c16_counter.count} host-sync (.item()) calls; expected 0'
+print(f'c16 _forward_once slice  : shape=(1,6,3072) + slice correct + {c16_counter.count} host sync (.item() calls)')
 
-# Case 16: resolve CFG accept -- guidance_scale > 1.0 no longer raises; pass through as-is.
+# Case 17: resolve CFG accept -- guidance_scale > 1.0 no longer raises; pass through as-is.
 # Also verify that setting sp.do_classifier_free_guidance=True alone is accepted (forward() ignores it
 # in favor of guidance_scale > 1.0 as the sole CFG criterion, mirroring upstream).
-c16_cfg = _resolve(None, _make_req(seed=7, guidance_scale=5.0))
-assert c16_cfg == ('a cat', 2048, 2048, 50, 7, 5.0), f'c16_cfg: {c16_cfg}'
-c16_do_cfg = _resolve(None, _make_req(seed=7, do_classifier_free_guidance=True))
-assert c16_do_cfg == ('a cat', 2048, 2048, 50, 7, 1.0), f'c16_do_cfg: {c16_do_cfg}'
-print(f'c16 resolve CFG accept   : guidance=5.0 -> tuple[..., 5.0]; do_cfg=True alone -> tuple[..., 1.0]')
+c17_cfg = _resolve(None, _make_req(seed=7, guidance_scale=5.0))
+assert c17_cfg == ('a cat', 2048, 2048, 50, 7, 5.0), f'c17_cfg: {c17_cfg}'
+c17_do_cfg = _resolve(None, _make_req(seed=7, do_classifier_free_guidance=True))
+assert c17_do_cfg == ('a cat', 2048, 2048, 50, 7, 1.0), f'c17_do_cfg: {c17_do_cfg}'
+print(f'c17 resolve CFG accept   : guidance=5.0 -> tuple[..., 5.0]; do_cfg=True alone -> tuple[..., 1.0]')
 
 print('pass')
 
@@ -557,12 +578,17 @@ print('pass')
 # c6 T2I uncond            : txt=24 all=30 vinput_sum=6 token_types_sum=7
 # c7 T2I 256x256           : txt=26 all=90 vinput_sum=64 token_types_sum=65
 # c8 resolve cond-only     : returned 6-tuple ('a cat', 2560, 1440, 50, 42, 1.0)
-# c9 resolve fail-fast x 6 : all 6 request-level checks raised NotImplementedError
-# c10 resolve prompt type  : 3 accepted (str/dict-x/dict-empty-str) + 4 rejected (TypeError)
-# c11 resolve boundary     : h<=0/w<=0/steps<=0 (ValueError) + seed=None (RuntimeError)
-# c12 init static config   : unknown/dev/dtype/cfg_parallel raised; full+bf16+cfg=1 accepted
-# c13 noise determinism    : torch.equal on same-seed CPU noise (64x96)
-# c14 noise shape+dtype+std: shape=(1,6,3072) dtype=fp32 std=~8.0 in [6.4, 9.6]
-# c15 _forward_once slice  : shape=(1,6,3072) + slice correct + 0 host sync (.item() calls)
-# c16 resolve CFG accept   : guidance=5.0 -> tuple[..., 5.0]; do_cfg=True alone -> tuple[..., 1.0]
+# [TRACE]* request __post_init__ logs may appear between cases:
+#         - unset guidance_scale=0.0 is normalized to effective guidance_scale=1.0
+#         - guidance_scale_2 is auto-filled from guidance_scale
+#         - guidance_scale=5.0 marks the request as guidance_scale_provided=True
+# c9 generator compat      : explicit seed+generator ok, generator-only seed recovery ok, mismatch rejected
+# c10 resolve fail-fast x 5: all 5 unsupported request-level checks raised NotImplementedError
+# c11 resolve prompt type  : 3 accepted (str/dict-x/dict-empty-str) + 4 rejected (TypeError)
+# c12 resolve boundary     : h<=0/w<=0/steps<=0 (ValueError) + seed=None+generator=None (RuntimeError)
+# c13 init static config   : unknown/dev/dtype/cfg_parallel raised; full+bf16+cfg=1 accepted
+# c14 noise determinism    : torch.equal on same-seed CPU noise (64x96)
+# c15 noise shape+dtype+std: shape=(1,6,3072) dtype=fp32 std=8.055 in [6.4, 9.6]
+# c16 _forward_once slice  : shape=(1,6,3072) + slice correct + 0 host sync (.item() calls)
+# c17 resolve CFG accept   : guidance=5.0 -> tuple[..., 5.0]; do_cfg=True alone -> tuple[..., 1.0]
 # pass

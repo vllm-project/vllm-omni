@@ -6,8 +6,10 @@ from __future__ import annotations
 import os
 from typing import ClassVar, Iterable
 
-import torch
 from einops import rearrange
+import numpy as np
+from PIL import Image
+import torch
 from torch import nn
 from vllm.logger import init_logger
 
@@ -271,11 +273,97 @@ def build_hidream_o1_scheduler(
 def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
 
-    def post_process_func(x):
-        return x
+    def post_process_func(
+        output_data: tuple[torch.Tensor, int, int],
+    ) -> Image.Image:
+        """Convert HiDream-O1 patch-space output to a PIL RGB image."""
+        if not isinstance(output_data, tuple) or len(output_data) != 3:
+            raise TypeError(
+                "HiDreamO1 postprocess expects "
+                "(patch_tensor, height, width), "
+                f"got {type(output_data).__name__}"
+            )
+
+        z, height, width = output_data
+
+        if not torch.is_tensor(z):
+            raise TypeError(
+                "HiDreamO1 postprocess expects the first tuple element "
+                f"to be a torch.Tensor, got {type(z).__name__}"
+            )
+
+        height = int(height)
+        width = int(width)
+
+        if height <= 0 or width <= 0:
+            raise ValueError(
+                f"HiDreamO1 postprocess requires positive height/width, "
+                f"got height={height}, width={width}"
+            )
+
+        if height % PATCH_SIZE != 0 or width % PATCH_SIZE != 0:
+            raise ValueError(
+                "HiDreamO1 output resolution must be divisible by "
+                f"PATCH_SIZE={PATCH_SIZE}, got {width}x{height}"
+            )
+
+        h_patches = height // PATCH_SIZE
+        w_patches = width // PATCH_SIZE
+        expected_image_len = h_patches * w_patches
+        expected_patch_dim = 3 * PATCH_SIZE * PATCH_SIZE
+
+        if z.ndim != 3:
+            raise ValueError(
+                "HiDreamO1 patch tensor must have shape "
+                "(B, image_len, patch_dim), "
+                f"got shape={tuple(z.shape)}"
+            )
+
+        if z.shape[0] != 1:
+            raise ValueError(
+                "HiDreamO1 postprocess currently expects batch size 1, "
+                f"got batch_size={z.shape[0]}"
+            )
+
+        if z.shape[1] != expected_image_len:
+            raise ValueError(
+                "HiDreamO1 patch count mismatch: "
+                f"got {z.shape[1]}, expected {expected_image_len} "
+                f"for resolution {width}x{height}"
+            )
+
+        if z.shape[2] != expected_patch_dim:
+            raise ValueError(
+                "HiDreamO1 patch dimension mismatch: "
+                f"got {z.shape[2]}, expected {expected_patch_dim}"
+            )
+
+        # Preserve upstream decode order exactly:
+        #   1. map patch values from [-1, 1] to [0, 1]
+        #   2. restore BCHW image layout
+        #   3. convert to float32 on CPU
+        img = (z + 1) / 2
+
+        img = rearrange(
+            img.cpu().float(),
+            "B (H W) (C p1 p2) -> B C (H p1) (W p2)",
+            H=h_patches,
+            W=w_patches,
+            p1=PATCH_SIZE,
+            p2=PATCH_SIZE,
+        )
+
+        arr = np.round(
+            np.clip(
+                img[0].numpy().transpose(1, 2, 0) * 255,
+                0,
+                255,
+            )
+        ).astype(np.uint8)
+
+        return Image.fromarray(arr).convert("RGB")
 
     return post_process_func
-
 
 class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     dummy_run_num_frames: ClassVar[int] = 0
