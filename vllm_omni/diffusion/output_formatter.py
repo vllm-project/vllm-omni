@@ -9,7 +9,11 @@ from typing import TypeGuard
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import supports_audio_output
-from vllm_omni.diffusion.output_metadata import (
+from vllm_omni.diffusion.registry import DiffusionModelRegistry
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.output_metadata import (
     DiffusionMetadata,
     DiffusionMultimodalOutput,
     DiffusionOutputEnvelope,
