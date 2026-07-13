@@ -326,6 +326,28 @@ class MingLLMModel(nn.Module):
         try:
             from .fm.cfm_cudagraph import CFMGraphExecutor, CFMSampler
 
+            # TODO(perf):
+            #   (1) compile per-block (dit_model.blocks) instead of the
+            #   whole forward for tighter fusion / fewer graph breaks;
+            #   (2) move the compile + a synthetic warmup forward to a post-weight-load hook
+            dit_model = self.flowloss.cfm.model
+            if not getattr(dit_model, "_ming_compiled", False):
+                try:
+                    # Scoped options (avoid mutating global inductor config).
+                    dit_model.forward = torch.compile(
+                        dit_model.forward,
+                        fullgraph=False,
+                        dynamic=False,
+                        options={
+                            "triton.cudagraphs": False,
+                            "triton.cudagraph_trees": False,
+                        },
+                    )
+                    dit_model._ming_compiled = True
+                    logger.info("Ming CFM DiT torch.compile enabled (inductor cudagraphs off).")
+                except Exception as exc:
+                    logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
+
             sampler = CFMSampler(self.flowloss.cfm.model, steps=_CFM_STEPS)
             self._cfm_graph = CFMGraphExecutor(
                 sampler,
