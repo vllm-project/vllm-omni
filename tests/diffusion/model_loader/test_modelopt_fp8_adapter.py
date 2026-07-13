@@ -42,6 +42,19 @@ class _QuantizedPackedModelOptModel(nn.Module):
         )
 
 
+class _RemappedModelOptModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime = nn.Module()
+        self.runtime.proj = nn.Linear(2, 2, bias=False)
+
+    @staticmethod
+    def remap_checkpoint_key(name: str) -> str:
+        return {
+            "transformer.orig.proj.weight": "runtime.proj.weight",
+        }.get(name, name)
+
+
 def _make_source() -> SimpleNamespace:
     return SimpleNamespace(
         subfolder="transformer",
@@ -92,3 +105,25 @@ def test_modelopt_adapter_keeps_scale_tensors_for_quantized_target():
         "transformer.block.to_q.weight_scale",
         "transformer.block.to_q.input_scale",
     ]
+
+
+def test_modelopt_adapter_uses_checkpoint_key_remap_for_target_dtype():
+    model = _RemappedModelOptModel()
+    adapter = ModelOptFp8CheckpointAdapter(model, _make_source())
+    fp8_weight = torch.tensor([[2.0, -4.0], [1.0, 3.0]], dtype=torch.float32).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.5], dtype=torch.float32)
+
+    adapted = list(
+        adapter.adapt(
+            iter(
+                [
+                    ("transformer.orig.proj.weight", fp8_weight),
+                    ("transformer.orig.proj.weight_scale", scale),
+                ]
+            )
+        )
+    )
+
+    assert [name for name, _ in adapted] == ["runtime.proj.weight"]
+    assert adapted[0][1].dtype == model.runtime.proj.weight.dtype
+    assert torch.allclose(adapted[0][1], fp8_weight.to(torch.float32) * scale)
