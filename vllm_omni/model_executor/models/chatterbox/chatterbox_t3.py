@@ -19,12 +19,14 @@ Weight loading maps from Chatterbox safetensors keys (``tfmr.*``,
 
 Fixes over PR #1517:
 - Prefill no longer emits fake zero speech_tokens (corrupted downstream)
-- ref_audio_path forwarded to S3Gen (instead of partial ref_dict)
+- Reference audio conditions T3 locally (VoiceEncoder + cond prompt tokens);
+  the stage input processor forwards the reference path to S3Gen separately
 """
 
 from __future__ import annotations
 
-import dataclasses
+import glob
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -77,15 +79,6 @@ def _build_speech_allowed_mask(config: Any) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Shared conditioning encoder
 # ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class ChatterboxT3Cond:
-    """Conditioning container passed to T3 during inference."""
-
-    speaker_emb: torch.Tensor  # (1, 256) from VoiceEncoder
-    cond_prompt_speech_tokens: torch.Tensor | None = None  # (1, plen)
-    cond_prompt_speech_emb: torch.Tensor | None = None  # (1, plen, hidden_size)
 
 
 class ChatterboxT3CondEnc(nn.Module):
@@ -224,13 +217,6 @@ class _ChatterboxT3Base(nn.Module):
                     if _seed_key in info_dict:
                         info_update[_seed_key] = info_dict[_seed_key]
 
-                # Pass ref_audio_path to S3Gen via stage connector so it can
-                # build its own ref_dict via embed_ref().
-                # additional_information["ref_audio"] is a list, e.g. ["/path/to/ref.wav"]
-                ref_audio_list = info_dict.get("ref_audio")
-                if isinstance(ref_audio_list, list) and ref_audio_list:
-                    info_update["ref_audio_path"] = ref_audio_list[0]
-
                 take = prompt_embeds_cpu[:span_len]
                 if int(take.shape[0]) < span_len:
                     pad_n = span_len - int(take.shape[0])
@@ -331,11 +317,6 @@ class _ChatterboxT3Base(nn.Module):
 
         # Concatenate: [cond || text || start_speech]
         prompt_embeds = torch.cat([cond_output, text_embedded, start_emb], dim=1)  # (1, L, H)
-
-        # Store ref_audio_path for S3Gen — the vocoder will build its own
-        # ref_dict via embed_ref() which extracts the full set of speaker
-        # conditioning (x-vector, prompt tokens, mel features).
-        info_dict["_ref_audio_path"] = ref_audio_path
 
         return prompt_embeds.squeeze(0)  # (L, H)
 
@@ -485,17 +466,6 @@ class _ChatterboxT3Base(nn.Module):
         self._s3_tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
         self._s3_tokenizer.to(device).eval()
         return self._s3_tokenizer
-
-    # -------------------- Prompt length estimation --------------------
-
-    @staticmethod
-    def estimate_prompt_len(text: str, speech_cond_prompt_len: int = 375) -> int:
-        """Rough estimate of prompt token count for placeholder allocation.
-
-        Layout: [1 (speaker) + speech_cond_prompt_len + text_tokens + 1 (start_speech)]
-        """
-        text_len = max(1, len(text) // 4 + 10)
-        return 1 + speech_cond_prompt_len + text_len + 1
 
 
 # ---------------------------------------------------------------------------
@@ -924,7 +894,6 @@ class ChatterboxT3ForGeneration(_ChatterboxT3Base):
         # Seed the speech-position counter for the decode hot path. After the
         # prefill consumes position 0 (start token), the first generated speech
         # token is at position 1. preprocess() increments on each decode step.
-        info_dict["_ref_audio_path"] = ref_audio_path
         info_dict["t3_speech_pos"] = 1
         return prompt_embeds.squeeze(0)  # (L, H)
 
@@ -1013,15 +982,12 @@ class ChatterboxT3ForGeneration(_ChatterboxT3Base):
         path missing the expected filename); callers fall back to the vLLM
         weight iterator in that case.
         """
-        import glob as _glob
-        import os as _os
-
         model_path = getattr(self.vllm_config.model_config, "model", None)
         if not model_path:
             return None
         candidates: list[str] = []
-        if _os.path.isdir(model_path):
-            candidates.append(_os.path.join(model_path, "t3_cfg.safetensors"))
+        if os.path.isdir(model_path):
+            candidates.append(os.path.join(model_path, "t3_cfg.safetensors"))
         # HF cache case: look up the snapshot directory.
         try:
             from huggingface_hub import snapshot_download
@@ -1030,11 +996,14 @@ class ChatterboxT3ForGeneration(_ChatterboxT3Base):
                 repo_id=model_path,
                 allow_patterns=["t3_cfg.safetensors"],
             )
-            candidates.append(_os.path.join(snap, "t3_cfg.safetensors"))
-        except Exception:
-            pass
+            candidates.append(os.path.join(snap, "t3_cfg.safetensors"))
+        except Exception as exc:
+            # Probe only — offline mode or a local-path model make
+            # snapshot_download fail legitimately; the glob fallback below
+            # still runs and a missing file fails loudly at load time.
+            logger.debug("t3_cfg.safetensors snapshot probe failed: %s", exc)
         for c in candidates:
-            if _os.path.isfile(c):
+            if os.path.isfile(c):
                 return c
         # Last resort: glob the HF cache, but scope to THIS repo's snapshot
         # directory (``models--<org>--<name>``) so we never silently load
@@ -1043,9 +1012,9 @@ class ChatterboxT3ForGeneration(_ChatterboxT3Base):
         if "/" not in model_path:
             return None
         repo_dir = "models--" + model_path.replace("/", "--")
-        cache_root = _os.environ.get("HF_HUB_CACHE") or _os.path.expanduser("~/.cache/huggingface/hub")
-        snap_pattern = _os.path.join(cache_root, repo_dir, "snapshots", "*", "t3_cfg.safetensors")
-        hits = _glob.glob(snap_pattern)
+        cache_root = os.environ.get("HF_HUB_CACHE") or os.path.expanduser("~/.cache/huggingface/hub")
+        snap_pattern = os.path.join(cache_root, repo_dir, "snapshots", "*", "t3_cfg.safetensors")
+        hits = glob.glob(snap_pattern)
         return hits[0] if hits else None
 
     def _english_only_weight_iterator(

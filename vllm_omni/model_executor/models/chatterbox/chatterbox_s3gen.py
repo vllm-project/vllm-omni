@@ -225,8 +225,8 @@ class ChatterboxS3Gen(nn.Module):
             n_rows += 1
             # The stage processor ships the reference-audio path on the
             # payload's ``speaker`` field (OmniPayloadStruct forbids ad-hoc
-            # keys); accept the legacy flat key too.
-            ref_audio_path = info.get("ref_audio_path") or info.get("speaker")
+            # keys).
+            ref_audio_path = info.get("speaker")
             if ref_audio_path:
                 paths.append(str(ref_audio_path))
 

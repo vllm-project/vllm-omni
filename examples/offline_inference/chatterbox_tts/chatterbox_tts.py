@@ -12,7 +12,6 @@ Usage:
 """
 
 import importlib
-import logging
 import os
 import sys
 
@@ -52,8 +51,6 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser  # noqa: E402
 
 from vllm_omni import Omni  # noqa: E402
 
-logger = logging.getLogger(__name__)
-
 DEFAULT_MODEL = "ResembleAI/chatterbox-turbo"
 DEFAULT_STAGE_CONFIGS = os.path.join(
     os.path.dirname(__file__),
@@ -82,12 +79,11 @@ def compute_prompt_len(
     text_len = len(tokenizer.encode(text, add_special_tokens=False))
 
     if ref_audio_path is not None:
-        import soundfile as _sf
         from chatterbox.models.s3tokenizer import S3Tokenizer
         from torchaudio.functional import resample as _resample
 
         s3tok = S3Tokenizer("speech_tokenizer_v2_25hz")
-        wav_np, _sr = _sf.read(ref_audio_path, dtype="float32", always_2d=False)
+        wav_np, _sr = sf.read(ref_audio_path, dtype="float32", always_2d=False)
         if wav_np.ndim > 1:
             wav_np = wav_np.mean(axis=-1)
         if _sr != 16000:
@@ -161,6 +157,7 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
 
     outputs = list(omni.generate(inputs, sampling_params_list=None))
+    num_saved = 0
     for i, omni_output in enumerate(outputs):
         ro = omni_output.request_output
         if ro is None:
@@ -199,6 +196,12 @@ def main(args):
         output_wav = os.path.join(output_dir, f"chatterbox_{request_id}.wav")
         sf.write(output_wav, audio_numpy, samplerate=sample_rate, format="WAV")
         print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+        num_saved += 1
+
+    if num_saved < len(outputs):
+        # Fail loudly: a run that produced no (or partial) audio is a broken
+        # run even when the engine itself reported success.
+        raise SystemExit(f"Expected {len(outputs)} audio outputs, saved {num_saved}")
 
 
 def parse_args():

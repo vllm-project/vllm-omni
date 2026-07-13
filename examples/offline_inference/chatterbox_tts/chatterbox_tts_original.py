@@ -18,7 +18,6 @@ Usage:
 """
 
 import importlib
-import logging
 import os
 import sys
 
@@ -57,8 +56,6 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 from vllm.utils.argparse_utils import FlexibleArgumentParser  # noqa: E402
 
 from vllm_omni import Omni  # noqa: E402
-
-logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "ResembleAI/chatterbox"
 DEFAULT_STAGE_CONFIGS = os.path.join(
@@ -125,7 +122,10 @@ def main(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    num_requests = 0
+    num_saved = 0
     for i, stage_outputs in enumerate(omni.generate(inputs, sampling_params_list=None)):
+        num_requests += 1
         ro = stage_outputs.request_output
         if ro is None:
             print(f"Request {i}: no request_output")
@@ -162,6 +162,12 @@ def main(args):
         output_wav = os.path.join(output_dir, f"chatterbox_original_{request_id}.wav")
         sf.write(output_wav, audio_numpy, samplerate=sample_rate, format="WAV")
         print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+        num_saved += 1
+
+    if num_saved < num_requests:
+        # Fail loudly: a run that produced no (or partial) audio is a broken
+        # run even when the engine itself reported success.
+        raise SystemExit(f"Expected {num_requests} audio outputs, saved {num_saved}")
 
 
 def parse_args():

@@ -3,8 +3,6 @@ from abc import ABC
 import torch
 import torch.nn.functional as F
 
-from .decoder import Decoder
-
 
 class BASECFM(torch.nn.Module, ABC):
     def __init__(
@@ -113,17 +111,3 @@ class BASECFM(torch.nn.Module, ABC):
             torch.sum(mask) * u.shape[1]
         )
         return loss, y
-
-
-class CFM(BASECFM):
-    def __init__(self, in_channels, out_channel, cfm_params, decoder_params, n_spks=1, spk_emb_dim=64):
-        super().__init__(
-            n_feats=in_channels,
-            cfm_params=cfm_params,
-            n_spks=n_spks,
-            spk_emb_dim=spk_emb_dim,
-        )
-
-        in_channels = in_channels + (spk_emb_dim if n_spks > 1 else 0)
-        # Just change the architecture of the estimator here
-        self.estimator = Decoder(in_channels=in_channels, out_channels=out_channel, **decoder_params)

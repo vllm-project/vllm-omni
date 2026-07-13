@@ -1,10 +1,15 @@
 async_chunk: true
+# Chatterbox Original is a PREVIEW (AR-stage CFG not yet implemented), so this
+# config is deliberately more conservative than chatterbox_turbo.yaml:
+# single-request batches, fully eager, synchronous scheduling, and lower GPU
+# memory headroom. Revisit these once CFG lands and Original is production-ready.
 stage_args:
   - stage_id: 0
     stage_type: llm
     is_comprehension: true
     runtime:
       devices: "0"
+      # Preview: validated single-request only; batching untested with CFG follow-up pending.
       max_batch_size: 1
     engine_args:
       model_stage: t3
@@ -27,13 +32,20 @@ stage_args:
       skip_tokenizer_init: true
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      # Preview conservatism (vs Turbo's cudagraphs + async_scheduling):
+      # eager + synchronous scheduling keep the LLaMA-backbone T3 path simple
+      # to debug while CFG support is still pending.
       enforce_eager: true
       trust_remote_code: true
       async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: latent
+      # 0.35/0.25 splits leave headroom for the chatterbox-tts helper models
+      # (voice encoder, s3 tokenizer) that Original loads alongside both stages.
       gpu_memory_utilization: 0.35
       distributed_executor_backend: "mp"
+      # Single-request prompts are short (~150-token speech cond + text); 512
+      # is ample and keeps activation memory low next to the 0.35 GPU split.
       max_num_batched_tokens: 512
       max_model_len: 8196
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.chatterbox.t3_to_s3gen_async_chunk
@@ -67,6 +79,8 @@ stage_args:
         model_type: chatterbox
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      # S3Gen forward calls .item() for ctx_frames, which breaks CUDA graph
+      # capture (stream-capture-unsupported) — same constraint as Turbo.
       enforce_eager: true
       trust_remote_code: true
       async_scheduling: false

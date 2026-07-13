@@ -164,4 +164,9 @@ def t3_to_s3gen_async_chunk(
         payload.speaker = cached_path
         logger.debug("Stage processor: attaching ref_audio_path=%s to chunk for request %s", cached_path, request_id)
 
+    if finished:
+        # Last chunk for this request — drop its cache entry so the map
+        # doesn't grow unboundedly across requests.
+        transfer_manager._chatterbox_ref_audio_paths.pop(request_id, None)
+
     return payload
