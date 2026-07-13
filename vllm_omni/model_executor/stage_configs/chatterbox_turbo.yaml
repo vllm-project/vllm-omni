@@ -20,11 +20,13 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
       trust_remote_code: true
-      # Overlap scheduling with execution, matching the qwen3_tts talker (same
-      # async_chunk 2-stage streaming architecture). prefix_caching stays off:
-      # the example feeds placeholder prompt_token_ids ([0]*len), so caching
-      # would collide unrelated prompts of equal length (peer keeps it off too).
-      async_scheduling: true
+      # async_scheduling stays off, matching every in-tree pipeline
+      # (step_audio_2, mimo_audio): on vllm v0.25 the async path only recovers
+      # token ids for preemption-resumed requests, so the OmniARScheduler's
+      # skip-and-re-add flow KeyErrors in _update_states. prefix_caching stays
+      # off: the example feeds placeholder prompt_token_ids ([0]*len), so
+      # caching would collide unrelated prompts of equal length.
+      async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: latent
       gpu_memory_utilization: 0.5
@@ -61,7 +63,7 @@ stage_args:
       # refactored to avoid host-device syncs in forward.
       enforce_eager: true
       trust_remote_code: true
-      async_scheduling: true
+      async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio
       gpu_memory_utilization: 0.3
