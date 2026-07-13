@@ -7,7 +7,8 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.sequential_backend import ModelLevelOffloadBackend, SequentialOffloadHook
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -39,6 +40,40 @@ def _track_pin_memory_calls():
         return original(self)
 
     return tracker, mock
+
+
+def test_model_level_backend_delegates_to_custom_pipeline_offload() -> None:
+    class CustomPipeline(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.enable_args = None
+            self.disable_called = False
+
+        def enable_omni_model_cpu_offload(self, **kwargs) -> None:
+            self.enable_args = kwargs
+
+        def disable_omni_model_cpu_offload(self) -> None:
+            self.disable_called = True
+
+    pipeline = CustomPipeline()
+    backend = ModelLevelOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.MODEL_LEVEL, pin_cpu_memory=False),
+        torch.device("cpu"),
+    )
+
+    backend.enable(pipeline)
+
+    assert backend.enabled is True
+    assert pipeline.enable_args == {
+        "device": torch.device("cpu"),
+        "pin_memory": False,
+        "use_hsdp": False,
+    }
+
+    backend.disable()
+
+    assert backend.enabled is False
+    assert pipeline.disable_called is True
 
 
 class TestMoveParamsPinMemory:
