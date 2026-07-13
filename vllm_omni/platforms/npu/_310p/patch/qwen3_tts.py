@@ -9,12 +9,13 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
 from vllm.multimodal.audio import AudioResampler
 from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
 from vllm_ascend.sample.sampler import apply_top_k_top_p, random_sample
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, nd_to_nz_2d
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, maybe_trans_nz, nd_to_nz_2d
 
 from vllm_omni.model_executor.models.common import qwen3_code_predictor
 from vllm_omni.model_executor.models.qwen3_tts import (
@@ -148,6 +149,19 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._buffers.pop("_fusion_causal_mask", None)
+        self._q_size = self.num_heads * self.head_dim
+        self._kv_size = self.num_kv_heads * self.head_dim
+        self._fused_qkv_weight = None
+        self._fused_qkv_bias = None
+
+    def prepare_qkv_weights(self) -> None:
+        # Pack QKV once so each graph replay uses one matmul and consumes the
+        # weight directly in the 310P matmul layout.
+        self._fused_qkv_weight = maybe_trans_nz(
+            torch.cat((self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0).contiguous()
+        )
+        if self.q_proj.bias is not None:
+            self._fused_qkv_bias = torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias), dim=0)
 
     def forward(
         self,
@@ -159,12 +173,11 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
             return super().forward(hidden_states, position_embeddings)
 
         bsz, seq_len, _ = hidden_states.shape
-        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
-        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
-
-        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
+        qkv = F.linear(hidden_states, self._fused_qkv_weight, self._fused_qkv_bias)
+        q, k, v = qkv.split((self._q_size, self._kv_size, self._kv_size), dim=-1)
+        q = self.q_norm(q.view(bsz, seq_len, self.num_heads, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(k.view(bsz, seq_len, self.num_kv_heads, self.head_dim)).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
@@ -290,6 +303,18 @@ class _Qwen3TTSTalkerCodePredictor310P(
             prefix=prefix,
         )
         self._projected_codec_embed_weight = None
+
+    def _prepare_npu_weights(self) -> None:
+        qkv_projections = set()
+        with torch.no_grad():
+            for layer in self.model.layers:
+                attention = layer.self_attn
+                attention.prepare_qkv_weights()
+                qkv_projections.update((attention.q_proj, attention.k_proj, attention.v_proj))
+
+            for module in self.modules():
+                if isinstance(module, nn.Linear) and module not in qkv_projections:
+                    module.weight.data = maybe_trans_nz(module.weight.data)
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
