@@ -469,14 +469,14 @@ class TestSupportedPipelines:
 
     def test_helios_supports_step_execution_for_streaming_output(self) -> None:
         from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline
-        from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
+        from vllm_omni.diffusion.models.interface import DiffusionV2Atoms, supports_step_execution
 
         # Avoid loading model weights; protocol membership depends on the class contract.
         pipeline = object.__new__(HeliosPipeline)
 
         assert pipeline.supports_step_execution is True
         assert supports_step_execution(pipeline) is True
-        assert isinstance(pipeline, SupportsStepExecution) is True
+        assert isinstance(pipeline, DiffusionV2Atoms) is True
 
     def test_load_model_rejects_streaming_output_without_step_execution(self, monkeypatch) -> None:
         class _NoStepPipeline:

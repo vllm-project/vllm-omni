@@ -10,11 +10,9 @@ model-related operations.
 
 from __future__ import annotations
 
-import copy
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any
 
 import torch
 from torch.profiler import record_function
@@ -37,16 +35,11 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
     BatchRunnerOutput,
     DiffusionRequestState,
     RunnerOutput,
-    attach_stage_durations,
-    clear_pipeline_stage_durations,
-    consume_pipeline_stage_durations,
-    merge_stage_durations,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -220,7 +213,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "DiffusionV2Atoms; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
         if self.od_config.streaming_output and not self.supports_step_mode():
@@ -340,7 +333,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_prefetch: bool = False,
     ) -> None:
         # Receive AR KV. Single-request execution can use the prefetch path:
-        # consume prior-forward payload, sync-fallback on miss; request-batch
+        # consume prior-forward payload, synchronously receive on miss; request-batch
         # execution keeps the synchronous per-request receive path.
         kv_recv_t0 = time.perf_counter()
         if use_prefetch and self._kv_prefetch_enabled:
@@ -495,19 +488,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return self._runner_output_from_outputs(reqs, outputs)
 
-    def _attach_stepwise_metrics(
-        self,
-        state: DiffusionRequestState,
-        output: DiffusionOutput,
-        *,
-        is_primary: bool,
-    ) -> None:
-        merge_stage_durations(
-            state,
-            consume_pipeline_stage_durations(self.pipeline),
-        )
-        attach_stage_durations(state, output)
-
     def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -563,240 +543,3 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
-
-    def _update_states(
-        self, scheduler_output: DiffusionSchedulerOutput
-    ) -> tuple[list[DiffusionRequestState], list[str]]:
-        """Step-before update: cleanup finished requests and get/create one running state."""
-        for request_id in scheduler_output.finished_req_ids:
-            self.state_cache.pop(request_id, None)
-
-        resolved: list[DiffusionRequestState] = []
-        new_request_ids: list[str] = []
-        try:
-            # process new requests
-            for sched_new_req in scheduler_output.scheduled_new_reqs:
-                request_id = sched_new_req.request_id
-                new_request_ids.append(request_id)
-                if request_id in self.state_cache:
-                    raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
-                new_state = DiffusionRequestState(
-                    request_id=request_id,
-                    sampling=copy.deepcopy(sched_new_req.req.sampling_params),
-                    prompt=sched_new_req.req.prompt,
-                    kv_sender_info=sched_new_req.req.kv_sender_info,
-                )
-                state_req = copy.copy(sched_new_req.req)
-                state_req.sampling_params = new_state.sampling
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                    state_req,
-                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self.target_device,
-                )
-                self.state_cache[request_id] = new_state
-                resolved.append(new_state)
-
-            # process cached requests
-            for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
-                state = self.state_cache.get(request_id)
-                if state is None:
-                    raise ValueError(f"Missing cached state for request {request_id}.")
-                resolved.append(state)
-        except Exception:
-            for request_id in new_request_ids:
-                self.state_cache.pop(request_id, None)
-            raise
-
-        return resolved, new_request_ids
-
-    def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
-        # process new reqs
-        for state in states:
-            if state.request_id in new_request_ids:
-                # set generator
-                if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
-                clear_pipeline_stage_durations(self.pipeline)
-                # encode
-                self.pipeline.prepare_encode(state)
-                merge_stage_durations(
-                    state,
-                    consume_pipeline_stage_durations(self.pipeline),
-                )
-
-        input_batch = InputBatch.make_batch(
-            states,
-            cached_batch=getattr(self, "input_batch", None),
-        )
-        self.input_batch = input_batch
-        return input_batch
-
-    def _update_states_after(
-        self,
-        states: list[DiffusionRequestState],
-        input_batch: InputBatch,
-        interrupted: bool = False,
-    ):
-        """Step-after update: clear cached state for completed request."""
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
-        else:
-            input_batch.latents = gathered_latents.clone()
-
-        self.input_batch = input_batch
-        scatter_latents(states, input_batch)
-
-        for state in states:
-            if interrupted or state.request_denoise_completed:
-                self.state_cache.pop(state.request_id, None)
-
-    def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
-        model_state = getattr(self, "model_state", None)
-        if model_state is None:
-            return {}
-        prepare_attn = getattr(model_state, "prepare_attn", None)
-        if not callable(prepare_attn):
-            return {}
-        return prepare_attn(input_batch)
-
-    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
-        """Execute one step for one scheduled request and return runner output."""
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if not self.supports_step_mode():
-            raise ValueError("Current pipeline does not support step execution.")
-        # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, editing inputs, and
-        # similar features are not supported here yet.
-        if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Step mode does not support cache_backend yet.")
-
-        use_hsdp = self.od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
-            had_active_states = bool(self.state_cache)
-            states, new_request_ids = self._update_states(scheduler_output)
-            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
-                current_omni_platform.reset_peak_memory_stats()
-            input_batch = self._prepare_batch_inputs(states, new_request_ids)
-            attn_metadata = self._prepare_attn_metadata(input_batch)
-
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
-            ):
-                clear_pipeline_stage_durations(self.pipeline)
-                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
-                denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
-                for state in states:
-                    merge_stage_durations(
-                        state,
-                        denoise_stage_durations,
-                    )
-
-                runner_output_list = []
-                pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
-                    for state in states:
-                        runner_output_list.append(
-                            RunnerOutput(
-                                request_id=state.request_id,
-                                step_index=state.step_index,
-                                finished=True,
-                                result=DiffusionOutput(error="stepwise denoise interrupted"),
-                            )
-                        )
-
-                else:
-                    offset = 0
-                    for req in states:
-                        row_num = req.latents.shape[0]
-                        try:
-                            self.pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
-                            if self.od_config.streaming_output:
-                                should_decode = req.chunk_denoise_completed
-                            else:
-                                should_decode = req.denoise_completed
-
-                            if should_decode:
-                                clear_pipeline_stage_durations(self.pipeline)
-                                result = self.pipeline.post_decode(req)
-                                if result is not None:
-                                    self._attach_stepwise_metrics(
-                                        req,
-                                        result,
-                                        is_primary=is_primary,
-                                    )
-                            else:
-                                result = None
-                            # finished should be computed after post_decode() advanced chunk_index
-                            finished = (
-                                req.request_denoise_completed
-                                if self.od_config.streaming_output
-                                else req.denoise_completed
-                            )
-                            runner_output_list.append(
-                                RunnerOutput(
-                                    request_id=req.request_id,
-                                    step_index=req.step_index,
-                                    finished=finished,
-                                    result=result,
-                                )
-                            )
-                            offset = offset + row_num
-                        except Exception as per_req_exc:
-                            offset = offset + row_num
-                            logger.error(
-                                "Stepwise per-request error for %s: %s",
-                                req.request_id,
-                                per_req_exc,
-                                exc_info=True,
-                            )
-                            runner_output_list.append(
-                                RunnerOutput(
-                                    request_id=req.request_id,
-                                    step_index=req.step_index,
-                                    finished=True,
-                                    result=DiffusionOutput(error=str(per_req_exc)),
-                                )
-                            )
-
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
-
-                if is_primary:
-                    batch_peak_memory_mb = self._sample_peak_memory_mb()
-                    states_by_id = {state.request_id: state for state in states}
-                    for state in states:
-                        state.peak_memory_mb = max(state.peak_memory_mb, batch_peak_memory_mb)
-                    for runner_output in runner_output_list:
-                        if runner_output.result is None:
-                            continue
-                        state = states_by_id.get(runner_output.request_id)
-                        if state is None:
-                            continue
-                        runner_output.result.peak_memory_mb = max(
-                            runner_output.result.peak_memory_mb,
-                            state.peak_memory_mb,
-                        )
-
-                self._update_states_after(states, input_batch, pipeline_interrupted)
-
-                return BatchRunnerOutput.from_list(runner_output_list)

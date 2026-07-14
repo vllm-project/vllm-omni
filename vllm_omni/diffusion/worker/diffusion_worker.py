@@ -48,6 +48,7 @@ from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_model_runner_v2 import DiffusionModelRunnerV2
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.lora.request import LoRARequest
@@ -240,6 +241,11 @@ class DiffusionWorker:
         else:
             model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
         model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        needs_step_runner = bool(
+            getattr(self.od_config, "step_execution", False) or getattr(self.od_config, "streaming_output", False)
+        )
+        if needs_step_runner and model_runner_cls is DiffusionModelRunner:
+            model_runner_cls = DiffusionModelRunnerV2
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
@@ -318,7 +324,7 @@ class DiffusionWorker:
             init_workspace_manager(self.device)
 
     def _create_profiler(self) -> WorkerProfiler | None:
-        profiler_config = self.od_config.profiler_config
+        profiler_config = getattr(self.od_config, "profiler_config", None)
         profiler_type = getattr(profiler_config, "profiler", None)
         if profiler_type == "torch":
             return create_omni_profiler(

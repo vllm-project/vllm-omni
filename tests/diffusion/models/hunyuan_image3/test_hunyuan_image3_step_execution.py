@@ -112,7 +112,7 @@ def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
         ),
     ],
 )
-def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
+def test_encode_preserves_normal_hunyuan_bot_task_semantics(
     monkeypatch,
     sampling,
     prompt_item,
@@ -140,7 +140,7 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
     )
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
-        pipeline.prepare_encode(state)
+        pipeline.encode(state)
 
     assert captured["bot_task"] == expected_model_bot_task
     assert captured["system_prompt_bot_task"] == expected_system_bot_task
@@ -167,6 +167,7 @@ def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
                 request_id="req-forward-bot-task",
                 sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
                 prompt={"prompt": "prompt", "bot_task": "vanilla"},
+                kv_sender_info=None,
             )
         ]
     )

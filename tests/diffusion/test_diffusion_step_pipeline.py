@@ -14,6 +14,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+import vllm_omni.diffusion.worker.diffusion_model_runner_v2 as model_runner_v2_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
 )
+from vllm_omni.diffusion.models.interface import StagePayload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -41,6 +43,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_model_runner_v2 import DiffusionModelRunnerV2
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
@@ -77,27 +80,65 @@ class _StepPipeline:
         self.scheduler_calls = 0
         self.decode_calls = 0
 
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
-        self.prepare_calls += 1
-        state.timesteps = [torch.tensor(10), torch.tensor(5)]
-        state.latents = torch.tensor([0.0])
+    def init_state(self, state):
+        return state
+
+    def check_inputs(self, state):
+        return state
+
+    def encode(self, state):
         state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         return state
 
-    def denoise_step(self, input_batch, **kwargs):
-        self.denoise_calls += 1
-        return torch.full_like(input_batch.prompt_embeds, fill_value=0.5)
+    def prepare(self, state):
+        self.prepare_calls += 1
+        state.latents = torch.tensor([0.0])
+        state.timesteps = [torch.tensor(10), torch.tensor(5)]
+        return state
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del noise_pred, kwargs
+    def diffuse(self, state):
+        while not state.denoise_completed:
+            state.step_index += 1
+        return state
+
+    def pack_stage_state(self, state, boundary):
+        return StagePayload(
+            request_id=state.request_id,
+            boundary=boundary,
+            scalar_fields={},
+            tensor_fields={},
+            private_scalar_fields={},
+            private_tensor_fields={},
+        )
+
+    def unpack_stage_state(self, payload, state):
+        del payload
+        return state
+
+    def build_step_attention_metadata(self, input_batch):
+        del input_batch
+        return {}
+
+    def build_step_batch(self, states, *, cached_batch=None):
+        return InputBatch.make_batch(states, cached_batch=cached_batch)
+
+    def denoise_step(self, input_batch):
+        self.denoise_calls += 1
+        return torch.full_like(input_batch.latents, fill_value=0.5)
+
+    def step_scheduler(self, state, noise_pred):
+        del noise_pred
         self.scheduler_calls += 1
         state.step_index += 1
+        return state
 
-    def post_decode(self, state, **kwargs):
-        del kwargs
+    def decode(self, state):
         self.decode_calls += 1
-        return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
+        state.extra["decoded_output"] = DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
+        return state
+
+    def postprocess(self, state):
+        return state.extra["decoded_output"]
 
 
 class _ProfilingStepPipeline(_StepPipeline):
@@ -114,18 +155,18 @@ class _ProfilingStepPipeline(_StepPipeline):
     def clear_profiler_records(self) -> None:
         self._stage_durations.clear()
 
-    def prepare_encode(self, state, **kwargs):
-        result = super().prepare_encode(state, **kwargs)
+    def encode(self, state):
+        result = super().encode(state)
         self._stage_durations["QwenImagePipeline.text_encoder.forward"] = 1.0
         return result
 
-    def denoise_step(self, input_batch, **kwargs):
-        result = super().denoise_step(input_batch, **kwargs)
+    def denoise_step(self, input_batch):
+        result = super().denoise_step(input_batch)
         self._stage_durations["QwenImagePipeline.diffuse"] = 2.0
         return result
 
-    def post_decode(self, state, **kwargs):
-        result = super().post_decode(state, **kwargs)
+    def decode(self, state):
+        result = super().decode(state)
         self._stage_durations["QwenImagePipeline.vae.decode"] = 3.0
         return result
 
@@ -148,18 +189,18 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch):
+        del input_batch
         self.denoise_calls += 1
         return None
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del state, noise_pred, kwargs
+    def step_scheduler(self, state, noise_pred):
+        del state, noise_pred
         raise AssertionError("step_scheduler should not run after interrupt")
 
-    def post_decode(self, state, **kwargs):
-        del state, kwargs
-        raise AssertionError("post_decode should not run after interrupt")
+    def decode(self, state):
+        del state
+        raise AssertionError("decode should not run after interrupt")
 
 
 class _FakePeakMemoryPlatform:
@@ -180,6 +221,14 @@ class _FakePeakMemoryPlatform:
 
     def is_available(self) -> bool:
         return True
+
+
+def _patch_stepwise_runtime(monkeypatch, platform=None):
+    platform = platform or _FakePeakMemoryPlatform([0.0])
+    monkeypatch.setattr(model_runner_v2_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", platform)
+    monkeypatch.setattr(model_runner_v2_module, "current_omni_platform", platform)
+    return platform
 
 
 class _IdentityNoiseTransformer(torch.nn.Module):
@@ -208,18 +257,51 @@ class _DistributedStepPipeline(CFGParallelMixin):
     def interrupt(self):
         return self._interrupt
 
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
-        state.timesteps = [torch.tensor(1.0, device=self.device)]
-        state.latents = torch.ones((1, 1), device=self.device)
-        state.step_index = 0
-        state.scheduler = self.scheduler
-        state.do_true_cfg = self.mode == "cfg"
+    def init_state(self, state):
+        return state
+
+    def check_inputs(self, state):
+        return state
+
+    def encode(self, state):
         state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         return state
 
-    def denoise_step(self, state, **kwargs):
-        del kwargs
+    def prepare(self, state):
+        state.latents = torch.ones((1, 1), device=self.device)
+        state.timesteps = [torch.tensor(1.0, device=self.device)]
+        state.step_index = 0
+        state.scheduler = self.scheduler
+        state.do_true_cfg = self.mode == "cfg"
+        return state
+
+    def diffuse(self, state):
+        while not state.denoise_completed:
+            state.step_index += 1
+        return state
+
+    def pack_stage_state(self, state, boundary):
+        return StagePayload(
+            request_id=state.request_id,
+            boundary=boundary,
+            scalar_fields={},
+            tensor_fields={},
+            private_scalar_fields={},
+            private_tensor_fields={},
+        )
+
+    def unpack_stage_state(self, payload, state):
+        del payload
+        return state
+
+    def build_step_attention_metadata(self, input_batch):
+        del input_batch
+        return {}
+
+    def build_step_batch(self, states, *, cached_batch=None):
+        return InputBatch.make_batch(states, cached_batch=cached_batch)
+
+    def denoise_step(self, input_batch):
         if self.mode == "ulysses":
             sp_group = get_sp_group().ulysses_group
             seq_world_size = torch.distributed.get_world_size(sp_group)
@@ -228,7 +310,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
             intermediate = SeqAllToAll4D.apply(sp_group, input_tensor, 2, 1, False)
             output = SeqAllToAll4D.apply(sp_group, intermediate, 1, 2, False)
             torch.testing.assert_close(output, original, rtol=1e-5, atol=1e-5)
-            return torch.ones_like(state.latents)
+            return torch.ones_like(input_batch.latents)
 
         if self.mode == "ring":
             ring_group = get_sp_group().ring_group
@@ -241,10 +323,10 @@ class _DistributedStepPipeline(CFGParallelMixin):
             comm.wait()
             expected = torch.full_like(recv_tensor, float(((rank - 1) % world_size) + 1))
             torch.testing.assert_close(recv_tensor, expected, rtol=1e-5, atol=1e-5)
-            return torch.ones_like(state.latents)
+            return torch.ones_like(input_batch.latents)
 
-        positive_kwargs = {"x": state.latents + 1}
-        negative_kwargs = {"x": state.latents - 1}
+        positive_kwargs = {"x": input_batch.latents + 1}
+        negative_kwargs = {"x": input_batch.latents - 1}
         return self.predict_noise_maybe_with_cfg(
             do_true_cfg=True,
             true_cfg_scale=1.0,
@@ -253,8 +335,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
             cfg_normalize=False,
         )
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del kwargs
+    def step_scheduler(self, state, noise_pred):
         if self.mode == "cfg":
             state.latents = self.scheduler_step_maybe_with_cfg(
                 noise_pred,
@@ -266,10 +347,14 @@ class _DistributedStepPipeline(CFGParallelMixin):
         else:
             state.latents = state.latents + noise_pred
         state.step_index += 1
+        return state
 
-    def post_decode(self, state, **kwargs):
-        del kwargs
-        return DiffusionOutput(output=state.latents.detach().cpu())
+    def decode(self, state):
+        state.extra["decoded_output"] = DiffusionOutput(output=state.latents.detach().cpu())
+        return state
+
+    def postprocess(self, state):
+        return state.extra["decoded_output"]
 
 
 def _make_step_request(num_inference_steps: int = 2):
@@ -307,7 +392,7 @@ def _make_vllm_config():
 
 
 def _make_runner():
-    runner = object.__new__(DiffusionModelRunner)
+    runner = object.__new__(DiffusionModelRunnerV2)
     runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
@@ -326,7 +411,7 @@ def _make_runner():
 
 
 def _make_distributed_runner(mode: str, device: torch.device):
-    runner = object.__new__(DiffusionModelRunner)
+    runner = object.__new__(DiffusionModelRunnerV2)
     runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
@@ -423,7 +508,7 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
             "MASTER_PORT": master_port,
         }
     )
-    model_runner_module.set_forward_context = _noop_forward_context
+    model_runner_v2_module.set_forward_context = _noop_forward_context
 
     try:
         init_distributed_environment()
@@ -437,7 +522,7 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
             raise ValueError(f"Unsupported distributed test mode: {mode}")
 
         runner = _make_distributed_runner(mode, device)
-        result = DiffusionModelRunner.execute_stepwise(
+        result = DiffusionModelRunnerV2.execute_stepwise(
             runner,
             _make_scheduler_output(_make_step_request(num_inference_steps=1), step_id=0),
         )
@@ -500,14 +585,14 @@ def test_step_profiler_reports_denoise_step_as_diffuse():
 
 @pytest.mark.cpu
 class TestRunner:
-    """DiffusionModelRunner.execute_stepwise"""
+    """DiffusionModelRunnerV2.execute_stepwise"""
 
     def test_completes_request_and_clears_state(self, monkeypatch):
         runner = _make_runner()
         req = _make_step_request()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        _patch_stepwise_runtime(monkeypatch)
 
-        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        result = DiffusionModelRunnerV2.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
         first = result.get_request_output("req-1")
         assert first.request_id == "req-1"
         assert first.step_index == 1
@@ -515,7 +600,7 @@ class TestRunner:
         assert first.result is None
         assert "req-1" in runner.state_cache
 
-        result = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+        result = DiffusionModelRunnerV2.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
         second = result.get_request_output("req-1")
         assert second.request_id == "req-1"
         assert second.step_index == 2
@@ -535,33 +620,33 @@ class TestRunner:
         runner.pipeline = _ProfilingStepPipeline()
         req = _make_step_request()
         reset_calls = []
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        monkeypatch.setattr(model_runner_v2_module, "set_forward_context", _noop_forward_context)
         monkeypatch.setattr(
-            model_runner_module.current_omni_platform,
+            model_runner_v2_module.current_omni_platform,
             "is_available",
             lambda: True,
         )
         monkeypatch.setattr(
-            model_runner_module.current_omni_platform,
+            model_runner_v2_module.current_omni_platform,
             "reset_peak_memory_stats",
             lambda: reset_calls.append(True),
         )
         monkeypatch.setattr(
-            model_runner_module.current_omni_platform,
+            model_runner_v2_module.current_omni_platform,
             "max_memory_reserved",
             lambda: 2 * 1024**2,
         )
         monkeypatch.setattr(
-            model_runner_module.current_omni_platform,
+            model_runner_v2_module.current_omni_platform,
             "max_memory_allocated",
             lambda: 1024**2,
         )
 
-        DiffusionModelRunner.execute_stepwise(
+        DiffusionModelRunnerV2.execute_stepwise(
             runner,
             _make_scheduler_output(req, step_id=0),
         )
-        result = DiffusionModelRunner.execute_stepwise(
+        result = DiffusionModelRunnerV2.execute_stepwise(
             runner,
             _make_cached_scheduler_output(step_id=1),
         )
@@ -581,21 +666,20 @@ class TestRunner:
         runner = _make_runner()
         req = _make_step_request()
         fake_platform = _FakePeakMemoryPlatform([1500.0, 1200.0])
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-        monkeypatch.setattr(model_runner_module, "current_omni_platform", fake_platform)
+        _patch_stepwise_runtime(monkeypatch, fake_platform)
 
-        first = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        first = DiffusionModelRunnerV2.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
         first_output = first.get_request_output("req-1")
         assert first_output.finished is False
         assert first_output.result is None
 
-        second = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+        second = DiffusionModelRunnerV2.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
         second_output = second.get_request_output("req-1")
         assert second_output.finished is True
         assert second_output.result is not None
         assert second_output.result.peak_memory_mb == pytest.approx(1500.0)
 
-    def test_rejects_multi_request_step_batch(self):
+    def test_handles_multi_request_step_batch(self, monkeypatch):
         runner = _make_runner()
         req_1 = _make_step_request()
         req_2 = _make_step_request()
@@ -613,18 +697,19 @@ class TestRunner:
             num_waiting_reqs=0,
         )
 
-        result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+        _patch_stepwise_runtime(monkeypatch)
+        result = DiffusionModelRunnerV2.execute_stepwise(runner, scheduler_output)
         assert len(result) == 2
 
-    def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
+    def test_receives_kv_payload_before_step_inputs(self, monkeypatch):
         runner = _make_runner()
         captured: dict[str, object] = {}
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
-            def prepare_encode(self, state, **kwargs):
+            def check_inputs(self, state):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
-                return super().prepare_encode(state, **kwargs)
+                return super().check_inputs(state)
 
         class _KVTransferManager:
             def receive_multi_kv_cache_distributed(self, req, cfg_kv_collect_func=None, target_device=None):
@@ -636,10 +721,10 @@ class TestRunner:
         runner.pipeline.device = torch.device("cpu")
         runner.od_config.cfg_kv_collect_func = "collect-cfg"
         runner.kv_transfer_manager = _KVTransferManager()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        _patch_stepwise_runtime(monkeypatch)
         req = _make_step_request()
 
-        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        DiffusionModelRunnerV2.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
 
         assert captured["past_key_values"] is kv_payload
         assert captured["cfg_kv_collect_func"] == "collect-cfg"
@@ -650,15 +735,15 @@ class TestRunner:
         runner = _make_runner()
 
         with pytest.raises(ValueError, match="Missing cached state"):
-            DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(request_id="req-missing"))
+            DiffusionModelRunnerV2.execute_stepwise(runner, _make_cached_scheduler_output(request_id="req-missing"))
 
     def test_interrupt_marks_request_finished_and_clears_state(self, monkeypatch):
         runner = _make_runner()
         runner.pipeline = _InterruptingStepPipeline()
         req = _make_step_request()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        _patch_stepwise_runtime(monkeypatch)
 
-        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        result = DiffusionModelRunnerV2.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
         output = result.get_request_output("req-1")
         assert output.request_id == "req-1"
         assert output.step_index == 0
@@ -1022,16 +1107,70 @@ class TestSupportedPipelines:
 
         assert stage_cfg["engine_args"]["step_execution"] is True
 
-    def test_qwen_image_supports_step_execution(self):
-        from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
-        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
+    def test_qwen_image_edit_supports_v2_step_execution(self):
+        from vllm_omni.diffusion.models.interface import (
+            DiffusionV2Atoms,
+            supports_step_execution,
+        )
+        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import QwenImageEditPipeline
 
         # Avoid loading model weights; protocol membership depends on the class contract.
-        pipeline = object.__new__(QwenImagePipeline)
+        pipeline = object.__new__(QwenImageEditPipeline)
 
         assert pipeline.supports_step_execution is True
         assert supports_step_execution(pipeline) is True
-        assert isinstance(pipeline, SupportsStepExecution) is True
+        assert isinstance(pipeline, DiffusionV2Atoms) is True
+
+    def test_qwen_image_edit_stage_payload_codec_keeps_model_private_fields(self):
+        from vllm_omni.diffusion.models.interface import StageBoundary
+        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import QwenImageEditPipeline
+
+        pipeline = object.__new__(QwenImageEditPipeline)
+        sampling = OmniDiffusionSamplingParams()
+        state = DiffusionRequestState(request_id="req-1", sampling=sampling)
+        state.prompt_embeds = torch.ones((1, 2, 3))
+        state.prompt_embeds_mask = torch.ones((1, 2), dtype=torch.bool)
+        state.latents = torch.ones((1, 4, 8))
+        state.img_shapes = [[(1, 2, 2), (1, 4, 4)]]
+        state.txt_seq_lens = [2]
+        state.extra.update(
+            {
+                "image_latents": torch.zeros((1, 4, 8)),
+                "calculated_height": 64,
+                "calculated_width": 64,
+                "cfg_normalize": True,
+                "decode_height": 32,
+                "decode_width": 32,
+                "num_inference_steps": 2,
+                "output_type": "pil",
+                "sigmas": [1.0, 0.5],
+                "true_cfg_scale": 4.0,
+            }
+        )
+
+        payload = pipeline.pack_stage_state(state, StageBoundary.ENCODE_TO_DIT)
+
+        assert payload.request_id == "req-1"
+        assert payload.boundary is StageBoundary.ENCODE_TO_DIT
+        assert "latents" not in payload.tensor_fields
+        assert "prompt_embeds" in payload.tensor_fields
+        assert "image_latents" not in payload.tensor_fields
+        assert "image_latents" in payload.private_tensor_fields
+        assert payload.scalar_fields["img_shapes"] == [[(1, 2, 2), (1, 4, 4)]]
+        assert payload.private_scalar_fields["num_inference_steps"] == 2
+
+        restored = DiffusionRequestState(request_id="req-1", sampling=OmniDiffusionSamplingParams())
+        pipeline.unpack_stage_state(payload, restored)
+
+        assert restored.latents is None
+        torch.testing.assert_close(restored.extra["image_latents"], state.extra["image_latents"])
+        assert restored.img_shapes == state.img_shapes
+        assert restored.extra["decode_height"] == 32
+
+        decode_payload = pipeline.pack_stage_state(state, StageBoundary.DIT_TO_DECODE)
+
+        assert decode_payload.tensor_fields == {"latents": state.latents}
+        assert decode_payload.private_tensor_fields == {}
 
 
 @hardware_test(

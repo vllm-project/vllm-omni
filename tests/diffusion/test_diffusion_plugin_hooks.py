@@ -122,6 +122,36 @@ class TestWorkerUsesHook:
         mock_platform.get_diffusion_model_runner_cls.assert_called_once()
         mock_resolve.assert_called_once_with("custom.path")
 
+    @patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
+    def test_streaming_output_uses_v2_runner_with_default_runner(self, mock_platform):
+        """Streaming output needs the stepwise runner even before load_model."""
+        import vllm_omni.diffusion.worker.diffusion_worker as worker_module
+        from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+
+        class _SelectedRunner:
+            def __init__(self, vllm_config, od_config, device):
+                self.vllm_config = vllm_config
+                self.od_config = od_config
+                self.device = device
+
+        class _StreamingOutputConfig:
+            step_execution = False
+            streaming_output = True
+            stage_id = 0
+
+        mock_platform.get_diffusion_model_runner_cls.return_value = (
+            "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
+        )
+        od_config = _StreamingOutputConfig()
+
+        with (
+            patch.object(DiffusionWorker, "init_device"),
+            patch.object(worker_module, "DiffusionModelRunnerV2", _SelectedRunner),
+        ):
+            worker = DiffusionWorker(local_rank=0, rank=0, od_config=od_config, skip_load_model=True)
+
+        assert isinstance(worker.model_runner, _SelectedRunner)
+
     @patch("vllm_omni.diffusion.worker.diffusion_worker.get_diffusion_ir_op_priority_func")
     @patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
     def test_ir_op_priority_hook_receives_platform_default(self, mock_platform, mock_get_hook):

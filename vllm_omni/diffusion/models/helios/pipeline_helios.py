@@ -8,7 +8,7 @@ import json
 import logging
 import math
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -26,11 +26,13 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import StageBoundary, StagePayload, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.step_mixin import DiffusionV2CFGStepMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -155,7 +157,12 @@ def get_helios_pre_process_func(
 
 
 class HeliosPipeline(
-    nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    DiffusionV2CFGStepMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
 
@@ -167,6 +174,175 @@ class HeliosPipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    stage_payload_tensor_fields: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.ENCODE_TO_DIT: ("prompt_embeds", "negative_prompt_embeds"),
+        StageBoundary.DIT_TO_DECODE: ("latents",),
+    }
+    stage_payload_scalar_fields: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.ENCODE_TO_DIT: (
+            "do_true_cfg",
+            "chunk_index",
+            "step_in_chunk",
+            "total_chunks",
+            "chunk_num_steps",
+        ),
+        StageBoundary.DIT_TO_DECODE: (
+            "do_true_cfg",
+            "chunk_index",
+            "step_in_chunk",
+            "total_chunks",
+            "chunk_num_steps",
+        ),
+    }
+    stage_payload_private_tensor_fields: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.ENCODE_TO_DIT: (
+            "history_latents",
+            "image_latents",
+            "indices_hidden_states",
+            "indices_latents_history_long",
+            "indices_latents_history_mid",
+            "indices_latents_history_short",
+            "latents_mean",
+            "latents_std",
+        ),
+        StageBoundary.DIT_TO_DECODE: (
+            "history_latents",
+            "history_video",
+            "image_latents",
+            "indices_hidden_states",
+            "indices_latents_history_long",
+            "indices_latents_history_mid",
+            "indices_latents_history_short",
+            "latents_history_long",
+            "latents_history_mid",
+            "latents_history_short",
+            "latents_mean",
+            "latents_std",
+            "stage1_start_latents",
+        ),
+    }
+    stage_payload_private_scalar_fields: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.ENCODE_TO_DIT: (
+            "attention_kwargs",
+            "batch_size",
+            "dtype",
+            "generator",
+            "guidance_scale",
+            "height",
+            "history_sizes",
+            "is_amplify_first_chunk",
+            "is_enable_stage2",
+            "is_skip_first_chunk",
+            "keep_first_frame",
+            "num_channels_latents",
+            "num_history_latent_frames",
+            "num_latent_frames_per_chunk",
+            "num_steps",
+            "output_type",
+            "pyramid_num_inference_steps_list",
+            "pyramid_num_stages",
+            "total_generated_latent_frames",
+            "use_cfg_zero_star",
+            "use_zero_init",
+            "vae_dtype",
+            "width",
+            "window_num_frames",
+            "zero_steps",
+        ),
+        StageBoundary.DIT_TO_DECODE: (
+            "attention_kwargs",
+            "batch_size",
+            "dtype",
+            "generator",
+            "guidance_scale",
+            "height",
+            "history_sizes",
+            "is_amplify_first_chunk",
+            "is_enable_stage2",
+            "is_first_chunk",
+            "is_second_chunk",
+            "is_skip_first_chunk",
+            "keep_first_frame",
+            "num_channels_latents",
+            "num_history_latent_frames",
+            "num_latent_frames_per_chunk",
+            "num_steps",
+            "output_type",
+            "pyramid_num_inference_steps_list",
+            "pyramid_num_stages",
+            "stage2_height",
+            "stage2_start_point_list",
+            "stage2_width",
+            "stage_index",
+            "stage_step_index",
+            "total_generated_latent_frames",
+            "use_cfg_zero_star",
+            "use_zero_init",
+            "vae_dtype",
+            "width",
+            "window_num_frames",
+            "zero_steps",
+        ),
+    }
+
+    def pack_stage_state(
+        self,
+        state: DiffusionRequestState,
+        boundary: StageBoundary,
+    ) -> StagePayload:
+        def state_fields(field_names: tuple[str, ...]) -> dict[str, object]:
+            return {name: getattr(state, name) for name in field_names if getattr(state, name, None) is not None}
+
+        def extra_fields(field_names: tuple[str, ...]) -> dict[str, object]:
+            return {name: state.extra[name] for name in field_names if name in state.extra}
+
+        def extra_tensor_fields(field_names: tuple[str, ...]) -> dict[str, torch.Tensor]:
+            tensors: dict[str, torch.Tensor] = {}
+            for name in field_names:
+                if name not in state.extra:
+                    continue
+                value = state.extra[name]
+                if value is None:
+                    continue
+                if not torch.is_tensor(value):
+                    raise TypeError(f"Helios private tensor field {name!r} must be a torch.Tensor.")
+                tensors[name] = value
+            return tensors
+
+        return StagePayload(
+            request_id=state.request_id,
+            boundary=boundary,
+            scalar_fields=state_fields(self.stage_payload_scalar_fields.get(boundary, ())),
+            tensor_fields=state_fields(self.stage_payload_tensor_fields.get(boundary, ())),
+            private_scalar_fields=extra_fields(self.stage_payload_private_scalar_fields.get(boundary, ())),
+            private_tensor_fields=extra_tensor_fields(self.stage_payload_private_tensor_fields.get(boundary, ())),
+        )
+
+    def unpack_stage_state(
+        self,
+        payload: StagePayload,
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
+        if payload.request_id != state.request_id:
+            raise ValueError(
+                f"StagePayload request_id {payload.request_id!r} does not match state {state.request_id!r}."
+            )
+        if payload.boundary not in (StageBoundary.ENCODE_TO_DIT, StageBoundary.DIT_TO_DECODE):
+            raise ValueError(f"Unsupported stage payload boundary: {payload.boundary!r}.")
+        for name, value in payload.scalar_fields.items():
+            setattr(state, name, value)
+        for name, value in payload.tensor_fields.items():
+            setattr(state, name, value)
+        state.extra.update(payload.private_scalar_fields)
+        state.extra.update(payload.private_tensor_fields)
+        if payload.boundary is StageBoundary.ENCODE_TO_DIT:
+            state.extra.setdefault("image_latents", None)
+        if payload.boundary is StageBoundary.DIT_TO_DECODE:
+            state.extra.setdefault("history_video", None)
+            state.extra.setdefault("image_latents", None)
+        if "output_type" in state.extra:
+            state.sampling.output_type = state.extra["output_type"]
+        return state
 
     def __init__(
         self,
@@ -175,6 +351,7 @@ class HeliosPipeline(
         prefix: str = "",
     ):
         super().__init__()
+        del prefix
         self.od_config = od_config
 
         self.device = get_local_device()
@@ -270,6 +447,10 @@ class HeliosPipeline(
     def current_timestep(self):
         return self._current_timestep
 
+    @property
+    def interrupt(self) -> bool:
+        return getattr(self, "_interrupt", False)
+
     def _stage1_sigmas(self, num_steps: int) -> np.ndarray:
         # DMD drops the last timestep in set_timesteps(). Only compensate for
         # the one-step dummy-run edge case; otherwise preserve the historical
@@ -277,13 +458,38 @@ class HeliosPipeline(
         sigma_count = num_steps + 2 if self.is_distilled and num_steps == 1 else num_steps + 1
         return np.linspace(0.999, 0.0, sigma_count)[:-1]
 
-    def prepare_encode(
+    def check_inputs(
         self,
         state: DiffusionRequestState,
-        **kwargs: Any,
     ) -> DiffusionRequestState:
-        """Initialize Helios request state for chunk-wise step execution."""
-        del kwargs
+        req = DiffusionRequestBatch(
+            requests=[
+                OmniDiffusionRequest(
+                    prompt=state.prompt,
+                    sampling_params=state.sampling,
+                    request_id=state.request_id,
+                )
+            ]
+        )
+        extra = getattr(state.sampling, "extra_args", {}) or {}
+        image = extra.get("image")
+        video = extra.get("video")
+        if image is not None and video is not None:
+            raise ValueError("image and video cannot be provided simultaneously")
+        if len(req.prompts) > 1:
+            raise ValueError("Helios step execution supports a single prompt, not a batched request.")
+        prompt = None
+        if len(req.prompts) == 1:
+            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
+        if prompt is None:
+            raise ValueError("Prompt is required for Helios generation.")
+        return state
+
+    def encode(
+        self,
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
+        """Encode prompt/media inputs and initialize chunk-independent state."""
         # Wrap the single request in a DiffusionRequestBatch so the batch
         # compatibility properties (`prompts`, etc.) used below are available;
         # OmniDiffusionRequest itself only exposes a singular `prompt`.
@@ -527,6 +733,14 @@ class HeliosPipeline(
                 "zero_steps": int(extra.get("zero_steps", 1)),
             }
         )
+        return state
+
+    def prepare(
+        self,
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
+        if "history_latents" not in state.extra:
+            raise ValueError(f"Request {state.request_id} has no Helios history latents after encode/unpack.")
         self._prepare_next_chunk(state)
         return state
 
@@ -655,10 +869,10 @@ class HeliosPipeline(
     def denoise_step(
         self,
         input_batch: InputBatch,
-        states: Sequence[DiffusionRequestState],
         **kwargs: Any,
     ) -> torch.Tensor | None:
         del kwargs
+        states = list(input_batch.states)
         if len(states) != 1:
             raise ValueError("Helios step execution supports a single request, not a batched request.")
         state = states[0]
@@ -776,7 +990,7 @@ class HeliosPipeline(
         state: DiffusionRequestState,
         noise_pred: torch.Tensor,
         **kwargs: Any,
-    ) -> None:
+    ) -> DiffusionRequestState:
         del kwargs
         if state.extra["is_enable_stage2"]:
             self._step_scheduler_stage2(state, noise_pred)
@@ -799,6 +1013,7 @@ class HeliosPipeline(
                 state.latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, state.latents, state.do_true_cfg)
             state.step_in_chunk += 1
             state.step_index = state.step_in_chunk
+        return state
 
     def _step_scheduler_stage2(self, state: DiffusionRequestState, noise_pred: torch.Tensor) -> None:
         extra = state.extra
@@ -864,12 +1079,10 @@ class HeliosPipeline(
             extra["stage2_start_point_list"].append(state.latents)
         self._set_stage2_timesteps(state)
 
-    def post_decode(
+    def decode(
         self,
         state: DiffusionRequestState,
-        **kwargs: Any,
-    ) -> DiffusionOutput:
-        del kwargs
+    ) -> DiffusionRequestState:
         extra = state.extra
         is_first_chunk = extra["is_first_chunk"]
         is_second_chunk = extra["is_second_chunk"]
@@ -892,10 +1105,13 @@ class HeliosPipeline(
         else:
             extra["history_video"] = torch.cat([extra["history_video"], current_video], dim=2)
 
-        output = current_latents if extra["output_type"] == "latent" else current_video
         completed_chunk_index = state.chunk_index
         state.chunk_index += 1
         finished = state.request_denoise_completed
+        if getattr(self.od_config, "streaming_output", False):
+            output = current_latents if extra["output_type"] == "latent" else current_video
+        else:
+            output = real_history_latents if extra["output_type"] == "latent" else extra["history_video"]
         if not finished:
             self._prepare_next_chunk(state)
         else:
@@ -903,13 +1119,25 @@ class HeliosPipeline(
             if current_omni_platform.is_available():
                 current_omni_platform.empty_cache()
 
-        return DiffusionOutput(
+        state.extra["decoded_output"] = DiffusionOutput(
             output=output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else {},
             chunk_index=completed_chunk_index,
             total_chunks=state.total_chunks,
             finished=finished,
         )
+        return state
+
+    def postprocess(
+        self,
+        state: DiffusionRequestState,
+    ) -> DiffusionOutput:
+        output = state.extra.get("decoded_output")
+        if output is None:
+            raise ValueError(f"Request {state.request_id} has not been decoded.")
+        if not isinstance(output, DiffusionOutput):
+            raise TypeError(f"Decoded output for request {state.request_id} must be a DiffusionOutput.")
+        return output
 
     def forward(
         self,

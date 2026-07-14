@@ -24,14 +24,23 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import (
+    StageBoundary,
+    StagePayload,
+    SupportImageInput,
+    SupportsComponentDiscovery,
+)
+from vllm_omni.diffusion.models.step_mixin import DiffusionV2CFGStepMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.inputs.data import OmniTextPrompt
-from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
+from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import (
+    Siglip2VisionTransformer,
+)
 
 from .hunyuan_image3_tokenizer import TokenizerEncodeOutput, TokenizerWrapper
 from .hunyuan_image3_transformer import (
@@ -54,7 +63,6 @@ from .system_prompt import get_system_prompt
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +70,46 @@ BatchRaggedImages = torch.Tensor | list[torch.Tensor | list[torch.Tensor]]
 BatchRaggedTensor = torch.Tensor | list[torch.Tensor]
 
 _STEP_MODEL_KWARGS = "hunyuan_model_kwargs"
+_STEP_MODEL_KWARGS_STRUCTURE = "hunyuan_model_kwargs_structure"
 _STEP_INPUT_IDS = "hunyuan_input_ids"
 _STEP_GENERATOR = "hunyuan_generator"
 _STEP_GUIDANCE_SCALE = "hunyuan_guidance_scale"
 _STEP_CFG_FACTOR = "hunyuan_cfg_factor"
 _STEP_OUTPUT_SIZE = "hunyuan_output_size"
+_STEP_OUTPUT_TYPE = "hunyuan_output_type"
+_STEP_NUM_INFERENCE_STEPS = "hunyuan_num_inference_steps"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
+_STEP_AR_KV_STRUCTURE = "hunyuan_ar_kv_structure"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
+_STEP_TENSOR_TREE_PREFIX = "hunyuan_tensor_tree:"
+_STEP_TENSOR_TREE_REF = "__hunyuan_tensor_ref__"
+_STEP_TENSOR_TREE_TUPLE = "__hunyuan_tuple__"
+_STEP_MODEL_KWARGS_PAYLOAD_KEYS = (
+    "ar_kv_data",
+    "ar_kv_reuse_len",
+    "ar_kv_reuse_offset",
+    "attention_mask",
+    "cond_timestep",
+    "cond_timestep_scatter_index",
+    "cond_vae_image_mask",
+    "cond_vae_images",
+    "cond_vit_image_mask",
+    "cond_vit_images",
+    "custom_pos_emb",
+    "full_attn_spans",
+    "gen_timestep_scatter_index",
+    "image_mask",
+    "mode",
+    "num_image_tokens",
+    "past_key_values",
+    "position_ids",
+    "prefill_step",
+    "query_lens",
+    "seq_lens",
+    "use_cache",
+    "vit_kwargs",
+)
 
 
 def default(val, d):
@@ -337,6 +377,7 @@ class HunyuanImage3Pipeline(
     HunyuanImage3PreTrainedModel,
     GenerationMixin,
     SupportImageInput,
+    DiffusionV2CFGStepMixin,
     SupportsComponentDiscovery,
     DiffusionPipelineProfilerMixin,
 ):
@@ -346,6 +387,207 @@ class HunyuanImage3Pipeline(
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    stage_payload_tensor_fields: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.DIT_TO_DECODE: ("latents",),
+    }
+    stage_payload_scalar_fields: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.ENCODE_TO_DIT: ("do_true_cfg",),
+    }
+    stage_payload_private_tensor_fields: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.ENCODE_TO_DIT: (_STEP_INPUT_IDS,),
+    }
+    stage_payload_private_scalar_fields: ClassVar[dict[StageBoundary, tuple[str, ...]]] = {
+        StageBoundary.ENCODE_TO_DIT: (
+            _STEP_GENERATOR,
+            _STEP_GUIDANCE_SCALE,
+            _STEP_CFG_FACTOR,
+            _STEP_OUTPUT_SIZE,
+            _STEP_OUTPUT_TYPE,
+            _STEP_NUM_INFERENCE_STEPS,
+            _STEP_COT_TEXT_LIST,
+        ),
+        StageBoundary.DIT_TO_DECODE: (
+            _STEP_GENERATOR,
+            _STEP_OUTPUT_TYPE,
+            _STEP_COT_TEXT_LIST,
+        ),
+    }
+
+    def pack_stage_state(
+        self,
+        state: DiffusionRequestState,
+        boundary: StageBoundary,
+    ) -> StagePayload:
+        def state_fields(field_names: tuple[str, ...]) -> dict[str, object]:
+            return {name: getattr(state, name) for name in field_names if getattr(state, name, None) is not None}
+
+        def extra_fields(field_names: tuple[str, ...]) -> dict[str, object]:
+            return {name: state.extra[name] for name in field_names if name in state.extra}
+
+        def extra_tensor_fields(
+            field_names: tuple[str, ...],
+        ) -> dict[str, torch.Tensor]:
+            tensors: dict[str, torch.Tensor] = {}
+            for name in field_names:
+                if name not in state.extra:
+                    continue
+                value = state.extra[name]
+                if value is None:
+                    continue
+                if not torch.is_tensor(value):
+                    raise TypeError(f"Hunyuan private tensor field {name!r} must be a torch.Tensor.")
+                tensors[name] = value
+            return tensors
+
+        private_scalar_fields = extra_fields(self.stage_payload_private_scalar_fields.get(boundary, ()))
+        private_tensor_fields = extra_tensor_fields(self.stage_payload_private_tensor_fields.get(boundary, ()))
+        if boundary is StageBoundary.ENCODE_TO_DIT:
+            if _STEP_MODEL_KWARGS in state.extra:
+                private_scalar_fields[_STEP_MODEL_KWARGS_STRUCTURE] = self._pack_model_kwargs_structure(
+                    state,
+                    private_tensor_fields,
+                )
+            if _STEP_AR_KV in state.extra and state.extra[_STEP_AR_KV] is not None:
+                private_scalar_fields[_STEP_AR_KV_STRUCTURE] = self._flatten_tensor_tree(
+                    _STEP_AR_KV,
+                    state.extra[_STEP_AR_KV],
+                    private_tensor_fields,
+                )
+
+        return StagePayload(
+            request_id=state.request_id,
+            boundary=boundary,
+            scalar_fields=state_fields(self.stage_payload_scalar_fields.get(boundary, ())),
+            tensor_fields=state_fields(self.stage_payload_tensor_fields.get(boundary, ())),
+            private_scalar_fields=private_scalar_fields,
+            private_tensor_fields=private_tensor_fields,
+        )
+
+    def unpack_stage_state(
+        self,
+        payload: StagePayload,
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
+        if payload.request_id != state.request_id:
+            raise ValueError(
+                f"StagePayload request_id {payload.request_id!r} does not match state {state.request_id!r}."
+            )
+        if payload.boundary not in (
+            StageBoundary.ENCODE_TO_DIT,
+            StageBoundary.DIT_TO_DECODE,
+        ):
+            raise ValueError(f"Unsupported stage payload boundary: {payload.boundary!r}.")
+        for name, value in payload.scalar_fields.items():
+            setattr(state, name, value)
+        for name, value in payload.tensor_fields.items():
+            setattr(state, name, value)
+        tensor_tree_fields = {
+            name: value
+            for name, value in payload.private_tensor_fields.items()
+            if name.startswith(_STEP_TENSOR_TREE_PREFIX)
+        }
+        private_tensor_fields = {
+            name: value
+            for name, value in payload.private_tensor_fields.items()
+            if not name.startswith(_STEP_TENSOR_TREE_PREFIX)
+        }
+        state.extra.update(payload.private_scalar_fields)
+        state.extra.update(private_tensor_fields)
+        if _STEP_MODEL_KWARGS_STRUCTURE in state.extra:
+            state.extra[_STEP_MODEL_KWARGS] = self._restore_tensor_tree(
+                state.extra.pop(_STEP_MODEL_KWARGS_STRUCTURE),
+                tensor_tree_fields,
+            )
+            if _STEP_GENERATOR in state.extra:
+                state.extra[_STEP_MODEL_KWARGS]["generator"] = state.extra[_STEP_GENERATOR]
+        if _STEP_AR_KV_STRUCTURE in state.extra:
+            state.extra[_STEP_AR_KV] = self._restore_tensor_tree(
+                state.extra.pop(_STEP_AR_KV_STRUCTURE),
+                tensor_tree_fields,
+            )
+        if _STEP_OUTPUT_TYPE in state.extra:
+            state.sampling.output_type = state.extra[_STEP_OUTPUT_TYPE]
+        return state
+
+    def _flatten_tensor_tree(
+        self,
+        path: str,
+        value: Any,
+        tensor_fields: dict[str, torch.Tensor],
+    ) -> Any:
+        if torch.is_tensor(value):
+            key = f"{_STEP_TENSOR_TREE_PREFIX}{path}"
+            tensor_fields[key] = value
+            return {_STEP_TENSOR_TREE_REF: key}
+        if isinstance(value, tuple):
+            return {
+                _STEP_TENSOR_TREE_TUPLE: [
+                    self._flatten_tensor_tree(f"{path}.{i}", item, tensor_fields) for i, item in enumerate(value)
+                ]
+            }
+        if isinstance(value, list):
+            return [self._flatten_tensor_tree(f"{path}.{i}", item, tensor_fields) for i, item in enumerate(value)]
+        if isinstance(value, dict):
+            return {key: self._flatten_tensor_tree(f"{path}.{key}", item, tensor_fields) for key, item in value.items()}
+        return value
+
+    def _restore_tensor_tree(
+        self,
+        structure: Any,
+        tensor_fields: dict[str, torch.Tensor],
+    ) -> Any:
+        if isinstance(structure, dict):
+            if set(structure) == {_STEP_TENSOR_TREE_REF}:
+                key = structure[_STEP_TENSOR_TREE_REF]
+                if key not in tensor_fields:
+                    raise ValueError(f"Missing Hunyuan tensor payload field {key!r}.")
+                return tensor_fields[key]
+            if set(structure) == {_STEP_TENSOR_TREE_TUPLE}:
+                return tuple(
+                    self._restore_tensor_tree(item, tensor_fields) for item in structure[_STEP_TENSOR_TREE_TUPLE]
+                )
+            return {key: self._restore_tensor_tree(item, tensor_fields) for key, item in structure.items()}
+        if isinstance(structure, list):
+            return [self._restore_tensor_tree(item, tensor_fields) for item in structure]
+        return structure
+
+    def _full_attn_spans_from_tokenizer_output(
+        self,
+        input_ids: torch.Tensor,
+        tokenizer_output: TokenizerEncodeOutput,
+    ) -> list[list[tuple[int, int]]]:
+        seq_len = input_ids.shape[1]
+        batch_image_slices = [
+            tokenizer_output.joint_image_slices[i] + tokenizer_output.gen_image_slices[i]
+            for i in range(input_ids.shape[0])
+        ]
+        full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(input_ids.shape[0])]
+        for i, image_slices in enumerate(batch_image_slices):
+            for image_slice in image_slices:
+                start = image_slice.start if image_slice.start is not None else 0
+                stop = image_slice.stop if image_slice.stop is not None else seq_len
+                assert start < stop, f"Invalid image slice: {image_slice}"
+                full_attn_spans[i].append((int(start), int(stop)))
+            if full_attn_spans[i]:
+                full_attn_spans[i].sort(key=lambda x: x[0])
+        return full_attn_spans
+
+    def _pack_model_kwargs_structure(
+        self,
+        state: DiffusionRequestState,
+        tensor_fields: dict[str, torch.Tensor],
+    ) -> Any:
+        model_kwargs = state.extra[_STEP_MODEL_KWARGS]
+        payload_kwargs = {key: model_kwargs[key] for key in _STEP_MODEL_KWARGS_PAYLOAD_KEYS if key in model_kwargs}
+        if "full_attn_spans" not in payload_kwargs and "tokenizer_output" in model_kwargs:
+            input_ids = state.extra[_STEP_INPUT_IDS]
+            payload_kwargs["full_attn_spans"] = self._full_attn_spans_from_tokenizer_output(
+                input_ids,
+                model_kwargs["tokenizer_output"],
+            )
+        if "tokenizer_output" in model_kwargs:
+            payload_kwargs["prefill_step"] = True
+        return self._flatten_tensor_tree(_STEP_MODEL_KWARGS, payload_kwargs, tensor_fields)
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -486,6 +728,10 @@ class HunyuanImage3Pipeline(
             self._pipeline = HunyuanImage3Text2ImagePipeline(model=self, scheduler=self.scheduler, vae=self.vae)
         return self._pipeline
 
+    @property
+    def interrupt(self) -> bool:
+        return getattr(self, "_interrupt", False)
+
     def _validate_step_request(self, state: "DiffusionRequestState") -> None:
         prompt = state.prompt
         sampling = state.sampling
@@ -580,7 +826,13 @@ class HunyuanImage3Pipeline(
             if not allow_cond_image or not any(has_cond_image):
                 batch_cond_image_info = None
 
-        return prompt, cot_text_list, system_prompt, batch_cond_image_info, tokenizer_bot_task
+        return (
+            prompt,
+            cot_text_list,
+            system_prompt,
+            batch_cond_image_info,
+            tokenizer_bot_task,
+        )
 
     def _extract_step_prompt_inputs(
         self,
@@ -591,10 +843,12 @@ class HunyuanImage3Pipeline(
             [state.prompt] if state.prompt is not None else [],
             getattr(sampling, "extra_args", {}) or {},
             request_id=state.request_id,
-            allow_cond_image=False,
+            allow_cond_image=True,
         )
 
-    def _snapshot_injected_ar_kv(self) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
+    def _snapshot_injected_ar_kv(
+        self,
+    ) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
         snapshot: list[list[tuple[torch.Tensor, torch.Tensor]] | None] = []
         found = False
         for layer in self.model.layers:
@@ -1151,7 +1405,7 @@ class HunyuanImage3Pipeline(
         return cond_vae_images, cond_t, batch_cond_vit_images
 
     @staticmethod
-    def check_inputs(prompt=None, message_list=None):
+    def _check_prompt_inputs(prompt=None, message_list=None):
         if prompt is None and message_list is None:
             raise ValueError("Either `prompt` or `message_list` should be provided.")
         if prompt is not None and message_list is not None:
@@ -1208,7 +1462,7 @@ class HunyuanImage3Pipeline(
         **kwargs,
     ):
         # 1. Sanity check
-        self.check_inputs(prompt, message_list)
+        self._check_prompt_inputs(prompt, message_list)
         device = default(device, self.device)
 
         # 2. Format inputs
@@ -1410,23 +1664,16 @@ class HunyuanImage3Pipeline(
         # attention and image tokens use full attention.
         bsz, seq_len = inputs_tensor.shape
         device = inputs_tensor.device
-        tokenizer_output = model_kwargs["tokenizer_output"]
-        batch_image_slices = [
-            tokenizer_output.joint_image_slices[i] + tokenizer_output.gen_image_slices[i] for i in range(bsz)
-        ]
+        full_attn_spans = model_kwargs.get("full_attn_spans")
+        if full_attn_spans is None:
+            tokenizer_output = model_kwargs["tokenizer_output"]
+            full_attn_spans = self._full_attn_spans_from_tokenizer_output(inputs_tensor, tokenizer_output)
         attention_mask = (
             torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril(diagonal=0).repeat(bsz, 1, 1)
         )
-        full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
-            for j, image_slice in enumerate(batch_image_slices[i]):
-                attention_mask[i, image_slice, image_slice] = True
-                start = image_slice.start if image_slice.start is not None else 0
-                stop = image_slice.stop if image_slice.stop is not None else seq_len
-                assert start < stop, f"Invalid image slice: {image_slice}"
-                full_attn_spans[i].append((int(start), int(stop)))
-            if full_attn_spans[i]:
-                full_attn_spans[i].sort(key=lambda x: x[0])
+            for start, stop in full_attn_spans[i]:
+                attention_mask[i, start:stop, start:stop] = True
         attention_mask = attention_mask.unsqueeze(1)
         model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
@@ -1485,6 +1732,7 @@ class HunyuanImage3Pipeline(
         is_encoder_decoder: bool = False,
         num_new_tokens: int = 1,
     ) -> dict[str, Any]:
+        del is_encoder_decoder, num_new_tokens
         mode = model_kwargs["mode"]
 
         updated_model_kwargs = {
@@ -1506,8 +1754,11 @@ class HunyuanImage3Pipeline(
                 updated_model_kwargs[cache_name] = getattr(outputs, possible_cache_name)
                 break
 
-        if "tokenizer_output" in model_kwargs:
+        is_prefill_step = "tokenizer_output" in model_kwargs or bool(model_kwargs.get("prefill_step"))
+        if is_prefill_step:
             if mode == "gen_text":
+                if "tokenizer_output" not in model_kwargs:
+                    raise ValueError("Hunyuan gen_text prefill requires tokenizer_output.")
                 # When enable batching, we use right padding, which requires a real_pos to index the valid
                 # end position of the sequence. If tokenizer_output in model_kwargs, it means we are in the
                 # prefill step of generation.
@@ -1530,9 +1781,15 @@ class HunyuanImage3Pipeline(
                 current_starts = timestep_position_ids.reshape(-1)
                 max_current_start = int(current_starts.max().item())
                 for attention_mask_i, position_ids_i, current_start_i in zip(
-                    model_kwargs["attention_mask"], updated_model_kwargs["position_ids"], current_starts
+                    model_kwargs["attention_mask"],
+                    updated_model_kwargs["position_ids"],
+                    current_starts,
                 ):
-                    query_mask = torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1) - offset)
+                    query_mask = torch.index_select(
+                        attention_mask_i,
+                        dim=1,
+                        index=position_ids_i.reshape(-1) - offset,
+                    )
                     current_start = int(current_start_i.item())
                     prefix_mask = torch.index_select(
                         query_mask,
@@ -1562,46 +1819,6 @@ class HunyuanImage3Pipeline(
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
 
         return updated_model_kwargs
-
-    def _generate(
-        self,
-        generator: list[torch.Generator] | None = None,
-        **kwargs,
-    ):
-        mode = kwargs.get("mode", "gen_text")
-        # verbose > 1 not support
-        if mode == "gen_text":
-            raise NotImplementedError("Not support gen text for hunyuan image")
-
-        elif mode == "gen_image":
-            batch_gen_image_info: list[ImageInfo] = kwargs.get("batch_gen_image_info")
-            if batch_gen_image_info is None:
-                raise ValueError("`batch_gen_image_info` should be provided when `mode` is `gen_image`.")
-
-            image_info: ImageInfo = batch_gen_image_info[0]
-            num_image_tokens = (
-                image_info.image_token_length
-                + (1 if image_info.add_timestep_token else 0)
-                + (1 if image_info.add_guidance_token else 0)
-            )
-            kwargs["num_image_tokens"] = num_image_tokens
-            # 50 and 5.0 hard code
-            results = self.pipeline(
-                batch_size=len(batch_gen_image_info),
-                image_size=[
-                    batch_gen_image_info[0].image_height,
-                    batch_gen_image_info[0].image_width,
-                ],
-                num_inference_steps=kwargs.get("num_inference_steps", 50),
-                guidance_scale=kwargs.get("guidance_scale", 5.0),
-                generator=generator,
-                model_kwargs=kwargs,
-            )
-            samples = results[0]
-            return samples
-
-        else:
-            raise ValueError(f"Unknown mode {mode}, only `gen_text` and `gen_image` are supported.")
 
     @staticmethod
     def _check_inputs(cond, target, check_list):
@@ -1800,27 +2017,6 @@ class HunyuanImage3Pipeline(
             k, v = kv["key"], kv["value"]
             cache_mgr._injected_ar_kv = [(k[:positive_reuse_len], v[:positive_reuse_len])]
 
-    def _extract_ar_kv_from_request(self, req) -> dict[str, Any]:
-        kv = getattr(getattr(req, "sampling_params", None), "past_key_values", None)
-        if kv is None:
-            return {}
-        key_cache = getattr(kv, "key_cache", None)
-        value_cache = getattr(kv, "value_cache", None)
-        if not key_cache or not value_cache:
-            return {}
-        ar_kv_data = {
-            i: {"key": k, "value": v}
-            for i, (k, v) in enumerate(zip(key_cache, value_cache))
-            if k is not None and v is not None
-        }
-        if not ar_kv_data:
-            return {}
-        logger.info(
-            f"[AR KV Reuse] Extracted {len(ar_kv_data)} layers of AR KV, "
-            f"each with length: {next(iter(ar_kv_data.values()))['key'].shape}"
-        )
-        return {"ar_kv_data": ar_kv_data}
-
     def _extract_ar_kv_from_sampling(self, sampling: Any) -> dict[str, Any]:
         kv = getattr(sampling, "past_key_values", None)
         if kv is None:
@@ -1836,12 +2032,18 @@ class HunyuanImage3Pipeline(
         }
         return {"ar_kv_data": ar_kv_data} if ar_kv_data else {}
 
-    def prepare_encode(
+    def check_inputs(
         self,
-        state: "DiffusionRequestState",
-        **kwargs: Any,
-    ) -> "DiffusionRequestState":
-        del kwargs
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
+        self._validate_step_request(state)
+        self._extract_step_prompt_inputs(state)
+        return state
+
+    def encode(
+        self,
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
         self._validate_step_request(state)
         pipe = self.pipeline
         sampling = state.sampling
@@ -1894,6 +2096,39 @@ class HunyuanImage3Pipeline(
             + (1 if image_info.add_guidance_token else 0)
         )
         model_kwargs["num_image_tokens"] = num_image_tokens
+        state.do_true_cfg = guidance_scale > 1.0
+        state.extra.update(
+            {
+                _STEP_MODEL_KWARGS: model_kwargs,
+                _STEP_INPUT_IDS: input_ids,
+                _STEP_GENERATOR: model_kwargs["generator"],
+                _STEP_GUIDANCE_SCALE: guidance_scale,
+                _STEP_CFG_FACTOR: 1 + int(guidance_scale > 1.0),
+                _STEP_OUTPUT_SIZE: (target_height, target_width),
+                _STEP_OUTPUT_TYPE: sampling.output_type or "pil",
+                _STEP_NUM_INFERENCE_STEPS: num_inference_steps,
+                _STEP_COT_TEXT_LIST: cot_text_list,
+            }
+        )
+        return state
+
+    def prepare(
+        self,
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
+        if _STEP_MODEL_KWARGS not in state.extra:
+            raise ValueError(f"Missing Hunyuan model kwargs for request {state.request_id}.")
+        if _STEP_INPUT_IDS not in state.extra:
+            raise ValueError(f"Missing Hunyuan input ids for request {state.request_id}.")
+        if _STEP_OUTPUT_SIZE not in state.extra:
+            raise ValueError(f"Missing Hunyuan output size for request {state.request_id}.")
+
+        pipe = self.pipeline
+        model_kwargs = state.extra[_STEP_MODEL_KWARGS]
+        input_ids = state.extra[_STEP_INPUT_IDS]
+        target_height, target_width = state.extra[_STEP_OUTPUT_SIZE]
+        num_inference_steps = state.extra[_STEP_NUM_INFERENCE_STEPS]
+        guidance_scale = state.extra[_STEP_GUIDANCE_SCALE]
 
         timesteps, _ = retrieve_timesteps(
             self.scheduler,
@@ -1937,22 +2172,15 @@ class HunyuanImage3Pipeline(
             device=self.device,
         )
         model_kwargs["ar_kv_reuse_len"] = ar_kv_reuse_len
+        state.extra[_STEP_AR_KV] = self._snapshot_injected_ar_kv()
 
         state.latents = latents
         state.timesteps = timesteps
         state.step_index = 0
         state.scheduler = req_scheduler
-        state.do_true_cfg = guidance_scale > 1.0
-        state.extra = {
-            _STEP_MODEL_KWARGS: model_kwargs,
-            _STEP_INPUT_IDS: input_ids,
-            _STEP_GENERATOR: model_kwargs["generator"],
-            _STEP_GUIDANCE_SCALE: guidance_scale,
-            _STEP_CFG_FACTOR: 1 + int(guidance_scale > 1.0),
-            _STEP_OUTPUT_SIZE: (target_height, target_width),
-            _STEP_COT_TEXT_LIST: cot_text_list,
-            _STEP_AR_KV: self._snapshot_injected_ar_kv(),
-        }
+        state.extra[_STEP_MODEL_KWARGS] = model_kwargs
+        state.extra[_STEP_INPUT_IDS] = input_ids
+        state.extra[_STEP_GENERATOR] = model_kwargs["generator"]
         return state
 
     def _step_group_key(self, state: "DiffusionRequestState") -> tuple[Any, ...]:
@@ -2006,7 +2234,9 @@ class HunyuanImage3Pipeline(
         return row_state_indexes, row_branches
 
     @staticmethod
-    def _validate_step_group_states(states: list["DiffusionRequestState"]) -> tuple[bool, int]:
+    def _validate_step_group_states(
+        states: list["DiffusionRequestState"],
+    ) -> tuple[bool, int]:
         if not states:
             raise ValueError("HunyuanImage3 denoise_step received an empty group.")
 
@@ -2182,10 +2412,10 @@ class HunyuanImage3Pipeline(
         state: "DiffusionRequestState",
         noise_pred: torch.Tensor,
         **kwargs: Any,
-    ) -> None:
+    ) -> DiffusionRequestState:
         del kwargs
         if getattr(self, "interrupt", False):
-            return
+            return state
         generator = state.extra.get(_STEP_GENERATOR)
         step_kwargs = self.pipeline.prepare_extra_func_kwargs(state.scheduler.step, {"generator": generator})
         latent_dtype = state.latents.dtype
@@ -2197,21 +2427,22 @@ class HunyuanImage3Pipeline(
             return_dict=False,
         )[0].to(dtype=latent_dtype)
         state.step_index += 1
+        return state
 
-    def post_decode(
+    def decode(
         self,
-        state: "DiffusionRequestState",
-        **kwargs: Any,
-    ) -> DiffusionOutput:
-        output_type = kwargs.get("output_type", "pil")
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
+        output_type = state.extra.get(_STEP_OUTPUT_TYPE, state.sampling.output_type or "pil")
         generator = state.extra.get(_STEP_GENERATOR)
         latents = state.latents
         if output_type == "latent":
-            return DiffusionOutput(
+            state.extra["decoded_output"] = DiffusionOutput(
                 output=latents,
                 custom_output={},
                 stage_durations=getattr(self, "stage_durations", None),
             )
+            return state
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
@@ -2235,79 +2466,39 @@ class HunyuanImage3Pipeline(
         custom_output = {}
         if any(text is not None for text in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0]
-        return DiffusionOutput(
+        state.extra["decoded_output"] = DiffusionOutput(
             output=image[0],
             custom_output=custom_output,
             stage_durations=getattr(self, "stage_durations", None),
         )
+        return state
 
-    def forward(
+    def postprocess(
         self,
-        req: DiffusionRequestBatch,
-        prompt: str | list[str] = "",
-        image_size="auto",
-        height: int = 1024,
-        width: int = 1024,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 5.0,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        **kwargs,
+        state: DiffusionRequestState,
     ) -> DiffusionOutput:
-        extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
-        (
-            prompt_from_req,
-            cot_text_list,
-            system_prompt,
-            batch_cond_image_info,
-            tokenizer_bot_task,
-        ) = self._extract_prompt_inputs(
-            req.prompts,
-            extra_args,
+        output = state.extra.get("decoded_output")
+        if output is None:
+            raise ValueError(f"Request {state.request_id} has not been decoded.")
+        if not isinstance(output, DiffusionOutput):
+            raise TypeError(f"Decoded output for request {state.request_id} must be a DiffusionOutput.")
+        return output
+
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if len(req.prompts) > 1:
+            logger.warning(
+                "This model only supports a single prompt, not a batched request. Taking only the first prompt for now."
+            )
+        state = DiffusionRequestState(
             request_id=req.request_id,
-            allow_cond_image=True,
+            sampling=req.sampling_params,
+            prompt=req.prompts[0],
+            kv_sender_info=req.kv_sender_info,
         )
-        prompt = prompt_from_req or prompt
-        cot_text = (
-            [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
-        )
-
-        generator = req.sampling_params.generator or generator
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
-        if guidance_scale <= 1.0:
-            logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
-        image_size = (height, width)
-
-        # ---- AR KV Reuse: extract injected KV from request ----
-        ar_kv_kwargs = self._extract_ar_kv_from_request(req)
-
-        model_inputs = self.prepare_model_inputs(
-            prompt=prompt,
-            cot_text=cot_text,
-            system_prompt=system_prompt,
-            mode="gen_image",
-            generator=generator,
-            image_size=image_size,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            batch_cond_image_info=batch_cond_image_info,
-            bot_task=tokenizer_bot_task,
-            **ar_kv_kwargs,
-        )
-
-        model_inputs.update(ar_kv_kwargs)
-
-        outputs = self._generate(**model_inputs, **kwargs)
-        image = outputs[0]
-        custom_output = {}
-        if any(t is not None for t in cot_text_list):
-            custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
-        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        return DiffusionOutput(
-            output=image,
-            custom_output=custom_output,
-            stage_durations=stage_durations,
-        )
+        state = self.init_state(state)
+        state = self.check_inputs(state)
+        state = self.encode(state)
+        state = self.prepare(state)
+        state = self.diffuse(state)
+        state = self.decode(state)
+        return self.postprocess(state)
