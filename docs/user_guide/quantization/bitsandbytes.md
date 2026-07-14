@@ -17,12 +17,12 @@ quantize during model loading via the `bitsandbytes` CUDA kernels.
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ |
-| AMD ROCm | ⭕ |
+| AMD ROCm | ❌ |
 | Intel XPU | ❌ |
 | Ascend NPU | ❌ |
 
-Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
-guide.
+Legend: `✅` supported, `❌` unsupported. Non-CUDA platforms raise in
+`get_quant_method()`; CUDA requires compute capability 7.5+ (`SM 75+`).
 
 Requires the optional `bitsandbytes` package (`pip install bitsandbytes`).
 
