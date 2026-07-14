@@ -1,6 +1,43 @@
 {
   "source": "https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers/resolve/main/transformer/diffusion_pytorch_model.safetensors.index.json",
   "index_parameter_count": 1421,
+  "canonical_name_set_sha256": "5d31b7f64fd5e5e271b789b2dbe50fb7bbf146bd8b750646bdc9abb4e5b8139d",
+  "canonical_name_to_shard_sha256": "e1addc27d2b1fad6f10226a23a265ee3e3c61e74dce4d5859727bdf180a67992",
+  "canonical_serialization": "sorted lines formatted as parameter_name=shard_filename with LF separators and no trailing LF",
+  "shards": {
+    "diffusion_pytorch_model-00001-of-00008.safetensors": {
+      "parameter_count": 180,
+      "parameter_names_sha256": "81a3d4778de604e75609aae7dac3d8dcbc081811e7748267fe953bbeb375e79d"
+    },
+    "diffusion_pytorch_model-00002-of-00008.safetensors": {
+      "parameter_count": 180,
+      "parameter_names_sha256": "4e36e2596a6468f29179fa5795396f2e9a7f7d8debc912b34a6f6c2c7c7c610d"
+    },
+    "diffusion_pytorch_model-00003-of-00008.safetensors": {
+      "parameter_count": 180,
+      "parameter_names_sha256": "6f74a7b2cf7444c2daa2b3fc32bd3787589b35543c230c5c13b89f0f0f2a0998"
+    },
+    "diffusion_pytorch_model-00004-of-00008.safetensors": {
+      "parameter_count": 180,
+      "parameter_names_sha256": "ec5c967ed5271ba7834337c4ee93a73f8ed0eead4492d4920624251c65c058ac"
+    },
+    "diffusion_pytorch_model-00005-of-00008.safetensors": {
+      "parameter_count": 180,
+      "parameter_names_sha256": "ad1fdab5830dd9ce43ea007f112b4be223327b7c8197c766d9cf9219e74d619b"
+    },
+    "diffusion_pytorch_model-00006-of-00008.safetensors": {
+      "parameter_count": 180,
+      "parameter_names_sha256": "fd58f0d86be42d8afcf55d3e07d8a22f7f6ef5064da931a600c890b71b6dfbae"
+    },
+    "diffusion_pytorch_model-00007-of-00008.safetensors": {
+      "parameter_count": 180,
+      "parameter_names_sha256": "305a1714b5f4fb54d5877c593b451273ab1490d90fd0896a299d96e140295047"
+    },
+    "diffusion_pytorch_model-00008-of-00008.safetensors": {
+      "parameter_count": 161,
+      "parameter_names_sha256": "4c18d94d96168682eb212f93e3cdf7313928776d8d9e6e4de0255fe899decb25"
+    }
+  },
   "top_level_modules": [
     "blocks",
     "c2ws_hidden_states_layer1",

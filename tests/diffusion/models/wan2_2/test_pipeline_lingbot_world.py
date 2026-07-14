@@ -25,6 +25,32 @@ _ROOT = Path(__file__).parents[4]
 _MODULE_PATH = _ROOT / "vllm_omni/diffusion/models/wan2_2/pipeline_lingbot_world.py"
 _REGISTRY_PATH = _ROOT / "vllm_omni/diffusion/registry.py"
 _WAN_INIT_PATH = _ROOT / "vllm_omni/diffusion/models/wan2_2/__init__.py"
+_MODEL_INDEX_FIXTURE = Path(__file__).with_name("fixtures") / "lingbot_world_model_index.json.fixture"
+_SCHEDULER_FIXTURE = Path(__file__).with_name("fixtures") / "lingbot_world_scheduler_config.json.fixture"
+
+
+def _scheduler_config(**overrides):
+    values = {
+        "_class_name": "UniPCMultistepScheduler",
+        "num_train_timesteps": 1000,
+        "flow_shift": 5.0,
+        "prediction_type": "flow_prediction",
+        "predict_x0": True,
+        "use_flow_sigmas": True,
+        "use_dynamic_shifting": False,
+        "use_beta_sigmas": False,
+        "use_exponential_sigmas": False,
+        "use_karras_sigmas": False,
+        "final_sigmas_type": "zero",
+        "timestep_spacing": "linspace",
+        "solver_order": 2,
+        "solver_type": "bh2",
+        "lower_order_final": True,
+        "disable_corrector": [],
+        "time_shift_type": "exponential",
+    }
+    values.update(overrides)
+    return values
 
 
 @dataclass
@@ -107,7 +133,7 @@ class _Cache:
 
 
 class _RecordingTransformer(nn.Module):
-    def __init__(self, *, raise_on_call: int | None = None):
+    def __init__(self, *, raise_on_call: int | None = None, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.config = SimpleNamespace(
             patch_size=(1, 2, 2),
@@ -127,11 +153,12 @@ class _RecordingTransformer(nn.Module):
         self.calls: list[dict] = []
         self.cache_allocations: list[dict] = []
         self.raise_on_call = raise_on_call
+        self._dtype = dtype
         self.loaded_weights: list[tuple[str, torch.Tensor]] = []
 
     @property
     def dtype(self) -> torch.dtype:
-        return torch.float32
+        return self._dtype
 
     def forward(self, **kwargs):
         call = {
@@ -180,6 +207,7 @@ class _StubVAE(_FakePretrained):
         )
         self.encode_inputs: list[torch.Tensor] = []
         self.decode_inputs: list[torch.Tensor] = []
+        self.on_decode = None
 
     def encode(self, video: torch.Tensor):
         self.encode_inputs.append(video.detach().clone())
@@ -198,6 +226,8 @@ class _StubVAE(_FakePretrained):
 
     def decode(self, latents: torch.Tensor, return_dict: bool = False):
         del return_dict
+        if self.on_decode is not None:
+            self.on_decode()
         self.decode_inputs.append(latents.detach().clone())
         pixel_frames = (latents.shape[2] - 1) * 4 + 1
         decoded = torch.zeros(
@@ -216,8 +246,8 @@ class _SamplingParams:
     def __init__(
         self,
         *,
-        height: int = 16,
-        width: int = 16,
+        height: int | None = 16,
+        width: int | None = 16,
         num_frames: int = 9,
         num_inference_steps: int | None = 4,
         num_outputs_per_prompt: int = 1,
@@ -226,6 +256,7 @@ class _SamplingParams:
         output_type: str | None = "latent",
         max_sequence_length: int | None = 512,
         extra_args: dict | None = None,
+        include_action: bool = True,
     ) -> None:
         self.height = height
         self.width = width
@@ -233,10 +264,16 @@ class _SamplingParams:
         self.num_inference_steps = num_inference_steps
         self.num_outputs_per_prompt = num_outputs_per_prompt
         self.seed = seed
-        self.generator = generator
+        self.generator = (
+            generator
+            if generator is not None
+            else (torch.Generator(device="cpu").manual_seed(seed) if seed is not None else None)
+        )
         self.output_type = output_type
         self.max_sequence_length = max_sequence_length
-        self.extra_args = {} if extra_args is None else extra_args
+        self.extra_args = {"action_path": "."} if include_action else {}
+        if extra_args is not None:
+            self.extra_args.update(extra_args)
         self.latents = None
 
 
@@ -321,19 +358,7 @@ def _load_pipeline_module():
     def load_json(model, filename, local_files_only):
         del model, local_files_only
         assert filename == "scheduler/scheduler_config.json"
-        return {
-            "num_train_timesteps": 1000,
-            "flow_shift": 5.0,
-            "prediction_type": "flow_prediction",
-            "solver_order": 2,
-            "predict_x0": True,
-            "solver_type": "bh2",
-            "lower_order_final": True,
-            "disable_corrector": [],
-            "use_dynamic_shifting": False,
-            "time_shift_type": "exponential",
-            "final_sigmas_type": "zero",
-        }
+        return _scheduler_config()
 
     trajectory = SimpleNamespace(
         poses=torch.eye(4).repeat(32, 1, 1),
@@ -360,6 +385,31 @@ def _load_pipeline_module():
         def __init__(self, poses, intrinsics):
             self.poses = poses
             self.intrinsics = intrinsics
+
+    @dataclass(frozen=True)
+    class TrustedActionDirectory:
+        root: Path
+        relative: Path
+        root_device: int
+        root_inode: int
+
+    def resolve_trusted_action_directory(action_path, trusted_root):
+        try:
+            root = Path(trusted_root).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise ValueError("The configured LingBot trusted action root is unavailable.") from None
+        try:
+            candidate = Path(action_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            candidate = candidate.resolve(strict=True)
+            relative = candidate.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError("action_path must be contained by the trusted action root.") from None
+        if not candidate.is_dir():
+            raise ValueError("action_path must identify a directory in the trusted action root.")
+        stat_result = root.stat()
+        return TrustedActionDirectory(root, relative, stat_result.st_dev, stat_result.st_ino)
 
     def allocate_lingbot_cache(**kwargs):
         return _Cache(
@@ -428,9 +478,11 @@ def _load_pipeline_module():
             "vllm_omni.diffusion.models.wan2_2.lingbot_world_camera": _module(
                 "vllm_omni.diffusion.models.wan2_2.lingbot_world_camera",
                 CameraTrajectory=CameraTrajectory,
+                TrustedActionDirectory=TrustedActionDirectory,
                 build_plucker_embedding=build_plucker_embedding,
                 interpolate_camera_trajectory=interpolate_camera_trajectory,
                 load_camera_trajectory=load_camera_trajectory,
+                resolve_trusted_action_directory=resolve_trusted_action_directory,
             ),
             "vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer": _module(
                 "vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer",
@@ -478,7 +530,15 @@ def _od_config(**overrides):
         "dtype": torch.float32,
         "flow_shift": None,
         "quantization_config": None,
-        "model_config": {},
+        "model_config": {"lingbot_action_root": str(_ROOT)},
+        "parallel_config": SimpleNamespace(
+            pipeline_parallel_size=1,
+            sequence_parallel_size=1,
+            cfg_parallel_size=1,
+            vae_patch_parallel_size=1,
+            use_hsdp=False,
+            enable_expert_parallel=False,
+        ),
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -507,7 +567,7 @@ def _pipeline(module, *, transformer=None, od_config=None):
 
 def _request(*, sampling=None, prompt=None, num_reqs: int = 1):
     return _RequestBatch(
-        _prompt(action_path="prompt-actions") if prompt is None else prompt,
+        _prompt() if prompt is None else prompt,
         _SamplingParams() if sampling is None else sampling,
         num_reqs=num_reqs,
     )
@@ -616,6 +676,7 @@ def _resolve_pipeline_through_real_registry(pipeline_module):
         spec.loader.exec_module(registry_module)
         resolved = registry_module.DiffusionModelRegistry._try_load_model_cls("LingBotWorldCausalDMDPipeline")
         entry = registry_module._DIFFUSION_MODELS["LingBotWorldCausalDMDPipeline"]
+        cache_acceleration_disabled = "LingBotWorldCausalDMDPipeline" in registry_module._NO_CACHE_ACCELERATION
     finally:
         sys.modules.pop(spec.name, None)
         for name, old_module in previous.items():
@@ -623,7 +684,7 @@ def _resolve_pipeline_through_real_registry(pipeline_module):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = old_module
-    return resolved, entry
+    return resolved, entry, cache_acceleration_disabled
 
 
 def test_component_discovery_uses_official_checkpoint_contract() -> None:
@@ -639,6 +700,82 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     assert pipeline.scheduler.config.shift == 5.0
     assert pipeline.scheduler.config.num_train_timesteps == 1000
     assert module._loader_state.prefetch_calls == [("checkpoint", ("tokenizer", "text_encoder", "vae"), False)]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "feature"),
+    [
+        ("pipeline_parallel_size", 2, "pipeline parallelism"),
+        ("sequence_parallel_size", 2, "sequence parallelism"),
+        ("cfg_parallel_size", 2, "CFG parallelism"),
+        ("vae_patch_parallel_size", 2, "VAE parallelism"),
+        ("use_hsdp", True, "HSDP"),
+        ("enable_expert_parallel", True, "expert parallelism"),
+    ],
+)
+def test_unsupported_parallel_modes_fail_before_component_loading(field: str, value: object, feature: str) -> None:
+    module = _load_pipeline_module()
+    parallel_config = _od_config().parallel_config
+    setattr(parallel_config, field, value)
+
+    with pytest.raises(NotImplementedError, match=feature):
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
+
+    assert module._loader_state.prefetch_calls == []
+
+
+def test_official_scheduler_config_matches_fixed_dmd_contract() -> None:
+    import json
+
+    module = _load_pipeline_module()
+    scheduler_config = json.loads(_SCHEDULER_FIXTURE.read_text())
+    module._load_json = lambda *args, **kwargs: scheduler_config.copy()
+
+    pipeline = _pipeline(module)
+
+    assert pipeline.scheduler.config.num_train_timesteps == 1000
+    assert pipeline.scheduler.config.shift == 5.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("_class_name", "FlowMatchEulerDiscreteScheduler"),
+        ("num_train_timesteps", 999),
+        ("prediction_type", "epsilon"),
+        ("predict_x0", False),
+        ("use_flow_sigmas", False),
+        ("use_dynamic_shifting", True),
+        ("final_sigmas_type", "sigma_min"),
+    ],
+)
+def test_scheduler_config_rejects_semantic_drift(field: str, value: object) -> None:
+    module = _load_pipeline_module()
+    module._load_json = lambda *args, **kwargs: _scheduler_config(**{field: value})
+
+    with pytest.raises(ValueError, match=field):
+        _pipeline(module)
+
+
+def test_official_model_index_discovers_only_declared_components() -> None:
+    import json
+
+    module = _load_pipeline_module()
+    model_index = json.loads(_MODEL_INDEX_FIXTURE.read_text())
+    resolved, entry, cache_acceleration_disabled = _resolve_pipeline_through_real_registry(module)
+
+    assert model_index["_class_name"] == "LingBotWorldCausalDMDPipeline"
+    assert resolved is module.LingBotWorldCausalDMDPipeline
+    assert entry == ("wan2_2", "pipeline_lingbot_world", "LingBotWorldCausalDMDPipeline")
+    assert cache_acceleration_disabled
+    assert model_index["tokenizer"] == ["transformers", "T5TokenizerFast"]
+    assert model_index["text_encoder"] == ["transformers", "UMT5EncoderModel"]
+    assert model_index["vae"] == ["diffusers", "AutoencoderKLWan"]
+    assert model_index["scheduler"] == ["diffusers", "UniPCMultistepScheduler"]
+    assert model_index["transformer"] == ["diffusers", "CausalLingBotWorldTransformer3DModel"]
+    assert model_index["image_encoder"] == [None, None]
+    assert model_index["image_processor"] == [None, None]
+    assert model_index["transformer_2"] == [None, None]
 
 
 def test_postprocess_reads_output_type_from_sampling_params() -> None:
@@ -668,6 +805,48 @@ def test_noise_uses_device_safe_diffusers_helper() -> None:
     assert calls == [((1, 2, 3), generator, torch.device("cpu"), torch.float32)]
 
 
+def test_request_requires_runner_provided_generator() -> None:
+    module = _load_pipeline_module()
+    sampling = _SamplingParams(seed=None, generator=None)
+
+    with pytest.raises(ValueError, match="runner-provided torch.Generator"):
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
+
+
+@pytest.mark.parametrize("unsupported", ["generator-list", "caller-latents"])
+def test_request_rejects_unsupported_sampling_state(unsupported: str) -> None:
+    module = _load_pipeline_module()
+    sampling = _SamplingParams()
+    if unsupported == "generator-list":
+        sampling.generator = [sampling.generator]
+        message = "generator list"
+    else:
+        sampling.latents = torch.zeros(1, 16, 3, 2, 2)
+        message = "caller-provided latents"
+
+    with pytest.raises(ValueError, match=message):
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
+
+
+def test_denoise_state_stays_fp32_while_transformer_inputs_use_model_dtype() -> None:
+    module = _load_pipeline_module()
+    transformer = _RecordingTransformer(dtype=torch.bfloat16)
+    pipeline = _pipeline(module, transformer=transformer)
+    requested_noise_dtypes: list[torch.dtype] = []
+
+    def randn(shape, *, generator, dtype):
+        del generator
+        requested_noise_dtypes.append(dtype)
+        return torch.zeros(shape, dtype=dtype)
+
+    pipeline._randn = randn
+    result = pipeline(_request())
+
+    assert requested_noise_dtypes == [torch.float32] * 4
+    assert result.output.dtype == torch.float32
+    assert all(call["hidden_states"].dtype == torch.bfloat16 for call in transformer.calls)
+
+
 def test_path_image_rejects_oversized_source_before_decode_or_convert(monkeypatch, tmp_path: Path) -> None:
     module = _load_pipeline_module()
     source_path = tmp_path / "oversized-compressed.png"
@@ -688,9 +867,7 @@ def test_path_image_rejects_oversized_source_before_decode_or_convert(monkeypatc
     monkeypatch.setattr(module.PIL.Image.Image, "load", forbidden_load)
 
     with pytest.raises(ValueError, match="source image.*4096.*4096"):
-        _pipeline(module)._parse_request(
-            _RequestBatch(_prompt(action_path="prompt-actions", images=str(source_path)), _SamplingParams())
-        )
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(images=str(source_path)), _SamplingParams()))
 
     assert decode_calls == []
 
@@ -700,14 +877,59 @@ def test_normal_path_image_is_decoded_after_source_size_validation(tmp_path: Pat
     source_path = tmp_path / "normal.png"
     Image.new("RGBA", (32, 24), color=(1, 2, 3, 128)).save(source_path)
 
-    parsed = _pipeline(module)._parse_request(
-        _RequestBatch(_prompt(action_path="prompt-actions", images=str(source_path)), _SamplingParams())
-    )
+    parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(images=str(source_path)), _SamplingParams()))
 
     assert module._MAX_SOURCE_IMAGE_PIXELS == 4096 * 4096
     assert isinstance(parsed.image, Image.Image)
     assert parsed.image.mode == "RGB"
     assert parsed.image.size == (32, 24)
+
+
+@pytest.mark.parametrize(
+    ("source_size", "expected_size"),
+    [
+        ((832, 480), (464, 832)),
+        ((480, 832), (832, 480)),
+        ((512, 512), (624, 624)),
+    ],
+)
+def test_default_resolution_matches_official_480p_aspect_derivation(source_size, expected_size) -> None:
+    module = _load_pipeline_module()
+    sampling = _SamplingParams(height=None, width=None)
+
+    parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(images=Image.new("RGB", source_size)), sampling))
+
+    assert (parsed.height, parsed.width) == expected_size
+    assert parsed.height % 16 == 0
+    assert parsed.width % 16 == 0
+    assert parsed.height * parsed.width <= 480 * 832
+
+
+def test_pil_and_tensor_images_share_official_bicubic_preprocess() -> None:
+    module = _load_pipeline_module()
+    height, width = 7, 11
+    source = torch.arange(3 * height * width, dtype=torch.uint8).reshape(3, height, width)
+    pil_image = Image.fromarray(source.permute(1, 2, 0).numpy(), mode="RGB")
+    sampling = _SamplingParams(height=16, width=32)
+
+    pil_pipeline = _pipeline(module)
+    tensor_pipeline = _pipeline(module)
+    pil_inputs = pil_pipeline._parse_request(_RequestBatch(_prompt(images=pil_image), sampling))
+    tensor_inputs = tensor_pipeline._parse_request(
+        _RequestBatch(_prompt(images=source.clone()), _SamplingParams(height=16, width=32))
+    )
+    pil_condition = pil_pipeline._prepare_image_tensor(pil_inputs.image, height=16, width=32)
+    tensor_condition = tensor_pipeline._prepare_image_tensor(tensor_inputs.image, height=16, width=32)
+    expected = torch.nn.functional.interpolate(
+        source.unsqueeze(0).float() / 255.0,
+        size=(16, 32),
+        mode="bicubic",
+        align_corners=False,
+    )
+    expected = expected * 2.0 - 1.0
+
+    torch.testing.assert_close(pil_condition, expected)
+    torch.testing.assert_close(tensor_condition, expected)
 
 
 def test_path_image_decode_error_is_sanitized(monkeypatch) -> None:
@@ -720,9 +942,7 @@ def test_path_image_decode_error_is_sanitized(monkeypatch) -> None:
     )
 
     with pytest.raises(ValueError, match="Unable to load multi_modal_data.image") as exc_info:
-        _pipeline(module)._parse_request(
-            _RequestBatch(_prompt(action_path="prompt-actions", images=unsafe_path), _SamplingParams())
-        )
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(images=unsafe_path), _SamplingParams()))
 
     assert unsafe_path not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
@@ -736,17 +956,13 @@ def test_supplied_pil_image_obeys_documented_source_pixel_ceiling(source_size) -
     source_image.close = lambda: close_calls.append(True)
 
     if source_size[0] * source_size[1] <= 4096 * 4096:
-        parsed = _pipeline(module)._parse_request(
-            _RequestBatch(_prompt(action_path="prompt-actions", images=source_image), _SamplingParams())
-        )
+        parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(images=source_image), _SamplingParams()))
         assert parsed.image is not source_image
         assert parsed.image.mode == "RGB"
         assert close_calls == []
     else:
         with pytest.raises(ValueError, match="source image.*4096.*4096"):
-            _pipeline(module)._parse_request(
-                _RequestBatch(_prompt(action_path="prompt-actions", images=source_image), _SamplingParams())
-            )
+            _pipeline(module)._parse_request(_RequestBatch(_prompt(images=source_image), _SamplingParams()))
         assert close_calls == []
 
 
@@ -759,52 +975,49 @@ def test_supplied_pil_decode_error_is_sanitized_without_closing_caller(monkeypat
     monkeypatch.setattr(source_image, "close", lambda: close_calls.append(True))
 
     with pytest.raises(ValueError, match="Unable to load multi_modal_data.image") as exc_info:
-        _pipeline(module)._parse_request(
-            _RequestBatch(_prompt(action_path="prompt-actions", images=source_image), _SamplingParams())
-        )
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(images=source_image), _SamplingParams()))
 
     assert unsafe_detail not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
     assert close_calls == []
 
 
-@pytest.mark.parametrize("source", ["extra", "prompt"])
-def test_action_path_resolves_from_exactly_one_supported_source(source: str, tmp_path: Path) -> None:
+def test_action_path_resolves_from_sampling_extra_args(tmp_path: Path) -> None:
     module = _load_pipeline_module()
     action_root = tmp_path / "trusted-actions"
     contained_action = action_root / "actions"
     contained_action.mkdir(parents=True)
     pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": str(action_root)}))
-    sampling = _SamplingParams(extra_args={"action_path": "actions"} if source == "extra" else {})
-    prompt = _prompt(action_path="prompt-actions" if source == "prompt" else None)
+    sampling = _SamplingParams(extra_args={"action_path": "actions"})
+    prompt = _prompt()
     original_extra = dict(sampling.extra_args)
     original_prompt = prompt.copy()
 
     parsed = pipeline._parse_request(_RequestBatch(prompt, sampling))
 
-    assert parsed.action_path == (str(contained_action.resolve()) if source == "extra" else "prompt-actions")
+    assert parsed.action_path.root == action_root.resolve()
+    assert parsed.action_path.relative == Path("actions")
     assert sampling.extra_args == original_extra
     assert prompt == original_prompt
 
 
-@pytest.mark.parametrize(
-    ("extra_action", "prompt_action", "message"),
-    [(None, None, "action_path"), ("actions", "prompt-actions", "ambiguous.*action_path")],
-)
-def test_action_path_rejects_missing_or_ambiguous_sources(extra_action, prompt_action, message) -> None:
+@pytest.mark.parametrize("with_extra", [False, True], ids=["additional-only", "extra-and-additional"])
+def test_additional_information_action_path_is_not_an_input_source(with_extra: bool) -> None:
     module = _load_pipeline_module()
-    sampling = _SamplingParams(extra_args={} if extra_action is None else {"action_path": extra_action})
+    sampling = _SamplingParams(
+        extra_args={"action_path": "."} if with_extra else None,
+        include_action=with_extra,
+    )
 
-    with pytest.raises(ValueError, match=message):
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path=prompt_action), sampling))
+    with pytest.raises(ValueError, match="additional_information.*action_path.*not supported"):
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="legacy-actions"), sampling))
 
 
-def test_online_action_path_requires_a_trusted_root() -> None:
+def test_action_path_is_required_in_sampling_extra_args() -> None:
     module = _load_pipeline_module()
-    sampling = _SamplingParams(extra_args={"action_path": "actions"})
 
-    with pytest.raises(ValueError, match="lingbot_action_root|VLLM_OMNI_LINGBOT_ACTION_ROOT"):
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
+    with pytest.raises(ValueError, match="sampling_params.extra_args.action_path"):
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(), _SamplingParams(include_action=False)))
 
 
 @pytest.mark.parametrize("escape_kind", ["traversal", "absolute", "symlink"])
@@ -833,11 +1046,12 @@ def test_online_action_path_uses_environment_root_fallback(monkeypatch, tmp_path
     action_dir = root / "forward"
     action_dir.mkdir(parents=True)
     monkeypatch.setenv("VLLM_OMNI_LINGBOT_ACTION_ROOT", str(root))
-    pipeline = _pipeline(module)
+    pipeline = _pipeline(module, od_config=_od_config(model_config={}))
 
     parsed = pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": "forward"})))
 
-    assert parsed.action_path == str(action_dir.resolve())
+    assert parsed.action_path.root == root.resolve()
+    assert parsed.action_path.relative == Path("forward")
 
 
 def test_online_action_path_error_suppresses_path_bearing_filesystem_cause(tmp_path: Path) -> None:
@@ -870,27 +1084,29 @@ def test_online_action_path_unknown_user_is_sanitized(source: str, tmp_path: Pat
     assert exc_info.value.__cause__ is None
 
 
-def test_offline_prompt_action_path_remains_a_local_path_without_trusted_root() -> None:
+def test_action_path_requires_a_trusted_root_for_every_request() -> None:
     module = _load_pipeline_module()
+    pipeline = _pipeline(module, od_config=_od_config(model_config={}))
 
-    parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="offline/actions"), _SamplingParams()))
-
-    assert parsed.action_path == "offline/actions"
+    with pytest.raises(ValueError, match="lingbot_action_root|VLLM_OMNI_LINGBOT_ACTION_ROOT"):
+        pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams()))
 
 
 @pytest.mark.parametrize(
     ("request_batch", "message"),
     [
         (_request(num_reqs=2), "single prompt"),
-        (_request(prompt=_prompt(images=[])), "exactly one image"),
+        (_request(prompt=_prompt(images=[Image.new("RGB", (16, 16))])), "image.*list"),
+        (_request(prompt=_prompt(images=[])), "image.*list"),
         (
             _request(prompt=_prompt(images=[Image.new("RGB", (16, 16)), Image.new("RGB", (16, 16))])),
-            "exactly one image",
+            "image.*list",
         ),
         (_request(sampling=_SamplingParams(num_outputs_per_prompt=2)), "num_outputs_per_prompt"),
         (_request(sampling=_SamplingParams(num_inference_steps=5)), "num_inference_steps"),
         (_request(sampling=_SamplingParams(height=15)), "height.*divisible"),
         (_request(sampling=_SamplingParams(width=15)), "width.*divisible"),
+        (_request(sampling=_SamplingParams(height=None, width=16)), "height and width.*both"),
         (_request(sampling=_SamplingParams(num_frames=13)), "num_frames.*three-frame"),
     ],
 )
@@ -905,7 +1121,7 @@ def test_resource_limits_accept_exact_documented_boundaries() -> None:
     module = _load_pipeline_module()
     sampling = _SamplingParams(height=480, width=832, num_frames=117, max_sequence_length=512)
 
-    parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="offline-actions"), sampling))
+    parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
 
     assert (parsed.height, parsed.width, parsed.num_frames, parsed.max_sequence_length) == (480, 832, 117, 512)
 
@@ -930,7 +1146,7 @@ def test_resource_limits_reject_oversize_before_any_component_call(sampling, mes
     pipeline._allocate_request_cache = lambda *args, **kwargs: calls.append("cache")
 
     with pytest.raises(ValueError, match=message):
-        pipeline(_RequestBatch(_prompt(action_path="offline-actions"), sampling))
+        pipeline(_RequestBatch(_prompt(), sampling))
 
     assert calls == []
 
@@ -954,7 +1170,7 @@ def test_camera_load_error_is_actionable_without_echoing_path_contents() -> None
     with pytest.raises(ValueError, match="camera trajectory.*action_path") as exc_info:
         _pipeline(module)(_request())
 
-    assert "prompt-actions" not in str(exc_info.value)
+    assert str(_ROOT) not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
 
 
@@ -1102,28 +1318,24 @@ def test_request_flow_shift_override_has_precedence_without_mutating_scheduler()
 
     default_inputs = pipeline._parse_request(_request())
     sampling = _SamplingParams(extra_args={"flow_shift": 2.0})
-    override_inputs = pipeline._parse_request(_RequestBatch(_prompt(action_path="prompt-actions"), sampling))
+    override_inputs = pipeline._parse_request(_RequestBatch(_prompt(), sampling))
 
     assert default_inputs.flow_shift == 3.0
     assert override_inputs.flow_shift == 2.0
-    assert sampling.extra_args == {"flow_shift": 2.0}
+    assert sampling.extra_args == {"action_path": ".", "flow_shift": 2.0}
     assert pipeline.scheduler.config.shift == 3.0
 
 
 def test_checkpoint_flow_shift_default_and_engine_request_override_precedence() -> None:
     module = _load_pipeline_module()
-    checkpoint_scheduler_config = {
-        "num_train_timesteps": 1000,
-        "flow_shift": 6.25,
-        "shift": 7.5,
-    }
+    checkpoint_scheduler_config = _scheduler_config(flow_shift=6.25, shift=7.5)
     module._load_json = lambda *args, **kwargs: checkpoint_scheduler_config.copy()
 
     checkpoint_default = _pipeline(module)
     engine_override = _pipeline(module, od_config=_od_config(flow_shift=3.5))
     request_override = checkpoint_default._parse_request(
         _RequestBatch(
-            _prompt(action_path="prompt-actions"),
+            _prompt(),
             _SamplingParams(extra_args={"flow_shift": 2.25}),
         )
     )
@@ -1145,10 +1357,10 @@ def test_checkpoint_flow_shift_default_and_engine_request_override_precedence() 
 )
 def test_checkpoint_scheduler_shift_fallback_order(scheduler_config, expected: float) -> None:
     module = _load_pipeline_module()
-    module._load_json = lambda *args, **kwargs: {
-        "num_train_timesteps": 1000,
-        **scheduler_config,
-    }
+    checkpoint_config = _scheduler_config()
+    checkpoint_config.pop("flow_shift")
+    checkpoint_config.update(scheduler_config)
+    module._load_json = lambda *args, **kwargs: checkpoint_config.copy()
 
     pipeline = _pipeline(module)
 
@@ -1161,7 +1373,7 @@ def test_request_flow_shift_must_be_positive_and_finite(flow_shift) -> None:
     sampling = _SamplingParams(extra_args={"flow_shift": flow_shift})
 
     with pytest.raises(ValueError, match="flow_shift.*positive.*finite"):
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="prompt-actions"), sampling))
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
 
 
 @pytest.mark.parametrize(
@@ -1174,7 +1386,7 @@ def test_request_flow_shift_rejects_booleans_and_normalizes_integer_overflow(flo
     sampling = _SamplingParams(extra_args={"flow_shift": flow_shift})
 
     with pytest.raises(ValueError, match="flow_shift.*positive.*finite"):
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="prompt-actions"), sampling))
+        _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
 
 
 def test_flow_shift_is_request_local_and_sigma_lookup_is_built_once_per_request() -> None:
@@ -1197,7 +1409,7 @@ def test_flow_shift_is_request_local_and_sigma_lookup_is_built_once_per_request(
         extra_args = {} if flow_shift is None else {"flow_shift": flow_shift}
         return pipeline(
             _RequestBatch(
-                _prompt(action_path="prompt-actions"),
+                _prompt(),
                 _SamplingParams(num_frames=21, extra_args=extra_args),
             )
         ).output
@@ -1283,6 +1495,48 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     assert cache_ref() is None
 
 
+def test_request_cache_is_released_before_vae_decode() -> None:
+    module = _load_pipeline_module()
+    transformer = _RecordingTransformer()
+    pipeline = _pipeline(module, transformer=transformer)
+    cache_refs: list[weakref.ReferenceType] = []
+    original_allocate = transformer.allocate_cache
+
+    def allocate(**kwargs):
+        cache = original_allocate(**kwargs)
+        cache_refs.append(weakref.ref(cache))
+        return cache
+
+    transformer.allocate_cache = allocate
+
+    def assert_cache_released() -> None:
+        gc.collect()
+        assert len(cache_refs) == 1
+        assert cache_refs[0]() is None
+
+    pipeline.vae.on_decode = assert_cache_released
+
+    result = pipeline(_request(sampling=_SamplingParams(num_frames=21, output_type="np")))
+
+    assert result.output.shape[2] == 21
+
+
+def test_117_frame_request_generates_ten_complete_latent_blocks() -> None:
+    module = _load_pipeline_module()
+    transformer = _RecordingTransformer()
+    pipeline = _pipeline(module, transformer=transformer)
+    module.load_camera_trajectory = lambda path: SimpleNamespace(
+        poses=torch.eye(4).repeat(117, 1, 1),
+        intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(117, 1),
+    )
+
+    result = pipeline(_request(sampling=_SamplingParams(num_frames=117, output_type="latent")))
+
+    assert result.output.shape == (1, 16, 30, 2, 2)
+    assert len(transformer.calls) == 50
+    assert [call["start_frame"] for call in transformer.calls[::5]] == list(range(0, 30, 3))
+
+
 def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer(raise_on_call=2)
@@ -1312,10 +1566,11 @@ def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
 
 def test_registry_and_wan_exports_resolve_official_pipeline_class_name() -> None:
     module = _load_pipeline_module()
-    resolved, entry = _resolve_pipeline_through_real_registry(module)
+    resolved, entry, cache_acceleration_disabled = _resolve_pipeline_through_real_registry(module)
 
     assert entry == ("wan2_2", "pipeline_lingbot_world", "LingBotWorldCausalDMDPipeline")
     assert resolved is module.LingBotWorldCausalDMDPipeline
+    assert cache_acceleration_disabled
     assert module.LingBotWorldCausalDMDPipeline.__name__ == "LingBotWorldCausalDMDPipeline"
     wan_init = _WAN_INIT_PATH.read_text()
     assert "from .pipeline_lingbot_world import" in wan_init

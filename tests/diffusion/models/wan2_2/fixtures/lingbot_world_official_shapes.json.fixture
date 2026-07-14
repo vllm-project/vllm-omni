@@ -5,7 +5,25 @@
     "shard_8_header": "https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers/resolve/main/transformer/diffusion_pytorch_model-00008-of-00008.safetensors"
   },
   "dtype": "F32",
+  "shard_representatives": {
+    "diffusion_pytorch_model-00001-of-00008.safetensors": "blocks.0.cam_injector_layer1.bias",
+    "diffusion_pytorch_model-00002-of-00008.safetensors": "blocks.4.cam_injector_layer1.bias",
+    "diffusion_pytorch_model-00003-of-00008.safetensors": "blocks.10.cam_injector_layer1.bias",
+    "diffusion_pytorch_model-00004-of-00008.safetensors": "blocks.14.cam_scale_layer.bias",
+    "diffusion_pytorch_model-00005-of-00008.safetensors": "blocks.20.cam_injector_layer1.bias",
+    "diffusion_pytorch_model-00006-of-00008.safetensors": "blocks.25.cam_injector_layer1.bias",
+    "diffusion_pytorch_model-00007-of-00008.safetensors": "blocks.30.cam_injector_layer1.bias",
+    "diffusion_pytorch_model-00008-of-00008.safetensors": "blocks.35.cam_injector_layer1.bias"
+  },
   "parameter_shapes": {
+    "blocks.0.cam_injector_layer1.bias": [5120],
+    "blocks.4.cam_injector_layer1.bias": [5120],
+    "blocks.10.cam_injector_layer1.bias": [5120],
+    "blocks.14.cam_scale_layer.bias": [5120],
+    "blocks.20.cam_injector_layer1.bias": [5120],
+    "blocks.25.cam_injector_layer1.bias": [5120],
+    "blocks.30.cam_injector_layer1.bias": [5120],
+    "blocks.35.cam_injector_layer1.bias": [5120],
     "patch_embedding.weight": [5120, 36, 1, 2, 2],
     "patch_embedding_wancamctrl.weight": [5120, 1536],
     "c2ws_hidden_states_layer1.weight": [5120, 5120],

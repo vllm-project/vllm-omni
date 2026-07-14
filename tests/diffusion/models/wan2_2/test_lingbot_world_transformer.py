@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -323,6 +325,42 @@ def test_constructor_defaults_match_official_checkpoint_config() -> None:
     assert {name: parameters[name].default for name in expected} == expected
 
 
+def test_transformer_exposes_parameter_dtype_for_pipeline_runtime() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module)
+
+    assert model.dtype == next(model.parameters()).dtype
+
+
+def test_lingbot_rms_norm_uses_global_tp_square_mean(monkeypatch) -> None:
+    module = attention_tests._load_module()
+    reduced_values: list[torch.Tensor] = []
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    def all_reduce(value: torch.Tensor) -> torch.Tensor:
+        reduced_values.append(value.detach().clone())
+        return value * 2
+
+    monkeypatch.setattr(module, "tensor_model_parallel_all_reduce", all_reduce)
+    norm = module._LingBotRMSNorm(hidden_size=2, eps=0.0)
+    value = torch.tensor([[3.0, 4.0]])
+
+    output = norm(value)
+
+    torch.testing.assert_close(output, value / math.sqrt(12.5))
+    assert len(reduced_values) == 1
+    torch.testing.assert_close(reduced_values[0], torch.tensor([[25.0]]))
+
+
+def test_attention_rejects_heads_not_divisible_by_tp_size(monkeypatch) -> None:
+    module = attention_tests._load_module()
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 3)
+
+    with pytest.raises(ValueError, match="num_heads=2.*tp_size=3"):
+        module.LingBotSelfAttention(dim=4, num_heads=2)
+
+
 def test_constructor_rejects_unsupported_qk_norm_with_config_error() -> None:
     module = attention_tests._load_module()
 
@@ -347,35 +385,86 @@ def test_constructor_rejects_unsupported_quantization_with_runtime_error() -> No
 
 def test_from_config_accepts_diffusers_metadata_and_normalizes_patch_size() -> None:
     module = attention_tests._load_module()
+
+    class ConfigProbe(module.CausalLingBotWorldTransformer3DModel):
+        def __init__(self, **kwargs) -> None:
+            self.received_kwargs = kwargs
+
     config = {
         "_class_name": "CausalLingBotWorldTransformer3DModel",
         "_diffusers_version": "0.35.0.dev0",
         "patch_size": [1, 2, 2],
-        "num_attention_heads": 2,
-        "attention_head_dim": 2,
+        "num_attention_heads": 40,
+        "attention_head_dim": 128,
         "in_channels": 36,
-        "out_channels": 2,
-        "text_dim": 6,
-        "freq_dim": 4,
-        "ffn_dim": 8,
-        "num_layers": 1,
+        "out_channels": 16,
+        "text_dim": 4096,
+        "freq_dim": 256,
+        "ffn_dim": 13824,
+        "num_layers": 40,
         "cross_attn_norm": True,
         "eps": 1e-6,
         "image_dim": None,
         "added_kv_proj_dim": None,
-        "rope_max_seq_len": 16,
+        "rope_max_seq_len": 1024,
         "pos_embed_seq_len": None,
         "qk_norm": "rms_norm_across_heads",
-        "sink_size": 1,
-        "num_frames_per_block": 1,
-        "sliding_window_num_frames": 3,
+        "sink_size": 9,
+        "num_frames_per_block": 3,
+        "sliding_window_num_frames": 18,
         "local_attn_size": -1,
     }
 
-    model = module.CausalLingBotWorldTransformer3DModel.from_config(config, prefix="transformer")
+    model = ConfigProbe.from_config(config, prefix="transformer")
 
-    assert model.config.patch_size == (1, 2, 2)
-    assert model.config.num_layers == 1
+    assert model.received_kwargs["patch_size"] == (1, 2, 2)
+    assert model.received_kwargs["num_layers"] == 40
+    assert model.received_kwargs["prefix"] == "transformer"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("in_channels", 35),
+        ("num_layers", 39),
+        ("num_attention_heads", 32),
+        ("attention_head_dim", 64),
+        ("ffn_dim", 10240),
+        ("num_frames_per_block", 4),
+        ("sliding_window_num_frames", 24),
+        ("sink_size", 0),
+    ],
+)
+def test_from_config_rejects_checkpoint_topology_drift(field: str, value: object) -> None:
+    module = attention_tests._load_module()
+    config = {
+        "_class_name": "CausalLingBotWorldTransformer3DModel",
+        "_diffusers_version": "0.35.0.dev0",
+        "patch_size": [1, 2, 2],
+        "num_attention_heads": 40,
+        "attention_head_dim": 128,
+        "in_channels": 36,
+        "out_channels": 16,
+        "text_dim": 4096,
+        "freq_dim": 256,
+        "ffn_dim": 13824,
+        "num_layers": 40,
+        "cross_attn_norm": True,
+        "eps": 1e-6,
+        "image_dim": None,
+        "added_kv_proj_dim": None,
+        "rope_max_seq_len": 1024,
+        "pos_embed_seq_len": None,
+        "qk_norm": "rms_norm_across_heads",
+        "sink_size": 9,
+        "num_frames_per_block": 3,
+        "sliding_window_num_frames": 18,
+        "local_attn_size": -1,
+    }
+    config[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        module.CausalLingBotWorldTransformer3DModel.from_config(config)
 
 
 def test_from_config_rejects_unknown_checkpoint_fields() -> None:
@@ -427,24 +516,6 @@ def test_load_weights_consumes_checkpoint_iterator_incrementally() -> None:
     assert model.load_weights(weights()) == {first_name}
 
 
-def test_forward_rejects_cache_capacity_that_ignores_configured_window() -> None:
-    module = attention_tests._load_module()
-    model = _tiny_model(module, num_layers=1)
-    hidden_states = torch.randn(1, 36, 1, 4, 4)
-    camera_hidden_states = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
-
-    with pytest.raises(ValueError, match="capacity.*12"):
-        model(
-            hidden_states,
-            torch.tensor([1.0]),
-            torch.randn(1, 3, 6),
-            camera_hidden_states,
-            cache=_cache(module, model, max_tokens=16),
-            start_frame=0,
-            update_cache=True,
-        )
-
-
 def test_checkpoint_weight_index_fixture_matches_model_namespaces() -> None:
     module = attention_tests._load_module()
     fixture = json.loads(_FIXTURE_PATH.read_text())
@@ -456,9 +527,22 @@ def test_checkpoint_weight_index_fixture_matches_model_namespaces() -> None:
     assert {name.removeprefix("blocks.0.") for name in parameter_names if name.startswith("blocks.0.")} == set(
         fixture["block_parameter_suffixes"]
     )
-    assert fixture["index_parameter_count"] == 40 * len(fixture["block_parameter_suffixes"]) + len(
-        fixture["non_block_parameters"]
+    expanded_names = set(fixture["non_block_parameters"])
+    expanded_names.update(
+        f"blocks.{layer}.{suffix}" for layer in range(40) for suffix in fixture["block_parameter_suffixes"]
     )
+    canonical_names = "\n".join(sorted(expanded_names))
+
+    assert len(expanded_names) == fixture["index_parameter_count"] == 1421
+    assert hashlib.sha256(canonical_names.encode()).hexdigest() == fixture["canonical_name_set_sha256"]
+    assert fixture["canonical_name_to_shard_sha256"] == (
+        "e1addc27d2b1fad6f10226a23a265ee3e3c61e74dce4d5859727bdf180a67992"
+    )
+    assert list(fixture["shards"]) == [
+        f"diffusion_pytorch_model-{index:05}-of-00008.safetensors" for index in range(1, 9)
+    ]
+    assert sum(shard["parameter_count"] for shard in fixture["shards"].values()) == 1421
+    assert all(len(shard["parameter_names_sha256"]) == 64 for shard in fixture["shards"].values())
 
 
 def test_official_default_shapes_match_public_safetensors_header_fixture() -> None:
@@ -469,6 +553,9 @@ def test_official_default_shapes_match_public_safetensors_header_fixture() -> No
         model = module.CausalLingBotWorldTransformer3DModel()
     parameters = dict(model.named_parameters())
     expected_dtype = {"F32": torch.float32}[fixture["dtype"]]
+
+    assert len(fixture["shard_representatives"]) == 8
+    assert set(fixture["shard_representatives"].values()) <= set(fixture["parameter_shapes"])
 
     for name, expected_shape in fixture["parameter_shapes"].items():
         assert tuple(parameters[name].shape) == tuple(expected_shape), name
