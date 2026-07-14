@@ -80,4 +80,5 @@ from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_
 from vllm_omni.transformers_utils.configs import miso_tts as _miso_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import miso_tts as _miso_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402

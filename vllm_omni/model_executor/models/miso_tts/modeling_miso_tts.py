@@ -19,9 +19,11 @@ import io
 import os
 import re
 from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from vllm.logger import init_logger
 
@@ -198,6 +200,8 @@ def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
     return r
 
 
+
+
 # ---------------------------------------------------------------------------
 # Miso ``Model`` (upstream)
 # ---------------------------------------------------------------------------
@@ -234,9 +238,7 @@ class MisoTTSModel(nn.Module):
 
         self.projection = nn.Linear(backbone_dim, decoder_dim, bias=False)
         self.codebook0_head = nn.Linear(backbone_dim, config.audio_vocab_size, bias=False)
-        self.audio_head = nn.Parameter(
-            torch.empty(config.audio_num_codebooks - 1, decoder_dim, config.audio_vocab_size)
-        )
+        self.audio_head = nn.Parameter(torch.empty(config.audio_num_codebooks - 1, decoder_dim, config.audio_vocab_size))
 
     def setup_caches(self, max_batch_size: int, dtype: torch.dtype | None = None) -> None:
         """Setup KV caches and return a causal mask."""
@@ -367,35 +369,37 @@ def load_miso_model_weights(path_or_repo: str, device: torch.device, dtype: torc
     else:
         checkpoint = torch.load(model_file, map_location="cpu")
         state_dict = _state_dict_from_checkpoint(checkpoint)
-
+    
     # The checkpoint uses mlp_norm.scale but torchtune expects sa_norm.scale
     # Copy mlp_norm.scale to sa_norm.scale for compatibility
     for key in list(state_dict.keys()):
         if key.endswith(".mlp_norm.scale"):
             sa_key = key.replace(".mlp_norm.scale", ".sa_norm.scale")
             state_dict[sa_key] = state_dict[key]
-
+    
     model.load_state_dict(state_dict)
-
+    
     # Move to device and cast to target dtype (official approach: load first, then convert)
     model.to(device=device, dtype=dtype)
     model.eval()
-
+    
     return model
 
 
 def load_mimi_codec(device: torch.device, num_codebooks: int):
+    import os
+    import sys
+    
     patch_bitsandbytes_import_for_unquantized_layers()
-
+    
     # Disable torch._dynamo globally to prevent any compilation
     import torch._dynamo
-
     torch._dynamo.disable()
-
+    
     from moshi.models import loaders
 
     w = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
     mimi = loaders.get_mimi(w, device=device)
     mimi.set_num_codebooks(num_codebooks)
-
+    
     return mimi

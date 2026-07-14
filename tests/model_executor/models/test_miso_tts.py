@@ -159,6 +159,8 @@ def test_build_prompt_text_segment_uses_speaker_prefix_and_text_column() -> None
 
 
 def test_build_prompt_audio_segment_fills_codebook_columns() -> None:
+    fs = _Q + 1
+
     class _Tok:
         def encode(self, _text: str) -> list[int]:
             return [1]

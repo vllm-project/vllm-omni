@@ -51,19 +51,19 @@ def talker_preprocess_input(
     """Extract additional_information (text, speaker) into runtime info for talker."""
     if model_intermediate_buffer is None:
         return {}
-
+    
     # Try different possible req_id attribute names
     req_id = getattr(request, "req_id", None)
     if req_id is None:
         req_id = getattr(request, "request_id", None)
     if req_id is None:
         req_id = getattr(request, "external_req_id", None)
-
+    
     if req_id is None:
         return {}
-
+    
     info = model_intermediate_buffer.get(req_id, {})
-
+    
     # Return the info dict which will be merged into runtime_additional_information
     return info
 
@@ -143,7 +143,7 @@ def talker2mimi_async_chunk(
         done_flags = multimodal_output.get("done")
         if isinstance(done_flags, (list, tuple)) and len(done_flags) > 0:
             finished = finished or bool(done_flags[0])
-        elif hasattr(done_flags, "item"):  # torch.Tensor
+        elif hasattr(done_flags, 'item'):  # torch.Tensor
             finished = finished or bool(done_flags.item())
 
     connector = getattr(transfer_manager, "connector", None)
@@ -176,6 +176,8 @@ def talker2mimi_async_chunk(
     if not window:
         return None
 
+    num_frames = len(window)
+    
     # Fix: Use frame-major order [T*Q] instead of codebook-major [Q*T]
     # This matches what the decoder expects in _frames_from_runtime_info
     # Optimized: use torch operations instead of list comprehension

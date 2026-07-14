@@ -118,6 +118,7 @@ class MisoTTSMimiDecoder(nn.Module):
                 outputs.append(torch.zeros(0, dtype=torch.float32))
                 continue
 
+            req_id = str(info.get("global_request_id") or info.get("_omni_req_id") or idx)
             frames = _frames_from_runtime_info(info, input_ids)
             if frames.numel() == 0:
                 outputs.append(torch.zeros(0, dtype=torch.float32))
@@ -131,12 +132,8 @@ class MisoTTSMimiDecoder(nn.Module):
 
             # In async_chunk mode, the connector sends cumulative frames (100, 101, 102... 150)
             # Just use the frames directly - they're already the full sequence up to this point
-            finished = (
-                bool(info.get("meta", {}).get("finished", info.get("meta", {}).get("is_segment_finished", False)))
-                if isinstance(info.get("meta"), dict)
-                else False
-            )
-
+            finished = bool(info.get("meta", {}).get("finished", info.get("meta", {}).get("is_segment_finished", False))) if isinstance(info.get("meta"), dict) else False
+            
             # Only decode when finished (like official implementation)
             if finished:
                 # [1, Q, T]
