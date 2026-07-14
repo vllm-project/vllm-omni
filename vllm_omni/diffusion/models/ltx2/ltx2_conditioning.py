@@ -8,9 +8,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import PIL.Image
 import torch
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.utils.torch_utils import randn_tensor
+from diffusers.video_processor import VideoProcessor
 
 from .ltx2_denoise import I2VVideoAudioScheduler
 
@@ -241,6 +243,72 @@ class LTXTextConditioningMixin:
 
 class LTXI2VConditioningMixin:
     """First-frame conditioning behavior common to LTX2 and LTX2.3."""
+
+    support_image_input = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.video_processor = VideoProcessor(
+            vae_scale_factor=self.vae_spatial_compression_ratio,
+            resample="bilinear",
+        )
+
+    @staticmethod
+    def _resolve_single_prompt_image(raw_image: Any) -> Any:
+        if isinstance(raw_image, list):
+            if len(raw_image) != 1:
+                raise ValueError(
+                    "LTX I2V prompt dictionaries support exactly one image per prompt. "
+                    "Pass one image per prompt for batched I2V requests."
+                )
+            return raw_image[0]
+        return raw_image
+
+    @staticmethod
+    def _resolve_additional_image(additional: dict[str, Any]) -> Any:
+        for field_name in ("preprocessed_image", "pixel_values", "image"):
+            raw_image = additional.get(field_name)
+            if raw_image is not None:
+                return raw_image
+        return None
+
+    def _resolve_request_image(
+        self,
+        req: Any,
+        image: Any | None,
+        request_inputs: LTXRequestInputs,
+    ) -> Any | None:
+        if image is not None or not req.prompts:
+            return image
+
+        raw_images = []
+        for prompt_item in req.prompts:
+            if isinstance(prompt_item, str):
+                raw_image = None
+            else:
+                multi_modal_data = prompt_item.get("multi_modal_data") or {}
+                raw_image = multi_modal_data.get("image")
+                if raw_image is None:
+                    raw_image = self._resolve_additional_image(prompt_item.get("additional_information") or {})
+            raw_image = self._resolve_single_prompt_image(raw_image)
+            if isinstance(raw_image, str):
+                raw_image = PIL.Image.open(raw_image).convert("RGB")
+            raw_images.append(raw_image)
+
+        if any(raw_image is None for raw_image in raw_images) and request_inputs.latents is None:
+            raise ValueError("Image is required for LTX I2V generation.")
+        if len(raw_images) == 1:
+            return raw_images[0]
+        return raw_images or image
+
+    def _check_forward_inputs(
+        self,
+        request_inputs: LTXRequestInputs,
+        image: Any | None = None,
+    ) -> None:
+        if image is None and request_inputs.latents is None:
+            raise ValueError("Provide either `image` or `latents`. Cannot leave both undefined.")
+        super()._check_forward_inputs(request_inputs, image=image)
 
     def prepare_latents(
         self,

@@ -15,7 +15,7 @@ class TestCFGParallelIntegration:
     def test_ltx23_pipeline_has_cfg_parallel_mixin(self):
         """LTX23Pipeline must use the shared CFG parallel implementation."""
         from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
 
         assert issubclass(LTX23Pipeline, CFGParallelMixin)
 
@@ -33,7 +33,7 @@ class TestCFGParallelHelpers:
     """Test LTX-2.3 CFG helper math without loading model weights."""
 
     def test_combine_cfg_noise_matches_x0_space_formula(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
 
         pipe = object.__new__(LTX23Pipeline)
         video_sample = torch.tensor([[[1.0, -2.0]]])
@@ -70,7 +70,7 @@ class TestCFGParallelHelpers:
 
     def test_two_rank_cfg_parallel_smoke_uses_rank_local_branch_and_x0_formula(self, monkeypatch):
         from vllm_omni.diffusion.models.ltx2 import ltx2_guidance
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx23
 
         pipe = object.__new__(ltx23.LTX23Pipeline)
         video_sample = torch.tensor([[[1.0, -2.0]]])
@@ -143,7 +143,7 @@ class TestCFGParallelForwardPath:
 
     def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch):
         from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_base
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -250,7 +250,7 @@ class TestCFGParallelForwardPath:
         expected_frame_rate,
     ):
         from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_guidance, ltx2_pipeline_base
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams

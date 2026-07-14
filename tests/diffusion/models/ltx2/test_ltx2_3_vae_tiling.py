@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class TestLTX23OutputRank:
     def test_single_process_rank_is_output_rank(self, monkeypatch):
-        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23
+        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2 as ltx23
 
         monkeypatch.setattr(ltx23.torch.distributed, "is_initialized", lambda: False)
 
@@ -21,7 +21,7 @@ class TestLTX23OutputRank:
         assert ltx23._should_decode_video_on_rank(SimpleNamespace(is_distributed_enabled=lambda: False)) is True
 
     def test_non_output_rank_skips_decode_unless_vae_decode_is_distributed(self, monkeypatch):
-        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23
+        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2 as ltx23
 
         monkeypatch.setattr(ltx23.torch.distributed, "is_initialized", lambda: True)
         monkeypatch.setattr(ltx23.torch.distributed, "get_rank", lambda: 1)

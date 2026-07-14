@@ -20,12 +20,15 @@ from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
 from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_base import LTXPipelineBase
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX2_ONE_STAGE_RECIPE, LTX23_ONE_STAGE_RECIPE
 from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs
-from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline, LTX2TwoStagesPipeline
-from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
-from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
-from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import (
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2ImageToVideoPipeline,
+    LTX2Pipeline,
+    LTX23ImageToVideoPipeline,
+    LTX23Pipeline,
+)
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
     LTX2ImageToVideoTwoStagesPipeline,
+    LTX2TwoStagesPipeline,
 )
 
 
@@ -45,6 +48,8 @@ def test_ltx_one_stage_variants_share_forward_template():
     assert LTX2ImageToVideoPipeline._forward_impl is LTXPipelineBase._forward_impl
     assert LTX23Pipeline._forward_impl is LTXPipelineBase._forward_impl
     assert LTX23ImageToVideoPipeline._forward_impl is LTXPipelineBase._forward_impl
+    assert LTX2Pipeline.forward is LTX23Pipeline.forward
+    assert LTX2ImageToVideoPipeline.forward is LTX23ImageToVideoPipeline.forward
 
 
 def test_ltx_versions_share_request_prompt_and_step_templates():
