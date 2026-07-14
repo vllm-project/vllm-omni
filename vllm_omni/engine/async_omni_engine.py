@@ -130,8 +130,9 @@ def _upgrade_to_omni_request(
             raw_prompt_embeds = raw_prompt.get("prompt_embeds")
             if isinstance(raw_prompt_embeds, torch.Tensor):
                 prompt_embeds = raw_prompt_embeds
+        raw_ai = raw_prompt.get("additional_information")
         additional_information = serialize_additional_information(
-            raw_prompt.get("additional_information"),
+            raw_ai,
             log_prefix="AsyncOmniEngine",
         )
 
@@ -745,6 +746,7 @@ class AsyncOmniEngine:
                     self.stage_pools[0].release_binding(request_id)
                 raise
             _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
+
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = _upgrade_to_omni_request(request, prompt)

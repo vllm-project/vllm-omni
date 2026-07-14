@@ -365,6 +365,27 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    # Kimi Audio models
+    "MoonshotKimiaForCausalLM": (
+        "kimi_audio",
+        "kimi_audio",
+        "KimiAudioForConditionalGeneration",
+    ),
+    "KimiAudioForConditionalGeneration": (
+        "kimi_audio",
+        "kimi_audio",
+        "KimiAudioForConditionalGeneration",
+    ),
+    "KimiAudioLLMForConditionalGeneration": (
+        "kimi_audio",
+        "kimi_audio_llm",
+        "KimiAudioLLMForConditionalGeneration",
+    ),
+    "KimiAudioDetokenizerForConditionalGeneration": (
+        "kimi_audio",
+        "kimi_audio_detokenizer",
+        "KimiAudioDetokenizerForConditionalGeneration",
+    ),
 }
 
 

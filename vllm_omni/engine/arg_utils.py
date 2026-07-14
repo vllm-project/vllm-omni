@@ -100,6 +100,14 @@ def register_omni_models_to_vllm():
         if arch not in supported_archs:
             ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
+    # Override upstream Kimi Audio models with vllm-omni versions
+    # The checkpoint uses "MoonshotKimiaForCausalLM" which is registered in upstream vllm
+    # as ASR-only. We override it with our full audio I/O implementation.
+    ModelRegistry.register_model(
+        "MoonshotKimiaForCausalLM",
+        "vllm_omni.model_executor.models.kimi_audio.kimi_audio_llm:KimiAudioLLMForConditionalGeneration",
+    )
+
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401
 

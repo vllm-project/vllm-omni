@@ -484,3 +484,231 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+def _register_omni_models_early():
+    """Register omni models to vllm at import time to override upstream models."""
+    try:
+        from vllm.model_executor.models import ModelRegistry
+
+        from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+        supported_archs = ModelRegistry.get_supported_archs()
+        for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
+            if arch not in supported_archs:
+                ModelRegistry.register_model(
+                    arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}"
+                )
+
+        # Override upstream Kimi Audio model with vllm-omni version
+        ModelRegistry.register_model(
+            "MoonshotKimiaForCausalLM",
+            "vllm_omni.model_executor.models.kimi_audio.kimi_audio_llm:KimiAudioLLMForConditionalGeneration",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_register_omni_models_early()
+
+
+def _patch_tokenizer_special_tokens_map():
+    """Patch transformers tokenizer to handle missing _special_tokens_map.
+
+    Some custom tokenizers (like Kimi's TikTokenTokenizer) try to set special tokens
+    before calling super().__init__(), which causes AttributeError because _special_tokens_map
+    doesn't exist yet. This patch makes __setattr__ more robust.
+    """
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+        # Save the original __setattr__
+        original_setattr = PreTrainedTokenizerBase.__setattr__
+
+        def patched_setattr(self, key, value):
+            # If trying to set a special token and _special_tokens_map doesn't exist, create it
+            if key in ("bos_token", "eos_token", "unk_token", "pad_token", "additional_special_tokens"):
+                if not hasattr(self, "_special_tokens_map"):
+                    object.__setattr__(self, "_special_tokens_map", {})
+            return original_setattr(self, key, value)
+
+        # Replace __setattr__
+        PreTrainedTokenizerBase.__setattr__ = patched_setattr
+        _PATCH_LOGGER.info("Patched tokenizer __setattr__ to handle missing _special_tokens_map")
+
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_patch_tokenizer_special_tokens_map()
+
+
+def _patch_tokenizer_pythonbackend_attributes():
+    """Patch transformers tokenizer to add missing PythonBackend attributes.
+
+    Some custom tokenizers (like Kimi's CachedTikTokenTokenizer) don't call
+    super().__init__(), so PythonBackend formatting attributes required by vLLM's
+    chat-template/tokenizer path are never initialized. This patch installs
+    class-level defaults before any tokenizer is instantiated.
+    """
+    try:
+        from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+
+        # Install class-level defaults for attributes that PythonBackend expects
+        if not hasattr(PreTrainedTokenizer, "special_tokens_pattern"):
+            PreTrainedTokenizer.special_tokens_pattern = None
+        if not hasattr(PreTrainedTokenizer, "token_type_ids_pattern"):
+            PreTrainedTokenizer.token_type_ids_pattern = "bert_style"
+        if not hasattr(PreTrainedTokenizer, "token_type_ids_include_special_tokens"):
+            PreTrainedTokenizer.token_type_ids_include_special_tokens = True
+
+        if not hasattr(PreTrainedTokenizerFast, "special_tokens_pattern"):
+            PreTrainedTokenizerFast.special_tokens_pattern = None
+        if not hasattr(PreTrainedTokenizerFast, "token_type_ids_pattern"):
+            PreTrainedTokenizerFast.token_type_ids_pattern = "bert_style"
+        if not hasattr(PreTrainedTokenizerFast, "token_type_ids_include_special_tokens"):
+            PreTrainedTokenizerFast.token_type_ids_include_special_tokens = True
+
+        _PATCH_LOGGER.info("Patched tokenizer PythonBackend attributes (special_tokens_pattern, etc.)")
+
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_patch_tokenizer_pythonbackend_attributes()
+
+
+def _patch_tiktiktokenizer_encode_signature():
+    """Patch TikTokenTokenizer.encode() to accept truncation parameter.
+
+    vLLM's renderer calls tokenizer.encode() with a truncation parameter,
+    but some custom tokenizers (like Kimi's TikTokenTokenizer) don't support it.
+    This patch wraps the encode method to accept and ignore the truncation parameter.
+    """
+    try:
+        # Patch both base class and any TikTokenTokenizer subclasses
+        from transformers import PreTrainedTokenizer
+
+        # Store the original encode method
+        original_encode = PreTrainedTokenizer.encode
+
+        # Create a wrapper that accepts and ignores unsupported parameters
+        def patched_encode(self, *args, **kwargs):
+            # Remove parameters that custom tokenizers may not support
+            kwargs.pop("truncation", None)
+            kwargs.pop("max_length", None)
+            kwargs.pop("padding", None)
+            kwargs.pop("return_tensors", None)
+            kwargs.pop("add_special_tokens", None)
+            return original_encode(self, *args, **kwargs)
+
+        # Apply the patch to base class
+        PreTrainedTokenizer.encode = patched_encode
+
+        # Also patch any loaded TikTokenTokenizer classes
+        # They may be in sys.modules after transformers loads the remote code
+        import sys
+
+        for module_name, module in sys.modules.items():
+            if module and hasattr(module, "TikTokenTokenizer"):
+                tik_tokenizer_cls = getattr(module, "TikTokenTokenizer")
+                if hasattr(tik_tokenizer_cls, "encode"):
+                    tik_tokenizer_cls.encode = patched_encode
+                    _PATCH_LOGGER.info(f"Patched TikTokenTokenizer.encode() in {module_name}")
+
+        _PATCH_LOGGER.info("Patched PreTrainedTokenizer.encode() to accept truncation parameter")
+
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_patch_tiktiktokenizer_encode_signature()
+
+
+def _patch_tokenizer_decode_signature():
+    """Patch tokenizer.decode() to accept skip_special_tokens parameter.
+
+    vLLM calls tokenizer.decode() with skip_special_tokens parameter,
+    but some custom tokenizers (like Kimi's TikTokenTokenizer) don't support it.
+    This patch wraps the decode method to accept and ignore unsupported parameters.
+    """
+    try:
+        from transformers import PreTrainedTokenizer
+
+        # Store the original decode method
+        original_decode = PreTrainedTokenizer.decode
+
+        # Create a wrapper that accepts and ignores unsupported parameters
+        def patched_decode(self, *args, **kwargs):
+            # Remove parameters that custom tokenizers may not support
+            kwargs.pop("skip_special_tokens", None)
+            kwargs.pop("clean_up_tokenization_spaces", None)
+            return original_decode(self, *args, **kwargs)
+
+        # Apply the patch to base class
+        PreTrainedTokenizer.decode = patched_decode
+
+        _PATCH_LOGGER.info("Patched PreTrainedTokenizer.decode() to accept skip_special_tokens parameter")
+
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Also patch TikTokenTokenizer if it's available (Kimi Audio uses it)
+    try:
+        # Try to import the tokenizer from the model directory
+        import sys
+        from pathlib import Path
+
+        # Check if we can find tokenization_kimia.py in common locations
+        possible_paths = [
+            Path("/data1/moonshotai/Kimi-Audio-7B-Instruct/tokenization_kimia.py"),
+            Path("/data/moonshotai/Kimi-Audio-7B-Instruct/tokenization_kimia.py"),
+        ]
+
+        for tokenizer_path in possible_paths:
+            if tokenizer_path.exists():
+                # Add the directory to sys.path temporarily
+                tokenizer_dir = str(tokenizer_path.parent)
+                if tokenizer_dir not in sys.path:
+                    sys.path.insert(0, tokenizer_dir)
+
+                try:
+                    from tokenization_kimia import TikTokenTokenizer
+
+                    _PATCH_LOGGER.info(f"Found TikTokenTokenizer class: {TikTokenTokenizer}")
+                    _PATCH_LOGGER.info(f"Original decode method: {TikTokenTokenizer.decode}")
+
+                    # Store the original decode method
+                    original_tiktoken_decode = TikTokenTokenizer.decode
+
+                    # Create a wrapper that accepts and ignores unsupported parameters
+                    def patched_tiktoken_decode(self, t, **kwargs):
+                        # Remove parameters that tiktoken doesn't support
+                        kwargs.pop("skip_special_tokens", None)
+                        kwargs.pop("clean_up_tokenization_spaces", None)
+                        return original_tiktoken_decode(self, t)
+
+                    # Apply the patch
+                    TikTokenTokenizer.decode = patched_tiktoken_decode
+                    _PATCH_LOGGER.info("Patched TikTokenTokenizer.decode() to accept skip_special_tokens parameter")
+                    _PATCH_LOGGER.info(f"New decode method: {TikTokenTokenizer.decode}")
+
+                    # Verify the patch worked by checking signature
+                    import inspect
+
+                    sig = inspect.signature(TikTokenTokenizer.decode)
+                    _PATCH_LOGGER.info(f"Patched signature: {sig}")
+
+                except Exception as e:
+                    _PATCH_LOGGER.error(f"Could not patch TikTokenTokenizer: {e}", exc_info=True)
+                finally:
+                    # Clean up sys.path
+                    if tokenizer_dir in sys.path:
+                        sys.path.remove(tokenizer_dir)
+                break
+
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_patch_tokenizer_decode_signature()

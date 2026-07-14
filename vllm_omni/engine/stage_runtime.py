@@ -433,9 +433,11 @@ class StageRuntime:
     ) -> dict[int, list[StagePoolClient | None]]:
         """Initialize all stage replicas.
 
-        Stages sharing the same GPU are initialized sequentially to avoid
-        memory profiling interference. Stages on different GPUs are
-        initialized in parallel.
+        Stages sharing at least one physical GPU are initialized sequentially
+        (even when their `devices` strings only partially overlap) to avoid
+        init-lock/spawn-lock order deadlocks and memory profiling
+        interference. Stages on fully disjoint GPUs are initialized in
+        parallel.
         """
         initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
@@ -444,10 +446,54 @@ class StageRuntime:
         init_state_lock = threading.Lock()
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
 
-        init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
+        # Group replicas for initialization. Replicas that share at least one
+        # physical GPU must land in the SAME sequential group even when their
+        # `devices` strings differ (e.g. a tensor-parallel stage on "6,7" and
+        # a single-GPU stage on "7" share GPU 7). Concurrent initialization on
+        # a shared device serializes the per-device init flock and the spawn
+        # mutex in opposite order — a lock-order deadlock that only the
+        # stage_init_timeout breaks, after which both stages initialize the
+        # shared device simultaneously (deadlocking NCCL setup and corrupting
+        # vLLM's free-memory profiling). Only stages with fully disjoint
+        # device sets are safe to initialize in parallel.
+        init_groups: list[list[tuple[int, ReplicaInitPlan]]] = []
+        init_group_keys: list[Any] = []  # frozenset of device ids (mergeable) or opaque str key
         for plan in stage_plans:
             for replica in plan.replicas:
-                init_groups.setdefault(self._replica_init_group_key(replica), []).append((plan.stage_idx, replica))
+                item = (plan.stage_idx, replica)
+                device_ids = self._replica_init_device_ids(replica)
+                key: Any = device_ids if device_ids is not None else self._replica_init_group_key(replica)
+                for idx, existing_key in enumerate(init_group_keys):
+                    if device_ids is not None:
+                        matched = isinstance(existing_key, frozenset) and bool(existing_key & device_ids)
+                    else:
+                        matched = existing_key == key
+                    if matched:
+                        init_groups[idx].append(item)
+                        if device_ids is not None:
+                            init_group_keys[idx] = existing_key | device_ids
+                        break
+                else:
+                    init_groups.append([item])
+                    init_group_keys.append(key)
+
+        # Collapse transitively overlapping device groups — a later replica
+        # may bridge two groups formed earlier (e.g. {6,7}, {4,5}, then {7,4}).
+        merged = True
+        while merged:
+            merged = False
+            for i in range(len(init_group_keys)):
+                for j in range(i + 1, len(init_group_keys)):
+                    ki, kj = init_group_keys[i], init_group_keys[j]
+                    if isinstance(ki, frozenset) and isinstance(kj, frozenset) and ki & kj:
+                        init_groups[i].extend(init_groups[j])
+                        init_group_keys[i] = ki | kj
+                        del init_groups[j]
+                        del init_group_keys[j]
+                        merged = True
+                        break
+                if merged:
+                    break
 
         def _init_group(group: list[tuple[int, ReplicaInitPlan]]) -> None:
             """Initialize replicas in one scheduling group sequentially."""
@@ -469,24 +515,26 @@ class StageRuntime:
                 with init_state_lock:
                     initialized_clients_by_stage[stage_idx][replica.replica_id] = client
 
-        inline_keys = [key for key in init_groups if key.startswith("inline:")]
-        for key in inline_keys:
-            _init_group(init_groups.pop(key))
+        def _is_inline_group(key: Any) -> bool:
+            return isinstance(key, str) and key.startswith("inline:")
 
-        if primary_exc is None and init_groups:
-            if len(init_groups) == 1:
-                _init_group(next(iter(init_groups.values())))
+        inline_groups = [group for key, group in zip(init_group_keys, init_groups) if _is_inline_group(key)]
+        parallel_groups = [group for key, group in zip(init_group_keys, init_groups) if not _is_inline_group(key)]
+        for group in inline_groups:
+            _init_group(group)
+
+        if primary_exc is None and parallel_groups:
+            if len(parallel_groups) == 1:
+                _init_group(parallel_groups[0])
             else:
-                future_to_group: dict[concurrent.futures.Future[None], str] = {}
                 if self._stage_init_executor is None:
                     self._stage_init_executor = concurrent.futures.ThreadPoolExecutor(
-                        max_workers=len(init_groups),
+                        max_workers=len(parallel_groups),
                         thread_name_prefix="stage-init",
                     )
-                for group_key, group in init_groups.items():
-                    future_to_group[self._stage_init_executor.submit(_init_group, group)] = group_key
+                futures = [self._stage_init_executor.submit(_init_group, group) for group in parallel_groups]
 
-                for future in concurrent.futures.as_completed(future_to_group):
+                for future in concurrent.futures.as_completed(futures):
                     try:
                         future.result()
                     except Exception as exc:
@@ -512,6 +560,35 @@ class StageRuntime:
         runtime_cfg = replica.metadata.runtime_cfg or {}
         devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
         return f"device:{devices}"
+
+    def _replica_init_device_ids(self, replica: ReplicaInitPlan) -> frozenset[int] | None:
+        """Physical GPU ids a local LLM replica will occupy, or None if unknown.
+
+        Mirrors the device extraction in `_replica_init_group_key`; used to
+        merge initialization groups whose device sets overlap so that
+        GPU-sharing stages initialize sequentially. Returns None (fall back to
+        the opaque group key) for remote/diffusion replicas and for configs
+        whose `devices` value is missing or not parseable as integer ids.
+        """
+        if replica.launch_mode == "remote" or replica.metadata.stage_type == "diffusion":
+            return None
+        runtime_cfg = replica.metadata.runtime_cfg or {}
+        devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
+        if devices is None:
+            return None
+        if isinstance(devices, str):
+            raw_parts: list[Any] = devices.split(",")
+        elif isinstance(devices, (list, tuple, set, frozenset)):
+            raw_parts = list(devices)
+        else:
+            raw_parts = [devices]
+        device_ids: set[int] = set()
+        for part in raw_parts:
+            try:
+                device_ids.add(int(str(part).strip()))
+            except (TypeError, ValueError):
+                return None
+        return frozenset(device_ids) if device_ids else None
 
     def _initialize_replica(
         self,
