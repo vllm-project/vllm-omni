@@ -598,6 +598,38 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+  - group: ":card_index_dividers: Tiny Model Tests [Multi-GPU]"
+    key: nightly-tiny-model-test-group
+    depends_on: upload-nightly-pipeline
+    if: >-
+      build.env("NIGHTLY") == "1" ||
+      build.pull_request.labels includes "nightly-test"
+    steps:
+      - label: ":full_moon: Tiny Model Tests · Diffusion (Multi-GPU accelerations)"
+        timeout_in_minutes: 30
+        # NOTE: Single-GPU (core_model) tiny model tests run on the ready label,
+        # so nightly only adds the multi-GPU parallelism configurations.
+        #
+        # This is a bit confusing, but `full_model` is used to mark the multigpu tests, and
+        # --run-level `core_model` is used to indicate that we should use tiny model weights
+        # for the CI, since these tests should pass irrespective of whether or not we use
+        # the full weights or not.
+        commands:
+          - timeout 25m pytest -sv tests/model_tests/diffusion -m 'full_model and cuda' --run-level "core_model"
+        agents:
+          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
   # Diffusion X2I suite: x2i / x2a / x2t and related non-video paths; x2v is only in "Diffusion X2V Model Test" below.
   - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
     key: nightly-diffusion-x2iat-group
@@ -618,6 +650,8 @@ steps:
             tests/e2e/online_serving/test_qwen_image_edit_expansion.py
             tests/e2e/online_serving/test_qwen_image_layered_expansion.py
             tests/e2e/online_serving/test_bagel_expansion.py
+            tests/e2e/online_serving/test_krea2_expansion.py
+            tests/e2e/offline_inference/test_krea2_expansion.py
             -m "full_model and diffusion and H100 and not distributed_cuda"
             --run-level "full_model"
         agents:
@@ -661,6 +695,7 @@ steps:
             pytest -sv
             tests/e2e/online_serving/test_qwen_image_expansion.py
             tests/e2e/online_serving/test_qwen_image_edit_expansion.py
+            tests/e2e/offline_inference/test_krea2_expansion.py
             -m "full_model and diffusion and H100 and distributed_cuda"
             --run-level "full_model"
         agents:
@@ -1287,6 +1322,44 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+      - label: ":full_moon: Diffusion X2V · Doc Test"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -s -v tests/examples/offline_inference/test_image_to_video.py -m "full_model and example and H100" --run-level "full_model"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
       - label: ":full_moon: Diffusion X2V · Other Function Test"
         timeout_in_minutes: 90
         commands:
@@ -1416,9 +1489,12 @@ steps:
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
             EXIT1=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
+            EXIT2=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT1
+            if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
+            exit $$EXIT2
         agents:
           queue: "mithril-h100-pool"
         plugins:

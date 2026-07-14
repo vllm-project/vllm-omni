@@ -938,8 +938,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         )
         logger.info("Text generation: %d chars", len(text_output))
         return DiffusionOutput(
-            output=text_output,
-            custom_output={"text_output": text_output},
+            output={
+                "payload": {"text": text_output},
+                "metadata": {"text": {"text_output": text_output}},
+            },
         )
 
     # -----------------------------------------------------------------------
@@ -1457,10 +1459,15 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
         images = _to_pil(image_prediction)
         img = images[0] if images else None
-        custom = {}
+        metadata = {}
         if think_text:
-            custom["think_text"] = think_text
-        return DiffusionOutput(output=img, custom_output=custom)
+            metadata["text"] = {"think_text": think_text}
+        return DiffusionOutput(
+            output={
+                "payload": {"image": img},
+                "metadata": metadata,
+            }
+        )
 
     # -----------------------------------------------------------------------
     # Weight loading

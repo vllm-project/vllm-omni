@@ -11,8 +11,8 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniTokensPrompt
     from vllm_omni.outputs import OmniRequestOutput
 
-from vllm_omni.engine.output_modality import FinalOutputModalityType
 from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 
 
 class StageClient(Protocol):

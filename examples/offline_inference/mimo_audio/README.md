@@ -1,4 +1,4 @@
-# MiMo-Audio Offline Inference
+# MiMo-Audio: Offline inference
 
 This directory contains an offline demo for running MiMo-Audio models with vLLM Omni. It builds task-specific inputs and generates WAV files or text outputs locally.
 

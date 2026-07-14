@@ -24,15 +24,15 @@ def test_dreamzero_vla_resolves_to_dreamzero_config(monkeypatch):
 
 def test_dreamzero_config_sets_model_class_and_policy_config(monkeypatch):
     monkeypatch.setattr(
-        "vllm_omni.config.config_factory.StageConfigFactory._auto_detect_model_type",
-        classmethod(lambda _cls, _model, trust_remote_code=True: ("vla", None)),
+        "vllm_omni.config.config_factory.StageConfigFactory._try_infer_model_type",
+        classmethod(lambda _cls, model, trust_remote_code=True: "vla"),
     )
     monkeypatch.setattr(
         "vllm_omni.diffusion.utils.hf_utils._looks_like_dreamzero",
         lambda _model: True,
     )
 
-    stage_configs = load_stage_configs_from_model("GEAR-Dreams/DreamZero-DROID")
+    stage_configs, _ = load_stage_configs_from_model("GEAR-Dreams/DreamZero-DROID")
     engine_args = stage_configs[0].engine_args
 
     assert engine_args.model_class_name == "DreamZeroPipeline"

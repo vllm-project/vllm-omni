@@ -1,7 +1,6 @@
 from typing import Any
 
 import torch
-from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
@@ -10,7 +9,6 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
-from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID
 
 logger = init_logger(__name__)
@@ -230,88 +228,6 @@ def llm2code2wav_async_chunk(
     )
 
 
-def llm2code2wav(
-    source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
-) -> list[OmniTokensPrompt]:
-    """
-    Process talker outputs to create code2wav inputs.
-
-    Workflow:
-    1. Extract talker's codec code outputs (8-layer RVQ codes)
-    2. Flatten codes for code2wav input
-    3. Package for code2wav stage
-
-    Args:
-        prompt: Original prompt data
-        requires_multimodal_data: Whether multimodal data is required
-
-    Returns:
-        List of OmniTokensPrompt for code2wav stage
-    """
-    talker_outputs = source_outputs
-    code2wav_inputs = []
-
-    # Process each talker output
-    for i, talker_output in enumerate(talker_outputs):
-        output = talker_output.outputs[0]
-
-        # Extract codec codes from talker output
-        # Expected shape: [8, seq_len] (8-layer RVQ codes)
-        mm = output.multimodal_output
-        mm_codes = mm.get("codes", {})
-        mm_hs = mm.get("hidden_states", {})
-        if "audio" in mm_codes:
-            codec_codes = mm_codes["audio"].to(torch.long)  # [seq_batch_size, 1, 8, 4]
-            is_all_zero = (codec_codes == 0).all(dim=(1, 2, 3))
-            non_zero_indices = (~is_all_zero).nonzero(as_tuple=True)[0]
-            if len(non_zero_indices) == 0:
-                # All codec codes are zero - skip this request with a warning
-                request_id = getattr(talker_output, "request_id", f"unknown_{i}")
-                logger.warning(
-                    "Skipping request %s: all codec codes are zero (empty output from Stage-0). "
-                    "This may indicate the model failed to generate valid audio codes.",
-                    request_id,
-                )
-            else:
-                if len(non_zero_indices) < codec_codes.shape[0]:
-                    codec_codes = codec_codes[non_zero_indices]
-        elif "output" in mm_hs and "audio" not in mm_codes:
-            codec_codes = torch.zeros(1, 1, 8, 4, dtype=torch.long)
-        else:
-            raise ValueError(f"Invalid multimodal_output: {output.multimodal_output}")
-
-        pad_vec = torch.tensor([TALKER_CODEC_PAD_TOKEN_ID] * 4)
-
-        code_final = prepend_and_flatten_colmajor(codec_codes, pad_vec)
-        code_final = code_final.tolist()
-
-        # Guard against flattened sequences longer than code2wav's max_model_len.
-        # Without this, add_request raises ``could not broadcast input array
-        # from shape (N,) into shape (max_model_len,)`` and kills the engine
-        # core (see issue #2683). Mirrors the offline end2end.py safeguard.
-        if len(code_final) > MAX_CODE2WAV_TOKENS:
-            request_id = getattr(talker_output, "request_id", f"unknown_{i}")
-            logger.warning(
-                "Request %s: code_final len=%d > MAX_CODE2WAV_TOKENS=%d, truncating.",
-                request_id,
-                len(code_final),
-                MAX_CODE2WAV_TOKENS,
-            )
-            code_final = code_final[:MAX_CODE2WAV_TOKENS]
-
-        code2wav_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=code_final,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-
-    return code2wav_inputs
-
-
 # ============================================================================
 # Worker-connector data plane (non-async-chunk path).
 # AR runner's `flatten_payload` converts the model emit
@@ -329,8 +245,9 @@ _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
 def _filter_zero_codec_rows(codec_codes: torch.Tensor) -> torch.Tensor:
     """Drop zero-padded codec rows from a 4-D `[N, 1, 8, 4]` tensor.
 
-    Mirrors the zero-row filter in the orchestrator-path `llm2code2wav`
-    body (see this file's ``llm2code2wav`` around line 224).
+    Shared by the sync placeholder builder (``llm2code2wav_token_only``) and
+    the full-payload producer (``llm2code2wav_full_payload``) so both size the
+    downstream codec sequence off the same non-zero frames.
     """
     if codec_codes.ndim != 4 or codec_codes.numel() == 0:
         return codec_codes
