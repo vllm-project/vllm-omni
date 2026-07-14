@@ -22,7 +22,6 @@ stages:
     gpu_memory_utilization: 0.85
     trust_remote_code: true
     enable_prefix_caching: false
-    enforce_eager: true
     async_scheduling: true
     max_num_batched_tokens: 512
     max_model_len: 8192

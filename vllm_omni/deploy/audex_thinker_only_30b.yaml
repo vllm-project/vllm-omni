@@ -11,7 +11,6 @@ stages:
     gpu_memory_utilization: 0.9
     trust_remote_code: true
     enable_prefix_caching: false
-    enforce_eager: true
     max_num_batched_tokens: 8192
     # 30 clips x 750 sound embeddings (900 s cap) + text headroom.
     max_model_len: 32768
