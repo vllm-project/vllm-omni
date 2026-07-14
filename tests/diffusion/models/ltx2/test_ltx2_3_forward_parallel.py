@@ -247,7 +247,7 @@ class TestCFGParallelForwardPath:
         audio_sampling_rate,
         expected_frame_rate,
     ):
-        from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_base
+        from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_pipeline_base
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -301,7 +301,7 @@ class TestCFGParallelForwardPath:
             scheduler.sigmas = torch.tensor([0.25, 0.25], device=device)
             return torch.tensor([1.0, 0.5], device=device), 2
 
-        monkeypatch.setattr(ltx23, "retrieve_timesteps", fake_retrieve_timesteps)
+        monkeypatch.setattr(ltx2_denoise, "retrieve_timesteps", fake_retrieve_timesteps)
 
         class FakeScheduler:
             def __init__(self, name="video", calls=None):

@@ -40,7 +40,7 @@ from tests.helpers.runtime import OmniServer
 _DIFFUSERS_VERSION = tuple(int(x) for x in diffusers.__version__.split(".")[:2] if x.isdigit())
 _DIFFUSERS_038 = _DIFFUSERS_VERSION >= (0, 38)
 
-MODEL_ID = "dg845/LTX-2.3-Diffusers"
+MODEL_ID = "diffusers/LTX-2.3-Diffusers"
 MODEL_ENV_VAR = "VLLM_TEST_LTX23_MODEL"
 PROMPT = "A lighthouse on a rocky cliff at sunset, waves crashing below, golden hour lighting"
 NEGATIVE_PROMPT = "blurry, low quality, distorted, watermark"
