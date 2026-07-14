@@ -57,6 +57,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
     SupportImageInput,
+    SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -628,7 +629,12 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 # Pipeline
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
-    nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    CFGParallelMixin,
+    SupportImageInput,
+    SupportsComponentDiscovery,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """Cosmos3 text/image/video/sound/action pipeline.
 
@@ -671,6 +677,10 @@ class Cosmos3OmniDiffusersPipeline(
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = []
 
     @classmethod
     def reference_video_decode_spec(
@@ -714,12 +724,6 @@ class Cosmos3OmniDiffusersPipeline(
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if od_config.enable_cpu_offload:
-            raise ValueError(
-                "Cosmos3 has no separate text encoder, so CPU offloading "
-                "(transformer↔encoder swapping) is not supported. "
-                "Use --enable-layerwise-offload instead."
-            )
         self.od_config = od_config
         self.device = get_local_device()
         self.dtype = od_config.dtype
@@ -822,6 +826,32 @@ class Cosmos3OmniDiffusersPipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool = True,
+        use_hsdp: bool = False,
+    ) -> None:
+        """Enable Cosmos3 component-level model offload.
+
+        Cosmos3 has a nested reasoner/generator transformer instead of separate
+        text-encoder and DiT pipeline components, so the transformer owns the
+        mutual-exclusion swaps.  The VAE stays resident on GPU like the generic
+        model-level offloader.
+        """
+        self.vae.to(device, non_blocking=True)
+        if isinstance(self._sound_tokenizer, nn.Module):
+            self._sound_tokenizer.to(device)
+        self.transformer.enable_model_cpu_offload(
+            device=device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+        )
+
+    def disable_omni_model_cpu_offload(self) -> None:
+        self.transformer.disable_model_cpu_offload()
 
     # -- Weight loading --------------------------------------------------------
 
