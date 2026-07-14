@@ -162,7 +162,7 @@ class TestBnBOnlineLinearMethod:
         method = BnBOnlineLinearMethod(mock_quant_config)
         layer = Module()
         layer.weight = Parameter(torch.randn(64, 32))
-        mocker.patch.object(torch.Tensor, "cuda", side_effect=lambda self, *args, **kwargs: self)
+        mocker.patch.object(torch.Tensor, "cuda", return_value=layer.weight.data)
 
         method.process_weights_after_loading(layer)
 

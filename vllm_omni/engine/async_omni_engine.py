@@ -1241,13 +1241,6 @@ class AsyncOmniEngine:
                         or cfg.engine_args.quantization_config is None
                     ):
                         cfg.engine_args.quantization_config = quantization_config
-                top_level_quantization_config = kwargs.get("quantization_config")
-                if top_level_quantization_config is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "quantization_config")
-                        or cfg.engine_args.quantization_config is None
-                    ):
-                        cfg.engine_args.quantization_config = top_level_quantization_config
                 # Inject profiler flags for diffusion stages
                 for profiler_key in (
                     "enable_diffusion_pipeline_profiler",
