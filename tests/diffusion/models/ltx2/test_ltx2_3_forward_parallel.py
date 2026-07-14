@@ -247,6 +247,7 @@ class TestCFGParallelForwardPath:
         audio_sampling_rate,
         expected_frame_rate,
     ):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_base
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -292,6 +293,7 @@ class TestCFGParallelForwardPath:
                 raise AssertionError(f"Unexpected gathered tensor: {tensor}")
 
         monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 2)
+        monkeypatch.setattr(ltx2_pipeline_base, "get_classifier_free_guidance_world_size", lambda: 2)
         monkeypatch.setattr(ltx23, "get_classifier_free_guidance_rank", lambda: cfg_rank)
         monkeypatch.setattr(ltx23, "get_cfg_group", lambda: FakeCfgGroup())
 

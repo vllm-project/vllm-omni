@@ -30,10 +30,11 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.lora.request import LoRARequest
 
+from .ltx2_recipes import LTX2_ONE_STAGE_RECIPE
+from .ltx2_stage import calculate_shift, denoise_stage
 from .pipeline_ltx2 import (
     LTX2Pipeline,
     _get_prompt_field,
-    calculate_shift,
 )
 from .pipeline_ltx2 import (
     get_ltx2_post_process_func as _get_ltx2_post_process_func,
@@ -86,15 +87,6 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         super().__init__(od_config=od_config, prefix=prefix)
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_spatial_compression_ratio, resample="bilinear")
 
-    @staticmethod
-    def _normalize_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
-    ) -> torch.Tensor:
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = (latents - latents_mean) * scaling_factor / latents_std
-        return latents
-
     def prepare_latents(
         self,
         image: torch.Tensor | None = None,
@@ -109,9 +101,13 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        height = height // self.vae_spatial_compression_ratio
-        width = width // self.vae_spatial_compression_ratio
-        num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+        num_frames, height, width = self._resolve_video_latent_shape(
+            height,
+            width,
+            num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
 
         shape = (batch_size, num_channels_latents, num_frames, height, width)
         mask_shape = (batch_size, 1, num_frames, height, width)
@@ -297,7 +293,7 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
-        guidance_scale: float = 4.0,
+        guidance_scale: float = LTX2_ONE_STAGE_RECIPE.guidance_scale,
         guidance_rescale: float = 0.0,
         noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
@@ -323,11 +319,13 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        height = req.sampling_params.height or height or 512
-        width = req.sampling_params.width or width or 768
-        num_frames = req.sampling_params.num_frames or num_frames or 121
-        frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or 24.0
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps or 40
+        height = req.sampling_params.height or height or self.one_stage_recipe.height
+        width = req.sampling_params.width or width or self.one_stage_recipe.width
+        num_frames = req.sampling_params.num_frames or num_frames or self.one_stage_recipe.num_frames
+        frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or self.one_stage_recipe.frame_rate
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps or self.one_stage_recipe.num_inference_steps
+        )
         if timesteps is None:
             num_inference_steps = max(int(num_inference_steps), 2)
         elif len(timesteps) < 2:
@@ -481,9 +479,13 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
                 padding_side=tokenizer_padding_side,
             )
 
-        latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        latent_height = height // self.vae_spatial_compression_ratio
-        latent_width = width // self.vae_spatial_compression_ratio
+        latent_num_frames, latent_height, latent_width = self._resolve_video_latent_shape(
+            height,
+            width,
+            num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
         if latents is not None:
             if latents.ndim == 5:
                 logger.info(
@@ -607,13 +609,8 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         )
         # No coord duplication needed: mixin handles CFG via separate forward calls.
 
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-
+        with denoise_stage(self, timesteps) as (steps, pbar):
+            for i, t in steps:
                 latent_model_input = latents.to(prompt_embeds.dtype)
                 audio_latent_model_input = audio_latents.to(prompt_embeds.dtype)
                 timestep = t.expand(latent_model_input.shape[0])

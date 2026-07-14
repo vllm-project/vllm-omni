@@ -4,18 +4,12 @@
 from __future__ import annotations
 
 import copy
-import inspect
-import json
 import os
 from collections.abc import Iterable
-from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
@@ -29,63 +23,27 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_classifier_free_guidance_world_size,
-)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.lora.request import LoRARequest
 
-from .ltx2_transformer import LTX2VideoTransformer3DModel
+from .ltx2_components import (
+    LTX2_COMPONENT_PROFILE,
+    create_transformer_from_config,
+    load_transformer_config,
+)
+from .ltx2_pipeline_base import LTXPipelineBase
+from .ltx2_recipes import LTX2_ONE_STAGE_RECIPE
+from .ltx2_stage import VideoAudioScheduler as _VideoAudioScheduler
+from .ltx2_stage import calculate_shift, denoise_stage
 from .pipeline_ltx2_latent_upsample import LTX2LatentUpsamplePipeline
 
 logger = init_logger(__name__)
-
-
-def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
-    """Load transformer config from model directory or HF Hub."""
-    if local_files_only:
-        config_path = os.path.join(model_path, subfolder, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                return json.load(f)
-    else:
-        try:
-            from huggingface_hub import hf_hub_download
-
-            config_path = hf_hub_download(
-                repo_id=model_path,
-                filename=f"{subfolder}/config.json",
-            )
-            with open(config_path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def create_transformer_from_config(
-    config: dict,
-    quant_config: QuantizationConfig | None = None,
-) -> LTX2VideoTransformer3DModel:
-    """Create LTX2VideoTransformer3DModel from config dict."""
-    if not config and quant_config is None:
-        return LTX2VideoTransformer3DModel()
-
-    signature = inspect.signature(LTX2VideoTransformer3DModel.__init__)
-    allowed_keys = set(signature.parameters.keys())
-    kwargs = {k: v for k, v in config.items() if k in allowed_keys}
-    if quant_config is not None:
-        kwargs["quant_config"] = quant_config
-
-    return LTX2VideoTransformer3DModel(**kwargs)
 
 
 def get_ltx2_post_process_func(
@@ -119,50 +77,14 @@ def _get_prompt_field(prompt: Any, key: str) -> Any:
     return _unwrap_request_tensor(value)
 
 
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
-
-
-class _VideoAudioScheduler:
-    """Composite scheduler dispatching to video and audio schedulers."""
-
-    def __init__(self, video_scheduler, audio_scheduler):
-        self.video_scheduler = video_scheduler
-        self.audio_scheduler = audio_scheduler
-
-    def step(self, noise_pred, t, latents, return_dict=False, generator=None):
-        video_out = self.video_scheduler.step(
-            noise_pred[0],
-            t[0],
-            latents[0],
-            return_dict=False,
-            generator=generator,
-        )[0]
-        audio_out = self.audio_scheduler.step(
-            noise_pred[1],
-            t[1],
-            latents[1],
-            return_dict=False,
-            generator=generator,
-        )[0]
-        return ((video_out, audio_out),)
-
-
-class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsComponentDiscovery):
+class LTX2Pipeline(LTXPipelineBase):
     supports_request_batch = False
 
-    _dit_modules: ClassVar[list[str]] = ["transformer"]
-    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
-    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+    component_profile = LTX2_COMPONENT_PROFILE
+    one_stage_recipe = LTX2_ONE_STAGE_RECIPE
+    _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
+    _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
+    _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
 
     # Audio is diffused jointly with video; warmup must size audio tokens.
     dummy_run_num_frames = 2
@@ -466,109 +388,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
                     f"{negative_prompt_attention_mask.shape}."
                 )
 
-    @staticmethod
-    def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> torch.Tensor:
-        batch_size, num_channels, num_frames, height, width = latents.shape
-        post_patch_num_frames = num_frames // patch_size_t
-        post_patch_height = height // patch_size
-        post_patch_width = width // patch_size
-        latents = latents.reshape(
-            batch_size,
-            -1,
-            post_patch_num_frames,
-            patch_size_t,
-            post_patch_height,
-            patch_size,
-            post_patch_width,
-            patch_size,
-        )
-        latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
-        return latents
-
-    @staticmethod
-    def _unpack_latents(
-        latents: torch.Tensor, num_frames: int, height: int, width: int, patch_size: int = 1, patch_size_t: int = 1
-    ) -> torch.Tensor:
-        batch_size = latents.size(0)
-        latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
-        latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
-        return latents
-
-    @staticmethod
-    def _normalize_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
-    ) -> torch.Tensor:
-        # Normalize latents across the channel dimension [B, C, F, H, W]
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = (latents - latents_mean) * scaling_factor / latents_std
-        return latents
-
-    @staticmethod
-    def _normalize_audio_latents(latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor):
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents - latents_mean) / latents_std
-
-    @staticmethod
-    def _denormalize_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
-    ) -> torch.Tensor:
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = latents * latents_std / scaling_factor + latents_mean
-        return latents
-
-    @staticmethod
-    def _denormalize_audio_latents(latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor):
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents * latents_std) + latents_mean
-
-    @staticmethod
-    def _create_noised_state(
-        latents: torch.Tensor, noise_scale: float | torch.Tensor, generator: torch.Generator | None = None
-    ):
-        noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
-        noised_latents = noise_scale * noise + (1 - noise_scale) * latents
-        return noised_latents
-
-    @staticmethod
-    def _pack_audio_latents(
-        latents: torch.Tensor, patch_size: int | None = None, patch_size_t: int | None = None
-    ) -> torch.Tensor:
-        if patch_size is not None and patch_size_t is not None:
-            batch_size, num_channels, latent_length, latent_mel_bins = latents.shape
-            post_patch_latent_length = latent_length / patch_size_t
-            post_patch_mel_bins = latent_mel_bins / patch_size
-            latents = latents.reshape(
-                batch_size, -1, post_patch_latent_length, patch_size_t, post_patch_mel_bins, patch_size
-            )
-            latents = latents.permute(0, 2, 4, 1, 3, 5).flatten(3, 5).flatten(1, 2)
-        else:
-            latents = latents.transpose(1, 2).flatten(2, 3)
-        return latents
-
-    @staticmethod
-    def _unpack_audio_latents(
-        latents: torch.Tensor,
-        latent_length: int,
-        num_mel_bins: int,
-        patch_size: int | None = None,
-        patch_size_t: int | None = None,
-    ) -> torch.Tensor:
-        if patch_size is not None and patch_size_t is not None:
-            batch_size = latents.size(0)
-            latents = latents.reshape(batch_size, latent_length, num_mel_bins, -1, patch_size_t, patch_size)
-            latents = latents.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
-        else:
-            latents = latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
-        return latents
-
-    @staticmethod
-    def _unpad_audio_latents(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
-        return latents[:, :num_frames]
-
     def prepare_latents(
         self,
         batch_size: int = 1,
@@ -598,9 +417,13 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
             latents = self._create_noised_state(latents, noise_scale, generator)
             return latents.to(device=device, dtype=dtype)
 
-        height = height // self.vae_spatial_compression_ratio
-        width = width // self.vae_spatial_compression_ratio
-        num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+        num_frames, height, width = self._resolve_video_latent_shape(
+            height,
+            width,
+            num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
 
         shape = (batch_size, num_channels_latents, num_frames, height, width)
 
@@ -679,43 +502,12 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
         return latents, original_latent_length, padded_latent_length
 
     @property
-    def guidance_scale(self):
-        return self._guidance_scale
-
-    @property
     def guidance_rescale(self):
         return self._guidance_rescale
 
     @property
     def do_classifier_free_guidance(self):
         return self._guidance_scale > 1.0
-
-    @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
-    @property
-    def current_timestep(self):
-        return self._current_timestep
-
-    @property
-    def attention_kwargs(self):
-        return self._attention_kwargs
-
-    @property
-    def interrupt(self):
-        return self._interrupt
-
-    def _transformer_cache_context(self, context_name: str):
-        cache_context = getattr(self.transformer, "cache_context", None)
-        if callable(cache_context):
-            return cache_context(context_name)
-        return nullcontext()
-
-    def predict_noise(self, **kwargs):
-        with self._transformer_cache_context("cond_uncond"):
-            noise_pred_video, noise_pred_audio = self.transformer(**kwargs)
-        return noise_pred_video.float(), noise_pred_audio.float()
 
     def combine_cfg_noise(self, positive_noise_pred, negative_noise_pred, true_cfg_scale, cfg_normalize=False):
         """Per-element CFG combine with guidance_rescale support."""
@@ -727,23 +519,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
             video_combined = rescale_noise_cfg(video_combined, video_pos, guidance_rescale=self._guidance_rescale)
             audio_combined = rescale_noise_cfg(audio_combined, audio_pos, guidance_rescale=self._guidance_rescale)
         return (video_combined, audio_combined)
-
-    def _synchronize_cfg_parallel_step_output(
-        self,
-        latents: tuple[torch.Tensor, torch.Tensor],
-        do_true_cfg: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not (do_true_cfg and get_classifier_free_guidance_world_size() > 1):
-            return latents
-
-        # Without this sync, CUDA async execution causes non-deterministic
-        # numerical drift across denoising steps in CFG parallel mode,
-        # producing different video outputs across runs.
-        latents = tuple(tensor.contiguous() for tensor in latents)
-        device = next((tensor.device for tensor in latents if tensor.is_cuda), None)
-        if device is not None:
-            torch.cuda.current_stream(device).synchronize()
-        return latents
 
     @torch.no_grad()
     def forward(
@@ -758,7 +533,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
-        guidance_scale: float = 4.0,
+        guidance_scale: float = LTX2_ONE_STAGE_RECIPE.guidance_scale,
         guidance_rescale: float = 0.0,
         noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
@@ -784,11 +559,13 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        height = req.sampling_params.height or height or 512
-        width = req.sampling_params.width or width or 768
-        num_frames = req.sampling_params.num_frames or num_frames or 121
-        frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or 24.0
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps or 40
+        height = req.sampling_params.height or height or self.one_stage_recipe.height
+        width = req.sampling_params.width or width or self.one_stage_recipe.width
+        num_frames = req.sampling_params.num_frames or num_frames or self.one_stage_recipe.num_frames
+        frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or self.one_stage_recipe.frame_rate
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps or num_inference_steps or self.one_stage_recipe.num_inference_steps
+        )
         if timesteps is None:
             num_inference_steps = max(int(num_inference_steps), 2)
         elif len(timesteps) < 2:
@@ -911,9 +688,13 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
                 padding_side=tokenizer_padding_side,
             )
 
-        latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        latent_height = height // self.vae_spatial_compression_ratio
-        latent_width = width // self.vae_spatial_compression_ratio
+        latent_num_frames, latent_height, latent_width = self._resolve_video_latent_shape(
+            height,
+            width,
+            num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
         if latents is not None:
             if latents.ndim == 5:
                 logger.info(
@@ -1021,13 +802,8 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
         # No coord duplication needed: mixin handles CFG via separate forward calls,
         # not batch=2. Each forward gets batch=1 coords directly.
 
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-
+        with denoise_stage(self, timesteps) as (steps, pbar):
+            for i, t in steps:
                 latent_model_input = latents.to(prompt_embeds.dtype)
                 audio_latent_model_input = audio_latents.to(prompt_embeds.dtype)
                 timestep = t.expand(latent_model_input.shape[0])
@@ -1139,10 +915,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCompon
             audio = self.vocoder(generated_mel_spectrograms)
 
         return DiffusionOutput(output=(video, audio))
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
 
 
 class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):

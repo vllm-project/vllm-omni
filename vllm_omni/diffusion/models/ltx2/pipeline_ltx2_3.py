@@ -17,8 +17,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-from collections.abc import Iterable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -31,14 +29,11 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retri
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
-from torch import nn
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import DistributedAutoencoderKLLTX2Video
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -47,18 +42,19 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
-from .pipeline_ltx2 import (
-    _VideoAudioScheduler,
-    calculate_shift,
+from .ltx2_components import (
+    LTX23_COMPONENT_PROFILE,
     create_transformer_from_config,
     load_transformer_config,
 )
+from .ltx2_pipeline_base import LTXPipelineBase
+from .ltx2_recipes import LTX23_ONE_STAGE_RECIPE
+from .ltx2_stage import VideoAudioScheduler as _VideoAudioScheduler
+from .ltx2_stage import calculate_shift, denoise_stage
 
 logger = init_logger(__name__)
 
@@ -275,13 +271,7 @@ def _prepare_decode_timestep_conditioning(
     )
 
 
-class LTX23Pipeline(
-    nn.Module,
-    CFGParallelMixin,
-    ProgressBarMixin,
-    SupportsComponentDiscovery,
-    DiffusionPipelineProfilerMixin,
-):
+class LTX23Pipeline(LTXPipelineBase, DiffusionPipelineProfilerMixin):
     """Fully independent LTX-2.3 pipeline.
 
     Key differences from LTX2Pipeline:
@@ -294,10 +284,12 @@ class LTX23Pipeline(
     supports_request_batch = True
     # Audio is diffused jointly with video; warmup must size audio tokens.
     dummy_run_num_frames = 2
-    _dit_modules: ClassVar[list[str]] = ["transformer"]
-    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "connectors"]
-    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
-    _resident_modules: ClassVar[list[str]] = ["vocoder"]
+    component_profile = LTX23_COMPONENT_PROFILE
+    one_stage_recipe = LTX23_ONE_STAGE_RECIPE
+    _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
+    _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
+    _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
+    _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
 
     def __init__(
         self,
@@ -581,115 +573,6 @@ class LTX23Pipeline(
 
         return prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask
 
-    # ------------------------------------------------------------------
-    # Latent utilities (shared with LTX2Pipeline)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> torch.Tensor:
-        batch_size, num_channels, num_frames, height, width = latents.shape
-        post_patch_num_frames = num_frames // patch_size_t
-        post_patch_height = height // patch_size
-        post_patch_width = width // patch_size
-        latents = latents.reshape(
-            batch_size,
-            -1,
-            post_patch_num_frames,
-            patch_size_t,
-            post_patch_height,
-            patch_size,
-            post_patch_width,
-            patch_size,
-        )
-        latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
-        return latents
-
-    @staticmethod
-    def _unpack_latents(
-        latents: torch.Tensor,
-        num_frames: int,
-        height: int,
-        width: int,
-        patch_size: int = 1,
-        patch_size_t: int = 1,
-    ) -> torch.Tensor:
-        batch_size = latents.size(0)
-        latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
-        latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
-        return latents
-
-    @staticmethod
-    def _normalize_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
-    ) -> torch.Tensor:
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = (latents - latents_mean) * scaling_factor / latents_std
-        return latents
-
-    @staticmethod
-    def _normalize_audio_latents(latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor):
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents - latents_mean) / latents_std
-
-    @staticmethod
-    def _denormalize_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor, scaling_factor: float = 1.0
-    ) -> torch.Tensor:
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = latents * latents_std / scaling_factor + latents_mean
-        return latents
-
-    @staticmethod
-    def _denormalize_audio_latents(latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor):
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents * latents_std) + latents_mean
-
-    @staticmethod
-    def _pack_audio_latents(
-        latents: torch.Tensor, patch_size: int | None = None, patch_size_t: int | None = None
-    ) -> torch.Tensor:
-        if patch_size is not None and patch_size_t is not None:
-            batch_size, num_channels, latent_length, latent_mel_bins = latents.shape
-            post_patch_latent_length = latent_length / patch_size_t
-            post_patch_mel_bins = latent_mel_bins / patch_size
-            latents = latents.reshape(
-                batch_size, -1, post_patch_latent_length, patch_size_t, post_patch_mel_bins, patch_size
-            )
-            latents = latents.permute(0, 2, 4, 1, 3, 5).flatten(3, 5).flatten(1, 2)
-        else:
-            latents = latents.transpose(1, 2).flatten(2, 3)
-        return latents
-
-    @staticmethod
-    def _unpack_audio_latents(
-        latents: torch.Tensor,
-        latent_length: int,
-        num_mel_bins: int,
-        patch_size: int | None = None,
-        patch_size_t: int | None = None,
-    ) -> torch.Tensor:
-        if patch_size is not None and patch_size_t is not None:
-            batch_size = latents.size(0)
-            latents = latents.reshape(batch_size, latent_length, num_mel_bins, -1, patch_size_t, patch_size)
-            latents = latents.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
-        else:
-            latents = latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
-        return latents
-
-    @staticmethod
-    def _unpad_audio_latents(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
-        return latents[:, :num_frames]
-
-    @staticmethod
-    def _get_sp_padded_audio_latent_length(audio_latent_length: int, sp_size: int) -> int:
-        if sp_size > 1:
-            audio_latent_length += (sp_size - (audio_latent_length % sp_size)) % sp_size
-        return audio_latent_length
-
     def _resolve_audio_latent_length(self, audio_latent_length: int, audio_latents: torch.Tensor | None) -> int:
         if audio_latents is None or audio_latents.ndim != 4:
             return audio_latent_length
@@ -796,9 +679,13 @@ class LTX23Pipeline(
             latents = noise_scale * noise + (1 - noise_scale) * latents
             return latents.to(device=device, dtype=dtype)
 
-        height = height // self.vae_spatial_compression_ratio
-        width = width // self.vae_spatial_compression_ratio
-        num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+        num_frames, height, width = self._resolve_video_latent_shape(
+            height,
+            width,
+            num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
         shape = (batch_size, num_channels_latents, num_frames, height, width)
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         latents = self._pack_latents(latents, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size)
@@ -860,29 +747,9 @@ class LTX23Pipeline(
         latents = self._pack_audio_latents(latents)
         return latents, original_latent_length, padded_latent_length
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
-    @property
-    def guidance_scale(self):
-        return self._guidance_scale
-
     @property
     def do_classifier_free_guidance(self):
         return self._guidance_scale is not None and self._guidance_scale > 1.0
-
-    @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
-    @property
-    def current_timestep(self):
-        return self._current_timestep
-
-    @property
-    def interrupt(self):
-        return self._interrupt
 
     # ------------------------------------------------------------------
     # Input validation
@@ -929,16 +796,6 @@ class LTX23Pipeline(
                 )
 
     # ------------------------------------------------------------------
-    # Cache context
-    # ------------------------------------------------------------------
-
-    def _transformer_cache_context(self, context_name: str):
-        cache_context = getattr(self.transformer, "cache_context", None)
-        if callable(cache_context):
-            return cache_context(context_name)
-        return nullcontext()
-
-    # ------------------------------------------------------------------
     # CFG helpers
     # ------------------------------------------------------------------
 
@@ -954,11 +811,6 @@ class LTX23Pipeline(
         x0_uncond = sample - negative_noise_pred * sigma
         x0_guided = x0_cond + (guidance_scale - 1) * (x0_cond - x0_uncond)
         return (sample - x0_guided) / sigma
-
-    def predict_noise(self, **kwargs):
-        with self._transformer_cache_context("cond_uncond"):
-            noise_pred_video, noise_pred_audio = self.transformer(**kwargs)
-        return noise_pred_video.float(), noise_pred_audio.float()
 
     def combine_cfg_noise(
         self,
@@ -1039,20 +891,6 @@ class LTX23Pipeline(
             audio_sigma=audio_sigma,
         )
 
-    def _synchronize_cfg_parallel_step_output(
-        self,
-        latents: tuple[torch.Tensor, torch.Tensor],
-        do_true_cfg: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not (do_true_cfg and get_classifier_free_guidance_world_size() > 1):
-            return latents
-
-        latents = tuple(tensor.contiguous() for tensor in latents)
-        device = next((tensor.device for tensor in latents if tensor.is_cuda), None)
-        if device is not None:
-            torch.cuda.current_stream(device).synchronize()
-        return latents
-
     def _resolve_request_inputs(
         self,
         req: DiffusionRequestBatch,
@@ -1087,11 +925,15 @@ class LTX23Pipeline(
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        height = common_sampling_params.height or height or 512
-        width = common_sampling_params.width or width or 768
-        num_frames = common_sampling_params.num_frames or num_frames or 121
-        frame_rate = common_sampling_params.resolved_frame_rate or frame_rate or 24.0
-        num_inference_steps = common_sampling_params.num_inference_steps or num_inference_steps or 40
+        height = common_sampling_params.height or height or self.one_stage_recipe.height
+        width = common_sampling_params.width or width or self.one_stage_recipe.width
+        num_frames = common_sampling_params.num_frames or num_frames or self.one_stage_recipe.num_frames
+        frame_rate = common_sampling_params.resolved_frame_rate or frame_rate or self.one_stage_recipe.frame_rate
+        num_inference_steps = (
+            common_sampling_params.num_inference_steps
+            or num_inference_steps
+            or self.one_stage_recipe.num_inference_steps
+        )
         if timesteps is None:
             num_inference_steps = max(int(num_inference_steps), 2)
         elif len(timesteps) < 2:
@@ -1281,9 +1123,13 @@ class LTX23Pipeline(
         self,
         request_inputs: _LTX23RequestInputs,
     ) -> tuple[int, int, int]:
-        latent_num_frames = (request_inputs.num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        latent_height = request_inputs.height // self.vae_spatial_compression_ratio
-        latent_width = request_inputs.width // self.vae_spatial_compression_ratio
+        latent_num_frames, latent_height, latent_width = self._resolve_video_latent_shape(
+            request_inputs.height,
+            request_inputs.width,
+            request_inputs.num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
         if request_inputs.latents is not None and request_inputs.latents.ndim == 5:
             _, _, latent_num_frames, latent_height, latent_width = request_inputs.latents.shape
         return latent_num_frames, latent_height, latent_width
@@ -1520,13 +1366,8 @@ class LTX23Pipeline(
         guidance_scale = request_inputs.guidance_scale
         audio_scheduler = forward_ctx.audio_scheduler
 
-        with self.progress_bar(total=len(forward_ctx.timesteps)) as pbar:
-            for i, t in enumerate(forward_ctx.timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-
+        with denoise_stage(self, forward_ctx.timesteps) as (steps, pbar):
+            for i, t in steps:
                 if forward_ctx.cfg_parallel_ready:
                     latent_model_input = denoise_ctx.latents.to(prompt_context.positive_connector_prompt_embeds.dtype)
                     audio_latent_model_input = denoise_ctx.audio_latents.to(
@@ -1777,7 +1618,7 @@ class LTX23Pipeline(
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
-        guidance_scale: float = 4.0,
+        guidance_scale: float = LTX23_ONE_STAGE_RECIPE.guidance_scale,
         noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -1826,7 +1667,3 @@ class LTX23Pipeline(
             timesteps=timesteps,
             attention_kwargs=attention_kwargs,
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)

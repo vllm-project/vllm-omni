@@ -16,6 +16,7 @@ from diffusers.video_processor import VideoProcessor
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
+from .ltx2_recipes import LTX23_ONE_STAGE_RECIPE
 from .pipeline_ltx2_3 import (
     LTX23Pipeline,
     _LTX23DenoiseContext,
@@ -42,9 +43,6 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_spatial_compression_ratio, resample="bilinear")
 
     support_image_input = True
-
-    _normalize_latents = staticmethod(LTX2ImageToVideoPipeline._normalize_latents)
-    _create_noised_state = staticmethod(LTX2ImageToVideoPipeline._create_noised_state)
 
     @staticmethod
     def _resolve_single_prompt_image(raw_image: Any) -> Any:
@@ -86,9 +84,13 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         already represent the full video state including the conditioning first
         frame. Packed 3D latents are assumed to be in transformer token layout.
         """
-        height = height // self.vae_spatial_compression_ratio
-        width = width // self.vae_spatial_compression_ratio
-        num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+        num_frames, height, width = self._resolve_video_latent_shape(
+            height,
+            width,
+            num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
 
         shape = (batch_size, num_channels_latents, num_frames, height, width)
         mask_shape = (batch_size, 1, num_frames, height, width)
@@ -261,9 +263,13 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         self,
         request_inputs: _LTX23RequestInputs,
     ) -> tuple[int, int, int]:
-        latent_num_frames = (request_inputs.num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        latent_height = request_inputs.height // self.vae_spatial_compression_ratio
-        latent_width = request_inputs.width // self.vae_spatial_compression_ratio
+        latent_num_frames, latent_height, latent_width = self._resolve_video_latent_shape(
+            request_inputs.height,
+            request_inputs.width,
+            request_inputs.num_frames,
+            vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
+            vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
+        )
         if request_inputs.latents is not None:
             if request_inputs.latents.ndim == 5:
                 _, _, latent_num_frames, latent_height, latent_width = request_inputs.latents.shape
@@ -395,7 +401,7 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
-        guidance_scale: float = 4.0,
+        guidance_scale: float = LTX23_ONE_STAGE_RECIPE.guidance_scale,
         noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
