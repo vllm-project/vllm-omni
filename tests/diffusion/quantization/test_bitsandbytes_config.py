@@ -3,6 +3,8 @@
 """Unit tests for BitsAndBytes quantization config."""
 
 import importlib.util
+import sys
+import types
 
 import pytest
 import torch
@@ -22,6 +24,21 @@ bitsandbytes_available = pytest.mark.skipif(
     importlib.util.find_spec("bitsandbytes") is None,
     reason="bitsandbytes package not installed",
 )
+
+
+def _ensure_bitsandbytes_importable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject a stub bitsandbytes package when the optional dep is absent.
+
+    ``mocker.patch("bitsandbytes...")`` imports the target module; without a
+    stub, core-model CI without bitsandbytes raises ModuleNotFoundError.
+    """
+    if importlib.util.find_spec("bitsandbytes") is not None:
+        return
+    bnb = types.ModuleType("bitsandbytes")
+    bnb_functional = types.ModuleType("bitsandbytes.functional")
+    bnb.functional = bnb_functional
+    monkeypatch.setitem(sys.modules, "bitsandbytes", bnb)
+    monkeypatch.setitem(sys.modules, "bitsandbytes.functional", bnb_functional)
 
 
 def test_bitsandbytes_config_creation():
@@ -116,16 +133,21 @@ class TestBnBOnlineLinearMethod:
         return config
 
     @pytest.fixture
-    def mock_deps(self, mocker):
+    def mock_deps(self, mocker, monkeypatch: pytest.MonkeyPatch):
+        _ensure_bitsandbytes_importable(monkeypatch)
         mock_qweight = torch.ones((64, 32), dtype=torch.uint8)
         mock_quant_state = mocker.Mock()
         mock_quant = mocker.patch(
             "bitsandbytes.functional.quantize_4bit",
             return_value=(mock_qweight, mock_quant_state),
+            create=True,
         )
+        # x is (2, 16, 32) -> flattened (32, 32); matmul must return (32, 64)
+        # so apply can reshape back to (2, 16, 64).
         mock_matmul = mocker.patch(
             "bitsandbytes.matmul_4bit",
-            return_value=torch.randn(4, 64),
+            return_value=torch.randn(32, 64),
+            create=True,
         )
         return {
             "quant": mock_quant,
@@ -154,7 +176,7 @@ class TestBnBOnlineLinearMethod:
 
         method = BnBOnlineLinearMethod(mock_quant_config)
         layer = Module()
-        layer.weight = Parameter(torch.ones((64, 32), dtype=torch.uint8))
+        layer.weight = Parameter(torch.ones((64, 32), dtype=torch.uint8), requires_grad=False)
         layer.quant_state = mock_deps["mock_quant_state"]
 
         x = torch.randn(2, 16, 32, dtype=torch.float16)
