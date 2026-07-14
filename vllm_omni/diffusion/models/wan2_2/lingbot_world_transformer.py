@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Checkpoint-compatible causal DiT used by LingBot World v2."""
 
 from __future__ import annotations
 
@@ -26,6 +27,14 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 
 @dataclass
 class LingBotAttentionCache:
+    """K/V storage plus its logical cursor metadata.
+
+    ``end`` is occupied storage, ``absolute_end`` is the next global token
+    position, and ``sink_end`` separates permanently retained prefix tokens
+    from the sliding local window. ``last_start`` rejects overlapping or
+    out-of-order causal chunks.
+    """
+
     key: torch.Tensor
     value: torch.Tensor
     end: int = 0
@@ -36,6 +45,8 @@ class LingBotAttentionCache:
 
 @dataclass
 class LingBotTransformerCache:
+    """One request's per-layer video K/V and reusable text K/V."""
+
     self_attention: list[LingBotAttentionCache]
     cross_attention: list[LingBotAttentionCache | None]
 
@@ -50,6 +61,7 @@ def allocate_lingbot_cache(
     device: torch.device,
     dtype: torch.dtype,
 ) -> LingBotTransformerCache:
+    # Cross-attention starts empty because its token count is known after text encoding.
     shape = (batch_size, max_tokens, num_local_heads, head_dim)
     self_attention = [
         LingBotAttentionCache(
@@ -104,47 +116,6 @@ class _LingBotRMSNorm(nn.Module):
 
 def _projection_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
-
-
-def _validate_cache_storage(
-    cache: LingBotAttentionCache,
-    *,
-    batch_size: int,
-    num_local_heads: int,
-    head_dim: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    cache_name: str,
-) -> int:
-    if cache.key.ndim != 4 or cache.value.ndim != 4:
-        raise ValueError(f"{cache_name} cache key and value storage must both be rank 4.")
-    if cache.key.shape != cache.value.shape:
-        raise ValueError(f"{cache_name} cache key and value tensors must have identical shapes.")
-
-    expected_shape = (batch_size, num_local_heads, head_dim)
-    actual_shape = (cache.key.shape[0], cache.key.shape[2], cache.key.shape[3])
-    if actual_shape != expected_shape:
-        raise ValueError(
-            f"{cache_name} cache batch/head shape {actual_shape} does not match attention shape {expected_shape}."
-        )
-    if cache.key.device != cache.value.device or cache.key.device != device:
-        raise ValueError(f"{cache_name} cache key/value device must match the attention input device.")
-    if cache.key.dtype != cache.value.dtype or cache.key.dtype != dtype:
-        raise ValueError(f"{cache_name} cache key/value dtype must match the attention input dtype.")
-
-    capacity = cache.key.shape[1]
-    if capacity <= 0:
-        raise ValueError(f"{cache_name} cache capacity must be positive.")
-    if cache.key.untyped_storage().data_ptr() == cache.value.untyped_storage().data_ptr():
-        raise ValueError(f"{cache_name} cache key and value must not share backing storage.")
-    if (
-        cache.key.requires_grad
-        or cache.value.requires_grad
-        or cache.key.grad_fn is not None
-        or cache.value.grad_fn is not None
-    ):
-        raise ValueError(f"{cache_name} cache key and value must be detached from autograd.")
-    return int(capacity)
 
 
 def _validate_metadata_integer(name: str, value: int | None, *, allow_none: bool = False) -> None:
@@ -262,19 +233,10 @@ class LingBotSelfAttention(nn.Module):
     def _validate_cache(
         self,
         cache: LingBotAttentionCache,
-        hidden_states: torch.Tensor,
         *,
         sink_tokens: int,
     ) -> None:
-        capacity = _validate_cache_storage(
-            cache,
-            batch_size=hidden_states.shape[0],
-            num_local_heads=self.num_local_heads,
-            head_dim=self.head_dim,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-            cache_name="Self-attention",
-        )
+        capacity = cache.key.shape[1]
         _validate_metadata_integer("end", cache.end)
         _validate_metadata_integer("absolute_end", cache.absolute_end)
         _validate_metadata_integer("last_start", cache.last_start, allow_none=True)
@@ -289,6 +251,7 @@ class LingBotSelfAttention(nn.Module):
         if cache.absolute_end < 0:
             raise ValueError("Self-attention cache absolute_end must be non-negative.")
 
+        # Cache layout: [permanent sink prefix | newest local-window tokens].
         if cache.last_start is None:
             if cache.end != 0 or cache.absolute_end != 0 or cache.sink_end != 0:
                 raise ValueError("An uninitialized self-attention cache must have zeroed metadata.")
@@ -413,8 +376,10 @@ class LingBotSelfAttention(nn.Module):
             raise ValueError("sink_tokens must be a non-negative integer.")
         if not isinstance(update_cache, bool):
             raise ValueError("update_cache must be a boolean.")
-        self._validate_cache(cache, hidden_states, sink_tokens=sink_tokens)
+        self._validate_cache(cache, sink_tokens=sink_tokens)
 
+        # Project logical [B, S, D] tokens into TP-local
+        # [B, S, num_local_heads, head_dim].
         query = self.norm_q(self.q(hidden_states))
         key = self.norm_k(self.k(hidden_states))
         value = self.v(hidden_states)
@@ -431,6 +396,8 @@ class LingBotSelfAttention(nn.Module):
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
 
+        # The attention kernel sees history + current K/V even when the caller
+        # asks not to mutate persistent cache state.
         visible_key, visible_value = self._update_cache(
             cache,
             key,
@@ -515,30 +482,6 @@ class LingBotCrossAttention(nn.Module):
             disable_kv_quant=True,
         )
 
-    def _validate_cache(self, cache: LingBotAttentionCache, hidden_states: torch.Tensor) -> None:
-        capacity = _validate_cache_storage(
-            cache,
-            batch_size=hidden_states.shape[0],
-            num_local_heads=self.num_local_heads,
-            head_dim=self.head_dim,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-            cache_name="Cross-attention",
-        )
-        _validate_metadata_integer("end", cache.end)
-        _validate_metadata_integer("absolute_end", cache.absolute_end)
-        _validate_metadata_integer("last_start", cache.last_start, allow_none=True)
-        _validate_metadata_integer("sink_end", cache.sink_end)
-
-        if not 1 <= cache.end <= capacity:
-            raise ValueError(f"Cross-attention cache end={cache.end} must be within [1, {capacity}].")
-        if cache.absolute_end != cache.end:
-            raise ValueError("Cross-attention cache absolute_end must equal end.")
-        if cache.last_start != 0:
-            raise ValueError("Cross-attention cache last_start must be zero.")
-        if cache.sink_end != 0:
-            raise ValueError("Cross-attention cache cannot contain sink tokens.")
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -548,12 +491,10 @@ class LingBotCrossAttention(nn.Module):
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         if hidden_states.ndim != 3:
             raise ValueError("Cross-attention hidden_states must be rank 3 [batch, tokens, dim].")
-        if cache is not None:
-            self._validate_cache(cache, hidden_states)
-
         query = self.norm_q(self.q(hidden_states))
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
 
+        # Text K/V is constant within a request and is projected once per layer.
         if cache is None:
             if encoder_hidden_states is None:
                 raise ValueError("encoder_hidden_states are required when the cross-attention cache is empty.")
@@ -680,6 +621,7 @@ class LingBotAttentionBlock(nn.Module):
         if token_count % num_frames != 0:
             raise ValueError("The patched token count must be divisible by the timestep frame count.")
         tokens_per_frame = token_count // num_frames
+        # Timestep, camera, and text remain separate conditioning paths.
         modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
         shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation.chunk(6, dim=2)
 
@@ -745,6 +687,7 @@ class _LingBotCameraPatchEmbedding(nn.Module):
         patch_frames, patch_height, patch_width = self.patch_size
         if frames % patch_frames or height % patch_height or width % patch_width:
             raise ValueError("camera_hidden_states dimensions must be divisible by patch_size.")
+        # Preserve Conv3d patch order while retaining checkpoint weight/bias names.
         hidden_states = hidden_states.reshape(
             batch_size,
             channels,
@@ -961,6 +904,12 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             self.register_buffer(f"_rope_{axis}_cosine", cosine, persistent=False)
             self.register_buffer(f"_rope_{axis}_sine", sine, persistent=False)
 
+    @property
+    def dtype(self) -> torch.dtype:
+        """Return the dtype used by the transformer parameters."""
+
+        return next(self.parameters()).dtype
+
     @classmethod
     def from_config(
         cls,
@@ -995,9 +944,41 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         unexpected = set(config) - constructor_keys - metadata_keys
         if unexpected:
             raise ValueError(f"Unexpected LingBot config keys: {sorted(unexpected)}")
+        missing = constructor_keys - set(config)
+        if missing:
+            raise ValueError(f"Missing LingBot checkpoint config keys: {sorted(missing)}")
+        if config.get("_class_name") != "CausalLingBotWorldTransformer3DModel":
+            raise ValueError(
+                "_class_name must be 'CausalLingBotWorldTransformer3DModel' for the LingBot World v2 checkpoint."
+            )
         kwargs = {name: value for name, value in config.items() if name in constructor_keys}
         if "patch_size" in kwargs:
             kwargs["patch_size"] = tuple(kwargs["patch_size"])
+        checkpoint_contract = {
+            "patch_size": (1, 2, 2),
+            "num_attention_heads": 40,
+            "attention_head_dim": 128,
+            "in_channels": 36,
+            "out_channels": 16,
+            "text_dim": 4096,
+            "freq_dim": 256,
+            "ffn_dim": 13824,
+            "num_layers": 40,
+            "cross_attn_norm": True,
+            "eps": 1e-6,
+            "image_dim": None,
+            "added_kv_proj_dim": None,
+            "rope_max_seq_len": 1024,
+            "pos_embed_seq_len": None,
+            "qk_norm": "rms_norm_across_heads",
+            "sink_size": 9,
+            "num_frames_per_block": 3,
+            "sliding_window_num_frames": 18,
+            "local_attn_size": -1,
+        }
+        for name, expected in checkpoint_contract.items():
+            if kwargs[name] != expected:
+                raise ValueError(f"LingBot checkpoint config {name} must be {expected!r}, got {kwargs[name]!r}.")
         return cls(**kwargs, quant_config=quant_config, prefix=prefix)
 
     def allocate_cache(
@@ -1023,6 +1004,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         ):
             raise ValueError("latent_height and latent_width must be positive integers.")
 
+        # Cache capacity is measured in post-patch tokens, not raw/latent
+        # pixels: window_frames * (latent_height/patch_h) * (latent_width/patch_w).
         patch_frames, patch_height, patch_width = self.config.patch_size
         if patch_frames != 1 or latent_height % patch_height or latent_width % patch_width:
             raise ValueError("latent height/width must align with the configured LingBot patch size.")
@@ -1223,20 +1206,9 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         patched_start_frame = start_frame // patch_frames
         current_start = patched_start_frame * tokens_per_frame
         sink_tokens = self.config.sink_size * tokens_per_frame
-        cache_window_frames = (
-            self.config.local_attn_size if self.config.local_attn_size != -1 else self.config.sliding_window_num_frames
-        )
-        expected_cache_tokens = cache_window_frames * tokens_per_frame
-        for index, layer_cache in enumerate(cache.self_attention):
-            if layer_cache.key.ndim != 4 or layer_cache.value.ndim != 4:
-                raise ValueError(f"Self-attention cache layer {index} must use rank-4 K/V storage.")
-            if layer_cache.key.shape[1] != expected_cache_tokens or layer_cache.value.shape[1] != expected_cache_tokens:
-                raise ValueError(
-                    f"Self-attention cache layer {index} capacity must be {expected_cache_tokens} tokens "
-                    f"for the configured causal window, got K={layer_cache.key.shape[1]} "
-                    f"and V={layer_cache.value.shape[1]}."
-                )
-
+        # Phase 1: create absolute 3D positions for this causal block. The
+        # spatial coordinates restart for every frame; temporal coordinates
+        # begin at ``start_frame`` so cached blocks retain their true ordering.
         rotary_emb = self._rotary_embedding(
             frames=patched_frames,
             height=patched_height,
@@ -1245,6 +1217,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        # Phase 2: independently patchify video and camera grids to identical
+        # token layouts, then project timestep and text conditions.
         hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
         camera_hidden_states = self.patch_embedding_wancamctrl(camera_hidden_states)
         camera_hidden_states = camera_hidden_states + self.c2ws_hidden_states_layer2(
@@ -1260,6 +1234,9 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             dtype=hidden_states.dtype,
         )
         encoder_hidden_states = self.text_embedding(encoder_hidden_states)
+        # Phase 3: each layer receives its own cache entry. Text K/V is passed
+        # only when absent; the returned cache is stored for subsequent DMD
+        # steps and causal blocks in this request.
         for index, block in enumerate(self.blocks):
             hidden_states, cross_cache = block(
                 hidden_states,
@@ -1275,6 +1252,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             )
             cache.cross_attention[index] = cross_cache
 
+        # Phase 4: map tokens to per-patch 16-channel flow values and restore
+        # [B, C, F, H, W] for the Pipeline's sampler update.
         hidden_states = self.head(hidden_states, timestep_embedding)
         return self._unpatchify(
             hidden_states,
@@ -1285,6 +1264,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load exact checkpoint names, delegating TP sharding to parameters."""
+
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         for name, loaded_weight in weights:

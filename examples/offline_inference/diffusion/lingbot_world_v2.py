@@ -45,7 +45,31 @@ class LingBotPaths:
     action_dir: Path
     action_root: Path
     action_relative: Path
+    camera_frames: int
     output: Path
+
+
+def _validate_camera_arrays(action_dir: Path) -> int:
+    """Validate the bounded camera contract before starting the engine."""
+
+    try:
+        poses = np.load(action_dir / "poses.npy", mmap_mode="r", allow_pickle=False)
+        intrinsics = np.load(action_dir / "intrinsics.npy", mmap_mode="r", allow_pickle=False)
+    except (OSError, TypeError, ValueError):
+        raise ValueError("Camera files must be valid numeric poses.npy and intrinsics.npy arrays.") from None
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        raise ValueError("poses.npy must have shape [frames, 4, 4].")
+    if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
+        raise ValueError("intrinsics.npy must have shape [frames, 4].")
+    if poses.shape[0] != intrinsics.shape[0]:
+        raise ValueError("poses.npy and intrinsics.npy must contain the same frame count.")
+    if not 1 <= poses.shape[0] <= _MAX_RAW_FRAMES:
+        raise ValueError("Camera arrays must contain between 1 and 117 frames.")
+    if poses.dtype.kind not in "fiu" or intrinsics.dtype.kind not in "fiu":
+        raise ValueError("Camera arrays must contain real numeric values.")
+    if not np.isfinite(poses).all() or not np.isfinite(intrinsics).all():
+        raise ValueError("Camera arrays must contain only finite values.")
+    return int(poses.shape[0])
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -98,6 +122,7 @@ def resolve_cli_paths(args: argparse.Namespace) -> LingBotPaths:
         raise ValueError("--action-dir must point to an existing directory.")
     if not all((action_dir / name).is_file() for name in ("poses.npy", "intrinsics.npy")):
         raise ValueError("--action-dir must contain poses.npy and intrinsics.npy.")
+    camera_frames = _validate_camera_arrays(action_dir)
 
     action_root = action_dir.parent.resolve()
     try:
@@ -113,6 +138,7 @@ def resolve_cli_paths(args: argparse.Namespace) -> LingBotPaths:
         action_dir=action_dir,
         action_root=action_root,
         action_relative=action_relative,
+        camera_frames=camera_frames,
         output=output,
     )
 
@@ -165,6 +191,8 @@ def build_request(
         raise ValueError("--num-frames must be a positive integer.")
     if args.num_frames > _MAX_RAW_FRAMES:
         raise ValueError("--num-frames must not exceed 117 raw frames.")
+    if args.num_frames > paths.camera_frames:
+        raise ValueError("Camera arrays must contain at least --num-frames frames.")
     if (args.num_frames - 1) % _TEMPORAL_COMPRESSION:
         raise ValueError("--num-frames must satisfy (num_frames - 1) divisible by 4.")
     latent_frames = (args.num_frames - 1) // _TEMPORAL_COMPRESSION + 1
@@ -213,7 +241,7 @@ def extract_video_array(outputs: Any) -> np.ndarray:
     if isinstance(images, list) and len(images) == 1:
         images = images[0]
 
-    video = np.asarray(images)
+    video: np.ndarray = np.asarray(images)
     if video.ndim == 5:
         if video.shape[0] != 1:
             raise ValueError(f"Expected one generated video, got batch shape {video.shape}.")

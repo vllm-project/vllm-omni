@@ -100,9 +100,11 @@ th {
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
 
 LingBot-World 2.0 v1 is limited to the 14B causal-fast checkpoint, one first-frame image plus a
-camera directory, fixed four-step DMD sampling, and request-local history. Its DiT path is TP-aware,
-but v1 does not support sequence/Ulysses parallelism, Cache-DiT/TeaCache, VAE parallelism,
-cross-request or streaming session state, runtime events, causal-pretrain, or the 1.3B checkpoint.
+camera directory, 9–117 raw frames in `9 + 12k` increments, fixed four-step DMD sampling, and
+request-local history. Its DiT path and local RMSNorm are TP-aware, but real-checkpoint TP=1 and
+TP>1 CUDA runs are still pending. v1 does not support SP/USP, pipeline or CFG parallelism, HSDP,
+VAE parallelism, quantization, Cache-DiT/TeaCache, cross-request or streaming session state,
+runtime events, causal-pretrain, or the 1.3B checkpoint.
 Camera directories consume only `poses.npy` and `intrinsics.npy`; any `wasd_action.npy` or
 `ijkl_action.npy` files are ignored rather than converted to runtime action events.
 The repository includes an opt-in H100/CUDA E2E entry; the table remains experimental until a

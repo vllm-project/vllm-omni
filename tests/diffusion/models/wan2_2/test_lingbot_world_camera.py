@@ -23,6 +23,7 @@ CameraTrajectory = _CAMERA_MODULE.CameraTrajectory
 build_plucker_embedding = _CAMERA_MODULE.build_plucker_embedding
 interpolate_camera_trajectory = _CAMERA_MODULE.interpolate_camera_trajectory
 load_camera_trajectory = _CAMERA_MODULE.load_camera_trajectory
+resolve_trusted_action_directory = _CAMERA_MODULE.resolve_trusted_action_directory
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -38,6 +39,10 @@ def _write_trajectory(
 ) -> None:
     np.save(directory / "poses.npy", poses)
     np.save(directory / "intrinsics.npy", intrinsics)
+
+
+def _trusted(directory: Path):
+    return resolve_trusted_action_directory(".", directory)
 
 
 def _trajectory(
@@ -56,7 +61,7 @@ def test_load_camera_trajectory_rejects_missing_files(tmp_path: Path, present_fi
 
     missing_file = "poses.npy" if present_file is None else "intrinsics.npy"
     with pytest.raises(FileNotFoundError, match=missing_file):
-        load_camera_trajectory(tmp_path)
+        load_camera_trajectory(_trusted(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -64,7 +69,7 @@ def test_load_camera_trajectory_rejects_missing_files(tmp_path: Path, present_fi
     [
         (np.zeros((2, 3, 4)), np.zeros((2, 4)), "poses.npy"),
         (_identity_poses(2), np.zeros((2, 3)), "intrinsics.npy"),
-        (_identity_poses(0), np.zeros((0, 4)), "at least one"),
+        (_identity_poses(0), np.zeros((0, 4)), "1 and 117"),
         (_identity_poses(2), np.zeros((1, 4)), "same number of frames"),
     ],
 )
@@ -77,7 +82,7 @@ def test_load_camera_trajectory_rejects_invalid_shapes(
     _write_trajectory(tmp_path, poses, intrinsics)
 
     with pytest.raises(ValueError, match=message):
-        load_camera_trajectory(tmp_path)
+        load_camera_trajectory(_trusted(tmp_path))
 
 
 @pytest.mark.parametrize("array_name", ["poses", "intrinsics"])
@@ -91,7 +96,7 @@ def test_load_camera_trajectory_rejects_non_finite_values(tmp_path: Path, array_
     _write_trajectory(tmp_path, poses, intrinsics)
 
     with pytest.raises(ValueError, match="finite"):
-        load_camera_trajectory(tmp_path)
+        load_camera_trajectory(_trusted(tmp_path))
 
 
 def test_load_camera_trajectory_preserves_raw_c2w_poses(tmp_path: Path) -> None:
@@ -115,12 +120,95 @@ def test_load_camera_trajectory_preserves_raw_c2w_poses(tmp_path: Path) -> None:
     intrinsics = np.array([[100.0, 110.0, 120.0, 130.0]] * 2)
     _write_trajectory(tmp_path, poses, intrinsics)
 
-    trajectory = load_camera_trajectory(tmp_path)
+    trajectory = load_camera_trajectory(_trusted(tmp_path))
 
     assert trajectory.poses.dtype == torch.float32
     assert trajectory.intrinsics.dtype == torch.float32
     torch.testing.assert_close(trajectory.poses, torch.from_numpy(poses).float())
     torch.testing.assert_close(trajectory.intrinsics, torch.from_numpy(intrinsics).float())
+
+
+def test_load_camera_trajectory_rejects_object_dtype_before_materializing(tmp_path: Path) -> None:
+    poses = _identity_poses(1).astype(object)
+    intrinsics = np.ones((1, 4), dtype=np.float32)
+    _write_trajectory(tmp_path, poses, intrinsics)
+
+    with pytest.raises(ValueError, match="poses.npy.*real numeric"):
+        load_camera_trajectory(_trusted(tmp_path))
+
+
+def test_load_camera_trajectory_rejects_frame_count_above_request_limit(tmp_path: Path) -> None:
+    _write_trajectory(
+        tmp_path,
+        _identity_poses(118),
+        np.ones((118, 4), dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="poses.npy.*1 and 117 frames"):
+        load_camera_trajectory(_trusted(tmp_path))
+
+
+def test_load_camera_trajectory_rejects_truncated_payload_before_loading(tmp_path: Path) -> None:
+    _write_trajectory(tmp_path, _identity_poses(1), np.ones((1, 4), dtype=np.float32))
+    poses_path = tmp_path / "poses.npy"
+    poses_path.write_bytes(poses_path.read_bytes()[:-1])
+
+    with pytest.raises(ValueError, match="poses.npy byte size"):
+        load_camera_trajectory(_trusted(tmp_path))
+
+
+def test_load_camera_trajectory_rejects_oversized_npy_header(tmp_path: Path) -> None:
+    header_size = 20_000
+    (tmp_path / "poses.npy").write_bytes(
+        np.lib.format.magic(2, 0) + header_size.to_bytes(4, "little") + b" " * (header_size - 1) + b"\n"
+    )
+    np.save(tmp_path / "intrinsics.npy", np.ones((1, 4), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="poses.npy.*oversized NPY header"):
+        load_camera_trajectory(_trusted(tmp_path))
+
+
+def test_load_camera_trajectory_rejects_symlink_swap_after_resolution(tmp_path: Path) -> None:
+    trusted_root = tmp_path / "trusted"
+    action_directory = trusted_root / "action"
+    outside = tmp_path / "outside"
+    action_directory.mkdir(parents=True)
+    outside.mkdir()
+    _write_trajectory(action_directory, _identity_poses(1), np.ones((1, 4), dtype=np.float32))
+    _write_trajectory(outside, _identity_poses(1), np.ones((1, 4), dtype=np.float32))
+    resolved = resolve_trusted_action_directory("action", trusted_root)
+    action_directory.rename(trusted_root / "original-action")
+    action_directory.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="securely open.*action directory"):
+        load_camera_trajectory(resolved)
+
+
+def test_load_camera_trajectory_rejects_symlinked_camera_file(tmp_path: Path) -> None:
+    trusted_root = tmp_path / "trusted"
+    action_directory = trusted_root / "action"
+    outside = tmp_path / "outside"
+    action_directory.mkdir(parents=True)
+    outside.mkdir()
+    _write_trajectory(action_directory, _identity_poses(1), np.ones((1, 4), dtype=np.float32))
+    np.save(outside / "poses.npy", _identity_poses(1))
+    resolved = resolve_trusted_action_directory("action", trusted_root)
+    (action_directory / "poses.npy").unlink()
+    (action_directory / "poses.npy").symlink_to(outside / "poses.npy")
+
+    with pytest.raises(ValueError, match="poses.npy.*opened securely"):
+        load_camera_trajectory(resolved)
+
+
+def test_load_camera_trajectory_ignores_non_camera_event_files(tmp_path: Path) -> None:
+    poses = _identity_poses(1)
+    intrinsics = np.ones((1, 4), dtype=np.float32)
+    _write_trajectory(tmp_path, poses, intrinsics)
+    np.save(tmp_path / "wasd_events.npy", np.array([{"key": "w"}], dtype=object))
+
+    trajectory = load_camera_trajectory(_trusted(tmp_path))
+
+    torch.testing.assert_close(trajectory.poses, torch.from_numpy(poses).float())
 
 
 def test_interpolate_camera_trajectory_uses_linear_and_spherical_interpolation() -> None:

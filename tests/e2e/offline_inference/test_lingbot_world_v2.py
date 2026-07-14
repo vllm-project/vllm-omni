@@ -36,8 +36,8 @@ def _make_assets(tmp_path: Path) -> tuple[Path, Path]:
     image.write_bytes(b"test image placeholder")
     action_dir = tmp_path / "trusted-actions" / "forward"
     action_dir.mkdir(parents=True)
-    np.save(action_dir / "poses.npy", np.eye(4, dtype=np.float32)[None])
-    np.save(action_dir / "intrinsics.npy", np.ones((1, 4), dtype=np.float32))
+    np.save(action_dir / "poses.npy", np.repeat(np.eye(4, dtype=np.float32)[None], 117, axis=0))
+    np.save(action_dir / "intrinsics.npy", np.ones((117, 4), dtype=np.float32))
     return image, action_dir
 
 
@@ -113,6 +113,7 @@ def test_resolve_paths_builds_a_canonical_trusted_action_root(tmp_path: Path) ->
     assert paths.action_dir == action_dir.resolve()
     assert paths.action_root == action_dir.parent.resolve()
     assert paths.action_relative == Path("forward")
+    assert paths.camera_frames == 117
     assert paths.output == (tmp_path / "outputs/clip.mp4").resolve()
 
 
@@ -132,6 +133,25 @@ def test_resolve_paths_requires_both_camera_arrays(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="poses.npy and intrinsics.npy"):
+        module.resolve_cli_paths(args)
+
+
+def test_resolve_paths_rejects_invalid_camera_shape_before_engine_start(tmp_path: Path) -> None:
+    module = _load_example()
+    image, action_dir = _make_assets(tmp_path)
+    np.save(action_dir / "poses.npy", np.zeros((9, 3, 4), dtype=np.float32))
+    args = module.parse_args(
+        [
+            "--prompt",
+            "move forward",
+            "--image",
+            str(image),
+            "--action-dir",
+            str(action_dir),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="poses.npy.*frames, 4, 4"):
         module.resolve_cli_paths(args)
 
 
