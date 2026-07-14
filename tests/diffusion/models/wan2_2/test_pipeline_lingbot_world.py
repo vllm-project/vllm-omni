@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import gc
 import importlib.util
-import math
 import sys
 import types
 import weakref
@@ -88,6 +87,11 @@ class _ProgressBarMixin:
                 return None
 
         yield _Bar()
+
+
+class _DiffusionPipelineProfilerMixin:
+    def setup_diffusion_pipeline_profiler(self, *, profiler_targets=None, enable_diffusion_pipeline_profiler=False):
+        self.profiler_setup = (tuple(profiler_targets or ()), enable_diffusion_pipeline_profiler)
 
 
 class _AutoWeightsLoader:
@@ -322,6 +326,7 @@ def _load_pipeline_module():
         "vllm_omni.diffusion.model_loader",
         "vllm_omni.diffusion.models",
         "vllm_omni.diffusion.models.wan2_2",
+        "vllm_omni.diffusion.profiler",
         "vllm_omni.diffusion.worker",
     ):
         stub_modules[package] = _make_package(package)
@@ -467,6 +472,10 @@ def _load_pipeline_module():
                 "vllm_omni.diffusion.models.progress_bar",
                 ProgressBarMixin=_ProgressBarMixin,
             ),
+            "vllm_omni.diffusion.profiler.diffusion_pipeline_profiler": _module(
+                "vllm_omni.diffusion.profiler.diffusion_pipeline_profiler",
+                DiffusionPipelineProfilerMixin=_DiffusionPipelineProfilerMixin,
+            ),
             "vllm_omni.diffusion.models.schedulers": _module(
                 "vllm_omni.diffusion.models.schedulers",
                 FlowUniPCMultistepScheduler=_FakeScheduler,
@@ -530,6 +539,7 @@ def _od_config(**overrides):
         "dtype": torch.float32,
         "flow_shift": None,
         "quantization_config": None,
+        "enable_diffusion_pipeline_profiler": False,
         "model_config": {"lingbot_action_root": str(_ROOT)},
         "parallel_config": SimpleNamespace(
             pipeline_parallel_size=1,
@@ -565,24 +575,24 @@ def _pipeline(module, *, transformer=None, od_config=None):
     return pipeline
 
 
+def test_pipeline_registers_lingbot_profiler_targets() -> None:
+    module = _load_pipeline_module()
+
+    pipeline = _pipeline(module, od_config=_od_config(enable_diffusion_pipeline_profiler=True))
+
+    assert isinstance(pipeline, _DiffusionPipelineProfilerMixin)
+    assert pipeline.profiler_setup == (
+        ("vae.encode", "vae.decode", "_generate_block", "text_encoder.forward", "tokenizer.forward"),
+        True,
+    )
+
+
 def _request(*, sampling=None, prompt=None, num_reqs: int = 1):
     return _RequestBatch(
         _prompt() if prompt is None else prompt,
         _SamplingParams() if sampling is None else sampling,
         num_reqs=num_reqs,
     )
-
-
-def _independent_sigma_oracle(timestep: int, *, flow_shift: float, num_train_timesteps: int = 1000) -> float:
-    """Scalar reference over the real FlowUniPC lattice, independent of production tensors."""
-
-    target = timestep / num_train_timesteps
-    shifted_lattice = []
-    for lattice_index in range(num_train_timesteps):
-        base_sigma = (num_train_timesteps - 1 - lattice_index) / num_train_timesteps
-        scaled_sigma = flow_shift * base_sigma
-        shifted_lattice.append(scaled_sigma / ((1.0 - base_sigma) + scaled_sigma))
-    return min(shifted_lattice, key=lambda sigma: abs(sigma - target))
 
 
 def _resolve_pipeline_through_real_registry(pipeline_module):
@@ -720,6 +730,15 @@ def test_unsupported_parallel_modes_fail_before_component_loading(field: str, va
 
     with pytest.raises(NotImplementedError, match=feature):
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
+
+    assert module._loader_state.prefetch_calls == []
+
+
+def test_unsupported_quantization_fails_before_component_loading() -> None:
+    module = _load_pipeline_module()
+
+    with pytest.raises(NotImplementedError, match="quantization"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=object()))
 
     assert module._loader_state.prefetch_calls == []
 
@@ -1239,77 +1258,70 @@ def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
 
     generator = torch.Generator(device="cpu").manual_seed(17)
     current = torch.randn((1, 16, 3, 2, 2), generator=generator)
-    for index, timestep in enumerate(module.LINGBOT_DMD_TIMESTEPS):
-        sigma = _independent_sigma_oracle(timestep, flow_shift=5.0)
+    warped_schedule = (
+        (1000.0, 1.0),
+        (937.5, 0.9375),
+        (2500.0 / 3.0, 5.0 / 6.0),
+        (625.0, 0.625),
+    )
+    for index, (_, sigma) in enumerate(warped_schedule):
         x0 = current - sigma
         if index + 1 < len(module.LINGBOT_DMD_TIMESTEPS):
-            next_sigma = _independent_sigma_oracle(module.LINGBOT_DMD_TIMESTEPS[index + 1], flow_shift=5.0)
+            next_sigma = warped_schedule[index + 1][1]
             noise = torch.randn(current.shape, generator=generator)
             current = (1.0 - next_sigma) * x0 + next_sigma * noise
         else:
             current = x0
     torch.testing.assert_close(result.output, current)
 
-    assert [int(call["timestep"].item()) for call in transformer.calls] == [1000, 750, 500, 250, 0]
+    torch.testing.assert_close(
+        torch.cat([call["timestep"] for call in transformer.calls]),
+        torch.tensor([*(timestep for timestep, _ in warped_schedule), 0.0]),
+    )
     assert [call["update_cache"] for call in transformer.calls] == [False, False, False, False, True]
     assert [call["start_frame"] for call in transformer.calls] == [0, 0, 0, 0, 0]
     assert len({call["cache_id"] for call in transformer.calls}) == 1
     torch.testing.assert_close(transformer.calls[-1]["hidden_states"][:, :16], result.output)
 
 
-@pytest.mark.parametrize("flow_shift", [5.0, 2.5])
-def test_dmd_sigma_lookup_matches_independent_oracle(flow_shift: float) -> None:
-    module = _load_pipeline_module()
-
-    lookup = module._build_shifted_flow_sigma_lookup(
-        flow_shift=flow_shift,
-        num_train_timesteps=1000,
-        timesteps=module.LINGBOT_DMD_TIMESTEPS,
-    )
-
-    expected = tuple(
-        _independent_sigma_oracle(timestep, flow_shift=flow_shift) for timestep in module.LINGBOT_DMD_TIMESTEPS
-    )
-    assert lookup == pytest.approx(expected, abs=1e-7)
-
-
 @pytest.mark.parametrize(
-    ("flow_shift", "expected"),
+    ("flow_shift", "expected_timesteps"),
     [
-        (5.0, (0.999799839872, 0.75, 0.500599520384, 0.251597444089)),
-        (2.5, (0.999599759856, 0.749656121045, 0.500349895031, 0.250637213254)),
+        (5.0, (1000.0, 937.5, 2500.0 / 3.0, 625.0)),
+        (2.5, (1000.0, 15000.0 / 17.0, 5000.0 / 7.0, 5000.0 / 11.0)),
     ],
 )
-def test_dmd_sigma_lookup_matches_flow_unipc_reference_values(flow_shift: float, expected) -> None:
+def test_request_flow_shift_warps_transformer_timesteps(flow_shift: float, expected_timesteps) -> None:
     module = _load_pipeline_module()
+    transformer = _RecordingTransformer()
+    pipeline = _pipeline(module, transformer=transformer)
 
-    lookup = module._build_shifted_flow_sigma_lookup(
-        flow_shift=flow_shift,
-        num_train_timesteps=1000,
-        timesteps=module.LINGBOT_DMD_TIMESTEPS,
+    pipeline(
+        _request(
+            sampling=_SamplingParams(extra_args={"action_path": ".", "flow_shift": flow_shift}),
+        )
     )
 
-    assert lookup == pytest.approx(expected, abs=1e-12)
-
-
-@pytest.mark.parametrize(
-    ("flow_shift", "expected"),
-    [
-        (1e-300, (9.99e-298, 9.99e-298, 9.99e-298, 9.99e-298)),
-        (1e300, (1.0, 1.0, 1.0, 0.0)),
-    ],
-)
-def test_dmd_sigma_lookup_stays_finite_for_extreme_finite_flow_shifts(flow_shift: float, expected) -> None:
-    module = _load_pipeline_module()
-
-    lookup = module._build_shifted_flow_sigma_lookup(
-        flow_shift=flow_shift,
-        num_train_timesteps=1000,
-        timesteps=module.LINGBOT_DMD_TIMESTEPS,
+    torch.testing.assert_close(
+        torch.cat([call["timestep"] for call in transformer.calls[:4]]),
+        torch.tensor(expected_timesteps),
     )
 
-    assert all(math.isfinite(sigma) and 0.0 <= sigma <= 1.0 for sigma in lookup)
-    assert lookup == pytest.approx(expected, rel=1e-12, abs=0.0)
+
+def test_request_tiny_positive_flow_shift_keeps_schedule_finite() -> None:
+    module = _load_pipeline_module()
+    transformer = _RecordingTransformer()
+    pipeline = _pipeline(module, transformer=transformer)
+
+    pipeline(
+        _request(
+            sampling=_SamplingParams(extra_args={"action_path": ".", "flow_shift": 1e-20}),
+        )
+    )
+
+    timesteps = torch.cat([call["timestep"] for call in transformer.calls[:4]])
+    assert torch.isfinite(timesteps).all()
+    assert timesteps[0].item() == 1000.0
 
 
 def test_request_flow_shift_override_has_precedence_without_mutating_scheduler() -> None:
@@ -1389,21 +1401,9 @@ def test_request_flow_shift_rejects_booleans_and_normalizes_integer_overflow(flo
         _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
 
 
-def test_flow_shift_is_request_local_and_sigma_lookup_is_built_once_per_request() -> None:
+def test_flow_shift_is_request_local_without_mutating_scheduler() -> None:
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
-    calls: list[float] = []
-    original_builder = module._build_shifted_flow_sigma_lookup
-
-    def recording_builder(*, flow_shift, num_train_timesteps, timesteps):
-        calls.append(flow_shift)
-        return original_builder(
-            flow_shift=flow_shift,
-            num_train_timesteps=num_train_timesteps,
-            timesteps=timesteps,
-        )
-
-    module._build_shifted_flow_sigma_lookup = recording_builder
 
     def generate(flow_shift=None):
         extra_args = {} if flow_shift is None else {"flow_shift": flow_shift}
@@ -1422,7 +1422,6 @@ def test_flow_shift_is_request_local_and_sigma_lookup_is_built_once_per_request(
     torch.testing.assert_close(default_before, default_after)
     assert not torch.equal(default_before, shifted_two)
     assert not torch.equal(shifted_two, shifted_seven)
-    assert calls == [5.0, 2.0, 7.0, 5.0]
     assert pipeline.scheduler.config.shift == 5.0
 
 
@@ -1470,7 +1469,11 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     assert result.output.shape == (1, 3, 21, 16, 16)
     assert len(transformer.calls) == 10
     assert [call["start_frame"] for call in transformer.calls] == [0] * 5 + [3] * 5
-    assert [int(call["timestep"].item()) for call in transformer.calls] == [1000, 750, 500, 250, 0] * 2
+    expected_timesteps = torch.tensor([1000.0, 937.5, 2500.0 / 3.0, 625.0, 0.0] * 2)
+    torch.testing.assert_close(
+        torch.cat([call["timestep"] for call in transformer.calls]),
+        expected_timesteps,
+    )
     assert len(allocations) == 1
     kwargs, cache_ref = allocations[0]
     assert kwargs == {

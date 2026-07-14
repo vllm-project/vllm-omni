@@ -20,6 +20,12 @@ _FIXTURE_PATH = Path(__file__).with_name("fixtures") / "lingbot_world_weight_ind
 _SHAPE_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "lingbot_world_official_shapes.json.fixture"
 
 
+@pytest.fixture(autouse=True)
+def _inference_context():
+    with torch.inference_mode():
+        yield
+
+
 def _tiny_model(
     module,
     *,
@@ -64,6 +70,42 @@ def _cache(module, model, *, max_tokens: int | None = None):
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
+
+
+def _checkpoint_parameter_specs(model) -> dict[str, tuple[torch.Size, torch.dtype]]:
+    specs: dict[str, tuple[torch.Size, torch.dtype]] = {}
+    for name, parameter in model.named_parameters():
+        marker = ".self_attn.qkv."
+        if marker not in name:
+            specs[name] = (parameter.shape, parameter.dtype)
+            continue
+        shard_shape = torch.Size((parameter.shape[0] // 3, *parameter.shape[1:]))
+        for projection in ("q", "k", "v"):
+            specs[name.replace(marker, f".self_attn.{projection}.")] = (shard_shape, parameter.dtype)
+    return specs
+
+
+def _checkpoint_weights_for_model(model) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    checkpoint_weights: dict[str, torch.Tensor] = {}
+    expected_parameters: dict[str, torch.Tensor] = {}
+    next_value = 1
+    for name, parameter in model.named_parameters():
+        marker = ".self_attn.qkv."
+        if marker not in name:
+            value = torch.full_like(parameter, next_value)
+            checkpoint_weights[name] = value
+            expected_parameters[name] = value
+            next_value += 1
+            continue
+        shards = []
+        shard_shape = (parameter.shape[0] // 3, *parameter.shape[1:])
+        for projection in ("q", "k", "v"):
+            value = torch.full(shard_shape, next_value, dtype=parameter.dtype, device=parameter.device)
+            checkpoint_weights[name.replace(marker, f".self_attn.{projection}.")] = value
+            shards.append(value)
+            next_value += 1
+        expected_parameters[name] = torch.cat(shards)
+    return checkpoint_weights, expected_parameters
 
 
 def _self_cache_snapshot(cache) -> list[tuple[torch.Tensor, torch.Tensor, tuple[int, int, int | None, int]]]:
@@ -332,6 +374,12 @@ def test_transformer_exposes_parameter_dtype_for_pipeline_runtime() -> None:
     assert model.dtype == next(model.parameters()).dtype
 
 
+def test_transformer_declares_regional_compile_block() -> None:
+    module = attention_tests._load_module()
+
+    assert module.CausalLingBotWorldTransformer3DModel._repeated_blocks == ["LingBotAttentionBlock"]
+
+
 def test_lingbot_rms_norm_uses_global_tp_square_mean(monkeypatch) -> None:
     module = attention_tests._load_module()
     reduced_values: list[torch.Tensor] = []
@@ -467,37 +515,46 @@ def test_from_config_rejects_checkpoint_topology_drift(field: str, value: object
         module.CausalLingBotWorldTransformer3DModel.from_config(config)
 
 
-def test_from_config_rejects_unknown_checkpoint_fields() -> None:
+def test_from_config_ignores_non_semantic_checkpoint_metadata() -> None:
     module = attention_tests._load_module()
+    config = {
+        "_class_name": "CausalLingBotWorldTransformer3DModel",
+        "architectures": ["CausalLingBotWorldTransformer3DModel"],
+        "future_diffusers_metadata": {"version": 1},
+    }
 
-    with pytest.raises(ValueError, match="unknown_field"):
-        module.CausalLingBotWorldTransformer3DModel.from_config({"unknown_field": 1})
+    with torch.device("meta"):
+        model = module.CausalLingBotWorldTransformer3DModel.from_config(config)
+
+    assert model.config.in_channels == 36
+    assert model.config.num_layers == 40
 
 
 def test_load_weights_uses_parameter_loaders_and_rejects_unknown_model_keys() -> None:
     module = attention_tests._load_module()
     model = _tiny_model(module, num_layers=1)
-    expected = {name: torch.full_like(param, index + 1) for index, (name, param) in enumerate(model.named_parameters())}
-    loader_calls = []
-    q_weight = model.blocks[0].self_attn.q.weight
+    checkpoint_weights, expected_parameters = _checkpoint_weights_for_model(model)
+    loader_calls: list[str] = []
+    qkv_weight = model.blocks[0].self_attn.qkv.weight
 
-    def record_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        loader_calls.append(param)
-        param.data.copy_(loaded_weight)
+    def record_loader(param: torch.Tensor, loaded_weight: torch.Tensor, shard_id: str) -> None:
+        loader_calls.append(shard_id)
+        shard_index = {"q": 0, "k": 1, "v": 2}[shard_id]
+        shard_size = param.shape[0] // 3
+        param.data.narrow(0, shard_index * shard_size, shard_size).copy_(loaded_weight)
 
-    q_weight.weight_loader = record_loader
-    loaded = model.load_weights(iter(expected.items()))
+    qkv_weight.weight_loader = record_loader
+    loaded = model.load_weights(iter(checkpoint_weights.items()))
 
-    assert loaded == set(expected)
-    assert loader_calls == [q_weight]
+    assert loaded == set(checkpoint_weights)
+    assert loader_calls == ["q", "k", "v"]
     for name, param in model.named_parameters():
-        torch.testing.assert_close(param, expected[name])
+        torch.testing.assert_close(param, expected_parameters[name])
 
-    first_name = next(iter(expected))
+    first_name = next(iter(checkpoint_weights))
     partial = _tiny_model(module, num_layers=1)
-    partial_loaded = partial.load_weights([(first_name, expected[first_name])])
+    partial_loaded = partial.load_weights([(first_name, checkpoint_weights[first_name])])
     assert partial_loaded == {first_name}
-    assert set(dict(partial.named_parameters())) - partial_loaded
 
     with pytest.raises(KeyError, match="unexpected_model.weight"):
         model.load_weights([("unexpected_model.weight", torch.ones(1))])
@@ -520,7 +577,7 @@ def test_checkpoint_weight_index_fixture_matches_model_namespaces() -> None:
     module = attention_tests._load_module()
     fixture = json.loads(_FIXTURE_PATH.read_text())
     model = _tiny_model(module, num_layers=1)
-    parameter_names = set(dict(model.named_parameters()))
+    parameter_names = set(_checkpoint_parameter_specs(model))
 
     assert {name.split(".", 1)[0] for name in parameter_names} == set(fixture["top_level_modules"])
     assert {name for name in parameter_names if not name.startswith("blocks.")} == set(fixture["non_block_parameters"])
@@ -551,12 +608,13 @@ def test_official_default_shapes_match_public_safetensors_header_fixture() -> No
 
     with torch.device("meta"):
         model = module.CausalLingBotWorldTransformer3DModel()
-    parameters = dict(model.named_parameters())
+    parameter_specs = _checkpoint_parameter_specs(model)
     expected_dtype = {"F32": torch.float32}[fixture["dtype"]]
 
     assert len(fixture["shard_representatives"]) == 8
     assert set(fixture["shard_representatives"].values()) <= set(fixture["parameter_shapes"])
 
     for name, expected_shape in fixture["parameter_shapes"].items():
-        assert tuple(parameters[name].shape) == tuple(expected_shape), name
-        assert parameters[name].dtype == expected_dtype
+        shape, dtype = parameter_specs[name]
+        assert tuple(shape) == tuple(expected_shape), name
+        assert dtype == expected_dtype

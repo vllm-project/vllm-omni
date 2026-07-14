@@ -18,10 +18,12 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.conv import Conv3dLayer
+from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 
 
@@ -118,42 +120,6 @@ def _projection_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
 
-def _validate_metadata_integer(name: str, value: int | None, *, allow_none: bool = False) -> None:
-    if allow_none and value is None:
-        return
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f"Cache metadata {name} must be an integer{' or None' if allow_none else ''}.")
-
-
-def _validate_current_start(current_start: int) -> None:
-    if not isinstance(current_start, int) or isinstance(current_start, bool):
-        raise ValueError("current_start must be a non-boolean integer.")
-    if current_start < 0:
-        raise ValueError(f"current_start must be non-negative, got {current_start}.")
-
-
-def _select_rotary_chunk(
-    rotary_emb: tuple[torch.Tensor, torch.Tensor],
-    *,
-    current_start: int,
-    chunk_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    def select(table: torch.Tensor) -> torch.Tensor:
-        current_token_count = table.numel() // table.shape[-1]
-        if current_token_count == chunk_tokens:
-            return table
-        if table.ndim == 2 and table.shape[0] >= current_start + chunk_tokens:
-            return table.narrow(0, current_start, chunk_tokens)
-        if table.ndim == 3 and table.shape[0] == 1 and table.shape[1] >= current_start + chunk_tokens:
-            return table.narrow(1, current_start, chunk_tokens)
-        raise ValueError(
-            "Rotary embeddings must describe the current chunk or provide a flat table covering its token offset."
-        )
-
-    cos, sin = rotary_emb
-    return select(cos), select(sin)
-
-
 class LingBotSelfAttention(nn.Module):
     """Block-causal self-attention over retained history and one full chunk."""
 
@@ -179,34 +145,16 @@ class LingBotSelfAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.num_local_heads = num_heads // tp_size
+        self.qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            bias=True,
+            prefix=_projection_prefix(prefix, "qkv"),
+        )
+        self.num_local_heads = self.qkv.num_heads
         self.tp_inner_dim = self.num_local_heads * self.head_dim
         self.sink_tokens = sink_tokens
-
-        self.q = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            prefix=_projection_prefix(prefix, "q"),
-        )
-        self.k = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            prefix=_projection_prefix(prefix, "k"),
-        )
-        self.v = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            return_bias=False,
-            prefix=_projection_prefix(prefix, "v"),
-        )
         self.o = RowParallelLinear(
             dim,
             dim,
@@ -230,43 +178,6 @@ class LingBotSelfAttention(nn.Module):
             skip_sequence_parallel=True,
         )
 
-    def _validate_cache(
-        self,
-        cache: LingBotAttentionCache,
-        *,
-        sink_tokens: int,
-    ) -> None:
-        capacity = cache.key.shape[1]
-        _validate_metadata_integer("end", cache.end)
-        _validate_metadata_integer("absolute_end", cache.absolute_end)
-        _validate_metadata_integer("last_start", cache.last_start, allow_none=True)
-        _validate_metadata_integer("sink_end", cache.sink_end)
-
-        if not 0 <= cache.end <= capacity:
-            raise ValueError(f"Self-attention cache end={cache.end} must be within [0, {capacity}].")
-        if not 0 <= cache.sink_end <= cache.end:
-            raise ValueError("Self-attention cache sink_end must be within the retained cache span.")
-        if cache.sink_end > sink_tokens:
-            raise ValueError("Self-attention cache sink_end exceeds the configured sink token count.")
-        if cache.absolute_end < 0:
-            raise ValueError("Self-attention cache absolute_end must be non-negative.")
-
-        # Cache layout: [permanent sink prefix | newest local-window tokens].
-        if cache.last_start is None:
-            if cache.end != 0 or cache.absolute_end != 0 or cache.sink_end != 0:
-                raise ValueError("An uninitialized self-attention cache must have zeroed metadata.")
-            return
-
-        if cache.last_start < 0:
-            raise ValueError("Self-attention cache last_start must be non-negative.")
-        if cache.absolute_end <= cache.last_start:
-            raise ValueError("Self-attention cache absolute_end must follow last_start.")
-        if cache.end == 0 or cache.end > cache.absolute_end:
-            raise ValueError("Initialized self-attention cache physical end is inconsistent with its absolute end.")
-        latest_chunk_tokens = cache.absolute_end - cache.last_start
-        if latest_chunk_tokens > cache.end:
-            raise ValueError("Self-attention cache no longer retains the complete latest chunk.")
-
     def _update_cache(
         self,
         cache: LingBotAttentionCache,
@@ -277,10 +188,6 @@ class LingBotSelfAttention(nn.Module):
         sink_tokens: int,
         update_cache: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        _validate_current_start(current_start)
-        if key.shape[1] == 0:
-            raise ValueError("The current attention chunk must contain at least one token.")
-
         chunk_tokens = key.shape[1]
         capacity = cache.key.shape[1]
         previous_end = cache.end
@@ -345,12 +252,11 @@ class LingBotSelfAttention(nn.Module):
 
         next_end = next_key.shape[1]
         if update_cache:
-            with torch.no_grad():
-                cache.key[:, :next_end].copy_(next_key.detach())
-                cache.value[:, :next_end].copy_(next_value.detach())
-                if next_end < previous_end:
-                    cache.key[:, next_end:previous_end].zero_()
-                    cache.value[:, next_end:previous_end].zero_()
+            cache.key[:, :next_end].copy_(next_key)
+            cache.value[:, :next_end].copy_(next_value)
+            if next_end < previous_end:
+                cache.key[:, next_end:previous_end].zero_()
+                cache.value[:, next_end:previous_end].zero_()
             cache.end = next_end
             cache.absolute_end = current_start + chunk_tokens
             cache.last_start = current_start
@@ -367,32 +273,21 @@ class LingBotSelfAttention(nn.Module):
         sink_tokens: int | None = None,
         update_cache: bool = True,
     ) -> torch.Tensor:
-        if hidden_states.ndim != 3:
-            raise ValueError("Self-attention hidden_states must be rank 3 [batch, tokens, dim].")
-        _validate_current_start(current_start)
         if sink_tokens is None:
             sink_tokens = self.sink_tokens
-        if not isinstance(sink_tokens, int) or isinstance(sink_tokens, bool) or sink_tokens < 0:
-            raise ValueError("sink_tokens must be a non-negative integer.")
-        if not isinstance(update_cache, bool):
-            raise ValueError("update_cache must be a boolean.")
-        self._validate_cache(cache, sink_tokens=sink_tokens)
 
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
-        query = self.norm_q(self.q(hidden_states))
-        key = self.norm_k(self.k(hidden_states))
-        value = self.v(hidden_states)
+        qkv, _ = self.qkv(hidden_states)
+        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
+        query = self.norm_q(query)
+        key = self.norm_k(key)
 
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
         key = key.unflatten(2, (self.num_local_heads, self.head_dim))
         value = value.unflatten(2, (self.num_local_heads, self.head_dim))
         if rotary_emb is not None:
-            cos, sin = _select_rotary_chunk(
-                rotary_emb,
-                current_start=current_start,
-                chunk_tokens=hidden_states.shape[1],
-            )
+            cos, sin = rotary_emb
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
 
@@ -489,8 +384,6 @@ class LingBotCrossAttention(nn.Module):
         *,
         cache: LingBotAttentionCache | None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
-        if hidden_states.ndim != 3:
-            raise ValueError("Cross-attention hidden_states must be rank 3 [batch, tokens, dim].")
         query = self.norm_q(self.q(hidden_states))
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
 
@@ -498,26 +391,13 @@ class LingBotCrossAttention(nn.Module):
         if cache is None:
             if encoder_hidden_states is None:
                 raise ValueError("encoder_hidden_states are required when the cross-attention cache is empty.")
-            if encoder_hidden_states.ndim != 3:
-                raise ValueError("encoder_hidden_states must be rank 3 [batch, tokens, dim].")
-            if encoder_hidden_states.shape[0] != hidden_states.shape[0]:
-                raise ValueError("encoder_hidden_states batch size must match hidden_states.")
-            if encoder_hidden_states.shape[1] == 0:
-                raise ValueError("encoder_hidden_states must contain at least one token.")
-            if encoder_hidden_states.shape[2] != self.dim:
-                raise ValueError(f"encoder_hidden_states width must equal dim={self.dim}.")
-            if encoder_hidden_states.device != hidden_states.device:
-                raise ValueError("encoder_hidden_states device must match hidden_states.")
-            if encoder_hidden_states.dtype != hidden_states.dtype:
-                raise ValueError("encoder_hidden_states dtype must match hidden_states.")
             key = self.norm_k(self.k(encoder_hidden_states))
             value = self.v(encoder_hidden_states)
             key = key.unflatten(2, (self.num_local_heads, self.head_dim))
             value = value.unflatten(2, (self.num_local_heads, self.head_dim))
             cache = LingBotAttentionCache(
-                # The request cache owns its storage independently of encoder activations.
-                key=key.detach().clone(),
-                value=value.detach().clone(),
+                key=key,
+                value=value,
                 end=key.shape[1],
                 absolute_end=key.shape[1],
                 last_start=0,
@@ -547,7 +427,7 @@ class LingBotAttentionBlock(nn.Module):
         super().__init__()
         ffn_dim = ffn_dim or dim * 4
         self.dim = dim
-        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm1 = LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.self_attn = LingBotSelfAttention(
             dim,
             num_heads,
@@ -561,8 +441,8 @@ class LingBotAttentionBlock(nn.Module):
             eps=eps,
             prefix=_projection_prefix(prefix, "cross_attn"),
         )
-        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(dim, eps=eps) if cross_attn_norm else nn.Identity()
+        self.norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm3 = LayerNorm(dim, eps=eps) if cross_attn_norm else nn.Identity()
         self.ffn = nn.Sequential(
             ColumnParallelLinear(
                 dim,
@@ -712,7 +592,7 @@ class _LingBotHead(nn.Module):
         eps: float,
     ) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm = LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.head = nn.Linear(dim, out_channels * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / math.sqrt(dim))
 
@@ -760,6 +640,8 @@ def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
 class CausalLingBotWorldTransformer3DModel(nn.Module):
     """Checkpoint-compatible causal LingBot World video transformer."""
 
+    _repeated_blocks = ["LingBotAttentionBlock"]
+    packed_modules_mapping = {"qkv": ["q", "k", "v"]}
     _layerwise_offload_blocks_attrs = ["blocks"]
 
     def __init__(
@@ -844,9 +726,9 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             local_attn_size=local_attn_size,
         )
 
-        self.patch_embedding = nn.Conv3d(
-            in_channels,
-            dim,
+        self.patch_embedding = Conv3dLayer(
+            in_channels=in_channels,
+            out_channels=dim,
             kernel_size=patch_size,
             stride=patch_size,
         )
@@ -918,42 +800,6 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         quant_config: Any | None = None,
         prefix: str = "",
     ) -> Self:
-        metadata_keys = {"_class_name", "_diffusers_version"}
-        constructor_keys = {
-            "patch_size",
-            "num_attention_heads",
-            "attention_head_dim",
-            "in_channels",
-            "out_channels",
-            "text_dim",
-            "freq_dim",
-            "ffn_dim",
-            "num_layers",
-            "cross_attn_norm",
-            "eps",
-            "image_dim",
-            "added_kv_proj_dim",
-            "rope_max_seq_len",
-            "pos_embed_seq_len",
-            "qk_norm",
-            "sink_size",
-            "num_frames_per_block",
-            "sliding_window_num_frames",
-            "local_attn_size",
-        }
-        unexpected = set(config) - constructor_keys - metadata_keys
-        if unexpected:
-            raise ValueError(f"Unexpected LingBot config keys: {sorted(unexpected)}")
-        missing = constructor_keys - set(config)
-        if missing:
-            raise ValueError(f"Missing LingBot checkpoint config keys: {sorted(missing)}")
-        if config.get("_class_name") != "CausalLingBotWorldTransformer3DModel":
-            raise ValueError(
-                "_class_name must be 'CausalLingBotWorldTransformer3DModel' for the LingBot World v2 checkpoint."
-            )
-        kwargs = {name: value for name, value in config.items() if name in constructor_keys}
-        if "patch_size" in kwargs:
-            kwargs["patch_size"] = tuple(kwargs["patch_size"])
         checkpoint_contract = {
             "patch_size": (1, 2, 2),
             "num_attention_heads": 40,
@@ -976,9 +822,18 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             "sliding_window_num_frames": 18,
             "local_attn_size": -1,
         }
+        class_name = config.get("_class_name")
+        if class_name is not None and class_name != "CausalLingBotWorldTransformer3DModel":
+            raise ValueError(
+                "_class_name must be 'CausalLingBotWorldTransformer3DModel' for the LingBot World v2 checkpoint."
+            )
+        kwargs = {name: value for name, value in config.items() if name in checkpoint_contract}
+        if "patch_size" in kwargs:
+            kwargs["patch_size"] = tuple(kwargs["patch_size"])
         for name, expected in checkpoint_contract.items():
-            if kwargs[name] != expected:
-                raise ValueError(f"LingBot checkpoint config {name} must be {expected!r}, got {kwargs[name]!r}.")
+            actual = kwargs.get(name, expected)
+            if actual != expected:
+                raise ValueError(f"LingBot checkpoint config {name} must be {expected!r}, got {actual!r}.")
         return cls(**kwargs, quant_config=quant_config, prefix=prefix)
 
     def allocate_cache(
@@ -1268,20 +1123,34 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
 
         params = dict(self.named_parameters())
         loaded: set[str] = set()
-        for name, loaded_weight in weights:
+        qkv_mapping = (("q", "q"), ("k", "k"), ("v", "v"))
+        for checkpoint_name, loaded_weight in weights:
+            name = checkpoint_name
+            shard_id = None
+            for projection_name, projection_shard in qkv_mapping:
+                marker = f".self_attn.{projection_name}."
+                if marker in name:
+                    name = name.replace(marker, ".self_attn.qkv.")
+                    shard_id = projection_shard
+                    break
             if name not in params:
-                raise KeyError(f"Unexpected LingBot model weight name: {name}")
+                raise KeyError(f"Unexpected LingBot model weight name: {checkpoint_name}")
             param = params[name]
             weight_loader = getattr(param, "weight_loader", None)
             if weight_loader is not None:
-                weight_loader(param, loaded_weight)
+                if shard_id is None:
+                    weight_loader(param, loaded_weight)
+                else:
+                    weight_loader(param, loaded_weight, shard_id)
             else:
+                if shard_id is not None:
+                    raise RuntimeError(f"Fused LingBot QKV parameter {name} has no stacked weight loader.")
                 if param.shape != loaded_weight.shape:
                     raise ValueError(
-                        f"Weight shape mismatch for {name}: parameter={tuple(param.shape)}, "
+                        f"Weight shape mismatch for {checkpoint_name}: parameter={tuple(param.shape)}, "
                         f"checkpoint={tuple(loaded_weight.shape)}."
                     )
                 with torch.no_grad():
                     param.copy_(loaded_weight)
-            loaded.add(name)
+            loaded.add(checkpoint_name)
         return loaded
