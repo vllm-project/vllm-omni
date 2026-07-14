@@ -1,0 +1,213 @@
+[
+    {
+        "test_name": "test_cosmos3_t2i_official_demo_2gpu",
+        "description": "Cosmos3-Nano text-to-image official demo workload on 2 GPUs",
+        "server_type": "vllm-omni",
+        "benchmark_endpoint": "/v1/images/generations",
+        "server_params": {
+            "model": "nvidia/Cosmos3-Nano",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "use-hsdp": true,
+                "hsdp-shard-size": 2,
+                "vae-patch-parallel-size": 2,
+                "vae-use-tiling": true,
+                "model-class-name": "Cosmos3OmniDiffusersPipeline",
+                "no-guardrails": true,
+                "stage-init-timeout": 900,
+                "init-timeout": 1200,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "1024x1024_steps4",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 1024,
+                "height": 1024,
+                "num-inference-steps": 4,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "seed": 42,
+                "extra-body": {
+                    "guidance_scale": 7.0,
+                    "flow_shift": 3.0,
+                    "guardrails": false
+                },
+                "baseline": {
+                    "throughput_qps": 1.107,
+                    "latency_mean": 0.8929,
+                    "peak_memory_mb_mean": 80000.0
+                }
+            }
+        ]
+    },
+    {
+        "test_name": "test_cosmos3_t2v_official_demo_2gpu",
+        "description": "Cosmos3-Nano text-to-video official demo workload on 2 GPUs",
+        "server_type": "vllm-omni",
+        "benchmark_endpoint": "/v1/videos",
+        "server_params": {
+            "model": "nvidia/Cosmos3-Nano",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "use-hsdp": true,
+                "hsdp-shard-size": 2,
+                "vae-patch-parallel-size": 2,
+                "vae-use-tiling": true,
+                "model-class-name": "Cosmos3OmniDiffusersPipeline",
+                "no-guardrails": true,
+                "stage-init-timeout": 900,
+                "init-timeout": 1200,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "1280x720_frames189_steps4",
+                "dataset": "random",
+                "task": "t2v",
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "seed": 42,
+                "random-request-config": [
+                    {
+                        "width": 1280,
+                        "height": 720,
+                        "prompt": "A robot arm is cleaning a plate in the kitchen.",
+                        "num_inference_steps": 4,
+                        "num_frames": 189,
+                        "fps": 24,
+                        "weight": 1
+                    }
+                ],
+                "extra-body": {
+                    "guidance_scale": 6.0,
+                    "flow_shift": 10.0,
+                    "max_sequence_length": 4096,
+                    "guardrails": false,
+                    "use_resolution_template": false,
+                    "use_duration_template": false
+                },
+                "baseline": {
+                    "throughput_qps": 0.027,
+                    "latency_mean": 36.6824,
+                    "peak_memory_mb_mean": 30155.4
+                }
+            }
+        ]
+    },
+    {
+        "test_name": "test_cosmos3_i2v_official_demo_2gpu",
+        "description": "Cosmos3-Nano image-to-video official demo workload on 2 GPUs",
+        "server_type": "vllm-omni",
+        "benchmark_endpoint": "/v1/videos",
+        "server_params": {
+            "model": "nvidia/Cosmos3-Nano",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "use-hsdp": true,
+                "hsdp-shard-size": 2,
+                "vae-patch-parallel-size": 2,
+                "vae-use-tiling": true,
+                "model-class-name": "Cosmos3OmniDiffusersPipeline",
+                "no-guardrails": true,
+                "stage-init-timeout": 900,
+                "init-timeout": 1200,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "1280x720_frames189_steps4",
+                "dataset": "random",
+                "task": "i2v",
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "num-input-images": 1,
+                "seed": 42,
+                "random-request-config": [
+                    {
+                        "width": 1280,
+                        "height": 720,
+                        "prompt": "The scene comes to life with smooth, natural motion.",
+                        "num_inference_steps": 4,
+                        "num_frames": 189,
+                        "fps": 24,
+                        "weight": 1
+                    }
+                ],
+                "extra-body": {
+                    "guidance_scale": 6.0,
+                    "flow_shift": 10.0,
+                    "max_sequence_length": 4096,
+                    "guardrails": false
+                },
+                "baseline": {
+                    "throughput_qps": 0.027,
+                    "latency_mean": 36.968,
+                    "peak_memory_mb_mean": 30443.6
+                }
+            }
+        ]
+    },
+    {
+        "test_name": "test_cosmos3_v2v_official_demo_2gpu",
+        "description": "Cosmos3-Nano video-to-video official demo workload on 2 GPUs",
+        "server_type": "vllm-omni",
+        "benchmark_endpoint": "/v1/videos",
+        "server_params": {
+            "model": "nvidia/Cosmos3-Nano",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "use-hsdp": true,
+                "hsdp-shard-size": 2,
+                "vae-patch-parallel-size": 2,
+                "vae-use-tiling": true,
+                "model-class-name": "Cosmos3OmniDiffusersPipeline",
+                "no-guardrails": true,
+                "stage-init-timeout": 900,
+                "init-timeout": 1200,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "1280x720_frames189_steps4",
+                "dataset": "random",
+                "task": "v2v",
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "seed": 42,
+                "random-request-config": [
+                    {
+                        "width": 1280,
+                        "height": 720,
+                        "prompt": "Continue the same scene with smooth natural motion.",
+                        "num_inference_steps": 4,
+                        "num_frames": 189,
+                        "fps": 24,
+                        "weight": 1
+                    }
+                ],
+                "extra-body": {
+                    "guidance_scale": 6.0,
+                    "flow_shift": 10.0,
+                    "max_sequence_length": 4096,
+                    "guardrails": false,
+                    "condition_frame_indexes_vision": [
+                        0,
+                        1
+                    ],
+                    "condition_video_keep": "first"
+                },
+                "baseline": {
+                    "throughput_qps": 0.027,
+                    "latency_mean": 37.2117,
+                    "peak_memory_mb_mean": 30135.6
+                }
+            }
+        ]
+    }
+]
