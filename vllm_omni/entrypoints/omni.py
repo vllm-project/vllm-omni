@@ -143,12 +143,13 @@ class Omni(OmniBase):
                 req_state.metrics = metrics
                 self.request_states[req_id] = req_state
 
-                # PD disaggregation: modify stage-0 (prefill) sampling params per request
+                # For PD disaggregation: select the prefill stage and rewrite its sampling params for this request.
                 req_sp_list = list(sampling_params_list)
-                pd_pair = self._get_pd_separation_pair()
-                if pd_pair is not None:
-                    p_id = pd_pair[0]
+                bound_prefill_stage_id: int | None = None
+                if self._get_pd_decode_id() is not None and self._get_pd_prefill_ids():
+                    p_id = self._pick_prefill_stage()
                     req_sp_list[p_id] = self._prepare_prefill_sampling_params(req_id, req_sp_list[p_id])
+                    bound_prefill_stage_id = p_id
 
                 self.engine.add_request(
                     request_id=req_id,
@@ -156,6 +157,7 @@ class Omni(OmniBase):
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id,
                     final_output_stage_ids=final_output_stage_ids,
+                    bound_prefill_stage_id=bound_prefill_stage_id,
                 )
                 submit_ts = time.time()
                 req_state.metrics.stage_first_ts[0] = submit_ts

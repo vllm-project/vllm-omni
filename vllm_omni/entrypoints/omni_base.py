@@ -210,6 +210,32 @@ class OmniBase(PDDisaggregationMixin):
         )
 
         # PD disaggregation state (detects if a prefill/decode stage pair is configured)
+        # Optional: pre-read ``pd_prefill_pick_strategy`` and (for 1P-N-D /
+        # M-P-N-D) ``pd_decode_pick_strategy`` from the deploy YAML (both
+        # are strings, top-level) so PD pipelines can configure the
+        # prefill / decode selectors without touching env vars.  Failures
+        # here are silent: ``_resolve_pd_*_pick_strategy`` falls back to
+        # the ``VLLM_OMNI_PD_*_PICK_STRATEGY`` env var and finally to the
+        # ``round_robin`` default.
+        try:
+            cfg_path = getattr(self.engine, "config_path", None)
+            if cfg_path:
+                import yaml as _yaml
+
+                with open(cfg_path) as _f:
+                    _raw = _yaml.safe_load(_f) or {}
+                strategy = _raw.get("pd_prefill_pick_strategy")
+                if strategy:
+                    self._pd_prefill_pick_strategy_override = str(strategy)
+                decode_strategy = _raw.get("pd_decode_pick_strategy")
+                if decode_strategy:
+                    self._pd_decode_pick_strategy_override = str(decode_strategy)
+        except Exception as _e:  # noqa: BLE001
+            logger.debug(
+                "[%s] could not pre-read pd_*_pick_strategy from deploy YAML: %s",
+                self.__class__.__name__,
+                _e,
+            )
         self._init_pd_state()
 
     @property

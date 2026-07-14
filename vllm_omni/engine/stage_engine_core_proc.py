@@ -103,7 +103,21 @@ class StageEngineCoreProc(EngineCoreProc):
 
             stage_label = f"stage{omni_stage_id}" if omni_stage_id is not None else "noid"
             set_death_signal(signal.SIGTERM)
-            set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
+            # NOTE: only append the "_DP{n}" suffix when this replica actually
+            # spans multiple intra-replica vLLM DP ranks (data_parallel_size > 1).
+            # StageEngineCoreProcManager follows the same rule when naming the
+            # multiprocessing.Process — keeping this in sync avoids a confusing
+            # OS-level process title (e.g. "..._DP0") for the common 1-DP-rank
+            # case, which looks like an extra process was spawned when in fact
+            # it is just this stage's single replica.
+            vllm_config = kwargs.get("vllm_config")
+            has_intra_replica_dp = bool(
+                vllm_config is not None and getattr(vllm_config.parallel_config, "data_parallel_size", 1) > 1
+            )
+            proc_title = f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}"
+            if has_intra_replica_dp:
+                proc_title += f"_DP{dp_rank}"
+            set_process_title(proc_title)
             decorate_logs()
             # Workaround for flashinfer/jit-cache version mismatch in CI.
             # The parent process handles this gracefully via ring_globals.py,

@@ -1,0 +1,212 @@
+# Qwen3-TTS 1P1D :PD deploy: Talker prefill → Talker decode → Code2Wav。
+# 第二阶段：把 Code2Wav 接到 PD pipeline 后端，让 /v1/audio/speech
+# 直接返回 wav 字节流（不再需要外部 token2wav 服务）。
+#
+# 拓扑（K=1 prefill + 1 decode + 1 code2wav，2 卡同机，故意把 prefill 和
+# code2wav 放在同一张卡上省卡；decode 独占一张卡）：
+#   stage 0 = Qwen3-TTS Talker (prefill-only, GPU 0, kv_producer)
+#   stage 1 = Qwen3-TTS Talker (decode-only,  GPU 1, kv_consumer)
+#   stage 2 = Qwen3-TTS Code2Wav                (GPU 0, 与 stage 0 共卡, final_output=audio)
+#
+# 与 qwen3_tts.yaml 的差异：
+#   * 把原 stage 0 (talker) 拆成 prefill+decode 两段；
+#   * 两段都加 kv_transfer_config（producer / consumer + 唯一 bootstrap_port）；
+#   * decode stage engine_input_source 指向 prefill stage（PD KV transfer）；
+#   * code2wav 阶段对应改成 stage 2，input_connector 指向 decode；
+#   * decode → code2wav 通过 SharedMemoryConnector + async_chunk 流式传 audio_codes；
+#   * code2wav 的字段（model_stage / model_arch / worker_type / scheduler_cls /
+#     final_output / final_output_type=audio）显式补齐。
+#
+# ❗ 与 3p1d / 1p3d 一致：stage_args 顶层不会把顶层 "connectors" 折叠进
+# runtime.connectors（只有 "stages" 顶层才会），引用式会报
+# "Undefined connector reference" 并退回默认参数、丢掉 codec 流式配置。
+# 因此下面 stage 的 output_connectors / input_connectors 直接用 **inline
+# 定义**（非引用），确保 codec_streaming / codec_chunk_frames / … 生效。
+#
+# 引擎参数对齐 3p1d（gpu_mem=0.6, talker max_num_batched_tokens=4096,
+# code2wav=65536）。1P1D 只有 1 个 P + 1 个 D，P/D 的采样参数、最大请求数、
+# token 都取一致（3p1d 里 P/D 本来不一样，1P1D 可以一样）。
+
+async_chunk: true
+
+stage_args:
+  # ============================================================
+  # Stage 0: Talker PREFILL-only (GPU 0, kv_producer, port 25201)
+  # ============================================================
+  - stage_id: 0
+    stage_type: llm
+    is_prefill_only: true
+    is_comprehension: true
+    runtime:
+      devices: "0"
+      env:
+        # ⚠️ vllm MooncakeConnector 仅读子进程 env VLLM_MOONCAKE_BOOTSTRAP_PORT
+        # 决定 bootstrap server 端口; kv_connector_extra_config.mooncake_bootstrap_port
+        # 仅供 vllm-omni 构造 remote_bootstrap_addr 使用, 必须一致.
+        VLLM_MOONCAKE_BOOTSTRAP_PORT: 25201
+        VLLM_HOST_IP: "127.0.0.1"
+    engine_args:
+      max_num_seqs: 256
+      model_stage: qwen3_tts
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      hf_overrides:
+        architectures: [Qwen3TTSTalkerForConditionalGeneration]
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.5
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false   # PD 与 prefix caching 互斥
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      tensor_parallel_size: 1
+      kv_transfer_config:
+        kv_connector: "MooncakeConnector"
+        kv_role: "kv_producer"
+        kv_rank: 0
+        kv_parallel_size: 2              # 1 prefill + 1 decode = 2
+        kv_ip: "127.0.0.1"
+        kv_connector_extra_config:
+          mooncake_bootstrap_port: 25201
+    final_output: false
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 4096
+      detokenize: true
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+
+  # ============================================================
+  # Stage 1: Talker DECODE-only (GPU 1, kv_consumer, port 25202)
+  # ============================================================
+  - stage_id: 1
+    stage_type: llm
+    is_decode_only: true
+    runtime:
+      devices: "1"
+      env:
+        VLLM_MOONCAKE_BOOTSTRAP_PORT: 25202
+        VLLM_HOST_IP: "127.0.0.1"
+    engine_args:
+      max_num_seqs: 256
+      model_stage: qwen3_tts
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      hf_overrides:
+        architectures: [Qwen3TTSTalkerForConditionalGeneration]
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.6
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      tensor_parallel_size: 1
+      # Talker decode → Code2Wav async-chunk feeder：每生成一段 audio_codes
+      # 就推到 SharedMemoryConnector，由 stage 2 的 code2wav 增量消费。
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+      kv_transfer_config:
+        kv_connector: "MooncakeConnector"
+        kv_role: "kv_consumer"
+        kv_rank: 1
+        kv_parallel_size: 2
+        kv_ip: "127.0.0.1"
+        kv_connector_extra_config:
+          mooncake_bootstrap_port: 25202
+    engine_input_source: [0]
+    final_output: false
+    output_connectors:
+      to_stage_2:
+        name: SharedMemoryConnector
+        extra:
+          shm_threshold_bytes: 65536
+          codec_streaming: true
+          connector_get_sleep_s: 0.01
+          connector_get_max_wait_first_chunk: 3000
+          connector_get_max_wait: 300
+          codec_chunk_frames: 25
+          codec_left_context_frames: 72
+          initial_codec_chunk_frames: 1
+          decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 4096
+      # NOTE: no fixed default seed here -- see the stage-0 comment above.
+      detokenize: true
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+
+  # ============================================================
+  # Stage 2: Code2Wav (GPU 0, 与 stage 0 prefill 共卡, final_output=audio)
+  # ============================================================
+  - stage_id: 2
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      max_num_seqs: 128
+      model_stage: code2wav
+      model_arch: Qwen3TTSCode2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.5
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      distributed_executor_backend: "mp"
+      # Codec prefill length is Q * num_frames (~16 * 2148 = 34368)；
+      # max_num_batched_tokens 必须 ≥ 34368，65536 留出 headroom。
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+      tensor_parallel_size: 1
+    engine_input_source: [1]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_1:
+        name: SharedMemoryConnector
+        extra:
+          shm_threshold_bytes: 65536
+          codec_streaming: true
+          connector_get_sleep_s: 0.01
+          connector_get_max_wait_first_chunk: 3000
+          connector_get_max_wait: 300
+          codec_chunk_frames: 25
+          codec_left_context_frames: 72
+          initial_codec_chunk_frames: 1
+          decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: false
+      repetition_penalty: 1.0
+
+edges:
+  - from: 0
+    to: 1
+  - from: 1
+    to: 2

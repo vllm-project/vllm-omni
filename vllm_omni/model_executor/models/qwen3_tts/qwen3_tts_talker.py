@@ -1089,6 +1089,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         top_p: float | None = None,
         generator: torch.Generator | None = None,
         generators: Sequence[torch.Generator | None] | None = None,
+        code_predictor_override: nn.Module | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
@@ -1119,7 +1120,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if top_p is None:
             top_p = float(subtalker_params.get("top_p", 1.0))
 
-        audio_codes = self.code_predictor(
+        code_predictor = code_predictor_override if code_predictor_override is not None else self.code_predictor
+        audio_codes = code_predictor(
             layer0_code=input_ids.reshape(bsz, 1),
             layer0_embed=last_id_hidden,
             last_talker_hidden=past_hidden,

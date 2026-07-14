@@ -484,3 +484,28 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+# Patch MooncakeConnector globally for PD disaggregation.
+def _patch_mooncake_connector_for_pd():
+    try:
+        from vllm_omni.distributed.kv_transfer.mooncake_pd_patch import (
+            apply_mooncake_connector_patch,
+        )
+
+        apply_mooncake_connector_patch()
+    except ImportError:
+        pass
+    except Exception:
+        # Patch failure is non-fatal for non-PD deployments; PD deployments
+        # will surface it later as "Missing remote_request_id".
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "Failed to apply MooncakeConnector PD patch at vllm_omni import; "
+            "PD KV transfer will fail with 'Missing remote_request_id' if used.",
+            exc_info=True,
+        )
+
+
+_patch_mooncake_connector_for_pd()

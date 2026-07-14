@@ -27,6 +27,8 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     request_timestamp: float
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
+    # M-P-N-D PD: caller-side picked prefill stage index.
+    bound_prefill_stage_id: int | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

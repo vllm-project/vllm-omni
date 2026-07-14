@@ -58,6 +58,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+        omni_kv_config = getattr(model_config, "omni_kv_config", None)
+        if not isinstance(omni_kv_config, dict):
+            omni_kv_config = {}
+        self._configured_from_stage = self._coerce_stage_id(omni_kv_config.get("omni_from_stage"))
+        self._configured_to_stage = self._coerce_stage_id(omni_kv_config.get("omni_to_stage"))
+
+        raw_sources = omni_kv_config.get("engine_input_source") or []
+        source_candidates: list[int] = []
+        for src in raw_sources:
+            coerced = self._coerce_stage_id(src)
+            if coerced is not None and coerced not in source_candidates:
+                source_candidates.append(coerced)
+        self._source_stage_candidates: list[int] = source_candidates
+        self._pinned_source_stage: dict[str, int] = {}
+
+        self._is_pd_decode_consumer = False
+        self._is_pd_prefill_producer = False
+        try:
+            kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+            if kv_transfer_config is not None:
+                kv_role = getattr(kv_transfer_config, "kv_role", None)
+                if kv_role == "kv_consumer":
+                    self._is_pd_decode_consumer = True
+                elif kv_role == "kv_producer":
+                    self._is_pd_prefill_producer = True
+        except Exception:
+            self._is_pd_decode_consumer = False
+            self._is_pd_prefill_producer = False
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -88,6 +116,55 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+
+    @staticmethod
+    def _coerce_stage_id(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _request_source_stage_id_optional(self, request: Request) -> int | None:
+        """Return the explicit ``omni_source_stage_id`` on a request, or None.
+
+        Unlike :meth:`_request_source_stage_id` this never falls back to a
+        default; callers use ``None`` to trigger fan-in source discovery.
+        """
+        info = getattr(request, "additional_information", None)
+        if info is not None and not isinstance(info, dict):
+            try:
+                from vllm_omni.engine.serialization import deserialize_additional_information
+
+                info = deserialize_additional_information(info)
+            except Exception:
+                info = None
+        if isinstance(info, dict):
+            value = info.get("omni_source_stage_id")
+            if isinstance(value, list) and value:
+                value = value[0]
+            return self._coerce_stage_id(value)
+        return None
+
+    def _request_source_stage_id(self, request: Request, default: int) -> int:
+        info = getattr(request, "additional_information", None)
+        if info is not None and not isinstance(info, dict):
+            try:
+                from vllm_omni.engine.serialization import deserialize_additional_information
+
+                info = deserialize_additional_information(info)
+            except Exception:
+                info = None
+        parsed_result: int | None = None
+        if isinstance(info, dict):
+            value = info.get("omni_source_stage_id")
+            if isinstance(value, list) and value:
+                value = value[0]
+            parsed_result = self._coerce_stage_id(value)
+        if parsed_result is None:
+            return default
+        return parsed_result
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -129,6 +206,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         receive loop to poll.
 
         Stage-0 has no upstream producer, so this call is a no-op there.
+        PD-decode consumer stages also skip: their inputs come via the
+        mooncake KV pull path, not the chunk connector.
 
         Args:
             request: The request object needing data.
@@ -136,6 +215,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         stage_id = self.connector.stage_id
 
         if stage_id == 0:
+            return
+        if self._is_pd_decode_consumer:
+            return
+        if self._is_pd_prefill_producer:
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
@@ -194,22 +277,39 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
-        target_stage_id = stage_id - 1
+        configured_from = self._configured_from_stage if self._configured_from_stage is not None else stage_id - 1
         req_id = request.request_id
         chunk_id = self.get_req_chunk[req_id]
         external_req_id = self.request_ids_mapping.get(req_id, req_id)
-        connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
-        # Use timeout=0 for non-blocking poll
-        try:
-            result = self.connector.get(
-                str(target_stage_id),
-                str(stage_id),
-                connector_get_key,
-            )
-        except Exception as e:
-            logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
-            return False
+        explicit_source = self._request_source_stage_id_optional(request)
+        pinned_source = self._pinned_source_stage.get(req_id)
+        if explicit_source is not None:
+            poll_targets = [explicit_source]
+        elif pinned_source is not None:
+            poll_targets = [pinned_source]
+        elif len(self._source_stage_candidates) > 1:
+            poll_targets = list(self._source_stage_candidates)
+        else:
+            poll_targets = [configured_from]
+
+        result = None
+        for candidate in poll_targets:
+            candidate_key = f"{external_req_id}_{candidate}_{chunk_id}"
+            try:
+                candidate_result = self.connector.get(
+                    str(candidate),
+                    str(stage_id),
+                    candidate_key,
+                )
+            except Exception as e:
+                logger.error(f"SharedMemoryConnector get failed for req {candidate_key}: {e}")
+                continue
+            if candidate_result is not None:
+                result = candidate_result
+                if pinned_source is None:
+                    self._pinned_source_stage[req_id] = candidate
+                break
 
         if result is None:
             return False
@@ -223,7 +323,21 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
             if self.model_mode == "ar":
-                request.additional_information = payload_data
+                from vllm_omni.engine.serialization import deserialize_additional_information
+
+                prev_info = getattr(request, "additional_information", None)
+                if prev_info is not None and not isinstance(prev_info, dict):
+                    prev_info = deserialize_additional_information(prev_info)
+                merged_info: dict = dict(prev_info) if isinstance(prev_info, dict) else {}
+                for key, value in payload_data.items():
+                    if isinstance(value, dict):
+                        existing_sub = merged_info.get(key)
+                        sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                        sub.update(value)
+                        merged_info[key] = sub
+                    else:
+                        merged_info[key] = value
+                request.additional_information = merged_info
                 if chunk_id > 0 and request.resumable:
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
@@ -286,7 +400,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
-            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
 
         return False
@@ -298,7 +411,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
         stage_id = self.connector.stage_id
-        next_stage_id = stage_id + 1
+        next_stage_id = self._configured_to_stage if self._configured_to_stage is not None else stage_id + 1
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
@@ -394,6 +507,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
+        self._pinned_source_stage.pop(request_id, None)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
@@ -465,6 +579,24 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         (unguarded) behaviour.
         """
         if self.connector.stage_id == 0:
+            return
+
+        # PD-decode consumer stages get their inputs from mooncake KV pull,
+        # not from chunk connector. Skip the whole park-into-WAITING_FOR_CHUNK
+        # path for them; otherwise the request is trapped in a poll loop and
+        # KV transfer never fires (dead-lock).
+        if self._is_pd_decode_consumer:
+            return
+
+        # PD prefill producer stages (non-zero prefill siblings in M-P-1-D) are
+        # round-robin parallel ENTRIES: the orchestrator feeds each the original
+        # prompt directly and their KV leaves via mooncake. They receive NO
+        # chunks. Without this guard, stage 1/2 get parked into
+        # WAITING_FOR_CHUNK polling ``<req>_<self>_0`` forever (num_scheduled=0,
+        # never runs prefill, never emits KV -> decode never picked -> hang).
+        # stage-0 is already covered by the ``stage_id == 0`` guard above; this
+        # extends the same treatment to the other prefill producers.
+        if self._is_pd_prefill_producer:
             return
 
         # Purge deque entries whose request was freed mid-flight (abort →
