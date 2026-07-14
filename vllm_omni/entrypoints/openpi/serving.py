@@ -122,7 +122,7 @@ class ServingRealtimeRobotOpenPI:
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
         # Build request, run inference through AsyncOmni
-        request = self._build_request(obs, session_id=session_id, reset=reset)
+        request = self.build_request(obs, session_id=session_id, reset=reset)
         result = None
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
         # exposes an async iterator, so consume it to completion and use the
@@ -140,6 +140,10 @@ class ServingRealtimeRobotOpenPI:
 
     def _next_request_id(self, session_id: str) -> str:
         return f"robot-{session_id}-{next(self._request_counter)}"
+
+    def build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:
+        """Build an engine request from raw robot obs."""
+        return self._build_request(obs, session_id=session_id, reset=reset)
 
     def _build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:
         """Build engine request from raw robot obs.

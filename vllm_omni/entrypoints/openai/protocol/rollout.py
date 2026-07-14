@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 class Observation(BaseModel):
     """Single-step robot observation."""
 
-    images: dict[str, list] | None = Field(
+    images: dict[str, list | str] | None = Field(
         default=None,
         description="Named camera images as nested float lists (H, W, C) or base64 strings.",
     )
@@ -80,8 +80,7 @@ class CreateSessionResponse(BaseModel):
 class RolloutStepRequest(BaseModel):
     step_id: int = Field(ge=0, description="Monotonically increasing per session.")
     observation: Observation
-    action: Action | None = Field(
-        default=None,
+    action: Action = Field(
         description="Required for world_model_env: executed action that produced this observation.",
     )
     use_session_context: bool = True

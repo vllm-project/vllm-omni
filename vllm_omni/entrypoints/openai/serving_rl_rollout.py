@@ -5,7 +5,6 @@
 P0 scope: world_model_env mode, single-session, DreamZero backbone.
 
 # Assumption: action -> obs folding
-# ─────────────────────────────────
 # DreamZero's diffusion pass jointly denoises (video_latent, action_latent)
 # from random noise; it does NOT accept an action as a conditioning input at
 # inference time. For world_model_env the client-provided Action is therefore
@@ -80,10 +79,18 @@ def _encode_video_output(video: Any) -> dict[str, Any]:
     """Encode raw video tensor / ndarray to a JSON-serialisable dict."""
     if video is None:
         return {}
+    if hasattr(video, "detach") and callable(video.detach):
+        video = video.detach()
+    if hasattr(video, "cpu") and callable(video.cpu):
+        video = video.cpu()
     if hasattr(video, "numpy"):
         video = video.numpy()
     if isinstance(video, np.ndarray):
-        return {"video": base64.b64encode(video.tobytes()).decode(), "shape": list(video.shape)}
+        return {
+            "video": base64.b64encode(video.tobytes()).decode(),
+            "shape": list(video.shape),
+            "dtype": str(video.dtype),
+        }
     return {"video": str(video)}
 
 
@@ -159,6 +166,7 @@ class ServingRLRollout:
             return self._error_response(
                 req.step_id,
                 -1,
+                0,
                 "session_not_found",
                 f"Session {session_id!r} does not exist.",
             )
@@ -166,6 +174,7 @@ class ServingRLRollout:
             return self._error_response(
                 req.step_id,
                 -1,
+                0,
                 "session_closed",
                 f"Session {session_id!r} is closed.",
             )
@@ -181,35 +190,58 @@ class ServingRLRollout:
         t0 = time.perf_counter()
         committed = session.committed_step_id
 
+        if req.use_session_context:
+            expected_step_id = committed + 1
+            if req.step_id != expected_step_id:
+                if req.step_id <= committed:
+                    code = "step_already_committed"
+                    message = (
+                        f"Step {req.step_id} is already committed; "
+                        f"highest committed step is {committed}."
+                    )
+                else:
+                    code = "step_out_of_order"
+                    message = f"Expected step_id {expected_step_id}, got {req.step_id}."
+                return self._error_response(
+                    req.step_id,
+                    committed,
+                    session.context_length,
+                    code,
+                    message,
+                )
+
         # reset=True on first call after session create/reset
-        is_first_step = committed == -1
+        reset = committed == -1 or not req.use_session_context
         robot_obs = _merge_action_into_obs(req.observation, req.action)
 
         try:
             video_out = await self._infer_world_model(
                 obs=robot_obs,
                 session_id=session.session_id,
-                reset=is_first_step,
+                reset=reset,
             )
         except Exception as exc:
             logger.exception("Step %d failed for session %s", req.step_id, session.session_id)
-            # Do NOT advance committed_step_id on failure (§6.5 atomic commit).
+            # Do NOT advance committed_step_id on failure (RFC section 6.5).
             return self._error_response(
                 req.step_id,
                 committed,
+                session.context_length,
                 "inference_error",
                 str(exc),
             )
 
-        # Only advance committed_step_id on success.
-        await self._store.advance(session.session_id, req.step_id)
+        if req.use_session_context:
+            # Only advance committed_step_id on successful contextual steps.
+            await self._store.advance(session.session_id, req.step_id)
+            committed = req.step_id
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         metadata = SessionMetadata(
             latency_ms=round(latency_ms, 2),
             steps_generated=1,
             session_context_length=session.context_length,
-            committed_step_id=req.step_id,
+            committed_step_id=committed,
         )
         return RolloutStepResponse(
             step_id=req.step_id,
@@ -226,12 +258,12 @@ class ServingRLRollout:
     ) -> Any:
         """Call the engine and return the video (next-observation) output.
 
-        Reuses ServingRealtimeRobotOpenPI._build_request() so request routing,
+        Reuses ServingRealtimeRobotOpenPI.build_request() so request routing,
         session_id threading, and OmniDiffusionSamplingParams construction are
         identical to the policy_inference path. Only the output extraction
         differs: we pull multimodal_output["video"] instead of ["actions"].
         """
-        request = self._openpi._build_request(obs, session_id=session_id, reset=reset)
+        request = self._openpi.build_request(obs, session_id=session_id, reset=reset)
         result = None
         async for output in self._openpi.engine_client.generate(
             prompt=request.prompts[0],
@@ -263,13 +295,14 @@ class ServingRLRollout:
     def _error_response(
         step_id: int,
         committed_step_id: int,
+        session_context_length: int,
         code: str,
         message: str,
     ) -> RolloutStepResponse:
         metadata = SessionMetadata(
             latency_ms=0.0,
             steps_generated=0,
-            session_context_length=0,
+            session_context_length=session_context_length,
             committed_step_id=committed_step_id,
         )
         return RolloutStepResponse(

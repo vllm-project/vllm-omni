@@ -29,7 +29,9 @@ from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 
 def _make_fake_result(video: Any = None) -> MagicMock:
     result = MagicMock()
-    result.multimodal_output = {"video": video or np.zeros((1, 3, 64, 64), dtype=np.float32)}
+    if video is None:
+        video = np.zeros((1, 3, 64, 64), dtype=np.float32)
+    result.multimodal_output = {"video": video}
     return result
 
 
@@ -43,7 +45,7 @@ def _make_openpi(video: Any = None, raises: Exception | None = None):
         yield _make_fake_result(video)
 
     openpi.engine_client.generate = _generate
-    openpi._build_request = MagicMock(
+    openpi.build_request = MagicMock(
         return_value=MagicMock(
             prompts=[""],
             request_id="test-req",
@@ -88,7 +90,7 @@ async def test_close_session(serving):
 
 
 # ---------------------------------------------------------------------------
-# Step â€” success path
+# Step - success path
 # ---------------------------------------------------------------------------
 
 
@@ -138,10 +140,59 @@ async def test_next_observation_present_on_success(serving):
     resp = await serving.step(sess.session_id, req)
     assert resp.next_observation is not None
     assert "video" in resp.next_observation
+    assert resp.next_observation["dtype"] == "float32"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_step_does_not_rerun_or_advance(serving):
+    sess = await serving.create_session(CreateSessionRequest(model="dreamzero", mode="world_model_env"))
+    req = RolloutStepRequest(step_id=0, observation=Observation(), action=Action())
+    assert (await serving.step(sess.session_id, req)).error is None
+
+    resp = await serving.step(sess.session_id, req)
+
+    assert resp.error is not None
+    assert resp.error.code == "step_already_committed"
+    assert resp.model_metadata.committed_step_id == 0
+    assert resp.model_metadata.session_context_length == 1
+    serving._openpi.build_request.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_out_of_order_step_does_not_rerun_or_advance(serving):
+    sess = await serving.create_session(CreateSessionRequest(model="dreamzero", mode="world_model_env"))
+    req = RolloutStepRequest(step_id=2, observation=Observation(), action=Action())
+
+    resp = await serving.step(sess.session_id, req)
+
+    assert resp.error is not None
+    assert resp.error.code == "step_out_of_order"
+    assert resp.model_metadata.committed_step_id == -1
+    assert resp.model_metadata.session_context_length == 0
+    serving._openpi.build_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stateless_step_does_not_commit_context(serving):
+    sess = await serving.create_session(CreateSessionRequest(model="dreamzero", mode="world_model_env"))
+    req = RolloutStepRequest(
+        step_id=7,
+        observation=Observation(),
+        action=Action(),
+        use_session_context=False,
+    )
+
+    resp = await serving.step(sess.session_id, req)
+
+    assert resp.error is None
+    assert resp.model_metadata.committed_step_id == -1
+    assert resp.model_metadata.session_context_length == 0
+    serving._openpi.build_request.assert_called_once()
+    assert serving._openpi.build_request.call_args.kwargs["reset"] is True
 
 
 # ---------------------------------------------------------------------------
-# Step â€” failure path: committed_step_id must NOT advance
+# Step - failure path: committed_step_id must NOT advance
 # ---------------------------------------------------------------------------
 
 
@@ -167,17 +218,18 @@ async def test_failed_step_after_success_preserves_last_committed():
     # Step 0 succeeds
     await good_serving.step(sess.session_id, RolloutStepRequest(step_id=0, observation=Observation(), action=Action()))
 
-    # Swap engine to failing one â€” reuse the same store via internal reference
+    # Swap engine to failing one - reuse the same store via internal reference
     good_serving._openpi = _make_openpi(raises=RuntimeError("oops"))
     resp = await good_serving.step(
         sess.session_id, RolloutStepRequest(step_id=1, observation=Observation(), action=Action())
     )
     assert resp.error is not None
     assert resp.model_metadata.committed_step_id == 0  # still at last good step
+    assert resp.model_metadata.session_context_length == 1
 
 
 # ---------------------------------------------------------------------------
-# Step â€” unknown session
+# Step - unknown session
 # ---------------------------------------------------------------------------
 
 
@@ -205,7 +257,7 @@ async def test_reset_clears_committed_step_id(serving):
 
 
 # ---------------------------------------------------------------------------
-# action â†’ obs folding (module assumption)
+# action -> obs folding (module assumption)
 # ---------------------------------------------------------------------------
 
 

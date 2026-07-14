@@ -5,7 +5,7 @@
 Each RolloutSession holds a per-session asyncio.Lock so that concurrent step
 requests for the same session are serialised. committed_step_id advances only
 on successful step completion; failed or timed-out steps leave it unchanged,
-preserving the atomic-context-commit guarantee from §6.5 of the RFC.
+preserving the atomic-context-commit guarantee from section 6.5 of the RFC.
 """
 
 from __future__ import annotations
@@ -21,6 +21,10 @@ class RolloutSessionNotFoundError(KeyError):
 
 
 class RolloutSessionClosedError(RuntimeError):
+    pass
+
+
+class RolloutSessionStepError(ValueError):
     pass
 
 
@@ -69,13 +73,16 @@ class RolloutSessionStore:
         return session
 
     async def close(self, session_id: str) -> None:
-        session = self._sessions.get(session_id)
-        if session is not None:
-            session.closed = True
+        session = await self.get(session_id)
+        session.closed = True
 
     async def advance(self, session_id: str, step_id: int) -> None:
         """Commit a successfully completed step. Called only on success."""
-        session = self._sessions.get(session_id)
-        if session is not None:
-            session.committed_step_id = step_id
-            session.context_length += 1
+        session = await self.get(session_id)
+        expected_step_id = session.committed_step_id + 1
+        if step_id != expected_step_id:
+            raise RolloutSessionStepError(
+                f"Expected step_id {expected_step_id}, got {step_id}."
+            )
+        session.committed_step_id = step_id
+        session.context_length += 1
