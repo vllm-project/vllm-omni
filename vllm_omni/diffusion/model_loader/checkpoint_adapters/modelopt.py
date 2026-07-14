@@ -127,6 +127,7 @@ class ModelOptFp8CheckpointAdapter:
 
         for candidate in self._weights_mapper.apply_list([name]):
             if candidate != name and candidate in self._loadable_tensors:
+                # Preserve shard names so downstream packed-weight loaders can route them.
                 return candidate, name
         return None, name
 
@@ -290,7 +291,7 @@ class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
                 if name.endswith(self._PRE_QUANT_SCALE_SUFFIX):
                     raise ValueError(
                         f"ModelOpt NVFP4 checkpoint tensor {name!r} is unsupported: "
-                        "vLLM does not consume pre_quant_scale. Export the checkpoint "
+                        "vLLM 0.25.0 does not consume pre_quant_scale. Export the checkpoint "
                         "with pre-quant scales folded into the weights."
                     )
                 yield name, tensor
