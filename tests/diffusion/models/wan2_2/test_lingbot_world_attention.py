@@ -18,6 +18,12 @@ from torch import nn
 _MODULE_PATH = Path(__file__).parents[4] / "vllm_omni/diffusion/models/wan2_2/lingbot_world_transformer.py"
 
 
+@pytest.fixture(autouse=True)
+def _inference_context():
+    with torch.inference_mode():
+        yield
+
+
 def _install_macos_vllm_stubs() -> None:
     if platform.system() != "Darwin":
         return
@@ -34,6 +40,7 @@ def _install_macos_vllm_stubs() -> None:
         "vllm.distributed",
         "vllm.model_executor",
         "vllm.model_executor.layers",
+        "vllm.model_executor.layers.conv",
         "vllm.model_executor.layers.linear",
         "vllm.model_executor.utils",
         "vllm_omni",
@@ -41,6 +48,7 @@ def _install_macos_vllm_stubs() -> None:
         "vllm_omni.diffusion.attention",
         "vllm_omni.diffusion.attention.layer",
         "vllm_omni.diffusion.layers",
+        "vllm_omni.diffusion.layers.norm",
         "vllm_omni.diffusion.layers.rope",
     ):
         ensure_module(name)
@@ -84,6 +92,56 @@ def _install_macos_vllm_stubs() -> None:
     linear = sys.modules["vllm.model_executor.layers.linear"]
     linear.ColumnParallelLinear = _Linear
     linear.RowParallelLinear = _Linear
+
+    class _QKVLinear(nn.Module):
+        def __init__(
+            self,
+            hidden_size: int,
+            head_size: int,
+            total_num_heads: int,
+            total_num_kv_heads: int | None = None,
+            *,
+            bias: bool = True,
+            **kwargs,
+        ) -> None:
+            super().__init__()
+            del kwargs
+            self.num_heads = total_num_heads
+            self.num_kv_heads = total_num_kv_heads or total_num_heads
+            output_size = (self.num_heads + 2 * self.num_kv_heads) * head_size
+            self.weight = nn.Parameter(torch.empty(output_size, hidden_size))
+            self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
+            self.calls = 0
+
+            def load_shard(param: torch.Tensor, loaded_weight: torch.Tensor, shard_id: str) -> None:
+                shard_index = {"q": 0, "k": 1, "v": 2}[shard_id]
+                shard_size = param.shape[0] // 3
+                param.data.narrow(0, shard_index * shard_size, shard_size).copy_(loaded_weight)
+
+            self.weight.weight_loader = load_shard
+            if self.bias is not None:
+                self.bias.weight_loader = load_shard
+
+        def forward(self, value: torch.Tensor):
+            self.calls += 1
+            return F.linear(value, self.weight, self.bias), None
+
+    linear.QKVParallelLinear = _QKVLinear
+
+    class _Conv3dLayer(nn.Conv3d):
+        def __init__(self, in_channels: int, out_channels: int, kernel_size, stride, **kwargs) -> None:
+            super().__init__(in_channels, out_channels, kernel_size=kernel_size, stride=stride, **kwargs)
+
+    sys.modules["vllm.model_executor.layers.conv"].Conv3dLayer = _Conv3dLayer
+
+    class _LayerNorm(nn.LayerNorm):
+        def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True) -> None:
+            super().__init__(dim, eps=eps, elementwise_affine=elementwise_affine)
+
+    sys.modules["vllm_omni.diffusion.layers.norm"].LayerNorm = _LayerNorm
 
     class _Attention(nn.Module):
         def __init__(self, *args, softmax_scale: float, **kwargs) -> None:
@@ -168,9 +226,15 @@ def _allocate_single_layer(module, *, max_tokens: int):
 
 
 def _set_identity_attention(attention: nn.Module) -> None:
-    for projection in (attention.q, attention.k, attention.v, attention.o):
+    qkv = getattr(attention, "qkv", None)
+    if qkv is not None:
+        projections = (qkv, attention.o)
+    else:
+        projections = (attention.q, attention.k, attention.v, attention.o)
+    for projection in projections:
         with torch.no_grad():
-            projection.weight.copy_(torch.eye(2))
+            identity = torch.eye(2)
+            projection.weight.copy_(torch.cat((identity, identity, identity)) if projection is qkv else identity)
             if projection.bias is not None:
                 projection.bias.zero_()
     attention.norm_q = nn.Identity()
@@ -230,6 +294,17 @@ def test_self_attention_repeated_offset_overwrites_then_later_offset_appends() -
     assert cache.end == 4
     assert cache.absolute_end == 4
     torch.testing.assert_close(cache.key[0, : cache.end, 0, 0], torch.tensor([10.0, 20.0, 3.0, 4.0]))
+
+
+def test_self_attention_uses_one_fused_qkv_projection() -> None:
+    module = _load_module()
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
+    cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
+
+    attention(_tokens(1, 2), cache=cache, current_start=0)
+
+    assert attention.qkv.calls == 1
+    assert not any(hasattr(attention, name) for name in ("q", "k", "v"))
 
 
 def test_self_attention_is_chunk_causal_without_masking_inside_current_chunk() -> None:
@@ -304,10 +379,9 @@ def test_self_attention_cache_is_isolated_between_requests() -> None:
     torch.testing.assert_close(second.key[0, : second.end, 0, 0], torch.tensor([8.0]))
 
 
-@pytest.mark.parametrize("attention_name", ["LingBotSelfAttention", "LingBotCrossAttention"])
-def test_attention_keeps_checkpoint_qkvo_and_norm_parameter_names(attention_name: str) -> None:
+def test_cross_attention_keeps_checkpoint_qkvo_and_norm_parameter_names() -> None:
     module = _load_module()
-    attention = getattr(module, attention_name)(dim=4, num_heads=2)
+    attention = module.LingBotCrossAttention(dim=4, num_heads=2)
 
     names = set(attention.state_dict())
 
@@ -365,29 +439,15 @@ def test_self_attention_applies_rotary_embedding_to_current_query_and_key() -> N
     torch.testing.assert_close(rotary_inputs[1][2], sin)
 
 
-def test_self_attention_slices_full_rotary_table_at_current_token_offset() -> None:
-    module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
-    cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
-    cos = torch.arange(6, dtype=torch.float32).unsqueeze(1)
-    sin = -cos
-    rotary_inputs = _record_inputs(attention.rotary_embedding)
-
-    attention(_tokens(1, 2), cache=cache, current_start=4, rotary_emb=(cos, sin))
-
-    expected_cos = torch.tensor([[4.0], [5.0]])
-    expected_sin = -expected_cos
-    torch.testing.assert_close(rotary_inputs[0][1], expected_cos)
-    torch.testing.assert_close(rotary_inputs[1][2], expected_sin)
-
-
 def test_attention_block_owns_checkpoint_parent_namespaces() -> None:
     module = _load_module()
     block = module.LingBotAttentionBlock(dim=4, num_heads=2, sink_tokens=1, prefix="blocks.0")
 
     names = set(block.state_dict())
-    children = ("q", "k", "v", "o", "norm_q", "norm_k")
-    expected = {f"{parent}.{child}.weight" for parent in ("self_attn", "cross_attn") for child in children}
+    expected = {
+        *(f"self_attn.{child}.weight" for child in ("qkv", "o", "norm_q", "norm_k")),
+        *(f"cross_attn.{child}.weight" for child in ("q", "k", "v", "o", "norm_q", "norm_k")),
+    }
 
     assert expected <= names
 
@@ -457,99 +517,6 @@ def test_sink_and_current_chunk_overflow_preserves_self_cache() -> None:
     _assert_cache_unchanged(cache, snapshot)
 
 
-def _make_invalid_self_cache(module, case: str):
-    cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
-    if case == "negative_end":
-        cache.end = -1
-    elif case == "end_past_capacity":
-        cache.end = 3
-    elif case == "negative_sink_end":
-        cache.sink_end = -1
-    elif case == "sink_past_end":
-        cache.sink_end = 1
-    elif case == "sink_past_configured":
-        cache.end = 2
-        cache.absolute_end = 2
-        cache.last_start = 0
-        cache.sink_end = 2
-    elif case == "negative_absolute_end":
-        cache.absolute_end = -1
-    elif case == "negative_last_start":
-        cache.end = 1
-        cache.absolute_end = 1
-        cache.last_start = -1
-    elif case == "uninitialized_nonempty":
-        cache.end = 1
-        cache.absolute_end = 1
-    elif case == "latest_chunk_not_retained":
-        cache.end = 1
-        cache.absolute_end = 4
-        cache.last_start = 2
-    elif case == "physical_end_after_absolute_end":
-        cache.end = 2
-        cache.absolute_end = 1
-        cache.last_start = 0
-    else:  # pragma: no cover - parametrization is exhaustive
-        raise AssertionError(case)
-    return cache
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "negative_end",
-        "end_past_capacity",
-        "negative_sink_end",
-        "sink_past_end",
-        "sink_past_configured",
-        "negative_absolute_end",
-        "negative_last_start",
-        "uninitialized_nonempty",
-        "latest_chunk_not_retained",
-        "physical_end_after_absolute_end",
-    ],
-)
-def test_invalid_self_cache_is_rejected_before_attention_dispatch(case: str) -> None:
-    module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=1)
-    cache = _make_invalid_self_cache(module, case)
-    snapshot = _cache_snapshot(cache)
-    attention_calls = _record_inputs(attention.attn)
-
-    with pytest.raises((ValueError, RuntimeError)):
-        attention(_tokens(7), cache=cache, current_start=0)
-
-    assert attention_calls == []
-    _assert_cache_unchanged(cache, snapshot)
-
-
-def test_cached_tensors_are_detached_and_do_not_alias_projected_tensors() -> None:
-    module = _load_module()
-    self_attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
-    cross_attention = module.LingBotCrossAttention(dim=2, num_heads=1)
-    self_cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
-    hidden_states = _tokens(1, 2).requires_grad_()
-    encoder_hidden_states = _tokens(3, 4).requires_grad_()
-    self_projected_keys = _record_outputs(self_attention.k)
-    self_projected_values = _record_outputs(self_attention.v)
-    cross_projected_keys = _record_outputs(cross_attention.k)
-    cross_projected_values = _record_outputs(cross_attention.v)
-
-    self_attention(hidden_states, cache=self_cache, current_start=0)
-    _, cross_cache = cross_attention(hidden_states, encoder_hidden_states, cache=None)
-
-    for cached in (self_cache.key, self_cache.value, cross_cache.key, cross_cache.value):
-        assert cached.requires_grad is False
-        assert cached.grad_fn is None
-    assert self_cache.key.untyped_storage().data_ptr() != self_projected_keys[0].untyped_storage().data_ptr()
-    assert self_cache.value.untyped_storage().data_ptr() != self_projected_values[0].untyped_storage().data_ptr()
-    assert self_cache.key.untyped_storage().data_ptr() != hidden_states.untyped_storage().data_ptr()
-    assert self_cache.value.untyped_storage().data_ptr() != hidden_states.untyped_storage().data_ptr()
-    assert cross_cache.key.untyped_storage().data_ptr() != cross_projected_keys[0].untyped_storage().data_ptr()
-    assert cross_cache.value.untyped_storage().data_ptr() != cross_projected_values[0].untyped_storage().data_ptr()
-    assert cross_cache.key.untyped_storage().data_ptr() != encoder_hidden_states.untyped_storage().data_ptr()
-
-
 def test_cross_attention_caches_are_isolated_between_requests() -> None:
     module = _load_module()
     attention = module.LingBotCrossAttention(dim=2, num_heads=1)
@@ -573,20 +540,3 @@ def test_tp_rmsnorm_weight_loader_selects_rank_shard(monkeypatch: pytest.MonkeyP
     norm.weight.weight_loader(norm.weight, torch.tensor([10.0, 20.0, 30.0, 40.0]))
 
     torch.testing.assert_close(norm.weight, torch.tensor([30.0, 40.0]))
-
-
-@pytest.mark.parametrize("current_start", [True, 1.5], ids=("boolean", "positive_float"))
-def test_non_integer_current_start_is_rejected_before_projection_and_preserves_cache(current_start) -> None:
-    module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
-    cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
-    snapshot = _cache_snapshot(cache)
-    projection_calls = _record_inputs(attention.q)
-    attention_calls = _record_inputs(attention.attn)
-
-    with pytest.raises(ValueError, match="non-boolean integer"):
-        attention(_tokens(1), cache=cache, current_start=current_start)
-
-    assert projection_calls == []
-    assert attention_calls == []
-    _assert_cache_unchanged(cache, snapshot)

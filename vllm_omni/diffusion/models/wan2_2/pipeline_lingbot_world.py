@@ -39,6 +39,7 @@ from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
 )
 from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import CausalLingBotWorldTransformer3DModel
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 if TYPE_CHECKING:
@@ -87,26 +88,31 @@ def _positive_finite_flow_shift(value: Any) -> float:
     return flow_shift
 
 
-def _build_shifted_flow_sigma_lookup(
+def _build_shifted_flow_schedule(
     *,
     flow_shift: float,
     num_train_timesteps: int,
     timesteps: tuple[int, ...],
-) -> tuple[float, ...]:
-    """Resolve all DMD timesteps against one request's shifted sigma grid."""
+) -> tuple[tuple[float, float], ...]:
+    """Map checkpoint DMD labels to request-local warped timestep/sigma pairs."""
 
     flow_shift = _positive_finite_flow_shift(flow_shift)
     if num_train_timesteps <= 0:
         raise ValueError("num_train_timesteps must be positive")
-    if any(timestep < 0 or timestep > num_train_timesteps for timestep in timesteps):
-        raise ValueError(f"timesteps must be between 0 and {num_train_timesteps}")
-    # Mirror FlowUniPC's ``1 - reversed(alpha)`` lattice: [N-1, ..., 0] / N.
-    base_sigmas = torch.arange(num_train_timesteps - 1, -1, -1, dtype=torch.float64) / num_train_timesteps
-    scaled_sigmas = flow_shift * base_sigmas
-    shifted_sigmas = scaled_sigmas / ((1.0 - base_sigmas) + scaled_sigmas)
-    normalized_timesteps = torch.tensor(timesteps, dtype=shifted_sigmas.dtype) / num_train_timesteps
-    indices = (shifted_sigmas[:, None] - normalized_timesteps[None, :]).abs().argmin(dim=0)
-    return tuple(float(value) for value in shifted_sigmas[indices].tolist())
+    if any(timestep <= 0 or timestep > num_train_timesteps for timestep in timesteps):
+        raise ValueError(f"timesteps must be between 1 and {num_train_timesteps}")
+
+    # The checkpoint labels index the unshifted [1, ..., 1 / N] training
+    # lattice. Apply the request's flow shift before using the value both as
+    # the transformer timestep and the sampling sigma.
+    base_sigmas = torch.tensor(timesteps, dtype=torch.float64) / num_train_timesteps
+    shifted_numerators = flow_shift * base_sigmas
+    shifted_sigmas = shifted_numerators / ((1.0 - base_sigmas) + shifted_numerators)
+    warped_timesteps = shifted_sigmas * num_train_timesteps
+    return tuple(
+        (float(timestep), float(sigma))
+        for timestep, sigma in zip(warped_timesteps.tolist(), shifted_sigmas.tolist(), strict=True)
+    )
 
 
 def _validate_scheduler_config(config: dict[str, Any]) -> None:
@@ -129,6 +135,8 @@ def _validate_scheduler_config(config: dict[str, Any]) -> None:
 
 
 def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
+    if getattr(od_config, "quantization_config", None) is not None:
+        raise NotImplementedError("LingBot World v1 does not support quantization.")
     parallel_config = getattr(od_config, "parallel_config", None)
     if parallel_config is None:
         return
@@ -244,6 +252,7 @@ class LingBotWorldCausalDMDPipeline(
     SupportImageInput,
     SupportsComponentDiscovery,
     ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """LingBot-World v2 I2V generation with a request-local causal cache."""
 
@@ -344,6 +353,16 @@ class LingBotWorldCausalDMDPipeline(
 
         self.vae_scale_factor_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
+        self.setup_diffusion_pipeline_profiler(
+            profiler_targets=[
+                "vae.encode",
+                "vae.decode",
+                "_generate_block",
+                "text_encoder.forward",
+                "tokenizer.forward",
+            ],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
+        )
 
     def _parse_request(self, req: DiffusionRequestBatch) -> _LingBotRequestInputs:
         if req.num_reqs != 1 or len(req.prompts) != 1:
@@ -661,7 +680,7 @@ class LingBotWorldCausalDMDPipeline(
         prompt_embeds: torch.Tensor,
         cache: LingBotTransformerCache,
         start_frame: int,
-        sigma_lookup: tuple[float, ...],
+        schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
     ) -> torch.Tensor:
@@ -673,7 +692,7 @@ class LingBotWorldCausalDMDPipeline(
             condition.shape[4],
         )
         current_latents = self._randn(block_shape, generator=generator, dtype=torch.float32)
-        for step_index, timestep_value in enumerate(LINGBOT_DMD_TIMESTEPS):
+        for step_index, (timestep_value, sigma) in enumerate(schedule):
             set_forward_context_denoise_step_idx(step_index)
             timestep = torch.full((1,), float(timestep_value), device=self.device, dtype=torch.float32)
             # Checkpoint channel contract:
@@ -693,14 +712,13 @@ class LingBotWorldCausalDMDPipeline(
                     "transformer flow prediction shape must match the 16-channel noise latent, "
                     f"got {tuple(flow_prediction.shape)} and {tuple(current_latents.shape)}."
                 )
-            sigma = sigma_lookup[step_index]
             # The checkpoint's flow parameterization is inverted by
             # x0 = x_t - sigma * flow. Intermediate steps re-noise that x0
             # estimate at the next sigma; the final step keeps x0 as this
             # block's generated latent.
             x0 = current_latents - sigma * flow_prediction.float()
-            if step_index + 1 < len(LINGBOT_DMD_TIMESTEPS):
-                next_sigma = sigma_lookup[step_index + 1]
+            if step_index + 1 < len(schedule):
+                next_sigma = schedule[step_index + 1][1]
                 noise = self._randn(current_latents.shape, generator=generator, dtype=torch.float32)
                 current_latents = (1.0 - next_sigma) * x0 + next_sigma * noise
             else:
@@ -744,7 +762,7 @@ class LingBotWorldCausalDMDPipeline(
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         inputs = self._parse_request(req)
-        sigma_lookup = _build_shifted_flow_sigma_lookup(
+        schedule = _build_shifted_flow_schedule(
             flow_shift=inputs.flow_shift,
             num_train_timesteps=int(getattr(self.scheduler.config, "num_train_timesteps", 1000)),
             timesteps=LINGBOT_DMD_TIMESTEPS,
@@ -787,7 +805,7 @@ class LingBotWorldCausalDMDPipeline(
                         prompt_embeds=prompt_embeds,
                         cache=cache,
                         start_frame=start_frame,
-                        sigma_lookup=sigma_lookup,
+                        schedule=schedule,
                         generator=inputs.generator,
                         progress_bar=progress_bar,
                     )
