@@ -240,15 +240,14 @@ class MisoTTSTalkerForConditionalGeneration(nn.Module):
         frame = model.generate_frame(s.curr_tokens, s.curr_tokens_mask, s.curr_pos, s.temperature, s.topk)
         s.frames_left -= 1
         is_zero_frame = bool((frame == 0).all())
-        
+
         # Match official behavior: break immediately on zero frame (EOS)
         # Don't update state after zero frame to prevent garbage generation
         if is_zero_frame:
             s.done = True
             return frame.reshape(-1).long(), True
-        
+
         dev = frame.device
-        nc = model.config.audio_num_codebooks
         # Match official implementation exactly
         s.curr_tokens = torch.cat([frame, torch.zeros(1, 1).long().to(dev)], dim=1).unsqueeze(1)
         s.curr_tokens_mask = torch.cat(

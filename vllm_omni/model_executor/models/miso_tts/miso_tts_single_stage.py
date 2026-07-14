@@ -2,19 +2,18 @@
 Single-stage Miso TTS implementation - directly copied from official Miso TTS.
 This integrates the talker and Mimi decoder into a single model.
 """
+
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
 
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 
 import torch
-import torchaudio
 from huggingface_hub import hf_hub_download
 
-from .modeling_miso_tts import MISO_TTS_8B_CONFIG, MisoTTSModel
 from .miso_compat import patch_bitsandbytes_import_for_unquantized_layers
+from .modeling_miso_tts import MisoTTSModel
 
 try:
     from moshi.models import loaders
@@ -22,8 +21,8 @@ except ImportError:
     # Fallback if moshi not available
     loaders = None
 
-from transformers import AutoTokenizer
 from tokenizers.processors import TemplateProcessing
+from transformers import AutoTokenizer
 
 DEFAULT_MISO_TTS_REPO_ID = "MisoLabs/MisoTTS"
 patch_bitsandbytes_import_for_unquantized_layers()
@@ -57,6 +56,7 @@ class MisoTTSSingleStage(torch.nn.Module):
     Single-stage Miso TTS model that integrates talker and Mimi decoder.
     Directly copied from official Miso TTS Generator class.
     """
+
     def __init__(
         self,
         model: MisoTTSModel,
@@ -82,7 +82,7 @@ class MisoTTSSingleStage(torch.nn.Module):
         self.device = device
         self.dtype = dtype
 
-    def _tokenize_text_segment(self, text: str, speaker: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize_text_segment(self, text: str, speaker: int) -> tuple[torch.Tensor, torch.Tensor]:
         frame_tokens = []
         frame_masks = []
 
@@ -97,7 +97,7 @@ class MisoTTSSingleStage(torch.nn.Module):
 
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
 
-    def _tokenize_audio(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize_audio(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         assert audio.ndim == 1, "Audio must be single channel"
 
         frame_tokens = []
@@ -120,7 +120,7 @@ class MisoTTSSingleStage(torch.nn.Module):
 
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
 
-    def _tokenize_segment(self, segment: Segment) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize_segment(self, segment: Segment) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             (seq_len, audio_num_codebooks + 1), (seq_len, audio_num_codebooks + 1)
@@ -135,7 +135,7 @@ class MisoTTSSingleStage(torch.nn.Module):
         self,
         text: str,
         speaker: int,
-        context: List[Segment],
+        context: list[Segment],
         max_audio_length_ms: float = 90_000,
         temperature: float = 0.9,
         topk: int = 50,
@@ -164,9 +164,7 @@ class MisoTTSSingleStage(torch.nn.Module):
         max_seq_len = 2048
         max_context_len = max_seq_len - max_generation_len
         if curr_tokens.size(1) >= max_context_len:
-            raise ValueError(
-                f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}"
-            )
+            raise ValueError(f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}")
 
         for _ in range(max_generation_len):
             sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
@@ -193,6 +191,6 @@ def load_miso_single_stage(
 ) -> MisoTTSSingleStage:
     """Load single-stage Miso TTS model."""
     from .modeling_miso_tts import load_miso_model_weights
-    
+
     model = load_miso_model_weights(model_path_or_repo_id, device, dtype)
     return MisoTTSSingleStage(model, device, dtype)

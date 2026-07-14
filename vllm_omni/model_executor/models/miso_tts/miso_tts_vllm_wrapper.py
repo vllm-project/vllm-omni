@@ -2,16 +2,17 @@
 VLLM wrapper for single-stage Miso TTS model.
 This integrates the official Miso TTS Generator into vllm-omni.
 """
+
 import logging
 import threading
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
-
 from vllm.config import VllmConfig
 
-from .miso_tts_single_stage import MisoTTSSingleStage, load_miso_single_stage, Segment
+from .miso_tts_single_stage import MisoTTSSingleStage, Segment, load_miso_single_stage
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ _DEFAULT_MAX_FRAMES = 125
 
 class MisoTTSSingleStageForVLLM(nn.Module):
     """VLLM wrapper for single-stage Miso TTS - bypasses vLLM generation framework."""
-    
+
     requires_raw_input_tokens = False  # We don't use vLLM's token generation
     have_multimodal_outputs = True
     has_preprocess = False
@@ -75,9 +76,9 @@ class MisoTTSSingleStageForVLLM(nn.Module):
     ) -> Any:
         if self._model is None:
             raise RuntimeError("Model not loaded")
-        
+
         infos = runtime_additional_information or [{}]
-        
+
         # Process each request using official Generator
         audios = []
         for info in infos:
@@ -85,13 +86,13 @@ class MisoTTSSingleStageForVLLM(nn.Module):
             if not text:
                 audios.append(torch.zeros(24000, device=self._device))  # 1 second of silence
                 continue
-            
+
             speaker = int(info.get("speaker", 0))
             max_frames = int(info.get("max_generation_frames", _DEFAULT_MAX_FRAMES))
             max_audio_length_ms = max_frames * 80
             temperature = float(info.get("temperature", _DEFAULT_TEMPERATURE))
             topk = int(info.get("topk", _DEFAULT_TOPK))
-            
+
             # Parse context if provided
             ctx = info.get("context", None)
             context = []
@@ -100,12 +101,14 @@ class MisoTTSSingleStageForVLLM(nn.Module):
                     ctx = [ctx]
                 for seg in ctx:
                     if isinstance(seg, dict):
-                        context.append(Segment(
-                            speaker=int(seg.get("speaker", 0)),
-                            text=str(seg.get("text", "")),
-                            audio=torch.tensor(seg.get("audio", []), dtype=torch.float32, device=self._device)
-                        ))
-            
+                        context.append(
+                            Segment(
+                                speaker=int(seg.get("speaker", 0)),
+                                text=str(seg.get("text", "")),
+                                audio=torch.tensor(seg.get("audio", []), dtype=torch.float32, device=self._device),
+                            )
+                        )
+
             try:
                 audio = self._model.generate(
                     text=text,
@@ -116,8 +119,8 @@ class MisoTTSSingleStageForVLLM(nn.Module):
                     topk=topk,
                 )
                 audios.append(audio)
-            except Exception as e:
+            except Exception:
                 audios.append(torch.zeros(24000, device=self._device))
-        
+
         # Return audio directly - bypass vLLM's token generation
         return {"audio": audios}
