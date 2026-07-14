@@ -369,6 +369,11 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        if attention_mask is not None and attention_mask.ndim == 4:
+            query_length = query_states.shape[-2]
+            key_length = key_states.shape[-2]
+            attention_mask = attention_mask[..., :query_length, :key_length]
+
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -506,6 +511,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerLayer(GradientCheckpointingLayer):
 
 
 @auto_docstring
+@torch.compile(dynamic=True)
 class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     _can_record_outputs = {
         "hidden_states": Qwen3TTSTokenizerV2DecoderTransformerLayer,
@@ -528,6 +534,37 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
 
         self.input_proj = nn.Linear(config.latent_dim, config.hidden_size)
         self.output_proj = nn.Linear(config.hidden_size, config.latent_dim)
+
+        # Code2Wav uses deterministic, cache-free masks. Materialize the exact
+        # Transformers masks once on CPU; registered buffers follow the model's
+        # device and stay out of checkpoints.
+        max_mask_length = int(config.max_position_embeddings)
+        if max_mask_length <= 0:
+            raise ValueError(f"max_position_embeddings must be positive, got {max_mask_length}")
+        mask_inputs = torch.empty(
+            (1, max_mask_length, config.hidden_size),
+            dtype=torch.float32,
+            device="cpu",
+        )
+        mask_kwargs = {
+            "config": self.config,
+            "attention_mask": None,
+            "past_key_values": None,
+            "position_ids": None,
+        }
+        sig = inspect.signature(create_causal_mask)
+        if "input_embeds" in sig.parameters:
+            mask_kwargs["input_embeds"] = mask_inputs
+            mask_kwargs["cache_position"] = torch.arange(max_mask_length)
+        else:
+            mask_kwargs["inputs_embeds"] = mask_inputs
+        static_full_mask = create_causal_mask(**mask_kwargs)
+        static_sliding_mask = (
+            create_sliding_window_causal_mask(**mask_kwargs) if self.has_sliding_layers else None
+        )
+        self._static_mask_max_length = max_mask_length
+        self.register_buffer("_static_full_attention_mask", static_full_mask, persistent=False)
+        self.register_buffer("_static_sliding_attention_mask", static_sliding_mask, persistent=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -572,29 +609,14 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # It may already have been prepared by e.g. `generate`
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            # Handle API changes across transformers versions
-            sig = inspect.signature(create_causal_mask)
-            if "input_embeds" in sig.parameters:
-                mask_kwargs["input_embeds"] = inputs_embeds
-                mask_kwargs["cache_position"] = cache_position
-            else:
-                mask_kwargs["inputs_embeds"] = inputs_embeds
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
-            # The sliding window alternating layers are not always activated depending on the config
-            if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        if attention_mask is not None and not isinstance(attention_mask, dict):
+            raise ValueError("Code2Wav static masks require attention_mask to be None or a prepared mask mapping")
+        if past_key_values is not None:
+            raise ValueError("Code2Wav static masks do not support KV cache")
+        if inputs_embeds.shape[1] > self._static_mask_max_length:
+            raise ValueError(
+                f"Input length {inputs_embeds.shape[1]} exceeds static mask length {self._static_mask_max_length}"
+            )
 
         hidden_states = inputs_embeds
 
@@ -602,9 +624,15 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if isinstance(attention_mask, dict):
+                layer_attention_mask = attention_mask[decoder_layer.attention_type]
+            elif decoder_layer.attention_type == "sliding_attention":
+                layer_attention_mask = self._static_sliding_attention_mask
+            else:
+                layer_attention_mask = self._static_full_attention_mask
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=layer_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -851,6 +879,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self.decoder = nn.ModuleList(decoder)
 
         self.post_init()
+
+        self.pre_transformer.forward = torch.compile(
+            self.pre_transformer.forward,
+            dynamic=True,
+        )
 
         # CUDA Graph support
         self._cudagraph_enabled = False
