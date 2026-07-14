@@ -670,6 +670,8 @@ class InternVLAA1(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if num_steps is None:
             num_steps = self.config.num_inference_steps
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}")
         batch_size = state.shape[0]
         device = state.device
         dtype = state.dtype

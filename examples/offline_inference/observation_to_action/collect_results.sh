@@ -211,7 +211,7 @@ PY
 then
   run_with_artifacts \
     "pytest_e2e" \
-    python -m pytest -sv tests/examples/offline_inference/test_internvla_a1.py -m advanced_model
+    python -m pytest -sv "$REPO_ROOT/tests/examples/offline_inference/test_internvla_a1.py" -m advanced_model
 else
   write_skip_artifact "pytest_e2e" "pytest is not installed in the current python environment"
 fi
