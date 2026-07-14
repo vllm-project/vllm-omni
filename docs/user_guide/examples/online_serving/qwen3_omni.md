@@ -1,4 +1,4 @@
-# Qwen3-Omni
+# Qwen3-Omni: Online serving
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen3_omni>.
 

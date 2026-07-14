@@ -9,6 +9,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -18,6 +19,8 @@ from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Confi
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
 from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
+
+logger = init_logger(__name__)
 
 
 class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
@@ -60,14 +63,14 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.gen_transformer = Transformer2DModel.from_config(self.config.gen_dit_config)
 
         # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config
-        llm_hidden_size = int(
-            getattr(
-                getattr(self.config.llm_config, "text_config", None),
-                "hidden_size",
-                0,
-            )
-            or 0
-        )
+        llm_hidden_size = 0
+        text_config = self.config.get_text_config()
+        if text_config is None:
+            logger.warning("No text config; failed to infer llm_hidden_size.")
+        elif not hasattr(text_config, "hidden_size"):
+            logger.warning("Text config exists, but has no hidden_size attribute; failed to infer llm_hidden_size.")
+        else:
+            llm_hidden_size = int(text_config.hidden_size or 0)
         if llm_hidden_size <= 0:
             raise ValueError(
                 "Failed to infer llm hidden_size from Mammothmoda2Config.llm_config.text_config.hidden_size"

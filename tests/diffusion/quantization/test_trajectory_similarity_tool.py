@@ -99,7 +99,6 @@ def test_candidate_model_can_point_to_offline_checkpoint_without_online_quantiza
         candidate_quantization_config_json=None,
         candidate_ignored_layers=None,
         ignored_layers=None,
-        candidate_gguf_model=None,
         candidate_load_format="default",
     )
 
