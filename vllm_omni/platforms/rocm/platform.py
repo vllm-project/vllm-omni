@@ -88,6 +88,14 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                logger.warning(
+                    "HuggingFace kernels-backed FlashAttention is "
+                    "not supported on ROCm. Falling back to local "
+                    "FLASH_ATTN."
+                )
+                backend_upper = "FLASH_ATTN"
+
             if backend_upper == "FLASH_ATTN" and not aiter_supported:
                 logger.warning(
                     "Flash Attention requires `aiter` library which is only supported "

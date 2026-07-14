@@ -41,6 +41,7 @@ except ImportError:
     soundfile = None
 
 
+from vllm.entrypoints.generate.base.serving import clamp_prompt_logprobs
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -64,7 +65,6 @@ from vllm.entrypoints.openai.engine.protocol import (
     ToolCall,
     UsageInfo,
 )
-from vllm.entrypoints.openai.engine.serving import clamp_prompt_logprobs
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
 )
@@ -149,6 +149,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
+
+    @property
+    def tool_call_id_type(self) -> str:
+        """Return the tool call ID type, delegating to model config.
+
+        Upstream vLLM removed the stored ``tool_call_id_type`` attribute
+        from ``OpenAIServingChat`` after the ParserManager refactor; the
+        field is now resolved on demand via ``get_tool_call_id_type``.
+        """
+        try:
+            from vllm.entrypoints.chat_utils import get_tool_call_id_type
+
+            return get_tool_call_id_type(self.model_config)
+        except Exception:
+            return "random"
 
     def _should_stream_with_auto_tool_parsing(self, request: ChatCompletionRequest) -> bool:
         """Check if streamed tokens should go through the tool-call parser.
@@ -368,7 +383,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
             if not self.use_harmony:
-                error_check_ret = self.openai_serving_render.validate_chat_template(
+                error_check_ret = self.online_renderer.validate_chat_template(
                     request_chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs,
                     trust_request_chat_template=self.trust_request_chat_template,
@@ -396,7 +411,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
             else:
                 should_include_tools = tool_dicts is not None
-                conversation, engine_prompts = self.openai_serving_render._make_request_with_harmony(
+                conversation, engine_prompts = self.online_renderer._make_request_with_harmony(
                     request, should_include_tools
                 )
 

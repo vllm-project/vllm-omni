@@ -8,7 +8,6 @@ import torch
 
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
     talker2code2wav_async_chunk,
-    text2flow,
     text2flow_full_payload,
     text2flow_token_only,
 )
@@ -49,29 +48,19 @@ def _transfer_manager(
     )
 
 
-def test_text2flow_supports_batched_source_outputs():
+def test_text2flow_token_only_supports_batched_source_outputs():
     source_outputs = [
         _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[8, 9]])}),
         _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[6, 7]])}),
     ]
 
-    outputs = text2flow(source_outputs=source_outputs, prompt=None)
+    outputs = text2flow_token_only(source_outputs=source_outputs, prompt=None)
 
     assert len(outputs) == 2
     assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
     assert outputs[1]["prompt_token_ids"] == [4, 5]
     assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
     assert outputs[1]["additional_information"]["ids"]["prompt"] == [20, 21]
-
-
-def test_text2flow_strips_reference_speech_prefix_from_cumulative_ids():
-    source_outputs = [
-        _source_output("req-0", [10, 11], [8, 9, 1, 2, 3], {"speech_token": torch.tensor([[8, 9]])}),
-    ]
-
-    outputs = text2flow(source_outputs=source_outputs, prompt=None)
-
-    assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
 
 
 def test_text2flow_token_only_strips_reference_speech_prefix_from_cumulative_ids():

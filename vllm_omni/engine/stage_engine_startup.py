@@ -138,6 +138,21 @@ class StageReplicaResources:
 # ---------------------------------------------------------------------------
 
 
+def _port_from_zmq_address(address: str | None) -> int | None:
+    """Extract the TCP port from a ``tcp://host:port`` ZMQ address, else ``None``.
+
+    Non-TCP transports (``ipc://``, ``inproc://``) and unparsable values return
+    ``None`` so callers can skip seeding them into the port-dedup set.
+    """
+    if not address:
+        return None
+    tail = address.rsplit(":", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
 class OmniMasterServer:
     """Registration server for single-stage engine startup."""
 
@@ -158,10 +173,25 @@ class OmniMasterServer:
         self._stage_configs: dict[StageRoute, Any] = {}
         self._stage_coordinator_addresses: dict[StageRoute, StageCoordinatorAddresses] = {}
         self._stage_config_events: dict[StageRoute, threading.Event] = {}
+        # Ports already handed out by *this* server. ``get_open_ports_list`` only
+        # guarantees uniqueness *within* a single call; a per-route call cannot
+        # see ports drawn for other routes, so two stages/replicas can draw the
+        # same ephemeral port and the second engine to ``bind()`` it dies with
+        # ``zmq.error.ZMQError: Address already in use``. Multi-stage models
+        # (e.g. Qwen3-Omni: thinker/talker/code2wav) allocate many routes and hit
+        # this intermittently. We dedup every allocated port against this set,
+        # seeded with the registration port (and coordinator ROUTER port) that
+        # are already bound on the same host.
+        self._allocated_ports: set[int] = set()
+        if master_port:
+            self._allocated_ports.add(int(master_port))
         # Coordinator ROUTER address echoed back in every registration reply
         # so OmniCoordClientForStage knows where to connect from inside the
         # engine subprocess.
         self._coordinator_router_address = coordinator_router_address
+        coord_port = _port_from_zmq_address(coordinator_router_address)
+        if coord_port is not None:
+            self._allocated_ports.add(coord_port)
         # Fires only for *newly assigned* (auto-assigned) replicas, not for
         # head-side pre-allocated slots that already have head-side clients.
         self._on_register = on_register
@@ -235,7 +265,7 @@ class OmniMasterServer:
 
         self._stage_config_events[route] = threading.Event()
         self._stage_coordinator_addresses[route] = StageCoordinatorAddresses()
-        hs_port, inp_port, out_port = get_open_ports_list(count=3)
+        hs_port, inp_port, out_port = self._alloc_unique_ports(3)
         alloc = StageAllocation(
             handshake_bind_address=f"tcp://{self._address}:{hs_port}",
             handshake_connect_address=f"tcp://{self._address}:{hs_port}",
@@ -246,6 +276,32 @@ class OmniMasterServer:
         )
         self._stage_routes[route] = alloc
         return alloc
+
+    def _alloc_unique_ports(self, count: int) -> list[int]:
+        """Return ``count`` open ports unique across every route this server owns.
+
+        ``get_open_ports_list`` dedups only within its own call, so we redraw any
+        port that collides with one already recorded in ``self._allocated_ports``
+        (registration/coordinator ports plus every previously-allocated route
+        port) and register the winners before returning. Callers already hold the
+        relevant allocation context (``__init__`` is single-threaded;
+        registration holds ``self._alloc_lock``).
+        """
+        picked: list[int] = []
+        # Bounded retry budget so a pathological host (near port exhaustion)
+        # fails loudly instead of spinning forever.
+        for _ in range(64):
+            for port in get_open_ports_list(count=count - len(picked)):
+                if port in self._allocated_ports:
+                    continue
+                self._allocated_ports.add(port)
+                picked.append(port)
+                if len(picked) == count:
+                    return picked
+        raise RuntimeError(
+            f"[OmniMasterServer] Could not allocate {count} unique open ports "
+            f"(host={self._address}); {len(self._allocated_ports)} already in use."
+        )
 
     def _next_free_replica_id(self, stage_id: int) -> int:
         """Return the next replica id to assign for an auto-assign registration.

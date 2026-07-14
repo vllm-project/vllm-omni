@@ -475,91 +475,63 @@ thinker_hidden_states = output.multimodal_output["24"]
 
 ### Implementation Example
 
-Create stage transition processors in `vllm_omni/model_executor/stage_input_processors/your_model_name.py`:
+Create stage transition processors in `vllm_omni/model_executor/stage_input_processors/your_model_name.py`. Each inter-stage edge should provide a **coherent processor set** rather than a single monolithic function:
+
+| Suffix | Role | Runs when |
+|--------|------|-----------|
+| `*_full_payload` | Worker-side payload producer | `async_chunk=false`; accumulates tensors and ships via connector |
+| `*_async_chunk` | Scheduler-side streaming producer | `async_chunk=true`; emits per-chunk payloads |
+| `*_token_only` | Orchestrator placeholder builder | `async_chunk=false`; allocates downstream prompt slots only |
 
 ```python
-# qwen3_omni.py
+# qwen3_omni.py (Thinker → Talker, non-async path)
 
-def thinker2talker(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+def thinker2talker_token_only(
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
 ) -> list[OmniTokensPrompt]:
-    """
-    Process thinker outputs to create talker inputs.
-
-    Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [0] for thinker)
-        prompt: Original prompt data
-
-    Returns:
-        List of OmniTokensPrompt for talker stage
-    """
-    source_stage_id = engine_input_source[0]
-    thinker_outputs = stage_list[source_stage_id].engine_outputs
-    talker_inputs = []
-
-    for thinker_output in thinker_outputs:
-        output = thinker_output.outputs[0]
-        # Extract thinker embeddings and hidden states
-        thinker_prefill_embeddings = output.multimodal_output["0"].float().clone().detach().cuda()
-        thinker_hidden_states = output.multimodal_output["24"].float().clone().detach().cuda()
-
-        info = {
-            "thinker_prefill_embeddings": thinker_prefill_embeddings,
-            "thinker_hidden_states": thinker_hidden_states,
-            "thinker_sequences": thinker_output.prompt_token_ids + output.token_ids,
-            "thinker_input_ids": thinker_output.prompt_token_ids,
-        }
-
-        talker_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0] * computed_length,
-                additional_information=info,
-                multi_modal_data=None,
-            )
-        )
-
-    return talker_inputs
+    """Allocate talker prefill slots; bulk tensors arrive via the connector."""
+    ...
 
 
-def talker2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
-) -> list[OmniTokensPrompt]:
-    """
-    Process talker outputs to create code2wav inputs.
-    """
-    source_stage_id = engine_input_source[0]
-    talker_outputs = stage_list[source_stage_id].engine_outputs
-    code2wav_inputs = []
+def thinker2talker_full_payload(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+) -> dict[str, Any] | None:
+    """Pack accumulated thinker hidden states into OmniPayload for stage-1."""
+    ...
 
-    for talker_output in talker_outputs:
-        output = talker_output.outputs[0]
-        # Extract codec codes
-        codec_codes = (
-            output.multimodal_output["code_predictor_codes"]
-            .to(torch.long)
-            .transpose(0, 1)
-            .cpu()
-            .to(torch.long)
-            .reshape(-1)
-            .tolist()
-        )
 
-        code2wav_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=codec_codes,
-                multi_modal_data=None,
-            )
-        )
-
-    return code2wav_inputs
+def thinker2talker_async_chunk(
+    transfer_manager: Any,
+    multimodal_output: OmniPayload | dict[str, Any],
+    request: OmniEngineCoreRequest,
+    is_finished: bool = False,
+) -> OmniPayloadStruct | None:
+    """Stream thinker rows to talker while async_chunk is enabled."""
+    ...
 ```
+
+Wire these in `pipeline.py`:
+
+```python
+StagePipelineConfig(
+    stage_id=0,
+    custom_process_next_stage_input_func=f"{_PROC}.thinker2talker_full_payload",
+    async_chunk_process_next_stage_input_func=f"{_PROC}.thinker2talker_async_chunk",
+    ...
+),
+StagePipelineConfig(
+    stage_id=1,
+    sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
+    ...
+),
+```
+
+Do **not** add a no-suffix `thinker2talker` when a `sync_process_input_func` is already declared — `_select_processor_funcs()` always prefers the `*_token_only` hook in non-async mode, so the bare function would never run. See `docs/design/rfc_stage_input_processors_refactor.md` for the full contract.
 
 ## Testing
 

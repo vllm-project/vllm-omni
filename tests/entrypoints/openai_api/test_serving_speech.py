@@ -39,7 +39,8 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _create_wav_header,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest, SpeechServingContext
+from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -973,6 +974,29 @@ class TestTTSMethods:
                 )
             )
 
+    def test_upload_ming_voice_embedding_wrong_dims_rejected_without_replacing_existing(self, speech_server):
+        """Ming embedding uploads must be 192-dim before replacing stored voices."""
+        speech_server._tts_model_type = "ming_tts"
+        existing = {
+            "name": "bad_emb_voice",
+            "file_path": "/tmp/voice_samples/bad_emb_voice.safetensors",
+            "mime_type": "application/x-safetensors",
+            "embedding_source": "direct",
+            "embedding_dim": 192,
+        }
+        speech_server.uploaded_speakers = {"bad_emb_voice": existing.copy()}
+
+        with pytest.raises(ValueError, match="Ming speaker embedding must have 192 dims, got 191"):
+            asyncio.run(
+                speech_server.upload_voice_embedding(
+                    embedding_json=json.dumps([0.0] * 191),
+                    consent="consent",
+                    name="bad_emb_voice",
+                )
+            )
+
+        assert speech_server.uploaded_speakers["bad_emb_voice"] == existing
+
     def test_base_task_requires_ref_audio_or_speaker_embedding(self, speech_server):
         """Base task without ref_audio or speaker_embedding is rejected."""
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base")
@@ -1556,6 +1580,86 @@ class TestTTSMethods:
         assert params["task_type"] == ["Base"]
         assert params["x_vector_only_mode"] == [True]
         assert "ref_audio" not in params
+
+    def test_ming_adapter_uploaded_direct_embedding_uses_embedding_not_audio(
+        self, speech_server, mocker: MockerFixture
+    ):
+        """Ming uploaded direct embeddings are loaded into prompt construction."""
+        speech_server.uploaded_speakers = {
+            "emb_voice": {
+                "name": "emb_voice",
+                "file_path": "/tmp/voice_samples/emb_voice.safetensors",
+                "mime_type": "application/x-safetensors",
+                "embedding_source": "direct",
+                "embedding_dim": 192,
+            }
+        }
+        fake_embedding = [0.1] * 192
+        mock_get_emb = mocker.patch.object(
+            speech_server, "_get_uploaded_speaker_embedding", return_value=fake_embedding
+        )
+        mock_get_audio = mocker.patch.object(speech_server, "_get_uploaded_audio_data")
+        mock_prompt = mocker.patch.object(
+            speech_server,
+            "_build_ming_dense_prompt",
+            return_value={"additional_information": {"speaker_count": 1}},
+        )
+
+        adapter = MingTTSAdapter(SpeechServingContext(server=speech_server))
+        req = OpenAICreateSpeechRequest(input="Hello", voice="emb_voice")
+        prepared = asyncio.run(adapter.build(req, [], False))
+
+        mock_get_emb.assert_called_once_with("emb_voice")
+        mock_get_audio.assert_not_called()
+        mock_prompt.assert_called_once_with(req, ref_audio_data=None)
+        prompt_request = mock_prompt.call_args.args[0]
+        assert prompt_request.speaker_embedding == fake_embedding
+        assert len(prompt_request.speaker_embedding) == 192
+        assert prepared.prompt["additional_information"]["speaker_count"] == 1
+        assert prepared.model_type == "ming_tts"
+
+    def test_ming_adapter_uploaded_audio_path_preserves_ref_text(self, speech_server, mocker: MockerFixture):
+        """Ming uploaded audio voices still resolve audio and stored ref_text."""
+        speech_server.uploaded_speakers = {
+            "audio_voice": {
+                "name": "audio_voice",
+                "file_path": "/tmp/voice_samples/audio_voice.wav",
+                "mime_type": "audio/wav",
+                "ref_text": "Reference transcript.",
+            }
+        }
+        ref_audio_source = "data:audio/wav;base64,ZmFrZWF1ZGlv"
+        ref_audio_data = ([0.0, 0.1], 16000)
+        fake_embedding = [0.2] * 192
+        mock_get_audio = mocker.patch.object(speech_server, "_get_uploaded_audio_data", return_value=ref_audio_source)
+        mock_get_emb = mocker.patch.object(speech_server, "_get_uploaded_speaker_embedding")
+        mocker.patch.object(
+            speech_server,
+            "_resolve_ref_audio",
+            new=mocker.AsyncMock(return_value=ref_audio_data),
+        )
+        mock_extract = mocker.patch.object(
+            speech_server,
+            "_extract_ming_speaker_embeddings_from_ref_audio",
+            return_value=[fake_embedding],
+        )
+        mock_prompt = mocker.patch.object(
+            speech_server,
+            "_build_ming_dense_prompt",
+            return_value={"additional_information": {"speaker_count": 1}},
+        )
+
+        adapter = MingTTSAdapter(SpeechServingContext(server=speech_server))
+        req = OpenAICreateSpeechRequest(input="Hello", voice="audio_voice")
+        prepared = asyncio.run(adapter.build(req, [], False))
+
+        mock_get_audio.assert_called_once_with("audio_voice")
+        mock_get_emb.assert_not_called()
+        mock_extract.assert_called_once_with([ref_audio_data])
+        mock_prompt.assert_called_once_with(req, ref_audio_data=ref_audio_data)
+        assert req.ref_text == "Reference transcript."
+        assert req.speaker_embedding == fake_embedding
+        assert prepared.model_type == "ming_tts"
 
     # ── regression: full flow from issue #1603 ──
 

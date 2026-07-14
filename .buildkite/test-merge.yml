@@ -627,11 +627,10 @@ steps:
       - label: "Diffusion · FLUX.2 Klein Test"
         source_file_dependencies:
           - tests/e2e/offline_inference/test_flux2_klein.py
-          - tests/e2e/online_serving/test_flux2_klein.py
           - vllm_omni/diffusion/models/flux2_klein/
         timeout_in_minutes: 30
         commands:
-          - pytest -s -v tests/e2e/offline_inference/test_flux2_klein.py tests/e2e/online_serving/test_flux2_klein.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+          - pytest -s -v tests/e2e/offline_inference/test_flux2_klein.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:

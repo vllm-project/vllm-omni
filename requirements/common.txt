@@ -13,7 +13,7 @@ transformers >= 5.5.3
 av>=14.0.0
 omegaconf>=2.3.0
 diffusers==0.38.0
-safetensors>=0.8.0rc0
+safetensors>=0.8.0
 accelerate==1.12.0
 soundfile>=0.13.1
 cache-dit==1.3.0

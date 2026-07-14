@@ -9,6 +9,7 @@ Stage 2: Code2Wav — RVQ codes → audio waveform
 
 from transformers import Qwen3OmniMoeConfig
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -21,6 +22,12 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_omni"
 QWEN3_OMNI_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_moe",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
+    endpoint_restrictions=(
+        EndpointRestriction(
+            OmniServingCapability.COMPLETIONS,
+            "Qwen3-Omni requires chat template structure for thinker-talker handoff. Use /v1/chat/completions instead.",
+        ),
+    ),
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -44,7 +51,6 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             input_sources=(0,),
             hf_config_name="talker_config",
             engine_output_type="latent",
-            custom_process_input_func=f"{_PROC}.thinker2talker",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
             custom_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_full_payload"),
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
@@ -62,7 +68,6 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             final_output_type="audio",
             hf_config_name="thinker_config",
             engine_output_type="audio",
-            custom_process_input_func=f"{_PROC}.talker2code2wav",
             sampling_constraints={"detokenize": True},
         ),
     ),

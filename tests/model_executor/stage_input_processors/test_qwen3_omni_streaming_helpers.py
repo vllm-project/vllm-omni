@@ -163,7 +163,7 @@ def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
 
     assert payload is not None
     assert payload["codes"]["audio"] == [10, 20, 11, 21, 12, 22]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_talker2code2wav_full_payload_drops_count_matched_terminal_row() -> None:
@@ -204,7 +204,7 @@ def test_talker2code2wav_full_payload_drops_rows_aligned_to_non_codec_ids() -> N
 
     assert payload is not None
     assert payload["codes"]["audio"] == [0, 0, 0]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
@@ -224,7 +224,7 @@ def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
 
     assert payload is not None
     assert payload["codes"]["audio"] == [0, 7, 0, 8, 0, 9]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    assert "code_predictor_codes" not in payload
 
 
 def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
@@ -247,7 +247,6 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["ids"]["all"] == [151644, 872, 3]
     assert payload["embed"]["prefill"].device.type == "cpu"
     assert payload["hidden_states"]["output"].device.type == "cpu"
-    assert payload["next_stage_prompt_len"] > 0
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
 

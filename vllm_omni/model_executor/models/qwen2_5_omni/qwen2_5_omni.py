@@ -17,7 +17,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
-    Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.model_executor.models.vision import (
@@ -39,6 +38,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerDummyInputsBuilder,
     Qwen2_5OmniThinkerMultiModalProcessor,
+    Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.platforms import current_omni_platform
