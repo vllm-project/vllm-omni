@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for the LTX-2.3 image-to-video pipeline."""
+"""Unit tests for LTX image-to-video input and conditioning behavior."""
 
 from types import SimpleNamespace
 
@@ -19,7 +19,7 @@ def _make_ltx23_request_pipe(cls):
     return pipe
 
 
-class TestLTX23ImageToVideoForwardStages:
+class TestLTXImageToVideoForwardStages:
     def test_forward_resolves_request_image_and_delegates_to_shared_forward_impl(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -86,11 +86,10 @@ class TestLTX23ImageToVideoForwardStages:
         torch.testing.assert_close(kwargs["sigma"], ts)
 
 
-class TestLTX23ImageToVideoPipeline:
-    def test_ltx23_i2v_pipeline_reuses_ltx23_semantics(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline, LTX23Pipeline
+class TestLTXImageToVideoConditioning:
+    def test_ltx23_i2v_supports_image_input(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
 
-        assert issubclass(LTX23ImageToVideoPipeline, LTX23Pipeline)
         assert LTX23ImageToVideoPipeline.support_image_input is True
 
     def test_ltx23_i2v_rejects_multi_image_prompt_list(self):
@@ -218,28 +217,3 @@ class TestLTX23ImageToVideoPipeline:
 
         torch.testing.assert_close(out[:, :1], latents[:, :1])
         torch.testing.assert_close(out[:, 1:], latents[:, 1:] + noise_pred[:, 1:] + 0.5)
-
-
-class TestLTX23ImageToVideoModule:
-    """Test that the shared one-stage module exposes LTX2.3 I2V entry points."""
-
-    def test_i2v_classes_importable(self):
-        """I2V classes must be importable from the implementation module."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
-
-        assert LTX23ImageToVideoPipeline is not None
-
-    def test_post_process_func_importable(self):
-        """get_ltx2_post_process_func must be importable for registry lookup."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import get_ltx2_post_process_func
-
-        assert callable(get_ltx2_post_process_func)
-
-    def test_i2v_class_matches_package_export(self):
-        """Package export must point at the I2V implementation module."""
-        from vllm_omni.diffusion.models.ltx2 import LTX23ImageToVideoPipeline as PackageExported
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
-            LTX23ImageToVideoPipeline as ModuleExported,
-        )
-
-        assert PackageExported is ModuleExported

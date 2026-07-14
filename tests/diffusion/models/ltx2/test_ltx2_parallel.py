@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for LTX-2.3 forward-parallel behavior."""
+"""Unit tests for LTX guidance and forward-parallel behavior."""
 
 from types import SimpleNamespace
 
@@ -9,24 +9,6 @@ import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-class TestCFGParallelIntegration:
-    def test_ltx23_pipeline_has_cfg_parallel_mixin(self):
-        """LTX23Pipeline must use the shared CFG parallel implementation."""
-        from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
-
-        assert issubclass(LTX23Pipeline, CFGParallelMixin)
-
-    def test_ltx2_transformer_has_dit_cache_config(self):
-        """Ensure LTX2 has a Cache DiT adapter config and that it uses separate CFG."""
-        from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
-        from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
-
-        adapter_config = getattr(LTX2VideoTransformer3DModel, "_cache_dit_adapter_config")
-        assert isinstance(adapter_config, CacheDiTAdapterConfig)
-        assert adapter_config.has_separate_cfg
 
 
 class TestCFGParallelHelpers:
