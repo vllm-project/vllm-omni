@@ -63,7 +63,6 @@ def test_create_shm_connector():
     spec = ConnectorSpec(name="SharedMemoryConnector", extra={"shm_threshold_bytes": 1024})
     connector = OmniConnectorFactory.create_connector(spec)
     assert isinstance(connector, SharedMemoryConnector)
-    assert connector.threshold == 1024
 
 
 def test_create_unknown_connector():
@@ -75,21 +74,20 @@ def test_create_unknown_connector():
 
 @pytest.fixture
 def shm_connector():
-    config = {"shm_threshold_bytes": 100, "inline_small_payloads": True}
-    return SharedMemoryConnector(config)
+    connector = SharedMemoryConnector({"shm_threshold_bytes": 100})
+    yield connector
+    connector.close()
 
 
-def test_put_get_inline(shm_connector):
-    """Test inline transfer for small data."""
+def test_put_get_small_payload_uses_shm(shm_connector):
+    """Small payloads use key-addressed SHM; inline metadata is retired."""
     data = {"small": "data"}
 
     success, size, metadata = shm_connector.put("stage_0", "stage_1", "req_1", data)
     assert success is True
-    assert "inline_bytes" in metadata
-    assert "shm" not in metadata
+    assert "shm" in metadata
+    assert "inline_bytes" not in metadata
     assert "size" in metadata
-    assert shm_connector._metrics["inline_writes"] == 1
-    assert shm_connector._metrics["shm_writes"] == 0
 
     # Retrieve
     retrieved_data, ret_size = shm_connector.get("stage_0", "stage_1", "req_1", metadata)
