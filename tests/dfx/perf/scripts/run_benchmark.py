@@ -9,8 +9,8 @@ import pytest
 from tests.dfx.conftest import (
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
-    extract_mark_resource_label,
     get_benchmark_params_for_server,
+    get_runtime_resource_label,
     is_diffusion_perf_config,
     load_benchmark_configs,
     resolve_baseline_value,
@@ -168,9 +168,7 @@ def test_performance_benchmark(omni_server, benchmark_params, request):
     print(f"Benchmark parameters: {benchmark_params}")
 
     assert_baseline = request.config.getoption("--assert-baseline", default=False)
-    resource_label = extract_mark_resource_label(
-        next((cfg.get("mark") for cfg in BENCHMARK_CONFIGS if cfg.get("test_name") == test_name), None)
-    )
+    resource_label = get_runtime_resource_label()
 
     def to_list(value, default=None):
         if value is None:

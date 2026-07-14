@@ -516,6 +516,9 @@ def extract_mark_resource_label(mark_field: Any) -> str:
     """Return a filename-safe hardware label from ``mark.hardware_marks.res`` values.
 
     Example: ``{"cuda": "H100"}`` -> ``"H100"``; multiple platforms join with ``-``.
+
+    Prefer :func:`get_runtime_resource_label` for perf result filenames so labels
+    reflect the machine that actually ran the benchmark.
     """
     if not isinstance(mark_field, dict):
         return "na"
@@ -529,17 +532,96 @@ def extract_mark_resource_label(mark_field: Any) -> str:
     return "-".join(labels) if labels else "na"
 
 
+_KNOWN_RUNTIME_RESOURCE_TOKENS: tuple[str, ...] = (
+    "H100",
+    "H800",
+    "H200",
+    "H20",
+    "L40S",
+    "L40",
+    "L4",
+    "A100",
+    "A800",
+    "A10G",
+    "A10",
+    "A30",
+    "MI325",
+    "MI300",
+    "MI250",
+    "B60",
+    "S5000",
+    "910B4",
+    "910B",
+    "910",
+    "310P",
+    "A2",
+    "A3",
+)
+_RUNTIME_RESOURCE_LABEL: str | None = None
+
+
+def _normalize_runtime_device_label(raw: str) -> str:
+    """Map a platform device name to a short filename-safe resource token."""
+    if not raw or not str(raw).strip():
+        return "na"
+    upper = str(raw).upper()
+    for token in _KNOWN_RUNTIME_RESOURCE_TOKENS:
+        if token.upper() in upper:
+            return _safe_filename_token(token)
+    compact = re.sub(r"[^a-zA-Z0-9]+", "", str(raw))
+    for prefix in ("NVIDIA", "AMD", "ASCEND", "HUAWEI"):
+        if compact.upper().startswith(prefix):
+            compact = compact[len(prefix) :]
+            break
+    return _safe_filename_token(compact[:48]) if compact else "na"
+
+
+def _read_runtime_device_name(*, device_id: int = 0) -> str | None:
+    """Device name from the active Omni platform."""
+    if current_omni_platform.device_count() <= device_id:
+        return None
+    get_name = getattr(current_omni_platform, "get_device_name", None)
+    if not callable(get_name):
+        return None
+    raw = get_name(device_id)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def get_runtime_resource_label(*, device_id: int = 0, refresh: bool = False) -> str:
+    """Return a filename-safe hardware label detected on the running machine."""
+    global _RUNTIME_RESOURCE_LABEL
+    if not refresh and _RUNTIME_RESOURCE_LABEL is not None:
+        return _RUNTIME_RESOURCE_LABEL
+    raw = _read_runtime_device_name(device_id=device_id)
+    label = _normalize_runtime_device_label(raw) if raw else "na"
+    if not refresh:
+        _RUNTIME_RESOURCE_LABEL = label
+    return label
+
+
+_FILENAME_OMIT_RESOURCE_LABELS = frozenset({"H100"})
+
+
+def hardware_json_value(resource_label: str | None) -> str:
+    """Hardware token stored in perf result JSON (empty when unknown)."""
+    token = _safe_filename_token(resource_label)
+    return "" if token == "na" else token
+
+
+def resource_label_for_filename(resource_label: str | None) -> str:
+    """Hardware token embedded in result filenames (H100 omitted on default CI pool)."""
+    token = _safe_filename_token(resource_label)
+    if token in _FILENAME_OMIT_RESOURCE_LABELS:
+        return ""
+    return token
+
+
 def extract_configs_resource_label(configs: list[dict[str, Any]]) -> str:
-    """Collect unique hardware labels from a benchmark config list for result filenames."""
-    labels: list[str] = []
-    seen: set[str] = set()
-    for cfg in configs:
-        label = extract_mark_resource_label(cfg.get("mark"))
-        if label == "na" or label in seen:
-            continue
-        seen.add(label)
-        labels.append(label)
-    return "-".join(labels) if labels else "na"
+    """Return runtime hardware label for perf result filenames."""
+    del configs
+    return get_runtime_resource_label()
 
 
 def resolve_baseline_value(
@@ -617,8 +699,11 @@ def run_benchmark(
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
     ro = _safe_filename_token(random_output_len)
-    hw = _safe_filename_token(resource_label)
-    result_filename = f"result_{test_name}_{hw}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
+    hw = resource_label_for_filename(resource_label)
+    if hw:
+        result_filename = f"result_{test_name}_{hw}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
+    else:
+        result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -688,6 +773,7 @@ def run_benchmark(
         result["random_input_len"] = random_input_len
     if random_output_len is not None:
         result["random_output_len"] = random_output_len
+    result["Hardware"] = hardware_json_value(resource_label)
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return result

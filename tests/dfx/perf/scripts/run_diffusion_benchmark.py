@@ -43,10 +43,11 @@ import pytest
 from benchmarks.diffusion.backends import endpoint_filename_token, normalize_endpoint
 from tests.dfx.conftest import (
     create_paired_benchmark_pytest_params,
-    extract_configs_resource_label,
-    extract_mark_resource_label,
+    get_runtime_resource_label,
+    hardware_json_value,
     is_diffusion_perf_config,
     resolve_pytest_marks,
+    resource_label_for_filename,
 )
 from tests.helpers.runtime import get_open_port
 
@@ -245,13 +246,12 @@ def _aggregated_result_file_for_source(source_file: str) -> Path:
     key = _normalized_source_path(source_file)
     if key not in _AGGREGATED_RESULT_FILES_BY_SOURCE:
         stem = Path(key).stem
-        configs_for_source = [
-            c for c in BENCHMARK_CONFIGS if _normalized_source_path(str(c.get(_DIFFUSION_SOURCE_CONFIG_KEY, ""))) == key
-        ]
-        resource = extract_configs_resource_label(configs_for_source)
-        _AGGREGATED_RESULT_FILES_BY_SOURCE[key] = (
-            BENCHMARK_RESULT_DIR / f"diffusion_result_{stem}_{resource}_{_SESSION_TIMESTAMP}.json"
-        )
+        resource = resource_label_for_filename(get_runtime_resource_label())
+        if resource:
+            result_name = f"diffusion_result_{stem}_{resource}_{_SESSION_TIMESTAMP}.json"
+        else:
+            result_name = f"diffusion_result_{stem}_{_SESSION_TIMESTAMP}.json"
+        _AGGREGATED_RESULT_FILES_BY_SOURCE[key] = BENCHMARK_RESULT_DIR / result_name
     return _AGGREGATED_RESULT_FILES_BY_SOURCE[key]
 
 
@@ -657,8 +657,12 @@ def run_benchmark(
     log_dir = BENCHMARK_RESULT_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     endpoint_label = endpoint_filename_token(endpoint)
-    resource_label = extract_mark_resource_label((server_cfg or {}).get("mark"))
-    log_file = log_dir / f"{test_name}_{resource_label}_{endpoint_label}_{timestamp}.log"
+    resource_label = get_runtime_resource_label()
+    hw_for_filename = resource_label_for_filename(resource_label)
+    if hw_for_filename:
+        log_file = log_dir / f"{test_name}_{hw_for_filename}_{endpoint_label}_{timestamp}.log"
+    else:
+        log_file = log_dir / f"{test_name}_{endpoint_label}_{timestamp}.log"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
@@ -768,7 +772,7 @@ def run_benchmark(
         "Model": model,
         "Framework": server_type,
         "API Endpoint": endpoint,
-        "Hardware": resource_label if resource_label != "na" else "",
+        "Hardware": hardware_json_value(resource_label),
         "Deployment": "",
         "Task": params.get("task", "t2i"),
         "Dataset": params.get("dataset", "random"),

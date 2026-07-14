@@ -131,16 +131,38 @@ def test_extract_mark_resource_label():
     )
 
 
-def test_extract_configs_resource_label():
-    from tests.dfx.conftest import extract_configs_resource_label
+def test_resource_label_for_filename():
+    from tests.dfx.conftest import resource_label_for_filename
 
-    configs = [
-        {"test_name": "a", "mark": {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}},
-        {"test_name": "b", "mark": {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}}},
-        {"test_name": "c", "mark": {"hardware_marks": {"res": {"cuda": "L4"}, "num_cards": 1}}},
-    ]
-    assert extract_configs_resource_label(configs) == "H100-L4"
-    assert extract_configs_resource_label([]) == "na"
+    assert resource_label_for_filename("H100") == ""
+    assert resource_label_for_filename("L4") == "L4"
+    assert resource_label_for_filename("910B") == "910B"
+    assert resource_label_for_filename("na") == "na"
+
+
+def test_hardware_json_value():
+    from tests.dfx.conftest import hardware_json_value
+
+    assert hardware_json_value("H100") == "H100"
+    assert hardware_json_value("na") == ""
+    assert hardware_json_value(None) == ""
+
+
+def test_extract_configs_resource_label(monkeypatch):
+    from tests.dfx.conftest import extract_configs_resource_label, get_runtime_resource_label
+
+    monkeypatch.setattr(
+        "tests.dfx.conftest._read_runtime_device_name",
+        lambda *, device_id=0: "NVIDIA H100 80GB HBM3",
+    )
+    get_runtime_resource_label(refresh=True)
+    assert extract_configs_resource_label([]) == "H100"
+    get_runtime_resource_label(refresh=True)
+    monkeypatch.setattr(
+        "tests.dfx.conftest._read_runtime_device_name",
+        lambda *, device_id=0: "Ascend910B2",
+    )
+    assert get_runtime_resource_label(refresh=True) == "910B"
 
 
 def test_load_benchmark_configs_from_dir(tmp_path):
@@ -239,8 +261,8 @@ def test_create_paired_omni_benchmark_pytest_params(tmp_path):
     params = create_paired_omni_benchmark_pytest_params(configs, tmp_path)
     by_id = {p.id: p for p in params}
     assert set(by_id) == {"test_omni-p0", "test_omni-p1", "test_tts-p0"}
-    omni_row, bench_row = by_id["test_tts-0"].values
+    omni_row, bench_row = by_id["test_tts-p0"].values
     assert omni_row[0] == "test_tts"
     assert bench_row == ("test_tts", 0)
-    assert any(m.name == "tts" for m in by_id["test_tts-0"].marks)
-    assert not any(m.name == "tts" for m in by_id["test_omni-0"].marks)
+    assert any(m.name == "tts" for m in by_id["test_tts-p0"].marks)
+    assert not any(m.name == "tts" for m in by_id["test_omni-p0"].marks)
