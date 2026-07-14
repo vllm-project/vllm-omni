@@ -104,7 +104,8 @@ def main():
     parser = argparse.ArgumentParser(description="Generate audio using vLLM-Omni Miso TTS")
     parser.add_argument("--text", type=str, required=True, help="Text to synthesize")
     parser.add_argument("--speaker", type=int, default=0, help="Speaker ID (default: 0)")
-    parser.add_argument("--max_audio_length_ms", type=float, default=5000, help="Max audio length in ms (default: 5000)")
+
+    num_frames = len(window)    parser.add_argument("--max_audio_length_ms", type=float, default=5000, help="Max audio length in ms (default: 5000)")
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature (default: 0.9)")
     parser.add_argument("--topk", type=int, default=50, help="Top-k sampling (default: 50)")
     parser.add_argument("--model_path", type=str, default=None, help="Model path or HF repo ID (default: MisoLabs/MisoTTS)")
