@@ -2,7 +2,7 @@
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
-We currently only support using the "openai-chat-omni" and "openai-image-edits-omni" backend.
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, and `daily-omni` serving benchmark backends.
 
 ## Basic Parameter Description
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
@@ -10,7 +10,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
 - `--backend`
-  Specify the backend adapter as openai-chat-omni, using OpenAI Chat compatible API behavior as the protocol. Currently only openai-chat-omni is supported.
+  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, and `daily-omni` to the upstream vLLM backend choices.
 
 - `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
@@ -55,7 +55,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
                     '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
-- `-print-stage`
+- `--print-stage`
 Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
 
 - `--save-result`
@@ -312,7 +312,7 @@ vllm bench serve \
   --ignore-eos \
   --percentile-metrics ttft,tpot,itl \
   --random-output-len 2 \
-  --extra_body '{"modalities": ["text"]}'
+  --extra-body '{"modalities": ["text"]}'
 ```
 
 If successful, you will see the following output:
@@ -390,7 +390,7 @@ vllm bench serve --omni \
   --ignore-eos \
   --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,ttfc,tpoc,icl \
   --random-output-len 900 \
-  --extra_body '{"modalities": ["text","audio"]}' \
+  --extra-body '{"modalities": ["text","audio"]}' \
   --print-stage
 ```
 
