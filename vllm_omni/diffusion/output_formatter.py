@@ -20,21 +20,6 @@ from vllm_omni.outputs.output_metadata import (
     DiffusionPayload,
     DiffusionPayloadValue,
     DiffusionPostprocessRawOutput,
-    strip_internal_metadata,
-    validate_diffusion_metadata,
-    validate_public_diffusion_metadata,
-)
-from vllm_omni.diffusion.registry import DiffusionModelRegistry
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniPromptType
-from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.outputs.output_metadata import (
-    DiffusionMetadata,
-    DiffusionMultimodalOutput,
-    DiffusionOutputEnvelope,
-    DiffusionPayload,
-    DiffusionPayloadValue,
-    DiffusionPostprocessRawOutput,
     DiffusionTrajectoryPayload,
     strip_internal_metadata,
     validate_diffusion_metadata,
