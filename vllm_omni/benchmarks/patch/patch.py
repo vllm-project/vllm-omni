@@ -220,6 +220,66 @@ def _daily_omni_repo_from_args(args) -> str | None:
     return None
 
 
+def _build_custom_image_requests(
+    custom_data: list[dict],
+    tokenizer: TokenizerLike,
+    num_requests: int,
+    output_len: int | None = None,
+    request_id_prefix: str = "",
+    no_oversample: bool = False,
+) -> list[SampleRequest]:
+    """Build ``SampleRequest`` objects from inline custom-image JSONL data.
+
+    Each row in ``custom_data`` is expected to have:
+      - ``prompt`` (str): the text prompt
+      - ``image_files`` (list[str], optional): list of image URLs or file paths
+
+    The resulting requests are suitable for the ``openai-image-edits-omni``
+    backend, with ``multi_modal_data`` containing ``image_url`` entries that
+    ``_iter_image_edit_inputs`` can consume.
+    """
+    sampled_requests: list[SampleRequest] = []
+
+    # Cycle through data to reach num_requests (unless no_oversample is set and
+    # there are more data rows than needed).
+    for i in range(num_requests):
+        row = custom_data[i % len(custom_data)]
+        prompt = row["prompt"]
+        image_files = row.get("image_files") or []
+
+        # Build multimodal content: each image URL becomes an image_url entry.
+        mm_content: list[dict] = []
+        for img_url in image_files:
+            mm_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": str(img_url)},
+                }
+            )
+
+        # Compute prompt_len from the tokenizer.  When tokenizer is unavailable
+        # (e.g. --skip-chat-template is set but no tokenizer is loaded), fall
+        # back to a conservative character-based estimate.
+        if tokenizer is not None:
+            prompt_len = len(tokenizer.encode(prompt))
+        else:
+            prompt_len = len(prompt) // 4
+
+        request_id = f"{request_id_prefix}{i}" if request_id_prefix else str(i)
+
+        sampled_requests.append(
+            SampleRequest(
+                prompt=prompt,
+                prompt_len=prompt_len,
+                expected_output_len=output_len or 1,
+                multi_modal_data=mm_content if mm_content else None,
+                request_id=request_id,
+            )
+        )
+
+    return sampled_requests
+
+
 def get_samples(args, tokenizer):
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
@@ -235,7 +295,7 @@ def get_samples(args, tokenizer):
 
     # Check if we need to handle omni-related backends/datasets
     is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
-    is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
+    is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name in ("random-mm", "custom-image")
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
@@ -392,6 +452,38 @@ def get_samples(args, tokenizer):
             no_oversample=args.no_oversample,
         )
         return input_requests
+
+    # Handle custom-image dataset: reads a JSONL file where each line is
+    # {"prompt": "...", "image_files": ["https://...", ...]} and creates
+    # SampleRequest objects with multimodal image content for the
+    # openai-image-edits-omni backend.
+    if args.dataset_name == "custom-image":
+        if not args.dataset_path:
+            raise ValueError(
+                "custom-image dataset requires --dataset-path pointing to a JSONL file "
+                "(generated from --dataset-path-inline in the test config)."
+            )
+        dataset_path = args.dataset_path
+        custom_data: list[dict] = []
+        with open(dataset_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if "prompt" not in row:
+                    raise ValueError("Each line in the custom-image JSONL must contain a 'prompt' field.")
+                custom_data.append(row)
+
+        input_requests = _build_custom_image_requests(
+            custom_data=custom_data,
+            tokenizer=tokenizer,
+            num_requests=args.num_prompts,
+            output_len=getattr(args, "random_output_len", None),
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
+        return input_requests
     else:
         return get_samples_old(args, tokenizer)
 
@@ -414,6 +506,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     image_pixels: int = 0
     denoise_step_latency_ms: float = 0.0
     text_latency: float = 0.0
+    peak_memory_mb: float = 0.0
     #: Worst-case streaming-audio underrun (wall-clock seconds the player
     #: would have been starved). Populated by the audio-speech backend; ``0.0``
     #: for backends that do not run continuity analysis.
@@ -670,6 +763,19 @@ def _image_generation_ms_from_content(content: Any) -> float:
     return 0.0
 
 
+def _peak_memory_mb_from_content(content: Any) -> float:
+    """Extract peak_memory_mb from image content items in SSE delta."""
+    if not isinstance(content, list):
+        return 0.0
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        pm = item.get("peak_memory_mb")
+        if isinstance(pm, (int, float)) and float(pm) > 0:
+            return float(pm)
+    return 0.0
+
+
 async def async_request_openai_chat_omni_completions(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -706,6 +812,13 @@ async def async_request_openai_chat_omni_completions(
         },
     }
     _update_payload_common(payload, request_func_input)
+    # Pure diffusion benchmark sets ``_vllm_omni_no_stream`` in extra_body,
+    # which ``_update_payload_common`` flattens to the top-level payload.
+    if payload.pop("_vllm_omni_no_stream", False):
+        payload.pop("temperature", None)
+        payload.pop("max_tokens", None)
+        payload.pop("stream", None)
+        payload.pop("stream_options", None)
     # Seed-TTS via chat: voice-clone fields live on the body; ensure audio is streamed.
     if getattr(request_func_input, "seed_tts_row", False):
         if payload.get("modalities") is None:
@@ -763,12 +876,15 @@ async def async_request_openai_chat_omni_completions(
         output.image_generation_time_ms = 0.0
         output.image_pixels = 0
         output.denoise_step_latency_ms = 0.0
+        output.peak_memory_mb = 0.0
         completion_tokens_seen = 0
         try:
+            raw_body = bytearray()
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
                     handler = StreamedResponseHandler()
                     async for chunk_bytes in response.content.iter_any():
+                        raw_body.extend(chunk_bytes)
                         # NOTE: Do NOT strip() here; TCP may fragment the SSE messages,
                         # so stripping here can cause problems depending on how it is split.
                         #
@@ -863,6 +979,9 @@ async def async_request_openai_chat_omni_completions(
                                         content_image_ms = _image_generation_ms_from_content(content)
                                         if content_image_ms > 0:
                                             output.image_generation_time_ms += content_image_ms
+                                        peak_mem = _peak_memory_mb_from_content(content)
+                                        if peak_mem > 0:
+                                            output.peak_memory_mb = peak_mem
 
                                 (
                                     metrics_image_count,
@@ -890,6 +1009,59 @@ async def async_request_openai_chat_omni_completions(
                         )
 
                     output.latency = timestamp - st
+                    # If no SSE data events were received (e.g. non-streaming
+                    # response from pure diffusion models), fall back to wall-clock
+                    # time since start.
+                    if output.latency == 0.0:
+                        output.latency = time.perf_counter() - st
+                    # For non-streaming responses (pure diffusion models), the SSE
+                    # handler produces no messages.  Fall back to parsing the raw
+                    # JSON body so that peak_memory_mb, stage_metrics, and
+                    # image-generation metrics are still captured (matching old
+                    # async_request_chat_completions).
+                    if raw_body:
+                        try:
+                            resp_json = json.loads(raw_body.decode("utf-8"))
+
+                            # --- peak_memory_mb (from content[0] or top-level metrics) ---
+                            choices = resp_json.get("choices", [])
+                            if choices and isinstance(choices, list):
+                                msg = choices[0].get("message", {})
+                                if isinstance(msg, dict):
+                                    content = msg.get("content", [])
+                                    if content and isinstance(content, list) and len(content) > 0:
+                                        first_item = content[0]
+                                        if isinstance(first_item, dict):
+                                            pm = first_item.get("peak_memory_mb")
+                                            if isinstance(pm, (int, float)) and float(pm) > 0:
+                                                output.peak_memory_mb = float(pm)
+                            if output.peak_memory_mb == 0.0:
+                                m = resp_json.get("metrics")
+                                if isinstance(m, dict):
+                                    pm = m.get("peak_memory_mb")
+                                    if isinstance(pm, (int, float)) and float(pm) > 0:
+                                        output.peak_memory_mb = float(pm)
+
+                            # --- stage_metrics snapshot (per-stage timing / metadata) ---
+                            _update_output_stage_metrics_from_payload(output, resp_json)
+
+                            # --- image-generation metrics extracted from stage_metrics ---
+                            (
+                                metrics_image_count,
+                                metrics_image_ms,
+                                metrics_image_pixels,
+                                metrics_denoise_step_ms,
+                            ) = _image_metrics_from_stage_metrics(resp_json.get("metrics"))
+                            if metrics_image_count > output.image_count:
+                                output.image_count = metrics_image_count
+                            if metrics_image_ms > output.image_generation_time_ms:
+                                output.image_generation_time_ms = metrics_image_ms
+                            if metrics_image_pixels > output.image_pixels:
+                                output.image_pixels = metrics_image_pixels
+                            if metrics_denoise_step_ms > output.denoise_step_latency_ms:
+                                output.denoise_step_latency_ms = metrics_denoise_step_ms
+                        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+                            pass
                     output.generated_text = generated_text
                     if output.itl:
                         # Align text_latency with ITL so TPOT formula and
@@ -1055,10 +1227,12 @@ async def async_request_openai_image_edits_omni(
     most_recent_text_timestamp = st
     generated_text = ""
     try:
+        raw_body = bytearray()
         async with session.post(url=api_url, data=form, headers=headers) as response:
             if response.status == 200:
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
+                    raw_body.extend(chunk_bytes)
                     if not chunk_bytes:
                         continue
                     for message in handler.add_chunk(chunk_bytes):
@@ -1094,6 +1268,9 @@ async def async_request_openai_image_edits_omni(
                             content_image_ms = _image_generation_ms_from_content(data.get("data"))
                             if content_image_ms > 0:
                                 output.image_generation_time_ms += content_image_ms
+                            peak_mem = _peak_memory_mb_from_content(data.get("data"))
+                            if peak_mem > 0:
+                                output.peak_memory_mb = peak_mem
                         (
                             metrics_image_count,
                             metrics_image_ms,
@@ -1109,6 +1286,57 @@ async def async_request_openai_image_edits_omni(
                         if metrics_denoise_step_ms > output.denoise_step_latency_ms:
                             output.denoise_step_latency_ms = metrics_denoise_step_ms
                 output.latency = timestamp - st
+                # If no SSE data events were received (e.g. non-streaming
+                # response from pure diffusion models), fall back to wall-clock
+                # time since start.
+                if output.latency == 0.0:
+                    output.latency = time.perf_counter() - st
+                # For non-streaming responses, fall back to raw JSON body
+                # so that peak_memory_mb, stage_metrics, and image-generation
+                # metrics are still captured.
+                if raw_body:
+                    try:
+                        resp_json = json.loads(raw_body.decode("utf-8"))
+
+                        # --- peak_memory_mb (from content[0] or top-level metrics) ---
+                        choices = resp_json.get("choices", [])
+                        if choices and isinstance(choices, list):
+                            msg = choices[0].get("message", {})
+                            if isinstance(msg, dict):
+                                content = msg.get("content", [])
+                                if content and isinstance(content, list) and len(content) > 0:
+                                    first_item = content[0]
+                                    if isinstance(first_item, dict):
+                                        pm = first_item.get("peak_memory_mb")
+                                        if isinstance(pm, (int, float)) and float(pm) > 0:
+                                            output.peak_memory_mb = float(pm)
+                        if output.peak_memory_mb == 0.0:
+                            m = resp_json.get("metrics")
+                            if isinstance(m, dict):
+                                pm = m.get("peak_memory_mb")
+                                if isinstance(pm, (int, float)) and float(pm) > 0:
+                                    output.peak_memory_mb = float(pm)
+
+                        # --- stage_metrics snapshot (per-stage timing / metadata) ---
+                        _update_output_stage_metrics_from_payload(output, resp_json)
+
+                        # --- image-generation metrics extracted from stage_metrics ---
+                        (
+                            metrics_image_count,
+                            metrics_image_ms,
+                            metrics_image_pixels,
+                            metrics_denoise_step_ms,
+                        ) = _image_metrics_from_stage_metrics(resp_json.get("metrics"))
+                        if metrics_image_count > output.image_count:
+                            output.image_count = metrics_image_count
+                        if metrics_image_ms > output.image_generation_time_ms:
+                            output.image_generation_time_ms = metrics_image_ms
+                        if metrics_image_pixels > output.image_pixels:
+                            output.image_pixels = metrics_image_pixels
+                        if metrics_denoise_step_ms > output.denoise_step_latency_ms:
+                            output.denoise_step_latency_ms = metrics_denoise_step_ms
+                    except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+                        pass
                 output.generated_text = generated_text
                 output.success = True
             else:
@@ -1242,6 +1470,206 @@ async def async_request_openai_audio_speech(
     return output
 
 
+async def async_request_openai_videos_omni(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """Async job-based request to ``/v1/videos`` for video generation benchmarks.
+
+    Protocol: POST ``/v1/videos`` → poll ``GET /v1/videos/{id}`` →
+    ``GET /v1/videos/{id}/content``.
+    """
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "OpenAI Videos API", "v1/videos")
+
+    extra_body = dict(request_func_input.extra_body or {})
+    model = request_func_input.model_name if request_func_input.model_name else request_func_input.model
+
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    # Build multipart form data.
+    form = aiohttp.FormData()
+    form.add_field("model", model)
+    if request_func_input.prompt:
+        form.add_field("prompt", str(request_func_input.prompt))
+
+    _VIDEO_FORM_KEYS = (
+        "width",
+        "height",
+        "num_frames",
+        "num_inference_steps",
+        "seed",
+        "fps",
+        "negative_prompt",
+        "guidance_scale",
+    )
+    for key in _VIDEO_FORM_KEYS:
+        value = extra_body.get(key)
+        if value is not None:
+            form.add_field(key, str(value))
+
+    # Attach input reference image(s) from multimodal content (i2v / ti2v).
+    image_index = 0
+    for image_input in _iter_image_edit_inputs(request_func_input.multi_modal_content):
+        _add_video_input_reference_to_form(form, image_input, image_index)
+        image_index += 1
+
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    _update_headers_common(headers, request_func_input)
+
+    st = time.perf_counter()
+    output.start_time = st
+    job_id: str | None = None
+
+    try:
+        # --- POST /v1/videos ---
+        async with session.post(url=api_url, data=form, headers=headers) as response:
+            if response.status != 200:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+                if pbar:
+                    pbar.update(1)
+                return output
+            resp_json = await response.json()
+            job_id = resp_json.get("id")
+            job_status = resp_json.get("status")
+            if not job_id or not job_status:
+                output.error = "API response missing job 'id' or 'status' field."
+                output.success = False
+                if pbar:
+                    pbar.update(1)
+                return output
+            # Capture peak_memory_mb from initial response if present.
+            pm = resp_json.get("peak_memory_mb")
+            if isinstance(pm, (int, float)) and float(pm) > 0:
+                output.peak_memory_mb = float(pm)
+
+        # --- Poll GET /v1/videos/{id} ---
+        poll_interval = 2.0
+        timeout_seconds = 600.0
+        deadline = time.perf_counter() + timeout_seconds
+        job_url = f"{api_url}/{job_id}"
+        poll_json: dict[str, Any] = {}
+
+        while job_status not in {"completed", "failed"}:
+            await asyncio.sleep(poll_interval)
+
+            async with session.get(job_url, headers=headers) as poll_response:
+                if poll_response.status != 200:
+                    output.error = f"Polling failed HTTP {poll_response.status}: {await poll_response.text()}"
+                    output.success = False
+                    if pbar:
+                        pbar.update(1)
+                    return output
+
+                poll_json = await poll_response.json()
+                job_status = poll_json.get("status", job_status)
+
+                if time.perf_counter() >= deadline:
+                    output.error = f"Timed out waiting for video job {job_id} to complete."
+                    output.success = False
+                    if pbar:
+                        pbar.update(1)
+                    return output
+
+        if job_status == "failed":
+            output.error = f"Video job failed: {poll_json}"
+            output.success = False
+            if pbar:
+                pbar.update(1)
+            return output
+
+        # --- Extract metrics from poll response ---
+        # stage_durations is ``dict[str, float]`` which differs from the
+        # ``dict[str, dict]`` shape expected by _build_stage_metrics_from_outputs;
+        # skip for now — per-stage timing can be wired in a follow-up.
+        pm = poll_json.get("peak_memory_mb")
+        if isinstance(pm, (int, float)) and float(pm) > 0:
+            output.peak_memory_mb = float(pm)
+
+        # --- GET /v1/videos/{id}/content ---
+        content_url = f"{job_url}/content"
+        async with session.get(content_url, headers=headers) as content_response:
+            if content_response.status != 200:
+                output.error = (
+                    f"Content retrieval failed HTTP {content_response.status}: {await content_response.text()}"
+                )
+                output.success = False
+                if pbar:
+                    pbar.update(1)
+                return output
+            await content_response.read()
+
+        output.success = True
+        output.latency = time.perf_counter() - st
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(f"ERROR: send video request failed, reason is: {output.error}")
+    finally:
+        # Best-effort cleanup of the async job.
+        if job_id is not None:
+            try:
+                async with session.delete(f"{api_url}/{job_id}", headers=headers) as _:
+                    pass
+            except Exception:
+                pass
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+def _add_video_input_reference_to_form(form: aiohttp.FormData, image_input: Any, image_index: int) -> None:
+    """Add one image as ``input_reference`` to a ``/v1/videos`` multipart form."""
+    filename = f"benchmark_input_{image_index}.png"
+
+    if isinstance(image_input, dict) and "bytes" in image_input:
+        form.add_field(
+            "input_reference",
+            image_input["bytes"],
+            filename=filename,
+            content_type="image/png",
+        )
+        return
+
+    if isinstance(image_input, str):
+        if image_input.startswith("data:image"):
+            # Decode data-URL into raw bytes for file upload.
+            _, b64 = image_input.split(",", 1)
+            raw = base64.b64decode(b64, validate=True)
+            form.add_field(
+                "input_reference",
+                raw,
+                filename=filename,
+                content_type="application/octet-stream",
+            )
+            return
+        if image_input.startswith("http://") or image_input.startswith("https://"):
+            raise ValueError(
+                "Remote URLs are not supported for video input_reference; use data URLs or local file paths."
+            )
+        # Local file path.
+        local_path = image_input.removeprefix("file://")
+        if not os.path.exists(local_path):
+            raise ValueError(f"Video input image not found: {local_path}")
+        mime = _guess_mime_type(local_path)
+        with open(local_path, "rb") as f:
+            form.add_field(
+                "input_reference",
+                f.read(),
+                filename=os.path.basename(local_path),
+                content_type=mime,
+            )
+        return
+
+    raise ValueError(f"Unsupported video input image type: {type(image_input).__name__}")
+
+
 ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_completions
 if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-chat-omni")
@@ -1253,6 +1681,10 @@ if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
 ASYNC_REQUEST_FUNCS["openai-image-edits-omni"] = async_request_openai_image_edits_omni
 if "openai-image-edits-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-image-edits-omni")
+
+ASYNC_REQUEST_FUNCS["openai-videos-omni"] = async_request_openai_videos_omni
+if "openai-videos-omni" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-videos-omni")
 
 # Daily-Omni backend for audio-visual reasoning benchmark
 # Reuses openai-chat-omni completions for video+text understanding
@@ -1575,6 +2007,9 @@ async def benchmark(
             defs.IMAGE_THROUGHPUT: getattr(metrics, defs.IMAGE_THROUGHPUT),
             defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
             defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
+            defs.PEAK_MEMORY_MB_MAX: getattr(metrics, defs.PEAK_MEMORY_MB_MAX),
+            defs.PEAK_MEMORY_MB_MEAN: getattr(metrics, defs.PEAK_MEMORY_MB_MEAN),
+            defs.PEAK_MEMORY_MB_MEDIAN: getattr(metrics, defs.PEAK_MEMORY_MB_MEDIAN),
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,

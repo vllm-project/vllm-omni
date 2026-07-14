@@ -70,6 +70,12 @@ MEDIAN_IMAGE_GENERATION_MS = f"median_{IMAGE_GENERATION}_ms"
 STD_IMAGE_GENERATION_MS = f"std_{IMAGE_GENERATION}_ms"
 PERCENTILES_IMAGE_GENERATION_MS = f"percentiles_{IMAGE_GENERATION}_ms"
 
+# Peak memory metrics (reported by server in diffusion response content).
+PEAK_MEMORY_MB = "peak_memory_mb"
+PEAK_MEMORY_MB_MAX = "peak_memory_mb_max"
+PEAK_MEMORY_MB_MEAN = "peak_memory_mb_mean"
+PEAK_MEMORY_MB_MEDIAN = "peak_memory_mb_median"
+
 # Stage snapshot / StageBenchmarkMetrics field names.
 TOTAL_OUTPUT = "total_output"
 TTFTS = "ttfts"

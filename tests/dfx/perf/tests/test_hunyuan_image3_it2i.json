@@ -107,23 +107,21 @@
         "benchmark_params": [
             {
                 "name": "inline_dataset_5_requests",
-                "dataset": "custom",
+                "dataset": "custom_image",
                 "dataset-path-inline": {
                     "type": "jsonl",
                     "content": [
                         {
                             "prompt": "新年宠物海报，Q版圆润的可爱标题“新年快乐汪”，副标题“HAPPY NEW YEAR”。 鱼眼镜头，背景是房间门口，近景，上传的主体歪头笑，围着红色围巾，戴着红色毛线帽，高清，绒毛细节，面部特写。 宝丽莱相纸，超现实主义，写实主义，胶片摄影，打印颗粒感肌理。肌理，超写实，复古感。",
-                            "image_urls": [
-                                "https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/main/assets/demo_instruct_imgs/input_0_0.png"
-                            ],
-                            "num_inference_steps": 8,
-                            "seed": 42,
-                            "guidance_scale": 1.0
+                            "image_files": ["https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/main/assets/demo_instruct_imgs/input_0_0.png"]
                         }
                     ]
                 },
                 "task": "ti2i",
                 "bot-task": "think_recaption",
+                "num-inference-steps": 8,
+                "seed": 42,
+                "guidance_scale": 1.0,
                 "max-concurrency": 16,
                 "num-prompts": 96,
                 "skip-performance-assertion": true,

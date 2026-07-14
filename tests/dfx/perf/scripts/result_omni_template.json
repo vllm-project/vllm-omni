@@ -45,6 +45,9 @@
   "mean_audio_duration_s": 0,
   "median_audio_duration_s": 0,
   "p99_audio_duration_s": 0,
+  "peak_memory_mb_max": 0,
+  "peak_memory_mb_mean": 0,
+  "peak_memory_mb_median": 0,
   "baseline": {
     "mean_ttft_ms": 0,
     "mean_audio_ttfp_ms": 0,

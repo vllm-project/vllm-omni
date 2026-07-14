@@ -43,6 +43,9 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEDIAN_IMAGE_GENERATION_MS, float, field(default=0.0)),
     (defs.STD_IMAGE_GENERATION_MS, float, field(default=0.0)),
     (defs.PERCENTILES_IMAGE_GENERATION_MS, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.PEAK_MEMORY_MB_MAX, float, field(default=0.0)),
+    (defs.PEAK_MEMORY_MB_MEAN, float, field(default=0.0)),
+    (defs.PEAK_MEMORY_MB_MEDIAN, float, field(default=0.0)),
 ]
 
 MultiModalsBenchmarkMetrics = make_dataclass(
@@ -302,6 +305,10 @@ def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsB
         for p, value in getattr(metrics, defs.PERCENTILES_IMAGE_GENERATION_MS) or []:
             if p in selected_percentiles:
                 print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} IMAGE_GENERATION (ms):", value))
+    if getattr(metrics, defs.PEAK_MEMORY_MB_MAX) > 0:
+        print("{:<40} {:<10.2f}".format("Peak Memory Max (MB):", getattr(metrics, defs.PEAK_MEMORY_MB_MAX)))
+        print("{:<40} {:<10.2f}".format("Peak Memory Mean (MB):", getattr(metrics, defs.PEAK_MEMORY_MB_MEAN)))
+        print("{:<40} {:<10.2f}".format("Peak Memory Median (MB):", getattr(metrics, defs.PEAK_MEMORY_MB_MEDIAN)))
 
 
 def process_one_metric(
@@ -727,6 +734,7 @@ def calculate_metrics(
     audio_frames: list[int] = []
     image_generation_times_ms: list[float] = []
     denoise_step_latencies_ms: list[float] = []
+    peak_memory_mbs: list[float] = []
     total_images = 0
     total_image_pixels = 0
     audio_underruns: list[float] = []
@@ -780,6 +788,9 @@ def calculate_metrics(
             denoise_step_latency_ms = float(getattr(outputs[i], defs.DENOISE_STEP_LATENCY_MS, 0.0) or 0.0)
             if denoise_step_latency_ms > 0:
                 denoise_step_latencies_ms.append(denoise_step_latency_ms)
+            peak_memory_mb = float(getattr(outputs[i], defs.PEAK_MEMORY_MB, 0.0) or 0.0)
+            if peak_memory_mb > 0:
+                peak_memory_mbs.append(peak_memory_mb)
             audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
             audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
             e2els.append(outputs[i].latency)
@@ -948,6 +959,9 @@ def calculate_metrics(
             defs.AUDIO_CONTINUITY_OK_RATE: (
                 (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0
             ),
+            defs.PEAK_MEMORY_MB_MAX: max(peak_memory_mbs) if peak_memory_mbs else 0.0,
+            defs.PEAK_MEMORY_MB_MEAN: float(np.mean(peak_memory_mbs)) if peak_memory_mbs else 0.0,
+            defs.PEAK_MEMORY_MB_MEDIAN: float(np.median(peak_memory_mbs)) if peak_memory_mbs else 0.0,
         },
     )
     print_metrics(

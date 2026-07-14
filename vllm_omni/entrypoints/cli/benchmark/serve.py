@@ -157,6 +157,7 @@ def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 _OMNI_BENCH_DATASET_CHOICES = (
+    "custom-image",
     "daily-omni",
     "seed-tts",
     "seed-tts-text",
@@ -205,6 +206,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
                 extra = [
                     c
                     for c in (
+                        "custom-image",
                         "daily-omni",
                         "seed-tts",
                         "seed-tts-text",
