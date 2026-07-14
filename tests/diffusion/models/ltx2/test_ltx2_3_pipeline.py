@@ -7,7 +7,7 @@ These tests verify:
 - Pipeline is properly registered in the diffusion registry
 - Post-process function is registered
 - Cache-DiT enablers are registered
-- Pipeline does NOT inherit from LTX2Pipeline
+- Pipeline shares the LTX family base without inheriting LTX2-specific behavior
 - Vocoder sample rate detection logic
 - Re-export module works correctly
 """
@@ -311,16 +311,16 @@ class TestLTX23ForwardStages:
         }
 
 
-class TestPipelineIndependence:
-    """Verify LTX23Pipeline is fully independent from LTX2Pipeline."""
+class TestPipelineInheritance:
+    """Verify sibling public pipelines meet at the shared family base."""
 
     def test_ltx23_pipeline_does_not_inherit_from_ltx2(self):
-        """LTX23Pipeline must NOT inherit from LTX2Pipeline."""
+        """LTX23Pipeline must not inherit LTX2-specific numerical behavior."""
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
 
         assert not issubclass(LTX23Pipeline, LTX2Pipeline), (
-            "LTX23Pipeline should be fully independent and not inherit from LTX2Pipeline"
+            "LTX23Pipeline should inherit the shared family base, not LTX2Pipeline"
         )
 
     def test_ltx23_pipeline_is_nn_module(self):

@@ -15,7 +15,6 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .ltx2_conditioning import LTXI2VConditioningMixin
-from .ltx2_denoise import LTXDenoiseContext, LTXForwardContext
 from .ltx2_recipes import LTX2_ONE_STAGE_RECIPE
 from .pipeline_ltx2 import (
     LTX2Pipeline,
@@ -26,7 +25,7 @@ from .pipeline_ltx2 import (
 )
 
 if TYPE_CHECKING:
-    from .ltx2_pipeline_base import LTXRequestInputs
+    from .ltx2_request import LTXRequestInputs
 
 logger = init_logger(__name__)
 
@@ -150,19 +149,6 @@ class LTX2ImageToVideoPipeline(LTXI2VConditioningMixin, LTX2Pipeline):
             prompt_attention_mask=request_inputs.prompt_attention_mask,
             negative_prompt_attention_mask=request_inputs.negative_prompt_attention_mask,
         )
-
-    def _denoise_timestep_kwargs(
-        self,
-        ts: torch.Tensor,
-        forward_ctx: LTXForwardContext,
-        denoise_ctx: LTXDenoiseContext,
-    ) -> dict[str, torch.Tensor]:
-        if denoise_ctx.conditioning_mask is None:
-            raise ValueError("LTX2 I2V requires a video conditioning mask.")
-        return {
-            "timestep": ts.unsqueeze(-1) * (1 - denoise_ctx.conditioning_mask),
-            "audio_timestep": ts,
-        }
 
     @torch.no_grad()
     def forward(

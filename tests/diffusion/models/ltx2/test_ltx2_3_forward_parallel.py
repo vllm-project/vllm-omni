@@ -69,6 +69,7 @@ class TestCFGParallelHelpers:
         assert torch.allclose(audio_combined, expected_audio)
 
     def test_two_rank_cfg_parallel_smoke_uses_rank_local_branch_and_x0_formula(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_guidance
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
 
         pipe = object.__new__(ltx23.LTX23Pipeline)
@@ -89,17 +90,17 @@ class TestCFGParallelHelpers:
                     return [video_pos, video_neg]
                 return [audio_pos, audio_neg]
 
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx23, "get_cfg_group", lambda: FakeCfgGroup())
+        monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_world_size", lambda: 2)
+        monkeypatch.setattr(ltx2_guidance, "get_cfg_group", lambda: FakeCfgGroup())
 
-        expected_video = ltx23.LTX23Pipeline._combine_x0_space_cfg(
+        expected_video = ltx2_guidance.combine_velocity_via_x0(
             video_sample,
             video_pos,
             video_neg,
             video_sigma,
             scale,
         )
-        expected_audio = ltx23.LTX23Pipeline._combine_x0_space_cfg(
+        expected_audio = ltx2_guidance.combine_velocity_via_x0(
             audio_sample,
             audio_pos,
             audio_neg,
@@ -109,7 +110,7 @@ class TestCFGParallelHelpers:
 
         for rank, expected_branch in ((0, "positive"), (1, "negative")):
             calls = []
-            monkeypatch.setattr(ltx23, "get_classifier_free_guidance_rank", lambda rank=rank: rank)
+            monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_rank", lambda rank=rank: rank)
 
             def fake_predict_noise(**kwargs):
                 calls.append(kwargs["branch"])
@@ -141,6 +142,7 @@ class TestCFGParallelForwardPath:
     """Test the LTX-2.3 CFG-parallel denoising path without loading model weights."""
 
     def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_base
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -150,7 +152,7 @@ class TestCFGParallelForwardPath:
         torch.nn.Module.__init__(pipe)
         pipe.device = torch.device("cpu")
         pipe.tokenizer_max_length = 4
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 1)
+        monkeypatch.setattr(ltx2_pipeline_base, "get_classifier_free_guidance_world_size", lambda: 1)
 
         class StopAtEncodePromptError(Exception):
             pass
@@ -247,7 +249,7 @@ class TestCFGParallelForwardPath:
         audio_sampling_rate,
         expected_frame_rate,
     ):
-        from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_pipeline_base
+        from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_guidance, ltx2_pipeline_base
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -292,10 +294,10 @@ class TestCFGParallelForwardPath:
                     return [audio_pos, audio_neg]
                 raise AssertionError(f"Unexpected gathered tensor: {tensor}")
 
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 2)
         monkeypatch.setattr(ltx2_pipeline_base, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_rank", lambda: cfg_rank)
-        monkeypatch.setattr(ltx23, "get_cfg_group", lambda: FakeCfgGroup())
+        monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_world_size", lambda: 2)
+        monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_rank", lambda: cfg_rank)
+        monkeypatch.setattr(ltx2_guidance, "get_cfg_group", lambda: FakeCfgGroup())
 
         def fake_retrieve_timesteps(scheduler, num_inference_steps, device, timesteps, sigmas=None, mu=None):
             scheduler.sigmas = torch.tensor([0.25, 0.25], device=device)
@@ -404,14 +406,14 @@ class TestCFGParallelForwardPath:
 
         output = pipe.forward(DiffusionRequestBatch(requests=[req]))[0]
 
-        expected_video_noise = ltx23.LTX23Pipeline._combine_x0_space_cfg(
+        expected_video_noise = ltx2_guidance.combine_velocity_via_x0(
             video_latents,
             video_pos,
             video_neg,
             pipe.scheduler.sigmas[0],
             4.0,
         )
-        expected_audio_noise = ltx23.LTX23Pipeline._combine_x0_space_cfg(
+        expected_audio_noise = ltx2_guidance.combine_velocity_via_x0(
             audio_latents,
             audio_pos,
             audio_neg,

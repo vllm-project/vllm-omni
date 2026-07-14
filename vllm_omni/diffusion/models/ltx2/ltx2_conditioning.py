@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -14,7 +15,228 @@ from diffusers.utils.torch_utils import randn_tensor
 from .ltx2_denoise import I2VVideoAudioScheduler
 
 if TYPE_CHECKING:
-    from .ltx2_pipeline_base import LTXPromptContext, LTXRequestInputs
+    from .ltx2_denoise import LTXDenoiseContext, LTXForwardContext
+    from .ltx2_request import LTXRequestInputs
+
+
+@dataclass
+class LTXPromptContext:
+    """Connector outputs consumed by an LTX denoise phase."""
+
+    batch_size: int
+    connector_prompt_embeds: torch.Tensor
+    connector_audio_prompt_embeds: torch.Tensor
+    connector_attention_mask: torch.Tensor
+    positive_connector_prompt_embeds: torch.Tensor
+    positive_connector_audio_prompt_embeds: torch.Tensor
+    positive_connector_attention_mask: torch.Tensor
+    negative_connector_prompt_embeds: torch.Tensor | None
+    negative_connector_audio_prompt_embeds: torch.Tensor | None
+    negative_connector_attention_mask: torch.Tensor | None
+
+
+def _repeat_prompt_tensor_for_outputs(tensor: torch.Tensor, num_outputs: int) -> torch.Tensor:
+    if num_outputs == 1:
+        return tensor
+    return tensor.repeat_interleave(num_outputs, dim=0)
+
+
+class LTXTextConditioningMixin:
+    """Shared Gemma encoding and text connector orchestration."""
+
+    connector_batches_cfg = False
+
+    def _get_gemma_prompt_embeds(
+        self,
+        prompt: str | list[str],
+        num_videos_per_prompt: int = 1,
+        max_sequence_length: int = 1024,
+        scale_factor: int = 8,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del scale_factor
+        device = device or self.device
+        dtype = dtype or self.text_encoder.dtype
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt)
+
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        text_inputs = self.tokenizer(
+            [text.strip() for text in prompt],
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids.to(device)
+        prompt_attention_mask = text_inputs.attention_mask.to(device)
+        hidden_states = self.text_encoder(
+            input_ids=text_input_ids,
+            attention_mask=prompt_attention_mask,
+            output_hidden_states=True,
+        ).hidden_states
+
+        prompt_embeds = torch.stack(hidden_states, dim=-1).flatten(2, 3).to(dtype=dtype)
+        prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
+        prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
+        prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+            prompt_attention_mask,
+            num_videos_per_prompt,
+        )
+        return prompt_embeds, prompt_attention_mask
+
+    def encode_prompt(
+        self,
+        prompt: str | list[str] | None,
+        negative_prompt: str | list[str] | None = None,
+        do_classifier_free_guidance: bool = True,
+        num_videos_per_prompt: int = 1,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        max_sequence_length: int = 1024,
+        scale_factor: int = 8,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        device = device or self.device
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt) if prompt is not None else prompt_embeds.shape[0]
+        negative_prompt_embeds_provided = negative_prompt_embeds is not None
+
+        if prompt_embeds is None:
+            prompt_embeds, prompt_attention_mask = self._get_gemma_prompt_embeds(
+                prompt=prompt,
+                num_videos_per_prompt=num_videos_per_prompt,
+                max_sequence_length=max_sequence_length,
+                scale_factor=scale_factor,
+                device=device,
+                dtype=dtype,
+            )
+        elif num_videos_per_prompt > 1:
+            prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
+            prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                prompt_attention_mask,
+                num_videos_per_prompt,
+            )
+
+        if do_classifier_free_guidance and negative_prompt_embeds is None:
+            negative_prompt = negative_prompt or ""
+            negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            if prompt is not None and type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type as `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
+            if isinstance(negative_prompt, list) and batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt` has batch size {len(negative_prompt)}, but `prompt` has batch size"
+                    f" {batch_size}."
+                )
+            negative_prompt_embeds, negative_prompt_attention_mask = self._get_gemma_prompt_embeds(
+                prompt=negative_prompt,
+                num_videos_per_prompt=num_videos_per_prompt,
+                max_sequence_length=max_sequence_length,
+                scale_factor=scale_factor,
+                device=device,
+                dtype=dtype,
+            )
+        elif do_classifier_free_guidance and negative_prompt_embeds_provided and num_videos_per_prompt > 1:
+            negative_prompt_embeds = _repeat_prompt_tensor_for_outputs(
+                negative_prompt_embeds,
+                num_videos_per_prompt,
+            )
+            negative_prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                negative_prompt_attention_mask,
+                num_videos_per_prompt,
+            )
+
+        return prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask
+
+    def _prepare_prompt_context(
+        self,
+        *,
+        prompt: str | list[str] | None,
+        negative_prompt: str | list[str] | None,
+        prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        prompt_attention_mask: torch.Tensor | None,
+        negative_prompt_attention_mask: torch.Tensor | None,
+        num_videos_per_prompt: int,
+        max_sequence_length: int,
+    ) -> LTXPromptContext:
+        if isinstance(prompt, str):
+            batch_size = 1
+        elif isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = (
+            self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                num_videos_per_prompt=num_videos_per_prompt,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                negative_prompt_attention_mask=negative_prompt_attention_mask,
+                max_sequence_length=max_sequence_length,
+                device=self.device,
+            )
+        )
+        padding_side = getattr(self.tokenizer, "padding_side", "left")
+
+        if self.do_classifier_free_guidance and self.connector_batches_cfg:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+
+        video_context, audio_context, attention_mask = self.connectors(
+            prompt_embeds,
+            prompt_attention_mask,
+            padding_side=padding_side,
+        )
+        positive_video_context = video_context
+        positive_audio_context = audio_context
+        positive_attention_mask = attention_mask
+        negative_video_context = None
+        negative_audio_context = None
+        negative_attention_mask = None
+
+        if self.do_classifier_free_guidance and self.connector_batches_cfg:
+            split_batch = batch_size * num_videos_per_prompt
+            negative_video_context = video_context[:split_batch]
+            positive_video_context = video_context[split_batch:]
+            negative_audio_context = audio_context[:split_batch]
+            positive_audio_context = audio_context[split_batch:]
+            negative_attention_mask = attention_mask[:split_batch]
+            positive_attention_mask = attention_mask[split_batch:]
+        elif self.do_classifier_free_guidance:
+            negative_video_context, negative_audio_context, negative_attention_mask = self.connectors(
+                negative_prompt_embeds,
+                negative_prompt_attention_mask,
+                padding_side=padding_side,
+            )
+
+        return LTXPromptContext(
+            batch_size=batch_size,
+            connector_prompt_embeds=video_context,
+            connector_audio_prompt_embeds=audio_context,
+            connector_attention_mask=attention_mask,
+            positive_connector_prompt_embeds=positive_video_context,
+            positive_connector_audio_prompt_embeds=positive_audio_context,
+            positive_connector_attention_mask=positive_attention_mask,
+            negative_connector_prompt_embeds=negative_video_context,
+            negative_connector_audio_prompt_embeds=negative_audio_context,
+            negative_connector_attention_mask=negative_attention_mask,
+        )
 
 
 class LTXI2VConditioningMixin:
@@ -241,3 +463,43 @@ class LTXI2VConditioningMixin:
             latent_height,
             latent_width,
         )
+
+    def _prepare_denoise_context_for_cfg(
+        self,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> LTXDenoiseContext:
+        denoise_ctx = super()._prepare_denoise_context_for_cfg(forward_ctx, denoise_ctx)
+        if denoise_ctx.conditioning_mask is None:
+            raise ValueError("LTX I2V denoising requires a conditioning mask.")
+
+        mask_batch = denoise_ctx.conditioning_mask.shape[0]
+        model_batch = denoise_ctx.video_coords.shape[0]
+        if model_batch % mask_batch != 0:
+            raise ValueError(
+                "I2V conditioning-mask batch must divide the Transformer input batch, "
+                f"but got {mask_batch} and {model_batch}."
+            )
+        repeats = model_batch // mask_batch
+        denoise_ctx.conditioning_mask_for_model = (
+            denoise_ctx.conditioning_mask if repeats == 1 else torch.cat([denoise_ctx.conditioning_mask] * repeats)
+        )
+        return denoise_ctx
+
+    def _denoise_timestep_kwargs(
+        self,
+        ts: torch.Tensor,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> dict[str, torch.Tensor]:
+        kwargs = super()._denoise_timestep_kwargs(ts, forward_ctx, denoise_ctx)
+        conditioning_mask = (
+            denoise_ctx.conditioning_mask if forward_ctx.cfg_parallel_ready else denoise_ctx.conditioning_mask_for_model
+        )
+        if conditioning_mask is None:
+            raise ValueError("LTX I2V denoising requires a conditioning mask.")
+        kwargs.update(
+            timestep=ts.unsqueeze(-1) * (1 - conditioning_mask),
+            audio_timestep=ts,
+        )
+        return kwargs

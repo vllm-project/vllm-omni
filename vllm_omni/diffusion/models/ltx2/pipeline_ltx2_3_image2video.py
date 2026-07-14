@@ -15,9 +15,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .ltx2_conditioning import LTXI2VConditioningMixin
-from .ltx2_denoise import LTXDenoiseContext, LTXForwardContext
-from .ltx2_pipeline_base import LTXRequestInputs
 from .ltx2_recipes import LTX23_ONE_STAGE_RECIPE
+from .ltx2_request import LTXRequestInputs
 from .pipeline_ltx2_3 import (
     LTX23Pipeline,
     get_ltx2_post_process_func,
@@ -132,39 +131,6 @@ class LTX23ImageToVideoPipeline(LTXI2VConditioningMixin, LTX23Pipeline):
             prompt_attention_mask=request_inputs.prompt_attention_mask,
             negative_prompt_attention_mask=request_inputs.negative_prompt_attention_mask,
         )
-
-    def _prepare_denoise_context_for_cfg(
-        self,
-        forward_ctx: LTXForwardContext,
-        denoise_ctx: LTXDenoiseContext,
-    ) -> LTXDenoiseContext:
-        denoise_ctx = super()._prepare_denoise_context_for_cfg(forward_ctx, denoise_ctx)
-        if denoise_ctx.conditioning_mask is None:
-            raise ValueError("I2V denoising requires a conditioning mask.")
-        if self.do_classifier_free_guidance and not forward_ctx.cfg_parallel_ready:
-            denoise_ctx.conditioning_mask_for_model = torch.cat(
-                [denoise_ctx.conditioning_mask, denoise_ctx.conditioning_mask]
-            )
-        else:
-            denoise_ctx.conditioning_mask_for_model = denoise_ctx.conditioning_mask
-        return denoise_ctx
-
-    def _denoise_timestep_kwargs(
-        self,
-        ts: torch.Tensor,
-        forward_ctx: LTXForwardContext,
-        denoise_ctx: LTXDenoiseContext,
-    ) -> dict[str, torch.Tensor]:
-        conditioning_mask = (
-            denoise_ctx.conditioning_mask if forward_ctx.cfg_parallel_ready else denoise_ctx.conditioning_mask_for_model
-        )
-        if conditioning_mask is None:
-            raise ValueError("I2V denoising requires a conditioning mask.")
-        return {
-            "timestep": ts.unsqueeze(-1) * (1 - conditioning_mask),
-            "audio_timestep": ts,
-            "sigma": ts,
-        }
 
     @torch.no_grad()
     def forward(

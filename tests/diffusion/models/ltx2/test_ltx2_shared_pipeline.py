@@ -9,16 +9,17 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_COMPONENT_PROFILE,
     LTX23_COMPONENT_PROFILE,
-    create_transformer_from_config,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXI2VConditioningMixin
 from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXDenoiseExecutor, LTXPhaseResult
-from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
-from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_base import (
-    LTXPipelineBase,
-    LTXRequestInputs,
+from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
+    LTX_LEGACY_VELOCITY_GUIDANCE,
+    LTX_OFFICIAL_X0_GUIDANCE,
 )
+from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
+from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_base import LTXPipelineBase
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX2_ONE_STAGE_RECIPE, LTX23_ONE_STAGE_RECIPE
+from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline, LTX2TwoStagesPipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
@@ -29,8 +30,6 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import (
 
 
 def test_ltx_versions_share_runtime_without_cross_version_inheritance():
-    from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2, pipeline_ltx2_3
-
     assert issubclass(LTX2Pipeline, LTXPipelineBase)
     assert issubclass(LTX23Pipeline, LTXPipelineBase)
     assert not issubclass(LTX23Pipeline, LTX2Pipeline)
@@ -39,8 +38,6 @@ def test_ltx_versions_share_runtime_without_cross_version_inheritance():
     assert LTX23Pipeline.component_profile is LTX23_COMPONENT_PROFILE
     assert LTX2Pipeline.one_stage_recipe is LTX2_ONE_STAGE_RECIPE
     assert LTX23Pipeline.one_stage_recipe is LTX23_ONE_STAGE_RECIPE
-    assert pipeline_ltx2.create_transformer_from_config is create_transformer_from_config
-    assert pipeline_ltx2_3.create_transformer_from_config is create_transformer_from_config
 
 
 def test_ltx_one_stage_variants_share_forward_template():
@@ -48,6 +45,30 @@ def test_ltx_one_stage_variants_share_forward_template():
     assert LTX2ImageToVideoPipeline._forward_impl is LTXPipelineBase._forward_impl
     assert LTX23Pipeline._forward_impl is LTXPipelineBase._forward_impl
     assert LTX23ImageToVideoPipeline._forward_impl is LTXPipelineBase._forward_impl
+
+
+def test_ltx_versions_share_request_prompt_and_step_templates():
+    shared_methods = (
+        "_get_gemma_prompt_embeds",
+        "encode_prompt",
+        "check_inputs",
+        "_resolve_request_inputs",
+        "_prepare_prompt_context",
+        "_denoise_step",
+    )
+    for method_name in shared_methods:
+        base_method = getattr(LTXPipelineBase, method_name)
+        assert getattr(LTX2Pipeline, method_name) is base_method
+        assert getattr(LTX23Pipeline, method_name) is base_method
+
+
+def test_ltx_versions_select_guidance_without_overriding_pipeline_control_flow():
+    assert LTX2Pipeline.guidance_strategy is LTX_LEGACY_VELOCITY_GUIDANCE
+    assert LTX23Pipeline.guidance_strategy is LTX_OFFICIAL_X0_GUIDANCE
+    assert LTX2Pipeline._predict_noise_for_step is LTXPipelineBase._predict_noise_for_step
+    assert LTX23Pipeline._predict_noise_for_step is LTXPipelineBase._predict_noise_for_step
+    assert LTX2Pipeline.combine_cfg_noise is LTXPipelineBase.combine_cfg_noise
+    assert LTX23Pipeline.combine_cfg_noise is LTXPipelineBase.combine_cfg_noise
 
 
 def test_ltx2_two_stage_variants_share_stage_orchestration():

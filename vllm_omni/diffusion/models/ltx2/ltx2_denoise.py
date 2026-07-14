@@ -19,7 +19,8 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from .ltx2_latents import LTXAVState
 
 if TYPE_CHECKING:
-    from .ltx2_pipeline_base import LTXPromptContext, LTXRequestInputs
+    from .ltx2_conditioning import LTXPromptContext
+    from .ltx2_request import LTXRequestInputs
 
 
 @dataclass

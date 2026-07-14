@@ -7,8 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from contextlib import nullcontext
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -21,6 +20,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 from . import ltx2_latents as latent_ops
+from .ltx2_conditioning import LTXPromptContext, LTXTextConditioningMixin
 from .ltx2_denoise import (
     LTXDenoiseContext,
     LTXForwardContext,
@@ -32,53 +32,21 @@ from .ltx2_denoise import (
     prepare_scheduler_stage,
     step_denoised_latents,
 )
+from .ltx2_guidance import LTXGuidanceStrategy
+from .ltx2_request import LTXRequestInputs, LTXRequestMixin
 
 
-@dataclass
-class LTXRequestInputs:
-    """Resolved request values shared by all LTX execution variants."""
-
-    prompt: str | list[str] | None
-    negative_prompt: str | list[str] | None
-    height: int
-    width: int
-    num_frames: int
-    frame_rate: float
-    num_inference_steps: int
-    guidance_scale: float
-    guidance_rescale: float
-    num_videos_per_prompt: int
-    generator: torch.Generator | list[torch.Generator] | None
-    latents: torch.Tensor | None
-    audio_latents: torch.Tensor | None
-    prompt_embeds: torch.Tensor | None
-    negative_prompt_embeds: torch.Tensor | None
-    prompt_attention_mask: torch.Tensor | None
-    negative_prompt_attention_mask: torch.Tensor | None
-    decode_timestep: float | list[float]
-    decode_noise_scale: float | list[float] | None
-    output_type: str
-    max_sequence_length: int
-
-
-@dataclass
-class LTXPromptContext:
-    """Connector outputs consumed by an LTX denoise phase."""
-
-    batch_size: int
-    connector_prompt_embeds: torch.Tensor
-    connector_audio_prompt_embeds: torch.Tensor
-    connector_attention_mask: torch.Tensor
-    positive_connector_prompt_embeds: torch.Tensor
-    positive_connector_audio_prompt_embeds: torch.Tensor
-    positive_connector_attention_mask: torch.Tensor
-    negative_connector_prompt_embeds: torch.Tensor | None
-    negative_connector_audio_prompt_embeds: torch.Tensor | None
-    negative_connector_attention_mask: torch.Tensor | None
-
-
-class LTXPipelineBase(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsComponentDiscovery):
+class LTXPipelineBase(
+    LTXRequestMixin,
+    LTXTextConditioningMixin,
+    nn.Module,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    SupportsComponentDiscovery,
+):
     """Common state and primitives shared by LTX2 and LTX2.3 pipelines."""
+
+    guidance_strategy: ClassVar[LTXGuidanceStrategy]
 
     _pack_latents = staticmethod(latent_ops.pack_latents)
     _unpack_latents = staticmethod(latent_ops.unpack_latents)
@@ -150,6 +118,14 @@ class LTXPipelineBase(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCom
         return self._guidance_scale
 
     @property
+    def guidance_rescale(self):
+        return self._guidance_rescale
+
+    @property
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale is not None and self._guidance_scale > 1.0
+
+    @property
     def num_timesteps(self):
         return self._num_timesteps
 
@@ -175,6 +151,32 @@ class LTXPipelineBase(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCom
         with self._transformer_cache_context("cond_uncond"):
             noise_pred_video, noise_pred_audio = self.transformer(**kwargs)
         return noise_pred_video.float(), noise_pred_audio.float()
+
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred,
+        negative_noise_pred,
+        true_cfg_scale,
+        cfg_normalize=False,
+        kwargs: dict[str, Any] | None = None,
+        **context: Any,
+    ):
+        if kwargs is not None:
+            context = {**kwargs, **context}
+        return self.guidance_strategy.combine_cfg_noise(
+            self,
+            positive_noise_pred,
+            negative_noise_pred,
+            true_cfg_scale,
+            cfg_normalize,
+            context,
+        )
+
+    def predict_noise_with_parallel_cfg(self, *args, **kwargs):
+        predict_parallel_cfg = getattr(self.guidance_strategy, "predict_parallel_cfg", None)
+        if predict_parallel_cfg is None:
+            raise NotImplementedError("The selected LTX guidance strategy does not implement parallel CFG.")
+        return predict_parallel_cfg(self, *args, **kwargs)
 
     def _synchronize_cfg_parallel_step_output(
         self,
@@ -202,7 +204,10 @@ class LTXPipelineBase(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCom
         self._attention_kwargs = attention_kwargs
         self._interrupt = False
         self._current_timestep = None
-        return self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() > 1
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        if self.do_classifier_free_guidance:
+            self.guidance_strategy.validate_cfg_world_size(cfg_world_size)
+        return self.do_classifier_free_guidance and cfg_world_size > 1
 
     def _check_forward_inputs(
         self,
@@ -352,7 +357,7 @@ class LTXPipelineBase(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCom
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
     ) -> LTXDenoiseContext:
-        return denoise_ctx
+        return self.guidance_strategy.prepare_denoise_context(self, forward_ctx, denoise_ctx)
 
     def _denoise_timestep_kwargs(
         self,
@@ -360,7 +365,7 @@ class LTXPipelineBase(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCom
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
     ) -> dict[str, torch.Tensor]:
-        return {"timestep": ts}
+        return self.guidance_strategy.timestep_kwargs(ts, forward_ctx, denoise_ctx)
 
     def _build_transformer_kwargs(
         self,
@@ -404,6 +409,49 @@ class LTXPipelineBase(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportsCom
             noise_pred_audio,
             timestep,
         )
+
+    def _predict_noise_for_step(
+        self,
+        index: int,
+        timestep: torch.Tensor,
+        state: latent_ops.LTXAVState,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.guidance_strategy.predict_noise(
+            self,
+            index,
+            timestep,
+            state,
+            forward_ctx,
+            denoise_ctx,
+        )
+
+    def _denoise_step(
+        self,
+        index: int,
+        timestep: torch.Tensor,
+        state: latent_ops.LTXAVState,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> latent_ops.LTXAVState:
+        denoise_ctx.latents = state.video
+        denoise_ctx.audio_latents = state.audio
+        noise_pred_video, noise_pred_audio = self._predict_noise_for_step(
+            index,
+            timestep,
+            state,
+            forward_ctx,
+            denoise_ctx,
+        )
+        video, audio = self._step_denoised_latents(
+            forward_ctx,
+            denoise_ctx,
+            noise_pred_video,
+            noise_pred_audio,
+            timestep,
+        )
+        return latent_ops.LTXAVState(video=video, audio=audio)
 
     def _unpack_and_denormalize_stage(
         self,
