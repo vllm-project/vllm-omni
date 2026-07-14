@@ -1,5 +1,5 @@
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_TAG=v0.24.0-a3
+ARG VLLM_ASCEND_TAG=v0.25.0-a3
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
 
 ARG APP_DIR=/vllm-workspace/vllm-omni
