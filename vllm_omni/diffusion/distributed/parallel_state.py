@@ -304,7 +304,6 @@ def get_ring_parallel_rank():
 
 
 def get_expert_parallel_group_ranks() -> list[list[int]]:
-    assert vllm_parallel_state._EP is not None, "expert parallel group is not initialized"
     assert _EXPERT_PARALLEL_GROUP_RANKS is not None, "expert parallel group ranks are not initialized"
     return _EXPERT_PARALLEL_GROUP_RANKS
 
@@ -898,16 +897,14 @@ def initialize_model_parallel(
         parallel_mode="fully_shard",
     )
 
-    _EXPERT_PARALLEL_GROUP_RANKS = None
+    _EXPERT_PARALLEL_GROUP_RANKS = rank_generator.get_ranks("tp-sp-cfg-dp")
     if use_moe_parallel_mapping:
-        ep_group_ranks = rank_generator.get_ranks("tp-sp-cfg-dp")
         vllm_parallel_state._EP = init_vllm_model_parallel_group(
-            group_ranks=ep_group_ranks,
+            group_ranks=_EXPERT_PARALLEL_GROUP_RANKS,
             local_rank=get_world_group().local_rank,
             backend=backend,
             group_name="ep",
         )
-        _EXPERT_PARALLEL_GROUP_RANKS = ep_group_ranks
 
     init_dit_group(dit_parallel_size, backend)
 
