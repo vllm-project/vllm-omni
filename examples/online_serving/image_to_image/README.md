@@ -2,7 +2,7 @@
 
 This example demonstrates how to deploy image-to-image models for online image editing service using vLLM-Omni.
 
-Supported models include Qwen-Image-Edit, BAGEL, and other image-to-image pipelines.
+Supported models include Qwen-Image-Edit, BAGEL, JoyAI-Image-Edit, and other image-to-image pipelines.
 
 For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
 
