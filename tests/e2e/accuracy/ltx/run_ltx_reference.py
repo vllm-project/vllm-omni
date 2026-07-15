@@ -1,0 +1,257 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Generate raw LTX video and audio outputs with the official or Omni runtime."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("official", "omni"), required=True)
+    parser.add_argument("--request", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--model")
+    parser.add_argument("--model-class-name")
+    parser.add_argument("--official-root", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--gemma-root", type=Path)
+    return parser.parse_args()
+
+
+def _save_outputs(
+    output_dir: Path,
+    *,
+    video: torch.Tensor,
+    audio: torch.Tensor,
+    audio_sample_rate: int,
+    metadata: dict[str, Any],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    video = video.detach().float().cpu().clamp(0.0, 1.0)
+    audio = audio.detach().float().cpu()
+    np.save(output_dir / "video.npy", video.numpy())
+    np.save(output_dir / "audio.npy", audio.numpy())
+
+    frame_indices = sorted({0, video.shape[0] // 2, video.shape[0] - 1})
+    for index in frame_indices:
+        frame = video[index].mul(255.0).round().to(torch.uint8).numpy()
+        Image.fromarray(frame).save(output_dir / f"frame_{index:04d}.png")
+
+    metadata.update(
+        {
+            "video_shape": list(video.shape),
+            "audio_shape": list(audio.shape),
+            "audio_sample_rate": int(audio_sample_rate),
+            "frame_indices": frame_indices,
+        }
+    )
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+
+def _insert_official_paths(official_root: Path) -> None:
+    for relative_path in ("packages/ltx-core/src", "packages/ltx-pipelines/src"):
+        path = str((official_root / relative_path).resolve())
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
+@torch.inference_mode()
+def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
+    if args.official_root is None or args.checkpoint is None or args.gemma_root is None:
+        raise ValueError("Official backend requires --official-root, --checkpoint, and --gemma-root")
+    _insert_official_paths(args.official_root)
+
+    from ltx_core.components.guiders import MultiModalGuiderParams
+    from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
+    from ltx_pipelines.utils.types import OffloadMode
+
+    pipeline = TI2VidOneStagePipeline(
+        checkpoint_path=str(args.checkpoint),
+        gemma_root=str(args.gemma_root),
+        loras=(),
+        offload_mode=OffloadMode.NONE,
+    )
+    video, audio = pipeline(
+        prompt=request["prompt"],
+        negative_prompt=request["negative_prompt"],
+        seed=request["seed"],
+        height=request["height"],
+        width=request["width"],
+        num_frames=request["num_frames"],
+        frame_rate=request["fps"],
+        num_inference_steps=request["num_inference_steps"],
+        video_guider_params=MultiModalGuiderParams(
+            cfg_scale=request["video_cfg_scale"],
+            stg_scale=request["video_stg_scale"],
+            rescale_scale=request["video_rescale_scale"],
+            modality_scale=request["video_modality_scale"],
+            skip_step=0,
+            stg_blocks=request["video_stg_blocks"],
+        ),
+        audio_guider_params=MultiModalGuiderParams(
+            cfg_scale=request["audio_cfg_scale"],
+            stg_scale=request["audio_stg_scale"],
+            rescale_scale=request["audio_rescale_scale"],
+            modality_scale=request["audio_modality_scale"],
+            skip_step=0,
+            stg_blocks=request["audio_stg_blocks"],
+        ),
+        images=[],
+        max_batch_size=4,
+    )
+    video_tensor = torch.cat([chunk.detach().cpu() for chunk in video], dim=0)
+    _save_outputs(
+        args.output_dir,
+        video=_canonical_video(video_tensor),
+        audio=audio.waveform,
+        audio_sample_rate=audio.sampling_rate,
+        metadata={
+            "backend": "official",
+            "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
+            "checkpoint": str(args.checkpoint),
+        },
+    )
+
+
+def _unwrap_omni_output(output: Any) -> tuple[Any, Any, int]:
+    from vllm_omni.outputs import OmniRequestOutput
+
+    audio = None
+    audio_sample_rate = None
+    frames = output[0] if isinstance(output, list) and output else output
+    if isinstance(frames, OmniRequestOutput):
+        multimodal_output = frames.multimodal_output or {}
+        audio = multimodal_output.get("audio")
+        audio_sample_rate = multimodal_output.get("audio_sample_rate")
+        if frames.is_pipeline_output and isinstance(frames.request_output, OmniRequestOutput):
+            frames = frames.request_output
+            multimodal_output = frames.multimodal_output or {}
+            audio = multimodal_output.get("audio", audio)
+            audio_sample_rate = multimodal_output.get("audio_sample_rate", audio_sample_rate)
+        if isinstance(frames, OmniRequestOutput):
+            if not frames.images:
+                raise ValueError("No video frames found in OmniRequestOutput")
+            frames = frames.images
+
+    if isinstance(frames, list) and len(frames) == 1:
+        frames = frames[0]
+    if isinstance(frames, tuple) and len(frames) == 2:
+        frames, audio = frames
+    elif isinstance(frames, dict):
+        audio = frames.get("audio", audio)
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
+        frames = frames.get("frames", frames.get("video"))
+
+    if frames is None or audio is None or audio_sample_rate is None:
+        raise ValueError("Omni output did not contain video, audio, and audio_sample_rate")
+    return frames, audio, int(audio_sample_rate)
+
+
+def _canonical_video(video: Any) -> torch.Tensor:
+    if isinstance(video, list):
+        if len(video) == 1:
+            return _canonical_video(video[0])
+        tensors = [torch.as_tensor(np.asarray(item) if not isinstance(item, torch.Tensor) else item) for item in video]
+        if all(item.ndim == 3 for item in tensors):
+            video = torch.stack(tensors)
+        elif all(item.ndim == 4 for item in tensors):
+            video = torch.cat(tensors)
+        else:
+            raise ValueError(f"Cannot combine video items with dimensions {[item.ndim for item in tensors]}")
+    tensor = torch.as_tensor(np.asarray(video) if not isinstance(video, torch.Tensor) else video).detach().cpu()
+    if tensor.ndim == 5:
+        tensor = tensor[0]
+    if tensor.ndim != 4:
+        raise ValueError(f"Expected a 4D video tensor, got {tuple(tensor.shape)}")
+    if tensor.shape[-1] in (3, 4):
+        tensor = tensor[..., :3]
+    elif tensor.shape[1] in (3, 4):
+        tensor = tensor[:, :3].permute(0, 2, 3, 1)
+    elif tensor.shape[0] in (3, 4):
+        tensor = tensor[:3].permute(1, 2, 3, 0)
+    else:
+        raise ValueError(f"Cannot infer video channel dimension from {tuple(tensor.shape)}")
+    tensor = tensor.float()
+    if tensor.numel() and tensor.max() > 1:
+        tensor = tensor / 255.0
+    elif tensor.numel() and tensor.min() < 0:
+        tensor = tensor.clamp(-1.0, 1.0).add(1.0).mul(0.5)
+    return tensor.clamp(0.0, 1.0)
+
+
+@torch.inference_mode()
+def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
+    if args.model is None or args.model_class_name is None:
+        raise ValueError("Omni backend requires --model and --model-class-name")
+
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
+    from vllm_omni.entrypoints.omni import Omni
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
+    from vllm_omni.platforms import current_omni_platform
+
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
+    omni = Omni(
+        model=args.model,
+        model_class_name=args.model_class_name,
+        enforce_eager=True,
+        parallel_config=DiffusionParallelConfig(),
+    )
+    try:
+        model_class_name = get_model_class_name(omni)
+        sampling_params = OmniDiffusionSamplingParams(
+            height=request["height"],
+            width=request["width"],
+            generator=generator,
+            guidance_scale=None,
+            num_inference_steps=request["num_inference_steps"],
+            num_frames=request["num_frames"],
+            fps=request["fps"],
+            frame_rate=float(request["fps"]),
+            output_type="np",
+        )
+        guidance = {
+            key: value for key, value in request.items() if key.startswith("video_") or key.startswith("audio_")
+        }
+        apply_declared_extra_args(sampling_params, get_extra_body_params(model_class_name), guidance)
+        output = omni.generate(
+            {"prompt": request["prompt"], "negative_prompt": request["negative_prompt"]},
+            sampling_params,
+        )
+        video, audio, audio_sample_rate = _unwrap_omni_output(output)
+        audio_tensor = torch.as_tensor(np.asarray(audio) if not isinstance(audio, torch.Tensor) else audio)
+        _save_outputs(
+            args.output_dir,
+            video=_canonical_video(video),
+            audio=audio_tensor,
+            audio_sample_rate=audio_sample_rate,
+            metadata={"backend": "omni", "model": args.model, "model_class_name": model_class_name},
+        )
+    finally:
+        omni.shutdown()
+
+
+def main() -> None:
+    args = _parse_args()
+    request = json.loads(args.request.read_text())
+    if args.backend == "official":
+        _run_official(args, request)
+    else:
+        _run_omni(args, request)
+
+
+if __name__ == "__main__":
+    main()
