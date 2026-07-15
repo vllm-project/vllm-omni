@@ -41,10 +41,12 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from cache_dit import ForwardPattern
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
@@ -374,6 +376,34 @@ class HiDreamO1UiTModel(nn.Module):
     are intentionally not ported.
     """
 
+    # Cache-DiT: blocks live at self.language_model.layers but the cache-dit
+    # framework requires a *direct* attribute key on the transformer object.
+    # The ``layers`` property below exposes language_model.layers here so the
+    # standard auto-detection path (no custom CUSTOM_DIT_ENABLERS entry needed)
+    # works via _cache_dit_adapter_config.block_forward_patterns["layers"].
+    #
+    # Each Qwen3VLTextDecoderLayer.forward returns a single hidden_states
+    # tensor → ForwardPattern.Pattern_0.  has_separate_cfg=True because
+    # CFGParallelMixin always runs cond and uncond as two separate
+    # pipeline.forward() calls. check_forward_pattern=False because our
+    # overridden block signature includes attn_metadata / position_embeddings
+    # kwargs that the stock pattern-checker doesn't expect.
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={"layers": ForwardPattern.Pattern_0},
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
+
+    # Layerwise offload and cache-dit need the nested block container path.
+    _layerwise_offload_blocks_attrs = ["language_model.layers"]
+
+    # HSDP: shard individual decoder layers.
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return "language_model.layers" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     def __init__(
         self,
         *,
@@ -535,3 +565,16 @@ class HiDreamO1UiTModel(nn.Module):
             cond_image_embeds=cond_image_embeds_out,
             cond_deepstack_image_embeds=cond_deepstack_image_embeds_out,
         )
+
+    @property
+    def layers(self) -> nn.ModuleList:
+        """Direct-attribute alias for cache-dit's block discovery.
+
+        cache-dit's standard auto-detection path (``maybe_build_block_adapter``)
+        looks up ``block_forward_patterns`` keys as direct attributes of
+        ``pipeline.transformer``.  The actual decoder blocks live at
+        ``self.language_model.layers``; this property exposes them under the
+        shorter key so ``_cache_dit_adapter_config`` can use ``"layers"``
+        without a custom enabler entry in ``CUSTOM_DIT_ENABLERS``.
+        """
+        return self.language_model.layers

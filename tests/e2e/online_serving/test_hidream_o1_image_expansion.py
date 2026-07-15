@@ -3,9 +3,10 @@
 """
 L4 nightly expansion tests for HiDream-O1-Image.
 
-Skeleton: one baseline t2i case now. Additional parametrized rows will be
-appended as later phases land (Phase 5: Cache-DiT, Phase 6: TP/SP/CFG-Parallel,
-Phase 7: CPU offload).
+Parametrized rows added per phase:
+  Phase 5: Cache-DiT (test_hidream_o1_dev_t2i_cache_dit)
+  Phase 6: TP/SP/CFG-Parallel/HSDP — coming
+  Phase 7: CPU offload — coming
 
 Run locally::
 
@@ -40,6 +41,11 @@ def _get_hidream_o1_feature_cases(model: str):
             id="default",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
+        pytest.param(
+            OmniServerParams(model=model, cache_backend="cache_dit"),
+            id="cache_dit",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
     ]
 
 
@@ -49,7 +55,7 @@ def _get_hidream_o1_feature_cases(model: str):
     indirect=True,
 )
 def test_hidream_o1_dev_t2i(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """L4 baseline: HiDream-O1-Image-Dev text-to-image at full 512×512."""
+    """L4: HiDream-O1-Image-Dev text-to-image, parameterized over baseline and Cache-DiT."""
     messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
     request_config = {
         "model": omni_server.model,
