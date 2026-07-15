@@ -589,11 +589,7 @@ class GroupCoordinator:
         if dst is None:
             dst = self.group_next_rank
 
-        torch.distributed.send(
-            tensor,
-            self.ranks[dst],
-            group=(self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group),
-        )
+        torch.distributed.send(tensor, self.ranks[dst], group=self.device_group)
 
     def recv(self, size: torch.Size, dtype: torch.dtype, src: int | None = None) -> torch.Tensor:
         """Receives a tensor from the src rank."""
@@ -602,11 +598,7 @@ class GroupCoordinator:
             src = self.group_prev_rank
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        torch.distributed.recv(
-            tensor,
-            self.ranks[src],
-            (self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group),
-        )
+        torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
     def destroy(self):
@@ -709,6 +701,22 @@ class PipelineGroupCoordinator(GroupCoordinator):
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
+
+    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
+        if dst is None:
+            dst = self.group_next_rank
+
+        group = self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group
+        torch.distributed.send(tensor, self.ranks[dst], group=group)
+
+    def recv(self, size: torch.Size, dtype: torch.dtype, src: int | None = None) -> torch.Tensor:
+        if src is None:
+            src = self.group_prev_rank
+
+        tensor = torch.empty(size, dtype=dtype, device=self.device)
+        group = self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group
+        torch.distributed.recv(tensor, self.ranks[src], group)
+        return tensor
 
     def reset_buffer(self):
         self.recv_tasks_queue = []
