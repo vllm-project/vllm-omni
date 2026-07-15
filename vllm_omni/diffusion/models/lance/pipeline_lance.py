@@ -62,6 +62,7 @@ from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.utils.video import normalize_decoded_video_frames
 
 from .lance_transformer import (
     LanceBagel,
@@ -1454,6 +1455,8 @@ class LancePipeline(BagelPipeline):
                     frames_bgr.append(_cv2.cvtColor(f, _cv2.COLOR_BGR2RGB))
                 cap.release()
                 video_raw = _np.stack(frames_bgr, axis=0)
+        elif isinstance(video_input, (list, tuple)):
+            video_raw, origin_fps = normalize_decoded_video_frames(video_input, default_fps=origin_fps_default)
         elif isinstance(video_input, _np.ndarray):
             video_raw = video_input
             origin_fps = origin_fps_default
