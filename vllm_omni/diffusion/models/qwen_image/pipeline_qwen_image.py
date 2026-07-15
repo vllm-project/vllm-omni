@@ -1102,7 +1102,17 @@ class QwenImagePipeline(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        # The text encoder drops its vision tower and lm_head (see
+        # _drop_unused_modules), so skip their checkpoint weights — otherwise
+        # AutoWeightsLoader raises on the now-missing modules.
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=[
+                "text_encoder.lm_head.",
+                "text_encoder.visual.",
+                "text_encoder.model.visual.",
+            ],
+        )
         loaded_weights = loader.load_weights(weights)
         # VAE loads via diffusers from_pretrained (outside AutoWeightsLoader), so
         # mark its params to satisfy strict coverage. The text_encoder streams
