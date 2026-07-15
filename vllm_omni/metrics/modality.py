@@ -85,7 +85,7 @@ _diffusion_exec_family = Histogram(
     defs.DIFFUSION_EXEC_S,
     "DiT forward pass execution time per request in seconds.",
     labelnames=_stage_labels,
-    buckets=defs.SECONDS_FAST_BUCKETS,
+    buckets=defs.SECONDS_BUCKETS,
 )
 _diffusion_exec_per_step_family = Histogram(
     defs.DIFFUSION_EXEC_PER_STEP_S,

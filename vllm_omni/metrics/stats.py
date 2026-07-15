@@ -645,8 +645,12 @@ class OrchestratorAggregator:
             diffusion_metrics = diffusion_metrics[0]
         if diffusion_metrics:
             for key, value in diffusion_metrics.items():
-                if value is not None:
+                if value is None:
+                    continue
+                if key.endswith("_time_s"):
                     self.diffusion_metrics[req_id][key] += value
+                else:
+                    self.diffusion_metrics[req_id][key] = value
 
     def on_forward(
         self,

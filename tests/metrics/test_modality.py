@@ -311,7 +311,6 @@ class TestObserveModalityAtFinalize:
                 "preprocess_time_s": 0.05,
                 "diffusion_engine_exec_time_s": 1.2,
                 "postprocess_time_s": 0.3,
-                "diffusion_engine_total_time_s": 1.55,
                 "image_num": 1,
                 "resolution": 1024,
                 "num_inference_steps": 50,
