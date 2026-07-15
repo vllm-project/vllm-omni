@@ -511,6 +511,25 @@ def test_split_diffusion_output_by_request_slices_tuple_outputs():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
+    """execute_model runs the pipeline forward after the KV receive step."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.kv_transfer_manager.receive_multi_kv_cache_distributed = lambda *a, **k: True
+    req = _make_request(skip_cache_refresh=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+
+    output = DiffusionModelRunner.execute_model(runner, req)
+
+    assert output.output == "ok"
+    assert runner.pipeline.forward_calls == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
