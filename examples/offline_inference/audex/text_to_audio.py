@@ -98,6 +98,8 @@ def _load_corpus(args) -> list[tuple[str, str]]:
     if args.captions_file:
         corpus = []
         for line in Path(args.captions_file).read_text().splitlines():
+            if not line.strip():
+                continue
             utt, caption = line.split("\t", 1)
             corpus.append((utt, caption.strip()))
         return corpus

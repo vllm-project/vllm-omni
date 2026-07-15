@@ -96,6 +96,8 @@ def _load_corpus(args) -> list[tuple[str, str]]:
     if args.texts_file:
         corpus = []
         for line in Path(args.texts_file).read_text().splitlines():
+            if not line.strip():
+                continue
             utt, text = line.split("\t", 1)
             corpus.append((utt, text.strip()))
         return corpus

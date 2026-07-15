@@ -35,7 +35,6 @@ from vllm.assets.audio import AudioAsset
 from vllm_omni import Omni
 
 ASR_QUESTION = "Transcribe the input speech."
-TARGET_SR = 16_000
 # The model root's default deploy yaml is the TTS pipeline; audio
 # understanding needs the single-stage thinker-only pipeline, so default to it.
 _DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "audex_thinker_only.yaml")
@@ -69,9 +68,8 @@ def _load_audio(path: str) -> tuple[np.ndarray, int]:
     audio, sr = sf.read(path, dtype="float32")
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
-    if sr != TARGET_SR:
-        # The processor resamples via its data parser; pass through as-is.
-        pass
+    # Native sample rate is passed through; the processor resamples via its
+    # data parser.
     return audio, sr
 
 
