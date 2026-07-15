@@ -10,11 +10,12 @@ from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransforme
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_ltx_rms_norm_no_affine_identity_weight_is_non_persistent_buffer():
+def test_ltx_rms_norm_no_affine_matches_official_torch_module():
     norm = _make_rms_norm(8, eps=1e-6, elementwise_affine=False)
 
     assert "weight" not in dict(norm.named_parameters())
-    assert "weight" in dict(norm.named_buffers())
+    assert norm.weight is None
+    assert "weight" not in dict(norm.named_buffers())
     assert "weight" not in norm.state_dict()
 
 

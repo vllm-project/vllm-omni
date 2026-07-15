@@ -516,7 +516,7 @@ class LTXI2VConditioningMixin:
             request_inputs.width,
             request_inputs.num_frames,
             noise_scale,
-            torch.float32,
+            prompt_context.positive_connector_prompt_embeds.dtype,
             device,
             request_inputs.generator,
             request_inputs.latents,
@@ -564,15 +564,25 @@ class LTXI2VConditioningMixin:
         ts: torch.Tensor,
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
+        *,
+        video_token_count: int,
+        audio_token_count: int,
     ) -> dict[str, torch.Tensor]:
-        kwargs = super()._denoise_timestep_kwargs(ts, forward_ctx, denoise_ctx)
+        if denoise_ctx.conditioning_mask is None:
+            raise ValueError("LTX I2V denoising requires a conditioning mask.")
+        kwargs = super()._denoise_timestep_kwargs(
+            ts,
+            forward_ctx,
+            denoise_ctx,
+            video_token_count=video_token_count,
+            audio_token_count=audio_token_count,
+        )
         conditioning_mask = (
             denoise_ctx.conditioning_mask if forward_ctx.cfg_parallel_ready else denoise_ctx.conditioning_mask_for_model
         )
         if conditioning_mask is None:
             raise ValueError("LTX I2V denoising requires a conditioning mask.")
         kwargs.update(
-            timestep=ts.unsqueeze(-1) * (1 - conditioning_mask),
-            audio_timestep=ts,
+            timestep=ts.reshape(-1, 1) * (1 - conditioning_mask),
         )
         return kwargs

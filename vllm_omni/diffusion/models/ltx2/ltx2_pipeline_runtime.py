@@ -34,7 +34,13 @@ from .ltx2_denoise import (
     build_transformer_kwargs,
     step_denoised_latents,
 )
-from .ltx2_guidance import LTXGuidanceStrategy
+from .ltx2_guidance import (
+    LTX_GUIDANCE_EXECUTOR,
+    LTXGuidanceExecutor,
+    LTXGuidancePlan,
+    LTXGuidanceSpec,
+    LTXModalityGuidance,
+)
 from .ltx2_recipes import LTXOneStageRecipe
 from .ltx2_request import LTXRequestInputs, LTXRequestMixin
 
@@ -104,8 +110,8 @@ class LTXPipelineRuntime(
     """Shared Omni runtime for explicitly composed LTX denoise phases."""
 
     component_profile: ClassVar[LTXComponentProfile]
-    guidance_strategy: ClassVar[LTXGuidanceStrategy]
     one_stage_recipe: ClassVar[LTXOneStageRecipe]
+    guidance_executor: ClassVar[LTXGuidanceExecutor] = LTX_GUIDANCE_EXECUTOR
     supports_request_batch = False
     connector_batches_cfg = False
     distributed_video_decode = True
@@ -117,6 +123,7 @@ class LTXPipelineRuntime(
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         del prefix
         super().__init__()
+        self._guidance_plan = LTXGuidancePlan.build(self.one_stage_recipe.guidance)
         initialize_pipeline_components(self, od_config)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -176,15 +183,15 @@ class LTXPipelineRuntime(
 
     @property
     def guidance_scale(self):
-        return self._guidance_scale
+        return self._guidance_plan.spec.video.cfg_scale
 
     @property
     def guidance_rescale(self):
-        return self._guidance_rescale
+        return self._guidance_plan.spec.video.rescale_scale
 
     @property
     def do_classifier_free_guidance(self):
-        return self._guidance_scale is not None and self._guidance_scale > 1.0
+        return self._guidance_plan.spec.do_cfg
 
     @property
     def interrupt(self):
@@ -212,20 +219,28 @@ class LTXPipelineRuntime(
     ):
         if kwargs is not None:
             context = {**kwargs, **context}
-        return self.guidance_strategy.combine_cfg_noise(
-            self,
-            positive_noise_pred,
-            negative_noise_pred,
-            true_cfg_scale,
-            cfg_normalize,
-            context,
+        del cfg_normalize
+        required = ("video_latents", "audio_latents", "video_sigma", "audio_sigma")
+        if any(context.get(name) is None for name in required):
+            raise ValueError("LTX x0-space CFG requires video/audio latents and sigmas.")
+        video_pos, audio_pos = positive_noise_pred
+        video_neg, audio_neg = negative_noise_pred
+        return (
+            self.guidance_executor.combine_cfg_velocity(
+                context["video_latents"],
+                video_pos,
+                video_neg,
+                context["video_sigma"],
+                true_cfg_scale,
+            ),
+            self.guidance_executor.combine_cfg_velocity(
+                context["audio_latents"],
+                audio_pos,
+                audio_neg,
+                context["audio_sigma"],
+                true_cfg_scale,
+            ),
         )
-
-    def predict_noise_with_parallel_cfg(self, *args, **kwargs):
-        predict_parallel_cfg = getattr(self.guidance_strategy, "predict_parallel_cfg", None)
-        if predict_parallel_cfg is None:
-            raise NotImplementedError("The selected LTX guidance strategy does not implement parallel CFG.")
-        return predict_parallel_cfg(self, *args, **kwargs)
 
     def _synchronize_cfg_parallel_step_output(
         self,
@@ -245,16 +260,29 @@ class LTXPipelineRuntime(
 
     def _setup_forward_runtime(
         self,
+        req: DiffusionRequestBatch,
         request_inputs: LTXRequestInputs,
         attention_kwargs: dict[str, Any] | None,
     ) -> bool:
-        self._guidance_scale = request_inputs.guidance_scale
-        self._guidance_rescale = request_inputs.guidance_rescale
+        self._guidance_plan = LTXGuidancePlan.build(request_inputs.guidance)
         del attention_kwargs
         self._interrupt = False
         cfg_world_size = get_classifier_free_guidance_world_size()
+        if (
+            req.is_dummy_run()
+            and cfg_world_size == 2
+            and self.do_classifier_free_guidance
+            and not self._guidance_plan.cfg_parallel_compatible
+        ):
+            # The single-device warmup follows the full recipe. CFG2 can only
+            # execute CFG-only guidance today, so warm that supported shape.
+            cfg_scale = self._guidance_plan.spec.video.cfg_scale
+            if cfg_scale == 1.0:
+                cfg_scale = self._guidance_plan.spec.audio.cfg_scale
+            cfg = LTXModalityGuidance(cfg_scale=cfg_scale)
+            self._guidance_plan = LTXGuidancePlan.build(LTXGuidanceSpec(video=cfg, audio=cfg))
         if self.do_classifier_free_guidance:
-            self.guidance_strategy.validate_cfg_world_size(cfg_world_size)
+            self.guidance_executor.validate_cfg_world_size(self._guidance_plan, cfg_world_size)
         return self.do_classifier_free_guidance and cfg_world_size > 1
 
     def _check_forward_inputs(
@@ -367,7 +395,7 @@ class LTXPipelineRuntime(
             request_inputs.width,
             request_inputs.num_frames,
             noise_scale,
-            torch.float32,
+            prompt_context.positive_connector_prompt_embeds.dtype,
             device,
             request_inputs.generator,
             request_inputs.latents,
@@ -416,7 +444,7 @@ class LTXPipelineRuntime(
             audio_latent_length=audio_num_frames,
             num_mel_bins=num_mel_bins,
             noise_scale=noise_scale,
-            dtype=torch.float32,
+            dtype=prompt_context.positive_connector_audio_prompt_embeds.dtype,
             device=device,
             generator=request_inputs.generator,
             latents=request_inputs.audio_latents,
@@ -453,15 +481,23 @@ class LTXPipelineRuntime(
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
     ) -> LTXDenoiseContext:
-        return self.guidance_strategy.prepare_denoise_context(self, forward_ctx, denoise_ctx)
+        return self.guidance_executor.prepare_denoise_context(
+            self._guidance_plan,
+            forward_ctx.cfg_parallel_ready,
+            denoise_ctx,
+        )
 
     def _denoise_timestep_kwargs(
         self,
         ts: torch.Tensor,
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
+        *,
+        video_token_count: int,
+        audio_token_count: int,
     ) -> dict[str, torch.Tensor]:
-        return self.guidance_strategy.timestep_kwargs(ts, forward_ctx, denoise_ctx)
+        del forward_ctx, denoise_ctx
+        return self.guidance_executor.timestep_kwargs(ts, video_token_count, audio_token_count)
 
     def _build_transformer_kwargs(
         self,
@@ -475,6 +511,7 @@ class LTXPipelineRuntime(
         encoder_attention_mask: torch.Tensor | None,
         audio_encoder_attention_mask: torch.Tensor | None,
         ts: torch.Tensor,
+        attention_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return build_transformer_kwargs(
             self,
@@ -487,6 +524,7 @@ class LTXPipelineRuntime(
             encoder_attention_mask=encoder_attention_mask,
             audio_encoder_attention_mask=audio_encoder_attention_mask,
             ts=ts,
+            attention_kwargs=attention_kwargs,
         )
 
     def _predict_noise_for_step(
@@ -497,8 +535,9 @@ class LTXPipelineRuntime(
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.guidance_strategy.predict_noise(
+        return self.guidance_executor.predict_noise(
             self,
+            self._guidance_plan,
             index,
             timestep,
             state,
@@ -530,6 +569,7 @@ class LTXPipelineRuntime(
             noise_pred_video,
             noise_pred_audio,
             timestep,
+            index,
         )
         return latent_ops.LTXAVState(video=video, audio=audio)
 

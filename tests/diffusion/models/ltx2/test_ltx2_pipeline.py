@@ -15,20 +15,30 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_COMPONENT_PROFILE,
     LTX23_COMPONENT_PROFILE,
+    _install_official_connector_processors,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXI2VConditioningMixin
 from vllm_omni.diffusion.models.ltx2.ltx2_denoise import (
     LTXDenoiseExecutor,
     LTXPhaseResult,
+    _official_ltx_sigmas,
     prepare_scheduler_stage,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
-    LTX_LEGACY_VELOCITY_GUIDANCE,
-    LTX_OFFICIAL_X0_GUIDANCE,
+    LTX_GUIDANCE_EXECUTOR,
+    LTXGuidancePlan,
+    LTXGuidanceSpec,
+    LTXModalityGuidance,
+    build_perturbation_kwargs,
+    combine_guided_x0,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
 from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_runtime import LTXPipelineRuntime
-from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX2_ONE_STAGE_RECIPE, LTX23_ONE_STAGE_RECIPE
+from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
+    LTX2_ONE_STAGE_RECIPE,
+    LTX23_ONE_STAGE_RECIPE,
+    LTX_POSITIVE_ONLY_RECIPE,
+)
 from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2ImageToVideoPipeline,
@@ -53,7 +63,7 @@ def _make_ltx_request_pipe(cls):
     return pipe
 
 
-def _resolve_request_inputs_for_test(pipe, req):
+def _resolve_request_inputs_for_test(pipe, req, *, guidance_scale=4.0, guidance_rescale=None):
     return pipe._resolve_request_inputs(
         req,
         prompt=None,
@@ -64,7 +74,8 @@ def _resolve_request_inputs_for_test(pipe, req):
         frame_rate=None,
         num_inference_steps=None,
         timesteps=None,
-        guidance_scale=4.0,
+        guidance_scale=guidance_scale,
+        guidance_rescale=guidance_rescale,
         num_videos_per_prompt=1,
         generator=None,
         latents=None,
@@ -183,12 +194,101 @@ def test_ltx_versions_share_request_prompt_and_step_templates():
 
 
 def test_ltx_versions_select_guidance_without_overriding_control_flow():
-    assert LTX2Pipeline.guidance_strategy is LTX_LEGACY_VELOCITY_GUIDANCE
-    assert LTX23Pipeline.guidance_strategy is LTX_OFFICIAL_X0_GUIDANCE
+    assert LTX2Pipeline.guidance_executor is LTX_GUIDANCE_EXECUTOR
+    assert LTX23Pipeline.guidance_executor is LTX_GUIDANCE_EXECUTOR
     assert LTX2Pipeline._predict_noise_for_step is LTXPipelineRuntime._predict_noise_for_step
     assert LTX23Pipeline._predict_noise_for_step is LTXPipelineRuntime._predict_noise_for_step
     assert LTX2Pipeline.combine_cfg_noise is LTXPipelineRuntime.combine_cfg_noise
     assert LTX23Pipeline.combine_cfg_noise is LTXPipelineRuntime.combine_cfg_noise
+
+
+def test_ltx_official_recipes_build_all_guidance_passes():
+    ltx2_plan = LTXGuidancePlan.build(LTX2_ONE_STAGE_RECIPE.guidance)
+    ltx23_plan = LTXGuidancePlan.build(LTX23_ONE_STAGE_RECIPE.guidance)
+
+    assert ltx2_plan.names == ltx23_plan.names == ("cond", "uncond", "ptb", "mod")
+    assert LTX2_ONE_STAGE_RECIPE.guidance.video.stg_blocks == (29,)
+    assert LTX23_ONE_STAGE_RECIPE.guidance.video.stg_blocks == (28,)
+    assert LTX23_ONE_STAGE_RECIPE.guidance.video.cfg_scale == 3.0
+    assert LTX23_ONE_STAGE_RECIPE.guidance.audio.cfg_scale == 7.0
+    assert LTX2_ONE_STAGE_RECIPE.use_official_sigma_schedule
+    assert LTX23_ONE_STAGE_RECIPE.use_official_sigma_schedule
+    assert not LTX_POSITIVE_ONLY_RECIPE.use_official_sigma_schedule
+
+
+def test_ltx_guidance_combines_official_x0_deltas_in_fp32():
+    cond = torch.tensor([[1.0, 3.0]], dtype=torch.bfloat16)
+    uncond = torch.tensor([[0.0, 1.0]], dtype=torch.bfloat16)
+    perturbed = torch.tensor([[0.5, 2.0]], dtype=torch.bfloat16)
+    isolated = torch.tensor([[0.25, 2.5]], dtype=torch.bfloat16)
+    guidance = LTXModalityGuidance(cfg_scale=3.0, stg_scale=0.5, modality_scale=2.0)
+
+    actual = combine_guided_x0(
+        cond=cond,
+        uncond_text=uncond,
+        uncond_perturbed=perturbed,
+        uncond_modality=isolated,
+        guidance=guidance,
+    )
+    expected = (
+        cond.float()
+        + 2.0 * (cond.float() - uncond.float())
+        + 0.5 * (cond.float() - perturbed.float())
+        + (cond.float() - isolated.float())
+    ).to(cond.dtype)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_ltx_guidance_builds_per_sample_stg_and_modality_masks():
+    plan = LTXGuidancePlan.build(LTX23_ONE_STAGE_RECIPE.guidance)
+    perturbations = build_perturbation_kwargs(plan, batch_size=2, reference=torch.ones(8, 1, 1))
+
+    assert perturbations["video_self_attention_blocks"] == (28,)
+    assert perturbations["audio_self_attention_blocks"] == (28,)
+    assert perturbations["video_self_attention_mask"].flatten().tolist() == [1, 1, 1, 1, 0, 0, 1, 1]
+    assert perturbations["a2v_cross_attention_mask"].flatten().tolist() == [1, 1, 1, 1, 1, 1, 0, 0]
+    torch.testing.assert_close(
+        perturbations["a2v_cross_attention_mask"],
+        perturbations["v2a_cross_attention_mask"],
+    )
+
+
+def test_ltx_default_sigma_schedule_matches_official_shift_and_stretch():
+    scheduler = SimpleNamespace(
+        config={
+            "base_image_seq_len": 1024,
+            "max_image_seq_len": 4096,
+            "base_shift": 0.95,
+            "max_shift": 2.05,
+            "shift_terminal": 0.1,
+        }
+    )
+
+    sigmas = _official_ltx_sigmas(scheduler, steps=4, device=torch.device("cpu"))
+
+    torch.testing.assert_close(
+        sigmas,
+        torch.tensor([1.0, 0.8671, 0.6316, 0.1, 0.0]),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+def test_ltx_component_loader_installs_official_connector_attention():
+    installed = []
+
+    class Attention:
+        def set_processor(self, processor):
+            installed.append(processor)
+
+    connector = SimpleNamespace(transformer_blocks=[SimpleNamespace(attn1=Attention())])
+    connectors = SimpleNamespace(video_connector=connector, audio_connector=connector)
+
+    _install_official_connector_processors(connectors)
+
+    assert len(installed) == 2
+    assert all(processor.__class__.__name__ == "_LTXOfficialConnectorAttnProcessor" for processor in installed)
 
 
 def test_ltx2_two_stage_variants_share_stage_orchestration():
@@ -255,8 +355,7 @@ def test_ltx2_two_stage_reuses_prompt_context_between_phases():
         num_frames=1,
         frame_rate=24.0,
         num_inference_steps=4,
-        guidance_scale=4.0,
-        guidance_rescale=0.0,
+        guidance=LTXGuidanceSpec.positive_only(),
         num_videos_per_prompt=1,
         generator=None,
         latents=None,
@@ -459,6 +558,71 @@ class TestLTXRequestParsing:
             resolved_t2v.negative_prompt_attention_mask,
             torch.stack([negative_attention_mask]),
         )
+
+    def test_request_resolves_per_modality_guidance_and_common_overrides(self):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={"prompt": "prompt", "negative_prompt": "negative"},
+                    sampling_params=OmniDiffusionSamplingParams(
+                        num_inference_steps=2,
+                        extra_args={
+                            "video_cfg_scale": 4.0,
+                            "audio_cfg_guidance_scale": 6.0,
+                            "video_stg_guidance_scale": 0.5,
+                            "audio_stg_scale": 0.25,
+                            "a2v_guidance_scale": 2.0,
+                            "v2a_guidance_scale": 4.0,
+                            "video_rescale_scale": 0.2,
+                            "audio_rescale_scale": 0.3,
+                            "video_stg_blocks": [3, 4],
+                            "audio_stg_blocks": 5,
+                        },
+                    ),
+                    request_id="ltx-guidance-overrides",
+                )
+            ]
+        )
+        pipe = _make_ltx_request_pipe(LTX23Pipeline)
+
+        resolved = _resolve_request_inputs_for_test(pipe, req, guidance_scale=None)
+
+        assert resolved.guidance.video == LTXModalityGuidance(4.0, 0.5, 2.0, 0.2, (3, 4))
+        assert resolved.guidance.audio == LTXModalityGuidance(6.0, 0.25, 4.0, 0.3, (5,))
+
+        common = _resolve_request_inputs_for_test(pipe, req, guidance_scale=2.0, guidance_rescale=0.0)
+        assert common.guidance.video.cfg_scale == common.guidance.audio.cfg_scale == 2.0
+        assert common.guidance.video.rescale_scale == common.guidance.audio.rescale_scale == 0.0
+
+    def test_request_batch_rejects_mixed_guidance_specs(self):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt="prompt-0",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        num_inference_steps=2,
+                        extra_args={"video_cfg_scale": scale},
+                    ),
+                    request_id=f"ltx-mixed-guidance-{index}",
+                )
+                for index, scale in enumerate((3.0, 4.0))
+            ]
+        )
+
+        with pytest.raises(ValueError, match="identical video/audio guidance"):
+            _resolve_request_inputs_for_test(
+                _make_ltx_request_pipe(LTX23Pipeline),
+                req,
+                guidance_scale=None,
+            )
 
     def test_request_input_resolution_rejects_mixed_precomputed_prompt_fields(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline

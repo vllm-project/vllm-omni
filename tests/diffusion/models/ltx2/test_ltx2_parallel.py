@@ -50,74 +50,33 @@ class TestCFGParallelHelpers:
         assert torch.allclose(video_combined, expected_video)
         assert torch.allclose(audio_combined, expected_audio)
 
-    def test_two_rank_cfg_parallel_smoke_uses_rank_local_branch_and_x0_formula(self, monkeypatch):
-        from vllm_omni.diffusion.models.ltx2 import ltx2_guidance
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx23
-
-        pipe = object.__new__(ltx23.LTX23Pipeline)
-        video_sample = torch.tensor([[[1.0, -2.0]]])
-        audio_sample = torch.tensor([[[0.5, 3.0, -1.0]]])
-        video_pos = torch.tensor([[[0.2, -0.3]]])
-        video_neg = torch.tensor([[[-0.4, 0.1]]])
-        audio_pos = torch.tensor([[[0.7, -0.2, 0.3]]])
-        audio_neg = torch.tensor([[[0.1, 0.4, -0.5]]])
-        video_sigma = torch.tensor(0.25)
-        audio_sigma = torch.tensor(0.5)
-        scale = 4.0
-
-        class FakeCfgGroup:
-            def all_gather(self, tensor, separate_tensors=True):
-                assert separate_tensors
-                if tensor.shape == video_pos.shape:
-                    return [video_pos, video_neg]
-                return [audio_pos, audio_neg]
-
-        monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx2_guidance, "get_cfg_group", lambda: FakeCfgGroup())
-
-        expected_video = ltx2_guidance.combine_velocity_via_x0(
-            video_sample,
-            video_pos,
-            video_neg,
-            video_sigma,
-            scale,
+    def test_cfg_parallel_rejects_non_cfg_guidance(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
+            LTX_GUIDANCE_EXECUTOR,
+            LTXGuidancePlan,
         )
-        expected_audio = ltx2_guidance.combine_velocity_via_x0(
-            audio_sample,
-            audio_pos,
-            audio_neg,
-            audio_sigma,
-            scale,
-        )
+        from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX23_ONE_STAGE_RECIPE
 
-        for rank, expected_branch in ((0, "positive"), (1, "negative")):
-            calls = []
-            monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_rank", lambda rank=rank: rank)
+        plan = LTXGuidancePlan.build(LTX23_ONE_STAGE_RECIPE.guidance)
 
-            def fake_predict_noise(**kwargs):
-                calls.append(kwargs["branch"])
-                if kwargs["branch"] == "positive":
-                    return video_pos, audio_pos
-                return video_neg, audio_neg
+        with pytest.raises(ValueError, match="CFG-only guidance"):
+            LTX_GUIDANCE_EXECUTOR.validate_cfg_world_size(plan, 2)
 
-            object.__setattr__(pipe, "predict_noise", fake_predict_noise)
-            video_combined, audio_combined = pipe.predict_noise_with_parallel_cfg(
-                true_cfg_scale=scale,
-                positive_kwargs={"branch": "positive"},
-                negative_kwargs={"branch": "negative"},
-                cfg_normalize=False,
-                video_latents=video_sample,
-                audio_latents=audio_sample,
-                video_sigma=video_sigma,
-                audio_sigma=audio_sigma,
-            )
+    def test_cfg_parallel_dummy_warms_supported_cfg_only_plan(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_runtime
+        from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX23_ONE_STAGE_RECIPE
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
 
-            assert calls == [expected_branch]
-            torch.testing.assert_close(video_combined, expected_video)
-            torch.testing.assert_close(audio_combined, expected_audio)
+        monkeypatch.setattr(ltx2_pipeline_runtime, "get_classifier_free_guidance_world_size", lambda: 2)
+        pipe = object.__new__(LTX23Pipeline)
+        req = SimpleNamespace(is_dummy_run=lambda: True)
+        request_inputs = SimpleNamespace(guidance=LTX23_ONE_STAGE_RECIPE.guidance)
 
-        assert "_cfg_video_latents" not in pipe.__dict__
-        assert "_cfg_audio_latents" not in pipe.__dict__
+        cfg_parallel_ready = pipe._setup_forward_runtime(req, request_inputs, attention_kwargs=None)
+
+        assert cfg_parallel_ready is True
+        assert pipe._guidance_plan.names == ("cond", "uncond")
+        assert pipe._guidance_plan.spec.video.cfg_scale == pipe._guidance_plan.spec.audio.cfg_scale == 3.0
 
 
 class TestCFGParallelForwardPath:
@@ -314,7 +273,7 @@ class TestCFGParallelForwardPath:
 
             def __call__(self, prompt_embeds, prompt_attention_mask, padding_side):
                 assert padding_side == "left"
-                assert prompt_embeds.shape[0] == 2
+                assert prompt_embeds.shape[0] == 1
                 return prompt_embeds, prompt_embeds, prompt_attention_mask
 
         rope_video_fps: list[float] = []
@@ -381,6 +340,14 @@ class TestCFGParallelForwardPath:
                 frame_rate=frame_rate_input,
                 num_inference_steps=2,
                 guidance_scale=4.0,
+                extra_args={
+                    "video_stg_scale": 0.0,
+                    "audio_stg_scale": 0.0,
+                    "video_modality_scale": 1.0,
+                    "audio_modality_scale": 1.0,
+                    "video_rescale_scale": 0.0,
+                    "audio_rescale_scale": 0.0,
+                },
                 latents=video_latents,
                 audio_latents=audio_latents,
                 output_type="latent",
@@ -388,7 +355,7 @@ class TestCFGParallelForwardPath:
             request_id="ltx23-cfg-parallel-forward-test",
         )
 
-        output = pipe.forward(DiffusionRequestBatch(requests=[req]))[0]
+        output = pipe.forward(DiffusionRequestBatch(requests=[req]), sigmas=[0.25, 0.25])[0]
 
         expected_video_noise = ltx2_guidance.combine_velocity_via_x0(
             video_latents,

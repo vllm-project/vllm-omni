@@ -79,10 +79,12 @@ class TestLTXImageToVideoForwardStages:
             ts,
             SimpleNamespace(cfg_parallel_ready=False),
             denoise_ctx,
+            video_token_count=2,
+            audio_token_count=1,
         )
 
         torch.testing.assert_close(kwargs["timestep"], torch.tensor([[0.0, 2.0], [4.0, 0.0]]))
-        torch.testing.assert_close(kwargs["audio_timestep"], ts)
+        torch.testing.assert_close(kwargs["audio_timestep"], ts[:, None])
         torch.testing.assert_close(kwargs["sigma"], ts)
 
 

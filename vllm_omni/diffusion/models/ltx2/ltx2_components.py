@@ -12,11 +12,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.nn.functional as F
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import DistributedAutoencoderKLLTX2Video
@@ -28,7 +30,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from .ltx2_transformer import LTX2VideoTransformer3DModel
+from .ltx2_transformer import LTX2VideoTransformer3DModel, apply_interleaved_rotary_emb, apply_split_rotary_emb
 
 try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
@@ -80,6 +82,83 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
     vocoder_cls=LTX2VocoderWithBWE or LTX2Vocoder,
     vocoder_fallback_cls=LTX2Vocoder,
 )
+
+
+_LTX_OFFICIAL_SDPA_PRIORITY = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+
+
+class _LTXOfficialConnectorAttnProcessor:
+    """Run connector attention with the official LTX SDPA semantics."""
+
+    def __call__(
+        self,
+        attn: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        gate_logits = attn.to_gate_logits(hidden_states) if attn.to_gate_logits is not None else None
+
+        query = attn.norm_q(attn.to_q(hidden_states))
+        key = attn.norm_k(attn.to_k(encoder_hidden_states))
+        value = attn.to_v(encoder_hidden_states)
+
+        if query_rotary_emb is not None:
+            key_rotary_emb = key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
+            if attn.rope_type == "interleaved":
+                query = apply_interleaved_rotary_emb(query, query_rotary_emb)
+                key = apply_interleaved_rotary_emb(key, key_rotary_emb)
+            elif attn.rope_type == "split":
+                query = apply_split_rotary_emb(query, query_rotary_emb, head_dim=attn.head_dim)
+                key = apply_split_rotary_emb(key, key_rotary_emb, head_dim=attn.head_dim)
+            else:
+                raise ValueError(f"Unsupported LTX connector RoPE type: {attn.rope_type}")
+
+        batch_size, _, inner_dim = query.shape
+        head_dim = inner_dim // attn.heads
+        query, key, value = (
+            tensor.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2) for tensor in (query, key, value)
+        )
+        if attention_mask is not None:
+            if attention_mask.ndim == 2:
+                attention_mask = attention_mask.unsqueeze(0)
+            if attention_mask.ndim == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+        with sdpa_kernel(_LTX_OFFICIAL_SDPA_PRIORITY, set_priority=True):
+            hidden_states = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, inner_dim)
+
+        if gate_logits is not None:
+            hidden_states = hidden_states.unflatten(2, (attn.heads, -1))
+            hidden_states = hidden_states * (2.0 * torch.sigmoid(gate_logits)).unsqueeze(-1)
+            hidden_states = hidden_states.flatten(2, 3)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        return attn.to_out[1](hidden_states)
+
+
+def _install_official_connector_processors(connectors: LTX2TextConnectors) -> None:
+    for connector_name in ("video_connector", "audio_connector"):
+        connector = getattr(connectors, connector_name, None)
+        for block in getattr(connector, "transformer_blocks", ()):
+            attention = getattr(block, "attn1", None)
+            if attention is not None:
+                attention.set_processor(_LTXOfficialConnectorAttnProcessor())
 
 
 def _detect_vocoder_output_sample_rate(model: str) -> int | None:
@@ -188,6 +267,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         local_files_only=local_files_only,
         dtype=dtype,
     )
+    _install_official_connector_processors(pipeline.connectors)
     pipeline.vae = _load_component(
         profile.video_vae_cls,
         model,
@@ -249,8 +329,6 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             tokenizer_max_length = getattr(encoder_config, "max_seq_len", None)
     pipeline.tokenizer_max_length = int(tokenizer_max_length or 1024)
 
-    pipeline._guidance_scale = None
-    pipeline._guidance_rescale = None
     pipeline._interrupt = False
 
 

@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+from .ltx2_guidance import LTXGuidanceSpec, LTXModalityGuidance
 
 
 @dataclass
@@ -24,8 +26,7 @@ class LTXRequestInputs:
     num_frames: int
     frame_rate: float
     num_inference_steps: int
-    guidance_scale: float
-    guidance_rescale: float
+    guidance: LTXGuidanceSpec
     num_videos_per_prompt: int
     generator: torch.Generator | list[torch.Generator] | None
     latents: torch.Tensor | None
@@ -38,6 +39,15 @@ class LTXRequestInputs:
     decode_noise_scale: float | list[float] | None
     output_type: str
     max_sequence_length: int
+
+    @property
+    def guidance_scale(self) -> float:
+        """Compatibility view for callers that only understand video CFG."""
+        return self.guidance.video.cfg_scale
+
+    @property
+    def guidance_rescale(self) -> float:
+        return self.guidance.video.rescale_scale
 
 
 def _unwrap_request_tensor(value: Any) -> Any:
@@ -65,11 +75,78 @@ def _get_audio_latents_from_sampling(sampling: Any) -> torch.Tensor | None:
     return sampling.extra_args.get("audio_latents")
 
 
+def _get_extra_arg(sampling: Any, *names: str) -> Any:
+    extra_args = sampling.extra_args or {}
+    for name in names:
+        value = extra_args.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_stg_blocks(value: Any, default: tuple[int, ...]) -> tuple[int, ...]:
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return (value,)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"STG blocks must be an integer or a list of integers, got {value!r}.")
+    return tuple(int(item) for item in value)
+
+
+def _resolve_modality_guidance(
+    sampling: Any,
+    modality: str,
+    default: LTXModalityGuidance,
+) -> LTXModalityGuidance:
+    cfg_aliases = (f"{modality}_cfg_scale", f"{modality}_cfg_guidance_scale")
+    stg_aliases = (f"{modality}_stg_scale", f"{modality}_stg_guidance_scale")
+    modality_aliases = (
+        ("video_modality_scale", "a2v_guidance_scale")
+        if modality == "video"
+        else ("audio_modality_scale", "v2a_guidance_scale")
+    )
+    cfg_scale = _get_extra_arg(sampling, *cfg_aliases)
+    stg_scale = _get_extra_arg(sampling, *stg_aliases)
+    modality_scale = _get_extra_arg(sampling, *modality_aliases)
+    rescale_scale = _get_extra_arg(sampling, f"{modality}_rescale_scale")
+    stg_blocks = _get_extra_arg(sampling, f"{modality}_stg_blocks")
+    return replace(
+        default,
+        cfg_scale=default.cfg_scale if cfg_scale is None else float(cfg_scale),
+        stg_scale=default.stg_scale if stg_scale is None else float(stg_scale),
+        modality_scale=default.modality_scale if modality_scale is None else float(modality_scale),
+        rescale_scale=default.rescale_scale if rescale_scale is None else float(rescale_scale),
+        stg_blocks=_normalize_stg_blocks(stg_blocks, default.stg_blocks),
+    )
+
+
+def _resolve_guidance_spec(
+    sampling: Any,
+    default: LTXGuidanceSpec,
+    *,
+    guidance_scale: float | None,
+    guidance_rescale: float | None,
+) -> LTXGuidanceSpec:
+    video = _resolve_modality_guidance(sampling, "video", default.video)
+    audio = _resolve_modality_guidance(sampling, "audio", default.audio)
+
+    common_cfg = sampling.guidance_scale if sampling.guidance_scale_provided else guidance_scale
+    if common_cfg is not None:
+        video = replace(video, cfg_scale=float(common_cfg))
+        audio = replace(audio, cfg_scale=float(common_cfg))
+
+    common_rescale = sampling.guidance_rescale if sampling.guidance_rescale else guidance_rescale
+    if common_rescale is not None:
+        video = replace(video, rescale_scale=float(common_rescale))
+        audio = replace(audio, rescale_scale=float(common_rescale))
+    return LTXGuidanceSpec(video=video, audio=audio)
+
+
 class LTXRequestMixin:
     """Normalize serving requests without coupling them to a model version."""
 
     supports_request_batch = False
-    supports_guidance_rescale = False
 
     @staticmethod
     def _resolve_request_sigmas(
@@ -129,7 +206,7 @@ class LTXRequestMixin:
         frame_rate: float | None,
         num_inference_steps: int | None,
         timesteps: list[int] | None,
-        guidance_scale: float,
+        guidance_scale: float | None,
         num_videos_per_prompt: int | None,
         generator: torch.Generator | list[torch.Generator] | None,
         latents: torch.Tensor | None,
@@ -142,7 +219,7 @@ class LTXRequestMixin:
         decode_noise_scale: float | list[float] | None,
         output_type: str,
         max_sequence_length: int | None,
-        guidance_rescale: float = 0.0,
+        guidance_rescale: float | None = None,
     ) -> LTXRequestInputs:
         sampling_params_list = req.sampling_params_list
         sampling = sampling_params_list[0]
@@ -170,10 +247,18 @@ class LTXRequestMixin:
             sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else num_videos_per_prompt or 1
         )
         max_sequence_length = sampling.max_sequence_length or max_sequence_length or self.tokenizer_max_length
-        if sampling.guidance_scale_provided:
-            guidance_scale = sampling.guidance_scale
-        if self.supports_guidance_rescale and sampling.guidance_rescale is not None:
-            guidance_rescale = sampling.guidance_rescale
+        guidance_specs = [
+            _resolve_guidance_spec(
+                item,
+                self.one_stage_recipe.guidance,
+                guidance_scale=guidance_scale,
+                guidance_rescale=guidance_rescale,
+            )
+            for item in sampling_params_list
+        ]
+        guidance = guidance_specs[0]
+        if any(item != guidance for item in guidance_specs[1:]):
+            raise ValueError("Batched LTX requests must use identical video/audio guidance parameters.")
 
         if self.supports_request_batch:
             if generator is None:
@@ -251,8 +336,7 @@ class LTXRequestMixin:
             num_frames=int(num_frames),
             frame_rate=float(frame_rate),
             num_inference_steps=int(num_inference_steps),
-            guidance_scale=guidance_scale,
-            guidance_rescale=guidance_rescale,
+            guidance=guidance,
             num_videos_per_prompt=int(num_videos_per_prompt),
             generator=generator,
             latents=latents,

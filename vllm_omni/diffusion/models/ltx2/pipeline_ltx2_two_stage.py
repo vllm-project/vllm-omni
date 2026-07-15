@@ -22,7 +22,7 @@ from .ltx2_components import (
     get_ltx2_post_process_func as get_ltx2_post_process_func,  # noqa: F401
 )
 from .ltx2_conditioning import LTXI2VConditioningMixin
-from .ltx2_guidance import LTX_LEGACY_VELOCITY_GUIDANCE
+from .ltx2_guidance import LTXGuidanceSpec
 from .ltx2_pipeline_runtime import LTXPipelineRuntime
 from .ltx2_recipes import LTX2_ONE_STAGE_RECIPE
 from .ltx2_request import LTXRequestInputs
@@ -33,7 +33,6 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
     """Legacy distilled-only LTX2 two-stage compatibility entry."""
 
     component_profile = LTX2_COMPONENT_PROFILE
-    guidance_strategy = LTX_LEGACY_VELOCITY_GUIDANCE
     one_stage_recipe = LTX2_ONE_STAGE_RECIPE
     supports_request_batch = False
     support_image_input = False
@@ -80,7 +79,7 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         stage2_inputs = replace(
             request_inputs,
             num_inference_steps=3,
-            guidance_scale=1.0,
+            guidance=LTXGuidanceSpec.positive_only(),
             latents=upscaled_video_latent,
             audio_latents=stage1.audio,
             decode_timestep=0.0,
@@ -110,8 +109,8 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         frame_rate: float | None = None,
         num_inference_steps: int | None = None,
         timesteps: list[int] | None = None,
-        guidance_scale: float = 4.0,
-        guidance_rescale: float = 0.0,
+        guidance_scale: float | None = None,
+        guidance_rescale: float | None = None,
         noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -141,11 +140,7 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
             frame_rate=frame_rate,
             num_inference_steps=num_inference_steps,
             timesteps=timesteps,
-            guidance_scale=(
-                getattr(getattr(self, "one_stage_recipe", None), "guidance_scale", 4.0)
-                if guidance_scale is None
-                else guidance_scale
-            ),
+            guidance_scale=guidance_scale,
             guidance_rescale=guidance_rescale,
             num_videos_per_prompt=num_videos_per_prompt,
             generator=generator,

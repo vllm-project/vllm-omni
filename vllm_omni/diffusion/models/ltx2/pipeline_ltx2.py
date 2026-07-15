@@ -22,12 +22,13 @@ from .ltx2_components import (
     get_ltx2_post_process_func as get_ltx2_post_process_func,  # noqa: F401
 )
 from .ltx2_conditioning import LTXI2VConditioningMixin
-from .ltx2_guidance import (
-    LTX_LEGACY_VELOCITY_GUIDANCE,
-    LTX_OFFICIAL_X0_GUIDANCE,
-)
 from .ltx2_pipeline_runtime import LTXPipelineRuntime
-from .ltx2_recipes import LTX2_ONE_STAGE_RECIPE, LTX23_ONE_STAGE_RECIPE, LTXOneStageRecipe
+from .ltx2_recipes import (
+    LTX2_ONE_STAGE_RECIPE,
+    LTX23_ONE_STAGE_RECIPE,
+    LTX_POSITIVE_ONLY_RECIPE,
+    LTXOneStageRecipe,
+)
 from .ltx2_request import LTXRequestInputs
 
 
@@ -38,7 +39,6 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
     one_stage_recipe: ClassVar[LTXOneStageRecipe]
 
     supports_request_batch = True
-    supports_guidance_rescale = False
 
     def _forward_impl(
         self,
@@ -75,8 +75,8 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
-        guidance_scale: float = 4.0,
-        guidance_rescale: float = 0.0,
+        guidance_scale: float | None = None,
+        guidance_rescale: float | None = None,
         noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -107,7 +107,7 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
             frame_rate=frame_rate,
             num_inference_steps=num_inference_steps,
             timesteps=timesteps,
-            guidance_scale=self.one_stage_recipe.guidance_scale if guidance_scale is None else guidance_scale,
+            guidance_scale=guidance_scale,
             guidance_rescale=guidance_rescale,
             num_videos_per_prompt=num_videos_per_prompt,
             generator=generator,
@@ -141,9 +141,7 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
 class LTX2Pipeline(LTXOneStagePipeline):
     """LTX2 one-stage text-to-video entry."""
 
-    supports_guidance_rescale = True
     component_profile = LTX2_COMPONENT_PROFILE
-    guidance_strategy = LTX_LEGACY_VELOCITY_GUIDANCE
     one_stage_recipe = LTX2_ONE_STAGE_RECIPE
     _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
     _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
@@ -154,11 +152,9 @@ class LTX2Pipeline(LTXOneStagePipeline):
 class LTX23Pipeline(LTXOneStagePipeline):
     """LTX2.3 one-stage text-to-video entry."""
 
-    connector_batches_cfg = True
     preserve_sp_padded_audio_duration = True
     reports_stage_durations = True
     component_profile = LTX23_COMPONENT_PROFILE
-    guidance_strategy = LTX_OFFICIAL_X0_GUIDANCE
     one_stage_recipe = LTX23_ONE_STAGE_RECIPE
     _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
     _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
@@ -241,6 +237,8 @@ class LTX23ImageToVideoPipeline(LTXI2VConditioningMixin, LTX23Pipeline):
 class LTX2T2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
     """LTX2 T2V entry for FastGen DMD2-distilled models."""
 
+    one_stage_recipe = LTX_POSITIVE_ONLY_RECIPE
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         self.__init_dmd2__()
@@ -248,6 +246,8 @@ class LTX2T2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
 
 class LTX2I2VDMD2Pipeline(DMD2PipelineMixin, LTX2ImageToVideoPipeline):
     """LTX2 I2V entry for FastGen DMD2-distilled models."""
+
+    one_stage_recipe = LTX_POSITIVE_ONLY_RECIPE
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
