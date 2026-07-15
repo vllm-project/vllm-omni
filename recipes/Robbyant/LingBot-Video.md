@@ -197,6 +197,55 @@ Local MoE validation on one NVIDIA L20X used checkpoint revision
 Do not treat these as production benchmarks; they are functional smoke plus
 controlled numerical-parity evidence for small validation inputs.
 
+## Reproducing MoE numerical parity
+
+The in-tree parity harness compares the native MoE implementation with a local
+checkout of the upstream LingBot-Video implementation. It uses local files
+only and does not download checkpoints.
+
+Set paths for the upstream checkout and the cached MoE checkpoint:
+
+```bash
+export LINGBOT_VIDEO_REPO=/path/to/lingbot-video
+export LINGBOT_VIDEO_MOE_MODEL=/path/to/lingbot-video-moe-30b-a3b
+```
+
+Run the lightweight sparse-block comparison:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python benchmarks/diffusion/lingbot_video_moe_parity.py \
+  --scope block \
+  --official-repo "${LINGBOT_VIDEO_REPO}" \
+  --output-json /tmp/lingbot_moe_block_parity.json
+```
+
+This path covers bias-corrected router selection, group-limited top-k, routed
+experts, FP32 scatter-weighted restore, padding masks, and the shared expert.
+It exits with a nonzero status unless the upstream and native block outputs are
+bitwise equal.
+
+The real-checkpoint transformer comparison requires one GPU with enough memory
+for the 30B checkpoint. Models are loaded sequentially, so two copies are not
+resident on the GPU at the same time:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python benchmarks/diffusion/lingbot_video_moe_parity.py \
+  --scope transformer \
+  --official-repo "${LINGBOT_VIDEO_REPO}" \
+  --model "${LINGBOT_VIDEO_MOE_MODEL}" \
+  --output-json /tmp/lingbot_moe_transformer_parity.json
+```
+
+Transformer parity fixes the official implementation to
+`diffusers:_native_math` and the native implementation to
+`TORCH_SDPA + SDPBackend.MATH`. The expected result is `exact=true`,
+`output.equal=true`, and zero max/mean/RMSE error. Different fused attention
+kernels can introduce BF16 rounding differences before MoE routing, so
+automatic attention-backend comparisons are diagnostic only and are not the
+bitwise correctness oracle.
+
 ## Known Limitations
 
 - T2V base-transformer inference only. T2I, I2V, TI2V, and the checkpoint's
