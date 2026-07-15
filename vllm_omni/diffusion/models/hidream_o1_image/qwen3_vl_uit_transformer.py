@@ -54,6 +54,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 
 logger = init_logger(__name__)
 
@@ -483,6 +484,28 @@ class HiDreamO1UiTModel(nn.Module):
 
     # Layerwise offload and cache-dit need the nested block container path.
     _layerwise_offload_blocks_attrs = ["language_model.layers"]
+
+    # Sequence parallelism (Ulysses / Ring).
+    #
+    # The plan hooks before language_model.forward() to split inputs_embeds
+    # along the sequence dimension (dim 1) and position_ids along its sequence
+    # dimension (dim 2, since shape is (3, B, S)).  attn_metadata is NOT in the
+    # plan and passes through unchanged: Ulysses AllToAll reconstructs the full
+    # sequence on each rank before local attention, so full_attn_spans and
+    # attn_mask global coordinates remain correct.
+    #
+    # Limitation: the reference-image path (pixel_values != None) uses
+    # visual_pos_masks for deepstack indexing into the sequence.  Those
+    # positions may span multiple SP ranks, making gather/scatter logic
+    # non-trivial.  For now SP is supported for text-to-image only; using
+    # --ulysses-degree/>1 with reference images produces incorrect results.
+    _sp_plan = {
+        "language_model": {
+            "inputs_embeds": SequenceParallelInput(split_dim=1, expected_dims=3),
+            "position_ids": SequenceParallelInput(split_dim=2, expected_dims=3),
+        },
+        "final_layer2": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     # HSDP: shard individual decoder layers.
     @staticmethod

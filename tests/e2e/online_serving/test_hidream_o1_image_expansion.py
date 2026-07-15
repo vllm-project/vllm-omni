@@ -6,6 +6,7 @@ L4 nightly expansion tests for HiDream-O1-Image.
 Parametrized rows added per phase:
   Phase 5: Cache-DiT (cache_dit)
   Phase 6a: Tensor Parallelism (tp2)
+  Phase 6b: Sequence Parallelism / Ulysses (ulysses2)
   Phase 7: CPU offload — coming
 
 Run locally::
@@ -50,6 +51,11 @@ def _get_hidream_o1_feature_cases(model: str):
         pytest.param(
             OmniServerParams(model=model, server_args=["--tensor-parallel-size", "2"]),
             id="tp2",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(model=model, server_args=["--ulysses-degree", "2"]),
+            id="ulysses2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
     ]
