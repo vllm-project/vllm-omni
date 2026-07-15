@@ -807,7 +807,7 @@ def assert_result(
 
 def _default_benchmark_endpoint_for_task(task: str) -> str:
     """Return the default client-side benchmark endpoint for a diffusion task."""
-    if task in {"t2v", "i2v", "ti2v"}:
+    if task in {"t2v", "i2v", "ti2v", "v2v"}:
         return "/v1/videos"
     if task in {"t2i", "i2i", "ti2i"}:
         return "/v1/chat/completions"

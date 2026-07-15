@@ -293,16 +293,19 @@ def main():
 
     if args.modality in ("img2text", "video2text"):
         for i, req_output in enumerate(outputs):
-            text = getattr(req_output, "output", None) or getattr(req_output, "text", None)
-            if text is None and hasattr(req_output, "custom_output"):
-                text = (req_output.custom_output or {}).get("text_output")
+            multimodal_output = getattr(req_output, "multimodal_output", {}) or {}
+            metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
+            text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
+            text = (multimodal_output.get("text") if isinstance(multimodal_output, dict) else None) or (
+                text_metadata.get("text_output") if isinstance(text_metadata, dict) else None
+            )
+            text = text or getattr(req_output, "output", None) or getattr(req_output, "text", None)
             print(f"[Output {i}] {text}")
         return
 
     if args.modality in ("text2video", "video2video", "image2video"):
         for i, req_output in enumerate(outputs):
-            custom = getattr(req_output, "custom_output", None) or {}
-            frames = custom.get("video_frames")
+            frames = getattr(req_output, "images", None)
             if not frames:
                 print(f"[Output {i}] no video frames returned")
                 continue

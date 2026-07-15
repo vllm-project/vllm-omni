@@ -10,7 +10,7 @@ import queue
 import threading
 import time
 from collections.abc import AsyncGenerator, Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -40,7 +40,6 @@ from vllm_omni.diffusion.output_formatter import (
 )
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
-    get_diffusion_action_post_process_func,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
@@ -155,17 +154,10 @@ class DiffusionEngine:
         self.od_config = od_config
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
-        self.action_post_process_func = get_diffusion_action_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
-        self._action_post_process_accepts_sampling_params = _func_accepts_parameter(
-            self.action_post_process_func, "sampling_params"
-        )
-        self._action_post_process_accepts_custom_output = _func_accepts_parameter(
-            self.action_post_process_func, "custom_output"
-        )
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         if self.od_config.streaming_output and not self.step_execution:
@@ -307,46 +299,18 @@ class DiffusionEngine:
         if self.od_config.enable_cpu_offload:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
-        custom_output = output.custom_output or {}
-        action_payload = None
-        action_only_output = bool(custom_output.get("action_only_output"))
-
         postprocess_start_time = time.perf_counter()
-        if action_only_output:
-            outputs = []
-        elif self.post_process_func is not None:
+        if self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
+            postprocess_kwargs: dict[str, object] = {}
             if self._post_process_accepts_sampling_params:
-                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
-            else:
-                outputs = self.post_process_func(output_data)
+                postprocess_kwargs["sampling_params"] = request.sampling_params
+            outputs = self.post_process_func(output_data, **postprocess_kwargs)
         else:
             outputs = output_data
 
-        postprocess_output = normalize_diffusion_postprocess_output(outputs, custom_output)
-        custom_output = postprocess_output.custom_output
-        action_payload = postprocess_output.action_payload
-        if action_payload is None:
-            action_payload = custom_output.get("actions")
-            if action_payload is not None:
-                postprocess_output = replace(postprocess_output, action_payload=action_payload)
-        action_post_process_func = getattr(self, "action_post_process_func", None)
-        if action_payload is None and action_post_process_func is not None:
-            raw_action_payload = custom_output.get("action")
-            if raw_action_payload is not None:
-                action_kwargs: dict[str, Any] = {}
-                if getattr(self, "_action_post_process_accepts_custom_output", False):
-                    action_kwargs["custom_output"] = custom_output
-                if getattr(self, "_action_post_process_accepts_sampling_params", False):
-                    action_kwargs["sampling_params"] = request.sampling_params
-                action_payload = action_post_process_func(raw_action_payload, **action_kwargs)
-                custom_output = {**custom_output, "actions": action_payload}
-                postprocess_output = replace(
-                    postprocess_output,
-                    custom_output=custom_output,
-                    action_payload=action_payload,
-                )
+        postprocess_output = normalize_diffusion_postprocess_output(outputs)
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
