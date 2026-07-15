@@ -872,6 +872,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         capture_batch_sizes: list[int] | None = None,
         extra_capture_shapes: list[tuple[int, int]] | None = None,
         compile_shapes: list[tuple[int, int]] | None = None,
+        compile_mode: str = "default",
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
@@ -892,6 +893,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             capture_batch_sizes=capture_batch_sizes,
             extra_capture_shapes=extra_capture_shapes,
             compile_shapes=compile_shapes,
+            compile_mode=compile_mode,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
         )
@@ -905,11 +907,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         )
         self._cudagraph_enabled = True
         logger.info(
-            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s extra_shapes=%s compile_shapes=%s",
+            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s "
+            "extra_shapes=%s compile_shapes=%s compile_mode=%s",
             self._cudagraph_wrapper.capture_batch_sizes,
             self._cudagraph_wrapper.capture_sizes,
             self._cudagraph_wrapper.extra_capture_shapes,
             self._cudagraph_wrapper.compile_shapes,
+            self._cudagraph_wrapper.compile_mode,
         )
 
     def forward(self, codes):

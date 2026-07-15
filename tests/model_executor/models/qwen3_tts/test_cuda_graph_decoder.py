@@ -421,6 +421,27 @@ def test_uncaptured_batch_size_falls_back(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+def test_batch_size_can_pad_to_next_captured_graph(decoder):
+    """Batch sizes between capture buckets should replay the next bucket."""
+    bucketed_wrapper = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25],
+        capture_batch_sizes=[1, 2, 4],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    bucketed_wrapper.warmup(DEVICE)
+
+    assert (3, 25) not in bucketed_wrapper.graphs
+    assert (4, 25) in bucketed_wrapper.graphs
+    codes = _random_codes(25, batch_size=3)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = bucketed_wrapper.decode(codes)
+    assert graph_out.shape[0] == 3
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
 def test_extra_capture_shape_uses_sparse_graph(decoder):
     """Extra capture shapes should not expand to a full batch x size product."""
     sparse_wrapper = CUDAGraphDecoderWrapper(

@@ -40,6 +40,16 @@ class _RecordingCodec:
         return wav, audio_lengths
 
 
+class _WrongLengthCodec:
+    def decode(self, codes_bqf: torch.Tensor, feature_lengths: torch.Tensor):
+        del feature_lengths
+        batch = codes_bqf.shape[0]
+        wav_len = int(codes_bqf.shape[-1]) * 10
+        wav = torch.arange(batch * wav_len, dtype=torch.float32).view(batch, 1, wav_len)
+        audio_lengths = torch.ones(batch, dtype=torch.long)
+        return wav, audio_lengths
+
+
 class _FakeOneArgCodec:
     def decode(self, codes_bqf: torch.Tensor):
         batch = codes_bqf.shape[0]
@@ -207,6 +217,30 @@ def test_dac_decoder_splits_groups_by_padded_frame_budget():
         ((2, 2, 46), (45, 46)),
         ((1, 2, 47), (47,)),
     ]
+
+
+def test_dac_decoder_derives_audio_lengths_from_frame_counts():
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._codec = _WrongLengthCodec()
+    decoder._codec_decode_takes_lengths = True
+    decoder._num_codebooks = 2
+    decoder._output_sample_rate = 44100
+    decoder._hop_length = 512
+    decoder._logged_codec_stats = False
+    decoder._ensure_codec_loaded = lambda: None
+    decoder._split_request_ids = lambda ids, seq_token_counts=None: [
+        torch.arange(2, dtype=torch.long),
+        torch.arange(4, dtype=torch.long),
+    ]
+
+    out = decoder.forward(input_ids=torch.arange(6, dtype=torch.long))
+
+    audios = out.multimodal_outputs["model_outputs"]
+    assert len(audios) == 2
+    assert audios[0].shape[0] == 10
+    assert audios[1].shape[0] == 20
 
 
 def test_dac_decoder_dtype_can_be_configured():

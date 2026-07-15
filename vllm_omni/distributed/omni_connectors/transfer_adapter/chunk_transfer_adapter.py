@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -88,6 +89,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+
+    @staticmethod
+    def _read_env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r; falling back to %d.", name, raw, default)
+            return default
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -501,6 +513,46 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
+
+    def _promote_finished_parked_chunks(self, waiting_queue: Any, running_queue: list[Request]) -> int:
+        promoted = self._promote_finished_parked_queue(
+            self.waiting_for_chunk_waiting_requests,
+            RequestStatus.WAITING,
+            waiting_queue,
+        )
+        promoted += self._promote_finished_parked_queue(
+            self.waiting_for_chunk_running_requests,
+            RequestStatus.RUNNING,
+            running_queue,
+        )
+        return promoted
+
+    def _promote_finished_parked_queue(
+        self,
+        parked: deque[Any],
+        target_status: RequestStatus,
+        target_queue: Any,
+    ) -> int:
+        if not parked or not self._finished_load_reqs:
+            return 0
+        remaining: deque[Any] = deque()
+        promoted = 0
+        for request in parked:
+            request_id = request.request_id
+            if request_id not in self._finished_load_reqs:
+                remaining.append(request)
+                continue
+            self._finished_load_reqs.discard(request_id)
+            self.requests_with_ready_chunks.add(request_id)
+            request.status = target_status
+            if target_status == RequestStatus.RUNNING:
+                target_queue.append(request)
+            else:
+                target_queue.add_request(request)
+            promoted += 1
+        parked.clear()
+        parked.extend(remaining)
+        return promoted
 
     def _evict_finished_active_streams(self, request_ids: set[str] | None = None) -> None:
         for request_id in list(self._active_streams):

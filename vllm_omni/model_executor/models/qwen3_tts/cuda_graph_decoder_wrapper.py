@@ -8,9 +8,8 @@ reducing kernel launch overhead during inference.
 """
 
 import bisect
-import os
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 
 import torch
@@ -151,6 +150,7 @@ class CUDAGraphDecoderWrapper:
         capture_batch_sizes: list[int] | None = None,
         extra_capture_shapes: list[tuple[int, int]] | None = None,
         compile_shapes: list[tuple[int, int]] | None = None,
+        compile_mode: str = "default",
         num_quantizers: int = 8,
         enabled: bool = True,
     ):
@@ -172,6 +172,7 @@ class CUDAGraphDecoderWrapper:
                 if int(batch_size) > 0 and int(size) > 0
             }
         )
+        self.compile_mode = str(compile_mode or "default")
         self._bucket_sizes = self.capture_sizes
         self.num_quantizers = num_quantizers
         self.enabled = enabled
@@ -187,13 +188,8 @@ class CUDAGraphDecoderWrapper:
 
         self._warmed_up = False
         self._device = None
-        self._stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        self._stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS_LOG_EVERY", "0") or 0)
+        self._stats_enabled = False
+        self._stats_log_every = 0
         self._stats_total = 0
         self._stats_hits = 0
         self._stats_compiled_hits = 0
@@ -203,6 +199,15 @@ class CUDAGraphDecoderWrapper:
         self._stats_hit_shapes: Counter[tuple[int, int, int]] = Counter()
         self._stats_compiled_shapes: Counter[tuple[int, int]] = Counter()
         self._stats_fallback_shapes: Counter[tuple[int, int, int]] = Counter()
+        self._profile_enabled = False
+        self._profile_log_every = 0
+        self._profile_calls: Counter[tuple[int, int, int, int, str]] = Counter()
+        self._profile_actual_frames: Counter[tuple[int, int, int, int, str]] = Counter()
+        self._profile_padded_frames: Counter[tuple[int, int, int, int, str]] = Counter()
+        self._profile_input_ms: defaultdict[tuple[int, int, int, int, str], float] = defaultdict(float)
+        self._profile_replay_ms: defaultdict[tuple[int, int, int, int, str], float] = defaultdict(float)
+        self._profile_clone_ms: defaultdict[tuple[int, int, int, int, str], float] = defaultdict(float)
+        self._profile_total_ms: defaultdict[tuple[int, int, int, int, str], float] = defaultdict(float)
 
     @staticmethod
     def compute_capture_sizes(
@@ -237,6 +242,12 @@ class CUDAGraphDecoderWrapper:
         idx = bisect.bisect_left(self._bucket_sizes, actual_size)
         if idx < len(self._bucket_sizes):
             return self._bucket_sizes[idx]
+        return None
+
+    def _get_padded_batch_size(self, actual_batch_size: int) -> int | None:
+        idx = bisect.bisect_left(self.capture_batch_sizes, actual_batch_size)
+        if idx < len(self.capture_batch_sizes):
+            return self.capture_batch_sizes[idx]
         return None
 
     def _get_capture_shapes(self) -> list[tuple[int, int]]:
@@ -294,6 +305,96 @@ class CUDAGraphDecoderWrapper:
             self._stats_compiled_shapes.most_common(12),
             self._stats_hit_shapes.most_common(12),
             self._stats_fallback_shapes.most_common(12),
+        )
+
+    def _record_profile_stats(
+        self,
+        *,
+        batch_size: int,
+        actual_size: int,
+        padded_batch_size: int,
+        padded_size: int,
+        path: str,
+        input_ms: float,
+        replay_ms: float,
+        clone_ms: float,
+        total_ms: float,
+    ) -> None:
+        if not self._profile_enabled:
+            return
+        key = (batch_size, actual_size, padded_batch_size, padded_size, path)
+        self._profile_calls[key] += 1
+        self._profile_actual_frames[key] += batch_size * actual_size
+        self._profile_padded_frames[key] += padded_batch_size * padded_size
+        self._profile_input_ms[key] += input_ms
+        self._profile_replay_ms[key] += replay_ms
+        self._profile_clone_ms[key] += clone_ms
+        self._profile_total_ms[key] += total_ms
+        total_calls = sum(self._profile_calls.values())
+        if self._profile_log_every > 0 and total_calls % self._profile_log_every == 0:
+            self.log_profile_stats()
+
+    def log_profile_stats(self) -> None:
+        if not self._profile_enabled or not self._profile_calls:
+            return
+
+        rows = []
+        for key, calls in self._profile_calls.items():
+            actual_frames = self._profile_actual_frames[key]
+            padded_frames = self._profile_padded_frames[key]
+            wasted_frames = padded_frames - actual_frames
+            rows.append(
+                (
+                    self._profile_total_ms[key],
+                    key,
+                    calls,
+                    actual_frames,
+                    padded_frames,
+                    wasted_frames,
+                    self._profile_input_ms[key],
+                    self._profile_replay_ms[key],
+                    self._profile_clone_ms[key],
+                )
+            )
+        rows.sort(reverse=True)
+
+        def format_row(
+            row: tuple[float, tuple[int, int, int, int, str], int, int, int, int, float, float, float],
+        ) -> str:
+            total_ms, key, calls, actual_frames, padded_frames, wasted_frames, input_ms, replay_ms, clone_ms = row
+            batch_size, actual_size, padded_batch_size, padded_size, path = key
+            wasted_pct = 100.0 * wasted_frames / max(1, padded_frames)
+            return (
+                f"path={path} req=({batch_size},{actual_size})->({padded_batch_size},{padded_size}) "
+                f"calls={calls} actual_frames={actual_frames} padded_frames={padded_frames} "
+                f"wasted={wasted_frames}({wasted_pct:.1f}%) "
+                f"avg_ms=input {input_ms / calls:.3f}, replay {replay_ms / calls:.3f}, "
+                f"clone {clone_ms / calls:.3f}, total {total_ms / calls:.3f} "
+                f"sum_ms=total {total_ms:.1f}, replay {replay_ms:.1f}"
+            )
+
+        total_ms = sum(self._profile_total_ms.values())
+        replay_ms = sum(self._profile_replay_ms.values())
+        input_ms = sum(self._profile_input_ms.values())
+        clone_ms = sum(self._profile_clone_ms.values())
+        actual_frames = sum(self._profile_actual_frames.values())
+        padded_frames = sum(self._profile_padded_frames.values())
+        wasted_frames = padded_frames - actual_frames
+        wasted_pct = 100.0 * wasted_frames / max(1, padded_frames)
+        logger.info(
+            "Code2Wav CUDA Graph profile: calls=%d actual_frames=%d padded_frames=%d "
+            "wasted_frames=%d wasted=%.2f%% total_ms=%.1f input_ms=%.1f replay_ms=%.1f clone_ms=%.1f "
+            "top_total=[%s]",
+            sum(self._profile_calls.values()),
+            actual_frames,
+            padded_frames,
+            wasted_frames,
+            wasted_pct,
+            total_ms,
+            input_ms,
+            replay_ms,
+            clone_ms,
+            "; ".join(format_row(row) for row in rows[:12]),
         )
 
     def warmup(
@@ -366,12 +467,16 @@ class CUDAGraphDecoderWrapper:
         )
 
     def _warmup_compile_shapes(self, device: torch.device, dtype: torch.dtype) -> None:
-        logger.info("Starting torch.compile + CUDA Graph warmup for decoder shapes: %s", self.compile_shapes)
+        logger.info(
+            "Starting torch.compile(mode=%s) + CUDA Graph warmup for decoder shapes: %s",
+            self.compile_mode,
+            self.compile_shapes,
+        )
         compile_start_s = time.perf_counter()
         try:
             self._compiled_decoder = torch.compile(
                 self.decoder.forward,
-                mode="default",
+                mode=self.compile_mode,
                 fullgraph=False,
                 dynamic=False,
             )
@@ -497,11 +602,13 @@ class CUDAGraphDecoderWrapper:
 
         batch_size = int(codes.shape[0])
         actual_size = int(codes.shape[-1])
+        padded_batch_size = self._get_padded_batch_size(batch_size)
         padded_size = self._get_padded_size(actual_size)
         compile_key = (batch_size, actual_size)
-        if compile_key not in self._compiled_shapes and padded_size is not None:
-            compile_key = (batch_size, padded_size)
+        if compile_key not in self._compiled_shapes and padded_batch_size is not None and padded_size is not None:
+            compile_key = (padded_batch_size, padded_size)
         if compile_key in self._compiled_shapes:
+            compiled_batch_size = compile_key[0]
             compiled_size = compile_key[1]
             self._record_decode_stats(
                 hit=True,
@@ -510,19 +617,59 @@ class CUDAGraphDecoderWrapper:
                 padded_size=compiled_size,
                 compiled=True,
             )
+            if self._profile_enabled:
+                profile_start = torch.cuda.Event(enable_timing=True)
+                profile_after_input = torch.cuda.Event(enable_timing=True)
+                profile_after_replay = torch.cuda.Event(enable_timing=True)
+                profile_after_clone = torch.cuda.Event(enable_timing=True)
+                profile_start.record()
             static_input = self._compiled_static_inputs[compile_key]
-            if actual_size == compiled_size:
+            if batch_size == compiled_batch_size and actual_size == compiled_size:
                 static_input.copy_(codes)
             else:
                 static_input.zero_()
-                static_input[:, :, :actual_size] = codes
+                static_input[:batch_size, :, :actual_size] = codes
+            if self._profile_enabled:
+                profile_after_input.record()
             self._compiled_graphs[compile_key].replay()
+            if self._profile_enabled:
+                profile_after_replay.record()
             output = self._trim_replay_output(self._compiled_static_outputs[compile_key], actual_size, compiled_size)
             if clone_graph_output:
-                return output.clone()
+                output = output.clone()
+                if self._profile_enabled:
+                    profile_after_clone.record()
+                    profile_after_clone.synchronize()
+                    self._record_profile_stats(
+                        batch_size=batch_size,
+                        actual_size=actual_size,
+                        padded_batch_size=compiled_batch_size,
+                        padded_size=compiled_size,
+                        path="compiled_graph_clone",
+                        input_ms=profile_start.elapsed_time(profile_after_input),
+                        replay_ms=profile_after_input.elapsed_time(profile_after_replay),
+                        clone_ms=profile_after_replay.elapsed_time(profile_after_clone),
+                        total_ms=profile_start.elapsed_time(profile_after_clone),
+                    )
+                return output
+            if self._profile_enabled:
+                profile_after_replay.synchronize()
+                self._record_profile_stats(
+                    batch_size=batch_size,
+                    actual_size=actual_size,
+                    padded_batch_size=compiled_batch_size,
+                    padded_size=compiled_size,
+                    path="compiled_graph_view",
+                    input_ms=profile_start.elapsed_time(profile_after_input),
+                    replay_ms=profile_after_input.elapsed_time(profile_after_replay),
+                    clone_ms=0.0,
+                    total_ms=profile_start.elapsed_time(profile_after_replay),
+                )
             return output
 
-        graph_key = (batch_size, padded_size) if padded_size is not None else None
+        graph_key = (
+            (padded_batch_size, padded_size) if padded_batch_size is not None and padded_size is not None else None
+        )
 
         if graph_key is None or graph_key not in self.graphs:
             self._record_decode_stats(
@@ -539,17 +686,55 @@ class CUDAGraphDecoderWrapper:
             actual_size=actual_size,
             padded_size=padded_size,
         )
+        if self._profile_enabled:
+            profile_start = torch.cuda.Event(enable_timing=True)
+            profile_after_input = torch.cuda.Event(enable_timing=True)
+            profile_after_replay = torch.cuda.Event(enable_timing=True)
+            profile_after_clone = torch.cuda.Event(enable_timing=True)
+            profile_start.record()
         static_input = self.static_inputs[graph_key]
-        if actual_size == padded_size:
+        if batch_size == graph_key[0] and actual_size == padded_size:
             static_input.copy_(codes)
         else:
             static_input.zero_()
-            static_input[:, :, :actual_size] = codes
+            static_input[:batch_size, :, :actual_size] = codes
+        if self._profile_enabled:
+            profile_after_input.record()
         self.graphs[graph_key].replay()
+        if self._profile_enabled:
+            profile_after_replay.record()
 
         output = self._trim_replay_output(self.static_outputs[graph_key], actual_size, padded_size)
         if clone_graph_output:
-            return output.clone()
+            output = output.clone()
+            if self._profile_enabled:
+                profile_after_clone.record()
+                profile_after_clone.synchronize()
+                self._record_profile_stats(
+                    batch_size=batch_size,
+                    actual_size=actual_size,
+                    padded_batch_size=graph_key[0],
+                    padded_size=padded_size,
+                    path="graph_clone",
+                    input_ms=profile_start.elapsed_time(profile_after_input),
+                    replay_ms=profile_after_input.elapsed_time(profile_after_replay),
+                    clone_ms=profile_after_replay.elapsed_time(profile_after_clone),
+                    total_ms=profile_start.elapsed_time(profile_after_clone),
+                )
+            return output
+        if self._profile_enabled:
+            profile_after_replay.synchronize()
+            self._record_profile_stats(
+                batch_size=batch_size,
+                actual_size=actual_size,
+                padded_batch_size=graph_key[0],
+                padded_size=padded_size,
+                path="graph_view",
+                input_ms=profile_start.elapsed_time(profile_after_input),
+                replay_ms=profile_after_input.elapsed_time(profile_after_replay),
+                clone_ms=0.0,
+                total_ms=profile_start.elapsed_time(profile_after_replay),
+            )
         return output
 
     def _trim_replay_output(self, static_output: torch.Tensor, actual_size: int, padded_size: int) -> torch.Tensor:

@@ -8,6 +8,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.model_executor.models.qwen3_tts.codec_decode_service import (
+    PyTorchCodecDecodeService,
+    ShmCodecDecodeService,
+    is_codec_handle_tensor,
+    resolve_codec_handle_tensor,
+)
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
     Qwen3TTSCode2Wav,
 )
@@ -27,8 +33,10 @@ class _FakeDecoder(nn.Module):
         self.batched_decode_calls: list[dict[str, int]] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
+        self.to_calls: list[dict[str, object]] = []
 
     def to(self, *args, **kwargs):
+        self.to_calls.append({"args": args, "kwargs": kwargs})
         return self
 
     def chunked_decode(
@@ -93,6 +101,7 @@ def _make_model(
     *,
     stage_connector_config=None,
     async_chunk: bool = False,
+    enforce_eager: bool = False,
     device: torch.device | None = None,
 ) -> Qwen3TTSCode2Wav:
     dec_config = _fake_dec_config()
@@ -118,6 +127,7 @@ def _make_model(
                     revision=None,
                     stage_connector_config=stage_connector_config,
                     async_chunk=async_chunk,
+                    enforce_eager=enforce_eager,
                 ),
                 device_config=SimpleNamespace(device=device or torch.device("cpu")),
             )
@@ -415,6 +425,197 @@ def test_forward_batches_equal_length_requests_in_one_decoder_call():
     torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
 
 
+def test_pytorch_codec_decode_service_batches_requests_and_records_stats():
+    decoder = _FakeDecoder()
+    service = PyTorchCodecDecodeService(
+        decoder=decoder,
+        num_quantizers=_NUM_QUANTIZERS,
+        decode_chunk_frames=300,
+        decode_left_context_frames=25,
+        decode_variable_chunk_batch_min_frames=300,
+        decode_batch_max_size=0,
+    )
+    group_chunks = [
+        [
+            (0, torch.arange(6, dtype=torch.long).reshape(_NUM_QUANTIZERS, 3)),
+            (1, torch.arange(6, 12, dtype=torch.long).reshape(_NUM_QUANTIZERS, 3)),
+        ]
+    ]
+
+    wav_rows = service.decode_group_chunks(group_chunks)
+
+    assert decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (2, _NUM_QUANTIZERS, 3),
+        }
+    ]
+    assert sorted(wav_rows) == [0, 1]
+    torch.testing.assert_close(wav_rows[0], torch.arange(18, dtype=torch.float32))
+    torch.testing.assert_close(wav_rows[1], torch.arange(1000, 1018, dtype=torch.float32))
+    assert service.stats.submitted_requests == 2
+    assert service.stats.decoded_batches == 1
+    assert service.stats.bucket_groups[(2, 3)] == 1
+
+
+def test_shm_codec_decode_service_returns_resolvable_handle(tmp_path):
+    decoder = _FakeDecoder()
+    service = ShmCodecDecodeService(
+        decoder=decoder,
+        num_quantizers=_NUM_QUANTIZERS,
+        decode_chunk_frames=300,
+        decode_left_context_frames=25,
+        decode_variable_chunk_batch_min_frames=300,
+        decode_batch_max_size=0,
+        max_queue_delay_us=50_000,
+        max_queue_jobs=2,
+    )
+    try:
+        handles = service.decode_group_chunks_to_handles_async(
+            [[(0, torch.arange(6, dtype=torch.long).reshape(_NUM_QUANTIZERS, 3))]],
+            trim_specs={
+                0: {
+                    "ctx_frames": 1,
+                    "actual_frames": 3,
+                    "upsample": _TOTAL_UPSAMPLE,
+                }
+            },
+        )
+        handle = handles[0]
+        assert is_codec_handle_tensor(handle)
+
+        wav = resolve_codec_handle_tensor(handle, timeout_s=1.0)
+    finally:
+        service.shutdown()
+
+    assert decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (1, _NUM_QUANTIZERS, 3),
+        }
+    ]
+    torch.testing.assert_close(wav, torch.arange(4, 12, dtype=torch.float32))
+    assert list(tmp_path.glob("*.pt")) == []
+
+
+def test_shm_codec_decode_service_can_resolve_shm_handle_without_files(tmp_path):
+    decoder = _FakeDecoder()
+    service = ShmCodecDecodeService(
+        decoder=decoder,
+        num_quantizers=_NUM_QUANTIZERS,
+        decode_chunk_frames=300,
+        decode_left_context_frames=25,
+        decode_variable_chunk_batch_min_frames=300,
+        decode_batch_max_size=8,
+        decode_batch_bucket_frames=[97],
+        max_queue_delay_us=50_000,
+        max_queue_jobs=2,
+    )
+    try:
+        handles = service.decode_group_chunks_to_handles_async(
+            [[(0, torch.arange(_NUM_QUANTIZERS * 73, dtype=torch.long).reshape(_NUM_QUANTIZERS, 73))]],
+            trim_specs={0: {"ctx_frames": 1, "actual_frames": 73, "upsample": _TOTAL_UPSAMPLE}},
+        )
+        wav = resolve_codec_handle_tensor(handles[0], timeout_s=1.0)
+    finally:
+        service.shutdown()
+
+    assert decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (1, _NUM_QUANTIZERS, 73),
+        }
+    ]
+    torch.testing.assert_close(wav, torch.arange(4, 292, dtype=torch.float32))
+    assert list(tmp_path.glob("*")) == []
+
+
+def test_shm_codec_decode_service_safe_error_write_does_not_raise():
+    service = ShmCodecDecodeService(
+        decoder=_FakeDecoder(),
+        num_quantizers=_NUM_QUANTIZERS,
+        decode_chunk_frames=300,
+        decode_left_context_frames=25,
+        decode_variable_chunk_batch_min_frames=300,
+        decode_batch_max_size=1,
+        max_queue_delay_us=0,
+        max_queue_jobs=1,
+    )
+    try:
+        with patch.object(service, "_write_error", side_effect=OSError("disk full")):
+            service._safe_write_error(123, RuntimeError("decode failed"))
+    finally:
+        service.shutdown()
+
+
+def test_forward_can_use_pytorch_codec_decode_service():
+    model = _make_model()
+    model._decode_service_enabled = True
+
+    out = model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),
+        seq_token_counts=[6, 6],
+        runtime_additional_information=[
+            {"meta": {"left_context_size": 0}},
+            {"meta": {"left_context_size": 1}},
+        ],
+    )
+
+    assert model.decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (2, _NUM_QUANTIZERS, 3),
+        }
+    ]
+    assert model._decode_service is not None
+    assert model._decode_service.stats.submitted_requests == 2
+    assert model._decode_service.stats.decoded_batches == 1
+    audios = out.multimodal_outputs["model_outputs"]
+    torch.testing.assert_close(audios[0], torch.arange(12, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
+
+
+def test_forward_can_return_deferred_audio_handles():
+    model = _make_model()
+    model._decode_deferred_output_enabled = True
+    model._decode_deferred_max_queue_delay_us = 0
+
+    try:
+        out = model.forward(
+            input_ids=torch.arange(12, dtype=torch.long),
+            seq_token_counts=[6, 6],
+            runtime_additional_information=[
+                {"meta": {"left_context_size": 0}},
+                {"meta": {"left_context_size": 1}},
+            ],
+        )
+        handles = out.multimodal_outputs["audio_handle"]
+        assert "model_outputs" not in out.multimodal_outputs
+        assert len(handles) == 2
+        assert all(is_codec_handle_tensor(handle) for handle in handles)
+
+        wav0 = resolve_codec_handle_tensor(handles[0], timeout_s=1.0)
+        wav1 = resolve_codec_handle_tensor(handles[1], timeout_s=1.0)
+    finally:
+        if isinstance(model._decode_service, ShmCodecDecodeService):
+            model._decode_service.shutdown()
+
+    assert isinstance(model._decode_service, ShmCodecDecodeService)
+    assert model.decoder.decode_calls == [
+        {
+            "chunk_size": 300,
+            "left_context_size": 25,
+            "codes_shape": (2, _NUM_QUANTIZERS, 3),
+        }
+    ]
+    torch.testing.assert_close(wav0, torch.arange(12, dtype=torch.float32))
+    torch.testing.assert_close(wav1, torch.arange(1004, 1012, dtype=torch.float32))
+
+
 def test_forward_uses_variable_length_chunk_batching_for_long_bucket_group():
     model = _make_model()
     model._decode_batch_bucket_frames = [4]
@@ -472,7 +673,7 @@ def test_forward_bucket_batches_different_length_requests_and_trims_rows():
     torch.testing.assert_close(audios[2], torch.arange(2008, 2016, dtype=torch.float32))
 
 
-def test_forward_bucket_pads_only_to_group_max_frame_length():
+def test_forward_bucket_pads_to_configured_bucket_frame_length():
     model = _make_model()
     model._decode_batch_bucket_frames = [8]
 
@@ -489,7 +690,7 @@ def test_forward_bucket_pads_only_to_group_max_frame_length():
         {
             "chunk_size": 300,
             "left_context_size": 25,
-            "codes_shape": (2, _NUM_QUANTIZERS, 3),
+            "codes_shape": (2, _NUM_QUANTIZERS, 8),
         }
     ]
     assert model.decoder.batched_decode_calls == []
@@ -517,7 +718,7 @@ def test_forward_splits_bucket_groups_by_configured_max_batch_size():
         {
             "chunk_size": 300,
             "left_context_size": 25,
-            "codes_shape": (2, _NUM_QUANTIZERS, 3),
+            "codes_shape": (2, _NUM_QUANTIZERS, 4),
         },
         {
             "chunk_size": 300,
@@ -567,6 +768,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
         "capture_batch_sizes": None,
         "extra_capture_shapes": None,
         "compile_shapes": None,
+        "compile_mode": "default",
         "device": torch.device("cuda"),
         "codec_chunk_frames": 25,
         "codec_left_context_frames": 72,
@@ -596,6 +798,26 @@ def test_cudagraph_capture_shapes_can_be_configured():
     assert call["extra_capture_shapes"] == [(3, 325), (5, 325)]
 
 
+def test_inner_cudagraph_can_run_when_stage_enforces_eager():
+    model = _make_model(
+        async_chunk=True,
+        enforce_eager=True,
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_cudagraph_capture_sizes": [73, 169],
+                "decode_cudagraph_batch_sizes": [1, 2, 4, 8],
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    call = model.decoder.cudagraph_calls[-1]
+    assert call["capture_sizes"] == [73, 169]
+    assert call["capture_batch_sizes"] == [1, 2, 4, 8]
+
+
 def test_decode_compile_shapes_can_be_configured():
     model = _make_model(
         async_chunk=True,
@@ -611,6 +833,26 @@ def test_decode_compile_shapes_can_be_configured():
 
     call = model.decoder.cudagraph_calls[-1]
     assert call["compile_shapes"] == [(1, 73), (1, 325)]
+    assert call["compile_mode"] == "default"
+
+
+def test_decode_compile_mode_can_be_configured():
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_compile_shapes": ["1:73"],
+                "decode_compile_mode": "reduce-overhead",
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    call = model.decoder.cudagraph_calls[-1]
+    assert call["compile_shapes"] == [(1, 73)]
+    assert call["compile_mode"] == "reduce-overhead"
 
 
 def test_decode_tf32_can_be_configured():
@@ -642,6 +884,48 @@ def test_decode_tf32_can_be_configured():
         torch.set_float32_matmul_precision(old_matmul_precision)
 
 
+def test_decode_dtype_defaults_to_fp32():
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={"extra": {}},
+    )
+
+    _load_weights_noop(model)
+
+    assert model._decode_dtype is torch.float32
+    assert model.decoder.to_calls[-1]["kwargs"] == {
+        "device": torch.device("cuda"),
+        "dtype": torch.float32,
+    }
+
+
+def test_decode_dtype_can_be_configured():
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={"extra": {"decode_dtype": "fp16"}},
+    )
+
+    _load_weights_noop(model)
+
+    assert model._decode_dtype is torch.float16
+    assert model.decoder.to_calls[-1]["kwargs"] == {
+        "device": torch.device("cuda"),
+        "dtype": torch.float16,
+    }
+
+
+def test_invalid_decode_dtype_is_rejected():
+    model = _make_model(
+        async_chunk=True,
+        stage_connector_config={"extra": {"decode_dtype": "int8"}},
+    )
+
+    with pytest.raises(ValueError, match="decode_dtype"):
+        _load_weights_noop(model)
+
+
 def test_decode_batch_bucket_frames_can_be_configured():
     model = _make_model(
         async_chunk=True,
@@ -659,6 +943,41 @@ def test_decode_batch_bucket_frames_can_be_configured():
     assert model._decode_batch_bucket_frames == [73, 169]
     assert model._decode_batch_max_size == 10
     assert model._decode_variable_chunk_batch_min_frames == 512
+
+
+def test_decode_service_can_be_configured():
+    model = _make_model(
+        async_chunk=True,
+        stage_connector_config={
+            "extra": {
+                "decode_service_enabled": True,
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    assert model._decode_service_enabled is True
+
+
+def test_deferred_codec_decode_can_be_configured():
+    model = _make_model(
+        async_chunk=True,
+        stage_connector_config={
+            "extra": {
+                "decode_deferred_output": True,
+                "decode_deferred_max_queue_delay_us": 1234,
+                "decode_deferred_max_queue_jobs": 7,
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    assert model._decode_deferred_output_enabled is True
+    assert model._decode_service_enabled is True
+    assert model._decode_deferred_max_queue_delay_us == 1234
+    assert model._decode_deferred_max_queue_jobs == 7
 
 
 def test_invalid_decode_batch_max_size_is_rejected():

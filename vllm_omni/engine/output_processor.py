@@ -413,6 +413,8 @@ class OmniRequestState(RequestState):
                 if self.output_kind == RequestOutputKind.DELTA:
                     for modality_key in DRAINABLE_MODALITIES:
                         self.mm_accumulated.tensors.pop(modality_key, None)
+                    self.mm_accumulated.tensors.pop("audio_handle", None)
+                    self.mm_accumulated.metadata.pop("audio_handle", None)
 
                 return output
         except (RuntimeError, TypeError, AttributeError):

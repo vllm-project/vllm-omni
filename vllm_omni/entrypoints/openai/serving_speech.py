@@ -2759,6 +2759,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         new_chunks = []
 
                 for chunk_tensor in new_chunks:
+                    chunk_tensor = await self._resolve_audio_value_async(chunk_tensor)
+                    if hasattr(chunk_tensor, "numel") and chunk_tensor.numel() == 0:
+                        continue
                     chunk_np = (
                         chunk_tensor.float().detach().cpu().numpy() if hasattr(chunk_tensor, "float") else chunk_tensor
                     )
@@ -2786,15 +2789,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         sample_rate=sample_rate_val,
                         response_format="pcm",
                         speed=1.0,
+                        stream_format="audio",
                         base64_encode=False,
                     )
+                    audio_data = self.create_audio(audio_obj).audio_data
                     if first_audio_chunk_s is None:
                         first_audio_chunk_s = time.perf_counter()
-                    audio_bytes = self.create_audio(audio_obj).audio_data
                     if include_sample_rate:
-                        yield audio_bytes, sample_rate_val
+                        yield audio_data, sample_rate_val
                     else:
-                        yield audio_bytes
+                        yield audio_data
             self._mark_ref_audio_artifact_ready_for_request(request_id)
             artifact_ready = True
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
@@ -2941,8 +2945,39 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         break
         if not mm:
             return None, None
-        key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
+        if "audio_handle" in mm:
+            key = "audio_handle"
+        elif "audio" in mm:
+            key = "audio"
+        else:
+            key = "model_outputs" if "model_outputs" in mm else None
         return mm, key
+
+    @staticmethod
+    async def _resolve_audio_value_async(value):
+        from vllm_omni.model_executor.models.qwen3_tts.codec_decode_service import (
+            is_codec_handle_tensor,
+            resolve_codec_handle_tensor_async,
+        )
+
+        if isinstance(value, list):
+            return await asyncio.gather(*(OmniOpenAIServingSpeech._resolve_audio_value_async(item) for item in value))
+        if is_codec_handle_tensor(value):
+            return await resolve_codec_handle_tensor_async(value)
+        return value
+
+    @staticmethod
+    def _resolve_audio_value(value):
+        from vllm_omni.model_executor.models.qwen3_tts.codec_decode_service import (
+            is_codec_handle_tensor,
+            resolve_codec_handle_tensor,
+        )
+
+        if isinstance(value, list):
+            return [OmniOpenAIServingSpeech._resolve_audio_value(item) for item in value]
+        if is_codec_handle_tensor(value):
+            return resolve_codec_handle_tensor(value)
+        return value
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.
@@ -3793,6 +3828,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("TTS model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
+            audio_tensor = self._resolve_audio_value(audio_tensor)
             sr_raw = audio_output.get("sr", 24000)
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
@@ -3942,6 +3978,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("TTS model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
+            audio_tensor = self._resolve_audio_value(audio_tensor)
             sr_raw = audio_output.get("sr", 24000)
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)

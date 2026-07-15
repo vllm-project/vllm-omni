@@ -114,23 +114,28 @@ class FishSpeechDACDecoder(nn.Module):
         self,
         codes_bqf: torch.Tensor,
         feature_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         assert self._codec is not None
         if self._codec_decode_takes_lengths:
-            return self._codec.decode(codes_bqf, feature_lengths)
+            wav_batch, _audio_lengths = self._codec.decode(codes_bqf, feature_lengths)
+            return wav_batch
 
         if hasattr(self._codec, "from_indices"):
             wav_batch = self._codec.from_indices(codes_bqf)
         else:
             wav_batch = self._codec.decode(codes_bqf)
-        max_frames = max(int(codes_bqf.shape[-1]), 1)
-        scale = wav_batch.shape[-1] / max_frames
-        audio_lengths = torch.clamp(
-            torch.round(feature_lengths.to(torch.float32) * scale).to(torch.long),
-            min=0,
-            max=wav_batch.shape[-1],
-        )
-        return wav_batch, audio_lengths
+        return wav_batch
+
+    @staticmethod
+    def _audio_lengths_from_frames(
+        actual_frames: list[int],
+        target_frames: int,
+        decoded_samples: int,
+    ) -> list[int]:
+        if target_frames <= 0 or decoded_samples <= 0:
+            return [0] * len(actual_frames)
+        scale = decoded_samples / target_frames
+        return [max(0, min(decoded_samples, int(round(frames * scale)))) for frames in actual_frames]
 
     def _bake_weight_norm(self, codec: nn.Module) -> None:
         baked = 0
@@ -430,14 +435,17 @@ class FishSpeechDACDecoder(nn.Module):
                 codes_bqf[row, :, :frame_count] = codes_qf
 
             with torch.amp.autocast("cuda", enabled=False):
-                wav_batch, audio_lengths = self._decode_codes(codes_bqf, feature_lengths)
-            audio_lengths_list = (
-                audio_lengths.detach().to(device="cpu", dtype=torch.long).reshape(-1).tolist()
-                if audio_lengths.numel() > 0
-                else []
+                wav_batch = self._decode_codes(codes_bqf, feature_lengths)
+            audio_lengths_list = self._audio_lengths_from_frames(
+                actual_frames,
+                target_frames,
+                int(wav_batch.shape[-1]),
             )
             for row, (j, _) in enumerate(group):
-                audio_len = int(audio_lengths_list[row]) if len(audio_lengths_list) > row else int(wav_batch.shape[-1])
+                if len(audio_lengths_list) > row:
+                    audio_len = int(audio_lengths_list[row])
+                else:
+                    audio_len = int(wav_batch.shape[-1])
                 wav_tensors[j] = wav_batch[row, 0, :audio_len]
 
         for bounded_group in _iter_bounded_groups(list(enumerate(valid_codes_qf))):
