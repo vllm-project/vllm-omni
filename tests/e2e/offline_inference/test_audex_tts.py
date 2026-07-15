@@ -130,8 +130,10 @@ def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, con
     return params
 
 
-@pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+# NOT advanced_model: on the L4 CI tier the guided cond/uncond pair stalled
+# in co-scheduling for 37+ min (observed on merge CI; never reproduced on
+# H100-tier KV headroom). Guided CFG coverage stays in the full_model runs.
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_level: str) -> None:
     """A guided request must yield exactly ONE audio stream (companion suppressed)."""
     prompt = build_cond_prompt(SYNTH_TEXTS[0])
