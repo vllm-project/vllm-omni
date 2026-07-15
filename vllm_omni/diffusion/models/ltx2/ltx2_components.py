@@ -12,15 +12,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.nn.functional as F
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import DistributedAutoencoderKLLTX2Video
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -30,7 +30,12 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from .ltx2_transformer import LTX2VideoTransformer3DModel, apply_interleaved_rotary_emb, apply_split_rotary_emb
+from .ltx2_transformer import (
+    LTX2VideoTransformer3DModel,
+    apply_interleaved_rotary_emb,
+    apply_split_rotary_emb,
+    to_ltx_padding_mask,
+)
 
 try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
@@ -84,16 +89,8 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
 )
 
 
-_LTX_OFFICIAL_SDPA_PRIORITY = [
-    SDPBackend.CUDNN_ATTENTION,
-    SDPBackend.FLASH_ATTENTION,
-    SDPBackend.EFFICIENT_ATTENTION,
-    SDPBackend.MATH,
-]
-
-
-class _LTXOfficialConnectorAttnProcessor:
-    """Run connector attention with the official LTX SDPA semantics."""
+class _LTXConnectorAttnProcessor:
+    """Preserve official connector math around Omni attention dispatch."""
 
     def __call__(
         self,
@@ -124,24 +121,16 @@ class _LTXOfficialConnectorAttnProcessor:
 
         batch_size, _, inner_dim = query.shape
         head_dim = inner_dim // attn.heads
-        query, key, value = (
-            tensor.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2) for tensor in (query, key, value)
-        )
-        if attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attention_mask = attention_mask.unsqueeze(0)
-            if attention_mask.ndim == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-        with sdpa_kernel(_LTX_OFFICIAL_SDPA_PRIORITY, set_priority=True):
-            hidden_states = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                is_causal=False,
-            )
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, inner_dim)
+        kv_heads = attn.inner_kv_dim // attn.head_dim
+        query = query.view(batch_size, -1, attn.heads, head_dim)
+        key = key.view(batch_size, -1, kv_heads, head_dim)
+        value = value.view(batch_size, -1, kv_heads, head_dim)
+
+        if attention_mask is not None and attn.omni_attention.attn_backend.get_name().upper() == "FLASH_ATTN":
+            attention_mask = to_ltx_padding_mask(attention_mask)
+        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        hidden_states = attn.omni_attention(query, key, value, attn_metadata)
+        hidden_states = hidden_states.reshape(batch_size, -1, inner_dim)
 
         if gate_logits is not None:
             hidden_states = hidden_states.unflatten(2, (attn.heads, -1))
@@ -152,13 +141,25 @@ class _LTXOfficialConnectorAttnProcessor:
         return attn.to_out[1](hidden_states)
 
 
-def _install_official_connector_processors(connectors: LTX2TextConnectors) -> None:
+def _install_connector_attention(connectors: LTX2TextConnectors) -> None:
     for connector_name in ("video_connector", "audio_connector"):
         connector = getattr(connectors, connector_name, None)
-        for block in getattr(connector, "transformer_blocks", ()):
+        for block_index, block in enumerate(getattr(connector, "transformer_blocks", ())):
             attention = getattr(block, "attn1", None)
             if attention is not None:
-                attention.set_processor(_LTXOfficialConnectorAttnProcessor())
+                attention.omni_attention = OmniAttention(
+                    num_heads=attention.heads,
+                    head_size=attention.head_dim,
+                    num_kv_heads=attention.inner_kv_dim // attention.head_dim,
+                    softmax_scale=1.0 / (attention.head_dim**0.5),
+                    causal=False,
+                    prefix=f"connectors.{connector_name}.transformer_blocks.{block_index}.attn1",
+                    role="ltx2.connector",
+                    role_category="self",
+                    skip_sequence_parallel=True,
+                    disable_kv_quant=True,
+                )
+                attention.set_processor(_LTXConnectorAttnProcessor())
 
 
 def _detect_vocoder_output_sample_rate(model: str) -> int | None:
@@ -267,7 +268,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         local_files_only=local_files_only,
         dtype=dtype,
     )
-    _install_official_connector_processors(pipeline.connectors)
+    _install_connector_attention(pipeline.connectors)
     pipeline.vae = _load_component(
         profile.video_vae_cls,
         model,

@@ -12,10 +12,11 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.models.ltx2 import ltx2_components
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_COMPONENT_PROFILE,
     LTX23_COMPONENT_PROFILE,
-    _install_official_connector_processors,
+    _install_connector_attention,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXI2VConditioningMixin
 from vllm_omni.diffusion.models.ltx2.ltx2_denoise import (
@@ -275,20 +276,82 @@ def test_ltx_default_sigma_schedule_matches_official_shift_and_stretch():
     )
 
 
-def test_ltx_component_loader_installs_official_connector_attention():
+def test_ltx_component_loader_installs_omni_connector_attention(monkeypatch):
     installed = []
+    kernels = []
+
+    class OmniAttention:
+        def __init__(self, **kwargs):
+            kernels.append(kwargs)
 
     class Attention:
+        heads = 32
+        head_dim = 128
+        inner_kv_dim = 4096
+
         def set_processor(self, processor):
             installed.append(processor)
 
-    connector = SimpleNamespace(transformer_blocks=[SimpleNamespace(attn1=Attention())])
-    connectors = SimpleNamespace(video_connector=connector, audio_connector=connector)
+    monkeypatch.setattr(ltx2_components, "OmniAttention", OmniAttention)
+    connectors = SimpleNamespace(
+        video_connector=SimpleNamespace(transformer_blocks=[SimpleNamespace(attn1=Attention())]),
+        audio_connector=SimpleNamespace(transformer_blocks=[SimpleNamespace(attn1=Attention())]),
+    )
 
-    _install_official_connector_processors(connectors)
+    _install_connector_attention(connectors)
 
     assert len(installed) == 2
-    assert all(processor.__class__.__name__ == "_LTXOfficialConnectorAttnProcessor" for processor in installed)
+    assert all(processor.__class__.__name__ == "_LTXConnectorAttnProcessor" for processor in installed)
+    assert all(kernel["role"] == "ltx2.connector" for kernel in kernels)
+    assert all(kernel["role_category"] == "self" for kernel in kernels)
+    assert all(kernel["skip_sequence_parallel"] for kernel in kernels)
+    assert all(kernel["disable_kv_quant"] for kernel in kernels)
+
+
+def test_ltx_connector_attention_dispatches_through_omni_kernel():
+    calls = []
+
+    class Backend:
+        @staticmethod
+        def get_name():
+            return "FLASH_ATTN"
+
+    class OmniAttention:
+        attn_backend = Backend
+
+        def __call__(self, query, key, value, metadata):
+            calls.append((query, key, value, metadata))
+            return query
+
+    attention = SimpleNamespace(
+        heads=2,
+        head_dim=4,
+        inner_kv_dim=8,
+        norm_q=torch.nn.Identity(),
+        norm_k=torch.nn.Identity(),
+        to_q=torch.nn.Identity(),
+        to_k=torch.nn.Identity(),
+        to_v=torch.nn.Identity(),
+        to_out=(torch.nn.Identity(), torch.nn.Identity()),
+        to_gate_logits=None,
+        rope_type="split",
+        omni_attention=OmniAttention(),
+    )
+    hidden_states = torch.randn(2, 3, 8)
+    additive_mask = torch.zeros(2, 1, 3, 3)
+
+    output = ltx2_components._LTXConnectorAttnProcessor()(
+        attention,
+        hidden_states,
+        attention_mask=additive_mask,
+    )
+
+    query, key, value, metadata = calls[0]
+    assert query.shape == key.shape == value.shape == (2, 3, 2, 4)
+    assert metadata.attn_mask.shape == (2, 3)
+    assert metadata.attn_mask.dtype == torch.bool
+    assert metadata.attn_mask.all()
+    torch.testing.assert_close(output, hidden_states)
 
 
 def test_ltx2_two_stage_variants_share_stage_orchestration():

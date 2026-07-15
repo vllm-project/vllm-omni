@@ -338,6 +338,23 @@ class TensorParallelRMSNorm(nn.Module):
         return out.to(dtype=x_dtype)
 
 
+def to_ltx_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Convert an additive/expanded LTX mask to a 2D padding mask."""
+    if attention_mask.ndim > 2:
+        if attention_mask.is_floating_point():
+            valid = attention_mask >= 0
+        else:
+            valid = attention_mask.to(torch.bool)
+        batch_size = valid.shape[0]
+        key_length = valid.shape[-1]
+        attention_mask = valid.reshape(batch_size, -1, key_length).all(dim=1)
+    if attention_mask.is_floating_point():
+        attention_mask = attention_mask >= 0
+    if attention_mask.dtype != torch.bool:
+        attention_mask = attention_mask.to(torch.bool)
+    return attention_mask
+
+
 class LTX2AudioVideoAttnProcessor:
     r"""
     Processor for implementing attention (SDPA is used by default if you're using PyTorch 2.0) for the LTX-2.0 model.
@@ -354,24 +371,6 @@ class LTX2AudioVideoAttnProcessor:
                 "LTX attention processors require a minimum PyTorch version of 2.0. "
                 "Please upgrade your PyTorch installation."
             )
-
-    @staticmethod
-    def _to_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
-        # Convert additive/expanded masks into a 2D padding mask for flash-attn.
-        if attention_mask.ndim > 2:
-            if attention_mask.is_floating_point():
-                valid = attention_mask >= 0
-            else:
-                valid = attention_mask.to(torch.bool)
-            b = valid.shape[0]
-            key_len = valid.shape[-1]
-            valid = valid.reshape(b, -1, key_len).all(dim=1)
-            attention_mask = valid
-        if attention_mask.is_floating_point():
-            attention_mask = attention_mask >= 0
-        if attention_mask.dtype != torch.bool:
-            attention_mask = attention_mask.to(torch.bool)
-        return attention_mask
 
     @staticmethod
     def _is_sp_enabled() -> bool:
@@ -401,12 +400,12 @@ class LTX2AudioVideoAttnProcessor:
             # For cross-attention, encoder sequence length != query length, so drop the mask.
             if encoder_hidden_states is not None and encoder_hidden_states.shape[1] != hidden_states.shape[1]:
                 return None
-            return self._to_padding_mask(attention_mask)
+            return to_ltx_padding_mask(attention_mask)
 
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
         if attn.attn.attn_backend.get_name().upper() == "FLASH_ATTN":
-            attention_mask = self._to_padding_mask(attention_mask)
+            attention_mask = to_ltx_padding_mask(attention_mask)
         return attention_mask
 
     @staticmethod
