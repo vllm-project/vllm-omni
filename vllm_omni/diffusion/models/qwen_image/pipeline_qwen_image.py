@@ -314,12 +314,12 @@ class QwenImagePipeline(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
 
-        def _drop_vision_tower(text_encoder: nn.Module) -> None:
-            # Qwen2.5-VL ships a vision tower that text-to-image does not use.
-            # Drop it on the meta device (before parameter materialization) so
-            # its parameters are never quantized nor allocated on any device.
-            # Handle both transformers layouts: newer puts visual under .model,
-            # older puts it directly on the model.
+        def _drop_unused_modules(text_encoder: nn.Module) -> None:
+            # Drop submodules text-to-image conditioning never uses, on the meta
+            # device (before parameter materialization) so their params are never
+            # quantized nor allocated on any device.
+            # 1. Vision tower (Qwen2.5-VL ships one). Handle both transformers
+            #    layouts: newer puts visual under .model, older on the model.
             visual_owner = None
             if hasattr(text_encoder, "model") and hasattr(text_encoder.model, "visual"):
                 visual_owner = text_encoder.model
@@ -329,14 +329,20 @@ class QwenImagePipeline(
                 del visual_owner.visual
             else:
                 logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
+            # 2. lm_head: encoding reads hidden_states[-1] (see forward below), so
+            #    the full-vocab logits projection is dead weight — dropping it
+            #    avoids allocating, quantizing, and running it every encode.
+            if hasattr(text_encoder, "lm_head"):
+                del text_encoder.lm_head
 
         self.text_encoder = create_transformers_model(
             AutoModelForImageTextToText,
             od_config,
             hf_config=text_encoder_config,
-            prune_fn=_drop_vision_tower,
+            device=self.device,
+            prune_fn=_drop_unused_modules,
             prefix="text_encoder",
-        ).to(self.device)
+        )
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
         # half-written cache (missing-shard ``OSError`` *and* the default
         # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
@@ -1099,10 +1105,12 @@ class QwenImagePipeline(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_weights = loader.load_weights(self._remap_text_encoder_weights(weights))
-        # Record components loaded by diffusers submodules to satisfy the
-        # loader's strict coverage check.
+        # VAE loads via diffusers from_pretrained (outside AutoWeightsLoader), so
+        # mark its params to satisfy strict coverage. The text_encoder streams
+        # through AutoWeightsLoader (which reports its real weights) and the strict
+        # check already exempts quant scale params, so it needs no blanket union —
+        # leaving it out keeps genuinely missing weights failing the check.
         loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
-        loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
         return loaded_weights
 
     @staticmethod
