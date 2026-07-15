@@ -381,10 +381,9 @@ class DiffusersPipelineLoader:
                     cast(DiffusersAdapterPipeline, model).load_weights()
                 else:
                     self.load_weights(model)
-
-            # Process weights after loading for quantization (e.g., FP8 online quantization)
-            # This is needed for vLLM's quantization methods that need to transform weights
-            self._process_weights_after_loading(model, target_device)
+                # HSDP processes quantized weights before wrapping parameters as
+                # DTensors. The non-HSDP path can process them here as usual.
+                self._process_weights_after_loading(model, target_device)
 
             if offload_after_quant:
                 model.to("cpu")
@@ -628,6 +627,11 @@ class DiffusersPipelineLoader:
             raise ValueError("HSDP is not supported with the diffusers adapter load format")
         model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
         self.load_weights(model)
+
+        # Quantization methods must finish while parameters are ordinary local
+        # tensors. Some post-load transforms use operations (for example,
+        # torch.unique in ModelOpt NVFP4) that do not support DTensor inputs.
+        self._process_weights_after_loading(model, target_device)
 
         # Discover pipeline components (DiT, encoders, VAEs) via
         # ModuleDiscovery, which consults SupportsComponentDiscovery

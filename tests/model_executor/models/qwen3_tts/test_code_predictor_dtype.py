@@ -49,6 +49,11 @@ def _load_module(name: str, filename: str):
 
 def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     """Build the dict of modules to inject into sys.modules."""
+
+    class NativeCustomOp(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return self.forward_native(*args, **kwargs)
+
     platforms_mock = mocker.MagicMock()
     platforms_mock.current_omni_platform.supports_torch_inductor.return_value = False
     platforms_mock.current_omni_platform.is_npu.return_value = False
@@ -76,6 +81,8 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
 
     vllm_parallel_mock = mocker.MagicMock()
     vllm_parallel_mock.VocabParallelEmbedding = torch.nn.Embedding
+    custom_op_mock = types.ModuleType("vllm_omni.diffusion.layers.custom_op")
+    custom_op_mock.CustomOp = NativeCustomOp
 
     return {
         "vllm_omni": mocker.MagicMock(),
@@ -85,6 +92,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
         "vllm.config.vllm": vllm_config_mod,
         "vllm.model_executor.model_loader.weight_utils": weight_utils_mock,
         "vllm.model_executor.layers.vocab_parallel_embedding": vllm_parallel_mock,
+        "vllm_omni.diffusion.layers.custom_op": custom_op_mock,
         "vllm_omni.model_executor": types.ModuleType("vllm_omni.model_executor"),
         "vllm_omni.model_executor.models": models_pkg,
         "vllm_omni.model_executor.models.common": common_pkg,
@@ -166,6 +174,38 @@ def _make_vllm_config(mocker: MockerFixture, max_num_seqs: int = 4):
     vllm_config = mocker.MagicMock()
     vllm_config.scheduler_config.max_num_seqs = max_num_seqs
     return vllm_config
+
+
+def test_npu_custom_ops_use_fused_norm_and_cached_rope(mocker: MockerFixture, loaded_target_classes) -> None:
+    common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    cp_config, _ = _make_tiny_config(loaded_target_classes)
+    rms_calls = []
+
+    def npu_rms_norm(hidden_states, weight, epsilon):
+        rms_calls.append((hidden_states, weight, epsilon))
+        return hidden_states + 1, None
+
+    mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
+    mocker.patch.object(
+        common_mod,
+        "torch_npu",
+        types.SimpleNamespace(npu_rms_norm=npu_rms_norm),
+        create=True,
+    )
+
+    hidden_states = torch.zeros(1, 2, cp_config.hidden_size, dtype=torch.float16)
+    norm = common_mod._RMSNorm(cp_config.hidden_size, eps=cp_config.rms_norm_eps)
+    torch.testing.assert_close(norm.forward_npu(hidden_states), hidden_states + 1)
+    assert len(rms_calls) == 1
+    assert rms_calls[0][2] == cp_config.rms_norm_eps
+
+    rotary = common_mod._RotaryEmbedding(cp_config)
+    assert rotary.cos_cached.shape == (cp_config.num_code_groups + 1, cp_config.head_dim)
+    assert rotary.sin_cached.shape == rotary.cos_cached.shape
+    position_ids = torch.tensor([[0, 2, 4]])
+    cos, sin = rotary.forward_npu(hidden_states, position_ids)
+    torch.testing.assert_close(cos, rotary.cos_cached[position_ids].to(torch.float16))
+    torch.testing.assert_close(sin, rotary.sin_cached[position_ids].to(torch.float16))
 
 
 class TestCodePredictorDtypeAlignment:
