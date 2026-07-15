@@ -74,8 +74,8 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```
     Note: ``run_benchmark.py`` and ``run_diffusion_benchmark.py`` accept an optional ``--test-config-file``. If omitted, each loads every ``*.json`` under ``tests/dfx/perf/tests/`` and pytest ``-m`` filters by each case's ``mark``:
     ```bash
-    pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "tts" --collect-only
-    pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "diffusion" --collect-only
+    pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "tts"
+    pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "diffusion"
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
       --test-config-file tests/dfx/perf/tests/test_tts.json
     ```
