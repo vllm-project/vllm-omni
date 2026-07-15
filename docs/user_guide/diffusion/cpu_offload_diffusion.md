@@ -33,7 +33,7 @@ m = Omni(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers", enable_cpu_offload=True)
 
 **CLI:**
 ```bash
-vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers --enable-cpu-offload
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --enable-cpu-offload
 ```
 
 ### To Support a Model
@@ -82,6 +82,33 @@ mutual exclusion: when one group runs, the other moves to CPU.
 - Support single GPU only for now
 
 
+### Component offloading for split models (e.g. Cosmos3)
+
+Some models split their transformer into mutually-exclusive *components* that run
+in different phases of a single forward pass rather than as separate pipeline
+components -- e.g. Cosmos3's understanding (reasoner) component runs once per
+generation while the generation (generator) component runs every denoising step.
+Such models have no separate text encoder to swap against, so the transformer
+owns a small model-local offload path and wraps each phase with
+`with self._offload_context(name):`
+
+```python
+class Cosmos3VFMTransformer(nn.Module):
+    def forward(self, ...):
+        with self._offload_context("reasoner"):
+            ...  # understanding pass, runs once
+        with self._offload_context("generator"):
+            ...  # denoising pass, runs every step
+```
+
+Model-level offloading then keeps exactly one component GPU-resident at a time
+(the other on CPU), reusing the same `SequentialOffloadHook` `.to()` movers. The
+pipeline opts in by exposing `enable_omni_model_cpu_offload` (which drives the
+transformer's `enable_model_cpu_offload` and pins the VAE). Layerwise offloading
+works for these models too -- each component declares its own block container via
+`_layerwise_offload_blocks_attrs`.
+
+
 ## Layerwise (Blockwise) Offloading
 
 ### How It Works
@@ -119,10 +146,10 @@ m = Omni(model="Wan-AI/Wan2.2-I2V-A14B-Diffusers", enable_layerwise_offload=True
 **CLI:**
 ```bash
 # Text-to-video
-vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers --enable-layerwise-offload
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --enable-layerwise-offload
 
 # Or image-to-video
-vllm-omni serve diffusion Wan-AI/Wan2.2-I2V-A14B-Diffusers --enable-layerwise-offload
+vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers --omni --enable-layerwise-offload
 ```
 
 ### To Support a Model
@@ -145,9 +172,9 @@ class Flux2Transformer2DModel(nn.Module):
 ```
 
 ### Limitations
-- Cold start latency increases because of
-    1) components are loaded to CPU first at the very first during initialization,
-    2) weight consolidation and pinning
+- Cold start latency increases because offloaded components must be moved to CPU
+  during setup; layerwise offload may add extra weight consolidation and pinning
+  work.
 - Performance depends on compute cost and H2D bandwidth as well
 - Support single GPU only for now
 
@@ -178,11 +205,18 @@ Both strategies use vLLM-Omni's hook registry system (`HookRegistry` and `ModelH
 
 ```
 OffloadBackend (base class)
-├── ModelLevelOffloadBackend → uses SequentialOffloadHook
+├── ModelLevelOffloadBackend → uses SequentialOffloadHook (.to() swap)
+│                              (delegates to a pipeline's enable_omni_model_cpu_offload
+│                               for split models like Cosmos3)
 └── LayerWiseOffloadBackend → uses LayerwiseOffloadHook
 ```
 
-Factory function `get_offload_backend()` selects the appropriate backend based on configuration.
+Factory function `get_offload_backend()` selects the appropriate backend based on
+configuration.
+
+For split models, `ModelLevelOffloadBackend.enable()` detects a pipeline's
+`enable_omni_model_cpu_offload` hook and delegates to it; Cosmos3 then swaps its
+reasoner/generator components inside the model forward pass.
 
 
 ## Supported Models

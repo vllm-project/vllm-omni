@@ -21,12 +21,12 @@ import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from transformers.utils.hub import cached_file
+from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     RequestResponseMetadata,
 )
-from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
@@ -1395,7 +1395,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         emb_dim = len(embedding)
         if self._tts_model_type == "ming_tts":
             if emb_dim != 192:
-                logger.warning("speaker_embedding has %d dimensions; Ming dense expects 192", emb_dim)
+                raise ValueError(f"Ming speaker embedding must have 192 dims, got {emb_dim}")
         else:
             dim_err = self._validate_qwen_tts_speaker_embedding_dim(emb_dim)
             if dim_err is not None:

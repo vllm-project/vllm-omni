@@ -106,7 +106,13 @@ def _to_cpu(value):
 
 
 def to_payload_element(
-    element: object, idx: int, start: int, end: int, pass_lists_through: bool = False, seq_len: int | None = None
+    element: object,
+    idx: int,
+    start: int,
+    end: int,
+    pass_lists_through: bool = False,
+    seq_len: int | None = None,
+    scheduled_seq_len: int | None = None,
 ):
     """Build an mm payload element corresponding to one request index
     from an element containing 0 or more CPU tensors.
@@ -120,21 +126,39 @@ def to_payload_element(
             passthrough data; this should be False in normal cases, but True
             if we need to avoid splitting nonempty lists prior to calling
             postprocess, which is the case for prefix cache.
-        seq_len: Optional sequence length (i.e., dim 0 of hidden states).
-            When set, a tensor whose first dimension equals seq_len is
-            sliced per request. The prefix cache passthrough also passes
-            the total scheduled token count here so 1D (seq_len,) metadata
-            that is intentionally not cached is still split per request.
+        seq_len: Optional hidden-aligned batch length (``hidden_states.shape[0]``).
+            When a tensor's first dimension equals this value, it is sliced
+            per request using ``start:end``.
+        scheduled_seq_len: Optional scheduler-aligned batch length
+            (``scheduler_output.total_num_scheduled_tokens``). Some full-payload
+            mm tensors (e.g. batched ``codes.audio`` with tail-only hidden states)
+            are laid out by scheduled tokens instead of the hidden tail shape.
+            When omitted, ``seq_len`` is reused for backward compatibility.
     """
-    # Cached per-token tensors are merged elsewhere; here a first dim
-    # equal to seq_len means a per-request slice is required.
-    if seq_len is not None and isinstance(element, torch.Tensor) and element.shape[0] == seq_len:
+    if scheduled_seq_len is None:
+        scheduled_seq_len = seq_len
+
+    # Cached per-token tensors are merged elsewhere; here a first dim equal to
+    # either the hidden-aligned or scheduler-aligned batch length means a
+    # per-request slice is required.
+    if isinstance(element, torch.Tensor) and (
+        (seq_len is not None and element.shape[0] == seq_len)
+        or (scheduled_seq_len is not None and element.shape[0] == scheduled_seq_len)
+    ):
         return element[start:end].contiguous()
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
     elif isinstance(element, dict):
         return {
-            sk: to_payload_element(sv, idx, start, end, pass_lists_through=pass_lists_through, seq_len=seq_len)
+            sk: to_payload_element(
+                sv,
+                idx,
+                start,
+                end,
+                pass_lists_through=pass_lists_through,
+                seq_len=seq_len,
+                scheduled_seq_len=scheduled_seq_len,
+            )
             for sk, sv in element.items()
         }
     elif isinstance(element, list):

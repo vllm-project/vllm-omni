@@ -19,6 +19,7 @@ from vllm_omni.diffusion.models.soulx_singer.modules import (
 )
 from vllm_omni.diffusion.models.soulx_singer.pipeline_soulx_singer_base import (
     FlowMatchingAudioPipeline,
+    convert_soulx_audio_output_to_numpy,
 )
 from vllm_omni.diffusion.models.soulx_singer.preprocess.payload import (
     SOULX_PREPROCESSED_KEY,
@@ -96,7 +97,7 @@ def get_soulxsinger_svc_pre_process_func(od_config: OmniDiffusionConfig):
 
 def get_soulxsinger_post_process_func(od_config: OmniDiffusionConfig):
     def post_process_func(audio: torch.Tensor):
-        return audio.detach().cpu().float().numpy()
+        return convert_soulx_audio_output_to_numpy(audio)
 
     return post_process_func
 
@@ -400,7 +401,7 @@ class PipelineSoulXSingerSVC(FlowMatchingAudioPipeline):
         return self._forward_batch_from_request(
             req,
             kind="svc",
-            custom_output_key="pitch_shift",
+            metadata_key="pitch_shift",
             infer_batch_fn=self.infer_svc_batch,
         )
 

@@ -85,25 +85,50 @@ class _PipelineBackedEngine:
             outputs = self.pipeline.step_outputs(request)
         except Exception as exc:
             outputs = [
-                DiffusionOutput(custom_output={"chunk": 0}, finished=False),
+                _streaming_diffusion_output(chunk=0, finished=False),
                 DiffusionOutput(error=str(exc), finished=True),
             ]
         for output in outputs:
             if output.error is not None:
                 yield [OmniRequestOutput.from_error(request_id=request.request_id, error_message=output.error)]
                 continue
-            custom_output = output.custom_output or {}
+            payload, metadata = _streaming_payload_and_metadata(output)
+            stream_metadata = metadata.get("stream", {})
             yield [
                 OmniRequestOutput.from_diffusion(
                     request_id=request.request_id,
-                    images=list(custom_output.get("images") or []),
-                    custom_output=custom_output,
+                    images=list(payload.get("image") or []),
+                    multimodal_output={"metadata": {"stream": stream_metadata}},
                     finished=output.finished,
                 )
             ]
 
     def abort(self, request_id: str) -> None:
         del request_id
+
+
+def _streaming_diffusion_output(
+    *,
+    chunk: int,
+    finished: bool,
+    images: list | None = None,
+) -> DiffusionOutput:
+    payload = {"image": images or []}
+    metadata = {"stream": {"chunk": chunk}}
+    return DiffusionOutput(
+        output={
+            "payload": payload,
+            "metadata": metadata,
+        },
+        finished=finished,
+    )
+
+
+def _streaming_payload_and_metadata(output: DiffusionOutput) -> tuple[dict, dict]:
+    envelope = output.output if isinstance(output.output, dict) else {}
+    payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
+    metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+    return payload, metadata
 
 
 class TestPipelineStreamingOutputToStageDiffusionClient:
@@ -114,8 +139,8 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
         """Mock pipeline chunks over ZMQ reach StageDiffusionClient with correct finished flags."""
         pipeline = _StepStreamingPipeline(
             [
-                DiffusionOutput(custom_output={"chunk": 0}, finished=False),
-                DiffusionOutput(custom_output={"chunk": 1}, finished=True),
+                _streaming_diffusion_output(chunk=0, finished=False),
+                _streaming_diffusion_output(chunk=1, finished=True),
             ]
         )
 
@@ -123,7 +148,7 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
 
         assert [output.request_id for output in outputs] == ["req-stream", "req-stream"]
         assert [output.finished for output in outputs] == [False, True]
-        assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+        assert [output.multimodal_output["metadata"]["stream"]["chunk"] for output in outputs] == [0, 1]
         assert pipeline.requests[0].request_id == "req-stream"
 
     @pytest.mark.asyncio
@@ -136,7 +161,7 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
         assert len(outputs) == 2
         assert outputs[0].request_id == "req-error"
         assert outputs[0].finished is False
-        assert outputs[0].custom_output["chunk"] == 0
+        assert outputs[0].multimodal_output["metadata"]["stream"]["chunk"] == 0
         assert outputs[1].request_id == "req-error"
         assert outputs[1].finished is True
         assert outputs[1].error is not None
@@ -227,8 +252,8 @@ class TestPipelineStreamingOutputToEntrypoint:
         """Mock pipeline streaming chunks reach AsyncOmni.generate() via inline stage and orchestrator."""
         pipeline = _StepStreamingPipeline(
             [
-                DiffusionOutput(custom_output={"chunk": 0}, finished=False),
-                DiffusionOutput(custom_output={"chunk": 1}, finished=True),
+                _streaming_diffusion_output(chunk=0, finished=False),
+                _streaming_diffusion_output(chunk=1, finished=True),
             ]
         )
         inline_client = self._make_inline_pipeline_client(pipeline)
@@ -247,7 +272,7 @@ class TestPipelineStreamingOutputToEntrypoint:
 
             await _wait_for(lambda: len(pipeline.requests) == 1)
             assert pipeline.requests[0].request_id.startswith("req-omni-")
-            assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+            assert [output.multimodal_output["metadata"]["stream"]["chunk"] for output in outputs] == [0, 1]
             assert [getattr(output.request_output, "finished", output.finished) for output in outputs] == [False, True]
         finally:
             await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
@@ -258,8 +283,8 @@ class TestPipelineStreamingOutputToEntrypoint:
         frames = [np.full((4, 4, 3), fill_value=i, dtype=np.uint8) for i in range(2)]
         pipeline = _StepStreamingPipeline(
             [
-                DiffusionOutput(custom_output={"chunk": 0, "images": [frames]}, finished=False),
-                DiffusionOutput(custom_output={"chunk": 1, "images": [frames]}, finished=True),
+                _streaming_diffusion_output(chunk=0, images=[frames], finished=False),
+                _streaming_diffusion_output(chunk=1, images=[frames], finished=True),
             ]
         )
         inline_client = self._make_inline_pipeline_client(pipeline)

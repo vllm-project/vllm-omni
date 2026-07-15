@@ -32,12 +32,12 @@ flags. Image size uses the standard `--height` / `--width` flags.
   [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
 - Declared parameters:
   [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)
-- Stage config:
-  [`vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml`](../../vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml)
+- Deploy config:
+  [`vllm_omni/deploy/mammoth_moda2.yaml`](../../vllm_omni/deploy/mammoth_moda2.yaml)
 
 ## Hardware Support
 
-The default stage config runs both the AR and DiT stages on a single GPU
+The default deploy config runs both the AR and DiT stages on a single GPU
 (`devices: "0"`). The committed `gpu_memory_utilization` split (stage-0 AR `0.5`,
 stage-1 DiT `0.3`) is sized for an ~80 GB GPU. The model also fits on a 48 GB GPU
 after rebalancing the split so the AR weights (~23 GB) leave room for the KV
@@ -48,7 +48,7 @@ cache — see the note under *1x L40S 48GB*.
 ### 1x L40S 48GB
 
 > **48 GB config adjustment:** the committed
-> `vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml` uses
+> `vllm_omni/deploy/mammoth_moda2.yaml` uses
 > `gpu_memory_utilization` 0.5 / 0.3 (sized for ~80 GB). To fit on a 48 GB L40S,
 > set the stage-0 (AR) value to `0.8` and the stage-1 (DiT) value to `0.16`
 > before running. (On an ~80 GB GPU, leave the defaults unchanged.)
@@ -71,13 +71,13 @@ hf download bytedance-research/MammothModa2-Preview --local-dir ./MammothModa2-P
 ```
 
 Run text-to-image with the shared offline example from the repository root. The
-stage config sets `trust_remote_code`, so no extra flag is needed. Forward the
+deploy config sets `trust_remote_code`, so no extra flag is needed. Forward the
 MammothModa2 generation parameters as a JSON object through `--extra-body`:
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model ./MammothModa2-Preview \
-  --stage-configs-path vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml \
+  --stage-configs-path vllm_omni/deploy/mammoth_moda2.yaml \
   --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
   --height 1024 \
   --width 1024 \
