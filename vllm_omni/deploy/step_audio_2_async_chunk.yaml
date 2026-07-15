@@ -8,7 +8,7 @@ stages:
     devices: "0,1"
     tensor_parallel_size: 2
     max_num_seqs: 1
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.7
     enforce_eager: true
     async_scheduling: false
     max_num_batched_tokens: 1024
@@ -23,7 +23,7 @@ stages:
   - stage_id: 1
     devices: "1"
     max_num_seqs: 1
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.2
     enforce_eager: true
     async_scheduling: false
     max_num_batched_tokens: 2048

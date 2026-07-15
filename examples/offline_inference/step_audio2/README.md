@@ -51,7 +51,7 @@ Single request latency comparison between vLLM-Omni and official Step-Audio2 imp
 
 **Benchmark environment:**
 - GPU: NVIDIA H100 80GB (single card)
-- Model: Step-Audio2-mini
+- Model: Step-Audio-2-mini
 - Warmup: 1 run, Measured: 3 runs (averaged)
 
 ### Async Chunk Streaming Performance
@@ -73,7 +73,7 @@ Comparison between sequential (non-async) and async chunk modes via `/v1/audio/s
 
 **Benchmark environment:**
 - GPU: 4x NVIDIA RTX 3090 24GB (TP=2 for Thinker, 1 GPU for Token2Wav)
-- Model: Step-Audio2-mini
+- Model: Step-Audio-2-mini
 - Endpoint: `/v1/audio/speech` (10 prompts, concurrency=1)
 - Measured via `bench_tts_serve.py`
 
@@ -105,9 +105,8 @@ python end2end.py --query-type audio_to_text --model stepfun-ai/Step-Audio-2-min
 
 Models will be cached in `~/.cache/huggingface/hub/` for future use.
 
-**Available models**:
-- `stepfun-ai/Step-Audio-2-mini` (smaller, faster)
-- `stepfun-ai/Step-Audio2-7B` (larger, better quality)
+**Supported model**:
+- `stepfun-ai/Step-Audio-2-mini`
 
 ### Option 2: Manual Download (for offline use)
 
@@ -152,11 +151,6 @@ python end2end.py --query-type audio_to_text \
     --audio-path /path/to/input.wav \
     --model stepfun-ai/Step-Audio-2-mini
 
-# With specific model
-python end2end.py --query-type audio_to_text \
-    --audio-path /path/to/input.wav \
-    --model stepfun-ai/Step-Audio2-7B
-
 # With custom question
 python end2end.py --query-type audio_to_text \
     --audio-path input.wav \
@@ -175,11 +169,6 @@ Convert text to speech:
 python end2end.py --query-type text_to_audio \
     --text "Hello, this is a test of Step Audio 2 synthesis." \
     --model stepfun-ai/Step-Audio-2-mini
-
-# With specific model
-python end2end.py --query-type text_to_audio \
-    --text "Hello, this is a test." \
-    --model stepfun-ai/Step-Audio2-7B
 ```
 
 **Note**: Speaker voice is controlled by the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable or the default prompt wav bundled with the model.
@@ -197,11 +186,6 @@ Process input audio and generate output audio:
 python end2end.py --query-type audio_to_audio \
     --audio-path /path/to/source_audio.wav \
     --model stepfun-ai/Step-Audio-2-mini
-
-# With specific model
-python end2end.py --query-type audio_to_audio \
-    --audio-path source.wav \
-    --model stepfun-ai/Step-Audio2-7B
 ```
 
 This mode:
@@ -261,8 +245,8 @@ python end2end.py --query-type text_to_audio \
 
 The default configuration (`vllm_omni/deploy/step_audio_2.yaml`) uses:
 
-- **Stage 0 (Thinker)**: GPUs 0-1 with tensor parallel size 2, 80% memory
-- **Stage 1 (Token2Wav)**: GPU 1, 30% memory
+- **Stage 0 (Thinker)**: GPUs 0-1 with tensor parallel size 2, 70% memory
+- **Stage 1 (Token2Wav)**: GPU 1, 20% memory
 
 For **single GPU** setup, edit a deploy config copy to use `devices: "0"` for both stages.
 
@@ -362,7 +346,7 @@ Complete example from audio to final output:
 # 1. ASR: Transcribe audio
 python end2end.py --query-type audio_to_text \
     --audio-path interview.wav \
-    --model ./models/Step-Audio2-7B \
+    --model ./models/Step-Audio-2-mini \
     --output-dir ./outputs
 
 # 2. Check the transcription
@@ -372,7 +356,7 @@ cat ./outputs/00000_text.txt
 STEP_AUDIO2_DEFAULT_PROMPT_WAV=./speaker_samples/female_voice.wav \
 python end2end.py --query-type text_to_audio \
     --text "The quick brown fox jumps over the lazy dog" \
-    --model ./models/Step-Audio2-7B \
+    --model ./models/Step-Audio-2-mini \
     --output-dir ./outputs
 
 # 4. Listen to the result
