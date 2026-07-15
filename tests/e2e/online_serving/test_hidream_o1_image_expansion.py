@@ -7,6 +7,8 @@ Parametrized rows added per phase:
   Phase 5: Cache-DiT (cache_dit)
   Phase 6a: Tensor Parallelism (tp2)
   Phase 6b: Sequence Parallelism / Ulysses (ulysses2)
+  Phase 6c: CFG-Parallel (cfg_parallel2)
+  Phase 6d: HSDP (hsdp)
   Phase 7: CPU offload — coming
 
 Run locally::
@@ -57,6 +59,16 @@ def _get_hidream_o1_feature_cases(model: str):
             OmniServerParams(model=model, server_args=["--ulysses-degree", "2"]),
             id="ulysses2",
             marks=PARALLEL_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(model=model, server_args=["--cfg-parallel-size", "2"]),
+            id="cfg_parallel2",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(model=model, server_args=["--use-hsdp"]),
+            id="hsdp",
+            marks=SINGLE_CARD_FEATURE_MARKS,
         ),
     ]
 
