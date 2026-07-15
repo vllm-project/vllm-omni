@@ -43,6 +43,12 @@ import torch
 import torch.nn as nn
 from cache_dit import ForwardPattern
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
@@ -174,11 +180,15 @@ class TimestepEmbedder(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _build_attention_subclasses() -> dict[str, type]:
+def _build_attention_subclasses(quant_config: "QuantizationConfig | None" = None) -> dict[str, type]:
     """Build the attention/decoder-layer/text-model classes that need the
     masking rewire. Deferred into a function (rather than module-level
     classes) because the HF base classes are only available once
     `transformers` is confirmed importable.
+
+    ``quant_config`` is captured by closure and threaded into all parallel
+    linear layers (QKVParallelLinear, MergedColumnParallelLinear,
+    RowParallelLinear), enabling quantisation-aware weight loading.
     """
     hf = _load_qwen3_vl_classes()
     HFQwen3VLTextRMSNorm = hf["Qwen3VLTextRMSNorm"]
@@ -187,6 +197,8 @@ def _build_attention_subclasses() -> dict[str, type]:
     HFQwen3VLTextModel = hf["Qwen3VLTextModel"]
     Qwen3VLPreTrainedModel = hf["Qwen3VLPreTrainedModel"]
     apply_rotary_pos_emb = hf["apply_rotary_pos_emb"]
+
+    _quant_config = quant_config  # closure for subclasses below
 
     class Qwen3VLTextRMSNorm(HFQwen3VLTextRMSNorm):
         """Float32-upcast RMSNorm, matching the existing internvla_a1 adapter
@@ -200,23 +212,51 @@ def _build_attention_subclasses() -> dict[str, type]:
             return (self.weight * hidden_states).to(input_dtype)
 
     class Qwen3VLTextAttention(HFQwen3VLTextAttention):
-        """Same Q/K/V projections, Q/K-norm, and RoPE as upstream Qwen3-VL,
-        but dispatches the actual attention computation through vLLM-Omni's
-        ``Attention`` layer instead of HF's native eager/SDPA path, so that
-        the mixed causal(text)/full(image) mask (Phase 0 design lock) and
-        future backend selection / parallelism hooks are available.
+        """Same attention math as upstream Qwen3-VL (Q/K-norm, 3D-MRoPE) but
+        with TP-capable parallel projections (QKVParallelLinear /
+        RowParallelLinear) and vLLM-Omni's Attention layer for the compute
+        step, giving us the mixed causal/full mask path (Phase 0) and all
+        future parallelism hooks.
         """
 
         def __init__(self, config, layer_idx: int):
             super().__init__(config, layer_idx)
+            # Replace the plain nn.Linear projections created by the HF parent
+            # with TP-capable variants.  We delete the originals first so no
+            # stale parameters linger as unregistered tensors.
+            del self.q_proj, self.k_proj, self.v_proj, self.o_proj
+
+            hidden_size = config.hidden_size
+            num_heads = config.num_attention_heads
+            num_kv_heads = config.num_key_value_heads
+            attn_bias = getattr(config, "attention_bias", False)
+
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=num_heads,
+                total_num_kv_heads=num_kv_heads,
+                bias=attn_bias,
+                quant_config=_quant_config,
+                prefix=f"hidream_o1.language_model.layers.{layer_idx}.self_attn.qkv_proj",
+            )
+            self.o_proj = RowParallelLinear(
+                input_size=num_heads * self.head_dim,
+                output_size=hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                return_bias=False,
+                quant_config=_quant_config,
+                prefix=f"hidream_o1.language_model.layers.{layer_idx}.self_attn.o_proj",
+            )
             self.q_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.attn = Attention(
-                num_heads=self.config.num_attention_heads,
+                num_heads=self.qkv_proj.num_heads,  # per-TP-rank count
                 head_size=self.head_dim,
                 softmax_scale=self.scaling,
                 causal=False,  # masking is fully expressed via AttentionMetadata
-                num_kv_heads=self.config.num_key_value_heads,
+                num_kv_heads=self.qkv_proj.num_kv_heads,
                 prefix=f"hidream_o1.language_model.layers.{layer_idx}.self_attn",
                 role="self",
             )
@@ -229,27 +269,74 @@ def _build_attention_subclasses() -> dict[str, type]:
             **kwargs: Any,
         ) -> tuple[torch.Tensor, None]:
             input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.head_dim)
+
+            # QKVParallelLinear fuses all three projections; split the output
+            # using per-rank head counts so the shard sizes are correct under TP.
+            qkv, _ = self.qkv_proj(hidden_states)
+            q_size = self.qkv_proj.num_heads * self.head_dim
+            kv_size = self.qkv_proj.num_kv_heads * self.head_dim
+            q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
             # NOTE: deliberately NOT transposed to [B, H, S, D] here -- vLLM-Omni's
             # Attention layer expects [B, S, H, D]. RoPE is applied in-place below
             # with unsqueeze_dim=2 (heads at dim 2, not dim 1) to match.
-            q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
-            k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
-            v = self.v_proj(hidden_states).view(hidden_shape)
+            hidden_shape = (*input_shape, -1, self.head_dim)
+            q = self.q_norm(q.view(hidden_shape))
+            k = self.k_norm(k.view(hidden_shape))
+            v = v.view(hidden_shape)
 
             cos, sin = position_embeddings
             q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
 
             attn_output = self.attn(q, k, v, attn_metadata=attn_metadata)
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            # RowParallelLinear (return_bias=False) all-reduces across TP ranks
+            # and returns a plain tensor (no bias tuple).
             attn_output = self.o_proj(attn_output)
             return attn_output, None
+
+    class HiDreamO1TextMLP(nn.Module):
+        """SwiGLU MLP with TP-capable projections.
+
+        Replaces the HF-sourced ``Qwen3VLMLP`` (which uses plain nn.Linear)
+        inside each decoder layer so that the gate+up projections are fused
+        into a single ``MergedColumnParallelLinear`` and the down projection
+        uses ``RowParallelLinear``.
+        """
+
+        def __init__(self, config, layer_idx: int):
+            super().__init__()
+            hidden_size = config.hidden_size
+            intermediate_size = config.intermediate_size
+            self.gate_up_proj = MergedColumnParallelLinear(
+                input_size=hidden_size,
+                output_sizes=[intermediate_size, intermediate_size],
+                bias=False,
+                return_bias=False,
+                quant_config=_quant_config,
+                prefix=f"hidream_o1.language_model.layers.{layer_idx}.mlp.gate_up_proj",
+            )
+            self.down_proj = RowParallelLinear(
+                input_size=intermediate_size,
+                output_size=hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                return_bias=False,
+                quant_config=_quant_config,
+                prefix=f"hidream_o1.language_model.layers.{layer_idx}.mlp.down_proj",
+            )
+            self.act_fn = nn.SiLU()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            gate_up = self.gate_up_proj(x)
+            gate, up = gate_up.chunk(2, dim=-1)
+            return self.down_proj(self.act_fn(gate) * up)
 
     class Qwen3VLTextDecoderLayer(HFQwen3VLTextDecoderLayer):
         def __init__(self, config, layer_idx: int):
             super().__init__(config, layer_idx)
             self.self_attn = Qwen3VLTextAttention(config=config, layer_idx=layer_idx)
+            self.mlp = HiDreamO1TextMLP(config=config, layer_idx=layer_idx)
             self.input_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.post_attention_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -415,7 +502,8 @@ class HiDreamO1UiTModel(nn.Module):
     ):
         super().__init__()
         hf = _load_qwen3_vl_classes()
-        subclasses = _build_attention_subclasses()
+        quant_config = od_config.quantization_config if od_config is not None else None
+        subclasses = _build_attention_subclasses(quant_config=quant_config)
 
         config_cls = None
         model_path = od_config.model if od_config is not None else None

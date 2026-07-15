@@ -141,6 +141,17 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
         ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Maps (fused_param_suffix, checkpoint_suffix, shard_id) so that
+        # checkpoint's split q/k/v and gate/up weights are loaded into the
+        # fused QKVParallelLinear and MergedColumnParallelLinear params.
+        stacked_params_mapping = [
+            ("self_attn.qkv_proj", "self_attn.q_proj", "q"),
+            ("self_attn.qkv_proj", "self_attn.k_proj", "k"),
+            ("self_attn.qkv_proj", "self_attn.v_proj", "v"),
+            ("mlp.gate_up_proj", "mlp.gate_proj", 0),
+            ("mlp.gate_up_proj", "mlp.up_proj", 1),
+        ]
+
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
         skipped_lm_head = 0
@@ -154,7 +165,26 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
             if not name.startswith("model."):
                 logger.warning("Skipping unexpected HiDream-O1-Image weight key %s", name)
                 continue
-            local_name = "transformer." + name[len("model.") :]
+            local_name = "transformer." + name[len("model."):]
+
+            # Route checkpoint's split q/k/v and gate/up weights into the
+            # fused parallel linear params with appropriate shard ids.
+            matched = False
+            for fused_suffix, ckpt_suffix, shard_id in stacked_params_mapping:
+                if ckpt_suffix not in local_name or fused_suffix in local_name:
+                    continue
+                fused_name = local_name.replace(ckpt_suffix, fused_suffix)
+                if fused_name not in params_dict:
+                    continue
+                param = params_dict[fused_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, tensor, shard_id)
+                loaded.add(fused_name)
+                matched = True
+                break
+            if matched:
+                continue
+
             if local_name not in params_dict:
                 logger.warning("Skipping HiDream-O1-Image weight %s -- no matching local parameter", local_name)
                 continue

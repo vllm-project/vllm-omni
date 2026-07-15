@@ -4,8 +4,8 @@
 L4 nightly expansion tests for HiDream-O1-Image.
 
 Parametrized rows added per phase:
-  Phase 5: Cache-DiT (test_hidream_o1_dev_t2i_cache_dit)
-  Phase 6: TP/SP/CFG-Parallel/HSDP — coming
+  Phase 5: Cache-DiT (cache_dit)
+  Phase 6a: Tensor Parallelism (tp2)
   Phase 7: CPU offload — coming
 
 Run locally::
@@ -32,6 +32,7 @@ FULL_MODEL = "HiDream-ai/HiDream-O1-Image"
 T2I_PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-detailed."
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_hidream_o1_feature_cases(model: str):
@@ -45,6 +46,11 @@ def _get_hidream_o1_feature_cases(model: str):
             OmniServerParams(model=model, cache_backend="cache_dit"),
             id="cache_dit",
             marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(model=model, server_args=["--tensor-parallel-size", "2"]),
+            id="tp2",
+            marks=PARALLEL_FEATURE_MARKS,
         ),
     ]
 
