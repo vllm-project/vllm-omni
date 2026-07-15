@@ -40,7 +40,7 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_ltx23_request_pipe(cls):
+def _make_ltx_request_pipe(cls):
     pipe = object.__new__(cls)
     torch.nn.Module.__init__(pipe)
     pipe.device = torch.device("cpu")
@@ -76,6 +76,10 @@ def _resolve_request_inputs_for_test(pipe, req):
 
 
 def test_ltx_versions_share_runtime_without_cross_version_inheritance():
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+        DistributedAutoencoderKLLTX2Video,
+    )
+
     assert issubclass(LTX2Pipeline, LTXPipelineBase)
     assert issubclass(LTX23Pipeline, LTXPipelineBase)
     assert not issubclass(LTX23Pipeline, LTX2Pipeline)
@@ -84,6 +88,64 @@ def test_ltx_versions_share_runtime_without_cross_version_inheritance():
     assert LTX23Pipeline.component_profile is LTX23_COMPONENT_PROFILE
     assert LTX2Pipeline.one_stage_recipe is LTX2_ONE_STAGE_RECIPE
     assert LTX23Pipeline.one_stage_recipe is LTX23_ONE_STAGE_RECIPE
+    assert LTX2_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
+    assert LTX23_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
+
+
+def test_ltx_one_stage_variants_expose_shared_request_batch_and_distributed_decode_contracts():
+    one_stage_variants = (
+        LTX2Pipeline,
+        LTX2ImageToVideoPipeline,
+        LTX23Pipeline,
+        LTX23ImageToVideoPipeline,
+    )
+    assert all(pipeline_cls.supports_request_batch for pipeline_cls in one_stage_variants)
+    assert all(pipeline_cls.distributed_video_decode for pipeline_cls in one_stage_variants)
+    assert not LTX2TwoStagesPipeline.supports_request_batch
+    assert not LTX2ImageToVideoTwoStagesPipeline.supports_request_batch
+
+
+@pytest.mark.parametrize("pipeline_cls", [LTX2Pipeline, LTX23Pipeline])
+def test_ltx_request_batch_decode_splits_video_and_audio_per_request(pipeline_cls):
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    requests = [
+        OmniDiffusionRequest(
+            prompt=f"prompt-{index}",
+            sampling_params=OmniDiffusionSamplingParams(),
+            request_id=f"request-{index}",
+        )
+        for index in range(2)
+    ]
+    request_batch = DiffusionRequestBatch(requests)
+    video = torch.tensor([[1.0], [2.0]])
+    audio = torch.tensor([[3.0], [4.0]])
+    pipe = object.__new__(pipeline_cls)
+    torch.nn.Module.__init__(pipe)
+    object.__setattr__(pipe, "_decode_output", lambda **_kwargs: DiffusionOutput(output=(video, audio)))
+    forward_ctx = SimpleNamespace(
+        req=request_batch,
+        request_inputs=SimpleNamespace(
+            output_type="np",
+            generator=None,
+            decode_timestep=0.0,
+            decode_noise_scale=None,
+        ),
+        prompt_context=SimpleNamespace(connector_prompt_embeds=torch.empty(2, 1)),
+        device=torch.device("cpu"),
+        batch_size=2,
+        num_videos_per_prompt=1,
+    )
+
+    outputs = pipe._decode_and_split(forward_ctx, video, audio)
+
+    assert len(outputs) == 2
+    torch.testing.assert_close(outputs[0].output[0], video[:1])
+    torch.testing.assert_close(outputs[0].output[1], audio[:1])
+    torch.testing.assert_close(outputs[1].output[0], video[1:])
+    torch.testing.assert_close(outputs[1].output[1], audio[1:])
 
 
 def test_ltx_one_stage_variants_share_forward_template():
@@ -252,9 +314,15 @@ def test_ltx2_two_stage_reuses_prompt_context_between_phases():
     torch.testing.assert_close(output.output[1], torch.tensor([4.0]))
 
 
-class TestLTX23RequestParsing:
-    def test_t2v_and_i2v_share_request_input_resolution(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline, LTX23Pipeline
+class TestLTXRequestParsing:
+    @pytest.mark.parametrize(
+        ("t2v_cls", "i2v_cls"),
+        [
+            (LTX2Pipeline, LTX2ImageToVideoPipeline),
+            (LTX23Pipeline, LTX23ImageToVideoPipeline),
+        ],
+    )
+    def test_t2v_and_i2v_share_request_input_resolution(self, t2v_cls, i2v_cls):
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -302,11 +370,11 @@ class TestLTX23RequestParsing:
         )
 
         resolved_t2v = _resolve_request_inputs_for_test(
-            _make_ltx23_request_pipe(LTX23Pipeline),
+            _make_ltx_request_pipe(t2v_cls),
             req,
         )
         resolved_i2v = _resolve_request_inputs_for_test(
-            _make_ltx23_request_pipe(LTX23ImageToVideoPipeline),
+            _make_ltx_request_pipe(i2v_cls),
             req,
         )
 
@@ -352,7 +420,7 @@ class TestLTX23RequestParsing:
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        pipe = _make_ltx_request_pipe(LTX23Pipeline)
         req = DiffusionRequestBatch(
             [
                 OmniDiffusionRequest(
@@ -389,7 +457,7 @@ class TestLTX23ForwardStages:
     def test_encode_prompt_repeats_precomputed_embeds_for_num_outputs(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
 
-        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        pipe = _make_ltx_request_pipe(LTX23Pipeline)
         prompt_embeds = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
         negative_prompt_embeds = torch.tensor([[[-1.0], [-2.0]], [[-3.0], [-4.0]]])
         prompt_attention_mask = torch.tensor([[True, False], [False, True]])
@@ -434,7 +502,7 @@ class TestLTX23ForwardStages:
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        pipe = _make_ltx_request_pipe(LTX23Pipeline)
         req = DiffusionRequestBatch(
             [
                 OmniDiffusionRequest(
@@ -571,12 +639,47 @@ class TestRegistryIntegration:
         from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
 
         expected = [
+            "LTX2Pipeline",
+            "LTX2ImageToVideoPipeline",
+            "LTX2TwoStagesPipeline",
+            "LTX2ImageToVideoTwoStagesPipeline",
+            "LTX2T2VDMD2Pipeline",
+            "LTX2I2VDMD2Pipeline",
             "LTX23Pipeline",
             "LTX23ImageToVideoPipeline",
         ]
         for name in expected:
             assert name in _DIFFUSION_POST_PROCESS_FUNCS, f"{name} not in _DIFFUSION_POST_PROCESS_FUNCS"
             assert _DIFFUSION_POST_PROCESS_FUNCS[name] == "get_ltx2_post_process_func"
+
+    @pytest.mark.parametrize(
+        "model_class_name",
+        [
+            "LTX2Pipeline",
+            "LTX2ImageToVideoPipeline",
+            "LTX2TwoStagesPipeline",
+            "LTX2ImageToVideoTwoStagesPipeline",
+            "LTX2T2VDMD2Pipeline",
+            "LTX2I2VDMD2Pipeline",
+            "LTX23Pipeline",
+            "LTX23ImageToVideoPipeline",
+        ],
+    )
+    def test_post_process_func_resolves_from_every_entry_module(self, model_class_name):
+        from vllm_omni.diffusion.registry import get_diffusion_post_process_func
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vocoder_dir = os.path.join(tmpdir, "vocoder")
+            os.makedirs(vocoder_dir)
+            with open(os.path.join(vocoder_dir, "config.json"), "w") as config_file:
+                json.dump({"output_sampling_rate": 48000}, config_file)
+
+            post_process = get_diffusion_post_process_func(
+                SimpleNamespace(model_class_name=model_class_name, model=tmpdir)
+            )
+
+        result = post_process((torch.zeros(1), torch.zeros(1)))
+        assert result["audio_sample_rate"] == 48000
 
     def test_cache_dit_for_ltx2_does_not_have_custom_enablers_registered(self):
         """Pipeline variants are *not* registered in CUSTOM_DIT_ENABLERS."""
@@ -597,7 +700,7 @@ class TestVocoderSampleRateDetection:
 
     def test_detects_48khz_from_config(self):
         """Should detect output_sampling_rate=48000 from vocoder/config.json."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import _detect_vocoder_output_sample_rate
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _detect_vocoder_output_sample_rate
 
         with tempfile.TemporaryDirectory() as tmpdir:
             vocoder_dir = os.path.join(tmpdir, "vocoder")
@@ -610,7 +713,7 @@ class TestVocoderSampleRateDetection:
 
     def test_returns_none_for_no_output_sr(self):
         """Should return None if vocoder config has no output_sampling_rate."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import _detect_vocoder_output_sample_rate
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _detect_vocoder_output_sample_rate
 
         with tempfile.TemporaryDirectory() as tmpdir:
             vocoder_dir = os.path.join(tmpdir, "vocoder")
@@ -623,7 +726,7 @@ class TestVocoderSampleRateDetection:
 
     def test_returns_none_for_missing_directory(self):
         """Should return None if vocoder directory doesn't exist."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import _detect_vocoder_output_sample_rate
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _detect_vocoder_output_sample_rate
 
         result = _detect_vocoder_output_sample_rate("/nonexistent/path")
         assert result is None

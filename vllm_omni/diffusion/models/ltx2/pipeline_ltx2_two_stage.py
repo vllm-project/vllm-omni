@@ -24,6 +24,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.lora.request import LoRARequest
 
+from .ltx2_components import get_ltx2_post_process_func as get_ltx2_post_process_func  # noqa: F401
 from .ltx2_request import LTXRequestInputs
 from .pipeline_ltx2 import (
     LTX2ImageToVideoPipeline,
@@ -34,7 +35,7 @@ from .pipeline_ltx2_latent_upsample import LTX2LatentUpsamplePipeline
 
 
 class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
-    """LTX2 two-stage text-to-video entry."""
+    """Legacy distilled-only LTX2 two-stage compatibility entry."""
 
     dummy_run_num_frames = 2
     supports_request_batch = False

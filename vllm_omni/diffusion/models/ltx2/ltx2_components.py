@@ -16,6 +16,7 @@ from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchE
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
+from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import DistributedAutoencoderKLLTX2Video
@@ -66,6 +67,7 @@ LTX2_COMPONENT_PROFILE = LTXComponentProfile(
     dit_modules=("transformer",),
     encoder_modules=("text_encoder",),
     vae_modules=("vae", "audio_vae"),
+    video_vae_cls=DistributedAutoencoderKLLTX2Video,
 )
 
 LTX23_COMPONENT_PROFILE = LTXComponentProfile(
@@ -79,6 +81,39 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
     vocoder_fallback_cls=LTX2Vocoder,
     managed_aux_placement=True,
 )
+
+
+def _detect_vocoder_output_sample_rate(model: str) -> int | None:
+    """Read the generated waveform sample rate from the vocoder config."""
+    vocoder_config_path = os.path.join(model, "vocoder", "config.json")
+    if not os.path.exists(vocoder_config_path):
+        try:
+            vocoder_config_path = hf_hub_download(model, "vocoder/config.json")
+        except Exception:
+            return None
+    try:
+        with open(vocoder_config_path) as config_file:
+            return json.load(config_file).get("output_sampling_rate")
+    except Exception:
+        return None
+
+
+def get_ltx2_post_process_func(od_config: Any):
+    """Build the common LTX engine-output adapter."""
+    output_sample_rate = _detect_vocoder_output_sample_rate(od_config.model)
+
+    def post_process_func(output: tuple[torch.Tensor, torch.Tensor] | torch.Tensor):
+        if not (isinstance(output, tuple) and len(output) == 2):
+            return output
+        video, audio = output
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu()
+        result: dict[str, Any] = {"video": video, "audio": audio}
+        if output_sample_rate is not None:
+            result["audio_sample_rate"] = output_sample_rate
+        return result
+
+    return post_process_func
 
 
 def _load_component(

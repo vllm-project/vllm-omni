@@ -5,13 +5,10 @@
 
 from __future__ import annotations
 
-import json
-import os
 from typing import Any, ClassVar
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
-from huggingface_hub import hf_hub_download
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -24,6 +21,9 @@ from .ltx2_components import (
     LTXComponentProfile,
     initialize_pipeline_components,
 )
+from .ltx2_components import (
+    get_ltx2_post_process_func as get_ltx2_post_process_func,  # noqa: F401
+)
 from .ltx2_conditioning import LTXI2VConditioningMixin
 from .ltx2_guidance import (
     LTX_LEGACY_VELOCITY_GUIDANCE,
@@ -32,60 +32,6 @@ from .ltx2_guidance import (
 )
 from .ltx2_pipeline_base import LTXPipelineBase
 from .ltx2_recipes import LTX2_ONE_STAGE_RECIPE, LTX23_ONE_STAGE_RECIPE, LTXOneStageRecipe
-from .ltx2_request import LTXRequestInputs
-
-
-def _is_output_rank() -> bool:
-    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-
-
-def _vae_decode_needs_all_ranks(vae: Any) -> bool:
-    if not torch.distributed.is_initialized():
-        return False
-    is_distributed_enabled = getattr(vae, "is_distributed_enabled", None)
-    if not callable(is_distributed_enabled):
-        return False
-    try:
-        return bool(is_distributed_enabled())
-    except Exception:
-        return False
-
-
-def _should_decode_video_on_rank(vae: Any) -> bool:
-    return _is_output_rank() or _vae_decode_needs_all_ranks(vae)
-
-
-def _detect_vocoder_output_sample_rate(model: str) -> int | None:
-    """Read the generated waveform sample rate from the vocoder config."""
-    vocoder_config_path = os.path.join(model, "vocoder", "config.json")
-    if not os.path.exists(vocoder_config_path):
-        try:
-            vocoder_config_path = hf_hub_download(model, "vocoder/config.json")
-        except Exception:
-            return None
-    try:
-        with open(vocoder_config_path) as config_file:
-            return json.load(config_file).get("output_sampling_rate")
-    except Exception:
-        return None
-
-
-def get_ltx2_post_process_func(od_config: OmniDiffusionConfig):
-    """Build the common LTX engine-output adapter."""
-    output_sample_rate = _detect_vocoder_output_sample_rate(od_config.model)
-
-    def post_process_func(output: tuple[torch.Tensor, torch.Tensor] | torch.Tensor):
-        if not (isinstance(output, tuple) and len(output) == 2):
-            return output
-        video, audio = output
-        if isinstance(audio, torch.Tensor):
-            audio = audio.detach().cpu()
-        result: dict[str, Any] = {"video": video, "audio": audio}
-        if output_sample_rate is not None:
-            result["audio_sample_rate"] = output_sample_rate
-        return result
-
-    return post_process_func
 
 
 def _expand_per_prompt_decode_value(
@@ -148,13 +94,10 @@ class LTXOneStagePipeline(LTXPipelineBase, DiffusionPipelineProfilerMixin):
     guidance_strategy: ClassVar[LTXGuidanceStrategy]
     one_stage_recipe: ClassVar[LTXOneStageRecipe]
 
-    supports_request_batch = False
+    supports_request_batch = True
     supports_guidance_rescale = False
     connector_batches_cfg = False
-    distributed_video_decode = False
-    preserve_sp_padded_audio_duration = False
-    scheduler_shift_uses_max_sequence_length = False
-    reports_stage_durations = False
+    distributed_video_decode = True
     support_image_input = False
     dummy_run_num_frames = 2
 
@@ -165,45 +108,6 @@ class LTXOneStagePipeline(LTXPipelineBase, DiffusionPipelineProfilerMixin):
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
-
-    def _make_output(self, output: tuple[torch.Tensor, torch.Tensor]) -> DiffusionOutput:
-        if self.reports_stage_durations:
-            return DiffusionOutput(
-                output=output,
-                stage_durations=getattr(self, "stage_durations", None),
-            )
-        return DiffusionOutput(output=output)
-
-    def _resolve_audio_latent_length(self, requested_length: int, audio_latents: torch.Tensor | None) -> int:
-        if audio_latents is None or audio_latents.ndim != 4:
-            return requested_length
-
-        provided_length = audio_latents.shape[2]
-        if not self.preserve_sp_padded_audio_duration:
-            return provided_length
-
-        sp_size = getattr(self.od_config.parallel_config, "sequence_parallel_size", 1) or 1
-        padded_length = self._get_sp_padded_audio_latent_length(requested_length, int(sp_size))
-        return requested_length if provided_length in {requested_length, padded_length} else provided_length
-
-    def _scheduler_shift_sequence_length(
-        self,
-        latent_num_frames: int,
-        latent_height: int,
-        latent_width: int,
-    ) -> int:
-        if self.scheduler_shift_uses_max_sequence_length:
-            return self.scheduler.config.get("max_image_seq_len", 4096)
-        return super()._scheduler_shift_sequence_length(latent_num_frames, latent_height, latent_width)
-
-    def _resolve_request_image(
-        self,
-        req: DiffusionRequestBatch,
-        image: Any | None,
-        request_inputs: LTXRequestInputs,
-    ) -> Any | None:
-        del req, request_inputs
-        return image
 
     def _decode_output(
         self,
@@ -236,13 +140,24 @@ class LTXOneStagePipeline(LTXPipelineBase, DiffusionPipelineProfilerMixin):
             )
             latents = (1 - decode_noise_scale_t) * latents + decode_noise_scale_t * noise
 
-        should_decode_video = not self.distributed_video_decode or _should_decode_video_on_rank(self.vae)
+        dist_initialized = torch.distributed.is_initialized()
+        is_output_rank = not dist_initialized or torch.distributed.get_rank() == 0
+        vae_decode_needs_all_ranks = False
+        is_distributed_vae_enabled = getattr(self.vae, "is_distributed_enabled", None)
+        if self.distributed_video_decode and dist_initialized and callable(is_distributed_vae_enabled):
+            try:
+                # Distributed tiled decode is collective, so every rank must enter it.
+                vae_decode_needs_all_ranks = bool(is_distributed_vae_enabled())
+            except Exception:
+                pass
+
+        should_decode_video = not self.distributed_video_decode or is_output_rank or vae_decode_needs_all_ranks
         if should_decode_video:
             video = self.vae.decode(latents.to(self.vae.dtype), timestep_decode, return_dict=False)[0]
         else:
             video = torch.empty(0, device=latents.device, dtype=latents.dtype)
 
-        if self.distributed_video_decode and not _is_output_rank():
+        if self.distributed_video_decode and not is_output_rank:
             return self._make_output(
                 (
                     torch.empty(0, device=video.device, dtype=video.dtype),
@@ -345,9 +260,7 @@ class LTX2Pipeline(LTXOneStagePipeline):
 class LTX23Pipeline(LTXOneStagePipeline):
     """LTX2.3 one-stage text-to-video entry."""
 
-    supports_request_batch = True
     connector_batches_cfg = True
-    distributed_video_decode = True
     preserve_sp_padded_audio_duration = True
     scheduler_shift_uses_max_sequence_length = True
     reports_stage_durations = True

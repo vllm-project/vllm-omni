@@ -123,14 +123,16 @@ class TestCFGParallelHelpers:
 class TestCFGParallelForwardPath:
     """Test the LTX-2.3 CFG-parallel denoising path without loading model weights."""
 
-    def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch):
+    @pytest.mark.parametrize("pipeline_cls_name", ["LTX2Pipeline", "LTX23Pipeline"])
+    def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch, pipeline_cls_name):
         from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_base
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        pipe = object.__new__(ltx23.LTX23Pipeline)
+        pipeline_cls = getattr(ltx23, pipeline_cls_name)
+        pipe = object.__new__(pipeline_cls)
         torch.nn.Module.__init__(pipe)
         pipe.device = torch.device("cpu")
         pipe.tokenizer_max_length = 4

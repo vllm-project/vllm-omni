@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -47,6 +48,9 @@ class LTXPipelineBase(
     """Common state and primitives shared by LTX2 and LTX2.3 pipelines."""
 
     guidance_strategy: ClassVar[LTXGuidanceStrategy]
+    preserve_sp_padded_audio_duration = False
+    scheduler_shift_uses_max_sequence_length = False
+    reports_stage_durations = False
 
     _pack_latents = staticmethod(latent_ops.pack_latents)
     _unpack_latents = staticmethod(latent_ops.unpack_latents)
@@ -224,6 +228,23 @@ class LTXPipelineBase(
             negative_prompt_attention_mask=request_inputs.negative_prompt_attention_mask,
         )
 
+    def _resolve_request_image(
+        self,
+        req: DiffusionRequestBatch,
+        image: Any | None,
+        request_inputs: LTXRequestInputs,
+    ) -> Any | None:
+        del req, request_inputs
+        return image
+
+    def _make_output(self, output: tuple[torch.Tensor, torch.Tensor]) -> DiffusionOutput:
+        if self.reports_stage_durations:
+            return DiffusionOutput(
+                output=output,
+                stage_durations=getattr(self, "stage_durations", None),
+            )
+        return DiffusionOutput(output=output)
+
     def _prepare_video_latents_stage(
         self,
         request_inputs: LTXRequestInputs,
@@ -301,9 +322,16 @@ class LTXPipelineBase(
         requested_length: int,
         audio_latents: torch.Tensor | None,
     ) -> int:
-        if audio_latents is not None and audio_latents.ndim == 4:
-            return audio_latents.shape[2]
-        return requested_length
+        if audio_latents is None or audio_latents.ndim != 4:
+            return requested_length
+
+        provided_length = audio_latents.shape[2]
+        if not self.preserve_sp_padded_audio_duration:
+            return provided_length
+
+        sp_size = getattr(self.od_config.parallel_config, "sequence_parallel_size", 1) or 1
+        padded_length = self._get_sp_padded_audio_latent_length(requested_length, int(sp_size))
+        return requested_length if provided_length in {requested_length, padded_length} else provided_length
 
     def _scheduler_shift_sequence_length(
         self,
@@ -311,6 +339,8 @@ class LTXPipelineBase(
         latent_height: int,
         latent_width: int,
     ) -> int:
+        if self.scheduler_shift_uses_max_sequence_length:
+            return self.scheduler.config.get("max_image_seq_len", 4096)
         return latent_num_frames * latent_height * latent_width
 
     def _make_video_audio_scheduler(
