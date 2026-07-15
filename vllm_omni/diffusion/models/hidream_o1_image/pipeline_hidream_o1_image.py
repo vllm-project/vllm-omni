@@ -27,6 +27,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.hidream_o1_image.qwen3_vl_uit_transformer import HiDreamO1UiTModel
@@ -89,7 +90,7 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportImageInput, SupportsComponentDiscovery):
+class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportImageInput, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     # SupportImageInput protocol -- enables reference-image conditioning for
     # editing (1 ref) and subject-driven personalization (N refs).
     support_image_input: ClassVar[bool] = True
@@ -115,6 +116,16 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
         "transformer.x_embedder",
         "transformer.t_embedder1",
         "transformer.final_layer2",
+    ]
+
+    # DiffusionPipelineProfilerMixin — per-stage timing targets.
+    # No vae.encode/decode (this model has no VAE).  The vision-tower call
+    # (get_image_features) is a one-time-per-request cost for ref-image paths;
+    # forward_generation is the per-step cost that dominates for T2I.
+    _PROFILER_TARGETS: ClassVar[list[str]] = [
+        "transformer.get_image_features",
+        "transformer.forward_generation",
+        "transformer.x_embedder.forward",
     ]
 
     # Max side-length (pixels) for ref images fed to the VLM vision tower.
@@ -161,6 +172,10 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
                 fall_back_to_pt=False,
             )
         ]
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Maps (fused_param_suffix, checkpoint_suffix, shard_id) so that

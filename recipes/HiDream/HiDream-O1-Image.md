@@ -137,3 +137,72 @@ curl -s http://localhost:8095/v1/images/generations \
 - Resolution is snapped internally to the nearest 32-px-aligned value; you can pass any `height`/`width`.
 - For the `full` checkpoint with CFG (`guidance_scale > 1.0`), expect roughly 2x the VRAM and compute of the `dev` variant at the same resolution.
 - `transformers >= 4.57.1` is required at runtime; the pipeline will raise a clear error if the installed version is older.
+
+## Performance
+
+> **Status:** Benchmark numbers TBD — to be filled once the checkpoint is available on the target cluster.
+> The methodology below describes how to collect them.
+
+### Methodology
+
+HiDream-O1-Image has two cost buckets per request:
+
+1. **One-time setup** (runs once per request, not per step):
+   - Vision-tower `get_image_features` (only for ref-image paths — editing, personalization, layout-bbox).
+   - `fix_point` position-id construction (`get_rope_index_fix_point`).
+   - Patch embedding via `x_embedder`.
+   At 28 Dev steps the fixed overhead can represent a significant fraction of total latency — profile it
+   separately to avoid attributing it to per-step cost.
+
+2. **Per-step cost** (`forward_generation` × num_steps):
+   - The full decoder stack (Qwen3-VL backbone, 32 layers, ~8B params).
+   - No VAE decode — output is directly assembled from the final hidden states.
+
+Enable per-stage timing with `--enable-diffusion-pipeline-profiler` (backed by
+`DiffusionPipelineProfilerMixin`); the pipeline reports
+`transformer.get_image_features`, `transformer.forward_generation`, and
+`transformer.x_embedder.forward` durations.
+
+### Configurations to benchmark
+
+| Config | Command flags | Expected benefit |
+|--------|---------------|-----------------|
+| Baseline (Dev, 28 steps) | _(none)_ | Reference |
+| Cache-DiT | `--cache-backend cache_dit` | ~1.5–2× speedup per step (residual reuse) |
+| TP-2 | `--tensor-parallel-size 2` | ~1.6–1.9× step throughput (linear layer sharding) |
+| Ulysses-2 | `--ulysses-degree 2` | ~1.5–1.8× for long sequences (T2I at 1024²) |
+| Cache-DiT + TP-2 | `--cache-backend cache_dit --tensor-parallel-size 2` | Compounded; measure combined |
+
+### Profiling commands
+
+```bash
+# Single-GPU baseline with profiler
+vllm serve HiDream-ai/HiDream-O1-Image-Dev \
+    --omni \
+    --enable-diffusion-pipeline-profiler
+
+# Cache-DiT
+vllm serve HiDream-ai/HiDream-O1-Image-Dev \
+    --omni \
+    --cache-backend cache_dit \
+    --enable-diffusion-pipeline-profiler
+
+# TP-2
+vllm serve HiDream-ai/HiDream-O1-Image-Dev \
+    --omni \
+    --tensor-parallel-size 2 \
+    --enable-diffusion-pipeline-profiler
+```
+
+### Benchmark numbers
+
+> Numbers to be filled from H100-80GB measurements at 1024×1024, batch=1, seed=42.
+
+| Config | forward_generation (ms/step) | Total (s, 28 steps) | Peak VRAM (GB) |
+|--------|------------------------------|---------------------|----------------|
+| Baseline | — | — | — |
+| Cache-DiT | — | — | — |
+| TP-2 | — | — | — |
+| Ulysses-2 | — | — | — |
+| Cache-DiT + TP-2 | — | — | — |
+| CPU Offload | — | — | — |
