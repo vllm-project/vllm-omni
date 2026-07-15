@@ -16,7 +16,7 @@ steps:
       - "uv venv --python=3.12 && source .venv/bin/activate"
       - "uv pip install --upgrade build"
       - "python3 -m build"
-      - "bash .buildkite/scripts/upload-nightly-wheels.sh"
+      - "bash .buildkite/release/scripts/upload-nightly-wheels.sh"
 
   - label: "Generate and upload wheel indices"
     depends_on: "build-wheel"
@@ -24,7 +24,7 @@ steps:
     agents:
       queue: small_cpu_queue_release
     commands:
-      - "bash .buildkite/scripts/generate-and-upload-nightly-index.sh"
+      - "bash .buildkite/release/scripts/generate-and-upload-nightly-index.sh"
 
   - block: "Upload release wheels to PyPI"
     depends_on: "build-wheel"
@@ -38,7 +38,7 @@ steps:
     agents:
       queue: small_cpu_queue_release
     commands:
-      - "bash .buildkite/scripts/publish-release-wheels-pypi.sh"
+      - "bash .buildkite/release/scripts/publish-release-wheels-pypi.sh"
 
   - block: "Unblock to build release Docker images"
     depends_on: ~
@@ -100,7 +100,7 @@ steps:
     agents:
       queue: small_cpu_queue_release
     commands:
-      - "bash .buildkite/scripts/publish-release-images.sh"
+      - "bash .buildkite/release/scripts/publish-release-images.sh"
     plugins:
       - docker-login#v3.0.0:
           username: vllmbot

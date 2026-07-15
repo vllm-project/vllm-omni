@@ -9,7 +9,7 @@ steps:
   - label: ":github: Resolve skip-ci (docs / skip marks) & upload pipeline"
     key: upload-ci-pipeline
     commands:
-      - "python3 .buildkite/scripts/upload_pipeline.py --upload .buildkite/pipeline.yml"
+      - "python3 .buildkite/cuda/scripts/upload_pipeline.py --upload .buildkite/cuda/pipeline.yml"
     agents:
       queue: "cpu_queue_premerge"
 
@@ -37,7 +37,7 @@ steps:
         if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--e2e"
         fi
-        python3 .buildkite/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/test-ready.yml
+        python3 .buildkite/cuda/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-ready.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -52,7 +52,7 @@ steps:
         if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--e2e"
         fi
-        python3 .buildkite/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/test-merge.yml
+        python3 .buildkite/cuda/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -70,7 +70,7 @@ steps:
         build.pull_request.labels includes "diffusion-x2v-test"
       ))
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-nightly.yml
+      - buildkite-agent pipeline upload .buildkite/cuda/test-nightly.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -82,6 +82,6 @@ steps:
       (build.branch == "main" && build.env("WEEKLY") == "1") ||
       (build.branch != "main" && build.pull_request.labels includes "weekly-test")
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-weekly.yml
+      - buildkite-agent pipeline upload .buildkite/cuda/test-weekly.yml
     agents:
       queue: "cpu_queue_premerge"

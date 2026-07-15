@@ -1,9 +1,9 @@
-# .buildkite/pipeline-intel.yaml
+# .buildkite/intel/pipeline-intel.yml
 steps:
   - group: "INTEL Tests"
     steps:
       - label: "Intel: XPU Test"
-        command: "bash .buildkite/scripts/hardware_ci/run-xpu-test.sh"
+        command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
         agents:
           queue: "intel-gpu-omni"
         env:

@@ -57,7 +57,7 @@ steps:
           {% endif %}
 {% set cmd_body = (step.command or (step.commands | join("\n"))) | trim %}
 {% set indented_cmd = cmd_body | replace("\n", "\n            ") %}
-        command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh
+        command: bash .buildkite/amd/scripts/run-amd-test.sh
         env:
           DOCKER_BUILDKIT: "1"
 {% if step.env %}
@@ -104,7 +104,7 @@ steps:
       {% endif %}
 {% set cmd_body = (step.command or (step.commands | join("\n"))) | trim %}
 {% set indented_cmd = cmd_body | replace("\n", "\n        ") %}
-    command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh
+    command: bash .buildkite/amd/scripts/run-amd-test.sh
     env:
       DOCKER_BUILDKIT: "1"
 {% if step.env %}

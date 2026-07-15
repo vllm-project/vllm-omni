@@ -56,7 +56,7 @@ container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | hea
 # # Install AWS CLI to authenticate to ECR Public Gallery to get higher rate limit for pulling images
 # sudo apt-get update && sudo apt-get install -y awscli
 ##  Use safe docker login helper to prevent race conditions
-# source "$(dirname "${BASH_SOURCE[0]}")/../docker_login_ecr_public.sh"
+# source "$(dirname "${BASH_SOURCE[0]}")/../../common/scripts/docker_login_ecr_public.sh"
 # safe_docker_login_ecr_public
 
 ## Pull the container from AMD Docker Hub

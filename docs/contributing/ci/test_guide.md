@@ -24,7 +24,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     cd tests
     pytest -s -v -m "core_model and cpu"
     ```
-    The latest test command is available in the "Simple Unit Test" step of this [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
+    The latest test command is available in the "Simple Unit Test" step of this [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-ready.yml).
 
 === "L2 level"
 
@@ -40,7 +40,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```bash
     pytest -s -v -m "core_model and distributed_cuda and L4"  --run-level=core_model
     ```
-    The latest test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
+    The latest test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-ready.yml).
 
 === "L3 level"
 
@@ -55,7 +55,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```bash
     pytest -s -v -m "advanced_model and distributed_cuda and L4"  --run-level=advanced_model
     ```
-    The latest L3 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-merge.yml).
+    The latest L3 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-merge.yml).
 
 
 === "L4 level"
@@ -76,7 +76,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```bash
     pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
     ```
-    The latest L4 (nightly) test commands use the `full_model` marker and `--run-level full_model` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml) and [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml)). Example:
+    The latest L4 (nightly) test commands use the `full_model` marker and `--run-level full_model` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) and [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml)). Example:
 
     ```bash
     cd tests
@@ -110,7 +110,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
 
     ```
 
-    The latest L5 CI jobs (reliability + invalid-parameter weekly steps) are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-weekly.yml).
+    The latest L5 CI jobs (reliability + invalid-parameter weekly steps) are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml).
 
 You can find more information about markers in the documentation: [marker doc](./tests_markers.md)
 
