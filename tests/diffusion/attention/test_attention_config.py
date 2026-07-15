@@ -354,11 +354,18 @@ class TestOmniDiffusionConfigAttentionParsing:
     def test_dict_diffusion_attention_config(self):
         config = OmniDiffusionConfig(
             diffusion_attention_config={
-                "default": {"backend": "FLASH_ATTN"},
+                "default": {
+                    "backend": "FLASHINFER_ATTN",
+                    "extra": {"dtype_qk": torch.bfloat16, "dtype_vo": torch.float8_e4m3fn},
+                },
                 "per_role": {"self": "SPARSE_BLOCK"},
             }
         )
-        assert config.diffusion_attention_config.default.backend == "FLASH_ATTN"
+        assert config.diffusion_attention_config.default.backend == "FLASHINFER_ATTN"
+        assert config.diffusion_attention_config.default.extra == {
+            "dtype_qk": torch.bfloat16,
+            "dtype_vo": torch.float8_e4m3fn,
+        }
         assert config.diffusion_attention_config.per_role["self"].backend == "SPARSE_BLOCK"
 
     def test_no_diffusion_attention_config_defaults_to_empty(self):
