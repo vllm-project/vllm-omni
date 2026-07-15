@@ -303,7 +303,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
-        self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        # The width of embeddings received by this stage. It can differ from
+        # the stage's internal hidden size (e.g., Qwen2.5-Omni Talker receives
+        # 3584-wide Thinker states and projects them to a 896-wide hidden state).
+        self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
+        self.inputs_embeds = self._make_buffer(
+            self.max_num_tokens,
+            self.inputs_embeds_size,
+            dtype=self.dtype,
+            numpy=False,
+        )
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
