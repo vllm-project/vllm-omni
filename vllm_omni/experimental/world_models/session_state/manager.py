@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Session memory manager (RFC #4480).
 
-``SessionMemoryManager`` maps ``session_id -> {name: MemoryObject}`` and is the
+``SessionStateManager`` maps ``session_id -> {name: StateObject}`` and is the
 single authority for session lifecycle and eviction. It evicts by session count
 (LRU), matching the per-model session caches it adapts (e.g. DreamZero's), so
 an adapted model keeps the same eviction behaviour. A byte budget is recorded
@@ -20,7 +20,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import TypeVar
 
-from vllm_omni.experimental.world_models.memory.base import MemoryObject
+from vllm_omni.experimental.world_models.session_state.base import StateObject
 
 logger = logging.getLogger(__name__)
 
@@ -28,24 +28,24 @@ logger = logging.getLogger(__name__)
 # evicts identically.
 DEFAULT_MAX_SESSIONS = 64
 
-M = TypeVar("M", bound=MemoryObject)
+M = TypeVar("M", bound=StateObject)
 
 
-class SessionMemory:
-    """The named ``MemoryObject`` collection for one session."""
+class SessionState:
+    """The named ``StateObject`` collection for one session."""
 
     def __init__(self) -> None:
-        self._objects: dict[str, MemoryObject] = {}
+        self._objects: dict[str, StateObject] = {}
         # Session-scoped scalar/tensor metadata that is not itself a typed
-        # MemoryObject (e.g. counters, cached conditioning tensors). Persists
+        # StateObject (e.g. counters, cached conditioning tensors). Persists
         # across the per-call adapters that read/write it.
         # ``object`` (not ``Any``) so every read site must narrow explicitly.
         self.attrs: dict[str, object] = {}
 
-    def get(self, name: str) -> MemoryObject | None:
+    def get(self, name: str) -> StateObject | None:
         return self._objects.get(name)
 
-    def put(self, name: str, obj: MemoryObject) -> MemoryObject:
+    def put(self, name: str, obj: StateObject) -> StateObject:
         self._objects[name] = obj
         return obj
 
@@ -73,8 +73,8 @@ class SessionMemory:
         return sum(obj.nbytes for obj in self._objects.values())
 
 
-class SessionMemoryManager:
-    """Owns per-session memory and arbitrates the (count-based) LRU.
+class SessionStateManager:
+    """Owns per-session state and arbitrates the (count-based) LRU.
 
     The manager lives beside ``DiffusionRequestState`` (owned by the pipeline),
     not inside its ``extra`` dict: the manager is cross-request and long-lived,
@@ -93,7 +93,7 @@ class SessionMemoryManager:
         # Recorded for observability; enforcement is left to an eviction
         # planner (see RFC #4480).
         self.byte_budget = byte_budget
-        self._sessions: OrderedDict[str, SessionMemory] = OrderedDict()
+        self._sessions: OrderedDict[str, SessionState] = OrderedDict()
         # The locking strategy is injected rather than hard-coded: callers
         # that run the manager from worker threads keep the default
         # ``threading.Lock``, while an async or single-threaded owner can pass
@@ -110,13 +110,13 @@ class SessionMemoryManager:
     def _key(session_id: str | None) -> str:
         return str(session_id or "default")
 
-    def get_or_create_session(self, session_id: str | None) -> SessionMemory:
+    def get_or_create_session(self, session_id: str | None) -> SessionState:
         key = self._key(session_id)
         with self._lock:
             session = self._sessions.get(key)
             if session is None:
                 self.misses += 1
-                session = SessionMemory()
+                session = SessionState()
                 self._sessions[key] = session
                 while len(self._sessions) > self.max_sessions:
                     # Drop the oldest from the table only; do not free its
@@ -153,7 +153,7 @@ class SessionMemoryManager:
             }
 
 
-def resolve_session_memory_config(
+def resolve_session_state_config(
     enable: bool | None = None,
     max_sessions: int | None = None,
 ) -> tuple[bool, int]:
@@ -161,18 +161,18 @@ def resolve_session_memory_config(
 
     Environment variables (for quick enablement without touching config files):
 
-        ``OMNI_DIFFUSION_SESSION_MEMORY_MANAGER`` (``1``/``0``/``true``/``false``)
-        ``OMNI_DIFFUSION_SESSION_MEMORY_MANAGER_MAX_SESSIONS`` (positive int)
+        ``OMNI_DIFFUSION_SESSION_STATE_MANAGER`` (``1``/``0``/``true``/``false``)
+        ``OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS`` (positive int)
 
     Precedence: a *set* environment variable wins over the value passed in
-    (i.e. over ``OmniDiffusionConfig.enable_session_memory_manager``), in both
+    (i.e. over ``OmniDiffusionConfig.enable_session_state_manager``), in both
     directions -- ``...SESSION_MEMORY_MANAGER=0`` force-disables the manager
     even when the config enables it. Unset or unparsable values leave the
     passed-in value untouched (an unparsable ``MAX_SESSIONS`` logs a warning
     and is ignored). This mirrors how other omni feature toggles allow quick
     A/B flips on a deployed config.
     """
-    env_enable = os.environ.get("OMNI_DIFFUSION_SESSION_MEMORY_MANAGER")
+    env_enable = os.environ.get("OMNI_DIFFUSION_SESSION_STATE_MANAGER")
     if env_enable is not None:
         parsed = env_enable.strip().lower()
         if parsed in ("1", "true", "yes", "on"):
@@ -180,7 +180,7 @@ def resolve_session_memory_config(
         elif parsed in ("0", "false", "no", "off"):
             enable = False
 
-    env_size = os.environ.get("OMNI_DIFFUSION_SESSION_MEMORY_MANAGER_MAX_SESSIONS")
+    env_size = os.environ.get("OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS")
     if env_size is not None:
         try:
             env_size_int = int(env_size)
@@ -188,7 +188,7 @@ def resolve_session_memory_config(
                 max_sessions = env_size_int
         except ValueError:
             logger.warning(
-                "Ignoring non-integer OMNI_DIFFUSION_SESSION_MEMORY_MANAGER_MAX_SESSIONS=%r.",
+                "Ignoring non-integer OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS=%r.",
                 env_size,
             )
 

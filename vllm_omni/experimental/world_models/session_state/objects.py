@@ -19,7 +19,7 @@ from typing import TypeVar
 import numpy as np
 import torch
 
-from vllm_omni.experimental.world_models.memory.base import MemoryObject
+from vllm_omni.experimental.world_models.session_state.base import StateObject
 
 # The live ``{"is_init", "k", "v"}`` dict an encode-once cross-attention layer
 # populates on the first forward and reads thereafter.
@@ -30,7 +30,7 @@ CrossKVCache = dict[str, bool | torch.Tensor | None]
 ItemT = TypeVar("ItemT")
 
 
-class EncodeOnceKV(MemoryObject[CrossKVCache, CrossKVCache]):
+class EncodeOnceKV(StateObject[CrossKVCache, CrossKVCache]):
     """Encode-once cross-attention KV.
 
     Wraps an ``{"is_init", "k", "v"}`` dict that a model's cross-attention
@@ -73,7 +73,7 @@ class EncodeOnceKV(MemoryObject[CrossKVCache, CrossKVCache]):
         return self._cache is not None
 
 
-class LatentBuffer(MemoryObject[ItemT, list[ItemT]]):
+class LatentBuffer(StateObject[ItemT, list[ItemT]]):
     """Append / ring buffer of latent or pixel frames.
 
     A bounded ``deque`` (``maxlen`` set at ``allocate()`` time). The object

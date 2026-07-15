@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The ``MemoryObject`` contract for session memory (RFC #4480).
+"""The ``StateObject`` contract for session state (RFC #4480).
 
-A session is a named collection of ``MemoryObject`` instances. The interface
+A session is a named collection of ``StateObject`` instances. The interface
 deliberately speaks only of bytes, growth, read views, commitment, and
 evictability -- never tokens, layers, or attention. Writes are two-phase:
 ``stage()`` holds data for an in-progress window, ``commit()`` promotes it to
@@ -27,8 +27,8 @@ PayloadT = TypeVar("PayloadT")
 ViewT = TypeVar("ViewT")
 
 
-class MemoryObject(ABC, Generic[PayloadT, ViewT]):
-    """One typed unit of session memory with a uniform lifecycle.
+class StateObject(ABC, Generic[PayloadT, ViewT]):
+    """One typed unit of session state with a uniform lifecycle.
 
     A session's state is a named collection of these objects; the kinds of
     memory they represent include attention K/V (growing self-attention
@@ -48,7 +48,7 @@ class MemoryObject(ABC, Generic[PayloadT, ViewT]):
     # The dependency edge: what this object rebuilds from. ``None`` means it is
     # never recomputable (it must be preempted or rejected, not silently
     # dropped).
-    recompute_source: MemoryObject | None = None
+    recompute_source: StateObject | None = None
     # Estimated work to rebuild, given ``recompute_source`` is resident.
     recompute_cost: int = 0
     # Payload held by ``stage()`` until ``discard()`` clears it.

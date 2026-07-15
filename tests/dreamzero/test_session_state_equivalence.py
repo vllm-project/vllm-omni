@@ -3,9 +3,9 @@
 """Bit-equivalence tests: DreamZeroStateAdapter vs bespoke DreamZeroState.
 
 These drive both state objects directly with tiny CPU tensors -- no model, no
-GPU -- and assert the adapter (backed by the SessionMemoryManager) stores and
+GPU -- and assert the adapter (backed by the SessionStateManager) stores and
 returns exactly what the bespoke DreamZeroState does. This gates routing
-DreamZero through the shared session memory manager (RFC #4480).
+DreamZero through the shared session state manager (RFC #4480).
 
 DreamZero's attention KV is engine-owned (AR-Diffusion paged pool, PR #4534)
 and out of the adapter's scope; the state surface tested here is the model's
@@ -23,13 +23,13 @@ from vllm_omni.diffusion.models.dreamzero.state_dreamzero import (
     DreamZeroState,
 )
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
-from vllm_omni.experimental.world_models.memory import SessionMemoryManager
+from vllm_omni.experimental.world_models.session_state import SessionStateManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _create_both() -> tuple[DreamZeroState, DreamZeroStateAdapter]:
-    return DreamZeroState(), DreamZeroStateAdapter("session-0", SessionMemoryManager())
+    return DreamZeroState(), DreamZeroStateAdapter("session-0", SessionStateManager())
 
 
 def test_accumulate_frames_and_call_count_match() -> None:
@@ -174,7 +174,7 @@ def test_window_reset_preserves_latents_prompt_and_vae_stream() -> None:
 def test_metadata_fields_persist_across_adapter_instances() -> None:
     # A fresh adapter for the same session must see prior metadata (the manager
     # is the single source of truth).
-    manager = SessionMemoryManager()
+    manager = SessionStateManager()
     first = DreamZeroStateAdapter("s", manager)
     first.current_start_frame = 5
     first.clip_feas = torch.ones(2, 2)
@@ -188,7 +188,7 @@ def test_metadata_fields_persist_across_adapter_instances() -> None:
 
 
 def test_session_lru_caps_retained_sessions() -> None:
-    manager = SessionMemoryManager(max_sessions=3)
+    manager = SessionStateManager(max_sessions=3)
     for i in range(5):
         DreamZeroStateAdapter(f"s{i}", manager)
     assert len(manager) == 3
@@ -203,7 +203,7 @@ def test_adapter_keeps_state_when_its_session_is_evicted() -> None:
     # Regression: an adapter mid-generation must not lose its data when the
     # manager evicts its session to make room for newer ones. The adapter pins
     # the session, so its stored latents survive eviction from the lookup table.
-    manager = SessionMemoryManager(max_sessions=2)
+    manager = SessionStateManager(max_sessions=2)
     adapter = DreamZeroStateAdapter("active", manager)
     chunk = torch.randn(1, 2, 3, 4, 4)
     adapter.append_video_latents(chunk)
@@ -222,7 +222,7 @@ def test_adapter_keeps_state_when_its_session_is_evicted() -> None:
 def test_session_reset_clears_metadata() -> None:
     # Regression: resetting a session must not leave stale metadata behind, so a
     # fresh adapter for the same session sees defaults, not the old values.
-    manager = SessionMemoryManager()
+    manager = SessionStateManager()
     adapter = DreamZeroStateAdapter("s", manager)
     adapter.language = torch.tensor([1, 2, 3])
     adapter.current_start_frame = 5

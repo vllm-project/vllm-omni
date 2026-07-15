@@ -62,9 +62,9 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
 )
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
-from vllm_omni.experimental.world_models.memory import (
-    SessionMemoryManager,
-    resolve_session_memory_config,
+from vllm_omni.experimental.world_models.session_state import (
+    SessionStateManager,
+    resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -439,17 +439,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
-        # Opt-in: back per-session state with the shared SessionMemoryManager
+        # Opt-in: back per-session state with the shared SessionStateManager
         # (RFC #4480). Default off -> the bespoke DreamZeroState path above.
-        self._use_memory_manager, mm_max_sessions = resolve_session_memory_config(
-            enable=od_config.enable_session_memory_manager,
+        self._use_memory_manager, mm_max_sessions = resolve_session_state_config(
+            enable=od_config.enable_session_state_manager,
             max_sessions=MAX_DREAMZERO_SESSIONS,
         )
-        self._memory_manager: SessionMemoryManager | None = (
-            SessionMemoryManager(max_sessions=mm_max_sessions) if self._use_memory_manager else None
+        self._memory_manager: SessionStateManager | None = (
+            SessionStateManager(max_sessions=mm_max_sessions) if self._use_memory_manager else None
         )
         if self._use_memory_manager:
-            logger.info("DreamZero: session memory manager enabled (max_sessions=%d)", mm_max_sessions)
+            logger.info("DreamZero: session state manager enabled (max_sessions=%d)", mm_max_sessions)
         self.state = self._get_or_create_state("default")
 
         # DiT step cache is configured by StepCacheBackend

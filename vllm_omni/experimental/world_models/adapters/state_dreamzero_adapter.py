@@ -9,7 +9,7 @@ it interchangeably with the bespoke ``DreamZeroState`` (behind the opt-in flag).
 DreamZero's attention KV lives in the AR-Diffusion engine's paged pool
 (``self._ar_diffusion_kv_state``) and is *not* managed here; this adapter
 covers the model's non-KV session state. Storage is delegated to typed
-``MemoryObject`` instances owned by the ``SessionMemoryManager``:
+``StateObject`` instances owned by the ``SessionStateManager``:
 
     * the stitched frame buffer            -> ``LatentBuffer`` (ring)
     * accumulated AR video latents         -> ``LatentBuffer`` (append, CPU)
@@ -21,7 +21,7 @@ truth and the single LRU authority).
 
 The public methods mirror ``DreamZeroState`` statement for statement, so the two
 can be diffed to check equivalence. The only deviations are forced by the two
-buffer members being ``MemoryObject``s rather than a plain deque/list: a read
+buffer members being ``StateObject``s rather than a plain deque/list: a read
 uses ``.view()`` where the original reads ``list(...)`` or indexes/iterates the
 container, and a wholesale replacement uses ``self._session.put(...)`` where the
 original reassigns the attribute.
@@ -35,9 +35,9 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import FRAMES_PER_CHUNK
-from vllm_omni.experimental.world_models.memory.attrs import SessionAttr
-from vllm_omni.experimental.world_models.memory.manager import SessionMemoryManager
-from vllm_omni.experimental.world_models.memory.objects import LatentBuffer
+from vllm_omni.experimental.world_models.session_state.attrs import SessionAttr
+from vllm_omni.experimental.world_models.session_state.manager import SessionStateManager
+from vllm_omni.experimental.world_models.session_state.objects import LatentBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class DreamZeroStateAdapter:
     vae_encoder_out = SessionAttr[torch.Tensor | None](default=None)
     vae_pending_body_frames = SessionAttr[torch.Tensor | None](default=None)
 
-    def __init__(self, session_id: str | None, manager: SessionMemoryManager) -> None:
+    def __init__(self, session_id: str | None, manager: SessionStateManager) -> None:
         self._session_id = session_id
         # Pin the session for this adapter's lifetime. The manager may evict the
         # session from its lookup table to bound memory, but an adapter that is
