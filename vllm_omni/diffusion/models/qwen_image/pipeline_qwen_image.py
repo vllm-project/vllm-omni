@@ -329,11 +329,13 @@ class QwenImagePipeline(
                 del visual_owner.visual
             else:
                 logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
-            # 2. lm_head: encoding reads hidden_states[-1] (see forward below), so
-            #    the full-vocab logits projection is dead weight — dropping it
-            #    avoids allocating, quantizing, and running it every encode.
+            # 2. lm_head: encoding reads hidden_states[-1] (see forward below) and
+            #    discards the logits, but the model's forward still calls
+            #    self.lm_head. Swap it for Identity so we skip allocating,
+            #    quantizing, and running the full-vocab projection without
+            #    breaking forward (deleting it raises AttributeError there).
             if hasattr(text_encoder, "lm_head"):
-                del text_encoder.lm_head
+                text_encoder.lm_head = nn.Identity()
 
         self.text_encoder = create_transformers_model(
             AutoModelForImageTextToText,
