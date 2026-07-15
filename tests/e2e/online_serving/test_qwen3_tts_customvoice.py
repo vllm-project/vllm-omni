@@ -15,7 +15,11 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import (
+    get_deploy_config_path,
+    get_deploy_config_stage,
+    modify_stage_config,
+)
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
@@ -49,6 +53,28 @@ tts_server_params = [
         id="async_chunk",
     )
 ]
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_default_cuda_graph_startup(omni_server) -> None:
+    """Start both stages with the shipped CUDA Graph configuration."""
+    stage_1 = get_deploy_config_stage("qwen3_tts.yaml", stage_id=1)
+    assert stage_1.get("enforce_eager") is False
+    assert "--enforce-eager" not in omni_server.serve_args
+
+    [health] = omni_server.send_health_http_request()
+    assert health.success
+    assert health.status_code == 200
+
+    [models] = omni_server.send_models_http_request()
+    assert models.success
+    assert models.status_code == 200
+    assert models.json_body is not None
+    assert any(model["id"] == MODEL for model in models.json_body["data"])
 
 
 @pytest.mark.core_model
