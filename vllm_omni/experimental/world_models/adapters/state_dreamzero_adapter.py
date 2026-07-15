@@ -18,18 +18,24 @@ Scalar/tensor metadata (counters, prompt embeds, incremental VAE encoder
 stream) lives in the session's ``attrs`` so a freshly constructed adapter for
 an existing session sees the same data (the manager is the single source of
 truth and the single LRU authority).
+
+The public methods mirror ``DreamZeroState`` statement for statement, so the two
+can be diffed to check equivalence. The only deviations are forced by the two
+buffer members being ``MemoryObject``s rather than a plain deque/list: a read
+uses ``.view()`` where the original reads ``list(...)`` or indexes/iterates the
+container, and a wholesale replacement uses ``self._session.put(...)`` where the
+original reassigns the attribute.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import cast
 
 import numpy as np
 import torch
 
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import FRAMES_PER_CHUNK
-from vllm_omni.experimental.world_models.memory.attrs import SessionAttr, window_reset_survivors
+from vllm_omni.experimental.world_models.memory.attrs import SessionAttr
 from vllm_omni.experimental.world_models.memory.manager import SessionMemoryManager
 from vllm_omni.experimental.world_models.memory.objects import LatentBuffer
 
@@ -43,23 +49,20 @@ class DreamZeroStateAdapter:
     """Drop-in replacement for ``DreamZeroState`` backed by the manager.
 
     Session-scoped metadata is declared once per attribute via ``SessionAttr``
-    (reads fall back to the default after a session reset clears ``attrs``;
-    writes go through to the pinned session). The ``survives_window_reset``
-    marks drive ``reset(clear_video_latents=False)``, so the survival set
-    lives on the declarations rather than in a separate list.
+    (reads fall back to the default; writes go through to the pinned session).
     """
 
     call_count = SessionAttr[int](default=0, coerce=int)
     current_start_frame = SessionAttr[int](default=0, coerce=int)
     clip_feas = SessionAttr[torch.Tensor | None](default=None)
     ys = SessionAttr[torch.Tensor | None](default=None)
-    language = SessionAttr[torch.Tensor | None](default=None, survives_window_reset=True)
-    prompt_embeds = SessionAttr[torch.Tensor | None](default=None, survives_window_reset=True)
-    # -- incremental VAE encoder stream (fields mirror DreamZeroState) --
-    vae_stream_initialized = SessionAttr[bool](default=False, coerce=bool, survives_window_reset=True)
-    vae_enc_feat_map = SessionAttr[list[torch.Tensor | None] | None](default=None, survives_window_reset=True)
-    vae_encoder_out = SessionAttr[torch.Tensor | None](default=None, survives_window_reset=True)
-    vae_pending_body_frames = SessionAttr[torch.Tensor | None](default=None, survives_window_reset=True)
+    language = SessionAttr[torch.Tensor | None](default=None)
+    prompt_embeds = SessionAttr[torch.Tensor | None](default=None)
+    # -- incremental VAE encoder stream --
+    vae_stream_initialized = SessionAttr[bool](default=False, coerce=bool)
+    vae_enc_feat_map = SessionAttr[list[torch.Tensor | None] | None](default=None)
+    vae_encoder_out = SessionAttr[torch.Tensor | None](default=None)
+    vae_pending_body_frames = SessionAttr[torch.Tensor | None](default=None)
 
     def __init__(self, session_id: str | None, manager: SessionMemoryManager) -> None:
         self._session_id = session_id
@@ -98,6 +101,12 @@ class DreamZeroStateAdapter:
     def stitched_buffer(self) -> LatentBuffer[np.ndarray]:
         return self._ensure_frame_buffer()
 
+    @property
+    def video_latents_across_time(self) -> LatentBuffer[torch.Tensor]:
+        # Read access only; a wholesale replace goes through ``_session.put``
+        # (see reset / clear_video_latents).
+        return self._ensure_video_buffer()
+
     def reset_vae_encoder_stream(self) -> None:
         """Clear incremental Wan VAE encoder state used across AR steps."""
         self.vae_stream_initialized = False
@@ -105,24 +114,20 @@ class DreamZeroStateAdapter:
         self.vae_encoder_out = None
         self.vae_pending_body_frames = None
 
-    # -- frame accumulation (logic mirrors DreamZeroState) --------------
+    # -- frame accumulation ----------------------------------------------
 
     def accumulate_frames(self, stitched: np.ndarray) -> np.ndarray:
-        """Accumulate stitched frames and return multi-frame video.
-
-        Behaviourally identical to ``DreamZeroState.accumulate_frames``.
-        """
-        buffer = self.stitched_buffer
+        """Accumulate stitched frames and return multi-frame video."""
         if stitched.ndim == 3:
-            buffer.append(stitched)
+            self.stitched_buffer.append(stitched)
         elif stitched.ndim == 4:
-            buffer.extend(list(stitched))
+            self.stitched_buffer.extend(list(stitched))
         else:
             raise ValueError(f"Expected 3D or 4D stitched, got {stitched.ndim}D")
 
         num_frames = 1 if self.call_count == 0 else FRAMES_PER_CHUNK
 
-        buffer_frames = buffer.view()
+        buffer_frames = self.stitched_buffer.view()
         if len(buffer_frames) >= num_frames:
             frames = buffer_frames[-num_frames:]
         else:
@@ -133,7 +138,7 @@ class DreamZeroStateAdapter:
         self.call_count += 1
         return np.stack(frames, axis=0)
 
-    # -- video-latent accumulation (logic mirrors DreamZeroState) -------
+    # -- video-latent accumulation ---------------------------------------
 
     def append_video_latents(self, video_out: torch.Tensor) -> None:
         """Append one AR chunk of normalized video latents for later decode."""
@@ -141,22 +146,17 @@ class DreamZeroStateAdapter:
             raise ValueError(f"Expected 5D video_out, got shape {tuple(video_out.shape)}")
         # Upstream ``torch.cat(..., dim=2)`` uses (B, C, T, H, W).
         chunk = video_out.transpose(1, 2).detach().cpu()
-        buffer = self._ensure_video_buffer()
-        buffer.append(chunk)
+        self.video_latents_across_time.append(chunk)
         logger.info(
             "append_video_latents: chunk_shape=%s total_chunks=%d total_latent_t=%d",
             tuple(chunk.shape),
-            len(buffer),
-            int(sum(c.shape[2] for c in buffer.view())),
+            len(self.video_latents_across_time),
+            int(sum(c.shape[2] for c in self.video_latents_across_time.view())),
         )
 
     def get_concatenated_video_latents(self) -> torch.Tensor | None:
         """Return all accumulated chunks concatenated along the time dimension."""
-        stored = self._session.get(_VIDEO_LATENTS)
-        if not isinstance(stored, LatentBuffer) or not stored.resident:
-            return None
-        buffer = cast("LatentBuffer[torch.Tensor]", stored)
-        chunks = buffer.view()
+        chunks = self.video_latents_across_time.view()
         if not chunks:
             return None
         if len(chunks) == 1:
@@ -167,38 +167,35 @@ class DreamZeroStateAdapter:
         """Drop accumulated video latents without resetting frame/VAE state."""
         self._session.put(_VIDEO_LATENTS, self._new_video_buffer())
 
-    # -- reset / should_reset (logic mirrors DreamZeroState) ------------
+    # -- reset / should_reset --------------------------------------------
 
     def reset(self, *, clear_video_latents: bool = True) -> None:
         """Clear session state.
 
-        Mirrors ``DreamZeroState.reset``: a session reset (``True``) drops
-        everything including the prompt-embed cache and the incremental VAE
-        encoder stream; a window ("inference") reset (``False``) keeps the
-        accumulated video latents, ``language``, ``prompt_embeds``, and the
-        VAE encoder stream -- the prompt is unchanged and the Wan feat_cache
-        history is independent of the DiT attention window.
+        A session reset (``clear_video_latents=True``) drops everything,
+        including the prompt-embed cache and the incremental VAE encoder stream.
+        A window ("inference") reset (``False``) keeps the accumulated video
+        latents, ``language``, ``prompt_embeds``, and the VAE encoder stream --
+        the prompt is unchanged and the Wan feat_cache history is independent of
+        the DiT attention window. The survivors are kept the way the original
+        keeps them: by leaving them untouched inside the skipped ``if`` block.
         """
-        saved_attrs: dict[str, object] = {}
-        saved_chunks: list[torch.Tensor] = []
-        if not clear_video_latents:
-            stored = self._session.get(_VIDEO_LATENTS)
-            if isinstance(stored, LatentBuffer) and stored.resident:
-                saved_chunks = cast("LatentBuffer[torch.Tensor]", stored).view()
-            for key in window_reset_survivors(self):
-                if key in self._session.attrs:
-                    saved_attrs[key] = self._session.attrs[key]
+        saved_video_latents = [] if clear_video_latents else self._ensure_video_buffer().view()
+        self._session.put(_FRAMES, self._new_frame_buffer())
+        self.call_count = 0
+        restored_video = self._new_video_buffer()
+        restored_video.extend(saved_video_latents)
+        self._session.put(_VIDEO_LATENTS, restored_video)
 
-        # Canonical reset: drop every typed object and clear session metadata.
-        self._session.reset()
-        # Leave an empty, allocated frame buffer ready for the next call.
-        self._ensure_frame_buffer()
+        self.current_start_frame = 0
 
-        if not clear_video_latents:
-            self._session.attrs.update(saved_attrs)
-            restored = self._ensure_video_buffer()
-            if saved_chunks:
-                restored.extend(saved_chunks)
+        self.clip_feas = None
+        self.ys = None
+        if clear_video_latents:
+            # Session reset: drop the prompt-embed cache and VAE encoder stream.
+            self.language = None
+            self.prompt_embeds = None
+            self.reset_vae_encoder_stream()
 
     def reset_inference_state(self) -> None:
         """Reset window/frame state after local attention rolls without dropping video latents."""
@@ -211,12 +208,11 @@ class DreamZeroStateAdapter:
         local_attn_size: int,
     ) -> str | None:
         """Return why state should reset before the next forward(), if any."""
-        language = self.language
-        if language is None:
+        if self.language is None:
             logger.info("language is None, resetting")
             return "session"
 
-        if text_tokens is not None and not torch.equal(language, text_tokens):
+        if text_tokens is not None and not torch.equal(self.language, text_tokens):
             logger.info("language changed, resetting")
             return "session"
 

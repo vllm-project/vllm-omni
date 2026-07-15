@@ -8,10 +8,7 @@ cache onto this contract (e.g. ``state_dreamzero_adapter.DreamZeroStateAdapter``
 See RFC #4480 for the full design and roadmap.
 """
 
-from vllm_omni.experimental.world_models.memory.attrs import (
-    SessionAttr,
-    window_reset_survivors,
-)
+from vllm_omni.experimental.world_models.memory.attrs import SessionAttr
 from vllm_omni.experimental.world_models.memory.base import MemoryObject
 from vllm_omni.experimental.world_models.memory.manager import (
     DEFAULT_MAX_SESSIONS,
@@ -33,5 +30,4 @@ __all__ = [
     "SessionMemory",
     "SessionMemoryManager",
     "resolve_session_memory_config",
-    "window_reset_survivors",
 ]

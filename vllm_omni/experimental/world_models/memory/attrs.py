@@ -6,10 +6,10 @@
 tensor metadata as one class-level line instead of a hand-written property
 pair. The descriptor reads and writes ``SessionMemory.attrs`` on the host
 object's pinned ``_session``, using the attribute's own name as the key, so
-each key string exists exactly once. An attribute can be marked as surviving a
-window ("inference") reset; ``window_reset_survivors()`` enumerates the marked
-names so reset logic never maintains a separate key list that could drift from
-the declarations.
+each key string exists exactly once. Because the read falls back to the
+declared default when the key is absent, an adapter clears a value simply by
+assigning the default (or by clearing ``attrs``), keeping its method bodies a
+line-for-line mirror of the model's original state class.
 """
 
 from __future__ import annotations
@@ -35,8 +35,7 @@ class SessionAttr(Generic[T]):
 
         class SomeAdapter:
             call_count = SessionAttr[int](default=0, coerce=int)
-            language = SessionAttr[torch.Tensor | None](
-                default=None, survives_window_reset=True)
+            language = SessionAttr[torch.Tensor | None](default=None)
 
     Reads return ``attrs.get(<name>, default)``; writes go through ``coerce``
     (when given) and straight into the session's ``attrs``, so a freshly
@@ -48,11 +47,9 @@ class SessionAttr(Generic[T]):
         *,
         default: T,
         coerce: Callable[[T], T] | None = None,
-        survives_window_reset: bool = False,
     ) -> None:
         self.default = default
         self.coerce = coerce
-        self.survives_window_reset = survives_window_reset
         self.name = ""  # assigned by ``__set_name__``
 
     def __set_name__(self, owner: type, name: str) -> None:
@@ -71,14 +68,3 @@ class SessionAttr(Generic[T]):
 
     def __set__(self, obj: HasSessionMemory, value: T) -> None:
         obj._session.attrs[self.name] = self.coerce(value) if self.coerce is not None else value
-
-
-def window_reset_survivors(obj: object) -> list[str]:
-    """Names of ``SessionAttr`` declarations on ``type(obj)`` (and its bases)
-    marked ``survives_window_reset=True``, in declaration order."""
-    names: list[str] = []
-    for klass in reversed(type(obj).__mro__):
-        for name, attr in vars(klass).items():
-            if isinstance(attr, SessionAttr) and attr.survives_window_reset and name not in names:
-                names.append(name)
-    return names
