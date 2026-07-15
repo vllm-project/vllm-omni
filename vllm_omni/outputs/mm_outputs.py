@@ -19,6 +19,12 @@ from vllm_omni.outputs.utils import _is_tensor_list, _to_cpu
 
 logger = init_logger(__name__)
 
+# Keys whose values are metadata scalars (e.g. audio sample rate) but may
+# arrive as 0-d torch.Tensors — from_dict routes all tensors into .tensors,
+# so we relocate them to .metadata before consolidation to avoid a bogus
+# torch.cat attempt and its warn-and-keep-last fallback.
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate"})
+
 
 def _cat_tensors(
     tensors: list[torch.Tensor],
@@ -136,13 +142,13 @@ class MultimodalPayload(Mapping):
             return dict(self) == dict(other)
         return NotImplemented
 
-    def append(self, incoming: MultimodalPayload) -> MultimodalPayload:
-        """Append *incoming* onto this payload and return the result.
+    def merged_with(self, incoming: MultimodalPayload) -> MultimodalPayload:
+        """Merge *incoming* onto this payload and return the result.
 
         Tensor values accumulate into lists for deferred concatenation;
         non-tensor values are replaced with the latest. When this payload
         is empty, *incoming* is returned as-is, so callers should use the
-        return value: ``accumulated = accumulated.append(incoming)``.
+        return value: ``accumulated = accumulated.merged_with(incoming)``.
         """
         if self.is_empty:
             return incoming
@@ -157,6 +163,15 @@ class MultimodalPayload(Mapping):
         concatenated according to *strategy* (e.g. audio chunks along the
         time dimension, latent frames along the batch dimension).
         """
+        # Relocate scalar metadata tensors (e.g. sample rate) that from_dict
+        # routed into .tensors, so they take the REPLACE path via .metadata
+        # instead of failing torch.cat as 0-d tensors.
+        for key in _METADATA_TENSOR_KEYS:
+            value = self.tensors.pop(key, None)
+            if value is None:
+                continue
+            self.metadata[key] = value[-1] if isinstance(value, list) else value
+
         for key, value in list(self.tensors.items()):
             if _is_tensor_list(value):
                 self.tensors[key] = _consolidate_tensor_list(key, value, strategy)

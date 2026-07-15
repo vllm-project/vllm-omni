@@ -104,7 +104,7 @@ class OmniRequestState(RequestState):
 
             incoming = MultimodalPayload.from_raw(payload, modality_key)
             if incoming is not None:
-                self.mm_accumulated = self.mm_accumulated.append(incoming)
+                self.mm_accumulated = self.mm_accumulated.merged_with(incoming)
         except (ValueError, TypeError, RuntimeError):
             logger.exception("Error accumulating multimodal tensor")
 
