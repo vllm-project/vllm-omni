@@ -529,6 +529,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            text_seq_len=text_seq_len,
             **joint_attention_kwargs,
         )
 
