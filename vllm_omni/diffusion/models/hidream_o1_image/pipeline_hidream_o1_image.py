@@ -44,7 +44,7 @@ from vllm_omni.diffusion.models.hidream_o1_image.utils_hidream_o1 import (
     preprocess_ref_patches,
     resize_pilimage,
 )
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -89,11 +89,33 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportImageInput):
+class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, SupportImageInput, SupportsComponentDiscovery):
     # SupportImageInput protocol -- enables reference-image conditioning for
     # editing (1 ref) and subject-driven personalization (N refs).
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+
+    # SupportsComponentDiscovery — used by the CPU-offload framework to locate
+    # which submodules to move to CPU / GPU.
+    #
+    # Design notes:
+    # - _dit_modules: the full transformer (attention + MLP + diff-head modules).
+    # - _encoder_modules: vision tower lives nested inside the transformer; the
+    #   dotted path "transformer.visual" is resolved via operator.attrgetter,
+    #   which supports nested access without any special framework support.
+    # - _vae_modules: HiDream-O1-Image has no VAE (pixel-space diffusion); empty
+    #   list is safe — the offloader's `for vae in modules.vaes:` loop iterates
+    #   zero times.
+    # - _resident_modules: diffusion-glue modules that are cheap (no decoder
+    #   blocks) but must stay on GPU throughout the denoise loop.
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["transformer.visual"]
+    _vae_modules: ClassVar[list[str]] = []
+    _resident_modules: ClassVar[list[str]] = [
+        "transformer.x_embedder",
+        "transformer.t_embedder1",
+        "transformer.final_layer2",
+    ]
 
     # Max side-length (pixels) for ref images fed to the VLM vision tower.
     # The vision tower encodes semantic conditioning; it doesn't need full

@@ -233,6 +233,7 @@ reasoner/generator components inside the model forward pass.
 | Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
 | SoulXSingerPipeline / SoulXSingerSVCPipeline | `Soul-AILab/SoulX-Singer` | `DiffLlama` (`cfm_decoder.model.diff_estimator`) | ✓ | ✓ | `"layers"` |
 | BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | - | ✓ | `"layers"`, `"customized modules"` |
+| HiDreamO1ImagePipeline | `HiDream-ai/HiDream-O1-Image` | `HiDreamO1UiTModel` | ✓ | ✓ | `"language_model.layers"` |
 
 **Notes:**
 - Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally

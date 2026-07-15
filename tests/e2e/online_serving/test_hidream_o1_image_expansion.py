@@ -9,7 +9,7 @@ Parametrized rows added per phase:
   Phase 6b: Sequence Parallelism / Ulysses (ulysses2)
   Phase 6c: CFG-Parallel (cfg_parallel2)
   Phase 6d: HSDP (hsdp)
-  Phase 7: CPU offload — coming
+  Phase 7: CPU offload (cpu_offload, layerwise_offload)
 
 Run locally::
 
@@ -68,6 +68,16 @@ def _get_hidream_o1_feature_cases(model: str):
         pytest.param(
             OmniServerParams(model=model, server_args=["--use-hsdp"]),
             id="hsdp",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(model=model, server_args=["--enable-cpu-offload"]),
+            id="cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(model=model, server_args=["--enable-layerwise-offload"]),
+            id="layerwise_offload",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
     ]
