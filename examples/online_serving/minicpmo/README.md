@@ -11,17 +11,18 @@ The UI supports:
 ## 1. Start the backend server
 
 The deploy config auto-loads via `--omni`; the default
-`vllm_omni/deploy/minicpmo_4_5.yaml` targets a 2-GPU layout (thinker on
-GPU 0, talker + t2w sharing GPU 1).  For other hardware layouts pick
+`vllm_omni/deploy/minicpmo_4_5.yaml` targets a single-GPU layout (thinker
+and talker + t2w co-located on GPU 0).  For other hardware layouts pick
 one of the deploy variants below.
 
 | deploy config | GPUs | Notes |
 |---|---|---|
-| `minicpmo_4_5.yaml` (default) | 2 | Thinker on GPU0, talker+t2w on GPU1. |
+| `minicpmo_4_5.yaml` (default) | 1 | Thinker and talker+t2w co-located on GPU0. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | Thinker on GPU0, talker+t2w on GPU1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 
-Default (2-GPU):
+Default (single-GPU):
 
 ```bash
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
