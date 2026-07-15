@@ -113,21 +113,64 @@ class LTXTextConditioningMixin:
         batch_size = len(prompt) if prompt is not None else prompt_embeds.shape[0]
         negative_prompt_embeds_provided = negative_prompt_embeds is not None
 
-        if prompt_embeds is None:
-            prompt_embeds, prompt_attention_mask = self._get_gemma_prompt_embeds(
-                prompt=prompt,
-                num_videos_per_prompt=num_videos_per_prompt,
+        if do_classifier_free_guidance and prompt_embeds is None and negative_prompt_embeds is None:
+            negative_prompt = negative_prompt or ""
+            negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            if prompt is not None and type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type as `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
+            if isinstance(negative_prompt, list) and batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt` has batch size {len(negative_prompt)}, but `prompt` has batch size"
+                    f" {batch_size}."
+                )
+
+            # Official LTX encodes positive and negative prompts in one Gemma batch;
+            # separate bf16 GEMMs produce a different conditioning trajectory.
+            combined_embeds, combined_mask = self._get_gemma_prompt_embeds(
+                prompt=prompt + negative_prompt,
+                num_videos_per_prompt=1,
                 max_sequence_length=max_sequence_length,
                 scale_factor=scale_factor,
                 device=device,
                 dtype=dtype,
             )
-        elif num_videos_per_prompt > 1:
-            prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
-            prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
-                prompt_attention_mask,
-                num_videos_per_prompt,
-            )
+            prompt_embeds = combined_embeds[:batch_size]
+            negative_prompt_embeds = combined_embeds[batch_size:]
+            prompt_attention_mask = combined_mask[:batch_size]
+            negative_prompt_attention_mask = combined_mask[batch_size:]
+            if num_videos_per_prompt > 1:
+                prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
+                negative_prompt_embeds = _repeat_prompt_tensor_for_outputs(
+                    negative_prompt_embeds,
+                    num_videos_per_prompt,
+                )
+                prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                    prompt_attention_mask,
+                    num_videos_per_prompt,
+                )
+                negative_prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                    negative_prompt_attention_mask,
+                    num_videos_per_prompt,
+                )
+        else:
+            if prompt_embeds is None:
+                prompt_embeds, prompt_attention_mask = self._get_gemma_prompt_embeds(
+                    prompt=prompt,
+                    num_videos_per_prompt=num_videos_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    scale_factor=scale_factor,
+                    device=device,
+                    dtype=dtype,
+                )
+            elif num_videos_per_prompt > 1:
+                prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
+                prompt_attention_mask = _repeat_prompt_tensor_for_outputs(
+                    prompt_attention_mask,
+                    num_videos_per_prompt,
+                )
 
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             negative_prompt = negative_prompt or ""

@@ -23,6 +23,51 @@ def _make_pipeline(pipeline_cls, sequence_parallel_size: int = 1):
     return pipeline
 
 
+@pytest.mark.parametrize("pipeline_cls", [LTX2Pipeline, LTX23Pipeline])
+def test_prepare_video_latents_samples_directly_in_packed_token_space(pipeline_cls):
+    pipeline = _make_pipeline(pipeline_cls)
+    pipeline.vae_spatial_compression_ratio = 8
+    pipeline.vae_temporal_compression_ratio = 8
+    pipeline.transformer_spatial_patch_size = 2
+    pipeline.transformer_temporal_patch_size = 1
+
+    expected_generator = torch.Generator().manual_seed(42)
+    expected = torch.randn((1, 32, 16), generator=expected_generator)
+    actual = pipeline.prepare_latents(
+        batch_size=1,
+        num_channels_latents=4,
+        height=64,
+        width=64,
+        num_frames=9,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pipeline_cls", [LTX2Pipeline, LTX23Pipeline])
+def test_prepare_audio_latents_samples_directly_in_packed_token_space(pipeline_cls):
+    pipeline = _make_pipeline(pipeline_cls)
+
+    expected_generator = torch.Generator().manual_seed(42)
+    expected = torch.randn((1, 3, 32), generator=expected_generator)
+    actual, original_num_frames, padded_num_frames = pipeline.prepare_audio_latents(
+        batch_size=1,
+        num_channels_latents=2,
+        num_mel_bins=64,
+        audio_latent_length=3,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    assert original_num_frames == 3
+    assert padded_num_frames == 3
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_prepare_audio_latents_pads_generated_dummy_length_for_sp():
     pipeline = _make_pipeline(LTX23Pipeline, sequence_parallel_size=2)
 

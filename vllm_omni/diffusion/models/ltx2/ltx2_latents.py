@@ -224,18 +224,19 @@ def prepare_video_latents(
         vae_spatial_compression_ratio=pipeline.vae_spatial_compression_ratio,
         vae_temporal_compression_ratio=pipeline.vae_temporal_compression_ratio,
     )
-    shape = (batch_size, num_channels_latents, num_frames, height, width)
+    spatial_patch_size = pipeline.transformer_spatial_patch_size
+    temporal_patch_size = pipeline.transformer_temporal_patch_size
+    shape = (
+        batch_size,
+        (num_frames // temporal_patch_size) * (height // spatial_patch_size) * (width // spatial_patch_size),
+        num_channels_latents * temporal_patch_size * spatial_patch_size * spatial_patch_size,
+    )
     if isinstance(generator, list) and len(generator) != batch_size:
         raise ValueError(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
-    latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-    return pack_latents(
-        latents,
-        pipeline.transformer_spatial_patch_size,
-        pipeline.transformer_temporal_patch_size,
-    )
+    return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
 
 def prepare_audio_latents(
@@ -283,11 +284,11 @@ def prepare_audio_latents(
             latents = torch.cat([latents, padding], dim=1)
         return latents.to(device=device, dtype=dtype), original_latent_length, padded_latent_length
 
-    shape = (batch_size, num_channels_latents, padded_latent_length, latent_mel_bins)
+    shape = (batch_size, padded_latent_length, num_channels_latents * latent_mel_bins)
     if isinstance(generator, list) and len(generator) != batch_size:
         raise ValueError(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
     latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-    return pack_audio_latents(latents), original_latent_length, padded_latent_length
+    return latents, original_latent_length, padded_latent_length

@@ -727,6 +727,36 @@ class TestLTXRequestParsing:
 
 
 class TestLTX23ForwardStages:
+    @pytest.mark.parametrize("pipeline_cls", [LTX2Pipeline, LTX23Pipeline])
+    def test_encode_prompt_batches_positive_and_negative_gemma_inputs(self, pipeline_cls):
+        pipe = _make_ltx_request_pipe(pipeline_cls)
+        calls = []
+
+        def fake_get_gemma_prompt_embeds(**kwargs):
+            calls.append(kwargs)
+            count = len(kwargs["prompt"])
+            embeds = torch.arange(count, dtype=torch.float32).view(count, 1, 1)
+            mask = torch.arange(count).view(count, 1)
+            return embeds, mask
+
+        object.__setattr__(pipe, "_get_gemma_prompt_embeds", fake_get_gemma_prompt_embeds)
+
+        prompt_embeds, prompt_mask, negative_embeds, negative_mask = pipe.encode_prompt(
+            prompt=["positive-0", "positive-1"],
+            negative_prompt=["negative-0", "negative-1"],
+            do_classifier_free_guidance=True,
+            num_videos_per_prompt=2,
+            device=torch.device("cpu"),
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["prompt"] == ["positive-0", "positive-1", "negative-0", "negative-1"]
+        assert calls[0]["num_videos_per_prompt"] == 1
+        torch.testing.assert_close(prompt_embeds.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0]))
+        torch.testing.assert_close(negative_embeds.flatten(), torch.tensor([2.0, 2.0, 3.0, 3.0]))
+        torch.testing.assert_close(prompt_mask.flatten(), torch.tensor([0, 0, 1, 1]))
+        torch.testing.assert_close(negative_mask.flatten(), torch.tensor([2, 2, 3, 3]))
+
     def test_encode_prompt_repeats_precomputed_embeds_for_num_outputs(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
 
