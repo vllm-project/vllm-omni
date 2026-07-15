@@ -61,7 +61,7 @@
 #
 # Optional environment:
 #   REPO_ROOT     - vllm-omni root (working directory for pytest); see above
-#   YML           - path to test-nightly.yml (default: $REPO_ROOT/.buildkite/test-nightly.yml)
+#   YML           - path to test-nightly.yml (default: $REPO_ROOT/.buildkite/cuda/test-nightly.yml)
 #   LOG_DIR       - logs + generated job scripts; when unset, a timestamped directory under
 #                   $REPO_ROOT/logs/ is created:
 #                     nightly_jobs_YYYYMMDD-HHMMSS       (default / YAML nightly steps)
@@ -267,8 +267,14 @@ _derive_repo_root_from_yml() {
   local yml="$1"
   local d
   d="$(cd "$(dirname "${yml}")" && pwd)"
-  [[ "$(basename "${d}")" == ".buildkite" ]] || return 1
-  printf '%s\n' "$(dirname "${d}")"
+  while [[ "${d}" != "/" ]]; do
+    if [[ "$(basename "${d}")" == ".buildkite" ]]; then
+      printf '%s\n' "$(dirname "${d}")"
+      return 0
+    fi
+    d="$(dirname "${d}")"
+  done
+  return 1
 }
 
 # Resolve REPO_ROOT, YML (no relative path between script and repo)
