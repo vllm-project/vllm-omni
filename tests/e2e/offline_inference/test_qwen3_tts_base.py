@@ -55,7 +55,7 @@ def get_cuda_graph_config():
 # Same structure as test_qwen3_omni: models, stage_configs, test_params
 tts_server_params = [
     pytest.param(
-        (MODEL, get_cuda_graph_config()),
+        (MODEL, get_cuda_graph_config(), {"trust_remote_code": True}),
         id="no_cuda_graph",
     )
 ]

@@ -40,7 +40,18 @@ else:
 
 # Create parameter combinations for model and stage config
 # Qwen2.5-Omni with TP=3 needs longer init timeout
-test_params = [(model, stage_config, {"stage_init_timeout": 1200, "init_timeout": 1800}) for model in models]
+test_params = [
+    (
+        model,
+        stage_config,
+        {
+            "stage_init_timeout": 1200,
+            "init_timeout": 1800,
+            "trust_remote_code": True,
+        },
+    )
+    for model in models
+]
 
 
 def get_question(prompt_type="mix"):

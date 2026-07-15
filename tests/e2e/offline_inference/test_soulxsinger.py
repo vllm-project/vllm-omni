@@ -161,6 +161,7 @@ def test_soulxsinger_multistage_from_audio(
         model,
         stage_configs_path=get_deploy_config_path(deploy_yaml),
         async_chunk=False,
+        trust_remote_code=True,
     ) as runner:
         sampling = OmniDiffusionSamplingParams(
             num_inference_steps=4,
@@ -214,6 +215,7 @@ def test_soulxsinger_svs_precomputed(soulx_weights: tuple[Path, Path, Path]) -> 
         str(base_dir),
         stage_configs_path=get_deploy_config_path("soulxsinger_svs.yaml"),
         async_chunk=False,
+        trust_remote_code=True,
     ) as runner:
         sampling = OmniDiffusionSamplingParams(
             num_inference_steps=4,
