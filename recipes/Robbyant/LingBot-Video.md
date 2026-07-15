@@ -214,7 +214,7 @@ Run the lightweight sparse-block comparison:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python benchmarks/diffusion/lingbot_video_moe_parity.py \
+python benchmarks/lingbot_video/moe_transformer_parity.py \
   --scope block \
   --official-repo "${LINGBOT_VIDEO_REPO}" \
   --output-json /tmp/lingbot_moe_block_parity.json
@@ -231,7 +231,7 @@ resident on the GPU at the same time:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python benchmarks/diffusion/lingbot_video_moe_parity.py \
+python benchmarks/lingbot_video/moe_transformer_parity.py \
   --scope transformer \
   --official-repo "${LINGBOT_VIDEO_REPO}" \
   --model "${LINGBOT_VIDEO_MOE_MODEL}" \
