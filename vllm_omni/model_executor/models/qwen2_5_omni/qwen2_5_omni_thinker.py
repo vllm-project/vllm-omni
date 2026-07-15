@@ -504,8 +504,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 "in the audio tower part."
             )
 
-        self.quant_config = quant_config
-
         # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) only quantize
         # the Thinker LM (language model). Vision and audio encoder weights
         # remain in BF16 and have no corresponding scale tensors in the
@@ -528,6 +526,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         else:
             visual_quant_config = None
 
+        self.vllm_config = vllm_config
+        self.quant_config = quant_config
+
         with self._mark_tower_model(vllm_config, "audio"):
             if multimodal_config.get_limit_per_prompt("audio"):
                 self.audio_tower = Qwen2_5OmniAudioEncoder(thinker_config.audio_config)
@@ -540,7 +541,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                     vision_config=thinker_config.vision_config,
                     norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
                     quant_config=visual_quant_config,
-                    prefix=maybe_prefix(prefix, "visual"),
+                    prefix=visual_prefix,
                 )
             else:
                 self.visual = None
@@ -548,7 +549,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
                 vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "language_model"),
+                prefix=language_prefix,
                 hf_config=thinker_config.text_config,
                 architectures=["Qwen2ForCausalLM"],
             )

@@ -49,6 +49,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         quant_config = vllm_config.quant_config
         if isinstance(quant_config, ComponentQuantizationConfig):
             quant_config = quant_config.resolve("talker")
+            vllm_config = replace(vllm_config, quant_config=quant_config)
         elif quant_config is not None and quant_config.get_name() not in PRE_QUANTIZED_METHODS:
             quant_config = None
             vllm_config = replace(vllm_config, quant_config=None)
