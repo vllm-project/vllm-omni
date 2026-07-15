@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -1102,18 +1103,8 @@ class QwenImagePipeline(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # The text encoder drops its vision tower and lm_head (see
-        # _drop_unused_modules), so skip their checkpoint weights — otherwise
-        # AutoWeightsLoader raises on the now-missing modules.
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=[
-                "text_encoder.lm_head.",
-                "text_encoder.visual.",
-                "text_encoder.model.visual.",
-            ],
-        )
-        loaded_weights = loader.load_weights(weights)
+        loader = AutoWeightsLoader(self)
+        loaded_weights = loader.load_weights(self._remap_text_encoder_weights(weights))
         # VAE loads via diffusers from_pretrained (outside AutoWeightsLoader), so
         # mark its params to satisfy strict coverage. The text_encoder streams
         # through AutoWeightsLoader (which reports its real weights) and the strict
@@ -1121,6 +1112,31 @@ class QwenImagePipeline(
         # leaving it out keeps genuinely missing weights failing the check.
         loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
         return loaded_weights
+
+    @staticmethod
+    def _remap_text_encoder_weights(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        # The text_encoder is built from config and streamed through
+        # AutoWeightsLoader, which -- unlike transformers' from_pretrained --
+        # does not apply the model's checkpoint key remapping. Qwen2.5-VL ships
+        # a legacy-flat checkpoint (``model.layers.*``, ``model.norm``,
+        # ``model.embed_tokens``, ``visual.*``) while the in-memory
+        # Qwen2_5_VLModel nests the language model under
+        # ``model.language_model.*`` and the vision tower under
+        # ``model.visual.*``. Replay that remap here, and drop the submodules
+        # _drop_unused_modules deleted (vision tower + lm_head) so their
+        # checkpoint weights don't hit missing modules.
+        prefix = "text_encoder."
+        for name, tensor in weights:
+            if not name.startswith(prefix):
+                yield name, tensor
+                continue
+            sub = name[len(prefix) :]
+            if sub.startswith(("visual.", "model.visual.", "lm_head.")):
+                continue
+            sub = re.sub(r"^model\.(?!language_model\.|visual\.)", "model.language_model.", sub)
+            yield prefix + sub, tensor
 
 
 class QwenImageDMD2Pipeline(DMD2PipelineMixin, QwenImagePipeline):
