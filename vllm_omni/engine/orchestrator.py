@@ -1197,6 +1197,15 @@ class Orchestrator:
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
         _t_submit_start = _time.perf_counter()
 
+        # Log multimodal data passing for debugging
+        if requires_multimodal_data:
+            logger.info(
+                "[Orchestrator] req=%s: passing multimodal data to stage=%d (requires_multimodal_data=%s)",
+                req_id,
+                next_logical,
+                requires_multimodal_data,
+            )
+
         if next_pool.stage_type == "diffusion":
             companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
             expected = len(self._cfg_tracker.get_companion_request_ids(req_id))

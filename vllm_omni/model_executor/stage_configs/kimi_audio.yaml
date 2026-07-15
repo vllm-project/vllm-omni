@@ -1,0 +1,68 @@
+# Kimi Audio 2-stage pipeline configuration
+# Stage 0: LLM with bifurcation (text + audio logits)
+# Stage 1: Flow-matching detokenizer + vocoder
+
+stage_args:
+  # Stage 0: LLM with bifurcation (text + audio logits)
+  - stage_id: 0
+    runtime:
+      process: true
+      devices: "6"  # GPU 6 for Stage 0
+      max_batch_size: 1
+      requires_multimodal_data: true  # Pass audio features to model
+    engine_args:
+      model_stage: fused_llm
+      model_arch: KimiAudioLLMForConditionalGeneration
+      tensor_parallel_size: 1
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      max_model_len: 8192
+      engine_output_type: text  # Outputs text + audio tokens
+    is_comprehension: true  # Stage 0 owns tokenizer and does text comprehension
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0  # Greedy sampling (matches reference implementation)
+      top_p: 1.0
+      top_k: -1  # No top-k filtering when using greedy
+      max_tokens: 4096
+      seed: 42
+      detokenize: true
+
+  # Stage 1: Flow-matching detokenizer + vocoder
+  - stage_id: 1
+    runtime:
+      process: true
+      devices: "6"  # GPU 6 for Stage 1 (same as Stage 0 for debugging)
+      max_batch_size: 1
+    engine_args:
+      model_stage: audio_detokenizer
+      model_arch: KimiAudioDetokenizerForConditionalGeneration
+      tensor_parallel_size: 1
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.9
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      max_model_len: 8192
+      engine_output_type: audio  # Outputs waveform
+      input_modalities: ["audio"]  # Stage 1 receives audio tokens from stage 0
+    engine_input_source: [0]  # Takes input from Stage 0
+    is_comprehension: false
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0  # Greedy for deterministic detokenization
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      seed: 42
+      detokenize: true

@@ -10,11 +10,13 @@ from io import BytesIO
 from typing import Any, Final, cast
 
 import jinja2
+import numpy as np
 import torch
 from fastapi import Request
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from PIL import Image
 from pydantic import TypeAdapter
+from scipy import signal as scipy_signal
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
@@ -80,8 +82,9 @@ from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
 from vllm.sampling_params import SamplingParams
-from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers import TokenizerLike, cached_get_tokenizer
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
+from vllm.tokenizers.kimi_audio import KimiAudioTokenizer
 from vllm.tokenizers.mistral import (
     MistralTokenizer,
     maybe_serialize_tool_calls,
@@ -119,6 +122,15 @@ from vllm_omni.entrypoints.openai.utils import (
 )
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.model_executor.models.kimi_audio.constants import (
+    KIMI_AUDIO_AUDIO_EOD_TOKEN_IDS,
+    KIMI_AUDIO_BLANK_TOKEN_ID,
+    KIMI_AUDIO_EOS_TOKEN_ID,
+    KIMI_AUDIO_SAMPLE_RATE,
+    KIMI_AUDIO_SPEECH_CT_ID_TOKEN_ID,
+    KIMI_AUDIO_SPEECH_CTD_ID_TOKEN_ID,
+    KIMI_AUDIO_TEXT_EOS_TOKEN_ID,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
@@ -126,8 +138,170 @@ from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 logger = init_logger(__name__)
 
 
+# Special tokens that should be filtered from text output
+KIMI_AUDIO_SPECIAL_TOKENS = {
+    KIMI_AUDIO_BLANK_TOKEN_ID,  # BLANK token - should not appear in text
+    KIMI_AUDIO_EOS_TOKEN_ID,  # EOS token - handled by finish_reason
+    KIMI_AUDIO_TEXT_EOS_TOKEN_ID,  # text-stream EOS marker
+}.union(KIMI_AUDIO_AUDIO_EOD_TOKEN_IDS)
+
+
+def filter_kimi_audio_special_tokens(token_ids):
+    """Filter out Kimi Audio special tokens from text output.
+
+    Kimi Audio uses special tokens like BLANK (151666) that should not
+    appear in the final text output as they break JSON encoding.
+
+    Args:
+        token_ids: List or sequence of token IDs
+
+    Returns:
+        Filtered list of token IDs with special tokens removed
+    """
+    return [tid for tid in token_ids if tid not in KIMI_AUDIO_SPECIAL_TOKENS]
+
+
+def filter_kimi_audio_special_strings(text):
+    """Filter out Kimi Audio special token strings from decoded text.
+
+    When special tokens are decoded, they appear as strings like
+    '<|im_kimia_text_blank|>' which break JSON encoding.
+
+    Args:
+        text: Decoded text string
+
+    Returns:
+        Cleaned text with special token strings removed
+    """
+    if not text:
+        return text
+    # Remove common special token string patterns
+    special_patterns = [
+        "<|im_kimia_text_blank|>",
+        "<|im_kimia_text_eos|>",
+        "<|im_kimia_user_msg_start|>",
+        "<|im_kimia_assistant_msg_start|>",
+        "<|im_msg_end|>",
+        "<|im_media_begin|>",
+        "<|im_media_end|>",
+        "<|im_end|>",
+        "[EOS]",
+        "[BOS]",
+    ]
+    for pattern in special_patterns:
+        text = text.replace(pattern, "")
+    # Collapse leftover whitespace
+    text = " ".join(text.split())
+    return text
+
+
+def _normalize_audio_array(wav_array: np.ndarray, sr: int) -> np.ndarray:
+    """Normalize audio array to [channels, samples] format at target sample rate.
+
+    Args:
+        wav_array: Audio array in various formats
+        sr: Sample rate of the input audio
+
+    Returns:
+        Normalized audio array with shape [channels, samples] at KIMI_AUDIO_SAMPLE_RATE
+    """
+    # Reshape to [channels, samples]
+    if wav_array.ndim == 1:
+        wav_array = wav_array.reshape(1, -1)
+    elif wav_array.ndim == 2:
+        wav_array = wav_array.T
+
+    # Resample to target sample rate if needed
+    if sr != KIMI_AUDIO_SAMPLE_RATE:
+        num_samples_target = int(wav_array.shape[1] * KIMI_AUDIO_SAMPLE_RATE / sr)
+        wav_array = scipy_signal.resample(wav_array, num_samples_target, axis=1)
+
+    return wav_array
+
+
 async def _identity_async(value: Any) -> Any:
     return value
+
+
+def _is_audio_only_request(messages: list[dict[str, Any]]) -> bool:
+    """Return True when every message contains only audio and no text."""
+    has_audio = False
+    has_text = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "input_audio":
+                    has_audio = True
+                elif part.get("type") == "text":
+                    text = part.get("text", "")
+                    if isinstance(text, str) and text.strip():
+                        has_text = True
+        elif isinstance(content, str) and content.strip():
+            has_text = True
+    return has_audio and not has_text
+
+
+def _has_audio_input(messages: list[dict[str, Any]]) -> bool:
+    """Return True when any message contains an input_audio payload."""
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "input_audio":
+                    return True
+    return False
+
+
+def _extract_input_audio_bytes(messages: list[dict[str, Any]]) -> bytes | None:
+    """Extract the first base64 input_audio payload from the messages."""
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "input_audio":
+                input_audio = part.get("input_audio", {})
+                data = input_audio.get("data", "")
+                try:
+                    return base64.b64decode(data)
+                except Exception:
+                    return None
+    return None
+
+
+def _extract_request_prompt_text(messages: list[dict[str, Any]]) -> str | None:
+    """Extract any user text that accompanies an input_audio payload."""
+    texts: list[str] = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text", "")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text.strip())
+        elif isinstance(content, str) and content.strip():
+            texts.append(content.strip())
+    return " ".join(texts) if texts else None
+
+
+def _decode_audio_bytes_to_array(audio_bytes: bytes) -> np.ndarray | None:
+    """Decode audio bytes to a mono 16kHz float32 waveform."""
+    if soundfile is None:
+        return None
+    try:
+        wav, sr = soundfile.read(BytesIO(audio_bytes), dtype="float32")
+    except Exception:
+        return None
+    if wav.ndim == 2:
+        wav = wav.mean(axis=1)
+    if sr != KIMI_AUDIO_SAMPLE_RATE:
+        num_samples = int(len(wav) * KIMI_AUDIO_SAMPLE_RATE / sr)
+        wav = scipy_signal.resample(wav, num_samples)
+    return wav.astype(np.float32)
 
 
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
@@ -398,7 +572,75 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
-            if not self.use_harmony:
+            # Some models will return a list like ["text", None, "audio"], better
+            # to strip None in the list
+            engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
+            output_modalities = getattr(request, "modalities", engine_output_modalities)
+            request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
+
+            # Detect ASR mode: if request has audio input, force text-only output
+            # This prevents infinite audio generation loop for ASR requests
+            has_audio_input = False
+            for message in request.messages:
+                content = message.get("content", [])
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "input_audio":
+                            has_audio_input = True
+                            break
+                if has_audio_input:
+                    break
+
+            wants_audio_out = "audio" in (output_modalities or [])
+            if has_audio_input and not wants_audio_out:
+                # ASR mode: audio in, text out. Force text-only to prevent an
+                # unbounded audio generation loop.
+                logger.debug("Detected ASR mode (audio input, no audio requested), forcing text-only output")
+                output_modalities = ["text"]
+                request.modalities = ["text"]
+            elif has_audio_input and wants_audio_out:
+                # S2S mode: audio in, audio+text out (reference output_type="both").
+                # Keep both modalities so Stage 1 (audio detokenizer) runs.
+                logger.debug("Detected S2S mode (audio input + audio requested), enabling audio+text output")
+                output_modalities = ["text", "audio"]
+                request.modalities = ["text", "audio"]
+            elif "audio" not in output_modalities:
+                # Text chat mode: no audio input and no audio output requested
+                # Force text-only to avoid unnecessary Stage 1 processing
+                logger.debug("Text chat mode detected, ensuring text-only output")
+                output_modalities = ["text"]
+                request.modalities = ["text"]
+
+            # Kimi Audio ASR: detect and handle audio-only requests before any
+            # generic chat preprocessing.  The renderer/harmony path processes
+            # the audio into the sender-side multi-modal cache; if we then
+            # rebuild the prompt, the cache already contains the hash and the
+            # audio data is stripped before it reaches Stage 0.  Build the
+            # upstream transcription prompt directly instead.
+            is_kimi_audio_asr = self._is_kimi_audio_asr_request(request)
+            is_kimi_audio_s2s = (
+                self._is_kimi_audio_model() and _has_audio_input(request.messages) and not is_kimi_audio_asr
+            )
+            if is_kimi_audio_asr or is_kimi_audio_s2s:
+                try:
+                    if is_kimi_audio_asr:
+                        engine_prompts = [await self._build_kimi_audio_asr_prompt(request)]
+                        prompt_kind = "ASR"
+                    else:
+                        engine_prompts = [await self._build_kimi_audio_s2s_prompt(request)]
+                        prompt_kind = "S2S"
+                    # ``conversation`` is only used for response metadata; the
+                    # original messages are sufficient here.
+                    conversation = request.messages
+                    logger.debug(
+                        "Built Kimi Audio %s prompt with %d tokens",
+                        prompt_kind,
+                        len(engine_prompts[0].get("prompt_token_ids", [])),
+                    )
+                except Exception as e:
+                    logger.exception("Failed to build Kimi Audio %s prompt", "ASR" if is_kimi_audio_asr else "S2S")
+                    return self.create_error_response(str(e))
+            elif not self.use_harmony:
                 error_check_ret = self.online_renderer.validate_chat_template(
                     request_chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs,
@@ -443,12 +685,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
-
-        # Some models will return a list like ["text", None, "audio"], better
-        # to strip None in the list
-        engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
-        output_modalities = getattr(request, "modalities", engine_output_modalities)
-        request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
         num_inference_steps = None
         extra_body: dict[str, Any] = {}
@@ -584,6 +820,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
+                # Kimi Audio ASR-specific sampling defaults.
+                # Use greedy decoding (temperature 0) for the most accurate
+                # transcription, matching the upstream transcription endpoint.
+                if is_kimi_audio_asr:
+                    comprehension_idx = self._get_comprehension_stage_index()
+                    if comprehension_idx < len(sampling_params_list):
+                        asr_sp = sampling_params_list[comprehension_idx]
+                        asr_sp.temperature = 0.0
+                        asr_sp.repetition_penalty = 1.0
+                        asr_stop_ids = set(getattr(asr_sp, "stop_token_ids", None) or [])
+                        asr_stop_ids.add(KIMI_AUDIO_TEXT_EOS_TOKEN_ID)
+                        asr_sp.stop_token_ids = list(asr_stop_ids)
+                        logger.debug(
+                            "Applied Kimi Audio ASR sampling overrides: "
+                            "temperature=%s repetition_penalty=%s stop_token_ids=%s",
+                            asr_sp.temperature,
+                            asr_sp.repetition_penalty,
+                            asr_sp.stop_token_ids,
+                        )
+
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
                     if hasattr(sp, "height") and _image_gen_height is not None:
@@ -660,6 +916,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         documents: list[dict[str, str]] | None = None,
         add_special_tokens: bool = False,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
+        logger.debug("[ServingChat] _preprocess_chat called")
         if renderer is None:
             renderer = self.renderer
 
@@ -689,22 +946,102 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
 
         deferred_multi_modal_data: dict[str, Any] | None = None
-        if self._needs_multistage_multimodal_split():
-            messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
+        needs_split = self._needs_multistage_multimodal_split()
+
+        # Kimi Audio uses OpenAI-style ``input_audio`` items, but its chat
+        # template only generates audio markers from ``audio_url`` parts.
+        # Convert ``input_audio`` to inline ``audio_url`` data URLs so the
+        # upstream multimodal pipeline can fetch the audio, compute Whisper
+        # features, and expand the BLANK placeholders in Stage 0.
+        if self._is_kimi_audio_model():
+            from vllm_omni.model_executor.models.kimi_audio.request_preprocessor import (
+                KimiAudioRequestPreprocessor,
+            )
+
+            messages, deferred_multi_modal_data = KimiAudioRequestPreprocessor.prepare_messages(
+                messages, deferred_multi_modal_data
+            )
+
+        if needs_split:
+            # Run generic multistage split to extract raw bytes for modalities
+            # that are consumed by downstream stages rather than Stage 0.
+            _, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
                 messages,
                 request,
             )
 
-        (conversation,), (engine_prompt,) = await renderer.render_chat_async(
-            [messages],
-            chat_params,
-            tok_params,
-            prompt_extras={
-                k: v for k in ("mm_processor_kwargs", "cache_salt") if (v := getattr(request, k, None)) is not None
-            },
-        )
+            # Re-run the Kimi preprocessor on the stripped messages so any
+            # remaining ``input_audio`` items are still converted for the
+            # chat template.
+            if self._is_kimi_audio_model():
+                from vllm_omni.model_executor.models.kimi_audio.request_preprocessor import (
+                    KimiAudioRequestPreprocessor,
+                )
+
+                messages, deferred_multi_modal_data = KimiAudioRequestPreprocessor.prepare_messages(
+                    messages, deferred_multi_modal_data
+                )
+
+        # Debug: log messages before rendering
+        if self._is_kimi_audio_model():
+            logger.debug(
+                "[ServingChat] Messages before rendering (first message): %s", messages[0] if messages else "None"
+            )
+            for i, msg in enumerate(messages):
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if isinstance(content, list):
+                    logger.debug("[ServingChat] Message %d has %d content parts", i, len(content))
+                    for j, part in enumerate(content):
+                        if isinstance(part, dict):
+                            logger.debug("[ServingChat]   Part %d: type=%s", j, part.get("type"))
+
+        try:
+            (conversation,), (engine_prompt,) = await renderer.render_chat_async(
+                [messages],
+                chat_params,
+                tok_params,
+                prompt_extras={
+                    k: v for k in ("mm_processor_kwargs", "cache_salt") if (v := getattr(request, k, None)) is not None
+                },
+            )
+        except Exception as e:
+            logger.debug("[ServingChat] render_chat_async failed: %s", e)
+            raise
+
+        # Debug: log the rendered prompt and chat template for Kimi Audio models.
+        if self._is_kimi_audio_model():
+            logger.debug("[ServingChat] Kimi messages: %s", messages)
+            logger.debug("[ServingChat] Kimi conversation: %s", conversation)
+            logger.debug(
+                "[ServingChat] chat_template_content_format: %s",
+                chat_params.chat_template_content_format,
+            )
+        logger.debug("[ServingChat] Rendered engine_prompt keys: %s", list(engine_prompt.keys()))
+        if "prompt" in engine_prompt:
+            prompt_text = engine_prompt["prompt"]
+            logger.debug("[ServingChat] Rendered prompt text (first 500 chars): %s", repr(prompt_text[:500]))
+        if "prompt_token_ids" in engine_prompt:
+            token_ids = engine_prompt["prompt_token_ids"]
+            logger.debug("[ServingChat] Rendered prompt token IDs len=%d first30=%s", len(token_ids), token_ids[:30])
+            if self._is_kimi_audio_model():
+                logger.debug("[ServingChat] Kimi prompt BLANK count=%d", token_ids.count(151666))
+            # Decode the tokens to see what text they represent
+            try:
+                tokenizer = renderer.get_tokenizer()
+                decoded_text = tokenizer.decode(token_ids[:30])
+                logger.debug("[ServingChat] Decoded prompt text (first 30 tokens): %s", repr(decoded_text))
+            except Exception as decode_err:
+                logger.debug("[ServingChat] Failed to decode prompt: %s", decode_err)
 
         tokenizer = renderer.get_tokenizer()
+
+        # Debug: log the chat template being used
+        if hasattr(tokenizer, "chat_template"):
+            logger.debug(
+                "[ServingChat] Tokenizer chat_template (first 300 chars): %s", repr(str(tokenizer.chat_template)[:300])
+            )
+        else:
+            logger.debug("[ServingChat] Tokenizer has no chat_template attribute!")
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
@@ -779,37 +1116,103 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return additional_information
 
     def _needs_multistage_multimodal_split(self) -> bool:
-        return bool(self._deferred_multimodal_modalities())
+        result = bool(self._deferred_multimodal_modalities())
+        logger.debug("[ServingChat] _needs_multistage_multimodal_split: %s", result)
+        return result
 
     def _deferred_multimodal_modalities(self) -> set[str]:
         stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        logger.debug("[ServingChat] _deferred_multimodal_modalities: stage_configs count=%d", len(stage_configs))
+
         if len(stage_configs) < 2:
             return set()
 
         first_stage_modalities = self._stage_input_modalities(stage_configs[0])
-        if not first_stage_modalities:
-            return set()
+        logger.debug("[ServingChat] first_stage_modalities: %s", first_stage_modalities)
 
+        # If first stage has no modalities defined, defer all downstream modalities
+        # (This handles cases like Kimi Audio where stage 0 uses custom processing)
         downstream_modalities: set[str] = set()
         for stage in stage_configs[1:]:
-            downstream_modalities.update(self._stage_input_modalities(stage))
-        return downstream_modalities - first_stage_modalities
+            stage_mods = self._stage_input_modalities(stage)
+            logger.debug("[ServingChat] downstream stage modalities: %s", stage_mods)
+            downstream_modalities.update(stage_mods)
+
+        if not first_stage_modalities:
+            # Stage 0 doesn't process any modalities through standard pipeline,
+            # so all downstream modalities should be deferred
+            result = downstream_modalities
+            logger.debug("[ServingChat] deferred_modalities (first_stage empty, defer all downstream): %s", result)
+            return result
+
+        result = downstream_modalities - first_stage_modalities
+        logger.debug("[ServingChat] deferred_modalities (downstream - first_stage): %s", result)
+        return result
 
     @staticmethod
     def _stage_input_modalities(stage: Any) -> set[str]:
+        # Check both engine_args (attribute) and yaml_engine_args (dict)
         engine_args = getattr(stage, "engine_args", None)
-        explicit = (
-            getattr(stage, "input_modalities", None)
-            or getattr(stage, "modalities", None)
-            or getattr(engine_args, "input_modalities", None)
-            or getattr(engine_args, "modalities", None)
+        yaml_engine_args = getattr(stage, "yaml_engine_args", None)
+
+        logger.debug(
+            "[ServingChat] _stage_input_modalities: engine_args=%s, yaml_engine_args=%s",
+            engine_args is not None,
+            yaml_engine_args is not None,
         )
+        if engine_args is not None:
+            logger.debug("[ServingChat] engine_args type: %s", type(engine_args))
+            if hasattr(engine_args, "__dict__"):
+                logger.debug(
+                    "[ServingChat] engine_args attributes: %s",
+                    [k for k in dir(engine_args) if not k.startswith("_")][:20],
+                )
+            elif isinstance(engine_args, dict):
+                logger.debug("[ServingChat] engine_args keys: %s", list(engine_args.keys()))
+                logger.debug("[ServingChat] engine_args.input_modalities: %s", engine_args.get("input_modalities"))
+        if yaml_engine_args:
+            logger.debug("[ServingChat] yaml_engine_args keys: %s", list(yaml_engine_args.keys()))
+            logger.debug(
+                "[ServingChat] yaml_engine_args.input_modalities: %s",
+                yaml_engine_args.get("input_modalities"),
+            )
+
+        # Try to get input_modalities from various sources
+        explicit = None
+        if engine_args is not None:
+            # Try attribute access first (for regular objects)
+            explicit = (
+                getattr(stage, "input_modalities", None)
+                or getattr(stage, "modalities", None)
+                or getattr(engine_args, "input_modalities", None)
+                or getattr(engine_args, "modalities", None)
+            )
+            # Also try dict-style access (for OmegaConf DictConfig and regular dicts)
+            if explicit is None:
+                try:
+                    explicit = engine_args.get("input_modalities") or engine_args.get("modalities")
+                except (AttributeError, TypeError):
+                    pass
+        elif yaml_engine_args is not None and isinstance(yaml_engine_args, dict):
+            explicit = (
+                getattr(stage, "input_modalities", None)
+                or getattr(stage, "modalities", None)
+                or yaml_engine_args.get("input_modalities")
+                or yaml_engine_args.get("modalities")
+            )
+
+        logger.debug("[ServingChat] explicit modalities: %s", explicit)
+
         if explicit:
             return {str(modality) for modality in as_list(explicit)}
 
-        model_stage = str(getattr(engine_args, "model_stage", None) or getattr(stage, "model_stage", "")).lower()
+        model_stage = str(
+            getattr(engine_args, "model_stage", None)
+            or (yaml_engine_args.get("model_stage") if yaml_engine_args else None)
+            or getattr(stage, "model_stage", "")
+        ).lower()
         if model_stage in {"asr", "stt"} or model_stage.endswith("_asr"):
-            return {"audio"}
+            return {"audios"}
         if any(name in model_stage for name in ("vision", "vl", "aura")):
             return {"image", "video"}
         if any(name in model_stage for name in ("tts", "talker", "code2wav")):
@@ -819,6 +1222,155 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return {"audio", "image", "video"}
         return set()
 
+    def _is_kimi_audio_model(self) -> bool:
+        """Check if the current model is Kimi Audio."""
+        model_arch = getattr(self.model_config.hf_config, "architectures", [])
+        if isinstance(model_arch, list) and len(model_arch) > 0:
+            arch_name = model_arch[0] if isinstance(model_arch[0], str) else str(model_arch[0])
+            is_kimi = "KimiAudio" in arch_name
+            return is_kimi
+        return False
+
+    def _is_kimi_audio_asr_request(self, request: ChatCompletionRequest) -> bool:
+        """Detect ASR (audio->text) requests for Kimi Audio.
+
+        Audio input that also requests ``audio`` in ``modalities`` is handled as
+        speech-to-speech (S2S), not ASR.
+        """
+        if not self._is_kimi_audio_model():
+            return False
+        if not _has_audio_input(request.messages):
+            return False
+        modalities = getattr(request, "modalities", None) or []
+        return "audio" not in modalities
+
+    async def _build_kimi_audio_asr_prompt(
+        self,
+        request: ChatCompletionRequest,
+    ) -> PromptType:
+        """Build the upstream-aligned ASR prompt for Kimi Audio.
+
+        This mirrors ``KimiAudioForConditionalGeneration.get_generation_prompt``:
+        a single user message containing the optional instruction, the audio
+        placeholder ``<|im_media_begin|><|im_kimia_text_blank|><|im_media_end|>``,
+        message-end marker, and the assistant start marker.  The custom
+        processor expands the single BLANK placeholder into the correct number
+        of Whisper-feature positions.
+        """
+        audio_bytes = _extract_input_audio_bytes(request.messages)
+        if audio_bytes is None:
+            raise ValueError("No input_audio payload found for ASR request")
+
+        audio_array = _decode_audio_bytes_to_array(audio_bytes)
+        if audio_array is None:
+            raise ValueError("Failed to decode input_audio bytes to waveform")
+        audio_array = _normalize_audio_array(audio_array, KIMI_AUDIO_SAMPLE_RATE)
+
+        request_prompt = _extract_request_prompt_text(request.messages)
+        if not request_prompt:
+            request_prompt = "Transcribe the audio to text:"
+
+        placeholder = "<|im_media_begin|><|im_kimia_text_blank|><|im_media_end|>"
+        user_content = f"{request_prompt}\n{placeholder}"
+
+        tokenizer = self._get_kimi_audio_tokenizer()
+        # Reference prompt_manager order (text side of a user audio message):
+        #   user_msg_start, <text>, im_media_begin, BLANK(*N), im_media_end,
+        #   CT, im_msg_end, assistant_msg_start   (assistant_msg_start LAST)
+        # The "generate text" control token (CT) must sit INSIDE the user audio
+        # message -- between im_media_end and im_msg_end -- NOT after
+        # assistant_msg_start, otherwise the model reads it as the first
+        # assistant token and emits im_end at step 0.  Encode the pre/post
+        # pieces and splice the CT id in between (special tokens are atomic,
+        # so piecewise encoding equals joint encoding across these boundaries).
+        pre = f"<|im_kimia_user_msg_start|>{user_content}"  # ...<|im_media_end|>
+        post = "<|im_msg_end|><|im_kimia_assistant_msg_start|>"
+        prompt_token_ids = tokenizer.encode(pre) + [KIMI_AUDIO_SPEECH_CT_ID_TOKEN_ID] + tokenizer.encode(post)
+
+        logger.debug(
+            "Built Kimi Audio ASR prompt with %d tokens (request_prompt=%r)",
+            len(prompt_token_ids),
+            request_prompt,
+        )
+        return {
+            "prompt_token_ids": prompt_token_ids,
+            "multi_modal_data": {"audio": audio_array},
+            # task_type without "tts" -> model output_type "text" (ASR).
+            "additional_information": {"task_type": ["understanding"]},
+        }
+
+    async def _build_kimi_audio_s2s_prompt(
+        self,
+        request: ChatCompletionRequest,
+    ) -> PromptType:
+        """Build the upstream-aligned speech-to-speech prompt for Kimi Audio.
+
+        Mirrors ``_build_kimi_audio_asr_prompt`` (same audio-delivering user
+        message + assistant-open marker) but appends the ``generate audio``
+        control token and tags the request with ``task_type=["tts"]`` so the
+        model's ``_output_type_for`` returns ``"audio"`` — the reference
+        ``output_type="both"`` mode that emits a text transcript *and* audio
+        tokens.  No ``target_text_token_ids`` is set: the text stream is
+        generated freely (see ``sample()``).
+        """
+        audio_bytes = _extract_input_audio_bytes(request.messages)
+        if audio_bytes is None:
+            raise ValueError("No input_audio payload found for S2S request")
+
+        audio_array = _decode_audio_bytes_to_array(audio_bytes)
+        if audio_array is None:
+            raise ValueError("Failed to decode input_audio bytes to waveform")
+        audio_array = _normalize_audio_array(audio_array, KIMI_AUDIO_SAMPLE_RATE)
+
+        request_prompt = _extract_request_prompt_text(request.messages)
+        placeholder = "<|im_media_begin|><|im_kimia_text_blank|><|im_media_end|>"
+        user_content = f"{request_prompt}\n{placeholder}" if request_prompt else placeholder
+
+        tokenizer = self._get_kimi_audio_tokenizer()
+        # Reference order: the CTD ("generate audio") control token sits INSIDE
+        # the user audio message -- between im_media_end and im_msg_end -- with
+        # assistant_msg_start LAST (see ASR builder for rationale).  Splice the
+        # CTD id between the pre- and post-control-token pieces.
+        pre = f"<|im_kimia_user_msg_start|>{user_content}"  # ...<|im_media_end|>
+        post = "<|im_msg_end|><|im_kimia_assistant_msg_start|>"
+        prompt_token_ids = tokenizer.encode(pre) + [KIMI_AUDIO_SPEECH_CTD_ID_TOKEN_ID] + tokenizer.encode(post)
+
+        # Generous audio-length cap; the audio EOD marker stops generation
+        # earlier.  ~1250 semantic frames ~= 25s of 24kHz audio.
+        max_audio_tokens = 1250
+        logger.debug(
+            "Built Kimi Audio S2S prompt with %d tokens (request_prompt=%r, max_audio_tokens=%d)",
+            len(prompt_token_ids),
+            request_prompt,
+            max_audio_tokens,
+        )
+        return {
+            "prompt_token_ids": prompt_token_ids,
+            "multi_modal_data": {"audio": audio_array},
+            # task_type contains "tts" -> model output_type "audio" (S2S/both).
+            # Deliberately no target_text_token_ids: text is generated freely.
+            "additional_information": {
+                "task_type": ["tts"],
+                "max_audio_tokens": [max_audio_tokens],
+                "audio_temperature": [0.8],
+                "audio_top_k": [10],
+            },
+        }
+
+    def _get_kimi_audio_tokenizer(self) -> KimiAudioTokenizer:
+        """Return (and cache) the Kimi Audio TikToken tokenizer."""
+        tokenizer = getattr(self, "_kimi_audio_tokenizer", None)
+        if tokenizer is None:
+            tokenizer = cached_get_tokenizer(
+                self.model_config.tokenizer,
+                tokenizer_cls=KimiAudioTokenizer,
+                tokenizer_mode=getattr(self.model_config, "tokenizer_mode", "auto"),
+                revision=getattr(self.model_config, "tokenizer_revision", None),
+                trust_remote_code=self.model_config.trust_remote_code,
+            )
+            self._kimi_audio_tokenizer = tokenizer
+        return tokenizer
+
     async def _prepare_multistage_multimodal_inputs(
         self,
         messages: list[ChatCompletionMessageParam],
@@ -826,6 +1378,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ) -> tuple[list[ChatCompletionMessageParam], dict[str, Any] | None]:
         """Hide modalities unsupported by stage 0 and stash them for downstream stages."""
         deferred_modalities = self._deferred_multimodal_modalities()
+
         deferred_parts: dict[str, list[Any]] = {modality: [] for modality in deferred_modalities}
         stripped_messages: list[ChatCompletionMessageParam] = []
 
@@ -842,6 +1395,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if modality is not None:
                     if payload is not None:
                         deferred_parts.setdefault(modality, []).append(payload)
+                    # DO NOT insert audio placeholder into stripped_content -
+                    # vLLM will try to materialize it and cause errors.
+                    # Instead, we inject the audio marker directly into the
+                    # rendered prompt for kimi-audio models (see below).
                     changed = True
                     continue
                 stripped_content.append(part)
@@ -869,6 +1426,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 modality,
                 parts,
             )
+
         return stripped_messages, multi_modal_data
 
     @staticmethod
@@ -886,11 +1444,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if isinstance(image, dict):
                 image = image.get("url")
             return "image", image
-        if part_type in {"audio_url", "input_audio", "audio"} and "audio" in deferred_modalities:
+        if part_type in {"audio_url", "input_audio", "audio"} and "audios" in deferred_modalities:
             audio = part.get("audio_url", part.get("input_audio", part.get("audio")))
             if isinstance(audio, dict):
-                audio = audio.get("url") or audio.get("data")
-            return "audio", audio
+                url = audio.get("url")
+                data = audio.get("data")
+                if url:
+                    audio = url
+                elif data:
+                    # Convert base64 data to data URL
+                    audio_format = audio.get("format", "wav")
+                    mime_type = f"audio/{audio_format}"
+                    audio = f"data:{mime_type};base64,{data}"
+                else:
+                    audio = None
+            return "audios", audio  # Use "audio" (singular) to match model's expectation
         return None, None
 
     @staticmethod
@@ -910,7 +1478,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     *(fetch_image(part) if isinstance(part, str) else _identity_async(part) for part in parts)
                 )
             )
-        if modality == "audio":
+        if modality == "audios":  # Use "audios" (plural) to match vLLM's expectation
             fetch_audio = getattr(media_connector, "fetch_audio_async", None)
             if fetch_audio is None:
                 return parts
@@ -1432,6 +2000,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             cur_recipient = harmony_parser.current_recipient
                         else:
                             delta_text = output.text or ""
+                            # Filter Kimi Audio special tokens from streaming delta
+                            if delta_text and model_name and "kimi" in model_name.lower():
+                                delta_text = filter_kimi_audio_special_strings(delta_text)
 
                         if not delta_text and not output.token_ids and not previous_num_tokens[i]:
                             # Chunked prefill case, don't return empty chunks
@@ -2178,6 +2749,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         conversation,
                         role,
                         reasoning_parser,
+                        model_name,
                     )
                     final_res = omni_outputs.request_output
                 else:
@@ -2196,7 +2768,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                     ]
             elif omni_outputs.final_output_type == "audio":
-                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                # For models like Kimi Audio that produce both text and audio,
+                # we need to combine them into a single choice rather than creating
+                # separate choices. Check if we already have a text choice and add
+                # audio to it.
+                audio_choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+
+                # If we already have choices (from text output), add audio to the first choice
+                if choices and audio_choices_data:
+                    # Find the text choice (should be index 0)
+                    text_choice = next((c for c in choices if c.message.content is not None), None)
+                    if text_choice and audio_choices_data[0].message.audio:
+                        # Add audio to the existing text choice.  For S2S the
+                        # transcript is the generated text, not the user input
+                        # that ``_extract_tts_input_text`` would return.
+                        audio_msg = audio_choices_data[0].message.audio
+                        if text_choice.message.content:
+                            audio_msg.transcript = text_choice.message.content
+                        text_choice.message.audio = audio_msg
+                        # Don't extend choices with audio_choices_data - we've merged it
+                        continue
+
+                # If no text choice exists, use the audio choice as-is
+                choices_data = audio_choices_data
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2277,6 +2871,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         conversation: list[ConversationMessage],
         role: str,
         reasoning_parser: ReasoningParser | None = None,
+        model_name: str | None = None,
     ):
         final_res = omni_outputs.request_output
         if self.tool_call_id_type == "kimi_k2":
@@ -2365,6 +2960,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 reasoning = None
                 content = output.text
+
+            # Filter Kimi Audio special tokens from content
+            # This handles cases where special tokens like BLANK (151666)
+            # are decoded into strings that break JSON encoding
+            if content and model_name and "kimi" in model_name.lower():
+                content = filter_kimi_audio_special_strings(content)
 
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
@@ -2529,7 +3130,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        mm_output = final_res.outputs[0].multimodal_output
+        mm_output = getattr(final_res.outputs[0], "multimodal_output", None)
+        if mm_output is None:
+            # No audio was generated (model only produced text)
+            # Return text-only response
+            text_body = ""
+            for output in final_res.outputs:
+                text_body += output.text or ""
+            message = ChatMessage(role=role, content=text_body)
+            return [
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=message,
+                    logprobs=None,
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ]
         audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
             if not audio_data:
@@ -2579,11 +3196,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
 
         # Create OpenAIChatCompletionAudio object with all required fields
+        transcript = self._extract_tts_input_text(request.messages)
         audio_obj = OpenAIChatCompletionAudio(
             id=audio_id,
             data=audio_base64,
             expires_at=expires_at,
-            transcript="",  # Empty transcript if not available
+            transcript=transcript,
         )
 
         for output in final_res.outputs:
@@ -3698,6 +4316,34 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """Normalize mixed message types and extract prompt + reference images once."""
         prompt, images, _videos, _audios = self._extract_diffusion_prompt_and_media(self._messages_to_dicts(messages))
         return prompt, images
+
+    @staticmethod
+    def _extract_tts_input_text(messages: list[Any]) -> str:
+        """Extract the user text prompt that is being turned into audio.
+
+        Walks the messages from newest to oldest and returns the first non-empty
+        text content found (typically the last user message). Falls back to
+        concatenating text parts from all messages if no standalone text is found.
+        """
+        dict_messages = OmniOpenAIServingChat._messages_to_dicts(messages)
+        text_parts: list[str] = []
+        for msg in reversed(dict_messages):
+            content = msg.get("content", "")
+            msg_texts: list[str] = []
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        txt = str(part.get("text", "")).strip()
+                        if txt:
+                            msg_texts.append(txt)
+            elif isinstance(content, str):
+                txt = content.strip()
+                if txt:
+                    msg_texts.append(txt)
+            if msg_texts:
+                return " ".join(msg_texts)
+            text_parts.extend(msg_texts)
+        return " ".join(text_parts)
 
     @staticmethod
     def _messages_to_dicts(messages: list[Any]) -> list[dict[str, Any]]:

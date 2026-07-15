@@ -78,6 +78,11 @@ logger = init_logger(__name__)
 
 # TTS Configuration
 _MING_TTS_MODEL_ARCHS = {"MingTTSForConditionalGeneration"}
+_KIMI_AUDIO_MODEL_ARCHS = {
+    "KimiAudioLLMForConditionalGeneration",
+    "KimiAudioDetokenizerForConditionalGeneration",
+}
+_KIMI_AUDIO_MODEL_STAGES = {"fused_llm"}
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
@@ -116,6 +121,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
+    | _KIMI_AUDIO_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
@@ -710,6 +716,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ming_flash_omni_tts"
         if model_arch in _MING_TTS_MODEL_ARCHS:
             return "ming_tts"
+        if model_arch in _KIMI_AUDIO_MODEL_ARCHS:
+            return "kimi_audio"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
         if model_stage in _MOSS_TTS_FULL_MODEL_STAGES:
@@ -2900,6 +2908,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Streaming path: output_tokens = sum of stage-0 deltas.
                 usage = self._build_speech_usage(request, tts_params or {}, usage_acc.total())
                 done_payload["usage"] = usage.model_dump()
+                if getattr(request, "input", None):
+                    done_payload["transcript"] = request.input
             done = json.dumps(done_payload, separators=(",", ":"))
             yield f"event: speech.audio.done\ndata: {done}\n\n"
         except asyncio.CancelledError:
@@ -3541,6 +3551,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = prepared.tts_params
             model_type = prepared.model_type
             qwen3_ref_audio_warmup_artifact_key = prepared.warmup_artifact_key
+            additional_info = prompt.get("additional_information")
+            logger.warning(
+                "[serving_speech] adapter prompt keys=%s additional_information keys=%s",
+                sorted(prompt.keys()),
+                sorted(additional_info.keys()) if isinstance(additional_info, dict) else None,
+            )
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -3632,6 +3648,39 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 max_tokens,
             )
 
+        # Kimi Audio: cap the audio stream length based on the input text so we
+        # don't keep generating until the client times out.  The adapter provides
+        # an estimated max_audio_tokens; we add the 6-token audio delay plus a
+        # small finish buffer.
+        if self._tts_model_type == "kimi_audio" and sampling_params_list:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            kimia_info = prompt.get("additional_information") if isinstance(prompt, dict) else None
+            max_audio_tokens = None
+            if isinstance(kimia_info, dict):
+                max_audio_tokens = kimia_info.get("max_audio_tokens")
+                if isinstance(max_audio_tokens, (list, tuple)) and max_audio_tokens:
+                    max_audio_tokens = max_audio_tokens[0]
+                if max_audio_tokens is not None:
+                    max_audio_tokens = int(max_audio_tokens)
+            if max_audio_tokens is None:
+                prompt_token_ids = prompt.get("prompt_token_ids")
+                text_token_len = len(prompt_token_ids) if isinstance(prompt_token_ids, list) else 50
+                max_audio_tokens = max(300, text_token_len * 15 + 30)
+            # 6-token delay + 10-token buffer for the model to finish gracefully.
+            sampling_params_list[0].max_tokens = max_audio_tokens + 6 + 10
+            # Greedy text decoding: the text stream should echo the input
+            # transcript verbatim before switching to BLANK padding.
+            sampling_params_list[0].temperature = 0.0
+            sampling_params_list[0].top_p = 1.0
+            sampling_params_list[0].top_k = 1
+            logger.info(
+                "Kimi-Audio dynamic tokens: max_audio_tokens=%d, max_tokens=%d",
+                max_audio_tokens,
+                sampling_params_list[0].max_tokens,
+            )
+
         # Apply model-specific extra parameters
         if request.extra_params is not None and sampling_params_list:
             if not isinstance(request.extra_params, dict):
@@ -3705,6 +3754,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     stage0_params.extra_args = {}
                 stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
 
+        additional_info = prompt.get("additional_information")
+        logger.debug(
+            "[serving_speech] before generate prompt keys=%s additional_information keys=%s",
+            sorted(prompt.keys()),
+            sorted(additional_info.keys()) if isinstance(additional_info, dict) else None,
+        )
         generator = self.engine_client.generate(
             prompt=prompt,
             request_id=request_id,

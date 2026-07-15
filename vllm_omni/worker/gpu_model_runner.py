@@ -487,6 +487,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 cleanup_finished_request(req_id)
 
         self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
+        # Give the model a chance to clean up per-request state before the next
+        # batch's inputs are prepared.  This is needed by Kimi Audio's dual-stream
+        # state so that a finished TTS request does not corrupt the next ASR
+        # request's embeddings.
+        model = getattr(self, "model", None)
+        if model is not None:
+            on_finished = getattr(model, "on_requests_finished", None)
+            if callable(on_finished):
+                on_finished(scheduler_output.finished_req_ids)
+
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1267,6 +1277,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                 )
             info_dict = deserialize_additional_information(info_payload)
             if info_dict:
+                logger.debug(
+                    "[GPUModelRunner] decoded additional_information keys=%s for req=%s",
+                    list(info_dict.keys()),
+                    req_id,
+                )
                 self.model_intermediate_buffer[req_id] = info_dict
                 setattr(self.requests[req_id], "additional_information_cpu", info_dict)
 
@@ -1283,16 +1298,21 @@ class OmniGPUModelRunner(GPUModelRunner):
             #   column_id = generated_len % (ar_width + 1)
             # and forces the EOL token when column_id == ar_width.
             generated_len = len(req_state.output_token_ids) if req_state is not None else 0
+            # Every request always carries its identity and generated length so
+            # per-request model state (e.g. Kimi Audio's dual-stream audio state)
+            # can detect slot reuse and reset before embeddings are computed.
+            base_info = {"req_id": req_id, "generated_len": generated_len}
             info = self.model_intermediate_buffer.get(req_id, {})
             if info:
-                info["generated_len"] = generated_len
-                per_req_runtime_info.append(info)
+                merged = dict(info)
+                merged.update(base_info)
+                per_req_runtime_info.append(merged)
                 if "thinker_reply_part_per_request" in info:
                     q = info["thinker_reply_part_per_request"]
                     if hasattr(q, "shape"):
                         logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
             else:
-                per_req_runtime_info.append({})
+                per_req_runtime_info.append(base_info)
         return per_req_runtime_info
 
     def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:
@@ -1336,10 +1356,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Backward compatible: also emit old name
             model_kwargs_extra["runtime_additional_information"] = buffer_map
         except Exception as e:
-            logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.debug("[OMNI DEBUG] Error building model_kwargs_extra: %s", e)
 
         # Per-request (start, end) hidden-row spans so make_omni_output can map
         # flat hidden rows to the right request in mixed prefill+decode steps,
@@ -1467,6 +1484,12 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
             payload_info = getattr(new_req, "additional_information", None)
+            logger.debug(
+                "[GPUModelRunner] _update_additional_information new_req=%s payload_type=%s keys=%s",
+                getattr(new_req, "req_id", None),
+                type(payload_info).__name__,
+                list(payload_info.keys()) if isinstance(payload_info, dict) else None,
+            )
             if isinstance(payload_info, dict):
                 self._update_intermediate_buffer(new_req.req_id, payload_info)
 
@@ -1551,10 +1574,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
+            #
+            # For Kimi Audio TTS the prompt carries a parallel audio token
+            # stream in ``additional_information`` / ``model_intermediate_buffer``.
+            # Passing it through here lets ``embed_input_ids`` fuse the audio
+            # stream markers into the prompt embeddings during prefill, before
+            # vLLM caches the KV for the prompt.
+            runtime_additional_information = self._gather_runtime_additional_information()
             inputs_embeds_scheduled = self.model.embed_input_ids(
                 self.input_ids.gpu[:num_scheduled_tokens],
                 multimodal_embeddings=mm_embeds,
                 is_multimodal=is_mm_embed,
+                runtime_additional_information=runtime_additional_information,
             )
 
             # TODO(woosuk): Avoid the copy. Optimize.

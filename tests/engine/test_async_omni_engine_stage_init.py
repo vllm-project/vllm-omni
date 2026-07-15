@@ -1,6 +1,7 @@
 import contextlib
 import importlib
 import os
+import threading
 import time
 import types
 
@@ -428,6 +429,117 @@ def test_remote_replicas_use_distinct_init_group_keys():
         "remote:1:0",
         "remote:1:1",
     ]
+
+
+def test_overlapping_device_stages_initialize_sequentially_in_one_group(monkeypatch):
+    """Stages whose device sets overlap initialize sequentially in one group.
+
+    A tensor-parallel stage on "6,7" and a single-GPU stage on "7" share GPU
+    7; their `devices` strings differ but they must NOT initialize
+    concurrently — concurrent init on the shared device deadlocks (init flock
+    vs spawn mutex lock-order inversion) and then races NCCL setup.
+    """
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=123,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    stage_plans = [
+        _make_llm_plan(0, stage_id=0, vllm_config=cfg),
+        _make_llm_plan(1, stage_id=1, vllm_config=cfg),
+    ]
+    stage_plans[0].replicas[0].metadata.runtime_cfg = {"devices": "6,7"}
+    stage_plans[1].replicas[0].metadata.runtime_cfg = {"devices": "7"}
+
+    calls = []
+
+    def _initialize_replica(plan, _stage_init_timeout):
+        calls.append((plan.metadata.stage_id, threading.get_ident()))
+        return types.SimpleNamespace(name=f"stage-{plan.metadata.stage_id}")
+
+    monkeypatch.setattr(runtime, "_initialize_replica", _initialize_replica)
+
+    initialized = runtime._initialize_stage_replicas(stage_plans, stage_init_timeout=123)
+
+    assert [stage_id for stage_id, _ in calls] == [0, 1]
+    assert len({thread_id for _, thread_id in calls}) == 1
+    # A single merged group runs inline; no thread pool is created.
+    assert runtime._stage_init_executor is None
+    assert [client.name for client in initialized[0]] == ["stage-0"]
+    assert [client.name for client in initialized[1]] == ["stage-1"]
+
+
+def test_disjoint_device_stages_initialize_in_parallel_groups(monkeypatch):
+    """Stages on fully disjoint GPUs keep parallel initialization."""
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=123,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    stage_plans = [
+        _make_llm_plan(0, stage_id=0, vllm_config=cfg),
+        _make_llm_plan(1, stage_id=1, vllm_config=cfg),
+    ]
+    stage_plans[0].replicas[0].metadata.runtime_cfg = {"devices": "6"}
+    stage_plans[1].replicas[0].metadata.runtime_cfg = {"devices": "7"}
+
+    def _initialize_replica(plan, _stage_init_timeout):
+        return types.SimpleNamespace(name=f"stage-{plan.metadata.stage_id}")
+
+    monkeypatch.setattr(runtime, "_initialize_replica", _initialize_replica)
+
+    initialized = runtime._initialize_stage_replicas(stage_plans, stage_init_timeout=123)
+
+    # Two disjoint groups → thread pool used for parallel init.
+    assert runtime._stage_init_executor is not None
+    assert [client.name for client in initialized[0]] == ["stage-0"]
+    assert [client.name for client in initialized[1]] == ["stage-1"]
+
+
+@pytest.mark.parametrize(
+    ("runtime_cfg", "launch_mode", "stage_type", "expected"),
+    [
+        ({"devices": "6,7"}, "local", "llm", frozenset({6, 7})),
+        ({"devices": "7"}, "local", "llm", frozenset({7})),
+        ({"devices": 7}, "local", "llm", frozenset({7})),
+        ({"devices": ["6", 7]}, "local", "llm", frozenset({6, 7})),
+        ({"devices": " 6 , 7 "}, "local", "llm", frozenset({6, 7})),
+        ({"devices": ""}, "local", "llm", None),
+        ({"devices": "gpu0"}, "local", "llm", None),
+        ({}, "local", "llm", None),
+        (None, "local", "llm", None),
+        ({"devices": "6,7"}, "remote", "llm", None),
+        ({"devices": "6,7"}, "local", "diffusion", None),
+    ],
+)
+def test_replica_init_device_ids_parsing(runtime_cfg, launch_mode, stage_type, expected):
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=123,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+    plan = _make_llm_plan(
+        0,
+        stage_id=0,
+        vllm_config=types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64)),
+    )
+    replica = plan.replicas[0]
+    replica.launch_mode = launch_mode
+    replica.metadata.stage_type = stage_type
+    replica.metadata.runtime_cfg = runtime_cfg
+
+    assert runtime._replica_init_device_ids(replica) == expected
 
 
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):

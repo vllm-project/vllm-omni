@@ -236,6 +236,10 @@ class StagePipelineConfig:
     # by ``stage_init_utils._resolve_model_tokenizer_paths``.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    # Input modalities: specifies what modalities this stage accepts as input
+    # (e.g., ["audio"], ["image", "video"]). Used by serving_chat to determine
+    # which modalities should be deferred to downstream stages.
+    input_modalities: tuple[str, ...] = ()
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -772,6 +776,8 @@ def _build_engine_args(
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:
         engine_args["engine_output_type"] = ps.engine_output_type
+    if ps.input_modalities:
+        engine_args["input_modalities"] = list(ps.input_modalities)
     if next_stage_proc:
         engine_args["custom_process_next_stage_input_func"] = next_stage_proc
     # Subdirectory indirections from StagePipelineConfig (structural, not

@@ -67,6 +67,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",
+            "KimiAudioForConditionalGeneration",
+            "KimiAudioDetokenizerForConditionalGeneration",
         }
         if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
