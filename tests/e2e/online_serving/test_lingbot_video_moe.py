@@ -38,7 +38,7 @@ def _get_server_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_server_cases(MODEL), indirect=True)
 def test_text_to_video_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
