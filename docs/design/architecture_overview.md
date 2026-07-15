@@ -13,7 +13,7 @@ This document outlines the architectural design for vLLM-Omni.
 
 The primary goal of the vLLM-Omni project is to build the fastest and easiest-to-use open-source Omni-Modality model inference & serving engine. vLLM-Omni extends the original vLLM, which was created to support large language models for text-based autoregressive (AR) generation tasks. vLLM-Omni is designed to support:
 
-* **Non-textual Output:** Enables the integration, efficient processing and output of various data types, including but not limited to, images, audio, and video, alongside text.
+* **Non-textual Output:** Enables the integration, efficient processing and output of various data types, including but not limited to, images, audio, video, and action trajectories, alongside text.
 * **Non-Autoregressive Structure:** Support model structure beyond autoregressive, especially Diffusion Transformer (DiT), which is widely used in visual and audio generation.
 * **Integration with vLLM Core:** Maintain compatibility and leverage existing vLLM key modules and optimizations where applicable.
 * **Extensibility:** Design a modular and flexible architecture that can easily accommodate new modalities, model architectures, and output formats.

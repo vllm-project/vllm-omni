@@ -650,6 +650,8 @@ steps:
             tests/e2e/online_serving/test_qwen_image_edit_expansion.py
             tests/e2e/online_serving/test_qwen_image_layered_expansion.py
             tests/e2e/online_serving/test_bagel_expansion.py
+            tests/e2e/online_serving/test_krea2_expansion.py
+            tests/e2e/offline_inference/test_krea2_expansion.py
             -m "full_model and diffusion and H100 and not distributed_cuda"
             --run-level "full_model"
         agents:
@@ -693,6 +695,7 @@ steps:
             pytest -sv
             tests/e2e/online_serving/test_qwen_image_expansion.py
             tests/e2e/online_serving/test_qwen_image_edit_expansion.py
+            tests/e2e/offline_inference/test_krea2_expansion.py
             -m "full_model and diffusion and H100 and distributed_cuda"
             --run-level "full_model"
         agents:
@@ -1486,9 +1489,12 @@ steps:
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
             EXIT1=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
+            EXIT2=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT1
+            if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
+            exit $$EXIT2
         agents:
           queue: "mithril-h100-pool"
         plugins:

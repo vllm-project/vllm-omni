@@ -1,4 +1,4 @@
-# Ming-flash-omni 2.0
+# Ming-flash-omni 2.0: Offline inference
 
 [Ming-flash-omni-2.0](https://github.com/inclusionAI/Ming) is an omni-modal model supporting text, image, video, and audio understanding, with text and speech outputs.
 

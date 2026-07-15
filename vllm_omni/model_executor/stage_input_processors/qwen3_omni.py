@@ -24,7 +24,9 @@ from vllm_omni.data_entry_keys import (
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_language_from_prompt,
     extract_language_from_request,
+    extract_speaker_from_prompt,
     extract_speaker_from_request,
 )
 
@@ -622,15 +624,11 @@ def thinker2talker_token_only(
 
     After the communication-layer refactor, this function only allocates a
     placeholder ``prompt_token_ids`` of the correct length so the scheduler can
-    reserve KV-cache slots. It does **not** forward bulk tensors or voice
-    metadata.
+    reserve KV-cache slots. It does **not** forward bulk tensors.
 
-    Bulk talker conditioning (embed / hidden_states / ids) and per-request
-    voice metadata (``speaker`` / ``language``) are packed by Stage-0
-    ``thinker2talker_full_payload`` via ``extract_speaker_from_request`` /
-    ``extract_language_from_request``, sent over the connector, and merged into
-    the Talker worker's ``model_intermediate_buffer`` on recv. The orchestrator
-    path therefore sets ``additional_information=None``.
+    Bulk talker conditioning is sent through the connector. Speaker and
+    language are also copied from the original prompt so they survive when
+    Stage-0 request metadata is unavailable to the connector payload.
 
     ``prompt`` / ``requires_multimodal_data`` are kept for call-site signature
     compatibility with other orchestrator input processors; they are unused.
@@ -655,10 +653,17 @@ def thinker2talker_token_only(
         thinker_input_ids = prompt_token_ids
         info_for_len = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
         prompt_len = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
+        # Keep this fallback until the connector reliably preserves voice metadata.
+        additional_information = to_dict(
+            OmniPayloadStruct(
+                speaker=extract_speaker_from_prompt(prompt, index=i),
+                language=extract_language_from_prompt(prompt, index=i),
+            )
+        )
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,
-                additional_information=None,
+                additional_information=additional_information or None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )

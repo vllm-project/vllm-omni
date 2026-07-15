@@ -684,3 +684,24 @@ steps:
                     hostPath:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
+
+      - label: "Diffusion · GGUF Plugin Test"
+        soft_fail: true
+        source_file_dependencies:
+          - tests/plugin/test_gguf_diffusion.py
+          - vllm_omni/diffusion/model_loader
+        commands:
+          - pip install "vllm-gguf-plugin>=0.0.3"
+          - timeout 30m pytest -sv tests/plugin/test_gguf_diffusion.py
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"

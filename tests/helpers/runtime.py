@@ -2826,7 +2826,7 @@ def iter_omni_server(
         # be ideal to cleanup consistently everywhere.
         original_model = model_prefix + params.model
         model = original_model
-        if run_level == "core_model":
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
         port = params.port
         stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
@@ -2917,7 +2917,7 @@ def iter_omni_runner(
             extra_omni_kwargs = dict(extra) if extra is not None else {}
         stage_config_path = stage_config_path_for_run_level(stage_config_path, run_level)
         model = model_prefix + model
-        if run_level == "core_model":
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
         with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
