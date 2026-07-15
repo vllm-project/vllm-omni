@@ -91,6 +91,8 @@ CUDA_VISIBLE_DEVICES=0 \
 vllm serve robbyant/lingbot-video-dense-1.3b \
   --omni \
   --model-class-name LingBotVideoPipeline \
+  --default-sampling-params \
+  '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}' \
   --port 8091
 ```
 
@@ -101,8 +103,14 @@ CUDA_VISIBLE_DEVICES=0 \
 vllm serve robbyant/lingbot-video-moe-30b-a3b \
   --omni \
   --model-class-name LingBotVideoPipeline \
+  --default-sampling-params \
+  '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}' \
   --port 8091
 ```
+
+These stage defaults match the LingBot reference pipeline. Request-level
+values continue to override them, so the smaller smoke request below remains
+unchanged.
 
 When serving MoE, replace the request's `model` form value below with
 `robbyant/lingbot-video-moe-30b-a3b`.

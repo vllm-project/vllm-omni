@@ -659,9 +659,7 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
             else extra_args.pop("num_inference_steps", 40)
         )
         guidance_scale = (
-            sampling.guidance_scale
-            if sampling.guidance_scale_provided or sampling.guidance_scale > 0
-            else extra_args.pop("guidance_scale", 6.0)
+            sampling.guidance_scale if sampling.guidance_scale_provided else extra_args.pop("guidance_scale", 6.0)
         )
         shift = extra_args.pop(
             "shift",

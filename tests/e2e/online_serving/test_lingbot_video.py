@@ -20,6 +20,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "robbyant/lingbot-video-dense-1.3b"
 PROMPT = "a robotic arm picks up a red block"
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
+DEFAULT_SAMPLING_PARAMS = '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}'
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 
@@ -29,7 +30,12 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
-                server_args=["--model-class-name", "LingBotVideoPipeline"],
+                server_args=[
+                    "--model-class-name",
+                    "LingBotVideoPipeline",
+                    "--default-sampling-params",
+                    DEFAULT_SAMPLING_PARAMS,
+                ],
             ),
             id="default",
             marks=SINGLE_CARD_FEATURE_MARKS,

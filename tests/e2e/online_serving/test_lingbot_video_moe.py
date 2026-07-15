@@ -15,6 +15,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "robbyant/lingbot-video-moe-30b-a3b"
 PROMPT = "a robotic arm picks up a red block"
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
+SMOKE_DEFAULT_SAMPLING_PARAMS = '{"0":{"num_frames":81,"num_inference_steps":2,"guidance_scale":3.0}}'
 
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
 
@@ -24,7 +25,12 @@ def _get_server_cases(model: str):
         pytest.param(
             OmniServerParams(
                 model=model,
-                server_args=["--model-class-name", "LingBotVideoPipeline"],
+                server_args=[
+                    "--model-class-name",
+                    "LingBotVideoPipeline",
+                    "--default-sampling-params",
+                    SMOKE_DEFAULT_SAMPLING_PARAMS,
+                ],
             ),
             id="default",
             marks=SINGLE_CARD_MARKS,
@@ -44,10 +50,7 @@ def test_text_to_video_moe(omni_server: OmniServer, openai_client: OpenAIClientH
             "negative_prompt": NEGATIVE_PROMPT,
             "height": 192,
             "width": 320,
-            "num_frames": 9,
             "fps": 24,
-            "num_inference_steps": 2,
-            "guidance_scale": 3.0,
             "flow_shift": 3.0,
             "seed": 42,
         },

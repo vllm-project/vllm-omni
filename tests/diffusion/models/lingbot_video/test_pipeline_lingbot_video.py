@@ -144,6 +144,30 @@ def test_forward_resolves_t2v_sampling_and_flow_shift_alias():
     assert call["output_type"] == "pt"
 
 
+def test_forward_uses_lingbot_guidance_default_when_omitted():
+    pipeline = _make_pipeline()
+    calls = []
+
+    def fake_generate(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros(1)
+
+    pipeline._generate = fake_generate
+    req = _make_request_batch(
+        "a robot arm",
+        height=192,
+        width=320,
+        num_frames=81,
+        num_inference_steps=2,
+        seed=42,
+    )
+
+    pipeline.forward(req)
+
+    assert calls[0]["num_frames"] == 81
+    assert calls[0]["guidance_scale"] == 6.0
+
+
 def test_forward_prefers_shift_over_flow_shift_and_defaults_negative_prompt():
     pipeline = _make_pipeline()
     calls = []
