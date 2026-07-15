@@ -114,6 +114,7 @@ def _tta_sampling_params(runner: OmniRunner, cond_prompt: str, tokenizer_bits, c
     return params
 
 
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_tta_eight_captions(omni_runner: OmniRunner, run_level: str, tta_tokenizer_bits) -> None:
     """All eight captions decode through XCodec1 to non-silent, finite audio.

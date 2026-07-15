@@ -68,6 +68,7 @@ pytestmark = [
 ]
 
 
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_tts_smoke(omni_runner: OmniRunner, run_level: str) -> None:
     """Audex TTS from the repo root should produce sane 16 kHz audio per prompt.
@@ -129,6 +130,7 @@ def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, con
     return params
 
 
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_level: str) -> None:
     """A guided request must yield exactly ONE audio stream (companion suppressed)."""
@@ -146,6 +148,7 @@ def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_lev
         assert 0.5 <= duration_s <= 20.0, f"Unexpected duration={duration_s:.3f}s"
 
 
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, run_level: str) -> None:
     """cfg_scale=1.0 must be indistinguishable from not passing cfg at all."""

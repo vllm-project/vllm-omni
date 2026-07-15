@@ -219,6 +219,35 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
+      - label: "TTS · Audex Test"
+        source_file_dependencies:
+          - tests/e2e/offline_inference/test_audex_tts.py
+          - tests/e2e/offline_inference/test_audex_tta.py
+          - tests/e2e/offline_inference/test_audex_s2t.py
+          - vllm_omni/model_executor/models/audex/
+          - vllm_omni/model_executor/stage_input_processors/audex.py
+          - vllm_omni/deploy/audex_tts.yaml
+          - vllm_omni/deploy/audex_tta.yaml
+          - vllm_omni/deploy/audex_thinker_only.yaml
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_LOGGING_LEVEL=DEBUG
+              pytest -s -v tests/e2e/offline_inference/test_audex_tts.py tests/e2e/offline_inference/test_audex_tta.py tests/e2e/offline_inference/test_audex_s2t.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+            "
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
       - label: "TTS · Higgs-Audio-V3 Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_higgs_audio_v3.py

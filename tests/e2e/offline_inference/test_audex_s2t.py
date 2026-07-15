@@ -82,6 +82,7 @@ def _wer(hyp: str, ref: str) -> float:
     return rows[-1] / len(ref_words)
 
 
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_asr_smoke(omni_runner: OmniRunner, run_level: str) -> None:
     """Transcribing the public audio asset yields coherent, non-degenerate text."""

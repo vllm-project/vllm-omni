@@ -8,7 +8,7 @@
 - Model: `nvidia/Nemotron-Labs-Audex-2B`, `nvidia/Nemotron-Labs-Audex-30B-A3B`
 - Task: Text-to-speech (English), text-to-audio (sound effects), audio understanding (ASR / audio QA), cascaded speech-to-speech
 - Mode: Online serving (`/v1/audio/speech`, `/v1/chat/completions`) and offline batch inference
-- Maintainer: @yuekaiz
+- Maintainer: Community
 
 ## When to use this recipe
 
