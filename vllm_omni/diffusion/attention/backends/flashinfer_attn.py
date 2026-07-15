@@ -13,12 +13,19 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 logger = init_logger(__name__)
 
 try:
-    from flashinfer.prefill import (
-        # Templated single prefill
-        single_prefill_with_kv_cache,
+    from flashinfer.prefill import single_prefill_with_kv_cache
+
+    HAS_FLASHINFER = True
+except Exception as e:
+    HAS_FLASHINFER = False
+    logger.warning(
+        "FlashInfer is unavailable; FLASHINFER_ATTN backend will not work. Reason: %s",
+        e,
     )
+
+try:
+    # New API: TRTLLM-optimized kernels for DeepSeek and DiT models
     from flashinfer.prefill import (
-        # TRTLLM-optimized kernels for DeepSeek and DiT models
         trtllm_ragged_attention_deepseek as _trtllm_ragged_attention_deepseek,
     )
     from flashinfer.prefill import (
@@ -28,12 +35,11 @@ try:
     trtllm_ragged_attention_deepseek = torch.compiler.disable(_trtllm_ragged_attention_deepseek)
     trtllm_sage_attention_quantize = torch.compiler.disable(_trtllm_sage_attention_quantize)
 
-    HAS_FLASHINFER = True
+    HAS_TRTLLM_RUGGED = True
 except Exception as e:
-    HAS_FLASHINFER = False
-    trtllm_ragged_attention_deepseek, trtllm_sage_attention_quantize = None, None
+    HAS_TRTLLM_RUGGED = False
     logger.warning(
-        "FlashInfer is unavailable; FLASHINFER_ATTN backend will not work. Reason: %s",
+        "TRTLLM-optimized kernels are unavailable. Reason: %s",
         e,
     )
 
@@ -93,7 +99,7 @@ class FlashInferAttentionImpl(AttentionImpl):
             raise ImportError("FLASHINFER_ATTN backend requires flashinfer")
 
         sm_major, _ = torch.cuda.get_device_capability(self.device)
-        self.use_trtllm_ragged = head_size == 128 and sm_major == 10
+        self.use_trtllm_ragged = sm_major == 10 and head_size == 128 and HAS_TRTLLM_RUGGED
         self._workspace: torch.Tensor | None = None
         if self.use_trtllm_ragged:
             if requested_backend == "auto":
@@ -133,7 +139,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         if dtype is None:
             return None
         if isinstance(dtype, str):
-            dtype = getattr(torch, dtype) # "bfloat16" -> torch.bfloat16
+            dtype = getattr(torch, dtype)  # "bfloat16" -> torch.bfloat16
         if dtype not in allowed:
             choices = ", ".join(sorted(str(item) for item in allowed))
             raise ValueError(f"Unsupported {option_name}={dtype}; expected one of: {choices}")
