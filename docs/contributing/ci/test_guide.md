@@ -12,11 +12,36 @@ When running test cases, you may need to install the following dependencies:
 
 ```bash
 uv pip install ".[dev]"
-apt-get install -y ffmpeg
+apt-get install -y espeak-ng jq
 ```
 
 ## Running Tests
 Our test scripts use the pytest framework. First, please use `git clone https://github.com/vllm-project/vllm-omni.git` to download the vllm-omni source code. Then, in the root directory of vllm-omni, you can run the following commands in your local test environment to execute the corresponding test cases.
+
+### CI job runners (L2–L4): logs, timing, and timeouts
+
+[`tools/run_ready_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_ready_jobs.sh), [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh), and [`tools/nightly/run_nightly_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/nightly/run_nightly_jobs.sh) share the same run-time behavior (via [`tools/run_jobs_common.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_jobs_common.sh)):
+
+**Log layout** (default under `logs/ready_jobs`, `logs/merge_jobs`, or `logs/nightly_jobs`; override with `--log-dir`):
+
+| Path | Description |
+|------|-------------|
+| `jobs/*.sh` | Generated per-step bash wrappers |
+| `jobs/.job_timeouts` | Job key → `timeout_in_minutes` from Buildkite YAML (when set) |
+| `<job_key>.log` | Tee output for each job |
+| `timing_summary.log` | Per-job duration and total wall time after the run completes |
+
+**Timing:** while each job runs, stderr prints `finished in …` or `failed after …`. When all jobs finish, a summary is printed and written to `timing_summary.log`, for example:
+
+```
+=== Job timing summary ===
+  TTS_VoxCPM2_Test  25m 40s  OK
+  Omni_Qwen3-Omni_Test  8m 05s  TIMED OUT
+Total wall time: 33m 45s (2 jobs)
+Failed jobs: 1/2
+```
+
+**Timeouts:** if a Buildkite step defines `timeout_in_minutes`, the runner wraps that job with `timeout ${N}m` (aligned with CI). Steps without `timeout_in_minutes` rely on any inline `timeout …` already present in the extracted pytest command. On timeout the process exits with code `124` and the summary marks the job as `TIMED OUT`.
 
 === "L1 level"
 
@@ -28,59 +53,107 @@ Our test scripts use the pytest framework. First, please use `git clone https://
 
 === "L2 level"
 
+    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_ready_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_ready_jobs.sh). The script reads [`.buildkite/test-ready.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/ready_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts) for timing and timeout behavior). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+
+    ```bash
+    # All L2 and L1 jobs (default: every pytest step in test-ready.yml)
+    bash tools/run_ready_jobs.sh
+
+    # Skip L1-style "Simple Test" steps in test-ready.yml (group or "Simple ·" labels)
+    bash tools/run_ready_jobs.sh --skip-simple
+    bash tools/run_ready_jobs.sh --skip-simple --model-type diffusion
+
+    # Preview extracted commands without running
+    bash tools/run_ready_jobs.sh --dry-run
+
+    # Filter by model area (OR semantics): omni | tts | diffusion | all
+    bash tools/run_ready_jobs.sh --model-type omni
+    bash tools/run_ready_jobs.sh --model-type tts,diffusion
+
+    # Match a Buildkite label substring (e.g. one model suite)
+    bash tools/run_ready_jobs.sh --model-type tts --label-substr "VoxCPM2"
+
+    ```
+
+    **Ad hoc:** run a single test file or marker expression manually:
+
     ```bash
     cd tests
-    pytest -s -v -m "core_model and not cpu" --run-level=core_model
-    ```
-    If you only want to run a specific test case, you can use:
-    ```bash
     pytest -s -v test_xxxx.py --run-level=core_model
+    pytest -s -v -m "core_model and distributed_cuda and L4" --run-level=core_model
     ```
-    If you only want to run specific test cases on a particular platform, you can use:
-    ```bash
-    pytest -s -v -m "core_model and distributed_cuda and L4"  --run-level=core_model
-    ```
-    The latest test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
 
 === "L3 level"
 
+    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh). The script reads [`.buildkite/test-merge.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-merge.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/merge_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts)). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+
     ```bash
-    pytest -s -v -m "advanced_model" --run-level=advanced_model
+    # All L3 and L1 jobs (default: every pytest step in test-merge.yml)
+    bash tools/run_merge_jobs.sh
+
+    # Skip L1-style "Simple Test" steps in test-merge.yml (group or "Simple ·" labels)
+    bash tools/run_merge_jobs.sh --skip-simple
+    bash tools/run_merge_jobs.sh --skip-simple --model-type omni
+
+    # Preview extracted commands without running
+    bash tools/run_merge_jobs.sh --dry-run
+
+    # Filter by model area (OR semantics): omni | tts | diffusion | all
+    bash tools/run_merge_jobs.sh --model-type diffusion
+    bash tools/run_merge_jobs.sh --model-type omni,tts
+
+    # Match a Buildkite label substring
+    bash tools/run_merge_jobs.sh --model-type diffusion --label-substr "Wan22"
+
     ```
-    If you only want to run a specific test case, you can use:
+
+    **Ad hoc:** run a single test file or marker expression manually:
+
     ```bash
     pytest -s -v test_xxxx.py --run-level=advanced_model
+    pytest -s -v -m "advanced_model and distributed_cuda and L4" --run-level=advanced_model
     ```
-    If you only want to run specific test cases on a particular platform, you can use:
-    ```bash
-    pytest -s -v -m "advanced_model and distributed_cuda and L4"  --run-level=advanced_model
-    ```
-    The latest L3 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-merge.yml).
 
 
 === "L4 level"
 
+    **Recommended:** run CI-aligned nightly jobs from the repo root via [`tools/nightly/run_nightly_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/nightly/run_nightly_jobs.sh). The script reads [`.buildkite/test-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml), generates per-step bash wrappers, runs pytest (perf jobs first, then aggregates perf JSON into Excel), and tees logs under `logs/nightly_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts); `generate_nightly_perf_excel` is included in the timing summary). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+
     ```bash
-    cd tests
-    pytest -s -v -m "full_model" --run-level=full_model
+    # All nightly jobs (default: test-type all, model-type all)
+    bash tools/nightly/run_nightly_jobs.sh
+
+    # Preview extracted commands without running
+    bash tools/nightly/run_nightly_jobs.sh --dry-run
+
+    # Test kind (--test-type, OR semantics): perf | acc | function | stability | local | all
+    bash tools/nightly/run_nightly_jobs.sh --test-type function
+    bash tools/nightly/run_nightly_jobs.sh --test-type perf,acc
+
+    # Model area (--model-type, OR semantics): omni | tts | diffusion | all
+    bash tools/nightly/run_nightly_jobs.sh --test-type function --model-type omni
+    bash tools/nightly/run_nightly_jobs.sh --test-type perf --model-type diffusion
+
+    # Stability scripts (tests/dfx/stability/scripts/) and local marker tests
+    bash tools/nightly/run_nightly_jobs.sh --test-type stability --model-type omni
+    bash tools/nightly/run_nightly_jobs.sh --test-type local --model-type tts
     ```
-    If you only want to run a specific test case, you can use:
-    ```bash
-    pytest -s -v test_xxxx.py --run-level=full_model
-    ```
-    If you only want to run specific test cases on a particular platform, you can use:
-    ```bash
-    pytest -s -v -m "full_model and distributed_cuda and L4"  --run-level=full_model
-    ```
-    Note: To run performance tests (defaults to ``test_qwen_omni.json``; use ``--test-config-file tests/dfx/perf/tests/test_tts.json`` for TTS):
-    ```bash
-    pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
-    ```
-    The latest L4 (nightly) test commands use the `full_model` marker and `--run-level full_model` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml) and [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml)). Example:
+
+    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI.
+
+    **Ad hoc:** run a single test file or marker expression manually:
 
     ```bash
     cd tests
+    pytest -s -v test_xxxx.py --run-level=full_model
+    pytest -s -v -m "full_model and distributed_cuda and L4" --run-level=full_model
     pytest -s -v -m "full_model and (omni or tts) and H100" --run-level=full_model
+    ```
+
+    To run a standalone perf benchmark (defaults to ``test_qwen_omni.json``; use ``--test-config-file tests/dfx/perf/tests/test_tts.json`` for TTS):
+
+    ```bash
+    pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
     ```
 
 === "L5 level"
