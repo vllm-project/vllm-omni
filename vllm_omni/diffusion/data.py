@@ -516,7 +516,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
-    from vllm_omni.diffusion.model_resolvers import resolve_model_class_resolution
+    from vllm_omni.diffusion.model_resolvers import resolve_model_class
 
     if not model:
         return None
@@ -537,7 +537,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     except Exception:
         cfg = {}
     architectures = cfg.get("architectures") or []
-    resolution = resolve_model_class_resolution(model, cfg)
+    resolution = resolve_model_class(model, cfg, for_enrich=False)
     if resolution.handled:
         return resolution.model_class_name
     if len(architectures) == 1:
@@ -1002,17 +1002,13 @@ class OmniDiffusionConfig:
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
     def _apply_resolved_model_class(self, model_class_name: str, *, override_existing: bool = True) -> None:
-        # Some families document ``--model-class-name`` as an explicit override
-        # (for example NextStep and Wan S2V), so preserve the caller-provided
-        # value when requested instead of replacing it with the inferred class.
-        # In that case we also keep the parsed ``TransformerConfig.from_dict``
-        # result from ``config.json`` instead of resetting it to an empty
-        # ``TransformerConfig()`` like the old branch-local code did.
-        if not override_existing and self.model_class_name is not None:
-            self.update_multimodal_support()
-            return
+        # Preserve explicit model_class_name for families that document it as an override.
+        if override_existing or self.model_class_name is None:
+            self.model_class_name = model_class_name
 
-        self.model_class_name = model_class_name
+        # Preserve historical behavior for these branches: even when the explicit
+        # model_class_name is kept, tf_model_config is reset to an empty
+        # TransformerConfig and multimodal metadata is refreshed.
         self.set_tf_model_config(TransformerConfig())
         self.update_multimodal_support()
 
@@ -1025,7 +1021,7 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
-        from vllm_omni.diffusion.model_resolvers import resolve_model_class_resolution
+        from vllm_omni.diffusion.model_resolvers import resolve_model_class
 
         # Default model_class_name for diffusers adapter
         if self.model_class_name is None and self.diffusion_load_format == "diffusers":
@@ -1076,7 +1072,7 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
-                    resolution = resolve_model_class_resolution(self.model, None)
+                    resolution = resolve_model_class(self.model, None, for_enrich=True)
                     if resolution.model_class_name is not None:
                         self._apply_resolved_model_class(resolution.model_class_name)
                         return
@@ -1084,15 +1080,11 @@ class OmniDiffusionConfig:
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
                 architectures = cfg.get("architectures") or []
-                resolution = resolve_model_class_resolution(self.model, cfg)
+                resolution = resolve_model_class(self.model, cfg, for_enrich=True)
                 if resolution.model_class_name is not None:
-                    preserve_explicit_model_class = resolution.model_class_name in {
-                        "NextStep11Pipeline",
-                        "WanS2VPipeline",
-                    }
                     self._apply_resolved_model_class(
                         resolution.model_class_name,
-                        override_existing=not preserve_explicit_model_class,
+                        override_existing=not resolution.preserve_explicit,
                     )
                 elif resolution.handled:
                     raise

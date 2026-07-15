@@ -35,7 +35,5 @@ def resolve_standard_model_class_name(
         return "NextStep11Pipeline"
     if model_type == "s2v":
         return "WanS2VPipeline"
-    if model_type == "Gr00tN1d7" or "Gr00tN1d7" in architectures:
-        return "Gr00tN1d7Pipeline"
 
     return None

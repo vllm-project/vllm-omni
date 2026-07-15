@@ -24,15 +24,21 @@ class ModelClassResolution:
         model_class_name: Resolved pipeline class name for the claimed family,
             or ``None`` when the family was recognized but could not be mapped
             to a concrete diffusion pipeline.
+        preserve_explicit: When True, callers should keep an already-specified
+            explicit ``model_class_name`` instead of overwriting it with the
+            inferred class for this family.
     """
 
     handled: bool
     model_class_name: str | None = None
+    preserve_explicit: bool = False
 
 
-def resolve_model_class_resolution(
+def resolve_model_class(
     model: str | None,
     cfg: ModelConfigLike | None,
+    *,
+    for_enrich: bool = False,
 ) -> ModelClassResolution:
     """Resolve diffusion model family in precedence order.
 
@@ -47,6 +53,9 @@ def resolve_model_class_resolution(
             ``get_hf_file_to_dict("config.json", model)``. Resolvers currently
             rely on fields such as ``model_type``, ``architectures``, and
             ``model_name`` when present.
+        for_enrich: When True, enable enrich-only families that historically
+            existed only in ``OmniDiffusionConfig.enrich_config()`` and were
+            not part of ``resolve_model_class_name()``.
 
     Returns:
         A ``ModelClassResolution`` describing whether a resolver claimed the
@@ -64,7 +73,22 @@ def resolve_model_class_resolution(
 
     standard_model_class = resolve_standard_model_class_name(model, cfg)
     if standard_model_class is not None:
-        return ModelClassResolution(handled=True, model_class_name=standard_model_class)
+        return ModelClassResolution(
+            handled=True,
+            model_class_name=standard_model_class,
+            preserve_explicit=standard_model_class in {"NextStep11Pipeline", "WanS2VPipeline"},
+        )
+
+    # Gr00tN1d7 is enrich-only by design. Keep it out of
+    # resolve_model_class_name() to preserve historical client-side behavior.
+    if for_enrich and cfg is not None:
+        model_type = cfg.get("model_type")
+        architectures = cfg.get("architectures") or []
+        if model_type == "Gr00tN1d7" or "Gr00tN1d7" in architectures:
+            return ModelClassResolution(
+                handled=True,
+                model_class_name="Gr00tN1d7Pipeline",
+            )
 
     return ModelClassResolution(handled=False)
 
@@ -72,5 +96,5 @@ def resolve_model_class_resolution(
 __all__ = [
     "ModelConfigLike",
     "ModelClassResolution",
-    "resolve_model_class_resolution",
+    "resolve_model_class",
 ]
