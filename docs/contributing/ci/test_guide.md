@@ -149,12 +149,18 @@ Failed jobs: 1/2
     pytest -s -v -m "full_model and distributed_cuda and L4" --run-level=full_model
     pytest -s -v -m "full_model and (omni or tts) and H100" --run-level=full_model
     ```
-
-    To run a standalone perf benchmark (defaults to ``test_qwen_omni.json``; use ``--test-config-file tests/dfx/perf/tests/test_tts.json`` for TTS):
-
+    If you only want to run specific test cases on a particular platform, you can use:
     ```bash
-    pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
+    pytest -s -v -m "full_model and distributed_cuda and L4"  --run-level=full_model
     ```
+    Note: ``run_benchmark.py`` and ``run_diffusion_benchmark.py`` accept an optional ``--test-config-file``. If omitted, each loads every ``*.json`` under ``tests/dfx/perf/tests/`` (omni/tts vs diffusion split by ``is_diffusion_perf_config``) and pytest ``-m`` filters by each case's JSON ``mark``:
+    ```bash
+    pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and tts and H100"
+    pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"
+    pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
+    pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
+    ```
+    Nightly **Perf Test** jobs in ``test-nightly.yml`` use ``--test-config-file`` only (no ``-m``). E2e L4 function tests still use ``full_model`` + ``--run-level full_model`` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml)). Example:
 
 === "L5 level"
 
