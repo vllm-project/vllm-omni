@@ -16,11 +16,11 @@ class FishSpeechAdapter(ARTTSAdapter):
     name = "fish_tts"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        """Validate Fish Speech request parameters. Returns error message or None."""
         server = self.ctx.server
         err = server._apply_uploaded_speaker(request)
         if err:
             return err
-        """Validate Fish Speech request parameters. Returns error message or None."""
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 

@@ -3010,6 +3010,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
         request_id: str | None = None,
+        has_inline_ref_audio: bool | None = None,
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
@@ -3042,7 +3043,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
         model_type: str | None = None
-        has_inline_ref_audio = request.ref_audio is not None
+        has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
         if self._tts_model_type == "ming_flash_omni_tts":
             # ming_flash_omni is intentionally NOT migrated onto the adapter
             # framework in this PR (it has no registered adapter); keep it on the
@@ -3265,12 +3266,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         base64_encode: bool = False,
         request_id: str | None = None,
         usage_out: list[SpeechTokenUsage] | None = None,
+        has_inline_ref_audio: bool | None = None,
     ) -> tuple[bytes | str, str]:
         # ``usage_out`` is an opt-in output channel: when a list is passed, the
         # computed SpeechTokenUsage is appended to it. The return stays a
         # 2-tuple so existing callers (and their test mocks) are unaffected;
         # only the batch path, which surfaces per-item usage, opts in.
-        request_id, generator, bytes_tts_params = await self._prepare_speech_generation(request, request_id=request_id)
+        request_id, generator, bytes_tts_params = await self._prepare_speech_generation(
+            request, request_id=request_id, has_inline_ref_audio=has_inline_ref_audio
+        )
         artifact_ready = False
 
         try:
@@ -3727,17 +3731,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         merged_requests = [self._merge_batch_item(batch_request, item) for item in batch_request.items]
 
         async def _run_item(idx: int, req: OpenAICreateSpeechRequest) -> SpeechBatchItemResult:
-            # Batch validation still goes through _validate_tts_request directly
-            # (not the adapter). The single-request path validates via the
-            # adapter; both ultimately call the same per-model validators, so the
-            # surfaces stay in sync. Routing batch through the adapter (and its
-            # uploaded-speaker handling) is a follow-up (RFC #4327).
+            has_inline_ref_audio = req.ref_audio is not None
             validation_error = self._validate_tts_request(req)
             if validation_error is not None:
                 return SpeechBatchItemResult(index=idx, status="error", error=validation_error)
             usage_box: list[SpeechTokenUsage] = []
             try:
-                audio_data, media_type = await self._generate_audio_bytes(req, base64_encode=True, usage_out=usage_box)
+                audio_data, media_type = await self._generate_audio_bytes(
+                    req, base64_encode=True, usage_out=usage_box, has_inline_ref_audio=has_inline_ref_audio
+                )
             except Exception as e:
                 logger.exception("Batch item %d failed: %s", idx, e)
                 return SpeechBatchItemResult(index=idx, status="error", error=str(e))

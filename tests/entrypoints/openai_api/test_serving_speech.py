@@ -1866,6 +1866,35 @@ class TestTTSMethods:
         assert error is not None
         assert "max 10 characters" in error
 
+    def test_batch_voice_not_treated_as_inline_ref_audio(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        speech_server._check_model = mocker.AsyncMock(return_value=None)
+        speech_server._batch_max_items = 32
+
+        def validate_and_resolve_uploaded_voice(request):
+            assert request.voice == "alice"
+            assert request.ref_audio is None
+
+            request.ref_audio = "data:audio/wav;base64,dGVzdA=="
+            request.ref_text = "reference text"
+            return None
+
+        speech_server._validate_tts_request = mocker.Mock(side_effect=validate_and_resolve_uploaded_voice)
+        speech_server._generate_audio_bytes = mocker.AsyncMock(return_value=("YWJj", "audio/wav"))
+
+        batch = BatchSpeechRequest(voice="alice", items=[SpeechBatchItem(input="hello")])
+
+        response = asyncio.run(speech_server.create_speech_batch(batch))
+        call = speech_server._generate_audio_bytes.await_args
+        request = call.args[0]
+
+        assert response.results[0].status == "success"
+        assert request.ref_audio is not None
+        assert call.kwargs["has_inline_ref_audio"] is False
+
 
 class TestFileValidationFunctions:
     """Unit tests for file validation helper functions."""

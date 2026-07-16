@@ -23,7 +23,6 @@ class StepAudio2Adapter(ARTTSAdapter):
     name = "step_audio2"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
-        # Dispatcher routes to the step_audio2 case (non-empty input check).
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
         return None
