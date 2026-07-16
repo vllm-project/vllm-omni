@@ -70,7 +70,6 @@ def _resolve_request_inputs_for_test(
     req,
     *,
     guidance_scale=4.0,
-    guidance_rescale=None,
     negative_prompt=None,
 ):
     return pipe._resolve_request_inputs(
@@ -82,9 +81,7 @@ def _resolve_request_inputs_for_test(
         num_frames=None,
         frame_rate=None,
         num_inference_steps=None,
-        timesteps=None,
         guidance_scale=guidance_scale,
-        guidance_rescale=guidance_rescale,
         num_videos_per_prompt=1,
         generator=None,
         latents=None,
@@ -801,7 +798,7 @@ class TestLTXRequestParsing:
             torch.stack([negative_attention_mask]),
         )
 
-    def test_request_resolves_per_modality_guidance_and_common_overrides(self):
+    def test_request_resolves_per_modality_guidance_and_common_cfg_override(self):
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -836,9 +833,37 @@ class TestLTXRequestParsing:
         assert resolved.guidance.video == LTXModalityGuidance(4.0, 0.5, 2.0, 0.2, (3, 4))
         assert resolved.guidance.audio == LTXModalityGuidance(6.0, 0.25, 4.0, 0.3, (5,))
 
-        common = _resolve_request_inputs_for_test(pipe, req, guidance_scale=2.0, guidance_rescale=0.0)
+        common = _resolve_request_inputs_for_test(pipe, req, guidance_scale=2.0)
         assert common.guidance.video.cfg_scale == common.guidance.audio.cfg_scale == 2.0
-        assert common.guidance.video.rescale_scale == common.guidance.audio.rescale_scale == 0.0
+        # LTX exposes independent video/audio rescale controls, not the
+        # model-agnostic sampling field.
+        assert common.guidance.video.rescale_scale == 0.2
+        assert common.guidance.audio.rescale_scale == 0.3
+
+    def test_request_rejects_unsupported_generic_scheduler_and_rescale_controls(self):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        cases = (
+            (OmniDiffusionSamplingParams(timesteps=torch.tensor([1.0])), "timesteps"),
+            (OmniDiffusionSamplingParams(guidance_rescale=0.5), "guidance_rescale"),
+            (OmniDiffusionSamplingParams(extra_args={"flow_shift": 3.0}), "flow_shift"),
+        )
+        pipe = _make_ltx_request_pipe(LTX23Pipeline)
+
+        for index, (sampling, field_name) in enumerate(cases):
+            req = DiffusionRequestBatch(
+                [
+                    OmniDiffusionRequest(
+                        prompt="prompt",
+                        sampling_params=sampling,
+                        request_id=f"ltx-unsupported-{index}",
+                    )
+                ]
+            )
+            with pytest.raises(ValueError, match=field_name):
+                _resolve_request_inputs_for_test(pipe, req)
 
     def test_request_batch_rejects_mixed_guidance_specs(self):
         from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -1005,8 +1030,6 @@ class TestLTX23ForwardStages:
             ]
         )
         fallback_sigmas = [1.0, 0.5]
-        timesteps = [1000, 500]
-        attention_kwargs = {"scale": 1.0}
         seen = {}
 
         def fake_forward_impl(req_arg, request_inputs, **kwargs):
@@ -1017,13 +1040,7 @@ class TestLTX23ForwardStages:
 
         object.__setattr__(pipe, "_forward_impl", fake_forward_impl)
 
-        output = pipe.forward(
-            req,
-            sigmas=fallback_sigmas,
-            timesteps=timesteps,
-            noise_scale=0.25,
-            attention_kwargs=attention_kwargs,
-        )
+        output = pipe.forward(req, sigmas=fallback_sigmas)
 
         assert output == ["delegated"]
         assert seen["req"] is req
@@ -1034,10 +1051,10 @@ class TestLTX23ForwardStages:
         assert seen["request_inputs"].guidance_scale == 4.5
         assert seen["request_inputs"].output_type == "latent"
         assert seen["kwargs"] == {
-            "noise_scale": 0.25,
+            "noise_scale": 0.0,
             "sigmas": request_sigmas,
-            "timesteps": timesteps,
-            "attention_kwargs": attention_kwargs,
+            "timesteps": None,
+            "attention_kwargs": None,
         }
 
     def test_t2v_forward_prefers_request_sigmas(self):

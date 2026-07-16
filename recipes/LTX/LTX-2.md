@@ -235,11 +235,22 @@ sampling_params = OmniDiffusionSamplingParams(
 )
 ```
 
-A request-level schedule takes precedence over a `sigmas` fallback passed
-directly to the pipeline. Custom `sigmas` and custom `timesteps` are mutually
-exclusive, and all requests in one fused batch must use identical `sigmas`.
-The `/v1/videos` form API and bundled offline CLI do not currently expose this
-field; use the Python request API when supplying a custom schedule.
+A request-level schedule takes precedence over the recipe schedule, and all
+requests in one fused batch must use identical `sigmas`. The `/v1/videos` form
+API and bundled offline CLI do not currently expose this field; use the Python
+request API when supplying a custom schedule.
+
+### Python Request Parameters
+
+| Parameter | Supported entrypoint | Behavior |
+|---|---|---|
+| `max_sequence_length` | `OmniDiffusionSamplingParams` | Maximum prompt-token length; defaults to the loaded tokenizer/model limit, normally 1024. |
+| `decode_timestep`, `decode_noise_scale` | `OmniDiffusionSamplingParams` | Optional timestep-conditioned VAE decode controls; defaults `0.0`/`None` add no decode noise. Scalar or per-output lists are accepted. |
+| `num_outputs_per_prompt` | `OmniDiffusionSamplingParams` | Generates multiple outputs for one prompt; this is separate from batching independent requests. |
+| `generator` | `OmniDiffusionSamplingParams` | Supplies a `torch.Generator` or one generator per effective output; otherwise use `seed`. |
+| `latents`, `audio_latents` | `OmniDiffusionSamplingParams` | Supply initial video/audio latents using the pipeline's packed or unpacked tensor layouts. |
+| `prompt_embeds`, `negative_prompt_embeds`, and masks | Python prompt payload | Bypass text encoding with precomputed conditioning tensors. Embeddings require their matching attention masks. |
+| `output_type` | `OmniDiffusionSamplingParams` | `"np"` decodes video/audio; `"latent"` returns latent outputs without VAE/vocoder decode. |
 
 !!! warning "Request batching requires identical LTX guidance"
 

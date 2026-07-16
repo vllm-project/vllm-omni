@@ -74,10 +74,7 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
         frame_rate: float | None = None,
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
-        timesteps: list[int] | None = None,
         guidance_scale: float | None = None,
-        guidance_rescale: float | None = None,
-        noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
@@ -89,14 +86,10 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
         decode_timestep: float | list[float] = 0.0,
         decode_noise_scale: float | list[float] | None = None,
         output_type: str = "np",
-        return_dict: bool = True,
-        attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
         *,
         image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
-        del return_dict
-        sigmas = self._resolve_request_sigmas(req, sigmas)
         request_inputs = self._resolve_request_inputs(
             req,
             prompt=prompt,
@@ -106,9 +99,7 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
             num_frames=num_frames,
             frame_rate=frame_rate,
             num_inference_steps=num_inference_steps,
-            timesteps=timesteps,
             guidance_scale=guidance_scale,
-            guidance_rescale=guidance_rescale,
             num_videos_per_prompt=num_videos_per_prompt,
             generator=generator,
             latents=latents,
@@ -125,10 +116,10 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
         image = self._resolve_request_image(req, image, request_inputs)
         sigmas = self._resolve_request_sigmas(req, sigmas)
         forward_kwargs = {
-            "noise_scale": noise_scale,
+            "noise_scale": 0.0,
             "sigmas": sigmas,
-            "timesteps": timesteps,
-            "attention_kwargs": attention_kwargs,
+            "timesteps": None,
+            "attention_kwargs": None,
         }
         if self.support_image_input:
             forward_kwargs["image"] = image

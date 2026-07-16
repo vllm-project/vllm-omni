@@ -56,14 +56,14 @@ class TestLTXImageToVideoForwardStages:
 
         object.__setattr__(pipe, "_forward_impl", fake_forward_impl)
 
-        output = pipe.forward(req, noise_scale=0.5)
+        output = pipe.forward(req)
 
         assert output == ["i2v-delegated"]
         assert seen["req"] is req
         assert seen["request_inputs"].prompt == ["make the image move"]
         assert seen["request_inputs"].negative_prompt == ["jitter"]
         assert seen["kwargs"]["image"] is image
-        assert seen["kwargs"]["noise_scale"] == 0.5
+        assert seen["kwargs"]["noise_scale"] == 0.0
 
     def test_denoise_timestep_kwargs_masks_video_only(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline

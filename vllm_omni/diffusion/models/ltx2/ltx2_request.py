@@ -45,10 +45,6 @@ class LTXRequestInputs:
         """Compatibility view for callers that only understand video CFG."""
         return self.guidance.video.cfg_scale
 
-    @property
-    def guidance_rescale(self) -> float:
-        return self.guidance.video.rescale_scale
-
 
 def _unwrap_request_tensor(value: Any) -> Any:
     if isinstance(value, list):
@@ -147,7 +143,6 @@ def _resolve_guidance_spec(
     default: LTXGuidanceSpec,
     *,
     guidance_scale: float | None,
-    guidance_rescale: float | None,
 ) -> LTXGuidanceSpec:
     video = _resolve_modality_guidance(sampling, "video", default.video)
     audio = _resolve_modality_guidance(sampling, "audio", default.audio)
@@ -157,10 +152,6 @@ def _resolve_guidance_spec(
         video = replace(video, cfg_scale=float(common_cfg))
         audio = replace(audio, cfg_scale=float(common_cfg))
 
-    common_rescale = sampling.guidance_rescale if sampling.guidance_rescale else guidance_rescale
-    if common_rescale is not None:
-        video = replace(video, rescale_scale=float(common_rescale))
-        audio = replace(audio, rescale_scale=float(common_rescale))
     return LTXGuidanceSpec(video=video, audio=audio)
 
 
@@ -226,7 +217,6 @@ class LTXRequestMixin:
         num_frames: int | None,
         frame_rate: float | None,
         num_inference_steps: int | None,
-        timesteps: list[int] | None,
         guidance_scale: float | None,
         num_videos_per_prompt: int | None,
         generator: torch.Generator | list[torch.Generator] | None,
@@ -240,9 +230,19 @@ class LTXRequestMixin:
         decode_noise_scale: float | list[float] | None,
         output_type: str,
         max_sequence_length: int | None,
-        guidance_rescale: float | None = None,
     ) -> LTXRequestInputs:
         sampling_params_list = req.sampling_params_list
+        for sampling in sampling_params_list:
+            if sampling.timesteps is not None:
+                raise ValueError("LTX does not support `timesteps`; use `sigmas` for a custom schedule.")
+            if sampling.guidance_rescale:
+                raise ValueError(
+                    "LTX does not support the common `guidance_rescale`; use `video_rescale_scale` and "
+                    "`audio_rescale_scale`."
+                )
+            if _get_extra_arg(sampling, "flow_shift") is not None:
+                raise ValueError("LTX does not support `flow_shift`; use `sigmas` for a custom schedule.")
+
         sampling = sampling_params_list[0]
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
         negative_prompt = _resolve_negative_prompts(
@@ -257,10 +257,7 @@ class LTXRequestMixin:
         num_inference_steps = (
             sampling.num_inference_steps or num_inference_steps or self.one_stage_recipe.num_inference_steps
         )
-        if timesteps is None:
-            num_inference_steps = max(int(num_inference_steps), 2)
-        elif len(timesteps) < 2:
-            raise ValueError("`timesteps` must contain at least 2 values for FlowMatchEulerDiscreteScheduler.")
+        num_inference_steps = max(int(num_inference_steps), 2)
 
         num_videos_per_prompt = (
             sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else num_videos_per_prompt or 1
@@ -271,7 +268,6 @@ class LTXRequestMixin:
                 item,
                 self.one_stage_recipe.guidance,
                 guidance_scale=guidance_scale,
-                guidance_rescale=guidance_rescale,
             )
             for item in sampling_params_list
         ]

@@ -56,18 +56,15 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         req: DiffusionRequestBatch,
         request_inputs: LTXRequestInputs,
         *,
-        noise_scale: float,
-        timesteps: list[int] | None,
-        attention_kwargs: dict[str, Any] | None,
         image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
         stage1 = self.run_phase(
             req,
             request_inputs,
-            noise_scale=noise_scale,
+            noise_scale=0.0,
             sigmas=DISTILLED_SIGMA_VALUES if self.distilled else None,
-            timesteps=timesteps,
-            attention_kwargs=attention_kwargs,
+            timesteps=None,
+            attention_kwargs=None,
             image=image,
         )
         upscaled_video_latent = self.upsample_pipe(
@@ -92,7 +89,7 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
             noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
             sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
             timesteps=None,
-            attention_kwargs=attention_kwargs,
+            attention_kwargs=None,
             prompt_context=stage1.forward_context.prompt_context,
         )
         return self.decode_phase(stage2)
@@ -160,9 +157,6 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         return self._run_two_stage(
             req,
             request_inputs,
-            noise_scale=noise_scale,
-            timesteps=timesteps,
-            attention_kwargs=attention_kwargs,
             image=image,
         )
 

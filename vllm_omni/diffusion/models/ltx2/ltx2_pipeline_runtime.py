@@ -186,10 +186,6 @@ class LTXPipelineRuntime(
         return self._guidance_plan.spec.video.cfg_scale
 
     @property
-    def guidance_rescale(self):
-        return self._guidance_plan.spec.video.rescale_scale
-
-    @property
     def do_classifier_free_guidance(self):
         return self._guidance_plan.spec.do_cfg
 
