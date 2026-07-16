@@ -1040,6 +1040,40 @@ class TestLTX23ForwardStages:
             "attention_kwargs": attention_kwargs,
         }
 
+    def test_t2v_forward_prefers_request_sigmas(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        request_sigmas = [1.0, 0.25]
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt="custom sigma schedule",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        num_inference_steps=2,
+                        sigmas=request_sigmas,
+                    ),
+                    request_id="ltx23-request-sigmas",
+                )
+            ]
+        )
+        pipe = _make_ltx_request_pipe(LTX23Pipeline)
+        seen = {}
+
+        def fake_forward_impl(req_arg, request_inputs, **kwargs):
+            del req_arg, request_inputs
+            seen.update(kwargs)
+            return ["delegated"]
+
+        object.__setattr__(pipe, "_forward_impl", fake_forward_impl)
+
+        output = pipe.forward(req, sigmas=[1.0, 0.5])
+
+        assert output == ["delegated"]
+        assert seen["sigmas"] == request_sigmas
+
 
 class TestPipelineComponents:
     def test_ltx23_pipeline_declares_offload_components(self):

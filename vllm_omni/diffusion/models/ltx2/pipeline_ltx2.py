@@ -123,6 +123,7 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
             max_sequence_length=max_sequence_length,
         )
         image = self._resolve_request_image(req, image, request_inputs)
+        sigmas = self._resolve_request_sigmas(req, sigmas)
         forward_kwargs = {
             "noise_scale": noise_scale,
             "sigmas": sigmas,
