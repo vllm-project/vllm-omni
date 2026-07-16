@@ -294,21 +294,29 @@ def test_ltx_component_loader_installs_omni_connector_attention(monkeypatch):
 
     monkeypatch.setattr(ltx2_components, "OmniAttention", OmniAttention)
     connectors = SimpleNamespace(
-        video_connector=SimpleNamespace(transformer_blocks=[SimpleNamespace(attn1=Attention())]),
-        audio_connector=SimpleNamespace(transformer_blocks=[SimpleNamespace(attn1=Attention())]),
+        video_connector=SimpleNamespace(
+            learnable_registers=object(),
+            transformer_blocks=[SimpleNamespace(attn1=Attention())],
+        ),
+        audio_connector=SimpleNamespace(
+            learnable_registers=object(),
+            transformer_blocks=[SimpleNamespace(attn1=Attention())],
+        ),
     )
 
     _install_connector_attention(connectors)
 
     assert len(installed) == 2
     assert all(processor.__class__.__name__ == "_LTXConnectorAttnProcessor" for processor in installed)
+    assert all(processor.has_learned_registers for processor in installed)
     assert all(kernel["role"] == "ltx2.connector" for kernel in kernels)
     assert all(kernel["role_category"] == "self" for kernel in kernels)
     assert all(kernel["skip_sequence_parallel"] for kernel in kernels)
     assert all(kernel["disable_kv_quant"] for kernel in kernels)
 
 
-def test_ltx_connector_attention_dispatches_through_omni_kernel():
+@pytest.mark.parametrize("has_learned_registers", [False, True])
+def test_ltx_connector_attention_dispatches_through_omni_kernel(has_learned_registers):
     calls = []
 
     class Backend:
@@ -340,7 +348,7 @@ def test_ltx_connector_attention_dispatches_through_omni_kernel():
     hidden_states = torch.randn(2, 3, 8)
     additive_mask = torch.zeros(2, 1, 3, 3)
 
-    output = ltx2_components._LTXConnectorAttnProcessor()(
+    output = ltx2_components._LTXConnectorAttnProcessor(has_learned_registers=has_learned_registers)(
         attention,
         hidden_states,
         attention_mask=additive_mask,
@@ -348,9 +356,12 @@ def test_ltx_connector_attention_dispatches_through_omni_kernel():
 
     query, key, value, metadata = calls[0]
     assert query.shape == key.shape == value.shape == (2, 3, 2, 4)
-    assert metadata.attn_mask.shape == (2, 3)
-    assert metadata.attn_mask.dtype == torch.bool
-    assert metadata.attn_mask.all()
+    if has_learned_registers:
+        assert metadata is None
+    else:
+        assert metadata.attn_mask.shape == (2, 3)
+        assert metadata.attn_mask.dtype == torch.bool
+        assert metadata.attn_mask.all()
     torch.testing.assert_close(output, hidden_states)
 
 

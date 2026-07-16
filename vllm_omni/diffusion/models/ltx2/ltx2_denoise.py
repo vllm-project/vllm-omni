@@ -326,8 +326,8 @@ def build_transformer_kwargs(
             video_token_count=hidden_states.shape[1],
             audio_token_count=audio_hidden_states.shape[1],
         ),
-        # LTX text connectors append learned registers, so padding masks are
-        # intentionally not forwarded into the denoise Transformer.
+        # This is valid only because LTX connectors replace every padding token
+        # with a learned register, making all output context tokens valid.
         "encoder_attention_mask": None,
         "audio_encoder_attention_mask": None,
         "num_frames": forward_ctx.latent_num_frames,

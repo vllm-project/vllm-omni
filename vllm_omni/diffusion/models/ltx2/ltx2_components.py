@@ -92,6 +92,9 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
 class _LTXConnectorAttnProcessor:
     """Preserve official connector math around Omni attention dispatch."""
 
+    def __init__(self, *, has_learned_registers: bool) -> None:
+        self.has_learned_registers = has_learned_registers
+
     def __call__(
         self,
         attn: Any,
@@ -126,7 +129,12 @@ class _LTXConnectorAttnProcessor:
         key = key.view(batch_size, -1, kv_heads, head_dim)
         value = value.view(batch_size, -1, kv_heads, head_dim)
 
-        if attention_mask is not None and attn.omni_attention.attn_backend.get_name().upper() == "FLASH_ATTN":
+        # The connector replaces padding tokens with learned registers before
+        # entering its blocks, so every key is valid and the old padding mask
+        # becomes an all-keep no-op.
+        if self.has_learned_registers:
+            attention_mask = None
+        elif attention_mask is not None and attn.omni_attention.attn_backend.get_name().upper() == "FLASH_ATTN":
             attention_mask = to_ltx_padding_mask(attention_mask)
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         hidden_states = attn.omni_attention(query, key, value, attn_metadata)
@@ -144,6 +152,7 @@ class _LTXConnectorAttnProcessor:
 def _install_connector_attention(connectors: LTX2TextConnectors) -> None:
     for connector_name in ("video_connector", "audio_connector"):
         connector = getattr(connectors, connector_name, None)
+        has_learned_registers = getattr(connector, "learnable_registers", None) is not None
         for block_index, block in enumerate(getattr(connector, "transformer_blocks", ())):
             attention = getattr(block, "attn1", None)
             if attention is not None:
@@ -159,7 +168,7 @@ def _install_connector_attention(connectors: LTX2TextConnectors) -> None:
                     skip_sequence_parallel=True,
                     disable_kv_quant=True,
                 )
-                attention.set_processor(_LTXConnectorAttnProcessor())
+                attention.set_processor(_LTXConnectorAttnProcessor(has_learned_registers=has_learned_registers))
 
 
 def _detect_vocoder_output_sample_rate(model: str) -> int | None:
