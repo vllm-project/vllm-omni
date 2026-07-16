@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from typing import Any
 
 import msgspec
@@ -59,7 +59,10 @@ class OmniMsgpackEncoder:
         if isinstance(obj, Image.Image):
             return self._encode_pil_image(obj)
 
-        # RequestOutput (not a dataclass, needs special handling)
+        # RequestOutput (not a dataclass, needs special handling).
+        # Note: OmniRequestOutput subclasses RequestOutput but is a dataclass,
+        # so msgspec encodes it natively (field map) and it never reaches
+        # this hook.
         if isinstance(obj, RequestOutput):
             return self._encode_request_output(obj)
 
@@ -252,23 +255,30 @@ class OmniMsgpackDecoder:
     def _decode_omni_request_output(self, obj: dict[str, Any]) -> Any:
         """Decode dict to OmniRequestOutput.
 
-        OmniRequestOutput is a dataclass, so we can use msgspec.convert
-        or construct it directly.
+        By the time this runs, ``_post_process`` has already reconstructed
+        nested values bottom-up (CompletionOutput, tensors, images, ...), so
+        the object is built directly from the known dataclass fields.
         """
         from vllm_omni.outputs import OmniRequestOutput
 
+        data = dict(obj)
+        # Legacy wire format (pre-inheritance): the stage output was nested
+        # under "request_output". Merge its content via the compat setter.
+        legacy_inner = data.pop("request_output", None)
+        multi_modal_placeholders = data.pop("multi_modal_placeholders", None)
+        field_names = {f.name for f in fields(OmniRequestOutput)}
+        known = {k: v for k, v in data.items() if k in field_names}
         try:
-            # Use msgspec.convert for dataclass reconstruction
-            return msgspec.convert(obj, OmniRequestOutput)
+            out = OmniRequestOutput(**known)
         except Exception:
-            try:
-                # Fallback: construct directly if msgspec.convert fails
-                # (e.g., if some fields are missing or have wrong types)
-                return OmniRequestOutput(**obj)
-            except Exception:
-                # If both attempts fail, return dict as-is (defensive fallback)
-                # This should rarely happen if _is_omni_request_output is correct
-                return obj
+            # Defensive fallback; should rarely happen if
+            # _is_omni_request_output is correct.
+            return obj
+        if legacy_inner is not None and not isinstance(legacy_inner, dict):
+            out.request_output = legacy_inner
+        if multi_modal_placeholders is not None:
+            setattr(out, "multi_modal_placeholders", multi_modal_placeholders)
+        return out
 
     def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
         """Decode dict to torch.Tensor."""

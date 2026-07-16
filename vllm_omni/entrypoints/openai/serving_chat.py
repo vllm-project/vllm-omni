@@ -3099,7 +3099,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_id=request_id,
             )
 
-        images = getattr(result.request_output, "images", [])
+        images = getattr(result, "images", [])
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
         cot_output = None
@@ -3170,7 +3170,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
                 elif final_output_type == "image":
-                    images = self._flatten_diffusion_images(getattr(output.request_output, "images", []))
+                    images = self._flatten_diffusion_images(getattr(output, "images", []))
                     if not images:
                         raise RuntimeError("Streaming image edit produced an empty final image output.")
                     image_data = [
@@ -3474,8 +3474,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Image output path (text2img / img2img)
             final_output_type = getattr(result, "final_output_type", "image")
-            # Handle nested OmniRequestOutput structure where images might be in request_output
-            images = getattr(result.request_output, "images", [])
+            images = getattr(result, "images", [])
             multimodal_output = getattr(result, "multimodal_output", {}) or {}
             stage_durations = result.stage_durations
             peak_memory_mb = result.peak_memory_mb
