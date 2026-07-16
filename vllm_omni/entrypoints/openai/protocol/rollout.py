@@ -50,7 +50,7 @@ class Action(BaseModel):
 class SessionMetadata(BaseModel):
     latency_ms: float
     steps_generated: int
-    session_context_length: int
+    context_length: int
     committed_step_id: int = Field(
         description="Highest step_id whose context has been atomically committed. "
         "-1 means no step has been committed yet (fresh or reset session).",

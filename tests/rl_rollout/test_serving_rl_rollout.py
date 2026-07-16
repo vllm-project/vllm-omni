@@ -154,7 +154,7 @@ async def test_duplicate_step_does_not_rerun_or_advance(serving):
     assert resp.error is not None
     assert resp.error.code == "step_already_committed"
     assert resp.model_metadata.committed_step_id == 0
-    assert resp.model_metadata.session_context_length == 1
+    assert resp.model_metadata.context_length == 1
     serving._openpi.build_request.assert_called_once()
 
 
@@ -168,7 +168,7 @@ async def test_out_of_order_step_does_not_rerun_or_advance(serving):
     assert resp.error is not None
     assert resp.error.code == "step_out_of_order"
     assert resp.model_metadata.committed_step_id == -1
-    assert resp.model_metadata.session_context_length == 0
+    assert resp.model_metadata.context_length == 0
     serving._openpi.build_request.assert_not_called()
 
 
@@ -186,9 +186,12 @@ async def test_stateless_step_does_not_commit_context(serving):
 
     assert resp.error is None
     assert resp.model_metadata.committed_step_id == -1
-    assert resp.model_metadata.session_context_length == 0
+    assert resp.model_metadata.context_length == 0
     serving._openpi.build_request.assert_called_once()
-    assert serving._openpi.build_request.call_args.kwargs["reset"] is True
+    kwargs = serving._openpi.build_request.call_args.kwargs
+    assert kwargs["reset"] is True
+    assert kwargs["session_id"] != sess.session_id
+    assert kwargs["session_id"].startswith(f"{sess.session_id}:stateless:")
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +228,7 @@ async def test_failed_step_after_success_preserves_last_committed():
     )
     assert resp.error is not None
     assert resp.model_metadata.committed_step_id == 0  # still at last good step
-    assert resp.model_metadata.session_context_length == 1
+    assert resp.model_metadata.context_length == 1
 
 
 # ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ class _FakeRolloutServing:
             model_metadata=SessionMetadata(
                 latency_ms=0.0,
                 steps_generated=0,
-                session_context_length=0,
+                context_length=0,
                 committed_step_id=-1,
             ),
         )

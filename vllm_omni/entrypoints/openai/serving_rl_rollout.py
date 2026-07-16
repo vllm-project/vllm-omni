@@ -124,12 +124,7 @@ class ServingRLRollout:
         )
 
     async def reset_session(self, session_id: str) -> ResetSessionResponse:
-        try:
-            session = await self._store.reset(session_id)
-        except RolloutSessionNotFoundError:
-            raise
-        except RolloutSessionClosedError:
-            raise
+        session = await self._store.reset(session_id)
         # Tell the engine to drop KV state for this session on the next call
         # by passing reset=True; no engine call is issued here.
         logger.info("Reset rollout session %s", session_id)
@@ -212,12 +207,15 @@ class ServingRLRollout:
 
         # reset=True on first call after session create/reset
         reset = committed == -1 or not req.use_session_context
+        engine_session_id = session.session_id
+        if not req.use_session_context:
+            engine_session_id = f"{session.session_id}:stateless:{random_uuid()}"
         robot_obs = _merge_action_into_obs(req.observation, req.action)
 
         try:
             video_out = await self._infer_world_model(
                 obs=robot_obs,
-                session_id=session.session_id,
+                session_id=engine_session_id,
                 reset=reset,
             )
         except Exception as exc:
@@ -240,7 +238,7 @@ class ServingRLRollout:
         metadata = SessionMetadata(
             latency_ms=round(latency_ms, 2),
             steps_generated=1,
-            session_context_length=session.context_length,
+            context_length=session.context_length,
             committed_step_id=committed,
         )
         return RolloutStepResponse(
@@ -295,14 +293,14 @@ class ServingRLRollout:
     def _error_response(
         step_id: int,
         committed_step_id: int,
-        session_context_length: int,
+        context_length: int,
         code: str,
         message: str,
     ) -> RolloutStepResponse:
         metadata = SessionMetadata(
             latency_ms=0.0,
             steps_generated=0,
-            session_context_length=session_context_length,
+            context_length=context_length,
             committed_step_id=committed_step_id,
         )
         return RolloutStepResponse(
