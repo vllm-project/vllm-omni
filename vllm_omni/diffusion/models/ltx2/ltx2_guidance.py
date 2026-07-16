@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -33,15 +34,15 @@ class LTXModalityGuidance:
 
     @property
     def do_cfg(self) -> bool:
-        return self.cfg_scale != 1.0
+        return not math.isclose(self.cfg_scale, 1.0)
 
     @property
     def do_stg(self) -> bool:
-        return self.stg_scale != 0.0 and bool(self.stg_blocks)
+        return not math.isclose(self.stg_scale, 0.0) and bool(self.stg_blocks)
 
     @property
     def do_modality_guidance(self) -> bool:
-        return self.modality_scale != 1.0
+        return not math.isclose(self.modality_scale, 1.0)
 
 
 @dataclass(frozen=True)
@@ -111,11 +112,7 @@ class LTXGuidancePlan:
 
     @property
     def cfg_parallel_compatible(self) -> bool:
-        return (
-            self.names == ("cond", "uncond")
-            and self.spec.video.cfg_scale == self.spec.audio.cfg_scale
-            and not self.spec.do_rescale
-        )
+        return self.names == ("cond", "uncond") and not self.spec.do_rescale
 
 
 def x0_from_velocity(sample: torch.Tensor, velocity: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -154,14 +151,17 @@ def combine_guided_x0(
     uncond_text = uncond_text.float() if isinstance(uncond_text, torch.Tensor) else uncond_text
     uncond_perturbed = uncond_perturbed.float() if isinstance(uncond_perturbed, torch.Tensor) else uncond_perturbed
     uncond_modality = uncond_modality.float() if isinstance(uncond_modality, torch.Tensor) else uncond_modality
-    pred = (
-        cond
-        + (guidance.cfg_scale - 1) * (cond - uncond_text)
-        + guidance.stg_scale * (cond - uncond_perturbed)
-        + (guidance.modality_scale - 1) * (cond - uncond_modality)
-    )
+    pred = cond + (guidance.cfg_scale - 1) * (cond - uncond_text)
+    if guidance.do_stg:
+        pred = pred + guidance.stg_scale * (cond - uncond_perturbed)
+    pred = pred + (guidance.modality_scale - 1) * (cond - uncond_modality)
     if guidance.rescale_scale != 0.0:
-        factor = cond.std() / pred.std()
+        reduce_dims = tuple(range(1, pred.ndim))
+        cond_std = cond.std(dim=reduce_dims, keepdim=True)
+        pred_std = pred.std(dim=reduce_dims, keepdim=True)
+        eps = torch.finfo(pred.dtype).eps
+        factor = cond_std / pred_std.clamp_min(eps)
+        factor = torch.where(pred_std > eps, factor, torch.ones_like(factor))
         factor = guidance.rescale_scale * factor + (1 - guidance.rescale_scale)
         pred = pred * factor
     return pred.to(dtype)
@@ -214,9 +214,7 @@ class LTXGuidanceExecutor:
         if cfg_world_size != 2:
             raise ValueError(f"LTX CFG parallelism supports cfg_parallel_size 1 or 2, got {cfg_world_size}.")
         if not plan.cfg_parallel_compatible:
-            raise ValueError(
-                "LTX CFG parallelism only supports CFG-only guidance with equal video/audio scales and no rescale."
-            )
+            raise ValueError("LTX CFG parallelism only supports CFG-only guidance without rescale.")
 
     @staticmethod
     def prepare_denoise_context(
@@ -273,9 +271,15 @@ class LTXGuidanceExecutor:
         self.validate_cfg_world_size(plan, get_classifier_free_guidance_world_size())
         prompt = forward_ctx.prompt_context
         negative = get_classifier_free_guidance_rank() == 1
-        video_context = prompt.negative_connector_prompt_embeds if negative else prompt.positive_connector_prompt_embeds
+        video_context = (
+            prompt.negative_connector_prompt_embeds
+            if negative and plan.spec.video.do_cfg
+            else prompt.positive_connector_prompt_embeds
+        )
         audio_context = (
-            prompt.negative_connector_audio_prompt_embeds if negative else prompt.positive_connector_audio_prompt_embeds
+            prompt.negative_connector_audio_prompt_embeds
+            if negative and plan.spec.audio.do_cfg
+            else prompt.positive_connector_audio_prompt_embeds
         )
         if video_context is None or audio_context is None:
             raise ValueError("Negative prompt context is required when LTX CFG is enabled.")
@@ -296,15 +300,20 @@ class LTXGuidanceExecutor:
         group = get_cfg_group()
         video = group.all_gather(local_video, separate_tensors=True)
         audio = group.all_gather(local_audio, separate_tensors=True)
-        scale = plan.spec.video.cfg_scale
         return (
-            self.combine_cfg_velocity(state.video, video[0], video[1], pipeline.scheduler.sigmas[index], scale),
+            self.combine_cfg_velocity(
+                state.video,
+                video[0],
+                video[1],
+                pipeline.scheduler.sigmas[index],
+                plan.spec.video.cfg_scale,
+            ),
             self.combine_cfg_velocity(
                 state.audio,
                 audio[0],
                 audio[1],
                 forward_ctx.audio_scheduler.sigmas[index],
-                scale,
+                plan.spec.audio.cfg_scale,
             ),
         )
 

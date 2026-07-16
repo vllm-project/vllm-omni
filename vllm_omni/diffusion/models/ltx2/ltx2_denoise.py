@@ -193,9 +193,10 @@ def _official_ltx_sigmas(scheduler: Any, steps: int, device: torch.device) -> to
     exp_shift = math.exp(sigma_shift)
     sigmas = torch.where(sigmas != 0, exp_shift / (exp_shift + (1 / sigmas - 1)), 0)
 
-    terminal = config.get("shift_terminal", 0.1)
-    terminal = 0.1 if terminal is None else terminal
-    if terminal:
+    # Official non-distilled checkpoints explicitly set this to 0.1. Missing
+    # or None means the loaded scheduler disabled terminal stretching.
+    terminal = config.get("shift_terminal")
+    if terminal is not None:
         non_zero = sigmas != 0
         one_minus_sigmas = 1.0 - sigmas[non_zero]
         scale = one_minus_sigmas[-1] / (1.0 - terminal)

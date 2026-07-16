@@ -274,13 +274,14 @@ class LTXPipelineRuntime(
             and self.do_classifier_free_guidance
             and not self._guidance_plan.cfg_parallel_compatible
         ):
-            # The single-device warmup follows the full recipe. CFG2 can only
-            # execute CFG-only guidance today, so warm that supported shape.
-            cfg_scale = self._guidance_plan.spec.video.cfg_scale
-            if cfg_scale == 1.0:
-                cfg_scale = self._guidance_plan.spec.audio.cfg_scale
-            cfg = LTXModalityGuidance(cfg_scale=cfg_scale)
-            self._guidance_plan = LTXGuidancePlan.build(LTXGuidanceSpec(video=cfg, audio=cfg))
+            # The single-device warmup follows the full recipe. CFG2 executes
+            # the same per-modality CFG scales without STG/modality passes.
+            self._guidance_plan = LTXGuidancePlan.build(
+                LTXGuidanceSpec(
+                    video=LTXModalityGuidance(cfg_scale=self._guidance_plan.spec.video.cfg_scale),
+                    audio=LTXModalityGuidance(cfg_scale=self._guidance_plan.spec.audio.cfg_scale),
+                )
+            )
         if self.do_classifier_free_guidance:
             self.guidance_executor.validate_cfg_world_size(self._guidance_plan, cfg_world_size)
         return self.do_classifier_free_guidance and cfg_world_size > 1

@@ -76,7 +76,8 @@ class TestCFGParallelHelpers:
 
         assert cfg_parallel_ready is True
         assert pipe._guidance_plan.names == ("cond", "uncond")
-        assert pipe._guidance_plan.spec.video.cfg_scale == pipe._guidance_plan.spec.audio.cfg_scale == 3.0
+        assert pipe._guidance_plan.spec.video.cfg_scale == 3.0
+        assert pipe._guidance_plan.spec.audio.cfg_scale == 7.0
 
 
 class TestCFGParallelForwardPath:
@@ -339,8 +340,9 @@ class TestCFGParallelForwardPath:
                 num_frames=1,
                 frame_rate=frame_rate_input,
                 num_inference_steps=2,
-                guidance_scale=4.0,
                 extra_args={
+                    "video_cfg_scale": 3.0,
+                    "audio_cfg_scale": 7.0,
                     "video_stg_scale": 0.0,
                     "audio_stg_scale": 0.0,
                     "video_modality_scale": 1.0,
@@ -362,14 +364,14 @@ class TestCFGParallelForwardPath:
             video_pos,
             video_neg,
             pipe.scheduler.sigmas[0],
-            4.0,
+            3.0,
         )
         expected_audio_noise = ltx2_guidance.combine_velocity_via_x0(
             audio_latents,
             audio_pos,
             audio_neg,
             pipe.scheduler.sigmas[0],
-            4.0,
+            7.0,
         )
         scheduler_call_names = [call[0] for call in pipe.scheduler.calls]
         assert scheduler_call_names == ["video", "audio", "video", "audio"]

@@ -38,6 +38,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_runtime import LTXPipelineRun
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX2_ONE_STAGE_RECIPE,
     LTX23_ONE_STAGE_RECIPE,
+    LTX_DEFAULT_NEGATIVE_PROMPT,
     LTX_POSITIVE_ONLY_RECIPE,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs
@@ -64,11 +65,18 @@ def _make_ltx_request_pipe(cls):
     return pipe
 
 
-def _resolve_request_inputs_for_test(pipe, req, *, guidance_scale=4.0, guidance_rescale=None):
+def _resolve_request_inputs_for_test(
+    pipe,
+    req,
+    *,
+    guidance_scale=4.0,
+    guidance_rescale=None,
+    negative_prompt=None,
+):
     return pipe._resolve_request_inputs(
         req,
         prompt=None,
-        negative_prompt=None,
+        negative_prompt=negative_prompt,
         height=None,
         width=None,
         num_frames=None,
@@ -222,7 +230,12 @@ def test_ltx_guidance_combines_official_x0_deltas_in_fp32():
     uncond = torch.tensor([[0.0, 1.0]], dtype=torch.bfloat16)
     perturbed = torch.tensor([[0.5, 2.0]], dtype=torch.bfloat16)
     isolated = torch.tensor([[0.25, 2.5]], dtype=torch.bfloat16)
-    guidance = LTXModalityGuidance(cfg_scale=3.0, stg_scale=0.5, modality_scale=2.0)
+    guidance = LTXModalityGuidance(
+        cfg_scale=3.0,
+        stg_scale=0.5,
+        modality_scale=2.0,
+        stg_blocks=(0,),
+    )
 
     actual = combine_guided_x0(
         cond=cond,
@@ -239,6 +252,71 @@ def test_ltx_guidance_combines_official_x0_deltas_in_fp32():
     ).to(cond.dtype)
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_ltx_guidance_skips_stg_without_perturbed_blocks():
+    cond = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    guidance = LTXModalityGuidance(stg_scale=1.0, stg_blocks=())
+
+    plan = LTXGuidancePlan.build(LTXGuidanceSpec(video=guidance))
+    actual = combine_guided_x0(
+        cond=cond,
+        uncond_text=0.0,
+        uncond_perturbed=0.0,
+        uncond_modality=0.0,
+        guidance=guidance,
+    )
+
+    assert plan.names == ("cond",)
+    torch.testing.assert_close(actual, cond)
+
+
+def test_ltx_guidance_uses_official_close_to_disabled_semantics():
+    guidance = LTXModalityGuidance(
+        cfg_scale=1.0 + 1e-10,
+        stg_scale=0.0,
+        modality_scale=1.0 + 1e-10,
+        stg_blocks=(0,),
+    )
+
+    assert LTXGuidancePlan.build(LTXGuidanceSpec(video=guidance)).names == ("cond",)
+
+
+def test_ltx_guidance_rescales_each_sample_independently():
+    cond = torch.tensor(
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[10.0, 30.0], [50.0, 70.0]],
+        ]
+    )
+    uncond = torch.stack((torch.zeros_like(cond[0]), cond[1]))
+    guidance = LTXModalityGuidance(cfg_scale=2.0, rescale_scale=1.0)
+
+    actual = combine_guided_x0(
+        cond=cond,
+        uncond_text=uncond,
+        uncond_perturbed=0.0,
+        uncond_modality=0.0,
+        guidance=guidance,
+    )
+
+    torch.testing.assert_close(actual, cond)
+
+
+def test_ltx_guidance_rescale_handles_zero_variance_prediction():
+    cond = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    guidance = LTXModalityGuidance(cfg_scale=2.0, rescale_scale=1.0)
+
+    actual = combine_guided_x0(
+        cond=cond,
+        uncond_text=2 * cond,
+        uncond_perturbed=0.0,
+        uncond_modality=0.0,
+        guidance=guidance,
+    )
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, torch.zeros_like(cond))
 
 
 def test_ltx_guidance_builds_per_sample_stg_and_modality_masks():
@@ -271,6 +349,47 @@ def test_ltx_default_sigma_schedule_matches_official_shift_and_stretch():
     torch.testing.assert_close(
         sigmas,
         torch.tensor([1.0, 0.8671, 0.6316, 0.1, 0.0]),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+def test_ltx_sigma_schedule_does_not_stretch_when_terminal_config_is_missing():
+    scheduler = SimpleNamespace(
+        config={
+            "base_image_seq_len": 1024,
+            "max_image_seq_len": 4096,
+            "base_shift": 0.95,
+            "max_shift": 2.05,
+        }
+    )
+
+    sigmas = _official_ltx_sigmas(scheduler, steps=4, device=torch.device("cpu"))
+
+    torch.testing.assert_close(
+        sigmas,
+        torch.tensor([1.0, 0.9589, 0.8859, 0.7214, 0.0]),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+def test_ltx_sigma_schedule_does_not_stretch_when_terminal_is_disabled():
+    scheduler = SimpleNamespace(
+        config={
+            "base_image_seq_len": 1024,
+            "max_image_seq_len": 4096,
+            "base_shift": 0.95,
+            "max_shift": 2.05,
+            "shift_terminal": None,
+        }
+    )
+
+    sigmas = _official_ltx_sigmas(scheduler, steps=4, device=torch.device("cpu"))
+
+    torch.testing.assert_close(
+        sigmas,
+        torch.tensor([1.0, 0.9589, 0.8859, 0.7214, 0.0]),
         rtol=1e-4,
         atol=1e-4,
     )
@@ -534,6 +653,55 @@ def test_ltx_custom_sigmas_bypass_scheduler_shifting():
 
 
 class TestLTXRequestParsing:
+    def test_request_resolves_official_and_explicit_negative_prompts_per_sample(self):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt=prompt,
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+                    request_id=f"ltx-negative-prompt-{index}",
+                )
+                for index, prompt in enumerate(
+                    (
+                        "use the official default",
+                        {"prompt": "disable the default", "negative_prompt": ""},
+                        {"prompt": "custom negative", "negative_prompt": "custom"},
+                    )
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(_make_ltx_request_pipe(LTX23Pipeline), req)
+
+        assert resolved.negative_prompt == [LTX_DEFAULT_NEGATIVE_PROMPT, "", "custom"]
+
+    def test_forward_negative_prompt_fallback_is_not_discarded(self):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt="prompt",
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+                    request_id="ltx-forward-negative-prompt",
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(
+            _make_ltx_request_pipe(LTX23Pipeline),
+            req,
+            negative_prompt="forward fallback",
+        )
+
+        assert resolved.negative_prompt == ["forward fallback"]
+
     @pytest.mark.parametrize(
         ("t2v_cls", "i2v_cls"),
         [

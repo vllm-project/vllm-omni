@@ -94,6 +94,27 @@ def _normalize_stg_blocks(value: Any, default: tuple[int, ...]) -> tuple[int, ..
     return tuple(int(item) for item in value)
 
 
+def _resolve_negative_prompts(
+    prompts: list[Any],
+    fallback: str | list[str],
+) -> str | list[str]:
+    if not prompts:
+        return fallback
+    if isinstance(fallback, list) and len(fallback) != len(prompts):
+        raise ValueError(
+            f"`negative_prompt` has batch size {len(fallback)}, but the request batch has size {len(prompts)}."
+        )
+
+    resolved = []
+    for index, item in enumerate(prompts):
+        request_value = None if isinstance(item, str) else item.get("negative_prompt")
+        if request_value is not None:
+            resolved.append(request_value)
+        else:
+            resolved.append(fallback[index] if isinstance(fallback, list) else fallback)
+    return resolved
+
+
 def _resolve_modality_guidance(
     sampling: Any,
     modality: str,
@@ -224,12 +245,10 @@ class LTXRequestMixin:
         sampling_params_list = req.sampling_params_list
         sampling = sampling_params_list[0]
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
-        if all(isinstance(item, str) or item.get("negative_prompt") is None for item in req.prompts):
-            negative_prompt = None
-        elif req.prompts:
-            negative_prompt = [
-                "" if isinstance(item, str) else (item.get("negative_prompt") or "") for item in req.prompts
-            ]
+        negative_prompt = _resolve_negative_prompts(
+            req.prompts,
+            negative_prompt if negative_prompt is not None else self.one_stage_recipe.negative_prompt,
+        )
 
         height = sampling.height or height or self.one_stage_recipe.height
         width = sampling.width or width or self.one_stage_recipe.width
