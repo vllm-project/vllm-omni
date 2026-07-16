@@ -27,6 +27,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--official-root", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--gemma-root", type=Path)
+    parser.add_argument(
+        "--attention-backend",
+        choices=("default", "sdpa_flash"),
+        default="default",
+    )
+    parser.add_argument("--enable-layerwise-offload", action="store_true")
     return parser.parse_args()
 
 
@@ -67,6 +73,46 @@ def _insert_official_paths(official_root: Path) -> None:
             sys.path.insert(0, path)
 
 
+def _configure_official_sdpa_flash(pipeline: Any) -> None:
+    """Pin official connector and denoiser attention to PyTorch SDPA Flash."""
+    from ltx_core.loader.attention_ops import set_attention_module_op
+    from ltx_core.model.transformer.attention import PytorchAttention
+    from torch.nn.attention import SDPBackend
+
+    class AllValidSDPAFlash(PytorchAttention):
+        def __init__(self) -> None:
+            super().__init__(priority=[SDPBackend.FLASH_ATTENTION])
+
+        def __call__(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            heads: int,
+            mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            if mask is not None and torch.count_nonzero(mask).item():
+                raise ValueError("The LTX accuracy guard cannot discard a non-empty attention mask")
+            return super().__call__(query, key, value, heads, mask=None)
+
+    attention = AllValidSDPAFlash()
+    module_op = set_attention_module_op(
+        attention=attention,
+        masked_attention=attention,
+    )
+    owners_and_attributes = (
+        (pipeline.stage, "_transformer_builder"),
+        (pipeline.prompt_encoder, "_embeddings_processor_builder"),
+    )
+    for owner, attribute in owners_and_attributes:
+        builder = getattr(owner, attribute)
+        setattr(
+            owner,
+            attribute,
+            builder.with_module_ops((*builder.module_ops, module_op)),
+        )
+
+
 @torch.inference_mode()
 def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
     if args.official_root is None or args.checkpoint is None or args.gemma_root is None:
@@ -81,8 +127,10 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
         checkpoint_path=str(args.checkpoint),
         gemma_root=str(args.gemma_root),
         loras=(),
-        offload_mode=OffloadMode.NONE,
+        offload_mode=OffloadMode.CPU if args.enable_layerwise_offload else OffloadMode.NONE,
     )
+    if args.attention_backend == "sdpa_flash":
+        _configure_official_sdpa_flash(pipeline)
     video, audio = pipeline(
         prompt=request["prompt"],
         negative_prompt=request["negative_prompt"],
@@ -119,6 +167,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
         audio_sample_rate=audio.sampling_rate,
         metadata={
             "backend": "official",
+            "attention_backend": args.attention_backend,
             "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
             "checkpoint": str(args.checkpoint),
         },
@@ -196,6 +245,15 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     if args.model is None or args.model_class_name is None:
         raise ValueError("Omni backend requires --model and --model-class-name")
 
+    attention_config = None
+    if args.attention_backend == "sdpa_flash":
+        attention_config = {
+            "default": {
+                "backend": "TORCH_SDPA",
+                "extra": {"backends": ["FLASH_ATTENTION"]},
+            }
+        }
+
     from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
     from vllm_omni.entrypoints.omni import Omni
@@ -208,6 +266,8 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
         model=args.model,
         model_class_name=args.model_class_name,
         enforce_eager=True,
+        enable_layerwise_offload=args.enable_layerwise_offload,
+        diffusion_attention_config=attention_config,
         parallel_config=DiffusionParallelConfig(),
     )
     try:
@@ -238,7 +298,12 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
             video=_canonical_video(video),
             audio=audio_tensor,
             audio_sample_rate=audio_sample_rate,
-            metadata={"backend": "omni", "model": args.model, "model_class_name": model_class_name},
+            metadata={
+                "backend": "omni",
+                "attention_backend": args.attention_backend,
+                "model": args.model,
+                "model_class_name": model_class_name,
+            },
         )
     finally:
         omni.shutdown()

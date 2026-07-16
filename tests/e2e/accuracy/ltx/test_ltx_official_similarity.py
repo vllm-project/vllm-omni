@@ -43,14 +43,14 @@ NEGATIVE_PROMPT = (
     "stylized filters, or AI artifacts."
 )
 
-# The guard exercises each runtime's production-default attention backend. On
-# H100 that may be different kernels, so this is an E2E regression threshold,
-# not the tighter CUDNN-vs-CUDNN numerical-parity threshold used for diagnosis.
-VIDEO_SSIM_MEAN_THRESHOLD = 0.93
+# Both runtimes use PyTorch SDPA pinned to its FlashAttention backend so
+# backend drift does not dominate this pipeline-level accuracy guard.
+ATTENTION_BACKEND = "sdpa_flash"
+VIDEO_SSIM_MEAN_THRESHOLD = 0.95
 VIDEO_SSIM_MIN_THRESHOLD = 0.90
-VIDEO_PSNR_MEAN_THRESHOLD = 28.0
-AUDIO_RELATIVE_L2_THRESHOLD = 0.5
-AUDIO_COSINE_THRESHOLD = 0.9
+VIDEO_PSNR_MEAN_THRESHOLD = 30.0
+AUDIO_RELATIVE_L2_THRESHOLD = 0.2
+AUDIO_COSINE_THRESHOLD = 0.95
 
 
 @dataclass(frozen=True)
@@ -306,7 +306,11 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
         str(runner),
         "--request",
         str(request_path),
+        "--attention-backend",
+        ATTENTION_BACKEND,
     ]
+    if os.environ.get("VLLM_TEST_LTX_ENABLE_LAYERWISE_OFFLOAD", "").lower() in {"1", "true", "yes", "on"}:
+        base_command.append("--enable-layerwise-offload")
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
 
@@ -348,6 +352,8 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
     omni_metadata = json.loads((omni_output / "metadata.json").read_text())
+    assert official_metadata["attention_backend"] == ATTENTION_BACKEND
+    assert omni_metadata["attention_backend"] == ATTENTION_BACKEND
     assert official_metadata["audio_sample_rate"] == omni_metadata["audio_sample_rate"]
     video_metrics = _video_metrics(
         np.load(official_output / "video.npy"),
@@ -359,6 +365,7 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
     )
     result = {
         "case": case.name,
+        "attention_backend": ATTENTION_BACKEND,
         "official_revision": official_revision,
         "model_revision": case.model_revision,
         "checkpoint_revision": case.checkpoint_revision,
