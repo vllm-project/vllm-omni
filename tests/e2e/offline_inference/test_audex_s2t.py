@@ -83,7 +83,7 @@ def _wer(hyp: str, ref: str) -> float:
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_audex_offline_asr_smoke(omni_runner: OmniRunner, run_level: str) -> None:
     """Transcribing the public audio asset yields coherent, non-degenerate text."""
     audio, sr = AudioAsset("mary_had_lamb").audio_and_sample_rate

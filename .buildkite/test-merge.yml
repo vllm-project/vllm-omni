@@ -219,6 +219,13 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
+      # H100 pool, not gpu_1_queue: on the L4 tier this step stalled
+      # nondeterministically after engine init (builds 12273 and 12282 hit
+      # different tests — guided CFG and then the plain smoke — each silent
+      # for 36+ min until the step timeout). The stall never reproduced on
+      # H100 across 24 L4-emulated rounds (KV budget capped to L4 bytes,
+      # 4-CPU taskset, 8% MPS SM quota), so it is pinned to the tier where
+      # the suite is verified to pass in ~7.5 min.
       - label: "TTS · Audex Test"
         source_file_dependencies:
           - tests/e2e/offline_inference/test_audex_tts.py
@@ -236,17 +243,38 @@ steps:
               pytest -s -v tests/e2e/offline_inference/test_audex_tts.py tests/e2e/offline_inference/test_audex_tta.py tests/e2e/offline_inference/test_audex_s2t.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
-          queue: "gpu_1_queue"
+          queue: "mithril-h100-pool"
         plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              shm-size: "8gb"
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
 
       - label: "TTS · Higgs-Audio-V3 Test"
         source_file_dependencies:

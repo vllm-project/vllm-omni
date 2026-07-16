@@ -69,7 +69,7 @@ pytestmark = [
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_audex_offline_tts_smoke(omni_runner: OmniRunner, run_level: str) -> None:
     """Audex TTS from the repo root should produce sane 16 kHz audio per prompt.
 
@@ -130,9 +130,11 @@ def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, con
     return params
 
 
-# NOT advanced_model: on the L4 CI tier the guided cond/uncond pair stalled
-# in co-scheduling for 37+ min (observed on merge CI; never reproduced on
-# H100-tier KV headroom). Guided CFG coverage stays in the full_model runs.
+# H100 hardware mark: on the L4 CI tier the audex pipeline stalls
+# nondeterministically after engine init (merge CI hit it in this test on
+# build 12273 and in the plain smoke on 12282; never reproduced on H100).
+# The merge-CI step runs on the H100 pool accordingly.
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_level: str) -> None:
     """A guided request must yield exactly ONE audio stream (companion suppressed)."""
@@ -151,7 +153,7 @@ def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_lev
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, run_level: str) -> None:
     """cfg_scale=1.0 must be indistinguishable from not passing cfg at all."""
     prompt = build_cond_prompt(SYNTH_TEXTS[1])
