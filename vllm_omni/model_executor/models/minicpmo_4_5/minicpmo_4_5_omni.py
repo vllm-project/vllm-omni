@@ -301,34 +301,41 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
 
-            runtime_info = kwargs.get("runtime_additional_information")
-            talker_info = {}
-            if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                talker_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
-
-            with torch.inference_mode():
-                talker_result = self.talker(
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    additional_information=talker_info,
-                )
-
             dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
 
-            # Talker returns a (mel_spec, waveform_or_None) tuple. MiniCPM-o
-            # 4.5 emits only the waveform (mel_spec is always None); keep the
-            # 2-slot unpack so a future mel-emitting variant can plug in
-            # without changing the wrapper.
-            mm_out: dict = {}
-            if isinstance(talker_result, tuple) and len(talker_result) == 2:
-                _, waveform = talker_result
-                if waveform is not None:
-                    mm_out["model_outputs"] = [waveform]
+            runtime_info = kwargs.get("model_intermediate_buffer")
+            if runtime_info is None:
+                runtime_info = kwargs.get("runtime_additional_information")
+            talker_infos = runtime_info if isinstance(runtime_info, list) and runtime_info else [{}]
+            empty_waveform = torch.empty(0, dtype=torch.float32, device=device)
+            waveforms: list[torch.Tensor] = []
+            with torch.inference_mode():
+                for output_slot, talker_info in enumerate(talker_infos):
+                    if not isinstance(talker_info, dict) or any(
+                        talker_info.get(key) is None for key in ("tts_token_ids", "tts_hidden_states")
+                    ):
+                        waveforms.append(empty_waveform)
+                        continue
+
+                    talker_result = self.talker(
+                        input_ids=input_ids,
+                        positions=positions,
+                        inputs_embeds=inputs_embeds,
+                        additional_information=talker_info,
+                    )
+
+                    # MiniCPM-o 4.5 emits (mel_spec, waveform), with mel_spec
+                    # currently always None. Keep an empty slot when a request
+                    # produces no waveform so output indices stay batch-aligned.
+                    waveform = None
+                    if isinstance(talker_result, tuple) and len(talker_result) == 2:
+                        _, waveform = talker_result
+                    output_waveform = waveform if waveform is not None else empty_waveform
+                    waveforms.append(output_waveform)
 
             return OmniOutput(
                 text_hidden_states=dummy_hidden,
-                multimodal_outputs=mm_out if mm_out else None,
+                multimodal_outputs={"model_outputs": waveforms},
             )
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")

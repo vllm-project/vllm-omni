@@ -418,7 +418,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return None, None
 
     def compute_logits(self, hidden_states, *args, **kwargs):
-        return torch.zeros(1, 2, device=hidden_states.device if isinstance(hidden_states, torch.Tensor) else "cuda")
+        batch_size = hidden_states.shape[0] if isinstance(hidden_states, torch.Tensor) else 1
+        device = hidden_states.device if isinstance(hidden_states, torch.Tensor) else "cuda"
+        return torch.zeros(batch_size, 2, device=device)
 
     def sample(self, logits, sampling_metadata):
         return None
