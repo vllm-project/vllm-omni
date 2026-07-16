@@ -23,8 +23,8 @@ from tests.helpers.runtime import OmniServer
 # defined in the same module.
 #
 # Optional JSON field ``mark`` is applied as pytest marks via
-# ``create_paired_omni_benchmark_pytest_params`` (e.g. ``"mark": {"hardware_marks":
-# {"res": {"cuda": "H100"}, "num_cards": 2}, "marks": ["full_model", "omni"]}``).
+# ``create_paired_omni_benchmark_pytest_params`` (e.g. ``"mark": [{"hardware_marks":
+# {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "omni"]``).
 
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"

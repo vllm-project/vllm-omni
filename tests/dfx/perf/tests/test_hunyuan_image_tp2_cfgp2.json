@@ -1,18 +1,18 @@
 [
   {
     "test_name": "test_hunyuan_image_tp2_cfgp2",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 4
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 4
+        }
       },
-      "marks": [
-        "diffusion",
-        "local_model"
-      ]
-    },
+      "diffusion",
+      "local_model"
+    ],
     "description": "TP=2 CfgP=2 baseline",
     "server_type": "vllm-omni",
     "server_params": {

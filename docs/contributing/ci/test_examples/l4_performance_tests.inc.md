@@ -15,7 +15,7 @@ Without **`--test-config-file`**, each runner scans all `*.json` under `tests/df
 - **`run_benchmark.py`**: omni and TTS cases only (skips diffusion JSON).
 - **`run_diffusion_benchmark.py`**: diffusion cases only (skips omni / TTS JSON).
 
-Diffusion cases are detected when the JSON has `server_type` (typically `"vllm-omni"`) or `"diffusion"` in `mark.marks`. Omni / TTS JSON has neither.
+Diffusion cases are detected when the JSON has `server_type` (typically `"vllm-omni"`) or `"diffusion"` in the `mark` array. Omni / TTS JSON has neither.
 
 **Running perf cases**
 
@@ -24,10 +24,11 @@ Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bul
 ```JSON
 {
     "test_name": "test_qwen3_omni_async_chunk",
-    "mark": {
-        "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2},
-        "marks": ["full_model", "omni"]
-    },
+    "mark": [
+        {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}},
+        "full_model",
+        "omni"
+    ],
     "server_params": {
         "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         "stage_config_name": "qwen3_omni.yaml"
@@ -69,24 +70,25 @@ Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bul
 
 Optional top-level field on each perf JSON **case object** (one per `test_name`). `run_benchmark.py` and `run_diffusion_benchmark.py` read it via `tests.dfx.conftest.resolve_pytest_marks` and attach the marks to the corresponding `pytest.param`, so you can filter locally with `-m`.
 
-When `mark` is present, **`hardware_marks` is required** (same shape as `@hardware_test` / `hardware_marks()` in `tests/helpers/mark.py`). The optional `marks` list adds registered pytest markers such as `full_model`, `omni`, `tts`, `diffusion`, or `local_model`.
+When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same shape as `@hardware_test` / `hardware_marks()` in `tests/helpers/mark.py`), followed by registered pytest marker name strings such as `full_model`, `omni`, `tts`, `diffusion`, or `local_model`.
 
 Supported form:
 
 | Form | Example | Effect |
 | ---- | ------- | ------ |
-| Object (single platform) | `"mark": {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}, "marks": ["full_model", "diffusion"]}` | Hardware marks from `hardware_marks(...)`; `num_cards` > 1 adds `distributed_*` (+ CUDA `skipif_cuda` when applicable). Named entries in `marks` become extra pytest marks. |
-| Object (multi-platform) | `"mark": {"hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325", "npu": "A2"}, "num_cards": {"cuda": 2, "rocm": 2, "npu": 1}}, "marks": ["full_model", "omni"]}` | Same as above, but declares **multiple platforms** in one case. Each entry in `res` gets its own platform/resource marks (`cuda`/`H100`, `rocm`/`MI325`, `npu`/`A2`, …). `num_cards` may be one int (shared) or a per-platform dict. Filter examples: `-m "full_model and H100 and cuda"`, `-m "full_model and MI325 and rocm"`. |
+| Array (single platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "diffusion"]` | Hardware marks from `hardware_marks(...)`; `num_cards` > 1 adds `distributed_*` (+ CUDA `skipif_cuda` when applicable). String entries become extra pytest marks. |
+| Array (multi-platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325", "npu": "A2"}, "num_cards": {"cuda": 2, "rocm": 2, "npu": 1}}}, "full_model", "omni"]` | Same as above, but declares **multiple platforms** in one case. Filter examples: `-m "full_model and H100 and cuda"`, `-m "full_model and MI325 and rocm"`. |
 
 Recommended for L4 perf cases:
 
 ```JSON
 {
     "test_name": "test_bagel_single_device_single_stage_t2i",
-    "mark": {
-        "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1},
-        "marks": ["full_model", "diffusion"]
-    },
+    "mark": [
+        {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
+        "full_model",
+        "diffusion"
+    ],
     "server_type": "vllm-omni",
     "server_params": { "...": "..." },
     "benchmark_params": [ { "name": "1024x1024_steps20", "...": "..." } ]
@@ -98,10 +100,11 @@ Multi-GPU diffusion (example: Cosmos3 with `cfg-parallel-size=2`):
 ```JSON
 {
     "test_name": "test_cosmos3_t2i_official_demo_2gpu",
-    "mark": {
-        "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2},
-        "marks": ["full_model", "diffusion"]
-    },
+    "mark": [
+        {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}},
+        "full_model",
+        "diffusion"
+    ],
     "server_type": "vllm-omni",
     "benchmark_endpoint": "/v1/images/generations",
     "server_params": { "...": "..." },
@@ -109,10 +112,10 @@ Multi-GPU diffusion (example: Cosmos3 with `cfg-parallel-size=2`):
 }
 ```
 
-- Omni perf: `"marks": ["full_model", "omni"]`
-- TTS perf: `"marks": ["full_model", "tts"]`
-- Diffusion perf: `"marks": ["full_model", "diffusion"]`
-- HunyuanImage local-weight cases: add `"local_model"` to `marks`.
+- Omni perf: include `"omni"` in the `mark` array
+- TTS perf: include `"tts"` in the `mark` array
+- Diffusion perf: include `"diffusion"` in the `mark` array
+- HunyuanImage local-weight cases: add `"local_model"` to the `mark` array
 
 **Parametrization IDs**
 

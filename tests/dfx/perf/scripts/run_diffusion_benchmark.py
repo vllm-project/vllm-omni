@@ -16,7 +16,7 @@ A config JSON file may be passed via --test-config-file. If omitted, every ``*.j
 Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
 
 Optional JSON field ``mark`` is applied as pytest marks on that case via
-``pytest.param`` (e.g. ``"mark": {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}, "marks": ["full_model", "diffusion"]}``).
+``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).
 
 All benchmark results are written under BENCHMARK_RESULT_DIR (override via the
 DIFFUSION_BENCHMARK_DIR environment variable). Each source JSON file gets one

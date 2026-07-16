@@ -1,18 +1,18 @@
 [
   {
     "test_name": "test_wan22_i2v_single_device",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 1
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-device baseline",
     "server_type": "vllm-omni",
     "server_params": {
@@ -51,18 +51,18 @@
   },
   {
     "test_name": "test_wan22_i2v_usp2_vae_patch2_hsdp_slicing",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 2
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "USP=2 + VAE patch parallel=2 + HSDP + VAE slicing",
     "server_type": "vllm-omni",
     "server_params": {

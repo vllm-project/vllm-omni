@@ -92,10 +92,12 @@ def test_resolve_pytest_marks_hardware_dict_with_extra():
     from tests.dfx.conftest import resolve_pytest_marks
 
     marks = resolve_pytest_marks(
-        {
-            "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2},
-            "marks": ["full_model", "diffusion", "local_model"],
-        }
+        [
+            {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}},
+            "full_model",
+            "diffusion",
+            "local_model",
+        ]
     )
     names = {m.name for m in marks}
     assert "H100" in names
@@ -107,25 +109,42 @@ def test_resolve_pytest_marks_hardware_dict_with_extra():
     assert "local_model" in names
 
 
+def test_resolve_pytest_marks_rejects_legacy_object_format():
+    from tests.dfx.conftest import resolve_pytest_marks
+
+    with pytest.raises(ValueError, match="mark must be a list"):
+        resolve_pytest_marks(
+            {
+                "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1},
+                "marks": ["full_model"],
+            }
+        )
+
+
 def test_extract_mark_resource_label():
     from tests.dfx.conftest import extract_mark_resource_label
 
     assert extract_mark_resource_label(None) == "na"
     assert (
         extract_mark_resource_label(
-            {
-                "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1},
-                "marks": ["full_model"],
-            }
+            [
+                {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
+                "full_model",
+            ]
         )
         == "H100"
     )
     assert (
         extract_mark_resource_label(
-            {
-                "hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325"}, "num_cards": 2},
-                "marks": ["diffusion"],
-            }
+            [
+                {
+                    "hardware_marks": {
+                        "res": {"cuda": "H100", "rocm": "MI325"},
+                        "num_cards": 2,
+                    }
+                },
+                "diffusion",
+            ]
         )
         == "H100-MI325"
     )
@@ -186,10 +205,10 @@ def test_create_unique_server_pytest_params_applies_marks(tmp_path):
     configs = [
         {
             "test_name": "test_with_mark",
-            "mark": {
-                "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1},
-                "marks": ["full_model"],
-            },
+            "mark": [
+                {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
+                "full_model",
+            ],
             "server_params": {"model": "some/model"},
             "benchmark_params": [{"name": "p0", "num_prompts": 1}],
         },
@@ -211,13 +230,13 @@ def test_is_diffusion_perf_config():
     from tests.dfx.conftest import is_diffusion_perf_config
 
     assert not is_diffusion_perf_config(
-        {"test_name": "omni_a", "mark": {"hardware_marks": {"res": {"cuda": "H100"}}, "marks": ["omni"]}}
+        {"test_name": "omni_a", "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "omni"]}
     )
     assert is_diffusion_perf_config(
         {
             "test_name": "diff_a",
             "server_type": "vllm-omni",
-            "mark": {"hardware_marks": {"res": {"cuda": "H100"}}, "marks": ["diffusion"]},
+            "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "diffusion"],
         }
     )
 
@@ -241,19 +260,19 @@ def test_create_paired_omni_benchmark_pytest_params(tmp_path):
     configs = [
         {
             "test_name": "test_omni",
-            "mark": {
-                "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1},
-                "marks": ["omni"],
-            },
+            "mark": [
+                {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
+                "omni",
+            ],
             "server_params": {"model": "m/omni"},
             "benchmark_params": [{"name": "p0", "num_prompts": 1}, {"name": "p1", "num_prompts": 2}],
         },
         {
             "test_name": "test_tts",
-            "mark": {
-                "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1},
-                "marks": ["tts"],
-            },
+            "mark": [
+                {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}},
+                "tts",
+            ],
             "server_params": {"model": "m/tts"},
             "benchmark_params": [{"name": "p0", "num_prompts": 1}],
         },

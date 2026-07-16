@@ -1,18 +1,18 @@
 [
   {
     "test_name": "test_qwen_image_single_device",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 1
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-device baseline (no parallelism)",
     "server_type": "vllm-omni",
     "server_params": {
@@ -58,18 +58,18 @@
   },
   {
     "test_name": "test_qwen_image_single_device_step_execution",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 1
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-device baseline (no parallelism) with step execution",
     "server_type": "vllm-omni",
     "server_params": {
@@ -116,18 +116,18 @@
   },
   {
     "test_name": "test_qwen_image_ulysses2_cfg2_vae_patch4",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 4
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 4
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Ulysses SP=2 + CFG-parallel=2 + VAE Patch Parallel=4",
     "server_type": "vllm-omni",
     "server_params": {
@@ -161,18 +161,18 @@
   },
   {
     "test_name": "test_qwen_image_ulysses2_cfg2_cache_dit",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 4
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 4
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Ulysses SP=2 + CFG-parallel=2 + CacheDiT acceleration",
     "server_type": "vllm-omni",
     "server_params": {
@@ -232,18 +232,18 @@
   },
   {
     "test_name": "test_qwen_image_single_device_step_execution_high_concurrency",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 1
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-device Qwen-Image step-level execution benchmark at 512x512, 20 steps, concurrency sweep",
     "server_type": "vllm-omni",
     "server_params": {

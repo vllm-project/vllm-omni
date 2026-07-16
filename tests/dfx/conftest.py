@@ -27,61 +27,69 @@ def _named_pytest_marks(names: list[str]) -> list[pytest.MarkDecorator]:
     return marks
 
 
+def _hardware_marks_from_dict(hw: Any) -> list[pytest.MarkDecorator]:
+    if not isinstance(hw, dict):
+        raise ValueError(f"mark.hardware_marks must be a dict, got {type(hw).__name__}")
+    res = hw.get("res")
+    if not isinstance(res, dict):
+        raise ValueError(f"mark.hardware_marks.res must be a dict, got {type(res).__name__}")
+    num_cards = hw.get("num_cards", 1)
+    return list(hardware_marks(res=res, num_cards=num_cards))
+
+
 def resolve_pytest_marks(mark_field: Any) -> list[pytest.MarkDecorator]:
     """Convert a JSON ``mark`` field into pytest mark decorators.
 
     Supported form (per test-case object in perf/stability JSON)::
 
-        "mark": {
-            "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2},
-            "marks": ["full_model", "diffusion"]
-        }
+        "mark": [
+            {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}},
+            "full_model",
+            "diffusion"
+        ]
 
+    Exactly one ``hardware_marks`` object is required when ``mark`` is present.
     ``hardware_marks`` delegates to :func:`tests.helpers.mark.hardware_marks`
-    (same shape as ``@hardware_test``). Named marks come from the ``marks``
-    string list.
+    (same shape as ``@hardware_test``). Additional array entries are registered
+    pytest marker names (strings).
     """
     if mark_field is None:
         return []
 
-    if not isinstance(mark_field, dict):
-        raise ValueError(f"mark must be a dict with hardware_marks; got {type(mark_field).__name__}")
-
-    if "hardware_marks" in mark_field:
-        hw = mark_field["hardware_marks"]
-        if not isinstance(hw, dict):
-            raise ValueError(f"mark.hardware_marks must be a dict, got {type(hw).__name__}")
-        res = hw.get("res")
-        if not isinstance(res, dict):
-            raise ValueError(f"mark.hardware_marks.res must be a dict, got {type(res).__name__}")
-        num_cards = hw.get("num_cards", 1)
-        marks = list(hardware_marks(res=res, num_cards=num_cards))
-        unknown_keys = set(mark_field) - {"hardware_marks", "marks"}
-        if unknown_keys:
-            raise ValueError(
-                f"mark dict with hardware_marks only allows a marks string list; unknown keys: {sorted(unknown_keys)}"
-            )
-        if "marks" in mark_field:
-            extra = mark_field["marks"]
-            if isinstance(extra, str):
-                extra = [extra]
-            if not isinstance(extra, list) or not all(isinstance(item, str) for item in extra):
-                raise ValueError("mark.marks must be a string or list of strings")
-            marks.extend(_named_pytest_marks(extra))
+    if isinstance(mark_field, list):
+        marks: list[pytest.MarkDecorator] = []
+        hw_seen = False
+        for item in mark_field:
+            if isinstance(item, dict) and "hardware_marks" in item:
+                if hw_seen:
+                    raise ValueError("mark array must contain at most one hardware_marks object")
+                hw_seen = True
+                marks.extend(_hardware_marks_from_dict(item["hardware_marks"]))
+                unknown_keys = set(item) - {"hardware_marks"}
+                if unknown_keys:
+                    raise ValueError(
+                        f"mark hardware_marks object only allows hardware_marks; unknown keys: {sorted(unknown_keys)}"
+                    )
+            elif isinstance(item, str):
+                item = item.strip()
+                if not item:
+                    raise ValueError("mark name must be a non-empty string")
+                marks.extend(_named_pytest_marks([item]))
+            else:
+                raise ValueError(
+                    f"mark array entries must be hardware_marks objects or marker name strings; got {type(item).__name__}"
+                )
+        if not hw_seen:
+            raise ValueError("mark array must contain a hardware_marks object")
         return marks
 
-    raise ValueError(f"mark dict must contain hardware_marks; got keys {sorted(mark_field.keys())}")
+    raise ValueError(f"mark must be a list; got {type(mark_field).__name__}")
 
 
 def _mark_names(mark_field: Any) -> set[str]:
-    if not isinstance(mark_field, dict):
-        return set()
-    marks = mark_field.get("marks") or []
-    if isinstance(marks, str):
-        marks = [marks]
-    if not isinstance(marks, list):
-        return set()
-    return {str(item) for item in marks if isinstance(item, str)}
+    if isinstance(mark_field, list):
+        return {str(item) for item in mark_field if isinstance(item, str)}
+    return set()
 
 
 def is_diffusion_perf_config(cfg: dict[str, Any]) -> bool:
@@ -520,6 +528,11 @@ def extract_mark_resource_label(mark_field: Any) -> str:
     Prefer :func:`get_runtime_resource_label` for perf result filenames so labels
     reflect the machine that actually ran the benchmark.
     """
+    if isinstance(mark_field, list):
+        for item in mark_field:
+            if isinstance(item, dict) and "hardware_marks" in item:
+                return extract_mark_resource_label(item)
+        return "na"
     if not isinstance(mark_field, dict):
         return "na"
     hw = mark_field.get("hardware_marks")

@@ -1,18 +1,18 @@
 [
   {
     "test_name": "test_ltx2_baseline_eager",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 1
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-device baseline with enforce-eager (no torch.compile)",
     "server_type": "vllm-omni",
     "server_params": {
@@ -55,18 +55,18 @@
   },
   {
     "test_name": "test_ltx2_torch_compile",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 1
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-device with torch.compile (default, no enforce-eager)",
     "server_type": "vllm-omni",
     "server_params": {
@@ -108,18 +108,18 @@
   },
   {
     "test_name": "test_ltx2_cfg2_eager",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 2
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "CFG-parallel=2 with enforce-eager",
     "server_type": "vllm-omni",
     "server_params": {
@@ -163,18 +163,18 @@
   },
   {
     "test_name": "test_ltx2_cfg2_compile",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 2
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "CFG-parallel=2 with torch.compile",
     "server_type": "vllm-omni",
     "server_params": {
@@ -217,18 +217,18 @@
   },
   {
     "test_name": "test_ltx2_cache_dit_eager",
-    "mark": {
-      "hardware_marks": {
-        "res": {
-          "cuda": "H100"
-        },
-        "num_cards": 1
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
       },
-      "marks": [
-        "full_model",
-        "diffusion"
-      ]
-    },
+      "full_model",
+      "diffusion"
+    ],
     "description": "CacheDiT with enforce-eager",
     "server_type": "vllm-omni",
     "server_params": {

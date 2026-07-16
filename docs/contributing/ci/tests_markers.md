@@ -125,15 +125,16 @@ def test_feature(omni_server):
 
 Perf JSON under `tests/dfx/perf/tests/` can attach pytest marks per **case** (`test_name` block). Parsed by `tests.dfx.conftest.resolve_pytest_marks` and applied to each parametrized run in `run_benchmark.py` / `run_diffusion_benchmark.py`.
 
-When `mark` is present, **`hardware_marks` is required** (same semantics as `hardware_marks()` above). Add a `marks` list for level/type tags, for example `full_model` + `omni` / `tts` / `diffusion`.
+When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same semantics as `hardware_marks()` above), followed by registered pytest marker name strings such as `full_model`, `omni`, `tts`, or `diffusion`.
 
 ```json
 {
   "test_name": "test_cosmos3_t2i_official_demo_2gpu",
-  "mark": {
-    "hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2},
-    "marks": ["full_model", "diffusion"]
-  },
+  "mark": [
+    {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}},
+    "full_model",
+    "diffusion"
+  ],
   "server_type": "vllm-omni",
   "server_params": { "...": "..." },
   "benchmark_params": [{ "name": "1024x1024_steps4", "...": "..." }]
