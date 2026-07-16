@@ -1,9 +1,8 @@
-# MiniCPM-o 4.5 deploy: 3-GPU layout (thinker TP=2 + talker on GPU 2).
+# MiniCPM-o 4.5 opt-in batching deploy: 2-GPU layout.
 #
-# Stage 0 (thinker): GPU 0,1 — 2-way tensor parallel, ~70% mem each.
-# Stage 1 (talker) : GPU 2   — MiniCPMTTS + Token2Wav, ~75% mem
-#                              (covers both the talker LM and the in-process
-#                              Token2Wav vocoder that emits the waveform).
+# Stage 0 uses vLLM continuous batching. Stage 1 accepts a request-aligned
+# runner batch, but MiniCPMTTS.generate() and Token2Wav are still executed
+# serially per request inside the model forward pass.
 pipeline: minicpmo_4_5
 async_chunk: false
 
@@ -12,12 +11,12 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
-    max_num_seqs: 16
+    max_num_seqs: 4
     gpu_memory_utilization: 0.7
-    enforce_eager: false
-    tensor_parallel_size: 2
+    enforce_eager: true
+    tensor_parallel_size: 1
     max_num_batched_tokens: 16384
-    devices: "0,1"
+    devices: "0"
     limit_mm_per_prompt:
       video: 1
     default_sampling_params:
@@ -30,12 +29,11 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    # Conservative default; use a validated batching variant before raising.
-    max_num_seqs: 1
+    max_num_seqs: 4
     gpu_memory_utilization: 0.75
-    enforce_eager: false
+    enforce_eager: true
     max_num_batched_tokens: 8192
-    devices: "2"
+    devices: "1"
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

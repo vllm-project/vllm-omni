@@ -179,6 +179,30 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     ) -> torch.Tensor:
         if self.model_stage == "tts":
             return self.get_input_embeddings(input_ids)
+        if multimodal_embeddings is not None and is_multimodal is not None:
+            n_ph = int(is_multimodal.sum().item()) if hasattr(is_multimodal, "sum") else -1
+            parts = []
+            total_emb = 0
+            for e in multimodal_embeddings:
+                n = int(e.shape[0]) if hasattr(e, "shape") else -1
+                parts.append(str(n))
+                if n > 0:
+                    total_emb += n
+            if n_ph >= 0 and total_emb != n_ph:
+                logger.error(
+                    "MiniCPM-o MM placeholder/embed mismatch before merge: "
+                    "embeds=%s (sum=%s) placeholders=%s pool_step=%s",
+                    "+".join(parts),
+                    total_emb,
+                    n_ph,
+                    getattr(getattr(self, "config", None), "audio_pool_step", "?"),
+                )
+            else:
+                logger.debug(
+                    "MiniCPM-o MM merge ok: embeds=%s placeholders=%s",
+                    "+".join(parts) if parts else "0",
+                    n_ph,
+                )
         return super().embed_input_ids(input_ids, multimodal_embeddings, is_multimodal=is_multimodal)
 
     def get_multimodal_embeddings(self, **kwargs):
@@ -301,34 +325,48 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
 
-            runtime_info = kwargs.get("runtime_additional_information")
-            talker_info = {}
-            if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                talker_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
-
-            with torch.inference_mode():
-                talker_result = self.talker(
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    additional_information=talker_info,
-                )
+            runtime_info = kwargs.get("model_intermediate_buffer")
+            if runtime_info is None:
+                runtime_info = kwargs.get("runtime_additional_information")
+            if isinstance(runtime_info, list) and runtime_info:
+                talker_infos = [info if isinstance(info, dict) else {} for info in runtime_info]
+            else:
+                talker_infos = [additional_information or {}]
 
             dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
 
-            # Talker returns a (mel_spec, waveform_or_None) tuple. MiniCPM-o
-            # 4.5 emits only the waveform (mel_spec is always None); keep the
-            # 2-slot unpack so a future mel-emitting variant can plug in
-            # without changing the wrapper.
-            mm_out: dict = {}
-            if isinstance(talker_result, tuple) and len(talker_result) == 2:
-                _, waveform = talker_result
-                if waveform is not None:
-                    mm_out["model_outputs"] = [waveform]
+            # MiniCPMTTS.generate() is still a blocking single-request API.
+            # Execute each row serially but keep one output slot per request so
+            # the runner can route waveforms without falling back to request 0.
+            waveforms: list[torch.Tensor] = []
+            valid_waveforms = 0
+            with torch.inference_mode():
+                for talker_info in talker_infos:
+                    talker_result = self.talker(
+                        input_ids=input_ids,
+                        positions=positions,
+                        inputs_embeds=inputs_embeds,
+                        additional_information=talker_info,
+                    )
+                    waveform = None
+                    if isinstance(talker_result, tuple) and len(talker_result) == 2:
+                        _, waveform = talker_result
+                    if waveform is None:
+                        waveforms.append(torch.empty(0, dtype=torch.float32))
+                    else:
+                        waveforms.append(torch.as_tensor(waveform, dtype=torch.float32))
+                        valid_waveforms += 1
+
+            logger.info(
+                "MiniCPM-o talker batch complete: requests=%d audio_outputs=%d empty_outputs=%d",
+                len(talker_infos),
+                valid_waveforms,
+                len(talker_infos) - valid_waveforms,
+            )
 
             return OmniOutput(
                 text_hidden_states=dummy_hidden,
-                multimodal_outputs=mm_out if mm_out else None,
+                multimodal_outputs={"model_outputs": waveforms},
             )
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")

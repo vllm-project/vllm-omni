@@ -2899,6 +2899,31 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config()
 
+    def _align_processor_audio_pool_step(self, hf_processor):
+        """Force processor.pool_step to match config.audio_pool_step.
+
+        vLLM's vendored MiniCPMOProcessor defaults pool_step=2, while
+        MiniCPM-o 4.5 checkpoints use audio_pool_step=5. Mismatch yields
+        ``assign N embeds to M placeholders`` crashes on audio+video.
+        """
+        expected = int(self.get_default_audio_pool_step())
+        current = getattr(hf_processor, "pool_step", None)
+        if current is None:
+            # Official trust_remote_code processor may only expose audio_pool_step.
+            current = getattr(hf_processor, "audio_pool_step", None)
+        if current is not None and int(current) != expected:
+            logger.warning(
+                "Overriding MiniCPM-o processor.pool_step %s -> %s "
+                "(must match config.audio_pool_step for placeholder/embed parity)",
+                current,
+                expected,
+            )
+        if hasattr(hf_processor, "pool_step"):
+            hf_processor.pool_step = expected
+        if hasattr(hf_processor, "audio_pool_step"):
+            hf_processor.audio_pool_step = expected
+        return hf_processor
+
     def get_hf_processor(self, **kwargs: object):
         # When skip_tokenizer_init=True (e.g. in worker), ctx.tokenizer is None.
         # HF MiniCPM processor requires a tokenizer; use get_tokenizer() which loads lazily.
@@ -2913,6 +2938,33 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
             )
         else:
             hf_processor = self.ctx.get_hf_processor(**kwargs)
+
+        # Prefer vendored processor with explicit pool_step (upstream MiniCPMO pattern).
+        try:
+            from vllm.transformers_utils.processors.minicpmo import MiniCPMOProcessor
+
+            if not isinstance(hf_processor, MiniCPMOProcessor):
+                hf_processor = MiniCPMOProcessor(
+                    image_processor=hf_processor.image_processor,
+                    feature_extractor=getattr(
+                        hf_processor, "feature_extractor", None
+                    )
+                    or getattr(hf_processor, "audio_processor", None),
+                    tokenizer=hf_processor.tokenizer,
+                    pool_step=self.get_default_audio_pool_step(),
+                )
+                logger.info(
+                    "Wrapped MiniCPM-o HF processor with vendored MiniCPMOProcessor "
+                    "(pool_step=%s)",
+                    hf_processor.pool_step,
+                )
+        except Exception as e:
+            logger.warning(
+                "Could not wrap MiniCPMOProcessor (%s); aligning pool_step in-place",
+                e,
+            )
+
+        self._align_processor_audio_pool_step(hf_processor)
 
         # NumPy arrays are considered as Iterable but not Sequence in
         # https://github.com/huggingface/transformers/blob/main/src/transformers/image_transforms.py#L428
@@ -4230,17 +4282,35 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         # NOTE: It is important to iterate over the keys in this dictionary
         # to preserve the order of the modalities.
+        modality_lens: list[str] = []
         for modality in mm_input_by_modality:
             multimodal_input = mm_input_by_modality[modality]
             if modality == "images":
                 image_embeddings = self._process_vision_input(multimodal_input)
                 multimodal_embeddings += tuple(image_embeddings)
+                modality_lens.append(
+                    f"image={[e.shape[0] for e in image_embeddings]}"
+                )
             if modality == "videos":
                 video_embeddings = self._process_vision_input(multimodal_input)
                 multimodal_embeddings += tuple(video_embeddings)
+                modality_lens.append(
+                    f"video={[e.shape[0] for e in video_embeddings]}"
+                )
             if modality == "audios":
                 audio_embeddings = self._process_audio_input(multimodal_input)
                 multimodal_embeddings += tuple(audio_embeddings)
+                modality_lens.append(
+                    f"audio={[e.shape[0] for e in audio_embeddings]} "
+                    f"(pool_step={getattr(self.config, 'audio_pool_step', '?')})"
+                )
+        if modality_lens:
+            total = sum(int(e.shape[0]) for e in multimodal_embeddings)
+            logger.info(
+                "MiniCPM-o MM embeds: %s total=%s",
+                ", ".join(modality_lens),
+                total,
+            )
         return multimodal_embeddings
 
     def get_input_embeddings(

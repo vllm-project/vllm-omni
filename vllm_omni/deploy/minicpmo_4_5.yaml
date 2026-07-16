@@ -6,6 +6,7 @@
 #                      (talker LM plus the vocoder that emits the waveform).
 #
 # Other GPU layouts: minicpmo_4_5_3gpu.yaml, minicpmo_4_5_8x4090.yaml.
+# Opt-in request batching: minicpmo_4_5_batching.yaml.
 async_chunk: false
 
 trust_remote_code: true
@@ -31,8 +32,8 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    # Talker only consumes runtime_additional_information[0]; any value > 1
-    # makes concurrent requests share request-0's audio (mm_outputs fallback).
+    # Keep the compatibility default at one request. The batching deploy raises
+    # this after enabling request-aligned serial Talker execution.
     max_num_seqs: 1
     gpu_memory_utilization: 0.1
     enforce_eager: false

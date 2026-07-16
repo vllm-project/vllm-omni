@@ -42,8 +42,7 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    # Talker only consumes runtime_additional_information[0]; any value > 1
-    # makes concurrent requests share request-0's audio (mm_outputs fallback).
+    # Conservative 24GB default; benchmark memory before raising this value.
     max_num_seqs: 1
     gpu_memory_utilization: 0.9
     enforce_eager: true
