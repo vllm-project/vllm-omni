@@ -92,12 +92,12 @@ Full pattern hierarchy: `TakeRank`, `Union`, `GatherDim`, `AllGather`, `StitchSp
 
 From highest to lowest, when the same axis is touched by multiple layers:
 
-1. **CLI overrides** (`--stage_N_tensor_parallel_size`, `--stage-overrides`, `--omni-lb-policy`, etc.). A CLI value always wins; a warning is emitted whenever it overrides a strategy-declared axis (see `_reconcile_strategy_with_cli` in `vllm_omni/config/config_factory.py`).
+1. **CLI overrides** (`--tensor-parallel-size`, `--stage-overrides`, `--omni-lb-policy`, etc.). A CLI value always wins; a warning is emitted whenever it overrides a strategy-declared axis (see `_reconcile_strategy_with_cli` in `vllm_omni/config/config_factory.py`).
 2. **Strategy YAML** (`--strategy-config`). Derived sizing is written onto the merged stages with *conflict-on-explicit* semantics — if the deploy YAML already set a value to something different, application raises `StrategyApplyError`.
 3. **Deploy YAML** (`--deploy-config` or the bundled `vllm_omni/deploy/<model_type>.yaml`).
 4. **Parser defaults.**
 
-After CLI overrides land, the device-layout guard re-runs (`check_device_layout`, called from `_reconcile_strategy_with_cli`) against the *effective* `tp * dp * pp * num_replicas` and the resolved `devices` string, so a `--devices` or `--tensor-parallel-size` that conflicts with the strategy's world size cannot slip past the pre-spawn check.
+After CLI overrides land, the device-layout guard re-runs (`check_device_layout`, called from `_reconcile_strategy_with_cli`) against the *effective* `tp * dp * pp * num_replicas` and the resolved `devices` string, so a `devices` value passed through `--stage-overrides` or a `--tensor-parallel-size` value that conflicts with the strategy's world size cannot slip past the pre-spawn check.
 
 ## Worked example
 
@@ -214,7 +214,7 @@ Strategy keys MUST be `model_stage` *names* (strings), the same labels stage con
     Use the `model_stage` name (e.g. `thinker`) instead.
 
 !!! warning "Mixing CLI overrides with a strategy on the same axis"
-    A strategy is meant to be the single writer for the axes it declares. If a CLI override (`--stage_0_tensor_parallel_size`, `--stage-overrides '{"0": {...}}'`) sets the same axis, the **CLI value wins** and a warning is emitted from `_reconcile_strategy_with_cli`. The device-layout guard then re-runs against the effective layout, so a CLI override that breaks `tp * dp * pp * num_replicas` will still fail fast at config time.
+    A strategy is meant to be the single writer for the axes it declares. If a CLI override (`--tensor-parallel-size 2`, `--stage-overrides '{"0": {"tensor_parallel_size": 2}}'`) sets the same axis, the **CLI value wins** and a warning is emitted from `_reconcile_strategy_with_cli`. The device-layout guard then re-runs against the effective layout, so a CLI override that breaks `tp * dp * pp * num_replicas` will still fail fast at config time.
 
 !!! warning "Passing `--strategy-config` against the legacy `--stage-configs-path`"
     Composable parallel only applies on the registry-based deploy path. If a model still resolves through the legacy `stage_args` YAML (loaded via `--stage-configs-path`), `--strategy-config` is silently inapplicable and emits:

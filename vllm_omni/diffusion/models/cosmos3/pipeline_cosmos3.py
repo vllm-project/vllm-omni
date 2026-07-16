@@ -20,7 +20,8 @@ Video generation is further specialized by inputs and extra args:
   transfer video generation.
 * ``action_mode``: action-capable video generation. RoboLab/OpenPI observation
   payloads in ``extra_args["robot_obs"]`` or ``extra_args["observation"]``
-  bypass normal video output and return action-only custom output.
+  bypass normal video output and return an action-only payload/metadata
+  envelope.
 
 Generated sound is video-only, cannot be combined with action or transfer, and
 is produced from sound latents rather than from ``multi_modal_data["audio"]``.
@@ -57,6 +58,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
     SupportImageInput,
+    SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -131,6 +133,7 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
 
 COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES = (
     max(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION) * COSMOS3_VAE_TEMPORAL_COMPRESSION + 1
@@ -529,6 +532,37 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         if output_type == "latent":
             return output
 
+        def _postprocess_action(action: Any, metadata: dict[str, Any]) -> Any:
+            internal_metadata = metadata.get("internal")
+            inputs = (
+                internal_metadata.get("robolab_action_postprocess") if isinstance(internal_metadata, dict) else None
+            )
+            if isinstance(inputs, RoboLabActionPostprocessInputs):
+                return postprocess_robolab_action(action, inputs)
+            return action
+
+        pending_action = None
+        pending_action_metadata: dict[str, Any] = {}
+        envelope_public_metadata: dict[str, Any] = {}
+        if isinstance(output, dict) and isinstance(output.get("payload"), dict):
+            envelope_payload = dict(output.get("payload") or {})
+            metadata = output.get("metadata") or {}
+            envelope_metadata = metadata if isinstance(metadata, dict) else {}
+            envelope_public_metadata = {key: value for key, value in envelope_metadata.items() if key != "internal"}
+            action = envelope_payload.pop("actions", None)
+            if action is not None:
+                pending_action = _postprocess_action(action, envelope_metadata)
+                pending_action_metadata = envelope_public_metadata
+                if not envelope_payload:
+                    return {
+                        "payload": {
+                            "video": [],
+                            "actions": pending_action,
+                        },
+                        "metadata": pending_action_metadata,
+                    }
+            output = envelope_payload
+
         audio = None
         audio_sample_rate = None
         if isinstance(output, dict):
@@ -567,11 +601,31 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
                 # check_video_safety expects a 5D tensor; re-add T axis.
                 checked = check_video_safety(image.unsqueeze(2))
                 image = checked.squeeze(2)
-            return video_processor.postprocess(image, output_type="pil")
-        if is_guardrails_enabled(od_config, sampling_params):
+            processed_image = video_processor.postprocess(image, output_type="pil")
+            if envelope_public_metadata:
+                return {
+                    "payload": {"image": processed_image},
+                    "metadata": envelope_public_metadata,
+                }
+            return processed_image
+        guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
+        if guardrails_enabled:
             video = check_video_safety(video)
         processed_video = video_processor.postprocess_video(video, output_type=output_type)
         if audio is None:
+            if pending_action is not None:
+                return {
+                    "payload": {
+                        "video": processed_video,
+                        "actions": pending_action,
+                    },
+                    "metadata": pending_action_metadata,
+                }
+            if envelope_public_metadata:
+                return {
+                    "payload": {"video": processed_video},
+                    "metadata": envelope_public_metadata,
+                }
             return processed_video
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
@@ -582,31 +636,36 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         }
         if audio_sample_rate is not None:
             result["audio_sample_rate"] = int(audio_sample_rate)
+        if pending_action is not None:
+            return {
+                "payload": {
+                    "video": result["video"],
+                    "audio": result["audio"],
+                    "actions": pending_action,
+                },
+                "metadata": {
+                    **pending_action_metadata,
+                    "video": {"fps": result["fps"]},
+                    "audio": {"sample_rate": result.get("audio_sample_rate")},
+                },
+            }
+        if envelope_public_metadata:
+            return {
+                "payload": {
+                    "video": result["video"],
+                    "audio": result["audio"],
+                },
+                "metadata": {
+                    **envelope_public_metadata,
+                    "video": {"fps": result["fps"], **envelope_public_metadata.get("video", {})}
+                    if isinstance(envelope_public_metadata.get("video"), dict)
+                    else {"fps": result["fps"]},
+                    "audio": {"sample_rate": result.get("audio_sample_rate")},
+                },
+            }
         return result
 
     return post_process_func
-
-
-def get_cosmos3_action_post_process_func(od_config: OmniDiffusionConfig):
-    """Build the custom-output postprocessor for Cosmos3 action predictions.
-
-    Action modes return predicted action tensors in ``custom_output`` alongside
-    normal video output. RoboLab/OpenPI policy serving marks action-only output
-    and carries observation metadata used here to map model-space actions back
-    to the requested robot action representation.
-    """
-    del od_config
-
-    def action_post_process_func(action: Any, custom_output: dict[str, Any] | None = None, sampling_params=None):
-        del sampling_params
-        inputs = custom_output.get("robolab_action_postprocess") if isinstance(custom_output, dict) else None
-        if isinstance(inputs, RoboLabActionPostprocessInputs):
-            processed_action = postprocess_robolab_action(action, inputs)
-            custom_output.pop("robolab_action_postprocess", None)
-            return processed_action
-        return action
-
-    return action_post_process_func
 
 
 def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
@@ -628,7 +687,12 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 # Pipeline
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
-    nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    CFGParallelMixin,
+    SupportImageInput,
+    SupportsComponentDiscovery,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """Cosmos3 text/image/video/sound/action pipeline.
 
@@ -663,14 +727,19 @@ class Cosmos3OmniDiffusersPipeline(
       T2I, transfer, and action+sound are rejected.
     * **Action generation** when ``action_mode`` is provided. ``policy`` and
       ``forward_dynamics`` require an image or video input; ``inverse_dynamics``
-      requires video input. Action predictions are returned in ``custom_output``.
+      requires video input. Action predictions are returned in the diffusion
+      output payload/metadata envelope.
       RoboLab/OpenPI observations in ``extra_args['robot_obs']`` or
-      ``extra_args['observation']`` return action-only custom output.
+      ``extra_args['observation']`` return an action-only envelope.
     * **T2V** otherwise (default video generation).
     """
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = []
 
     @classmethod
     def reference_video_decode_spec(
@@ -714,12 +783,6 @@ class Cosmos3OmniDiffusersPipeline(
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if od_config.enable_cpu_offload:
-            raise ValueError(
-                "Cosmos3 has no separate text encoder, so CPU offloading "
-                "(transformer↔encoder swapping) is not supported. "
-                "Use --enable-layerwise-offload instead."
-            )
         self.od_config = od_config
         self.device = get_local_device()
         self.dtype = od_config.dtype
@@ -822,6 +885,32 @@ class Cosmos3OmniDiffusersPipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool = True,
+        use_hsdp: bool = False,
+    ) -> None:
+        """Enable Cosmos3 component-level model offload.
+
+        Cosmos3 has a nested reasoner/generator transformer instead of separate
+        text-encoder and DiT pipeline components, so the transformer owns the
+        mutual-exclusion swaps.  The VAE stays resident on GPU like the generic
+        model-level offloader.
+        """
+        self.vae.to(device, non_blocking=True)
+        if isinstance(self._sound_tokenizer, nn.Module):
+            self._sound_tokenizer.to(device)
+        self.transformer.enable_model_cpu_offload(
+            device=device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+        )
+
+    def disable_omni_model_cpu_offload(self) -> None:
+        self.transformer.disable_model_cpu_offload()
 
     # -- Weight loading --------------------------------------------------------
 
@@ -929,6 +1018,9 @@ class Cosmos3OmniDiffusersPipeline(
 
         return None
 
+    # Checkpoint adapters use this hook before model-specific weight loading.
+    remap_checkpoint_key = _remap_ckpt_key
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Stream-remap checkpoint weights and load via AutoWeightsLoader.
 
@@ -943,6 +1035,10 @@ class Cosmos3OmniDiffusersPipeline(
             total = kept = 0
             for name, tensor in weights:
                 total += 1
+                if name in allowed or name in tp_aware:
+                    kept += 1
+                    yield name, tensor
+                    continue
                 remapped = self._remap_ckpt_key(name)
                 if remapped is not None and (remapped in allowed or remapped in tp_aware):
                     kept += 1
@@ -1379,15 +1475,25 @@ class Cosmos3OmniDiffusersPipeline(
             logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
 
         action = action_latents[:, :, :raw_action_dim].detach().cpu()
-        custom_action_output: dict[str, Any] = {
-            "action": action,
-            "raw_action_dim": raw_action_dim,
-            "action_mode": action_mode,
-            "domain_id": domain_id,
-            "action_only_output": True,
-            "robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs),
+        action_output: dict[str, Any] = {
+            "payload": {
+                "actions": action,
+            },
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": raw_action_dim,
+                    "action_mode": action_mode,
+                    "domain_id": domain_id,
+                },
+                "common": {
+                    "action_only_output": True,
+                },
+                "internal": {
+                    "robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs),
+                },
+            },
         }
-        return DiffusionOutput(output={}, custom_output=custom_action_output)
+        return DiffusionOutput(output=action_output)
 
     @staticmethod
     def _truthy(value) -> bool:
@@ -2851,11 +2957,15 @@ class Cosmos3OmniDiffusersPipeline(
             full_output = torch.cat([normalized_input.to(full_output), full_output], dim=-1)
 
         return DiffusionOutput(
-            output={"video": full_output},
-            custom_output={
-                "transfer_controls": full_controls,
-                "transfer_hints": list(per_hint_frames),
-                "fps": frame_rate,
+            output={
+                "payload": {"video": full_output},
+                "metadata": {
+                    "transfer": {
+                        "controls": full_controls,
+                        "hints": list(per_hint_frames),
+                    },
+                    "video": {"fps": frame_rate},
+                },
             },
         )
 
@@ -3257,12 +3367,18 @@ class Cosmos3OmniDiffusersPipeline(
                 raise ValueError("Cosmos3 action generation finished without action latents.")
             action = action_latents[:, :, :raw_action_dim].detach().cpu()
             return DiffusionOutput(
-                output={"video": video},
-                custom_output={
-                    "action": action,
-                    "raw_action_dim": raw_action_dim,
-                    "action_mode": action_mode,
-                    "domain_id": domain_id,
+                output={
+                    "payload": {
+                        "video": video,
+                        "actions": action,
+                    },
+                    "metadata": {
+                        "actions": {
+                            "raw_action_dim": raw_action_dim,
+                            "action_mode": action_mode,
+                            "domain_id": domain_id,
+                        },
+                    },
                 },
             )
 

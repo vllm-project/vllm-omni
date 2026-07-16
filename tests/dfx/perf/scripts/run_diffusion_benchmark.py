@@ -36,7 +36,7 @@ import pytest
 
 from benchmarks.diffusion.backends import endpoint_filename_token, normalize_endpoint
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model, pytest.mark.local_model]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
@@ -807,7 +807,7 @@ def assert_result(
 
 def _default_benchmark_endpoint_for_task(task: str) -> str:
     """Return the default client-side benchmark endpoint for a diffusion task."""
-    if task in {"t2v", "i2v", "ti2v"}:
+    if task in {"t2v", "i2v", "ti2v", "v2v"}:
         return "/v1/videos"
     if task in {"t2i", "i2i", "ti2i"}:
         return "/v1/chat/completions"
