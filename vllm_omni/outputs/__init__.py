@@ -3,7 +3,7 @@ from typing import Any
 
 import torch
 from PIL import Image
-from vllm.outputs import RequestOutput
+from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
@@ -71,12 +71,58 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
         )
 
 
+# RequestOutput attributes that hold generation content.  When wrapping a
+# stage output, these are copied onto the OmniRequestOutput itself so that
+# the object IS the RequestOutput instead of holding one.
+_REQUEST_OUTPUT_CONTENT_ATTRS = (
+    "prompt",
+    "prompt_token_ids",
+    "prompt_logprobs",
+    "outputs",
+    "finished",
+    "lora_request",
+    "encoder_prompt",
+    "encoder_prompt_token_ids",
+    "num_cached_tokens",
+    "kv_transfer_params",
+)
+
+# Omni-specific content copied when the wrapped stage output is itself an
+# OmniRequestOutput (e.g. a diffusion stage inside a multi-stage pipeline).
+_OMNI_CONTENT_ATTRS = (
+    "images",
+    "latents",
+    "trajectory_latents",
+    "trajectory_timesteps",
+    "trajectory_log_probs",
+    "trajectory_decoded",
+    "_multimodal_output",
+    "_custom_output",
+)
+
+# Dynamic attributes that must not be copied verbatim onto the wrapper:
+# they collide with properties defined on OmniRequestOutput.
+_COPY_SKIP_ATTRS = frozenset({"request_output", "multimodal_output", "custom_output"})
+
+
 @dataclass
-class OmniRequestOutput:
+class OmniRequestOutput(RequestOutput):
     """Unified request output for both pipeline stages and diffusion models.
 
+    Extends vLLM's ``RequestOutput`` so that omni outputs can flow directly
+    through vLLM serving codepaths (which expect ``prompt_token_ids``,
+    ``outputs``, etc. as real attributes).  The inherited fields store the
+    LLM generation content; omni-specific fields store pipeline/diffusion
+    extras.
+
+    Note: ``RequestOutput`` is a plain class (not a dataclass), so all of its
+    attributes are redeclared below as dataclass fields with defaults — the
+    dataclass-generated ``__init__`` replaces ``RequestOutput.__init__`` and
+    must set them itself.
+
     This class handles outputs from:
-    1. Multi-stage LLM pipelines (with stage_id, final_output_type, request_output)
+    1. Multi-stage LLM pipelines (with stage_id, final_output_type, and the
+       inherited RequestOutput fields carrying the stage's generation content)
     2. Diffusion models (with images, prompt, metrics)
 
     Attributes:
@@ -84,30 +130,38 @@ class OmniRequestOutput:
         finished: Whether generation is complete
         stage_id: Identifier of the stage that produced this output (pipeline mode)
         final_output_type: Type of output ("text", "image", "audio", "latents")
-        request_output: The underlying RequestOutput from the stage (pipeline mode)
         images: List of generated PIL images (diffusion mode)
-        prompt: The prompt used for generation (diffusion mode)
+        prompt: The prompt used for generation
         latents: Optional tensor of latent representations (diffusion mode)
-        metrics: Optional dictionary of generation metrics
+        metrics: Generation metrics. A plain dict for omni outputs; may carry
+            vLLM's request stats object when copied from a raw RequestOutput.
     """
 
+    # --- Inherited RequestOutput attributes (redeclared as fields) ---
     request_id: str = ""
+    prompt: OmniPromptType | None = None
+    prompt_token_ids: list[int] | None = None
+    prompt_logprobs: Any = None
+    outputs: list[CompletionOutput] = field(default_factory=list)
     finished: bool = True
+    metrics: Any = field(default_factory=dict)
+    lora_request: Any = None
+    encoder_prompt: str | None = None
+    encoder_prompt_token_ids: list[int] | None = None
+    num_cached_tokens: int | None = None
+    kv_transfer_params: dict[str, Any] | None = None
 
-    # Pipeline stage fields
+    # --- Pipeline stage fields ---
     stage_id: int | None = None
     final_output_type: str = "text"
-    request_output: RequestOutput | None = None
 
-    # Diffusion model fields
+    # --- Diffusion model fields ---
     images: list[Image.Image] = field(default_factory=list)
-    prompt: OmniPromptType | None = None
     latents: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_log_probs: torch.Tensor | None = None
     trajectory_decoded: list | None = None
-    metrics: dict[str, Any] = field(default_factory=dict)
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
     _custom_output: dict[str, Any] = field(default_factory=dict)
 
@@ -121,6 +175,44 @@ class OmniRequestOutput:
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
+
+    def _copy_content_from(self, source: Any) -> None:
+        """Copy generation content from a stage output into this object.
+
+        ``source`` may be a vLLM ``RequestOutput``, another
+        ``OmniRequestOutput``, or a duck-typed stand-in (tests use mocks and
+        SimpleNamespace). Attribute presence is checked against the source's
+        instance ``__dict__`` so that auto-created Mock attributes are not
+        copied. Control fields set by the wrapper (stage_id,
+        final_output_type, metrics, stage_durations, ...) are intentionally
+        not copied.
+        """
+        source_vars = getattr(source, "__dict__", None)
+
+        def _has(name: str) -> bool:
+            if source_vars is not None:
+                return name in source_vars
+            return hasattr(source, name)
+
+        for name in _REQUEST_OUTPUT_CONTENT_ATTRS + _OMNI_CONTENT_ATTRS:
+            if _has(name):
+                setattr(self, name, getattr(source, name))
+        if not self.request_id:
+            self.request_id = getattr(source, "request_id", "") or ""
+        # Dynamic attribute that vLLM code attaches to RequestOutput; it is a
+        # read-only property on this class, so store it in _multimodal_output.
+        if not isinstance(source, OmniRequestOutput) and _has("multimodal_output"):
+            mm = source.multimodal_output
+            if mm is not None:
+                self._multimodal_output = mm
+        # Preserve remaining dynamic attributes (e.g. dynamically annotated
+        # stage outputs) so they stay reachable through `request_output`.
+        if source_vars:
+            known = type(self).__dataclass_fields__.keys()
+            for name, value in source_vars.items():
+                if name.startswith("_") or name in known or name in _COPY_SKIP_ATTRS:
+                    continue
+                setattr(self, name, value)
 
     @classmethod
     def from_error(
@@ -155,7 +247,10 @@ class OmniRequestOutput:
         final_output_type: str,
         request_output: RequestOutput,
     ) -> "OmniRequestOutput":
-        """Create output from pipeline stage.
+        """Create output from a pipeline stage.
+
+        The stage output's content is copied into the new object's own
+        (inherited) fields.
 
         Args:
             stage_id: Stage identifier
@@ -165,13 +260,13 @@ class OmniRequestOutput:
         Returns:
             OmniRequestOutput configured for pipeline mode
         """
-        return cls(
-            request_id=getattr(request_output, "request_id", ""),
+        out = cls(
             stage_id=stage_id,
             final_output_type=final_output_type,
             request_output=request_output,
-            finished=True,
         )
+        out.finished = True
+        return out
 
     @classmethod
     def from_diffusion(
@@ -232,35 +327,21 @@ class OmniRequestOutput:
 
     @property
     def multimodal_output(self) -> Any:
-        """Return multimodal output from the underlying request output or local field.
+        """Return the multimodal output payload.
 
-        For pipeline outputs, this checks completion outputs first, then request_output.
-        For diffusion outputs, this returns the local _multimodal_output field.
+        Checks completion outputs first (where multimodal_output is attached
+        by AR stages), then the local _multimodal_output field.
 
         Returns either a MultimodalPayload (Phase 3+) or a plain dict (legacy).
         """
-        if self.request_output is None:
-            return self._multimodal_output
-
-        # Check completion outputs first (where multimodal_output is attached)
-        for output in getattr(self.request_output, "outputs", []):
+        for output in self.outputs:
             if mm := getattr(output, "multimodal_output", None):
                 return mm
-        if mm := getattr(self.request_output, "multimodal_output", None):
-            return mm
         return self._multimodal_output
 
     @property
     def custom_output(self) -> dict[str, Any]:
-        """Return custom output data from diffusion pipelines.
-
-        For diffusion outputs, returns the local _custom_output field.
-        For pipeline outputs with an inner OmniRequestOutput, forwards
-        the custom_output from the inner request output.
-        """
-        if self.request_output is not None:
-            if isinstance(self.request_output, OmniRequestOutput):
-                return self.request_output._custom_output
+        """Return custom output data from diffusion pipelines."""
         return self._custom_output
 
     @custom_output.setter
@@ -272,58 +353,6 @@ class OmniRequestOutput:
         """Return the number of generated images."""
         return len(self.images)
 
-    # Pass-through properties keep vLLM serving codepaths compatible with
-    # OmniRequestOutput for pipeline outputs (Issue #345).
-    @property
-    def prompt_token_ids(self) -> list[int] | None:
-        """Return prompt token IDs from the underlying request output.
-
-        This property is required for compatibility with vLLM's streaming
-        chat completion generator which checks res.prompt_token_ids.
-        """
-        if self.request_output is not None:
-            return getattr(self.request_output, "prompt_token_ids", None)
-        return None
-
-    @property
-    def outputs(self) -> list[Any]:
-        """Return outputs from the underlying request output.
-
-        This property is required for compatibility with vLLM's streaming
-        and non-streaming chat completion generators.
-        """
-        if self.request_output is not None:
-            return getattr(self.request_output, "outputs", [])
-        return []
-
-    @property
-    def encoder_prompt_token_ids(self) -> list[int] | None:
-        """Return encoder prompt token IDs from the underlying request output."""
-        if self.request_output is not None:
-            return getattr(self.request_output, "encoder_prompt_token_ids", None)
-        return None
-
-    @property
-    def prompt_logprobs(self) -> Any:
-        """Return prompt logprobs from the underlying request output."""
-        if self.request_output is not None:
-            return getattr(self.request_output, "prompt_logprobs", None)
-        return None
-
-    @property
-    def num_cached_tokens(self) -> int | None:
-        """Return number of cached tokens from the underlying request output."""
-        if self.request_output is not None:
-            return getattr(self.request_output, "num_cached_tokens", None)
-        return None
-
-    @property
-    def kv_transfer_params(self) -> Any:
-        """Return KV transfer params from the underlying request output."""
-        if self.request_output is not None:
-            return getattr(self.request_output, "kv_transfer_params", None)
-        return None
-
     @property
     def is_diffusion_output(self) -> bool:
         """Check if this is a diffusion model output."""
@@ -332,60 +361,33 @@ class OmniRequestOutput:
     @property
     def is_pipeline_output(self) -> bool:
         """Check if this is a pipeline stage output."""
-        return self.stage_id is not None and self.request_output is not None
+        return self.stage_id is not None
 
     def unwrap(self) -> "OmniRequestOutput":
-        """Unwrap nested OmniRequestOutput to get the innermost result.
+        """Return the output itself.
 
-        This helper handles the common pattern where pipeline outputs may wrap
-        other OmniRequestOutput instances. It recursively unwraps until it reaches
-        the final output with actual content (images, text, etc.).
-
-        Returns:
-            The innermost OmniRequestOutput containing the actual generation results.
-
-        Example:
-            ```python
-            result = omni.generate(...)
-            output = OmniRequestOutput.unwrap_result(result)
-            if output.images:
-                # Access images directly
-                video_frames = output.images
-            ```
+        Kept for backward compatibility: outputs used to nest a stage's
+        OmniRequestOutput inside ``request_output``; content is now flattened
+        onto the object itself, so there is nothing to unwrap.
         """
-        current = self
-        # Unwrap nested pipeline outputs
-        while current.is_pipeline_output and current.request_output is not None:
-            if isinstance(current.request_output, OmniRequestOutput):
-                current = current.request_output
-            else:
-                break
-        return current
+        return self
 
     @staticmethod
     def unwrap_result(result: Any) -> "OmniRequestOutput":
-        """Unwrap result from omni.generate() to get the final OmniRequestOutput.
+        """Extract the final OmniRequestOutput from omni.generate() results.
 
-        This static helper handles the full unwrapping pattern including:
+        Handles:
         1. Extracting from list if needed
         2. Type validation
-        3. Recursive unwrapping of nested pipeline outputs
 
         Args:
             result: The result from omni.generate() - may be a list or OmniRequestOutput
 
         Returns:
-            The innermost OmniRequestOutput with actual content
+            The OmniRequestOutput with actual content
 
         Raises:
             ValueError: If result is not an OmniRequestOutput or list containing one
-
-        Example:
-            ```python
-            result = omni.generate(...)
-            output = OmniRequestOutput.unwrap_result(result)
-            # output is guaranteed to be the final OmniRequestOutput
-            ```
         """
         # Handle list wrapper
         if isinstance(result, list):
@@ -397,7 +399,6 @@ class OmniRequestOutput:
         if not isinstance(result, OmniRequestOutput):
             raise ValueError(f"Expected OmniRequestOutput, got {type(result)}")
 
-        # Unwrap nested outputs
         return result.unwrap()
 
     def to_dict(self) -> dict[str, Any]:
@@ -437,7 +438,8 @@ class OmniRequestOutput:
             f"finished={self.finished}",
             f"stage_id={self.stage_id}",
             f"final_output_type={self.final_output_type!r}",
-            f"request_output={self.request_output}",
+            f"prompt_token_ids={self.prompt_token_ids}",
+            f"outputs={self.outputs}",
             f"images={images_repr}",
             f"prompt={self.prompt!r}",
             f"latents={self.latents}",
@@ -449,3 +451,45 @@ class OmniRequestOutput:
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"
+
+
+def _request_output_get(self: OmniRequestOutput) -> RequestOutput | None:
+    """Backward-compat view of the wrapped stage output.
+
+    The omni output now IS the RequestOutput, so pipeline/LLM outputs return
+    ``self``; pure diffusion or error outputs return None (matching the old
+    composition semantics where ``request_output`` was unset for them).
+    """
+    if self.stage_id is not None or self.outputs:
+        return self
+    return None
+
+
+def _request_output_set(self: OmniRequestOutput, value: Any) -> None:
+    if value is not None:
+        self._copy_content_from(value)
+
+
+# `request_output` is attached after class creation, NOT declared as a field
+# or InitVar: msgspec serializes dataclasses natively via __dataclass_fields__
+# (which includes InitVar pseudo-fields), so a request_output entry would be
+# read through the property during encoding — returning `self` and recursing
+# forever. As a plain property it is invisible to both dataclasses and
+# msgspec.
+OmniRequestOutput.request_output = property(  # type: ignore[assignment]
+    _request_output_get, _request_output_set
+)
+
+# Keep `request_output=` working as a constructor keyword for
+# backward compatibility: the wrapped stage output's content is copied onto
+# the new object (see _copy_content_from).
+_dataclass_init = OmniRequestOutput.__init__
+
+
+def _omni_request_output_init(self: OmniRequestOutput, *args: Any, request_output: Any = None, **kwargs: Any) -> None:
+    _dataclass_init(self, *args, **kwargs)
+    if request_output is not None:
+        self._copy_content_from(request_output)
+
+
+OmniRequestOutput.__init__ = _omni_request_output_init  # type: ignore[method-assign]
