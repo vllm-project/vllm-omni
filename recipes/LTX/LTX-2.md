@@ -222,6 +222,25 @@ sampling_params = OmniDiffusionSamplingParams(
 )
 ```
 
+### Custom Sigma Schedules
+
+One-stage LTX requests can override the recipe's default sigma schedule through
+the Python API. Set `sigmas` directly on `OmniDiffusionSamplingParams`; its
+length must match `num_inference_steps`.
+
+```python
+sampling_params = OmniDiffusionSamplingParams(
+    num_inference_steps=4,
+    sigmas=[1.0, 0.75, 0.5, 0.25],
+)
+```
+
+A request-level schedule takes precedence over a `sigmas` fallback passed
+directly to the pipeline. Custom `sigmas` and custom `timesteps` are mutually
+exclusive, and all requests in one fused batch must use identical `sigmas`.
+The `/v1/videos` form API and bundled offline CLI do not currently expose this
+field; use the Python request API when supplying a custom schedule.
+
 !!! warning "Request batching requires identical LTX guidance"
 
     One-stage LTX pipelines support request-level batching, but every request
@@ -229,7 +248,8 @@ sampling_params = OmniDiffusionSamplingParams(
     guidance configuration. This includes all CFG, STG, modality, rescale, and
     STG-block values. If requests with different effective LTX guidance are
     fused, the pipeline rejects the entire batch instead of executing separate
-    sub-batches.
+    sub-batches. Custom sigma schedules are also a batch invariant: every
+    request must provide the same `sigmas` list, or all requests must omit it.
 
     Keep concurrent requests on one server guidance-homogeneous, or set
     `--max-num-seqs 1` when clients need independent guidance configurations.
