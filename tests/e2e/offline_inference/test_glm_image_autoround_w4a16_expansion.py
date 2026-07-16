@@ -57,8 +57,8 @@ def _get_stage_config():
 
 stage_config = _get_stage_config()
 
-# (model, stage_config_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
-_OMNI_RUNNER_PARAM = (QUANTIZED_MODEL, stage_config, {"trust_remote_code": True})
+# (model, stage_config_path) for ``omni_runner`` indirect parametrize
+_OMNI_RUNNER_PARAM = (QUANTIZED_MODEL, stage_config)
 
 
 def compute_max_tokens(height: int, width: int, factor: int = 32) -> int:

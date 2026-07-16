@@ -43,8 +43,8 @@ MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 BAGEL_STAGE_CONFIG = get_deploy_config_path("ci/bagel.yaml")
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
-_OMNI_RUNNER_PARAM = (MODEL, BAGEL_STAGE_CONFIG, {"trust_remote_code": True})
+# (model, stage_configs_path) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+_OMNI_RUNNER_PARAM = (MODEL, BAGEL_STAGE_CONFIG)
 
 
 # ---------------------------------------------------------------------------

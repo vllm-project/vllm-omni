@@ -39,15 +39,11 @@ else:
     stage_configs = [get_cuda_graph_config()]
 
 # Create parameter combinations for model and stage config
-test_params = [(model, stage_config, {"trust_remote_code": True}) for model in models for stage_config in stage_configs]
+test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 # we can use the same config for a model that only has thinker (i.e., does not
 # enable audio output) because the resolver should figure out that it doesn't
 # need the full pipeline based on the HF config.
-thinker_test_params = [
-    (model, stage_config, {"trust_remote_code": True})
-    for model in thinker_only_models
-    for stage_config in stage_configs
-]
+thinker_test_params = [(model, stage_config) for model in thinker_only_models for stage_config in stage_configs]
 
 
 def get_question(prompt_type="video"):

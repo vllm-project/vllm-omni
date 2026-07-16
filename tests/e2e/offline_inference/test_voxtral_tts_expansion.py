@@ -38,7 +38,7 @@ pytestmark = [pytest.mark.slow, pytest.mark.tts]
 _OMNI_RUNNER_PARAM = (
     MODEL,
     STAGE_CONFIG,
-    {"enforce_eager": True, "trust_remote_code": True},
+    {"enforce_eager": True},
 )
 
 
@@ -105,7 +105,6 @@ def test_voxtral_tts_offline_streaming():
             stage_configs_path=STAGE_CONFIG,
             stage_init_timeout=300,
             enforce_eager=True,
-            trust_remote_code=True,
         )
 
         try:

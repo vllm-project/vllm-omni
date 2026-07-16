@@ -56,8 +56,8 @@ def _get_stage_config():
 
 stage_config = _get_stage_config()
 
-# Parametrise: (model, stage_config, extra_omni_kwargs)
-quant_params = [(QUANTIZED_MODEL, stage_config, {"trust_remote_code": True})]
+# Parametrise: (model, stage_config)
+quant_params = [(QUANTIZED_MODEL, stage_config)]
 
 
 # ------------------------------------------------------------------

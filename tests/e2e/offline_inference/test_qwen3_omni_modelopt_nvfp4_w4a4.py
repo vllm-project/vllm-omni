@@ -69,7 +69,7 @@ def _stage_config():
     )
 
 
-quant_params = [(QUANTIZED_MODEL, _stage_config(), {"trust_remote_code": True})]
+quant_params = [(QUANTIZED_MODEL, _stage_config())]
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=2)

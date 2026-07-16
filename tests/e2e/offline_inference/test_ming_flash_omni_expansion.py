@@ -45,8 +45,8 @@ def get_eager_config():
     return modify_stage_config(_CI_DEPLOY, updates={"stages": {0: {"enforce_eager": True}}})
 
 
-test_params_thinker = [(m, c, {"trust_remote_code": True}) for m in models for c in [get_eager_config_thinker()]]
-test_params = [(m, c, {"trust_remote_code": True}) for m in models for c in [get_eager_config()]]
+test_params_thinker = [(m, c) for m in models for c in [get_eager_config_thinker()]]
+test_params = [(m, c) for m in models for c in [get_eager_config()]]
 
 
 @pytest.mark.slow

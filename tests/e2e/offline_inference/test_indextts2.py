@@ -27,7 +27,6 @@ STAGE_CONFIG = get_deploy_config_path("indextts2.yaml")
 _OMNI_RUNNER_PARAM = (
     MODEL_NAME,
     STAGE_CONFIG,
-    {"trust_remote_code": True},
 )
 
 ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets" / "indextts2"

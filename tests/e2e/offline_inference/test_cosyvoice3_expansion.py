@@ -132,11 +132,11 @@ _cosy_deployment = get_deploy_config_path("cosyvoice3.yaml")
 _cosy_model_path = str(_resolve_model_dir())
 _OMNI_RUNNER_PARAMS = [
     pytest.param(
-        (_cosy_model_path, _cosy_deployment, {"async_chunk": False, "trust_remote_code": True}),
+        (_cosy_model_path, _cosy_deployment, {"async_chunk": False}),
         id="sync",
     ),
     pytest.param(
-        (_cosy_model_path, _cosy_deployment, {"async_chunk": True, "trust_remote_code": True}),
+        (_cosy_model_path, _cosy_deployment, {"async_chunk": True}),
         id="async_chunk",
     ),
 ]
