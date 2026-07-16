@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""E2E accuracy guard against a pinned Lightricks LTX pipeline revision."""
+"""E2E accuracy guard against a pinned Lightricks LTX pipeline revision.
+
+The comparison pins both runtimes to PyTorch SDPA FlashAttention and runs the
+official reference with ``max_batch_size=4`` to match Omni's fused guidance
+batch. Video and audio guidance use the official non-HQ one-stage defaults;
+only the generation shape and step count are reduced for CI runtime.
+"""
 
 from __future__ import annotations
 

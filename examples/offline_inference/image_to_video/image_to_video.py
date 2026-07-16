@@ -364,7 +364,7 @@ def main():
             None,
             121,
             30 if is_ltx23 else 40,
-            5.0,
+            None,
             512 * 768,
             32,
         )
@@ -447,7 +447,6 @@ def main():
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
-        flow_shift=flow_shift,
         diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
         diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
         diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
@@ -462,6 +461,8 @@ def main():
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
+    if flow_shift is not None:
+        omni_kwargs["flow_shift"] = flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
@@ -517,11 +518,10 @@ def main():
         num_inference_steps=num_inference_steps,
         num_frames=num_frames,
         frame_rate=frame_rate,
-        extra_args={
-            "sample_solver": args.sample_solver,
-            "flow_shift": flow_shift,
-        },
+        extra_args={"sample_solver": args.sample_solver},
     )
+    if flow_shift is not None:
+        sampling_params.extra_args["flow_shift"] = flow_shift
 
     # Route model-specific knobs through extra_body, filtered against the model's
     # declared extra_body_params. Models without a declaration only forward explicit
