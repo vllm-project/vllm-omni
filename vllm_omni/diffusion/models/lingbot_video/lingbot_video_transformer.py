@@ -3,7 +3,6 @@
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 import math
-import os
 
 import torch
 import torch.distributed as dist
@@ -118,10 +117,10 @@ class LingBotVideoRotaryEmbedding(nn.Module):
 
 
 def make_joint_position_ids(text_len: int, grid_t: int, grid_h: int, grid_w: int, device: torch.device) -> torch.Tensor:
-    """3D positions in [video; text] order. Text t-axis is 1..text_len; video t-axis starts at text_len+1.
+    """Return ``(t, h, w)`` positions with video rows before text rows.
 
-    Matches patchify_and_embed: cap start (1,0,0); vision start (cap_len+1,0,0);
-    freqs ordered with x first and cap second (same order as cat_interleave).
+    Text t-axis positions are 1..text_len, and video t-axis positions start at
+    text_len + 1. This matches the token order produced by ``_cat_interleave``.
     """
     tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
     hh = torch.arange(grid_h, device=device, dtype=torch.int32)
@@ -206,23 +205,9 @@ class LingBotVideoAttention(nn.Module):
         parallel_config=None,
     ):
         B, S, _ = x.shape
-        if os.environ.get("LINGBOT_FUSED_QKV_LINEAR") == "1":
-            weight = torch.cat(
-                (self.to_q.weight, self.to_k.weight, self.to_v.weight),
-                dim=0,
-            )
-            bias = None
-            if self.to_q.bias is not None:
-                bias = torch.cat(
-                    (self.to_q.bias, self.to_k.bias, self.to_v.bias),
-                    dim=0,
-                )
-            qkv = F.linear(x, weight, bias)
-            q, k, v = qkv.view(B, S, 3, self.num_heads, self.head_dim).unbind(2)
-        else:
-            q = self.to_q(x).unflatten(2, (self.num_heads, self.head_dim))
-            k = self.to_k(x).unflatten(2, (self.num_heads, self.head_dim))
-            v = self.to_v(x).unflatten(2, (self.num_heads, self.head_dim))
+        q = self.to_q(x).unflatten(2, (self.num_heads, self.head_dim))
+        k = self.to_k(x).unflatten(2, (self.num_heads, self.head_dim))
+        v = self.to_v(x).unflatten(2, (self.num_heads, self.head_dim))
         q = apply_rotary_emb(self.norm_q(q), rotary_emb)
         k = apply_rotary_emb(self.norm_k(k), rotary_emb)
         if packed_indices is None:
@@ -688,9 +673,8 @@ class LingBotVideoBlock(nn.Module):
         gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
         scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
-        # AdaLN modulation / norms run in fp32 (sensitive path); cast to the bulk
-        # compute dtype only at the bf16 Linear boundary. This replaces the old
-        # ambient autocast, which rounded Linear inputs to bf16 at the same point.
+        # AdaLN modulation and norms stay in fp32; cast to the transformer
+        # compute dtype only at Linear boundaries.
         bulk_dtype = self.attn.to_q.weight.dtype
         attn_in = (self.norm1(x) * scale_msa + shift_msa).to(bulk_dtype)
         attn_out = self.attn(

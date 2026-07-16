@@ -229,8 +229,9 @@ class LingBotVideoPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscove
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
 
     The in-tree transformer supports both dense MLP blocks and routed MoE blocks.
-    Fused expert kernels and automatic refiner orchestration are intentionally
-    left out of this pipeline.
+    Fused expert kernels and the optional ``refiner/`` transformer are not loaded
+    or executed. ``t_thresh`` only selects a low-noise sigma schedule for the
+    primary transformer; it does not enable automatic refiner orchestration.
     """
 
     supports_step_execution: ClassVar[bool] = False
