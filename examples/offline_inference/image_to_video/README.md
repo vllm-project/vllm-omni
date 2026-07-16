@@ -233,7 +233,7 @@ python image_to_video.py \
   --output i2v_cached.mp4
 ```
 
-### LTX-2.3
+### [LTX-2.3](../../../recipes/LTX/LTX-2.md)
 
 ```bash
 python image_to_video.py \
@@ -290,7 +290,7 @@ Key arguments:
 - `--guidance-scale` and `--guidance-scale-high`: CFG scale (applied to low/high-noise stages for MoE).
 - `--negative-prompt`: Optional list of artifacts to suppress.
 - `--boundary-ratio`: Boundary split ratio for two-stage MoE models.
-- `--flow-shift`: Scheduler flow shift (default: model-specific — Wan/LTX2 5.0, Cosmos3 10.0).
+- `--flow-shift`: Scheduler flow shift (default: Wan 5.0, Cosmos3 10.0). LTX does not consume this option.
 - `--sample-solver`: Wan2.2 sampling solver. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
 - `--num-inference-steps`: Number of denoising steps (default: model-specific — Wan 50, LTX2 40, Cosmos3 35).
 - `--fps`: Frames per second for the saved MP4 (requires `diffusers` export_to_video).

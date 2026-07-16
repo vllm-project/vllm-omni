@@ -13,7 +13,7 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
-| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` |
+| [LTX-2.3](../../../../recipes/LTX/LTX-2.md) | `diffusers/LTX-2.3-Diffusers` |
 
 ## Wan2.2 T2V
 
@@ -192,7 +192,7 @@ curl -X POST http://localhost:8091/v1/videos \
 | `negative_prompt`     | str    | None    | Negative prompt                                  |
 | `width`               | int    | None    | Video width in pixels                            |
 | `height`              | int    | None    | Video height in pixels                           |
-| `num_frames`          | int    | None    | Number of frames to generate                     |
+| `num_frames`          | int    | 1       | Number of frames to generate; set explicitly for video generation |
 | `fps`                 | int    | None    | Frames per second for output video               |
 | `num_inference_steps` | int    | None    | Number of denoising steps                        |
 | `guidance_scale`      | float  | None    | CFG guidance scale (low-noise stage)             |
@@ -375,7 +375,7 @@ curl -sS -X POST http://localhost:8098/v1/videos \
   -F "seed=42"
 ```
 
-## LTX-2.3
+## [LTX-2.3](../../../../recipes/LTX/LTX-2.md)
 
 LTX-2.3 uses a Diffusers-format checkpoint and a dedicated pipeline class:
 
