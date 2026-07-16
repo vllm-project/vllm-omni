@@ -1,5 +1,5 @@
 ---
-name: vllm-omni-test
+name: vllm-omni-create-testcase
 description: Generate and run tests for vllm-project/vllm-omni with CI-aligned levels and markers; wire new tests into Buildkite (test-ready.yml for L1/L2, test-merge.yml for L3, test-nightly.yml for L4). On completion, always provide copy-paste local and CI-like pytest commands plus prerequisites. Use when creating regression tests, adding L1-L4 coverage, selecting pytest markers, or validating fixes from issues/PRs.
 ---
 
