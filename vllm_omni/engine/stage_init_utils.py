@@ -27,11 +27,11 @@ from vllm.v1.executor import Executor
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
 
@@ -530,23 +530,24 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
 
 def get_stage_devices_per_replica(stage_cfg: Any) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
-    if getattr(stage_cfg, "stage_type", "llm") != "diffusion":
-        return get_stage_tp_size(stage_cfg)
+    engine_args = getattr(stage_cfg, "engine_args", {})
+    if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
+        parallel_config = _get_attr_or_item(engine_args, "parallel_config")
+        if parallel_config is None:
+            return 1
 
-    parallel_config = _get_attr_or_item(getattr(stage_cfg, "engine_args", {}), "parallel_config")
-    if parallel_config is None:
-        return 1
+        world_size = _get_attr_or_item(parallel_config, "world_size")
+        if world_size is not None:
+            return max(1, int(world_size))
 
-    world_size = _get_attr_or_item(parallel_config, "world_size")
-    if world_size is not None:
-        return max(1, int(world_size))
+        try:
+            from vllm_omni.diffusion.data import DiffusionParallelConfig
 
-    try:
-        from vllm_omni.diffusion.data import DiffusionParallelConfig
+            return max(1, int(DiffusionParallelConfig.from_dict(_to_dict(parallel_config)).world_size))
+        except Exception:
+            return 1
 
-        return max(1, int(DiffusionParallelConfig.from_dict(_to_dict(parallel_config)).world_size))
-    except Exception:
-        return 1
+    return get_stage_tp_size(stage_cfg)
 
 
 def compute_replica_layout(

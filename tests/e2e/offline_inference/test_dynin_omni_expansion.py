@@ -34,7 +34,7 @@ test_params = [(model, stage_config) for model in models for stage_config in sta
 DYNIN_CONFIG_PATH = str(_DEFAULT_DYNIN_CONFIG_PATH) if _DEFAULT_DYNIN_CONFIG_PATH is not None else None
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.omni,
     pytest.mark.parametrize("omni_runner", test_params, indirect=True),
 ]
@@ -290,7 +290,7 @@ def _numel(value: Any) -> int:
     return 0
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_t2i_decode_to_image(omni_runner) -> None:
     _configure_dynin_config_env()
     prompt = _build_t2i_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
@@ -304,7 +304,7 @@ def test_dynin_t2i_decode_to_image(omni_runner) -> None:
     assert _numel(image_value) > 0
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_mmu_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
@@ -322,7 +322,7 @@ def test_dynin_mmu_to_text(omni_runner) -> None:
     assert text_content
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_image_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
@@ -341,7 +341,7 @@ def test_dynin_image_to_text(omni_runner) -> None:
     assert text_content
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_speech_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
@@ -360,7 +360,7 @@ def test_dynin_speech_to_text(omni_runner) -> None:
     assert text_content
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_t2s_decode_to_audio(omni_runner) -> None:
     _configure_dynin_config_env()
     prompt = _build_t2s_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)

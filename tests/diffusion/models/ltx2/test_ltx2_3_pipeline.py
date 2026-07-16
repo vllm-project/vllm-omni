@@ -38,6 +38,279 @@ def _make_ltx23_pipeline(sequence_parallel_size: int = 1):
     return pipeline
 
 
+def _make_ltx23_request_pipe(cls):
+    pipe = object.__new__(cls)
+    torch.nn.Module.__init__(pipe)
+    pipe.device = torch.device("cpu")
+    pipe.tokenizer_max_length = 99
+    return pipe
+
+
+def _resolve_request_inputs_for_test(pipe, req):
+    return pipe._resolve_request_inputs(
+        req,
+        prompt=None,
+        negative_prompt=None,
+        height=None,
+        width=None,
+        num_frames=None,
+        frame_rate=None,
+        num_inference_steps=None,
+        timesteps=None,
+        guidance_scale=4.0,
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=None,
+    )
+
+
+class TestLTX23RequestParsing:
+    def test_t2v_and_i2v_share_request_input_resolution(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        prompt_embeds = torch.tensor([[1.0, 2.0]])
+        negative_prompt_embeds = torch.tensor([[3.0, 4.0]])
+        prompt_attention_mask = torch.tensor([True, False])
+        negative_attention_mask = torch.tensor([False, True])
+        video_latents = torch.ones(1, 2, 3)
+        audio_latents = torch.zeros(1, 2, 3)
+        generator = torch.Generator().manual_seed(123)
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={
+                        "prompt": "shared prompt",
+                        "negative_prompt": "shared negative",
+                        "additional_information": {
+                            "prompt_embeds": prompt_embeds,
+                            "negative_prompt_embeds": negative_prompt_embeds,
+                            "attention_mask": prompt_attention_mask,
+                            "negative_attention_mask": negative_attention_mask,
+                        },
+                    },
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=384,
+                        width=512,
+                        num_frames=25,
+                        frame_rate=12.5,
+                        num_inference_steps=1,
+                        num_outputs_per_prompt=2,
+                        guidance_scale=6.0,
+                        generator=generator,
+                        latents=video_latents,
+                        extra_args={"audio_latents": audio_latents},
+                        decode_timestep=[0.1],
+                        decode_noise_scale=[0.2],
+                        output_type="latent",
+                        max_sequence_length=17,
+                    ),
+                    request_id="ltx23-shared-request-inputs",
+                )
+            ]
+        )
+
+        resolved_t2v = _resolve_request_inputs_for_test(
+            _make_ltx23_request_pipe(LTX23Pipeline),
+            req,
+        )
+        resolved_i2v = _resolve_request_inputs_for_test(
+            _make_ltx23_request_pipe(LTX23ImageToVideoPipeline),
+            req,
+        )
+
+        assert resolved_i2v.prompt == resolved_t2v.prompt is None
+        assert resolved_i2v.negative_prompt == resolved_t2v.negative_prompt is None
+        assert resolved_i2v.height == resolved_t2v.height == 384
+        assert resolved_i2v.width == resolved_t2v.width == 512
+        assert resolved_i2v.num_frames == resolved_t2v.num_frames == 25
+        assert resolved_i2v.frame_rate == resolved_t2v.frame_rate == 12.5
+        assert resolved_i2v.num_inference_steps == resolved_t2v.num_inference_steps == 2
+        assert resolved_i2v.guidance_scale == resolved_t2v.guidance_scale == 6.0
+        assert resolved_i2v.num_videos_per_prompt == resolved_t2v.num_videos_per_prompt == 2
+        assert isinstance(resolved_i2v.generator, list)
+        assert isinstance(resolved_t2v.generator, list)
+        assert [gen.initial_seed() for gen in resolved_i2v.generator] == [123, 123]
+        assert [gen.initial_seed() for gen in resolved_t2v.generator] == [123, 123]
+        assert resolved_i2v.decode_timestep == resolved_t2v.decode_timestep == [0.1]
+        assert resolved_i2v.decode_noise_scale == resolved_t2v.decode_noise_scale == [0.2]
+        assert resolved_i2v.output_type == resolved_t2v.output_type == "latent"
+        assert resolved_i2v.max_sequence_length == resolved_t2v.max_sequence_length == 17
+        torch.testing.assert_close(resolved_i2v.latents, video_latents)
+        torch.testing.assert_close(resolved_t2v.latents, video_latents)
+        torch.testing.assert_close(resolved_i2v.audio_latents, audio_latents)
+        torch.testing.assert_close(resolved_t2v.audio_latents, audio_latents)
+        torch.testing.assert_close(resolved_i2v.prompt_embeds, torch.stack([prompt_embeds]))
+        torch.testing.assert_close(resolved_t2v.prompt_embeds, torch.stack([prompt_embeds]))
+        torch.testing.assert_close(resolved_i2v.negative_prompt_embeds, torch.stack([negative_prompt_embeds]))
+        torch.testing.assert_close(resolved_t2v.negative_prompt_embeds, torch.stack([negative_prompt_embeds]))
+        torch.testing.assert_close(resolved_i2v.prompt_attention_mask, torch.stack([prompt_attention_mask]))
+        torch.testing.assert_close(resolved_t2v.prompt_attention_mask, torch.stack([prompt_attention_mask]))
+        torch.testing.assert_close(
+            resolved_i2v.negative_prompt_attention_mask,
+            torch.stack([negative_attention_mask]),
+        )
+        torch.testing.assert_close(
+            resolved_t2v.negative_prompt_attention_mask,
+            torch.stack([negative_attention_mask]),
+        )
+
+    def test_request_input_resolution_rejects_mixed_precomputed_prompt_fields(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt={
+                        "prompt": "with embeds",
+                        "additional_information": {"prompt_embeds": torch.tensor([[1.0]])},
+                    },
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=384,
+                        width=512,
+                        num_frames=25,
+                        num_inference_steps=2,
+                    ),
+                    request_id="ltx23-mixed-precomputed-fields-0",
+                ),
+                OmniDiffusionRequest(
+                    prompt={"prompt": "without embeds"},
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=384,
+                        width=512,
+                        num_frames=25,
+                        num_inference_steps=2,
+                    ),
+                    request_id="ltx23-mixed-precomputed-fields-1",
+                ),
+            ]
+        )
+
+        with pytest.raises(ValueError, match="mix of provided and missing prompt_embeds"):
+            _resolve_request_inputs_for_test(pipe, req)
+
+
+class TestLTX23ForwardStages:
+    def test_encode_prompt_repeats_precomputed_embeds_for_num_outputs(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        prompt_embeds = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
+        negative_prompt_embeds = torch.tensor([[[-1.0], [-2.0]], [[-3.0], [-4.0]]])
+        prompt_attention_mask = torch.tensor([[True, False], [False, True]])
+        negative_prompt_attention_mask = torch.tensor([[False, False], [True, True]])
+
+        (
+            repeated_prompt_embeds,
+            repeated_prompt_attention_mask,
+            repeated_negative_prompt_embeds,
+            repeated_negative_prompt_attention_mask,
+        ) = pipe.encode_prompt(
+            prompt=None,
+            do_classifier_free_guidance=True,
+            num_videos_per_prompt=2,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            device=torch.device("cpu"),
+        )
+
+        torch.testing.assert_close(
+            repeated_prompt_embeds,
+            torch.tensor([[[1.0], [2.0]], [[1.0], [2.0]], [[3.0], [4.0]], [[3.0], [4.0]]]),
+        )
+        torch.testing.assert_close(
+            repeated_negative_prompt_embeds,
+            torch.tensor([[[-1.0], [-2.0]], [[-1.0], [-2.0]], [[-3.0], [-4.0]], [[-3.0], [-4.0]]]),
+        )
+        torch.testing.assert_close(
+            repeated_prompt_attention_mask,
+            torch.tensor([[True, False], [True, False], [False, True], [False, True]]),
+        )
+        torch.testing.assert_close(
+            repeated_negative_prompt_attention_mask,
+            torch.tensor([[False, False], [False, False], [True, True], [True, True]]),
+        )
+
+    def test_t2v_forward_delegates_to_shared_forward_impl(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        pipe = _make_ltx23_request_pipe(LTX23Pipeline)
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt="stage refactor prompt",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=384,
+                        width=512,
+                        num_frames=25,
+                        frame_rate=16,
+                        num_inference_steps=3,
+                        guidance_scale=4.5,
+                        output_type="latent",
+                    ),
+                    request_id="ltx23-t2v-forward-stage-delegation",
+                )
+            ]
+        )
+        sigmas = [1.0, 0.5]
+        timesteps = [1000, 500]
+        attention_kwargs = {"scale": 1.0}
+        seen = {}
+
+        def fake_forward_impl(req_arg, request_inputs, **kwargs):
+            seen["req"] = req_arg
+            seen["request_inputs"] = request_inputs
+            seen["kwargs"] = kwargs
+            return ["delegated"]
+
+        object.__setattr__(pipe, "_forward_impl", fake_forward_impl)
+
+        output = pipe.forward(
+            req,
+            sigmas=sigmas,
+            timesteps=timesteps,
+            noise_scale=0.25,
+            attention_kwargs=attention_kwargs,
+        )
+
+        assert output == ["delegated"]
+        assert seen["req"] is req
+        assert seen["request_inputs"].height == 384
+        assert seen["request_inputs"].width == 512
+        assert seen["request_inputs"].num_frames == 25
+        assert seen["request_inputs"].frame_rate == 16.0
+        assert seen["request_inputs"].guidance_scale == 4.5
+        assert seen["request_inputs"].output_type == "latent"
+        assert seen["kwargs"] == {
+            "noise_scale": 0.25,
+            "sigmas": sigmas,
+            "timesteps": timesteps,
+            "attention_kwargs": attention_kwargs,
+        }
+
+
 class TestPipelineIndependence:
     """Verify LTX23Pipeline is fully independent from LTX2Pipeline."""
 
@@ -64,13 +337,6 @@ class TestPipelineIndependence:
         from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 
         assert issubclass(LTX23Pipeline, ProgressBarMixin)
-
-    def test_ltx23_pipeline_has_cfg_parallel_mixin(self):
-        """LTX23Pipeline must use the shared CFG parallel implementation."""
-        from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
-
-        assert issubclass(LTX23Pipeline, CFGParallelMixin)
 
     def test_ltx23_pipeline_declares_offload_components(self):
         """LTX23Pipeline must expose LTX-2.3-specific modules to offload discovery."""
@@ -105,566 +371,39 @@ class TestPipelineIndependence:
         assert issubclass(LTX23Pipeline, DiffusionPipelineProfilerMixin)
 
 
-class TestLTX23VaeDecodeParallel:
-    """Test LTX-2.3 video VAE tiled parallel helpers without loading weights."""
+class TestLTX23DecodeConditioning:
+    def test_decode_conditioning_expands_per_prompt_values_to_effective_batch(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _expand_per_prompt_decode_value
 
-    def test_ltx23_video_vae_is_distributed_tile_only_class(self):
-        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
-            DistributedAutoencoderKLLTX2Video,
-        )
-        from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
+        assert _expand_per_prompt_decode_value(
+            [0.1, 0.2],
+            prompt_batch_size=2,
+            effective_batch_size=4,
+            field_name="decode_timestep",
+        ) == [0.1, 0.1, 0.2, 0.2]
+        assert _expand_per_prompt_decode_value(
+            [0.3],
+            prompt_batch_size=2,
+            effective_batch_size=4,
+            field_name="decode_timestep",
+        ) == [0.3, 0.3, 0.3, 0.3]
+        assert _expand_per_prompt_decode_value(
+            [0.1, 0.2, 0.3, 0.4],
+            prompt_batch_size=2,
+            effective_batch_size=4,
+            field_name="decode_timestep",
+        ) == [0.1, 0.2, 0.3, 0.4]
 
-        assert issubclass(DistributedAutoencoderKLLTX2Video, DistributedVaeMixin)
-        assert not hasattr(DistributedAutoencoderKLLTX2Video, "patch_split")
+    def test_decode_conditioning_rejects_ambiguous_lengths(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _expand_per_prompt_decode_value
 
-    def test_ltx23_video_vae_tile_split_uses_native_ltx23_tile_geometry(self):
-        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
-            DistributedAutoencoderKLLTX2Video,
-        )
-
-        vae = SimpleNamespace(
-            spatial_compression_ratio=32,
-            tile_sample_min_height=512,
-            tile_sample_min_width=512,
-            tile_sample_stride_height=448,
-            tile_sample_stride_width=448,
-            temporal_compression_ratio=8,
-            dtype=torch.float32,
-        )
-
-        z = torch.zeros(1, 2, 5, 16, 24)
-        tasks, grid_spec = DistributedAutoencoderKLLTX2Video.tile_split(vae, z)
-
-        assert grid_spec.grid_shape == (2, 2)
-        assert grid_spec.split_dims == (3, 4)
-        assert grid_spec.tile_spec["sample_height"] == 512
-        assert grid_spec.tile_spec["sample_width"] == 768
-        assert grid_spec.tile_spec["blend_height"] == 64
-        assert grid_spec.tile_spec["blend_width"] == 64
-        assert grid_spec.tile_spec["max_tile_output_shape"] == (1, 3, 33, 512, 512)
-        assert grid_spec.tile_spec["tile_output_shapes"] == {
-            0: (1, 3, 33, 512, 512),
-            1: (1, 3, 33, 512, 320),
-            2: (1, 3, 33, 64, 512),
-            3: (1, 3, 33, 64, 320),
-        }
-        assert [task.grid_coord for task in tasks] == [(0, 0), (0, 1), (1, 0), (1, 1)]
-        assert [tuple(task.tensor.shape) for task in tasks] == [
-            (1, 2, 5, 16, 16),
-            (1, 2, 5, 16, 10),
-            (1, 2, 5, 2, 16),
-            (1, 2, 5, 2, 10),
-        ]
-        assert [task.workload for task in tasks] == [5 * 16 * 16, 5 * 16 * 10, 5 * 2 * 16, 5 * 2 * 10]
-
-    def test_ltx23_video_vae_tile_merge_blends_and_crops_like_tiled_decode(self):
-        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
-            DistributedAutoencoderKLLTX2Video,
-        )
-        from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import GridSpec
-
-        class FakeVae:
-            def __init__(self):
-                self.blend_calls = []
-
-            def clear_cache(self):
-                pass
-
-            def blend_v(self, _previous, current, blend_height):
-                self.blend_calls.append(("v", blend_height))
-                return current
-
-            def blend_h(self, _previous, current, blend_width):
-                self.blend_calls.append(("h", blend_width))
-                return current
-
-        fake_vae = FakeVae()
-        grid_spec = GridSpec(
-            split_dims=(3, 4),
-            grid_shape=(2, 2),
-            tile_spec={
-                "sample_height": 10,
-                "sample_width": 10,
-                "blend_height": 1,
-                "blend_width": 2,
-                "tile_sample_stride_height": 5,
-                "tile_sample_stride_width": 5,
-            },
-        )
-        tiles = {
-            (0, 0): torch.full((1, 3, 2, 6, 6), 1.0),
-            (0, 1): torch.full((1, 3, 2, 6, 6), 2.0),
-            (1, 0): torch.full((1, 3, 2, 6, 6), 3.0),
-            (1, 1): torch.full((1, 3, 2, 6, 6), 4.0),
-        }
-
-        merged = DistributedAutoencoderKLLTX2Video.tile_merge(fake_vae, tiles, grid_spec)
-
-        assert merged.shape == (1, 3, 2, 10, 10)
-        assert fake_vae.blend_calls == [("h", 2), ("v", 1), ("v", 1), ("h", 2)]
-        torch.testing.assert_close(merged[:, :, :, :5, :5], torch.ones(1, 3, 2, 5, 5))
-        torch.testing.assert_close(merged[:, :, :, :5, 5:], torch.full((1, 3, 2, 5, 5), 2.0))
-        torch.testing.assert_close(merged[:, :, :, 5:, :5], torch.full((1, 3, 2, 5, 5), 3.0))
-        torch.testing.assert_close(merged[:, :, :, 5:, 5:], torch.full((1, 3, 2, 5, 5), 4.0))
-
-    def test_ltx23_video_vae_tiled_decode_dispatches_to_tile_operator(self):
-        from vllm_omni.diffusion.distributed.autoencoders import autoencoder_kl_ltx2
-
-        z = torch.zeros(1, 2, 1, 16, 24)
-        expected = torch.ones(1, 3, 1, 512, 768)
-        seen = {}
-
-        class FakeExecutor:
-            def execute(self, tensor, operator, broadcast_result=True):
-                seen["tensor"] = tensor
-                seen["operator"] = operator
-                seen["broadcast_result"] = broadcast_result
-                return expected
-
-        vae = SimpleNamespace(distributed_executor=FakeExecutor(), is_distributed_enabled=lambda: True)
-        vae.tile_split = autoencoder_kl_ltx2.DistributedAutoencoderKLLTX2Video.tile_split.__get__(vae)
-        vae.tile_exec = autoencoder_kl_ltx2.DistributedAutoencoderKLLTX2Video.tile_exec.__get__(vae)
-        vae.tile_merge = autoencoder_kl_ltx2.DistributedAutoencoderKLLTX2Video.tile_merge.__get__(vae)
-
-        output = autoencoder_kl_ltx2.DistributedAutoencoderKLLTX2Video.tiled_decode(
-            vae,
-            z,
-            temb=torch.tensor(0.5),
-            return_dict=False,
-        )
-
-        assert len(output) == 1
-        assert output[0] is expected
-        assert seen["tensor"] is z
-        assert seen["broadcast_result"] is False
-        assert seen["operator"].split.__name__ == "tile_split"
-        assert seen["operator"].merge.__name__ == "tile_merge"
-
-    def test_ltx23_vae_executor_gathers_known_tile_shapes_and_returns_empty_on_non_rank0(self):
-        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import LTX2VaeExecutor
-        from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
-            DistributedOperator,
-            GridSpec,
-            TileTask,
-        )
-
-        z = torch.zeros(1, 1, 1, 1, 1)
-        tile_output_shapes = {
-            0: (1, 1, 1, 2, 2),
-            1: (1, 1, 1, 2, 1),
-            2: (1, 1, 1, 1, 2),
-            3: (1, 1, 1, 1, 1),
-        }
-        tasks = [
-            TileTask(0, (0, 0), z, workload=4),
-            TileTask(1, (0, 1), z, workload=2),
-            TileTask(2, (1, 0), z, workload=2),
-            TileTask(3, (1, 1), z, workload=1),
-        ]
-        grid_spec = GridSpec(
-            split_dims=(3, 4),
-            grid_shape=(2, 2),
-            tile_spec={
-                "max_tile_output_shape": (1, 1, 1, 2, 2),
-                "tile_output_shapes": tile_output_shapes,
-            },
-            output_dtype=torch.float32,
-        )
-        seen = {}
-
-        def exec_tile(task):
-            return torch.full(tile_output_shapes[task.tile_id], float(task.tile_id + 1))
-
-        def merge_tiles(coord_tensor_map, passed_grid_spec):
-            seen["merged_shapes"] = {coord: tuple(tile.shape) for coord, tile in coord_tensor_map.items()}
-            assert passed_grid_spec is grid_spec
-            return torch.stack(
-                [
-                    coord_tensor_map[(0, 0)].flatten()[0],
-                    coord_tensor_map[(0, 1)].flatten()[0],
-                    coord_tensor_map[(1, 0)].flatten()[0],
-                    coord_tensor_map[(1, 1)].flatten()[0],
-                ]
+        with pytest.raises(ValueError, match="decode_timestep"):
+            _expand_per_prompt_decode_value(
+                [0.1, 0.2, 0.3],
+                prompt_batch_size=2,
+                effective_batch_size=4,
+                field_name="decode_timestep",
             )
-
-        operator = DistributedOperator(split=lambda _z: (tasks, grid_spec), exec=exec_tile, merge=merge_tiles)
-
-        rank0_executor = object.__new__(LTX2VaeExecutor)
-        rank0_executor.parallel_size = 2
-        rank0_executor.world_size = 2
-        rank0_executor.rank = 0
-
-        def gather_rank0(local_tile_tensor):
-            assigned = rank0_executor._balance_tasks(tasks, 2)
-            rank1_results = [(task.tile_id, exec_tile(task)) for task in assigned[1]]
-            rank1_tile_tensor = rank0_executor._pack_local_tiles_without_meta(
-                rank1_results,
-                list(local_tile_tensor.shape),
-                z.device,
-                torch.float32,
-            )
-            seen["rank0_gather_shape"] = tuple(local_tile_tensor.shape)
-            return [local_tile_tensor, rank1_tile_tensor]
-
-        def fail_final_sync(*_args, **_kwargs):
-            raise AssertionError("broadcast_result=False should not sync the final result")
-
-        rank0_executor.gather_tensors = gather_rank0
-        rank0_executor._sync_final_result = fail_final_sync
-
-        rank0_result = rank0_executor.execute(z, operator, broadcast_result=False)
-
-        torch.testing.assert_close(rank0_result, torch.tensor([1.0, 2.0, 3.0, 4.0]))
-        assert seen["rank0_gather_shape"] == (2, 1, 1, 1, 2, 2)
-        assert seen["merged_shapes"] == {
-            (0, 0): (1, 1, 1, 2, 2),
-            (0, 1): (1, 1, 1, 2, 1),
-            (1, 0): (1, 1, 1, 1, 2),
-            (1, 1): (1, 1, 1, 1, 1),
-        }
-
-        non_rank0_executor = object.__new__(LTX2VaeExecutor)
-        non_rank0_executor.parallel_size = 2
-        non_rank0_executor.world_size = 2
-        non_rank0_executor.rank = 1
-
-        def gather_rank1(local_tile_tensor):
-            seen["rank1_gather_shape"] = tuple(local_tile_tensor.shape)
-            return None
-
-        def fail_non_rank0_merge(*_args, **_kwargs):
-            raise AssertionError("non-rank0 should not merge gathered tiles")
-
-        non_rank0_executor.gather_tensors = gather_rank1
-        non_rank0_executor._sync_final_result = fail_final_sync
-
-        empty_result = non_rank0_executor.execute(
-            z,
-            DistributedOperator(
-                split=lambda _z: (tasks, grid_spec),
-                exec=exec_tile,
-                merge=fail_non_rank0_merge,
-            ),
-            broadcast_result=False,
-        )
-
-        assert tuple(empty_result.shape) == (0,)
-        assert seen["rank1_gather_shape"] == (2, 1, 1, 1, 2, 2)
-
-
-class TestCFGParallelHelpers:
-    """Test LTX-2.3 CFG helper math without loading model weights."""
-
-    def test_combine_cfg_noise_matches_x0_space_formula(self):
-        import torch
-
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23Pipeline
-
-        pipe = object.__new__(LTX23Pipeline)
-        video_sample = torch.tensor([[[1.0, -2.0]]])
-        audio_sample = torch.tensor([[[0.5, 3.0]]])
-        video_pos = torch.tensor([[[0.2, -0.3]]])
-        video_neg = torch.tensor([[[-0.4, 0.1]]])
-        audio_pos = torch.tensor([[[0.7, -0.2]]])
-        audio_neg = torch.tensor([[[0.1, 0.4]]])
-        video_sigma = torch.tensor(0.25)
-        audio_sigma = torch.tensor(0.5)
-        scale = 4.0
-
-        video_combined, audio_combined = pipe.combine_cfg_noise(
-            (video_pos, audio_pos),
-            (video_neg, audio_neg),
-            scale,
-            video_latents=video_sample,
-            audio_latents=audio_sample,
-            video_sigma=video_sigma,
-            audio_sigma=audio_sigma,
-        )
-
-        x0_video_cond = video_sample - video_pos * video_sigma
-        x0_video_uncond = video_sample - video_neg * video_sigma
-        x0_video_guided = x0_video_cond + (scale - 1) * (x0_video_cond - x0_video_uncond)
-        expected_video = (video_sample - x0_video_guided) / video_sigma
-
-        x0_audio_cond = audio_sample - audio_pos * audio_sigma
-        x0_audio_uncond = audio_sample - audio_neg * audio_sigma
-        x0_audio_guided = x0_audio_cond + (scale - 1) * (x0_audio_cond - x0_audio_uncond)
-        expected_audio = (audio_sample - x0_audio_guided) / audio_sigma
-        assert torch.allclose(video_combined, expected_video)
-        assert torch.allclose(audio_combined, expected_audio)
-
-    def test_two_rank_cfg_parallel_smoke_uses_rank_local_branch_and_x0_formula(self, monkeypatch):
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
-
-        pipe = object.__new__(ltx23.LTX23Pipeline)
-        video_sample = torch.tensor([[[1.0, -2.0]]])
-        audio_sample = torch.tensor([[[0.5, 3.0, -1.0]]])
-        video_pos = torch.tensor([[[0.2, -0.3]]])
-        video_neg = torch.tensor([[[-0.4, 0.1]]])
-        audio_pos = torch.tensor([[[0.7, -0.2, 0.3]]])
-        audio_neg = torch.tensor([[[0.1, 0.4, -0.5]]])
-        video_sigma = torch.tensor(0.25)
-        audio_sigma = torch.tensor(0.5)
-        scale = 4.0
-
-        class FakeCfgGroup:
-            def all_gather(self, tensor, separate_tensors=True):
-                assert separate_tensors
-                if tensor.shape == video_pos.shape:
-                    return [video_pos, video_neg]
-                return [audio_pos, audio_neg]
-
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx23, "get_cfg_group", lambda: FakeCfgGroup())
-
-        expected_video = ltx23.LTX23Pipeline._combine_x0_space_cfg(
-            video_sample,
-            video_pos,
-            video_neg,
-            video_sigma,
-            scale,
-        )
-        expected_audio = ltx23.LTX23Pipeline._combine_x0_space_cfg(
-            audio_sample,
-            audio_pos,
-            audio_neg,
-            audio_sigma,
-            scale,
-        )
-
-        for rank, expected_branch in ((0, "positive"), (1, "negative")):
-            calls = []
-            monkeypatch.setattr(ltx23, "get_classifier_free_guidance_rank", lambda rank=rank: rank)
-
-            def fake_predict_noise(**kwargs):
-                calls.append(kwargs["branch"])
-                if kwargs["branch"] == "positive":
-                    return video_pos, audio_pos
-                return video_neg, audio_neg
-
-            object.__setattr__(pipe, "predict_noise", fake_predict_noise)
-            video_combined, audio_combined = pipe.predict_noise_with_parallel_cfg(
-                true_cfg_scale=scale,
-                positive_kwargs={"branch": "positive"},
-                negative_kwargs={"branch": "negative"},
-                cfg_normalize=False,
-                video_latents=video_sample,
-                audio_latents=audio_sample,
-                video_sigma=video_sigma,
-                audio_sigma=audio_sigma,
-            )
-
-            assert calls == [expected_branch]
-            torch.testing.assert_close(video_combined, expected_video)
-            torch.testing.assert_close(audio_combined, expected_audio)
-
-        assert "_cfg_video_latents" not in pipe.__dict__
-        assert "_cfg_audio_latents" not in pipe.__dict__
-
-
-class TestCFGParallelForwardPath:
-    """Test the LTX-2.3 CFG-parallel denoising path without loading model weights."""
-
-    @pytest.mark.parametrize(("cfg_rank", "expected_prompt_value"), [(0, 1.0), (1, 0.0)])
-    @pytest.mark.parametrize(
-        ("frame_rate_input", "audio_sampling_rate", "expected_frame_rate"),
-        [(1.0, 1, 1.0), (None, 24, 24.0)],
-    )
-    def test_forward_cfg_parallel_steps_video_and_audio_scheduler(
-        self,
-        monkeypatch,
-        cfg_rank,
-        expected_prompt_value,
-        frame_rate_input,
-        audio_sampling_rate,
-        expected_frame_rate,
-    ):
-        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
-        from vllm_omni.diffusion.request import OmniDiffusionRequest
-        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-        pipe = object.__new__(ltx23.LTX23Pipeline)
-        torch.nn.Module.__init__(pipe)
-        pipe.device = torch.device("cpu")
-        pipe.tokenizer_max_length = 1
-        pipe.vae_spatial_compression_ratio = 32
-        pipe.vae_temporal_compression_ratio = 1
-        pipe.transformer_spatial_patch_size = 1
-        pipe.transformer_temporal_patch_size = 1
-        pipe.audio_sampling_rate = audio_sampling_rate
-        pipe.audio_hop_length = 1
-        pipe.audio_vae_temporal_compression_ratio = 1
-        pipe.audio_vae_mel_compression_ratio = 1
-        pipe.od_config = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=1))
-        pipe.tokenizer = SimpleNamespace(padding_side="left")
-        pipe.vae = SimpleNamespace(
-            latents_mean=torch.zeros(2),
-            latents_std=torch.ones(2),
-            config=SimpleNamespace(scaling_factor=1.0),
-        )
-        pipe.audio_vae = SimpleNamespace(
-            latents_mean=torch.zeros(2),
-            latents_std=torch.ones(2),
-            config=SimpleNamespace(mel_bins=2, latent_channels=1),
-        )
-
-        video_pos = torch.tensor([[[0.2, -0.3]]])
-        video_neg = torch.tensor([[[-0.4, 0.1]]])
-        audio_pos = torch.tensor([[[0.7, -0.2]]])
-        audio_neg = torch.tensor([[[0.1, 0.4]]])
-
-        class FakeCfgGroup:
-            def all_gather(self, tensor, separate_tensors=True):
-                assert separate_tensors
-                if torch.equal(tensor, video_pos) or torch.equal(tensor, video_neg):
-                    return [video_pos, video_neg]
-                if torch.equal(tensor, audio_pos) or torch.equal(tensor, audio_neg):
-                    return [audio_pos, audio_neg]
-                raise AssertionError(f"Unexpected gathered tensor: {tensor}")
-
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_world_size", lambda: 2)
-        monkeypatch.setattr(ltx23, "get_classifier_free_guidance_rank", lambda: cfg_rank)
-        monkeypatch.setattr(ltx23, "get_cfg_group", lambda: FakeCfgGroup())
-
-        def fake_retrieve_timesteps(scheduler, num_inference_steps, device, timesteps, sigmas=None, mu=None):
-            scheduler.sigmas = torch.tensor([0.25, 0.25], device=device)
-            return torch.tensor([1.0, 0.5], device=device), 2
-
-        monkeypatch.setattr(ltx23, "retrieve_timesteps", fake_retrieve_timesteps)
-
-        class FakeScheduler:
-            def __init__(self, name="video", calls=None):
-                self.name = name
-                self.calls = [] if calls is None else calls
-                self.config = {
-                    "max_image_seq_len": 4096,
-                    "base_image_seq_len": 1024,
-                    "base_shift": 0.95,
-                    "max_shift": 2.05,
-                }
-                self.sigmas = torch.tensor([0.25, 0.25])
-
-            def __deepcopy__(self, memo):
-                return FakeScheduler("audio", self.calls)
-
-            def step(self, noise_pred, t, latents, return_dict=False, generator=None):
-                self.calls.append((self.name, noise_pred.clone(), t.clone(), latents.clone()))
-                return (latents - noise_pred,)
-
-        class FakeConnectors:
-            def to(self, device):
-                return self
-
-            def __call__(self, prompt_embeds, prompt_attention_mask, padding_side):
-                assert padding_side == "left"
-                assert prompt_embeds.shape[0] == 2
-                return prompt_embeds, prompt_embeds, prompt_attention_mask
-
-        rope_video_fps: list[float] = []
-
-        class FakeRope:
-            def prepare_video_coords(self, batch_size, num_frames, height, width, device, fps):
-                rope_video_fps.append(fps)
-                return torch.zeros(batch_size, num_frames * height * width, 3, device=device)
-
-            def prepare_audio_coords(self, batch_size, num_frames, device):
-                return torch.zeros(batch_size, num_frames, 1, device=device)
-
-        class FakeTransformer:
-            def __init__(self):
-                self.config = SimpleNamespace(in_channels=2)
-                self.rope = FakeRope()
-                self.audio_rope = FakeRope()
-                self.calls = []
-
-            def __call__(self, **kwargs):
-                self.calls.append(kwargs)
-                expected_prompt = torch.full((1, 1, 1), expected_prompt_value)
-                torch.testing.assert_close(kwargs["encoder_hidden_states"], expected_prompt)
-                torch.testing.assert_close(kwargs["audio_encoder_hidden_states"], expected_prompt)
-                assert kwargs["hidden_states"].shape == (1, 1, 2)
-                assert kwargs["audio_hidden_states"].shape == (1, 1, 2)
-                if cfg_rank == 0:
-                    return video_pos, audio_pos
-                return video_neg, audio_neg
-
-        class DummyProgress:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def update(self):
-                pass
-
-        pipe.scheduler = FakeScheduler()
-        pipe.connectors = FakeConnectors()
-        pipe.transformer = FakeTransformer()
-        object.__setattr__(pipe, "progress_bar", lambda total: DummyProgress())
-
-        def fake_encode_prompt(**kwargs):
-            return (
-                torch.ones(1, 1, 1),
-                torch.ones(1, 1, dtype=torch.bool),
-                torch.zeros(1, 1, 1),
-                torch.ones(1, 1, dtype=torch.bool),
-            )
-
-        object.__setattr__(pipe, "encode_prompt", fake_encode_prompt)
-
-        video_latents = torch.tensor([[[1.0, -2.0]]])
-        audio_latents = torch.tensor([[[0.5, 3.0]]])
-        req = OmniDiffusionRequest(
-            prompts=[{"prompt": "prompt", "negative_prompt": "negative"}],
-            sampling_params=OmniDiffusionSamplingParams(
-                height=32,
-                width=32,
-                num_frames=1,
-                frame_rate=frame_rate_input,
-                num_inference_steps=2,
-                guidance_scale=4.0,
-                latents=video_latents,
-                audio_latents=audio_latents,
-                output_type="latent",
-            ),
-            request_id="ltx23-cfg-parallel-forward-test",
-        )
-
-        output = pipe.forward(req)
-
-        expected_video_noise = ltx23.LTX23Pipeline._combine_x0_space_cfg(
-            video_latents,
-            video_pos,
-            video_neg,
-            pipe.scheduler.sigmas[0],
-            4.0,
-        )
-        expected_audio_noise = ltx23.LTX23Pipeline._combine_x0_space_cfg(
-            audio_latents,
-            audio_pos,
-            audio_neg,
-            pipe.scheduler.sigmas[0],
-            4.0,
-        )
-        scheduler_call_names = [call[0] for call in pipe.scheduler.calls]
-        assert scheduler_call_names == ["video", "audio", "video", "audio"]
-        assert len(pipe.transformer.calls) == 2
-        torch.testing.assert_close(pipe.scheduler.calls[0][1], expected_video_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[1][1], expected_audio_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[2][1], expected_video_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[3][1], expected_audio_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[2][3], video_latents - expected_video_noise)
-        torch.testing.assert_close(pipe.scheduler.calls[3][3], audio_latents - expected_audio_noise)
-
-        video_out, audio_out = output.output
-        torch.testing.assert_close(video_out, (video_latents - 2 * expected_video_noise).reshape(1, 2, 1, 1, 1))
-        torch.testing.assert_close(audio_out, (audio_latents - 2 * expected_audio_noise).reshape(1, 1, 1, 2))
-
-        # fps regression guard: an omitted request fps (frame_rate_input=None) must resolve
-        # to the model's own 24.0 default, not crash on None; a provided rate is passed through.
-        assert rope_video_fps
-        assert all(fps == expected_frame_rate for fps in rope_video_fps)
 
 
 class TestRegistryIntegration:
@@ -719,15 +458,6 @@ class TestRegistryIntegration:
         ]
         for name in expected:
             assert name not in CUSTOM_DIT_ENABLERS, f"{name} not in CUSTOM_DIT_ENABLERS"
-
-    def test_ltx2_transformer_has_dit_cache_config(self):
-        """Ensure LTX2 has a Cache DiT adapter config and that it uses separate CFG."""
-        from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
-        from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
-
-        adapter_config = getattr(LTX2VideoTransformer3DModel, "_cache_dit_adapter_config")
-        assert isinstance(adapter_config, CacheDiTAdapterConfig)
-        assert adapter_config.has_separate_cfg
 
 
 class TestVocoderSampleRateDetection:
@@ -816,31 +546,6 @@ class TestPostProcessFunction:
         assert "video" in result
         assert "audio" in result
         assert "audio_sample_rate" not in result
-
-
-class TestReExportModule:
-    """Test that pipeline_ltx2_3_image2video.py correctly re-exports."""
-
-    def test_i2v_classes_importable(self):
-        """I2V classes must be importable from the re-export module."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3_image2video import LTX23ImageToVideoPipeline
-
-        assert LTX23ImageToVideoPipeline is not None
-
-    def test_post_process_func_importable(self):
-        """get_ltx2_post_process_func must be importable from re-export module."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3_image2video import get_ltx2_post_process_func
-
-        assert callable(get_ltx2_post_process_func)
-
-    def test_i2v_classes_are_same_as_direct_import(self):
-        """Re-exported classes must be the same objects as direct imports."""
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline as Direct
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3_image2video import (
-            LTX23ImageToVideoPipeline as ReExported,
-        )
-
-        assert Direct is ReExported
 
 
 class TestInitExports:

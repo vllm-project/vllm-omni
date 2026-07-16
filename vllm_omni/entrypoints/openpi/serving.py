@@ -128,7 +128,7 @@ class ServingRealtimeRobotOpenPI:
         # exposes an async iterator, so consume it to completion and use the
         # final output, matching other non-streaming OpenAI serving paths.
         async for output in self.engine_client.generate(
-            prompt=request.prompts[0],
+            prompt=request.prompt,
             request_id=request.request_id,
             sampling_params_list=[request.sampling_params],
         ):
@@ -159,7 +159,7 @@ class ServingRealtimeRobotOpenPI:
         prompt = obs.get("prompt", "")
         sampling_params = OmniDiffusionSamplingParams(extra_args=extra_args)
         return OmniDiffusionRequest(
-            prompts=[prompt],
+            prompt=prompt,
             sampling_params=sampling_params,
             request_id=self._next_request_id(session_id),
         )

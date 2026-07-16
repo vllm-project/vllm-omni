@@ -87,12 +87,17 @@ class DiT(nn.Module):
         return x
 
     def forward_with_cfg(self, x, t, c, cfg_scale, latent_history, patch_size):
-        if not cfg_scale == 1:
-            x = torch.cat([x, x], dim=0)
-            latent_history = torch.cat([latent_history, latent_history], dim=0)
-            fake_latent = torch.zeros_like(c)
-            c = torch.cat([c, fake_latent], dim=0)
+        # Always run the classifier-free-guidance path (cond + uncond). TTS
+        # inference always uses cfg>1, and branching on ``cfg_scale`` is avoided
+        # because under CUDA-graph capture it is a CUDA tensor — ``bool(cfg_scale)``
+        # would force a device sync and break capture. ``expand`` (not ``repeat``)
+        # avoids a fresh allocation each step.
+        x = torch.cat([x, x], dim=0)
+        latent_history = torch.cat([latent_history, latent_history], dim=0)
+        fake_latent = torch.zeros_like(c)
+        c = torch.cat([c, fake_latent], dim=0)
         if t.ndim == 0:
-            t = t.repeat(x.shape[0])
+            t = t.reshape(1)
+        t = t.expand(x.shape[0])
         model_out = self.forward(x, t, c, latent_history)
         return model_out[:, -patch_size:, :]

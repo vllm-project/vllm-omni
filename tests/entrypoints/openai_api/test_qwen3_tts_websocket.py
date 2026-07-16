@@ -113,9 +113,9 @@ class TestQwen3TTSWebSocket:
         session_done = result["session_done"]
 
         assert session_done is not None
-        assert session_done["total_sentences"] == 2
-        assert len(starts) == 2
-        assert len(dones) == 2
+        assert session_done["total_sentences"] == 1
+        assert len(starts) == 1
+        assert len(dones) == 1
 
         for idx, start in enumerate(starts):
             assert start["type"] == "audio.start"

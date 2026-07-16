@@ -140,6 +140,12 @@ def parse_args():
         help="Number of GPUs for tensor parallelism.",
     )
     parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs for CFG parallelism.",
+    )
+    parser.add_argument(
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
@@ -158,7 +164,7 @@ def parse_args():
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit"],
+        choices=["cache_dit", "tea_cache"],
         help="Cache backend to use for image generation acceleration.",
     )
     parser.add_argument(
@@ -194,6 +200,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         cache_backend=args.cache_backend,
         enable_cache_dit_summary=args.enable_cache_dit_summary,
+        cfg_parallel_size=args.cfg_parallel_size,
     )
 
     extra_args = {
@@ -237,6 +244,7 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Think mode     : {args.think}")
     print(f"  TP size        : {args.tensor_parallel_size}")
+    print(f"  CFG size       : {args.cfg_parallel_size}")
     print(f"  Cache backend  : {args.cache_backend or 'none'}")
     print(f"{'=' * 60}\n")
 
@@ -270,12 +278,17 @@ def main():
     )
 
     for req_output in outputs:
-        custom = getattr(req_output, "_custom_output", {}) or {}
-        if args.print_think and custom.get("think_text"):
-            print(f"[Think]\n{custom['think_text']}\n")
+        multimodal_output = getattr(req_output, "multimodal_output", {}) or {}
+        metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
+        text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
+        think_text = text_metadata.get("think_text") if isinstance(text_metadata, dict) else None
+        if args.print_think and think_text:
+            print(f"[Think]\n{think_text}\n")
 
         if is_text_output:
-            text = custom.get("text_output", "")
+            text = multimodal_output.get("text", "") if isinstance(multimodal_output, dict) else ""
+            if not text:
+                text = text_metadata.get("text_output", "") if isinstance(text_metadata, dict) else ""
             if not text:
                 text = getattr(req_output, "text", "") or ""
             print(f"[Response]\n{text}")

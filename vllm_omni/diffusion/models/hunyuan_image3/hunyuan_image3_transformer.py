@@ -29,7 +29,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
@@ -1100,6 +1100,12 @@ class ImageKVCacheManager:
 
         neg_kv = (key.reshape(-1, num_kv_heads, head_dim), value.reshape(-1, num_kv_heads, head_dim))
         self._injected_ar_kv = [self._injected_ar_kv[0], neg_kv]
+        logger.debug(
+            "[AR KV Reuse] neg branch: reused shared_prefix_len=%d, neg_kv_total_len=%d (q_len_actual=%d)",
+            shared_prefix_len,
+            key.shape[1],
+            q_len_actual,
+        )
         return key, value
 
     @staticmethod
@@ -1817,6 +1823,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         else:
             self.shared_mlp = None
 
+        enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
         self.experts = HunyuanFusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
@@ -1828,7 +1835,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
-            pcp_size=1,
+            pcp_size=None if enable_expert_parallel else 1,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -2427,13 +2434,8 @@ class HunyuanImage3Model(nn.Module):
             # processed with quantization, LoRA, fine-tuning, etc.
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                continue
+            # KV-cache scales are renamed via maybe_remap_kv_scale_name below;
+            # quant_config.get_cache_scale was removed in vLLM v0.23.0 (see #4810).
 
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -3145,6 +3147,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     ):
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         if ar_kv_data is None:
+            logger.debug(
+                "[AR KV Reuse] cfg_rank=%s: no AR KV received, fallback to full recompute (reuse_len=0)",
+                cfg_rank,
+            )
             return input_ids, 0
 
         # 1. positive prefix len

@@ -11,8 +11,8 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniTokensPrompt
     from vllm_omni.outputs import OmniRequestOutput
 
-from vllm_omni.engine.output_modality import FinalOutputModalityType
 from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 
 
 class StageClient(Protocol):
@@ -96,14 +96,6 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         self,
         request_id: str,
         prompt: OmniPromptType,
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None: ...
-
-    async def add_batch_request_async(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None: ...

@@ -121,6 +121,31 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                try:
+                    importlib.import_module("kernels")
+                    logger.info("Using HuggingFace kernels-backed attention backend '%s'", backend_upper)
+                except ImportError:
+                    if backend_upper == "FLASH_ATTN_HUB":
+                        logger.warning(
+                            "HuggingFace `kernels` library is not available. Falling back to local FLASH_ATTN."
+                        )
+                        backend_upper = "FLASH_ATTN"
+                    elif backend_upper == "FLASH_ATTN_3_HUB":
+                        logger.warning(
+                            "HuggingFace `kernels` library is not available. Falling back to local FLASH_ATTN."
+                        )
+                        backend_upper = "FLASH_ATTN"
+
+            if backend_upper == "FLASH_ATTN_3_HUB":
+                fa3_hub_supported = compute_capability is not None and compute_capability.major >= 9
+                if not fa3_hub_supported:
+                    logger.warning(
+                        "FLASH_ATTN_3_HUB requires a Hopper-class GPU with compute capability >= 9.0. "
+                        "Falling back to FLASH_ATTN_HUB."
+                    )
+                    backend_upper = "FLASH_ATTN_HUB"
+
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
                 if not compute_supported:
                     logger.warning(
@@ -214,13 +239,18 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return free
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.cuda.mem_get_info(device)
+        return free, total
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.cuda.get_device_name(device_id)
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
-        """Copied from vllm/platforms/cuda/platform.py v0.20.0 with force using vllm_c kernels"""
-        default = ["vllm_c", "native"]  # Originally using "native" here when compiling
+        """Prefer ``vllm_c`` CUDA kernels over ``native`` for diffusion IR ops."""
+        default = ["vllm_c", "native"]
 
         # Use oink if enabled for rms_norm
         # TODO(Laurawly/luka): remove this env var,

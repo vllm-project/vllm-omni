@@ -19,6 +19,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     HunyuanImage3Pipeline,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -41,7 +42,7 @@ def _state(request_id: str, step_index: int) -> DiffusionRequestState:
     state = DiffusionRequestState(
         request_id=request_id,
         sampling=SimpleNamespace(),
-        prompts=["prompt"],
+        prompt="prompt",
     )
     state.step_index = step_index
     state.timesteps = torch.tensor([1.0, 0.5, 0.25, 0.0])
@@ -135,7 +136,7 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
     state = DiffusionRequestState(
         request_id="req-bot-task",
         sampling=sampling,
-        prompts=[prompt_item],
+        prompt=prompt_item,
     )
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):
@@ -160,10 +161,14 @@ def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
 
     monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
     pipeline.prepare_model_inputs = fake_prepare_model_inputs
-    req = SimpleNamespace(
-        request_id="req-forward-bot-task",
-        sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
-        prompts=[{"prompt": "prompt", "bot_task": "vanilla"}],
+    req = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="req-forward-bot-task",
+                sampling_params=_sampling_params(bot_task="think_recaption", use_system_prompt="dynamic"),
+                prompt={"prompt": "prompt", "bot_task": "vanilla"},
+            )
+        ]
     )
 
     with pytest.raises(RuntimeError, match="stop after prepare_model_inputs"):

@@ -4,6 +4,7 @@
 # no reference audio required.
 # Rate: ~12.5 tokens/second; pass `tokens` to control duration.
 async_chunk: true
+trust_remote_code: true  # OpenMOSS-Team/MOSS-SoundEffect ships custom modeling code
 
 connectors:
   shm:

@@ -40,6 +40,7 @@ def _make_runner(multimodal_outputs):
     runner.supports_mm_inputs = False
     runner.speculative_config = None
     runner.routed_experts_initialized = False
+    runner._async_chunk = False
     return runner
 
 

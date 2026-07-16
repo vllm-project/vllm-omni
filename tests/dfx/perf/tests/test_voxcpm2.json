@@ -3,7 +3,10 @@
     "test_name": "test_voxcpm2",
     "server_params": {
       "model": "openbmb/VoxCPM2",
-      "trust_remote_code": true
+      "trust_remote_code": true,
+      "extra_cli_args": [
+        "--trust-remote-code"
+      ]
     },
     "benchmark_params": [
       {

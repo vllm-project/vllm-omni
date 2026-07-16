@@ -94,7 +94,7 @@ def omni_server(request):
 benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
 
 
-@pytest.fixture(params=benchmark_indices)
+@pytest.fixture
 def benchmark_params(request, omni_server):
     """Benchmark parameters fixture with proper parametrization"""
     test_name, param_index = request.param

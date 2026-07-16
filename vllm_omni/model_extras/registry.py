@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from PIL import Image
 
+from vllm_omni.model_extras.audiox import (
+    AUDIOX_EXTRA_BODY_PARAMS,
+    AUDIOX_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.bagel import (
     BAGEL_EXTRA_BODY_PARAMS,
     BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -34,19 +38,54 @@ from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+    MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+    MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_text_to_image_prompt as build_mammothmoda2_text_to_image_prompt,
+)
+from vllm_omni.model_extras.ming_flash_omni import (
+    MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
+    MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
+    MING_FLASH_OMNI_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.ming_flash_omni import (
+    build_image_to_image_prompt as build_ming_flash_omni_image_to_image_prompt,
+)
+from vllm_omni.model_extras.ming_flash_omni import (
+    build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
+)
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.vace import (
+    VACE_EXTRA_BODY_PARAMS,
+    VACE_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.vace import (
+    build_image_to_video_prompt as build_vace_image_to_video_prompt,
+)
 
-# TODO: extend with TextToVideoPromptBuilder, ImageToVideoPromptBuilder
-# once a video model needs model-specific prompt construction (follow-up PR).
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
     dict[str, Any],
 ]
 ImageToImagePromptBuilder = Callable[
     [str, str | None, "Image.Image | list[Image.Image]", int | None, int | None],
+    dict[str, Any],
+]
+ImageToVideoPromptBuilder = Callable[
+    [
+        str,
+        str | None,
+        "Mapping[str, Any]",
+        int | None,
+        int | None,
+        int | None,
+    ],
     dict[str, Any],
 ]
 
@@ -79,7 +118,25 @@ def default_image_to_image_prompt(
     return result
 
 
+def default_image_to_video_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    media_inputs: Mapping[str, Any],
+    height: int | None = None,
+    width: int | None = None,
+    num_frames: int | None = None,
+) -> dict[str, Any]:
+    del height, width, num_frames
+    if set(media_inputs) != {"image"} or not isinstance(media_inputs["image"], Image.Image):
+        raise ValueError("This model only supports a single --image input in the shared image-to-video example.")
+    return default_image_to_image_prompt(prompt, negative_prompt, media_inputs["image"])
+
+
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
+    "AudioXPipeline": {
+        "extra_body_params": AUDIOX_EXTRA_BODY_PARAMS,
+        "extra_output_params": AUDIOX_EXTRA_OUTPUT_PARAMS,
+    },
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
         "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -107,6 +164,24 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "HeliosPyramidPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
+    },
+    "WanVACEPipeline": {
+        "extra_body_params": VACE_EXTRA_BODY_PARAMS,
+        "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
+        "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
+    },
+    "MammothModa2DiTPipeline": {
+        "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_mammothmoda2_text_to_image_prompt,
+    },
+    "MingImagePipeline": {
+        "extra_body_params": MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
+        "extra_output_params": MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MING_FLASH_OMNI_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
 }
 
@@ -177,3 +252,21 @@ def build_image_to_image_prompt(
         else default_image_to_image_prompt
     )
     return builder(prompt, negative_prompt, input_image, height, width)
+
+
+def build_image_to_video_prompt(
+    model_class_name: str | None,
+    prompt: str,
+    negative_prompt: str | None,
+    media_inputs: Mapping[str, Any],
+    height: int | None = None,
+    width: int | None = None,
+    num_frames: int | None = None,
+) -> dict[str, Any]:
+    spec = _get_spec(model_class_name)
+    builder: ImageToVideoPromptBuilder = (
+        spec.get("image_to_video_prompt_builder", default_image_to_video_prompt)
+        if spec is not None
+        else default_image_to_video_prompt
+    )
+    return builder(prompt, negative_prompt, media_inputs, height, width, num_frames)

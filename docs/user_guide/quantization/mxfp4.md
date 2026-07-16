@@ -39,7 +39,7 @@ vLLM-Omni provides two quantization methods with different scale structures:
 | NVIDIA Blackwell GPU (SM 100+) | ⭕ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ |
 | NVIDIA Ampere GPU (SM 80+) | ⭕ |
-| AMD ROCm | ⭕ |
+| AMD ROCm (gfx950 / MI355X) | ✅ |
 | Intel XPU | ⭕ |
 | Ascend NPU (Atlas 950 A5) | ✅ |
 

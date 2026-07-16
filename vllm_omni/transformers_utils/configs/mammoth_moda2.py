@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import ClassVar, Literal
 
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLTextConfig,
     Qwen2_5_VLVisionConfig,
 )
+
+from vllm_omni.tokenizers.mammoth_moda2_tokenizer import MammothUTokenizer
 
 __all__ = [
     "Mammothmoda2Config",
@@ -229,7 +231,8 @@ class Mammothmoda2Config(PretrainedConfig):
         architectures: list[str] | None = None,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        # Must set llm_config before super().__init__() because the parent's
+        # validation calls get_text_config() which accesses self.llm_config
         self.llm_config = AutoConfig.for_model(**llm_config) if llm_config is not None else None
         self.gen_vae_config = gen_vae_config
         self.gen_dit_config = gen_dit_config
@@ -243,8 +246,13 @@ class Mammothmoda2Config(PretrainedConfig):
         self.tokenizer_class = "MammothUTokenizer"
         self.architectures = ["Mammothmoda2Model"]
 
+        super().__init__(**kwargs)
+
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
-        return self.llm_config
+        if self.llm_config is None:
+            return None
+        # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config
+        return self.llm_config.text_config
 
     def _require_llm_config(self) -> PretrainedConfig:
         if self.llm_config is None:
@@ -281,3 +289,6 @@ AutoConfig.register(Mammothmoda2Config.model_type, Mammothmoda2Config)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLConfig.model_type, Mammothmoda2Qwen2_5_VLConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLTextConfig.model_type, Mammothmoda2Qwen2_5_VLTextConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLVisionConfig.model_type, Mammothmoda2Qwen2_5_VLVisionConfig)
+# Register tokenizer_type -> the configs & AutoTokenizer
+AutoTokenizer.register(config_class=Mammothmoda2Config, slow_tokenizer_class=MammothUTokenizer)
+AutoTokenizer.register(config_class=Mammothmoda2Qwen2_5_VLConfig, slow_tokenizer_class=MammothUTokenizer)

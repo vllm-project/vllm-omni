@@ -7,6 +7,7 @@ without requiring the actual checkpoint or GPU.
 """
 
 import asyncio
+import json
 import time
 from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ import torch
 
 class TestHiggsAudioV3Config:
     def test_default_config_loads(self):
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
         )
 
@@ -34,7 +35,7 @@ class TestHiggsAudioV3Config:
         assert config.tie_modality_embeddings is True
 
     def test_custom_audio_encoder_config(self):
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
         )
 
@@ -51,7 +52,7 @@ class TestHiggsAudioV3Config:
         assert config.tie_modality_embeddings is False
 
     def test_invalid_num_codebooks_rejected(self):
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
         )
 
@@ -59,7 +60,7 @@ class TestHiggsAudioV3Config:
             HiggsAudioV3Config(audio_encoder_config={"num_codebooks": 0, "vocab_size": 1026})
 
     def test_negative_num_codebooks_rejected(self):
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
         )
 
@@ -67,7 +68,7 @@ class TestHiggsAudioV3Config:
             HiggsAudioV3Config(audio_encoder_config={"num_codebooks": -1, "vocab_size": 1026})
 
     def test_special_token_ids_initially_none(self):
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
         )
 
@@ -77,7 +78,7 @@ class TestHiggsAudioV3Config:
         assert config.audio_continuation_id is None
 
     def test_hidden_size_from_text_config(self):
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
         )
 
@@ -797,11 +798,11 @@ class TestAudioFeedback:
 class TestCodecStrictness:
     def test_bundled_missing_quantizer_key_raises(self):
         """Bundled codec load must fail when a quantizer codebook key is missing."""
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
-            HiggsAudioV3Config,
-        )
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
             HiggsAudioV3Code2Wav,
+        )
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
         )
 
         config = HiggsAudioV3Config()
@@ -821,11 +822,11 @@ class TestCodecStrictness:
 
     def test_bundled_missing_fc2_raises(self):
         """Bundled codec load must fail when fc2 keys are missing."""
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
-            HiggsAudioV3Config,
-        )
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
             HiggsAudioV3Code2Wav,
+        )
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
         )
 
         config = HiggsAudioV3Config()
@@ -844,11 +845,11 @@ class TestCodecStrictness:
     def test_bundled_unknown_decoder_key_rejected(self, monkeypatch):
         """Unknown decoder-side key should be rejected as unconsumed."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_code2wav as c2w_mod
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
-            HiggsAudioV3Config,
-        )
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
             HiggsAudioV3Code2Wav,
+        )
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
         )
 
         class FakeDAC(torch.nn.Module):
@@ -871,11 +872,11 @@ class TestCodecStrictness:
     def test_bundled_encoder_side_keys_accepted(self, monkeypatch):
         """Known encoder-side keys should not trigger unconsumed-key rejection."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_code2wav as c2w_mod
-        from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
-            HiggsAudioV3Config,
-        )
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
             HiggsAudioV3Code2Wav,
+        )
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
         )
 
         class FakeDAC(torch.nn.Module):
@@ -1199,9 +1200,9 @@ class TestRegistry:
         assert "HiggsAudioV3Code2WavForConditionalGeneration" in _OMNI_MODELS
 
     def test_pipeline_registered(self):
-        from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
+        from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 
-        assert "higgs_multimodal_qwen3" in _OMNI_PIPELINES
+        assert "higgs_multimodal_qwen3" in OMNI_PIPELINES
 
     def test_deploy_yaml_exists(self):
         import os
@@ -1309,13 +1310,42 @@ class TestVoiceCloneReferenceCache:
         parent = tmp_path / "OmniVoice"
         subdir = parent / "audio_tokenizer"
         subdir.mkdir(parents=True)
-        (subdir / "config.json").write_text("{}", encoding="utf-8")
+        (subdir / "config.json").write_text(
+            json.dumps({"model_type": "higgs_audio_v2_tokenizer"}),
+            encoding="utf-8",
+        )
 
         monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(parent))
         assert tok._resolve_audio_tokenizer_dir() == str(subdir)
 
         monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(subdir))
         assert tok._resolve_audio_tokenizer_dir() == str(subdir)
+
+    def test_audio_tokenizer_dir_rejects_omnivoice_config(self, tmp_path, monkeypatch):
+        import huggingface_hub
+        import huggingface_hub.constants as hub_constants
+
+        from vllm_omni.model_executor.models.higgs_audio_v2 import higgs_audio_v2_tokenizer as tok
+
+        parent = tmp_path / "OmniVoice"
+        subdir = parent / "audio_tokenizer"
+        subdir.mkdir(parents=True)
+        (subdir / "config.json").write_text(
+            json.dumps({"model_type": "omnivoice"}),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HIGGS_AUDIO_TOKENIZER_PATH", str(parent))
+        monkeypatch.setenv("HIGGS_AUDIO_V2_TOKENIZER_PATH", "")
+        monkeypatch.setattr(
+            huggingface_hub,
+            "try_to_load_from_cache",
+            lambda **_: str(subdir / "config.json"),
+        )
+        monkeypatch.setattr(hub_constants, "HF_HUB_CACHE", str(tmp_path / "empty_cache"))
+
+        assert tok._normalize_audio_tokenizer_dir(str(parent)) is None
+        assert tok._resolve_audio_tokenizer_dir() is None
 
     def test_higgs_v3_ref_code_cache_returns_clone(self):
         from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech

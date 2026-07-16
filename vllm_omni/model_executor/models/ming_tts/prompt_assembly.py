@@ -176,6 +176,84 @@ def build_dense_prompt_token_ids(
     )
 
 
+def build_moe_prompt_token_ids(
+    tokenizer: Any,
+    *,
+    prompt: str,
+    text: str,
+    instruction: str | None = None,
+    prompt_text: str | None = None,
+    speaker_count: int = 0,
+    prompt_patch_count: int = 0,
+) -> list[int]:
+    """Stage-0 prompt for the Ming MoE (bailing_moe) variant.
+
+    Mirrors the ``model_type != 'dense'`` branch of upstream
+    ``BailingMMNativeForConditionalGeneration.prepare_input_embed``: no system
+    message, ``<role>HUMAN/ASSISTANT</role>`` turns, and a ``<spk><audioPatch></spk>``
+    speaker placeholder (vs. the dense ``<|vision_*|>`` placeholder).
+    """
+    speaker_prompt = []
+    for idx in range(int(speaker_count)):
+        speaker_prompt.extend(
+            tokenizer.encode(f"  speaker_{idx + 1}:")
+            + tokenizer.encode("<spk>")
+            + tokenizer.encode("<audioPatch>")
+            + tokenizer.encode("</spk>\n")
+        )
+    instruction_prompt = (
+        tokenizer.encode(instruction) + tokenizer.encode("<|endoftext|>") if instruction is not None else []
+    )
+    prompt_text_tokens = (
+        tokenizer.encode(prompt_text) if int(prompt_patch_count) > 0 and prompt_text is not None else []
+    )
+    audio_patch_token_id = tokenizer.convert_tokens_to_ids("<audioPatch>")
+    if audio_patch_token_id == tokenizer.unk_token_id:
+        raise ValueError("Ming tokenizer is missing required <audioPatch> token.")
+    prompt_latent_tokens = [audio_patch_token_id] * int(prompt_patch_count)
+    text_input_prefix = (
+        []
+        if all(token in text for token in ("Genre: ", "Mood: ", "Instrument: ", "Theme: ", "Duration: "))
+        else tokenizer.encode(" Text input:\n")
+    )
+    return (
+        tokenizer.encode("<role>HUMAN</role>")
+        + tokenizer.encode(prompt)
+        + speaker_prompt
+        + text_input_prefix
+        + prompt_text_tokens
+        + tokenizer.encode(text)
+        + tokenizer.encode("<role>ASSISTANT</role>")
+        + instruction_prompt
+        + tokenizer.encode("<audio>")
+        + prompt_latent_tokens
+    )
+
+
+def build_prompt_token_ids(model_variant: str, tokenizer: Any, **kwargs: Any) -> list[int]:
+    """Dispatch to the dense or MoE Stage-0 prompt builder by model variant."""
+    if model_variant == "moe":
+        return build_moe_prompt_token_ids(tokenizer, **kwargs)
+    return build_dense_prompt_token_ids(tokenizer, **kwargs)
+
+
+def detect_model_variant(tokenizer: Any) -> str:
+    """Infer the Ming variant from the tokenizer's special tokens.
+
+    The bailing (MoE) tokenizer carries ``<role>`` chat markers; the dense
+    Qwen2 tokenizer does not. Used to pick the prompt format when the caller
+    does not pass an explicit variant.
+    """
+    try:
+        role_id = tokenizer.convert_tokens_to_ids("<role>")
+    except Exception:
+        return "dense"
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if role_id is None or (unk is not None and role_id == unk):
+        return "dense"
+    return "moe"
+
+
 def build_ming_dense_prompt(
     tokenizer: Any,
     *,
@@ -189,7 +267,10 @@ def build_ming_dense_prompt(
     speaker_embedding: Any = None,
     use_zero_spk_emb: bool = False,
     request_id: str | None = None,
+    model_variant: str | None = None,
 ) -> dict[str, Any]:
+    if model_variant is None:
+        model_variant = detect_model_variant(tokenizer)
     instruction_text = create_instruction(instruction)
     speaker_embeddings = coerce_speaker_embeddings(speaker_embedding, use_zero_spk_emb=use_zero_spk_emb)
     effective_runtime_controls = resolve_effective_runtime_controls(text=text, runtime_controls=runtime_controls)
@@ -217,7 +298,8 @@ def build_ming_dense_prompt(
             prompt_latent_value, patch_size=PATCH_SIZE, latent_dim=LATENT_DIM
         )
 
-    prompt_token_ids = build_dense_prompt_token_ids(
+    prompt_token_ids = build_prompt_token_ids(
+        model_variant,
         tokenizer,
         prompt=prompt,
         text=text,
@@ -266,7 +348,10 @@ __all__ = [
     "DEFAULT_PROMPT",
     "build_dense_prompt_token_ids",
     "build_ming_dense_prompt",
+    "build_moe_prompt_token_ids",
+    "build_prompt_token_ids",
     "create_instruction",
+    "detect_model_variant",
     "estimate_decode_step_window_for_duration",
     "estimate_decode_steps_for_duration",
     "parse_duration_seconds",

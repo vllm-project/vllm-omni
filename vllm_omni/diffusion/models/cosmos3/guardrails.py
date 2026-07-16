@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
 from vllm_omni.errors import GuardrailViolationError
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -28,6 +29,28 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# NPU/XPU compatibility: cosmos_guardrail.cosmos_utils.load_model calls
+# ``torch.load(path, weights_only=True)`` without ``map_location``.
+# On NPU/XPU, ``torch.cuda.is_available()`` is False, so deserializing a
+# CUDA checkpoint with ``weights_only=True`` raises an UnpicklingError.
+# Work around by patching ``torch.load`` to default ``map_location="cpu"``
+# when CUDA is unavailable and no explicit map_location was given.
+# ---------------------------------------------------------------------------
+_original_torch_load = torch.load
+
+
+def _patched_torch_load(*args, **kwargs):
+    if (
+        "map_location" not in kwargs
+        and not torch.cuda.is_available()
+        and (current_omni_platform.is_npu() or current_omni_platform.is_xpu())
+    ):
+        kwargs["map_location"] = "cpu"
+    return _original_torch_load(*args, **kwargs)
+
+
+torch.load = _patched_torch_load  # type: ignore[assignment]
 
 try:
     from cosmos_guardrail import CosmosSafetyChecker
@@ -75,7 +98,7 @@ def _build_text_guardrail(checker: Any) -> TextGuardrailFn:
 
 def _build_video_guardrail(checker: Any, offload_to_cpu: bool) -> VideoGuardrailFn:
     video_models = _nn_models(checker.video_guardrail)
-    compute_device = "cuda"
+    compute_device = current_omni_platform.device_type
 
     def video_guardrail(frames: np.ndarray) -> np.ndarray:
         if offload_to_cpu:
@@ -112,9 +135,9 @@ def _init_default_guardrails(offload_to_cpu: bool = False) -> None:
     checker = CosmosSafetyChecker()
 
     # Place text models on their resting device permanently. Video models
-    # idle on CPU when offload is on and move to GPU per-call (handled in
+    # idle on CPU when offload is on and move to compute device per-call (handled in
     # the video guardrail closure).
-    idle_device = "cpu" if offload_to_cpu else "cuda"
+    idle_device = "cpu" if offload_to_cpu else current_omni_platform.device_type
     for m in _nn_models(checker.text_guardrail):
         m.to(idle_device)
     for m in _nn_models(checker.video_guardrail):

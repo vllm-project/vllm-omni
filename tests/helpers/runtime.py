@@ -45,9 +45,9 @@ from tests.helpers.assertions import (
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
-    convert_audio_bytes_to_text,
     decode_b64_image,
 )
+from tests.model_tests.diffusion.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
@@ -898,16 +898,13 @@ class OpenAIClientHandler:
                     if details := getattr(chunk.usage, "prompt_tokens_details", None):
                         result.cached_tokens = details.cached_tokens
 
-            audio_content = None
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
                 wav_buf = BytesIO()
                 merged_seg.export(wav_buf, format="wav")
                 result.audio_bytes = wav_buf.getvalue()
-                audio_content = convert_audio_bytes_to_text(result.audio_bytes)
             result.text_content = text_content
             result.audio_data = audio_data
-            result.audio_content = audio_content
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
         except Exception as e:
@@ -932,12 +929,9 @@ class OpenAIClientHandler:
                 result.prompt_tokens = usage.prompt_tokens
                 if details := getattr(usage, "prompt_tokens_details", None):
                     result.cached_tokens = details.cached_tokens
-            audio_content = None
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
-                audio_content = convert_audio_bytes_to_text(result.audio_bytes)
             result.text_content = text_content
-            result.audio_content = audio_content
             result.e2e_latency = time.perf_counter() - wall_start
             if chat_completion.choices and chat_completion.choices[0].logprobs is not None:
                 result.logprobs = chat_completion.choices[0].logprobs.content
@@ -1063,6 +1057,29 @@ class OpenAIClientHandler:
             err_message=err_message,
         )
         r = self._post_json_endpoint("/v1/chat/completions", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_completions_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/completions`` with ``json`` or ``raw_body``."""
+        # TODO (Alex): A lot of these helpers should be consolidated as they differ only by endpoint
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/completions", cfg, default_timeout=120.0)
         resp = self._http_response_from_requests(r)
         assert_http_error(
             resp,
@@ -1587,6 +1604,8 @@ class OpenAIClientHandler:
             extra_body["mm_processor_kwargs"] = mm
         if "sampling_params_list" in request_config:
             extra_body["sampling_params_list"] = request_config["sampling_params_list"]
+        if request_config.get("extra_body"):
+            extra_body.update(request_config["extra_body"])
 
         create_kwargs: dict[str, Any] = {
             "model": request_config.get("model"),
@@ -1648,8 +1667,8 @@ class OpenAIClientHandler:
         Process streaming /v1/audio/speech responses into an OmniResponse.
 
         This mirrors _process_stream_omni_response but operates on low-level
-        audio bytes and produces an OmniResponse with audio_content filled
-        from Whisper transcription.
+        audio bytes. Whisper transcription runs in assert_audio_speech_response
+        when the run_level requires it.
         """
         result = OmniResponse()
 
@@ -1685,14 +1704,9 @@ class OpenAIClientHandler:
                     raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
 
             raw_bytes = bytes(data)
-            if response_format == "pcm":
-                transcript = None
-            else:
-                transcript = convert_audio_bytes_to_text(raw_bytes)
 
             # Populate OmniResponse.
             result.audio_bytes = raw_bytes
-            result.audio_content = transcript
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
             result.audio_format = getattr(response, "response", None)
@@ -1725,13 +1739,7 @@ class OpenAIClientHandler:
             else:
                 raise TypeError(f"Unsupported audio speech response type: {type(response)}")
 
-            if response_format == "pcm":
-                transcript = None
-            else:
-                transcript = convert_audio_bytes_to_text(raw_bytes)
-
             result.audio_bytes = raw_bytes
-            result.audio_content = transcript
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
             result.audio_format = getattr(response, "response", None)
@@ -1786,6 +1794,7 @@ class OpenAIClientHandler:
             "seed",
             "instructions",
             "speed",
+            "stream_format",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]
@@ -2084,6 +2093,9 @@ class OpenAIClientHandler:
         normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
         files: dict[str, tuple[str, BytesIO, str]] = {}
         image_reference = request_config.get("image_reference")
+        video_reference = request_config.get("video_reference")
+        if image_reference and video_reference:
+            raise ValueError("Only one of image_reference or video_reference can be provided")
         if image_reference:
             if image_reference.startswith("data:image"):
                 header, encoded = image_reference.split(",", 1)
@@ -2093,6 +2105,15 @@ class OpenAIClientHandler:
                 files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
             else:
                 normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
+        if video_reference:
+            if video_reference.startswith("data:video"):
+                header, encoded = video_reference.split(",", 1)
+                content_type = header.split(";")[0].removeprefix("data:")
+                extension = content_type.split("/")[-1]
+                file_data = base64.b64decode(encoded)
+                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+            else:
+                normalized_form_data["video_reference"] = json.dumps({"video_url": video_reference})
 
         result = DiffusionResponse()
         create_url = self._build_url("/v1/videos")
@@ -2784,25 +2805,6 @@ class OmniRunnerHandler:
 # ---------------------------------------------------------------------------
 
 
-def _core_model_stage_config_path_with_dummy_load_format(stage_config_path: str | None, run_level: str) -> str | None:
-    """For ``core_model`` runs, patch every stage in the deploy YAML to ``load_format: dummy``."""
-    if run_level != "core_model" or stage_config_path is None:
-        return stage_config_path
-    from tests.helpers.stage_config import modify_stage_config
-
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    new_schema_stages = cfg.get("stages")
-    stage_key = "stages" if new_schema_stages is not None else "stage_args"
-    update_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
-    stage_entries = cfg.get(stage_key, [])
-    stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
-    return modify_stage_config(
-        stage_config_path,
-        updates={stage_key: {stage_id: {update_path: "dummy"} for stage_id in stage_ids}},
-    )
-
-
 def iter_omni_server(
     request: Any,
     run_level: str,
@@ -2810,27 +2812,28 @@ def iter_omni_server(
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, Any, None]:
     """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
-    from tests.helpers.stage_config import modify_stage_config
+    from tests.helpers.stage_config import stage_config_path_for_run_level
 
     with omni_fixture_lock:
         params: OmniServerParams = request.param
-        model = model_prefix + params.model
+        # For now, when a tiny model is substituted, we preserve the original model
+        # name via --served-model-name (so that the server still accepts requests with
+        # the original name). We also do the same for server.model so that tests reading
+        # server.model send the correct name in requests.
+        #
+        # TODO: core models on this path currently do not clean up tiny models, although
+        # tiny model paths are deterministic, so it's not a huge footprint. Still, it would
+        # be ideal to cleanup consistently everywhere.
+        original_model = model_prefix + params.model
+        model = original_model
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+            model = resolve_tiny_model_path(model)
         port = params.port
-        stage_config_path = params.stage_config_path
-        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
-            with open(stage_config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-            new_schema_stages = cfg.get("stages")
-            stage_key = "stages" if new_schema_stages is not None else "stage_args"
-            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
-            stage_entries = cfg.get(stage_key, [])
-            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
-            stage_config_path = modify_stage_config(
-                stage_config_path,
-                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
-            )
+        stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
 
         server_args = params.server_args or []
+        if model != original_model:
+            server_args = [*server_args, "--served-model-name", original_model]
         if params.use_omni and params.stage_init_timeout is not None:
             server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
         else:
@@ -2856,6 +2859,8 @@ def iter_omni_server(
                 port=port,
                 env_dict=params.env_dict,
             ) as server:
+                if model != original_model:
+                    server.model = original_model
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")
@@ -2879,6 +2884,8 @@ def iter_omni_server(
                     use_omni=params.use_omni,
                 )
             ) as server:
+                if model != original_model:
+                    server.model = original_model
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")
@@ -2893,6 +2900,8 @@ def iter_omni_runner(
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, None, None]:
     """Yield an :class:`OmniRunner`; used by ``omni_runner`` / ``omni_runner_function`` fixtures."""
+    from tests.helpers.stage_config import stage_config_path_for_run_level
+
     with omni_fixture_lock:
         param = request.param
         if not isinstance(param, (tuple, list)) or len(param) not in (2, 3):
@@ -2906,8 +2915,10 @@ def iter_omni_runner(
         else:
             model, stage_config_path, extra = param[0], param[1], param[2]
             extra_omni_kwargs = dict(extra) if extra is not None else {}
-        stage_config_path = _core_model_stage_config_path_with_dummy_load_format(stage_config_path, run_level)
+        stage_config_path = stage_config_path_for_run_level(stage_config_path, run_level)
         model = model_prefix + model
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+            model = resolve_tiny_model_path(model)
         with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
             yield runner

@@ -5,7 +5,7 @@ Verifies that the AR->DiT pipeline produces an image tensor whose pixel values
 match a golden reference.
 
 Model Hub repo id: ``bytedance-research/MammothModa2-Preview``.
-Stage config: ``get_deploy_config_path("mammoth_moda2.yaml")`` → ``vllm_omni/deploy/mammoth_moda2.yaml``
+Deploy config: ``get_deploy_config_path("mammoth_moda2.yaml")`` -> ``vllm_omni/deploy/mammoth_moda2.yaml``
 
 Golden pixel file: ``tests/e2e/offline_inference/fixtures/mammoth_moda2_t2i_golden.json``
   Regenerate with: ``UPDATE_GOLDEN=1 pytest tests/e2e/offline_inference/test_mammoth_moda2_expansion.py``
@@ -36,9 +36,9 @@ _VISION_END_TOKEN_ID = 151653  # "<|vision_end|>"
 _AR_PATCH_SIZE = 16
 
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
-T2I_STAGE_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
+T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
-_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_STAGE_CONFIG)
+_OMNI_RUNNER_PARAM = (MODEL_PATH, None, {"deploy_config": T2I_DEPLOY_CONFIG})
 
 # Golden pixel reference file.  Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
@@ -99,7 +99,7 @@ def _sample_pixels(img_tensor: torch.Tensor) -> list[float]:
 # End-to-end test
 # ---------------------------------------------------------------------------
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]

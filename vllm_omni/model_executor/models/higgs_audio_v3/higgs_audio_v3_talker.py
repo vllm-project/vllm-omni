@@ -36,10 +36,10 @@ from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.platforms import current_platform
 from vllm.v1.outputs import SamplerOutput
 
-from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
     HiggsAudioV3Config,
 )
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 __all__ = ["HiggsAudioV3TalkerForConditionalGeneration"]
 

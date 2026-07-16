@@ -124,7 +124,7 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
 def test_sensenova_u1_lora_scale_and_deactivation(tmp_path) -> None:

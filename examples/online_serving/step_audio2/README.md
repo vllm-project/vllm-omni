@@ -1,4 +1,4 @@
-# Step-Audio2 Online Serving
+# Step-Audio2: Online serving
 
 This directory contains examples for running Step-Audio2 with vLLM-Omni's online serving API.
 

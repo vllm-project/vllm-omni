@@ -14,7 +14,6 @@ from .config_ming_tts import (
     PATCH_SIZE,
     SAMPLE_RATE,
     VAE_PATCH_SIZE,
-    VISION_START_TOKEN_ID,
     MingTTSConfig,
 )
 
@@ -232,14 +231,17 @@ def _find_audio_placeholder_positions(input_ids: torch.Tensor, cfg: MingTTSConfi
     return filtered if filtered.numel() > 0 else dummy_pos
 
 
-def _find_speaker_placeholder_positions(input_ids: torch.Tensor, hf_config: Any) -> list[int]:
-    vision_start_token_id = getattr(hf_config, "vision_start_token_id", VISION_START_TOKEN_ID)
-    vision_start_pos = (input_ids == int(vision_start_token_id)).nonzero(as_tuple=True)[0]
-    if vision_start_pos.numel() == 0:
+def _find_speaker_placeholder_positions(input_ids: torch.Tensor, cfg: MingTTSConfig) -> list[int]:
+    # The speaker embedding is written at the slot AFTER the placeholder marker:
+    # dense ``<|vision_start|>``+1 (the ``<|vision_pad|>`` slot), moe ``<spk>``+1
+    # (the ``<audioPatch>`` slot). See upstream prepare_input_embed.
+    placeholder_token_id = int(cfg.speaker_placeholder_token_id)
+    placeholder_pos = (input_ids == placeholder_token_id).nonzero(as_tuple=True)[0]
+    if placeholder_pos.numel() == 0:
         return []
 
     slots = []
-    for pos in vision_start_pos:
+    for pos in placeholder_pos:
         slot = int(pos.item()) + 1
         if slot < int(input_ids.shape[0]):
             slots.append(slot)

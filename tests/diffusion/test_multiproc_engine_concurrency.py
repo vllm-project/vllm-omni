@@ -18,10 +18,16 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler
+from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
+    DiffusionSchedulerOutput,
+    NewRequestData,
+)
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -40,7 +46,7 @@ def _mock_request(tag: str):
     """Return a lightweight request object identifiable by *tag*."""
     return SimpleNamespace(
         request_id=tag,
-        prompts=[f"prompt_{tag}"],
+        prompt=f"prompt_{tag}",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
     )
 
@@ -101,13 +107,24 @@ def _start_worker(req_q, res_q, count=2):
             req = req_q.get(timeout=10)
             method = req.get("method", "")
             args = req.get("args", ())
-            if method in {"generate", "execute_model"} and args and hasattr(args[0], "request_id"):
+            if method == "execute_model_batch" and args and isinstance(args[0], DiffusionSchedulerOutput):
+                sched_output = args[0]
+                runner_outputs = []
+                for nr in sched_output.scheduled_new_reqs:
+                    tag = f"result_for_{nr.request_id}"
+                    runner_outputs.append(
+                        RunnerOutput(request_id=nr.request_id, finished=True, result=_tagged_output(tag))
+                    )
+                res_q.put(BatchRunnerOutput.from_list(runner_outputs))
+            elif method in {"generate", "execute_model"} and args and hasattr(args[0], "request_id"):
                 tag = f"result_for_{args[0].request_id}"
+                res_q.put(_tagged_output(tag))
             elif args:
                 tag = f"result_for_{args[0]}"
+                res_q.put(_tagged_output(tag))
             else:
                 tag = f"result_for_{method}"
-            res_q.put(_tagged_output(tag))
+                res_q.put(_tagged_output(tag))
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -170,6 +187,64 @@ class TestConcurrentRequestExecution:
         # The bug causes them to be swapped.
         assert results["A"].error == "result_for_A"
         assert results["B"].error == "result_for_B"
+
+
+# ───────────────── request-mode dispatch (per-request vs batch) ─────────────
+
+
+def _make_sched_output(*request_ids: str) -> DiffusionSchedulerOutput:
+    """Build a request-mode scheduler output with the given new requests."""
+    new_reqs = [
+        NewRequestData(
+            request_id=rid,
+            req=OmniDiffusionRequest(
+                prompt=f"prompt_{rid}",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+                request_id=rid,
+            ),
+        )
+        for rid in request_ids
+    ]
+    return DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=new_reqs,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=len(new_reqs),
+        num_waiting_reqs=0,
+    )
+
+
+class TestRequestModeDispatch:
+    """Request-batch-capable dispatch uses ``execute_batch`` for request-mode cycles."""
+
+    @pytest.mark.parametrize("request_ids", [("solo",), ("A", "B", "C")])
+    def test_request_batch_capable_pipeline_uses_execute_batch(self, request_ids):
+        engine, executor, _, _ = _make_engine()
+        executor.execute_request = Mock(return_value="per-request")
+        executor.execute_batch = Mock(return_value="batch")
+        engine.execute_fn = executor.execute_batch
+
+        out = engine.execute_fn(_make_sched_output(*request_ids))
+
+        executor.execute_batch.assert_called_once()
+        assert out == "batch"
+        executor.execute_request.assert_not_called()
+
+    @pytest.mark.parametrize("request_ids", [("solo",), ("A", "B")])
+    def test_batch_path_routes_results_through_worker(self, request_ids):
+        """End-to-end: a request-batch cycle goes out as one ``execute_model_batch``
+        RPC and comes back as a per-request-routed ``BatchRunnerOutput``."""
+        engine, executor, req_q, res_q = _make_engine()
+        engine.execute_fn = executor.execute_batch
+        wt = _start_worker(req_q, res_q, count=1)
+
+        out = engine.execute_fn(_make_sched_output(*request_ids))
+        wt.join(5)
+
+        assert isinstance(out, BatchRunnerOutput)
+        results = {ro.request_id: ro.result.error for ro in out.runner_outputs}
+        assert results == {request_id: f"result_for_{request_id}" for request_id in request_ids}
 
 
 # ───────────────── concurrent collective RPC ─────────────────

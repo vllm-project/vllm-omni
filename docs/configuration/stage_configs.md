@@ -1,11 +1,11 @@
-# Stage configs for vLLM-Omni
+# Deploy and legacy stage configurations
 
-In vLLM-Omni, the target model is separated into multiple stages, which are processed by different LLMEngines, DiffusionEngines or other types of engines. Depending on different types of stages, such as Autoregressive (AR) stage or Diffusion transformer (DiT) stage, each can choose corresponding schedulers, model workers to load with the Engines in a plug-in fashion.
+In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while a deploy configuration controls how those stages run. Models that have not migrated to this split still use legacy stage configurations with a `stage_args` schema.
 
 !!! note
     Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when neither `--stage-configs-path` nor `--deploy-config` is provided — the model registry resolves the right pipeline + deploy YAML by `model_type`. The bundled defaults have been verified on 1xH100 for Qwen2.5-Omni and 2xH100 for Qwen3-Omni. Models that have not yet migrated to the new schema continue to use the legacy `vllm_omni/model_executor/stage_configs/<model>.yaml` files via `--stage-configs-path`.
 
-## New deploy schema reference
+## Deploy configuration schema
 
 The new deploy schema lives under `vllm_omni/deploy/` and is paired with a frozen `PipelineConfig` registered by the model's `pipeline.py`. Each deploy YAML has these top-level fields:
 
@@ -82,14 +82,14 @@ stages:
     input_connectors:  {from_stage_0: shm}
 ```
 
-### CLI flags introduced in this refactor
+### CLI flags
 
 | Flag | Description |
 |------|-------------|
-| `--deploy-config PATH` | Load a new-schema deploy YAML. Takes precedence over `--stage-configs-path`. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
+| `--deploy-config PATH` | Load a new-schema deploy YAML. It is mutually exclusive with `--stage-configs-path`. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
-| `--stage-configs-path` | **Deprecated.** Accepts legacy `stage_args` yamls and (auto-detected) new deploy yamls; emits a deprecation warning. Migrate to `--deploy-config`. To be removed in a follow-up PR. |
+| `--stage-configs-path` | **Deprecated.** Load a legacy `stage_args` YAML. New-schema YAMLs passed to this flag are auto-detected for compatibility, but should use `--deploy-config`. It is mutually exclusive with `--deploy-config` and will be removed in a future release. |
 
 ### Stage-Based CLI Paradigm
 
@@ -146,7 +146,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 
 From highest to lowest:
 
-1. Per-stage flags (`--stage-overrides` JSON, `--stage-<id>-<key>` if registered)
+1. Per-stage overrides (`--stage-overrides` JSON)
 2. Explicit global CLI flags (`--gpu-memory-utilization 0.85`, etc.)
 3. Platform section (`platforms.npu.stages`, etc.) on top of the base `stages:`
 4. Overlay YAML (via `base_config:`) on top of the base YAML
@@ -210,7 +210,7 @@ Effective config per stage after the merge:
 | 1 | `max_model_len` | `16384` | global CLI |
 | 2 | (all defaults) | — | base YAML (no overrides apply) |
 
-Therefore, as a core part of vLLM-Omni, the stage configs for a model have several main functions:
+Therefore, as a core part of vLLM-Omni, a model's pipeline and deployment configurations have several main functions:
 
 - Claim partition of stages and their corresponding class implementation in `model_executor/models`.
 - The disaggregated configuration for each stage and the communication topology among them.
@@ -219,16 +219,16 @@ Therefore, as a core part of vLLM-Omni, the stage configs for a model have sever
 - Default input parameters.
 
 To override specific parameters, explicitly inject the customized configuration schema
-in both online and offline instantiation flows. Prioritize the `--deploy-config` flag
-when loading the new-schema deploy YAML schemas, reserving the `--stage-configs-path` parameter
+in both online and offline instantiation flows. Use the `--deploy-config` flag
+when loading a deploy configuration, reserving the `--stage-configs-path` parameter
 exclusively to maintain compatibility with legacy `stage_args` YAML constructs.
 
 Examples:
 
-For offline (Assume necessary dependencies have been imported):
+For offline inference (assuming the necessary dependencies have been imported):
 ```python
 model_name = "Qwen/Qwen2.5-Omni-7B"
-omni = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
+omni = Omni(model=model_name, deploy_config="/path/to/deploy_config.yaml")
 ```
 
 For online serving:
@@ -242,11 +242,14 @@ Legacy online serving:
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
 ```
 !!! important
-    We are actively iterating on the definition of stage configs, and we welcome all feedbacks from both community users and developers to help us shape the development!
+    We are actively iterating on the definition of deployment configurations, and we welcome feedback from users and developers.
 
-Below is a specific example of stage_configs.yaml in Qwen2.5-omni.
+## Legacy stage configuration reference
+
+The remainder of this page documents the deprecated `stage_args` schema for models that have not migrated to deploy configurations. The following historical Qwen2.5-Omni configuration illustrates that schema; current Qwen2.5-Omni deployments should use `vllm_omni/deploy/qwen2_5_omni.yaml` instead.
+
 ```python
-# stage config for running qwen2.5-omni with AsyncOmniEngine + Orchestrator runtime.
+# Historical stage configuration for Qwen2.5-Omni.
 stage_args:
   - stage_id: 0 # mark the unique id for each stage
     runtime: # The disaggregated configuration
@@ -290,7 +293,6 @@ stage_args:
       enable_prefix_caching: false
       engine_output_type: latent
     engine_input_source: [0]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
     default_sampling_params:
       temperature: 0.9
       top_p: 0.8
@@ -339,7 +341,7 @@ runtime:
 
 ```
 
-## Stage Configuration Arguments
+## Legacy stage configuration arguments
 
 Each stage in the `stage_args` list contains the following configuration options:
 
@@ -378,6 +380,20 @@ Default: `"0"`
 The maximum number of sequences for concurrent processing in this stage. For LLM stages, this controls the vLLM scheduler's maximum concurrent sequences. For all stage types, this also controls how many tasks can be batched together in the task processing loop.
 
 Default: `1`
+
+#### `engine_args.request_batch_max_wait_ms`
+
+The maximum time, in milliseconds, that a diffusion request-mode stage may wait
+before the first `schedule()` of a new scheduler wave so compatible requests can
+accumulate for request-level batching. This only applies to diffusion pipelines
+that support request-level batching with `step_execution` disabled.
+
+Use this together with `max_num_seqs > 1` for bursty serving traffic. `0`
+disables admission waiting and preserves the lowest first-request latency.
+For diffusion request-level batching tuning, see
+[Request-Level Batching](../user_guide/diffusion/request_batching.md).
+
+Default: `0.0`
 
 ### `engine_args`
 

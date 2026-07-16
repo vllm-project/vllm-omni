@@ -1060,7 +1060,7 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         # BxC -> Bx1xC since this is per-step
         # Make it a list for vllm-omni processing
         audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))
-        mm_tokens = {"audio": audio_list}
+        mm_tokens = {"codes": {"audio": audio_list}}
 
         return fake_eos, mm_tokens
 

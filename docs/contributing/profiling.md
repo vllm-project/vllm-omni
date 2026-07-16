@@ -286,3 +286,54 @@ Recommended viewers:
 - Nsight Systems GUI for CUDA kernel timelines
 
 For upstream background on the underlying vLLM profiling infrastructure, see the [vLLM profiling guide](https://docs.vllm.ai/en/stable/contributing/profiling/).
+
+## 7. Orchestrator Monitor
+
+> **Warning:** Diagnostic only. Adds lightweight counters on the orchestrator poll loop and per-replica queue depth. Disable in production unless you are actively debugging orchestrator saturation.
+
+Multi-stage omni pipelines route client-facing outputs and inter-stage connector traffic through a single-process orchestrator. When that loop is saturated (for example by large multimodal payloads on the poll path), TTFT and stability can degrade even when GPU stages are healthy. The orchestrator monitor records time-series signals to confirm whether the orchestrator or downstream stage queues are the bottleneck.
+
+Enable on the stage-0 (orchestrator) process:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --stage-id 0 \
+  --enable-orch-monitor
+```
+
+Optional output path override:
+
+```bash
+export VLLM_OMNI_ORCH_MONITOR_PATH=/tmp/vllm_omni_orch_monitor.json
+```
+
+If unset, the monitor writes `./vllm_omni_orch_monitor_<MMDDHHMM>.json` at shutdown.
+
+### Recorded metrics
+
+Each 1-second window records:
+
+| Series | Description |
+|---|---|
+| `windows.duration_s` | Wall time covered by the window |
+| `windows.loop_idle` / `windows.loop_active` | Orchestrator poll-loop iterations with no work vs. active forwarding |
+| `replicas.<stage,replica>.outputs_queue_size` | MP client `outputs_queue` backlog for that replica |
+| `replicas.<stage,replica>.inflight` | Requests currently bound/routed to the replica |
+
+On shutdown the server also logs a short summary (`loop_active_pct`, per-replica queue averages/maxima).
+
+### Relationship to other diagnostics
+
+This monitor is intentionally separate from the existing profiling tools:
+
+| Tool | Scope | Output |
+|---|---|---|
+| `--enable-diffusion-pipeline-profiler` | Diffusion stage functions (`vae.decode`, `diffuse`, …) | Per-request `stage_durations` / logs |
+| `--enable-ar-profiler` | AR stage generation time | Per-request `stage_durations` |
+| `profiler_config` (`torch` / `cuda`) | GPU/CPU kernels inside a stage worker | `trace.json`, Nsight, operator tables |
+| Prometheus `/metrics` (`vllm:omni_*`) | Pipeline SLOs and cross-stage transfer | Continuous scrape endpoint |
+| `--enable-orch-monitor` | Orchestrator poll loop + replica queue backlog | Single JSON file at shutdown |
+
+The orchestrator monitor does not use `torch.profiler` because the bottleneck signal lives in the orchestrator process (poll-loop duty cycle and queue depth), not inside stage workers. It complements Prometheus metrics when you need a post-run time series for a benchmark or regression run.
+
+Process liveness monitors (`monitor_engine_liveness`, worker/engine-core monitors) are unrelated: they detect crashed workers, not orchestrator load.

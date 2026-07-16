@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2, or HunyuanVideo-1.5.
+Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2/LTX-2.3,
+HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
 - HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
+- Wan2.1 VACE: first/last-frame, inpainting, and reference conditioning
 
 Usage:
     # Wan I2V-A14B (MoE)
@@ -25,6 +27,13 @@ Usage:
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
         --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
+
+    # LTX-2.3 image-to-video
+    python image_to_video.py --model dg845/LTX-2.3-Diffusers \
+        --model-class-name LTX23ImageToVideoPipeline \
+        --image input.jpg --prompt "A cinematic dolly shot of a boat" \
+        --height 384 --width 512 --num-frames 25 --num-inference-steps 20 \
+        --frame-rate 24 --fps 24 --output ltx23_i2v.mp4
 
     # HunyuanVideo-1.5 I2V (480p)
     python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
@@ -53,7 +62,11 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
+from vllm_omni.model_extras import (
+    build_image_to_video_prompt,
+    get_extra_body_params,
+    get_model_class_name,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -73,18 +86,31 @@ parse_profiler_config = functools.partial(parse_json_object, flag_name="--profil
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video from an image (Wan2.2, LTX2, HunyuanVideo-1.5).")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate a video from one or more images "
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE)."
+        )
+    )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers I2V model ID or local path (Wan2.2 or HunyuanVideo-1.5).",
+        help="Diffusers I2V model ID or local path (Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE).",
     )
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2ImageToVideoPipeline).",
+        help="Override model class name (e.g., LTX2ImageToVideoPipeline or LTX23ImageToVideoPipeline).",
     )
-    parser.add_argument("--image", required=True, help="Path to input image.")
+    parser.add_argument("--image", help="Path to the first-frame or source image.")
+    parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
+    parser.add_argument("--mask-image", help="Path to an inpainting mask (used by models such as VACE).")
+    parser.add_argument(
+        "--reference-image",
+        action="append",
+        default=None,
+        help="Path to a reference image. Repeat to provide multiple references.",
+    )
     parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -98,7 +124,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None, help="Video width (auto-calculated from image if not set).")
     parser.add_argument("--num-frames", type=int, default=None, help="Number of frames. Default: model-specific.")
     parser.add_argument(
-        "--num-inference-steps", type=int, default=None, help="Sampling steps. Default: model-specific."
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Sampling steps. Default: model-specific.",
     )
     parser.add_argument("--boundary-ratio", type=float, default=0.875, help="Boundary split ratio for MoE models.")
     parser.add_argument(
@@ -191,7 +220,7 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "gguf"],
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
     )
 
@@ -297,13 +326,18 @@ def main():
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     model_name = str(args.model).lower() if args.model is not None else ""
     model_class_name = args.model_class_name
-    is_ltx2 = "ltx2" in model_name or (model_class_name and "ltx2" in model_class_name.lower())
+    is_ltx2 = model_class_name in {"LTX2ImageToVideoPipeline", "LTX23ImageToVideoPipeline"}
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
-    if model_class_name is None and is_ltx2:
-        model_class_name = "LTX2ImageToVideoPipeline"
 
-    # Load input image
-    image = PIL.Image.open(args.image).convert("RGB")
+    image = PIL.Image.open(args.image).convert("RGB") if args.image else None
+    last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
+    mask_image = PIL.Image.open(args.mask_image).convert("L") if args.mask_image else None
+    reference_images = (
+        [PIL.Image.open(path).convert("RGB") for path in args.reference_image] if args.reference_image else None
+    )
+    dimension_image = image or last_image or (reference_images[0] if reference_images else None)
+    if dimension_image is None:
+        raise ValueError("Provide --image, --last-image, or at least one --reference-image.")
 
     # Per-model generation defaults, applied only when the matching flag is omitted.
     # Cosmos3 would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
@@ -318,7 +352,15 @@ def main():
             16,
         )
     elif is_ltx2:
-        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 24, 4.0, 121, 40, 5.0, 512 * 768, 32
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            4.0,
+            121,
+            40,
+            5.0,
+            512 * 768,
+            32,
+        )
     else:  # Wan2.2 / HunyuanVideo-1.5
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 16, 5.0, 81, 50, 5.0, 480 * 832, 16
 
@@ -333,12 +375,21 @@ def main():
     height = args.height
     width = args.width
     if height is None or width is None:
-        calc_height, calc_width = calculate_dimensions(image, max_area=d_max_area, mod_value=d_mod)
+        calc_height, calc_width = calculate_dimensions(dimension_image, max_area=d_max_area, mod_value=d_mod)
         height = height or calc_height
         width = width or calc_width
 
-    # Resize image to target dimensions
-    image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+    media_inputs: dict[str, Any] = {}
+    if image is not None:
+        media_inputs["image"] = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+    if last_image is not None:
+        media_inputs["last_image"] = last_image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+    if mask_image is not None:
+        media_inputs["mask"] = mask_image.resize((width, height), PIL.Image.Resampling.NEAREST)
+    if reference_images is not None:
+        media_inputs["reference_images"] = [
+            reference.resize((width, height), PIL.Image.Resampling.LANCZOS) for reference in reference_images
+        ]
 
     # Configure cache based on backend type
     cache_config = None
@@ -409,8 +460,8 @@ def main():
     if args.extra_body and "guardrails" in args.extra_body:
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
-    resolved_model_class_name = get_model_class_name(omni)
-    declared_extra_body_params = get_extra_body_params(resolved_model_class_name)
+    model_class_name = get_model_class_name(omni) or model_class_name
+    declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -431,9 +482,18 @@ def main():
         f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size},"
         f" pipeline_parallel_size={args.pipeline_parallel_size}"
     )
-    print(f"  Video size: {args.width}x{args.height}")
+    print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
+    prompt_dict = build_image_to_video_prompt(
+        model_class_name=model_class_name,
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        media_inputs=media_inputs,
+        height=height,
+        width=width,
+        num_frames=num_frames,
+    )
     sampling_params = OmniDiffusionSamplingParams(
         height=height,
         width=width,
@@ -461,14 +521,7 @@ def main():
 
     generation_start = time.perf_counter()
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
-    frames = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-            "multi_modal_data": {"image": image},
-        },
-        sampling_params,
-    )
+    frames = omni.generate(prompt_dict, sampling_params)
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
@@ -476,6 +529,7 @@ def main():
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     audio = None
+    audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
         frames = frames[0] if frames else None
 
@@ -486,11 +540,13 @@ def main():
             )
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
+            audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
+                    audio_sample_rate = inner_output.multimodal_output.get("audio_sample_rate", audio_sample_rate)
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
@@ -498,6 +554,7 @@ def main():
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
+                    audio_sample_rate = frames.images[0].get("audio_sample_rate", audio_sample_rate)
                     frames = frames.images[0].get("frames") or frames.images[0].get("video")
                 else:
                     frames = frames.images
@@ -510,6 +567,7 @@ def main():
             frames, audio = first_item
         elif isinstance(first_item, dict):
             audio = first_item.get("audio")
+            audio_sample_rate = first_item.get("audio_sample_rate", audio_sample_rate)
             frames = first_item.get("frames") or first_item.get("video")
         elif isinstance(first_item, list):
             frames = first_item
@@ -518,6 +576,7 @@ def main():
         frames, audio = frames
     elif isinstance(frames, dict):
         audio = frames.get("audio")
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
         frames = frames.get("frames") or frames.get("video")
 
     if frames is None:
@@ -636,7 +695,7 @@ def main():
             frames_u8,
             audio_np,
             fps=float(fps),
-            audio_sample_rate=args.audio_sample_rate,
+            audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)

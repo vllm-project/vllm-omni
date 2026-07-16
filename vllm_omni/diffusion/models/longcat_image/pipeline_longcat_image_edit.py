@@ -6,7 +6,7 @@ import math
 import os
 import re
 from collections.abc import Iterable
-from typing import Any, ClassVar, cast
+from typing import ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -66,50 +67,48 @@ def get_longcat_image_edit_pre_process_func(
         request: OmniDiffusionRequest,
     ):
         """Pre-process requests for LongCatImageEditPipeline."""
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if not raw_image:  # None or empty list
-                raise ValueError("""Received no input image. This model requires one input image to run.""")
-            elif isinstance(raw_image, list):
-                if len(raw_image) > 1:
-                    raise ValueError(
-                        """Received multiple input images. Only a single image is supported by this model."""
-                    )
-                else:
-                    raw_image = raw_image[0]
-
-            if isinstance(raw_image, str):
-                image = PIL.Image.open(raw_image)
+        if not raw_image:  # None or empty list
+            raise ValueError("""Received no input image. This model requires one input image to run.""")
+        elif isinstance(raw_image, list):
+            if len(raw_image) > 1:
+                raise ValueError("""Received multiple input images. Only a single image is supported by this model.""")
             else:
-                image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
+                raw_image = raw_image[0]
 
-            image_size = image.size
-            calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] * 1.0 / image_size[1])
-            height = request.sampling_params.height or calculated_height
-            width = request.sampling_params.width or calculated_width
+        if isinstance(raw_image, str):
+            image = PIL.Image.open(raw_image)
+        else:
+            image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
 
-            # Store calculated dimensions in request
-            prompt["additional_information"]["calculated_height"] = calculated_height
-            prompt["additional_information"]["calculated_width"] = calculated_width
-            request.sampling_params.height = height
-            request.sampling_params.width = width
+        image_size = image.size
+        calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] * 1.0 / image_size[1])
+        height = request.sampling_params.height or calculated_height
+        width = request.sampling_params.width or calculated_width
 
-            # Preprocess image
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
-                image = image_processor.resize(image, calculated_height, calculated_width)
-                prompt_image = image_processor.resize(image, calculated_height // 2, calculated_width // 2)
-                image = image_processor.preprocess(image, calculated_height, calculated_width)
+        # Store calculated dimensions in request
+        prompt["additional_information"]["calculated_height"] = calculated_height
+        prompt["additional_information"]["calculated_width"] = calculated_width
+        request.sampling_params.height = height
+        request.sampling_params.width = width
 
-                # Store preprocessed image and prompt image in request
-                prompt["additional_information"]["preprocessed_image"] = image
-                prompt["additional_information"]["prompt_image"] = prompt_image
-            request.prompts[i] = prompt
+        # Preprocess image
+        if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
+            image = image_processor.resize(image, calculated_height, calculated_width)
+            prompt_image = image_processor.resize(image, calculated_height // 2, calculated_width // 2)
+            image = image_processor.preprocess(image, calculated_height, calculated_width)
+
+            # Store preprocessed image and prompt image in request
+            prompt["additional_information"]["preprocessed_image"] = image
+            prompt["additional_information"]["prompt_image"] = prompt_image
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -543,24 +542,7 @@ class LongCatImageEditPipeline(
                 f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
             )
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        image: PIL.Image.Image | torch.Tensor | None = None,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        num_inference_steps: int = 50,
-        sigmas: list[float] | None = None,
-        guidance_scale: float = 3.5,
-        num_images_per_prompt: int | None = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.FloatTensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        output_type: str | None = "pil",
-        return_dict: bool = True,
-        joint_attention_kwargs: dict[str, Any] | None = None,
-    ):
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         if len(req.prompts) > 1:
@@ -571,27 +553,22 @@ class LongCatImageEditPipeline(
         first_prompt = req.prompts[0]
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
         negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
-        prompt_embeds = None if isinstance(first_prompt, str) else first_prompt.get("prompt_embeds")
-        negative_prompt_embeds = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt_embeds")  # type: ignore # Why it is list[torch.Tensor] in OmniTokenInputs or OmniEmbedsPrompt? Doesn't make sense
 
-        sigmas = req.sampling_params.sigmas or sigmas
-        guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
-        )
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas
+        guidance_scale = req.sampling_params.guidance_scale
+        num_inference_steps = req.sampling_params.num_inference_steps or 50
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt is not None
-            else num_images_per_prompt
+            req.sampling_params.num_outputs_per_prompt if req.sampling_params.num_outputs_per_prompt > 0 else 1
         )
-        generator = req.sampling_params.generator or generator
+        generator = req.sampling_params.generator
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        latents = req.sampling_params.latents
+        prompt_embeds = None
+        negative_prompt_embeds = None
+        output_type = req.sampling_params.output_type or "pil"
 
-        if prompt is not None:
-            batch_size = 1 if isinstance(prompt, str) else len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
+        batch_size = 1 if isinstance(prompt, str) else len(prompt)
 
         if not isinstance(first_prompt, str) and "preprocessed_image" in (
             additional_information := first_prompt.get("additional_information", {})
@@ -601,13 +578,7 @@ class LongCatImageEditPipeline(
             calculated_height = additional_information.get("calculated_height", height)
             calculated_width = additional_information.get("calculated_width", width)
         else:
-            image_size = image[0].size if isinstance(image, list) else image.size
-            calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] * 1.0 / image_size[1])
-
-            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
-                image = self.image_processor.resize(image, calculated_height, calculated_width)
-                prompt_image = self.image_processor.resize(image, calculated_height // 2, calculated_width // 2)
-                image = self.image_processor.preprocess(image, calculated_height, calculated_width)
+            raise RuntimeError("Missing preprocess image that should have been created by the preprocess function.")
 
         self.check_inputs(
             prompt,
@@ -622,7 +593,8 @@ class LongCatImageEditPipeline(
             prompt=prompt, image=prompt_image, prompt_embeds=prompt_embeds, num_images_per_prompt=num_images_per_prompt
         )
 
-        if guidance_scale > 1:
+        do_true_cfg = guidance_scale > 1 and negative_prompt is not None
+        if do_true_cfg:
             (negative_prompt_embeds, negative_text_ids) = self.encode_prompt(
                 prompt=negative_prompt,
                 image=prompt_image,
@@ -681,7 +653,6 @@ class LongCatImageEditPipeline(
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
 
             timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
-            do_true_cfg = guidance_scale > 1
             positive_kwargs = {
                 "hidden_states": latent_model_input,
                 "timestep": timestep / 1000,

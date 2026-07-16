@@ -24,9 +24,9 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-# ``omni`` for all tests; 001/002 also get ``full_model`` via ``TestMossTtsNanoFull`` (003 is core+advanced only, no full_model).
+# ``omni`` for all tests; 001/002 also get ``slow`` via ``TestMossTtsNanoFull`` (003 is core+advanced only, no slow).
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.tts,
 ]
 
@@ -129,6 +129,7 @@ def test_text_to_audio_002(omni_server, openai_client, ref_audio_data_url) -> No
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
         "response_format": "pcm",
         "ref_audio": ref_audio_data_url,
         "min_hnr_db": -5.0,

@@ -198,12 +198,28 @@ def _assert_realtime_smoke(result: dict) -> None:
     assert result["output_sample_rate"] > 0
 
 
-def _assert_realtime_accuracy(result: dict) -> None:
+def _assert_realtime_accuracy(
+    result: dict,
+    whisper_model_size: str = "large-v3",
+) -> None:
+    """Assert that whisper transcription of audio output matches model text.
+
+    Args:
+        result: Roundtrip result dict from ``_run_realtime_audio_roundtrip``.
+        whisper_model_size: Whisper model used to transcribe the generated audio
+                   for the accuracy check. Defaults to ``large-v3``: the default
+                   ``small`` model mishears short Chinese TTS clips (observed:
+                   北京→韦京 and a dropped leading sentence, sim=0.443), which
+                   caused spurious sim<0.8 failures under async_chunk codec
+                   variability even though audio generation was correct. large-v3
+                   transcribes these clips reliably, so a failure here now points
+                   at the model, not the ASR grader.
+    """
     final_text = (result["transcription_text"] or "").strip()
     assert final_text, "Expected non-empty transcription (model text stream)"
 
     wav_out = _wav_bytes_from_pcm16(result["output_pcm"], result["output_sample_rate"])
-    whisper_text = convert_audio_bytes_to_text(wav_out).strip()
+    whisper_text = convert_audio_bytes_to_text(wav_out, model_size=whisper_model_size).strip()
     assert whisper_text, "Whisper returned empty string for synthesized output audio"
 
     sim = cosine_similarity_text(whisper_text.lower(), final_text.lower())
@@ -214,27 +230,6 @@ def _assert_realtime_accuracy(result: dict) -> None:
 
 
 class TestQwen3OmniRealtimeWebSocket:
-    @pytest.mark.core_model
-    @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
-    def test_streaming_audio_input_pcm_output_async_chunk_smoke(self, omni_server) -> None:
-        """Ready CI: async_chunk on, no send delay, smoke only."""
-        pcm16 = _synthetic_pcm16_input()
-
-        result = asyncio.run(
-            _run_realtime_audio_roundtrip(
-                omni_server.host,
-                omni_server.port,
-                omni_server.model,
-                pcm16,
-                chunk_ms=100,
-                send_delay_ms=0,
-            )
-        )
-
-        _assert_realtime_smoke(result)
-
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)

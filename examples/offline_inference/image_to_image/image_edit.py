@@ -139,6 +139,15 @@ def parse_args() -> argparse.Namespace:
         help="Path(s) to input image file(s) (PNG, JPG, etc.). Can specify multiple images.",
     )
     parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a deploy YAML. Required for multi-stage image-edit pipelines "
+            "whose deploy config is not auto-loaded."
+        ),
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         required=True,
@@ -349,7 +358,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        help="Disable torch.compile and force eager execution.",
+        default=None,
+        help=(
+            "Disable torch.compile and force eager execution. Left unset (None) "
+            "so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML value wins."
+        ),
     )
     parser.add_argument(
         "--vae-use-slicing",
@@ -468,7 +482,7 @@ def main():
         }
 
     # Initialize Omni with appropriate pipeline
-    omni = Omni(
+    omni_kwargs: dict[str, Any] = dict(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
@@ -476,11 +490,15 @@ def main():
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         parallel_config=parallel_config,
-        enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.enforce_eager is not None:
+        omni_kwargs["enforce_eager"] = args.enforce_eager
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
+    omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)
     print("Pipeline loaded")

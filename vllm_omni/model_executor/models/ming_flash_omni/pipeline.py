@@ -6,8 +6,8 @@ Stage 0: Thinker — multimodal understanding + text generation.
 Stage 1: Talker  — text -> audio waveform via CFM + AudioVAE.
 
 The thinker -> talker bridge passes the detokenized text rather than
-hidden states through `ming_flash_omni.thinker2talker`; the talker has a
-self-contained Qwen2 LLM that retokenizes the string itself.
+hidden states; the talker has a self-contained Qwen2 LLM that retokenizes
+the string itself.
 """
 
 from vllm_omni.config.stage_config import (
@@ -57,7 +57,6 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             hf_config_name="talker_config",
             engine_output_type="audio",
             tokenizer_subdir="talker/llm",
-            custom_process_input_func=f"{_PROC}.thinker2talker",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
         ),
     ),

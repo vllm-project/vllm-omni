@@ -12,6 +12,14 @@ def build_text_to_image_prompt(
     height: int | None = None,
     width: int | None = None,
 ) -> dict[str, Any]:
+    """Build a Cosmos3 T2I prompt by selecting image output modality.
+
+    Cosmos3 uses the same pipeline class for T2I and video modes. The OpenAI
+    image endpoint selects T2I by adding ``modalities=["image"]``. ``height``
+    and ``width`` are accepted for registry compatibility; sizing travels
+    through sampling params instead of the prompt payload.
+    """
+    del height, width
     text_prompt: dict[str, Any] = {
         "prompt": prompt,
         "modalities": ["image"],

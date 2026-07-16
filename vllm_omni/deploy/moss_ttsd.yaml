@@ -2,6 +2,7 @@
 # HF: OpenMOSS-Team/MOSS-TTSD-v1.0
 # Dialogue TTS — optimised for multi-turn conversational speech generation.
 async_chunk: true
+trust_remote_code: true  # OpenMOSS-Team/MOSS-TTSD-v1.0 ships custom modeling code
 
 connectors:
   shm:

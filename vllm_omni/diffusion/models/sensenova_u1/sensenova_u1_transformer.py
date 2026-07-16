@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 from cache_dit import ForwardPattern
 from transformers.cache_utils import DynamicCache
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -32,6 +33,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig, SensenovaCachedAdapter
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -373,6 +376,34 @@ class SenseNovaU1Attention(nn.Module):
         k = k.view(*input_shape, self.num_kv_heads, self.head_dim)
         v = v.view(*input_shape, self.num_kv_heads, self.head_dim)
 
+        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
+        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
+
+        value_states = v.transpose(1, 2)  # [B, H, S, D]
+        try:
+            from .fused_rmsnorm_rope import triton_qk_norm_rope
+        except ImportError:
+            triton_qk_norm_rope = None
+        if triton_qk_norm_rope is not None:
+            query_states, key_states = triton_qk_norm_rope(
+                q,
+                k,
+                q_norm.weight,
+                k_norm.weight,
+                q_norm_hw.weight,
+                k_norm_hw.weight,
+                cos_t,
+                sin_t,
+                cos_h,
+                sin_h,
+                cos_w,
+                sin_w,
+                self.config.rms_norm_eps,
+            )
+            return query_states, key_states, value_states
+        logger.debug("Triton fused SenseNova qk norm rope unavailable; using PyTorch fallback")
+
         # Split head_dim into t and hw halves
         q_t, q_hw = q.chunk(2, dim=-1)
         k_t, k_hw = k.chunk(2, dim=-1)
@@ -388,17 +419,13 @@ class SenseNovaU1Attention(nn.Module):
         k_h, k_w = k_hw.chunk(2, dim=-1)
 
         # RoPE for each dimension
-        cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
         q_t, k_t = apply_rotary_pos_emb(q_t, k_t, cos_t, sin_t)
-        cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
         q_h, k_h = apply_rotary_pos_emb(q_h, k_h, cos_h, sin_h)
-        cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
         q_w, k_w = apply_rotary_pos_emb(q_w, k_w, cos_w, sin_w)
 
         # Reassemble: [B, H, S, head_dim]
         query_states = torch.cat([q_t, q_h, q_w], dim=-1)
         key_states = torch.cat([k_t, k_h, k_w], dim=-1)
-        value_states = v.transpose(1, 2)  # [B, H, S, D]
         return query_states, key_states, value_states
 
     def forward_und(self, hidden_states, indexes, attention_mask, past_key_values=None, **kwargs):

@@ -26,6 +26,15 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _unshardable_parameters(model: nn.Module) -> set[nn.Parameter]:
+    """Return packed/integer or scalar parameters unsupported by FSDP2."""
+    return {
+        param
+        for param in model.parameters()
+        if param.ndim == 0 or not (param.is_floating_point() or param.is_complex())
+    }
+
+
 @dataclass
 class HSDPInferenceConfig:
     """Configuration for HSDP inference.
@@ -202,6 +211,32 @@ def apply_hsdp_to_model(
             target_device,
         )
 
+    # Serialized low-bit checkpoints may store packed weights in integer
+    # Parameters (for example, ModelOpt NVFP4 uses uint8) and global scales as
+    # scalar Parameters. FSDP2 cannot represent non-floating or zero-dimensional
+    # sharded parameters. Keep those tensors resident and replicated; eligible
+    # scales, biases, and other parameters remain HSDP-sharded.
+    unshardable_params = _unshardable_parameters(model)
+    if unshardable_params:
+        if target_device is None:
+            raise ValueError(
+                f"Model {type(model).__name__} has parameters that HSDP must ignore, "
+                "but apply_hsdp_to_model was called without target_device."
+            )
+        for param in unshardable_params:
+            if param.device != target_device:
+                param.data = param.data.to(target_device)
+        ignored_params.update(unshardable_params)
+        logger.info(
+            "HSDP excluding %d unshardable parameter tensors from sharding "
+            "(non_floating=%d, scalar=%d, dtypes=%s, moved to %s)",
+            len(unshardable_params),
+            sum(not (param.is_floating_point() or param.is_complex()) for param in unshardable_params),
+            sum(param.ndim == 0 for param in unshardable_params),
+            sorted({str(param.dtype) for param in unshardable_params}),
+            target_device,
+        )
+
     # Apply HSDP sharding, this will automatically handle weight distribution
     shard_model(
         model,
@@ -233,9 +268,9 @@ def shard_model(
     ignored_params (if provided) are excluded from the root fully_shard
     wrap, so they are not collected into the root flat-parameter, are not
     subject to MixedPrecisionPolicy, and retain their original dtype.
-    Per-submodule shard wraps do not receive ignored_params because the
-    ignored modules are expected to live at the root level, not inside any
-    block matched by hsdp_shard_conditions.
+    Each per-submodule wrap receives the subset of ignored_params that it owns.
+    This is required for packed integer parameters inside sharded transformer
+    blocks; the root wrap receives the full set for all remaining parameters.
     """
     hsdp_kwargs: dict[str, Any] = {
         "reshard_after_forward": reshard_after_forward,
@@ -246,7 +281,12 @@ def shard_model(
     num_sharded = 0
     for name, module in reversed(list(model.named_modules())):
         if any(cond(name, module) for cond in hsdp_shard_conditions):
-            fully_shard(module, **hsdp_kwargs)
+            module_kwargs = dict(hsdp_kwargs)
+            if ignored_params:
+                module_ignored_params = ignored_params.intersection(module.parameters())
+                if module_ignored_params:
+                    module_kwargs["ignored_params"] = module_ignored_params
+            fully_shard(module, **module_kwargs)
             num_sharded += 1
 
     if num_sharded == 0:

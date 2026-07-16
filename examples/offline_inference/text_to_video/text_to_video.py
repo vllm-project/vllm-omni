@@ -19,6 +19,15 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 _MODEL_PRESETS = {
+    "vace": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 81,
+        "num_inference_steps": 30,
+        "guidance_scale": 5.0,
+        "fps": 16,
+        "output": "vace_t2v_output.mp4",
+    },
     "wan": {
         "height": 720,
         "width": 1280,
@@ -61,6 +70,8 @@ _MODEL_PRESETS = {
 
 def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
+    if "vace" in model_lower:
+        return _MODEL_PRESETS["vace"]
     if "cosmos" in model_lower:
         return _MODEL_PRESETS["cosmos"]
     if "hunyuan" in model_lower:
@@ -216,7 +227,7 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "gguf"],
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
     )
 
@@ -381,7 +392,7 @@ def main():
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
 
     omni = Omni(**omni_kwargs)
-    model_class_name = get_model_class_name(omni)
+    model_class_name = get_model_class_name(omni) or model_class_name
     declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
@@ -419,7 +430,6 @@ def main():
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
 
     sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
-
     # Route model-specific knobs through extra_body, filtered against the model's
     # declared extra_body_params. Models without a declaration only forward explicit
     # --extra-body JSON (preserving the generic flags' legacy behavior).
@@ -445,6 +455,7 @@ def main():
         print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
     audio = None
+    audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
         frames = frames[0] if frames else None
 
@@ -455,11 +466,13 @@ def main():
             )
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
+            audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
+                    audio_sample_rate = inner_output.multimodal_output.get("audio_sample_rate", audio_sample_rate)
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
@@ -467,6 +480,7 @@ def main():
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
+                    audio_sample_rate = frames.images[0].get("audio_sample_rate", audio_sample_rate)
                     frames = frames.images[0].get("frames") or frames.images[0].get("video")
                 else:
                     frames = frames.images
@@ -479,6 +493,7 @@ def main():
             frames, audio = first_item
         elif isinstance(first_item, dict):
             audio = first_item.get("audio")
+            audio_sample_rate = first_item.get("audio_sample_rate", audio_sample_rate)
             frames = first_item.get("frames") or first_item.get("video")
         elif isinstance(first_item, list):
             frames = first_item
@@ -487,6 +502,7 @@ def main():
         frames, audio = frames
     elif isinstance(frames, dict):
         audio = frames.get("audio")
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
         frames = frames.get("frames") or frames.get("video")
 
     if frames is None:
@@ -601,7 +617,7 @@ def main():
             frames_u8,
             audio_np,
             fps=float(args.fps),
-            audio_sample_rate=args.audio_sample_rate,
+            audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)

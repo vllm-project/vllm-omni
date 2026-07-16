@@ -767,4 +767,7 @@ def scatter_latents(
     _scatter_batch_tensor_by_mapping(states, input_batch.idx_mapping_np, attr_name="latents", value=input_batch.latents)
 
 
-DiffusionInputBatch = InputBatch
+# Alias: InputBatch is the step/tensor-level batch.
+# DiffusionRequestBatch (in request_batch.py) is the request-level batch.
+StepInputBatch = InputBatch
+DiffusionInputBatch = StepInputBatch

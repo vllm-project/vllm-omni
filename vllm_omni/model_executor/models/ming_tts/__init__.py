@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from .config_ming_tts import MingDenseConfig
-from .ming_tts import MingTTSForConditionalGeneration
-from .ming_tts_audio_vae import MingAudioVAEModel
-from .ming_tts_llm import MingLLMModel
-
-__all__ = [
-    "MingDenseConfig",
-    "MingTTSForConditionalGeneration",
-    "MingLLMModel",
-    "MingAudioVAEModel",
-]
+# NOTE: Do not import model classes in this file. Importing any
+# submodule in this package triggers __init__.py execution, and
+# both the model registry and pipeline registry import submodules
+# directly — heavy imports here would be loaded as a side effect
+# even though nothing depends on these re-exports.
