@@ -66,7 +66,7 @@ Content-Type: application/json
 |-----------|------|---------|-------------|
 | `input` | string | **required** | Text prompt describing the audio to generate |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
-| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
+| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, opus |
 | `speed` | float | 1.0 | Playback speed (0.25 - 4.0) |
 
 #### Diffusion Parameters
@@ -90,7 +90,6 @@ Returns binary audio data with the appropriate `Content-Type` header:
 | `mp3` | `audio/mpeg` |
 | `flac` | `audio/flac` |
 | `pcm` | `audio/pcm` |
-| `aac` | `audio/aac` |
 | `opus` | `audio/opus` |
 
 ## Examples
@@ -285,7 +284,7 @@ Pydantic validation failure (e.g. invalid `response_format`, `speed` out of rang
     "detail": [
         {
             "type": "literal_error",
-            "msg": "Input should be 'wav', 'pcm', 'flac', 'mp3', 'aac' or 'opus'",
+            "msg": "Input should be 'wav', 'pcm', 'flac', 'mp3' or 'opus'",
             ...
         }
     ]
