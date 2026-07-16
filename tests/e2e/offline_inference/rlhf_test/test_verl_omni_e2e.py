@@ -390,20 +390,23 @@ class vLLMOmniHttpServerLocal:
 
         diffusion_output = self._to_tensor(final_res.images[0]).float() / 255.0
 
-        mm_output = final_res.custom_output or {}
+        metadata = (
+            final_res.multimodal_output.get("metadata", {}) if isinstance(final_res.multimodal_output, dict) else {}
+        )
+        prompt_embeddings = metadata.get("prompt_embeddings", {}) if isinstance(metadata, dict) else {}
 
         if sampling_params.get("logprobs", False):
-            all_log_probs = mm_output.get("all_log_probs")
+            all_log_probs = final_res.trajectory_log_probs
             log_probs = all_log_probs[0] if all_log_probs is not None else None
         else:
             log_probs = None
 
-        all_latents = mm_output.get("all_latents")
-        all_timesteps = mm_output.get("all_timesteps")
-        prompt_embeds = mm_output.get("prompt_embeds")
-        prompt_embeds_mask = mm_output.get("prompt_embeds_mask")
-        negative_prompt_embeds = mm_output.get("negative_prompt_embeds")
-        negative_prompt_embeds_mask = mm_output.get("negative_prompt_embeds_mask")
+        all_latents = final_res.trajectory_latents
+        all_timesteps = final_res.trajectory_timesteps
+        prompt_embeds = prompt_embeddings.get("prompt_embeds")
+        prompt_embeds_mask = prompt_embeddings.get("prompt_embeds_mask")
+        negative_prompt_embeds = prompt_embeddings.get("negative_prompt_embeds")
+        negative_prompt_embeds_mask = prompt_embeddings.get("negative_prompt_embeds_mask")
 
         extra_fields = {
             "all_latents": all_latents[0] if all_latents is not None else None,

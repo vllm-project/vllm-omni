@@ -32,7 +32,7 @@ FP8_DTYPES = tuple(
 @dataclass
 class _AdaptState:
     scale_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
-    pending_weights: dict[str, list[tuple[str, torch.Tensor, torch.dtype]]] = field(default_factory=dict)
+    pending_weights: dict[str, list[tuple[str, str, torch.Tensor, torch.dtype]]] = field(default_factory=dict)
     skipped_scales: int = 0
     dequantized_weights: int = 0
 
@@ -41,6 +41,7 @@ class ModelOptFp8CheckpointAdapter:
     def __init__(self, model: nn.Module, source: object):
         self._loadable_tensors = self._get_model_loadable_tensors(model)
         self._weights_mapper = self._get_weights_mapper(model)
+        self._checkpoint_key_mapper = getattr(model, "remap_checkpoint_key", None)
         self._source_label = getattr(source, "prefix", "") or getattr(source, "subfolder", None) or "model"
 
     @classmethod
@@ -110,14 +111,19 @@ class ModelOptFp8CheckpointAdapter:
             orig_to_new_prefix=orig_to_new_prefix,
         )
 
-    def _resolve_target_name(self, name: str) -> str | None:
+    def _resolve_target_and_output_names(self, name: str) -> tuple[str | None, str]:
         if name in self._loadable_tensors:
-            return name
+            return name, name
+
+        if callable(self._checkpoint_key_mapper):
+            candidate = self._checkpoint_key_mapper(name)
+            if candidate in self._loadable_tensors:
+                return candidate, candidate
 
         for candidate in self._weights_mapper.apply_list([name]):
             if candidate != name and candidate in self._loadable_tensors:
-                return candidate
-        return None
+                return candidate, name
+        return None, name
 
     @staticmethod
     def _reshape_weight_scale(scale: torch.Tensor, weight_shape: torch.Size) -> torch.Tensor:
@@ -160,8 +166,13 @@ class ModelOptFp8CheckpointAdapter:
         scale_name: str,
         state: _AdaptState,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        for weight_name, weight_tensor, target_dtype in state.pending_weights.pop(scale_name, []):
-            yield weight_name, self._dequantize_weight(weight_name, weight_tensor, state, target_dtype)
+        for (
+            weight_name,
+            output_name,
+            weight_tensor,
+            target_dtype,
+        ) in state.pending_weights.pop(scale_name, []):
+            yield output_name, self._dequantize_weight(weight_name, weight_tensor, state, target_dtype)
             state.dequantized_weights += 1
 
     def _handle_scale_tensor(
@@ -194,6 +205,7 @@ class ModelOptFp8CheckpointAdapter:
     def _maybe_dequantize_or_defer_weight(
         self,
         name: str,
+        output_name: str,
         tensor: torch.Tensor,
         target_dtype: torch.dtype,
         state: _AdaptState,
@@ -203,7 +215,7 @@ class ModelOptFp8CheckpointAdapter:
             raise ValueError(f"Missing ModelOpt FP8 weight_scale name for weight {name!r}")
 
         if scale_name not in state.scale_tensors:
-            state.pending_weights.setdefault(scale_name, []).append((name, tensor, target_dtype))
+            state.pending_weights.setdefault(scale_name, []).append((name, output_name, tensor, target_dtype))
             return None
 
         state.dequantized_weights += 1
@@ -235,17 +247,17 @@ class ModelOptFp8CheckpointAdapter:
         state = _AdaptState()
 
         for name, tensor in weights:
-            target_name = self._resolve_target_name(name)
+            target_name, output_name = self._resolve_target_and_output_names(name)
             if self._is_scale(name):
                 yield from self._handle_scale_tensor(name, tensor, target_name, state)
                 continue
 
             target_dtype = self._target_dtype_for_dequantization(tensor, target_name)
             if target_dtype is not None:
-                tensor = self._maybe_dequantize_or_defer_weight(name, tensor, target_dtype, state)
+                tensor = self._maybe_dequantize_or_defer_weight(name, output_name, tensor, target_dtype, state)
                 if tensor is None:
                     continue
-            yield name, tensor
+            yield output_name, tensor
 
         self._check_pending_weights(state)
         self._log_adaptation_summary(state)
