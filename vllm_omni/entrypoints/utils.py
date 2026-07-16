@@ -1,3 +1,4 @@
+import json
 import os
 import types
 from collections import Counter
@@ -316,7 +317,8 @@ def load_stage_configs_from_model(
     base_engine_args: dict | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
-) -> list:
+    strategy_config_path: str | None = None,
+) -> tuple[list, str | None]:
     """Load stage configurations from model's default config file.
 
     For models registered in the pipeline registry (new path), uses
@@ -330,9 +332,15 @@ def load_stage_configs_from_model(
         base_engine_args: Base engine args to merge as CLI overrides.
         deploy_config_path: Optional explicit deploy config path.
         stage_overrides: Per-stage overrides from --stage-overrides.
+        strategy_config_path: Optional path to a composable-parallel
+            ``strategy.yaml`` whose derived sizing is overlaid onto the
+            registry-merged stages (opt-in; ignored on the legacy YAML path).
 
     Returns:
-        List of stage configuration dictionaries
+        ``(stage_configs, omni_lb_policy)``: the list of stage configuration
+        dictionaries plus the strategy-derived pipeline-wide ``omni_lb_policy``
+        (``None`` when no strategy set one). The policy is returned rather than
+        written into a caller-provided mutable dict.
     """
     if base_engine_args is None:
         base_engine_args = {}
@@ -343,26 +351,44 @@ def load_stage_configs_from_model(
             for key, val in overrides.items():
                 cli_overrides[f"stage_{stage_id_str}_{key}"] = val
 
-    stages = StageConfigFactory.create_from_model(
+    strategy_specs = None
+    if strategy_config_path is not None:
+        from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
+
+        strategy_specs = load_strategy_specs(strategy_config_path)
+
+    stages, omni_lb_policy = StageConfigFactory.create_from_model(
         model,
         trust_remote_code=cli_overrides.get("trust_remote_code", False),
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
+        strategy_specs=strategy_specs,
     )
     if stages is not None:
         # Convert StageConfig objects to OmegaConf for backward compat
-        return [stage.to_omegaconf() for stage in stages]
+        return [stage.to_omegaconf() for stage in stages], omni_lb_policy
 
-    # Legacy fallback: load from YAML
+    # Legacy fallback: load from YAML. A composable-parallel strategy cannot be
+    # applied here (it overlays onto registry-merged stages), so warn rather than
+    # silently dropping the operator's --strategy-config.
+    if strategy_config_path is not None:
+        logger.warning(
+            "--strategy-config (%s) was provided but model %r resolves via the "
+            "legacy stage_configs YAML path, which does not support "
+            "composable-parallel strategies; the strategy is ignored. Use a "
+            "registry-based model to apply it.",
+            strategy_config_path,
+            model,
+        )
     stage_config_path = resolve_model_config_path(model)
     if stage_config_path is None:
-        return []
+        return [], None
     stage_configs = load_stage_configs_from_yaml(
         config_path=stage_config_path,
         base_engine_args=base_engine_args,
         prefer_stage_engine_args=True,
     )
-    return stage_configs
+    return stage_configs, None
 
 
 def load_stage_configs_from_yaml(
@@ -501,6 +527,25 @@ def filter_stages(
         return stage_configs
 
 
+def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
+    """Parse the ``--stage-overrides`` value into a per-stage override dict.
+
+    ``value`` may be a raw JSON string (as supplied on the CLI) or an
+    already-parsed mapping. Returns ``None`` when no overrides are given.
+
+    Raises:
+        ValueError: when ``value`` is a string that is not valid JSON.
+    """
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
+    return value
+
+
 def load_and_resolve_stage_configs(
     model: str,
     stage_configs_path: str | None,
@@ -508,7 +553,8 @@ def load_and_resolve_stage_configs(
     default_stage_cfg_factory: Any = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
-) -> tuple[str, list]:
+    strategy_config_path: str | None = None,
+) -> tuple[str, list, str | None]:
     """Load stage configurations from model or YAML file with fallback to defaults.
 
     Args:
@@ -521,9 +567,13 @@ def load_and_resolve_stage_configs(
             Mutually exclusive with ``stage_configs_path``.
         stage_overrides: Per-stage overrides from ``--stage-overrides`` JSON.
             Keys are stage_id strings, values are dicts of overrides.
+        strategy_config_path: Optional path to a composable-parallel
+            ``strategy.yaml`` overlaid onto the registry-merged stages.
 
     Returns:
-        Tuple of (config_path, stage_configs)
+        Tuple of ``(config_path, stage_configs, omni_lb_policy)`` — the last is
+        the strategy-derived pipeline-wide load-balancer policy (``None`` when no
+        strategy set one), returned for the engine to apply.
     """
     if stage_configs_path is not None and deploy_config_path is not None:
         raise ValueError(
@@ -551,13 +601,15 @@ def load_and_resolve_stage_configs(
                 stage_configs_path,
             )
 
+    omni_lb_policy: str | None = None
     if deploy_config_path is not None:
         config_path = deploy_config_path
-        stage_configs = load_stage_configs_from_model(
+        stage_configs, omni_lb_policy = load_stage_configs_from_model(
             model,
             base_engine_args=kwargs,
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
+            strategy_config_path=strategy_config_path,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
@@ -567,10 +619,11 @@ def load_and_resolve_stage_configs(
                 stage_configs = []
     elif stage_configs_path is None:
         config_path = resolve_model_config_path(model)
-        stage_configs = load_stage_configs_from_model(
+        stage_configs, omni_lb_policy = load_stage_configs_from_model(
             model,
             base_engine_args=kwargs,
             stage_overrides=stage_overrides,
+            strategy_config_path=strategy_config_path,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
@@ -585,7 +638,7 @@ def load_and_resolve_stage_configs(
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
     logger.debug(f"stage_configs: {stage_configs}")
 
-    return config_path, stage_configs
+    return config_path, stage_configs, omni_lb_policy
 
 
 def get_final_stage_id_for_e2e(

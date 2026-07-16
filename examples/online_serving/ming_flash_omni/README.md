@@ -1,4 +1,4 @@
-# Ming-flash-omni 2.0
+# Ming-flash-omni 2.0: Online serving
 
 ## Installation
 

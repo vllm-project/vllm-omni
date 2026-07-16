@@ -58,7 +58,10 @@ from vllm_omni.engine.stage_runtime import (
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
+from vllm_omni.entrypoints.utils import (
+    load_and_resolve_stage_configs,
+    parse_stage_overrides,
+)
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -1040,6 +1043,7 @@ class AsyncOmniEngine:
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
+            "quantization_config": kwargs.get("quantization_config", None),
             "diffusion_kv_cache_dtype": kwargs.get("diffusion_kv_cache_dtype", None),
             "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
             "diffusion_kv_cache_skip_layers": kwargs.get("diffusion_kv_cache_skip_layers", None),
@@ -1123,11 +1127,41 @@ class AsyncOmniEngine:
 
         return result
 
+    def _apply_strategy_lb_policy(self, derived: str | None, kwargs: dict[str, Any]) -> None:
+        """Apply a strategy-derived ``omni_lb_policy`` to the engine.
+
+        Precedence: an explicit ``--omni-lb-policy`` always wins. ``"random"`` is
+        the engine default and is treated as "unset" (indistinguishable from no
+        flag), so a strategy value overrides it. If the user explicitly passed a
+        non-default policy that conflicts with the strategy-derived one, raise so
+        the mismatch is not silently ignored.
+        """
+        if not derived:
+            return
+        explicit = kwargs.get("omni_lb_policy")
+        user_set = explicit is not None and str(explicit) != "random"
+        if user_set:
+            if str(explicit) != str(derived):
+                raise ValueError(
+                    f"Conflicting load-balancer policy: --omni-lb-policy={explicit!r} was given "
+                    f"but the composable-parallel strategy derived omni_lb_policy={derived!r}. "
+                    "Drop --omni-lb-policy to use the strategy value, or make them match."
+                )
+            return
+        if self._omni_lb_policy != str(derived):
+            logger.info(
+                "[composable_parallel] applying strategy-derived omni_lb_policy=%r (was %r).",
+                derived,
+                self._omni_lb_policy,
+            )
+            self._omni_lb_policy = str(derived)
+
     def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
+        strategy_config_path = kwargs.pop("strategy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
@@ -1142,26 +1176,22 @@ class AsyncOmniEngine:
             base_kwargs = kwargs
 
         # Parse --stage-overrides JSON string if provided
-        stage_overrides = None
-        if stage_overrides_json:
-            if isinstance(stage_overrides_json, str):
-                try:
-                    stage_overrides = json.loads(stage_overrides_json)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"--stage-overrides is not valid JSON: {exc}. Got: {stage_overrides_json!r}"
-                    ) from exc
-            else:
-                stage_overrides = stage_overrides_json
+        stage_overrides = parse_stage_overrides(stage_overrides_json)
 
-        config_path, stage_configs = load_and_resolve_stage_configs(
+        config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
             base_kwargs,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
+            strategy_config_path=strategy_config_path,
         )
+
+        # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
+        # an orchestrator-level knob (read once at construction), so apply it here
+        # rather than as a per-stage config field.
+        self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in stage_configs:
@@ -1204,7 +1234,7 @@ class AsyncOmniEngine:
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
                         )
-                quantization_config = kwargs.get("diffusion_quantization_config")
+                quantization_config = kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")
@@ -1538,16 +1568,18 @@ class AsyncOmniEngine:
         # and can cause CUDA OOM for subsequent engine instances (especially
         # large models like BAGEL-7B-MoT whose weights alone consume ~134 GiB).
         #
-        # Discard mode (level=2) is correct at shutdown: there is no benefit to
-        # keeping a CPU backup when the engine is being torn down.
+        # CuMemAllocator.sleep() is NOT idempotent — calling it on already-
+        # slept entries causes CUDA_ERROR_INVALID_VALUE at cumem_allocator
+        # cuMemRelease (double-free of the memory handle).  Use release_pools()
+        # instead, which is the designed cleanup path: it drops MemPool refs
+        # and lets the destructor/free path handle asleep entries correctly
+        # (returns a null handle so the C extension skips unmap/release).
         try:
             from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
 
             if cumem_available:
                 allocator = CuMemAllocator.get_instance()
-                # Sleep at level 2 discards all pool memory from the GPU
-                # without creating CPU backups — cheapest and fastest.
-                allocator.sleep()
+                allocator.release_pools()
                 logger.debug("[AsyncOmniEngine] Released CuMem memory pool during shutdown")
         except Exception:
             pass

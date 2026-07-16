@@ -856,8 +856,20 @@ class OmniKVTransferManager:
 
             payloads.append(local_payload)
 
+        padding = None
+        if not branch_roles and cfg_size == 2 and main_payload:
+            # AR didn't split KV by branch; cfg follower needs the same
+            # positive KV for shared-prefix reuse. Only safe for cfg_size == 2:
+            # for cfg_size > 2 every rank must get its own KV, which we can't
+            # assign here, so padding stays None and the runner raises.
+            # Shallow dict copy: shares PKV tensors with main_payload. Safe
+            # only because the send path (cfg_scatter -> pack -> to_gpu_tensor)
+            # reads tensors to serialize, never mutates in place. Any async/
+            # KV-pool path that mutates req.past_key_values mid-scatter must
+            # clone tensors here instead.
+            padding = dict(main_payload)
         while len(payloads) < cfg_size:
-            payloads.append(None)
+            payloads.append(padding)
 
         return payloads[:cfg_size]
 

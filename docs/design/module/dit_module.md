@@ -470,7 +470,7 @@ class Attention(nn.Module):
                  role="self", role_category=None, ...):
         # Resolve backend for this role from the active OmniDiffusionConfig
         config = get_current_diffusion_config_or_none()
-        attention_config = config.attention_config if config is not None else None
+        attention_config = config.diffusion_attention_config if config is not None else None
         attn_backend_cls, spec = get_attn_backend_for_role(
             role=role,
             head_size=head_size,
@@ -493,7 +493,7 @@ These backends provide the **kernel implementations** for attention computation.
 
 #### Backend Selection Mechanism
 
-Selection is driven by `AttentionConfig` on `OmniDiffusionConfig`, which carries a global `default` plus a `per_role` map of `AttentionSpec` entries. A role string is resolved in this order:
+Selection is driven by `OmniDiffusionConfig.diffusion_attention_config`, which carries a global `default` plus a `per_role` map of `AttentionSpec` entries. A role string is resolved in this order:
 
 ```python
 def get_attn_backend_for_role(role, head_size, attention_config=None, role_category=None):
@@ -909,7 +909,7 @@ def initialize_model_parallel(
 
 ```
 1. User Request
-   └─> OmniDiffusion.generate(prompt)
+   └─> Omni.generate(prompt)
        └─> Prepare OmniDiffusionRequest
            └─> DiffusionEngine.step(requests)
 

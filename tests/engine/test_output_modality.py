@@ -14,7 +14,7 @@ import torch
 # ── Load modules without triggering vllm_omni.__init__ ─────────────
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_ENGINE_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "engine"
+_OUTPUTS_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "outputs"
 
 
 def _load_module(name: str, filepath: Path):
@@ -26,12 +26,16 @@ def _load_module(name: str, filepath: Path):
 
 
 _om_mod = _load_module(
-    "vllm_omni.engine.output_modality",
-    _ENGINE_DIR / "output_modality.py",
+    "vllm_omni.outputs.output_modality",
+    _OUTPUTS_DIR / "output_modality.py",
+)
+_load_module(
+    "vllm_omni.outputs.utils",
+    _OUTPUTS_DIR / "utils.py",
 )
 _mm_mod = _load_module(
-    "vllm_omni.engine.mm_outputs",
-    _ENGINE_DIR / "mm_outputs.py",
+    "vllm_omni.outputs.mm_outputs",
+    _OUTPUTS_DIR / "mm_outputs.py",
 )
 
 OutputModality = _om_mod.OutputModality
