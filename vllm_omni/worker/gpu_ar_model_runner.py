@@ -42,6 +42,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.metrics.concurrency_trace import emit_concurrency_trace
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -1095,6 +1096,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+            batch_request_ids = tuple(str(req_id) for req_id in req_ids[:num_reqs])
+            batch_signature = (stage_id, batch_request_ids)
+            if batch_signature != getattr(self, "_concurrency_trace_batch_signature", None):
+                emit_concurrency_trace(
+                    "batch_composition_changed",
+                    stage_id=stage_id,
+                    batch_size=int(num_reqs),
+                    request_ids=list(batch_request_ids),
+                    scheduled_tokens=int(num_tokens_unpadded),
+                )
+                self._concurrency_trace_batch_signature = batch_signature
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,

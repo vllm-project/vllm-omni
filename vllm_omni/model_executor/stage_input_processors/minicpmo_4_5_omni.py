@@ -14,6 +14,7 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.metrics.concurrency_trace import emit_concurrency_trace
 
 
 def llm2tts(
@@ -108,6 +109,8 @@ def llm2tts(
             tts_hidden_slice = full_hidden[tts_bos_idx:end_idx]
 
         additional_information = {
+            "request_id": str(llm_output.request_id),
+            "batch_index": i,
             "prompt_embeds": prompt_hidden,
             "prompt_token_ids": list(prompt_token_ids),
             "llm_output_token_ids": list(llm_output_ids) if not isinstance(llm_output_ids, list) else llm_output_ids,
@@ -117,6 +120,15 @@ def llm2tts(
             additional_information["tts_token_ids"] = tts_token_ids_slice
         if tts_hidden_slice is not None:
             additional_information["tts_hidden_states"] = tts_hidden_slice
+
+        emit_concurrency_trace(
+            "stage1_input_ready",
+            request_id=str(llm_output.request_id),
+            batch_index=i,
+            batch_size=len(llm_outputs),
+            has_tts_input=tts_token_ids_slice is not None and tts_hidden_slice is not None,
+            tts_token_count=int(tts_token_ids_slice.numel()) if tts_token_ids_slice is not None else 0,
+        )
 
         # Minimal prompt token IDs: the talker's AR framework needs *some* tokens
         # to do a single prefill step. We use [BOS, PAD, EOS] as a dummy.

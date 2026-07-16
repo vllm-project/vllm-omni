@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from collections.abc import Iterable
 from functools import cached_property
 
@@ -31,6 +32,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from vllm_omni.metrics.concurrency_trace import emit_concurrency_trace
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -307,22 +309,54 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if runtime_info is None:
                 runtime_info = kwargs.get("runtime_additional_information")
             talker_infos = runtime_info if isinstance(runtime_info, list) and runtime_info else [{}]
+            scheduler_config = getattr(getattr(self, "vllm_config", None), "scheduler_config", None)
+            emit_concurrency_trace(
+                "stage1_batch_started",
+                batch_size=len(talker_infos),
+                configured_max_num_seqs=getattr(scheduler_config, "max_num_seqs", None),
+            )
+
             empty_waveform = torch.empty(0, dtype=torch.float32, device=device)
             waveforms: list[torch.Tensor] = []
             with torch.inference_mode():
                 for output_slot, talker_info in enumerate(talker_infos):
+                    request_id = talker_info.get("request_id") if isinstance(talker_info, dict) else None
                     if not isinstance(talker_info, dict) or any(
                         talker_info.get(key) is None for key in ("tts_token_ids", "tts_hidden_states")
                     ):
                         waveforms.append(empty_waveform)
+                        emit_concurrency_trace(
+                            "tts_slot_completed",
+                            request_id=request_id,
+                            output_slot=output_slot,
+                            outcome="missing_tts_input",
+                            waveform_samples=0,
+                        )
                         continue
 
-                    talker_result = self.talker(
-                        input_ids=input_ids,
-                        positions=positions,
-                        inputs_embeds=inputs_embeds,
-                        additional_information=talker_info,
+                    started_at = time.perf_counter()
+                    emit_concurrency_trace(
+                        "tts_slot_started",
+                        request_id=request_id,
+                        output_slot=output_slot,
                     )
+                    try:
+                        talker_result = self.talker(
+                            input_ids=input_ids,
+                            positions=positions,
+                            inputs_embeds=inputs_embeds,
+                            additional_information=talker_info,
+                        )
+                    except Exception as exc:
+                        emit_concurrency_trace(
+                            "tts_slot_completed",
+                            request_id=request_id,
+                            output_slot=output_slot,
+                            outcome="error",
+                            error_type=type(exc).__name__,
+                            latency_ms=(time.perf_counter() - started_at) * 1000.0,
+                        )
+                        raise
 
                     # MiniCPM-o 4.5 emits (mel_spec, waveform), with mel_spec
                     # currently always None. Keep an empty slot when a request
@@ -332,6 +366,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                         _, waveform = talker_result
                     output_waveform = waveform if waveform is not None else empty_waveform
                     waveforms.append(output_waveform)
+                    emit_concurrency_trace(
+                        "tts_slot_completed",
+                        request_id=request_id,
+                        output_slot=output_slot,
+                        outcome="ok" if waveform is not None else "empty_waveform",
+                        waveform_samples=int(output_waveform.numel()),
+                        latency_ms=(time.perf_counter() - started_at) * 1000.0,
+                    )
 
             return OmniOutput(
                 text_hidden_states=dummy_hidden,
