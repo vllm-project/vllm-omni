@@ -46,12 +46,24 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
 
+    dtype = normalized.get("dtype")
+    if dtype is None:
+        normalized["dtype"] = "auto"
+    elif isinstance(dtype, torch.dtype):
+        normalized["dtype"] = str(dtype).removeprefix("torch.")
+    elif not isinstance(dtype, str):
+        raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(dtype).__name__}")
+
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
     if "static_lora_scale" in normalized:
         if "lora_scale" not in normalized:
             normalized["lora_scale"] = normalized["static_lora_scale"]
         normalized.pop("static_lora_scale", None)
+
+    diffusion_quantization = normalized.pop("diffusion_quantization_config", None)
+    if normalized.get("quantization_config") is None and diffusion_quantization is not None:
+        normalized["quantization_config"] = diffusion_quantization
 
     # Backwards-compatibility: map "quantization" to "quantization_config"
     # so callers using the old field name still work.
@@ -91,6 +103,18 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     if "cache_backend" not in normalized:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
         normalized["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+
+    cache_config = normalized.get("cache_config")
+    if isinstance(cache_config, str):
+        try:
+            normalized["cache_config"] = json.loads(cache_config)
+        except json.JSONDecodeError:
+            logger.warning("Invalid cache_config JSON, using backend defaults.")
+            normalized.pop("cache_config", None)
+
+    if normalized.get("streaming_output") is None and normalized.get("diffusion_streaming_output") is not None:
+        normalized["streaming_output"] = normalized["diffusion_streaming_output"]
+    normalized.pop("diffusion_streaming_output", None)
 
     # Convert optional YAML null values to empty containers.
     for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
@@ -433,6 +457,27 @@ class DiffusionParallelConfig:
         if not isinstance(data, dict):
             raise TypeError(f"Expected parallel config dict, got {type(data)!r}")
         return cls(**data)
+
+    @classmethod
+    def from_stage_overrides(cls, kwargs: Mapping[str, Any]) -> "DiffusionParallelConfig":
+        """Resolve nested or flat stage inputs through the config's own defaults."""
+        parallel_config = kwargs.get("parallel_config")
+        if isinstance(parallel_config, cls):
+            return parallel_config
+
+        valid_fields = {item.name for item in fields(cls) if item.init}
+        if isinstance(parallel_config, Mapping):
+            values = {key: value for key, value in parallel_config.items() if key in valid_fields}
+        elif parallel_config is not None and hasattr(parallel_config, "__dict__"):
+            values = {key: value for key, value in vars(parallel_config).items() if key in valid_fields}
+        elif parallel_config is not None:
+            raise TypeError(
+                f"parallel_config must be a mapping or DiffusionParallelConfig, got {type(parallel_config).__name__}"
+            )
+        else:
+            values = {key: value for key, value in kwargs.items() if key in valid_fields}
+
+        return cls(**{key: value for key, value in values.items() if value is not None})
 
 
 @dataclass
@@ -1545,15 +1590,14 @@ class OmniDiffusionConfig:
                     raise
 
     @classmethod
-    def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
+    def normalize_init_kwargs(cls, kwargs: Mapping[str, Any]) -> dict[str, Any]:
         kwargs = normalize_omni_diffusion_kwargs(kwargs)
-
-        # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+        return {key: value for key, value in kwargs.items() if key in valid_fields and value is not None}
 
-        instance = cls(**filtered_kwargs)
-        return instance
+    @classmethod
+    def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
+        return cls(**cls.normalize_init_kwargs(kwargs))
 
 
 @dataclass

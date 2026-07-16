@@ -17,9 +17,8 @@ To add a new pipeline:
 
 Out of tree pipeline configs or resolvers can also be registered with register_pipeline.
 
-NOTE: Single-stage diffusion models continue to use the
-``_create_default_diffusion_stage_cfg`` fallback in
-``async_omni_engine.py``; for now we do not add them to registry.
+NOTE: Generic single-stage diffusion is selected by ``config.resolver`` when
+no registered Omni pipeline or legacy stage config matches.
 """
 
 from __future__ import annotations

@@ -11,11 +11,15 @@ from types import SimpleNamespace
 import pytest
 from pytest_mock import MockerFixture
 
+from vllm_omni.config.resolver import OmniConfigResolution, _parse_stage_overrides
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
-from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _resolved(*stages: SimpleNamespace) -> OmniConfigResolution:
+    return OmniConfigResolution(config_path="/fake/stages.yaml", stage_configs=tuple(stages))
 
 
 def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
@@ -165,26 +169,26 @@ def test_run_headless_rejects_non_multiprocess_worker_backend() -> None:
 
 def test_parse_stage_overrides_valid_json() -> None:
     """A valid JSON string is parsed into the nested per-stage dict."""
-    parsed = parse_stage_overrides('{"0": {"devices": "0,1"}, "1": {"devices": "2"}}')
+    parsed = _parse_stage_overrides('{"0": {"devices": "0,1"}, "1": {"devices": "2"}}')
     assert parsed == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
 
 
 def test_parse_stage_overrides_none_and_empty_return_none() -> None:
     """No overrides (None / empty string) resolve to ``None``."""
-    assert parse_stage_overrides(None) is None
-    assert parse_stage_overrides("") is None
+    assert _parse_stage_overrides(None) is None
+    assert _parse_stage_overrides("") is None
 
 
 def test_parse_stage_overrides_empty_dict_returns_none() -> None:
     """An empty dict is falsy and must resolve to ``None``, locking in parity
     with the original standard-path ``if stage_overrides_json:`` falsy check."""
-    assert parse_stage_overrides({}) is None
+    assert _parse_stage_overrides({}) is None
 
 
 def test_parse_stage_overrides_passes_through_non_str() -> None:
     """An already-parsed mapping is returned unchanged (identity)."""
     overrides = {"0": {"devices": "0"}}
-    assert parse_stage_overrides(overrides) is overrides
+    assert _parse_stage_overrides(overrides) is overrides
 
 
 def test_parse_stage_overrides_invalid_json_raises() -> None:
@@ -193,7 +197,7 @@ def test_parse_stage_overrides_invalid_json_raises() -> None:
     ``Got: <repr>`` suffix echoing the raw input."""
     bad = "{not valid json}"
     with pytest.raises(ValueError) as excinfo:
-        parse_stage_overrides(bad)
+        _parse_stage_overrides(bad)
     message = str(excinfo.value)
     assert message.startswith("--stage-overrides is not valid JSON:")
     assert f"Got: {bad!r}" in message
@@ -273,9 +277,7 @@ def test_parse_stage_overrides_accepts_empty_inner_dict() -> None:
 
 def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture) -> None:
     """Regression: the headless path must parse ``--stage-overrides`` (a JSON
-    string) and forward the parsed dict to ``load_and_resolve_stage_configs``,
-    mirroring the standard engine path. Previously it was dropped entirely,
-    silently producing a different per-stage device layout."""
+    string) through the same resolver request as the standard engine path."""
     captured: dict = {}
 
     def _fake_resolve(*args, **kwargs):
@@ -283,10 +285,10 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
         captured.update(kwargs)
         # Return a stage that does NOT match stage_id=0 so run_headless stops
         # right after the resolver call (we only care about how it was called).
-        return ("/fake/stages.yaml", [SimpleNamespace(stage_id=99)], None)
+        return _resolved(SimpleNamespace(stage_id=99))
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        "vllm_omni.config.resolver.resolve_omni_config",
         side_effect=_fake_resolve,
     )
 
@@ -309,7 +311,7 @@ def test_run_headless_invalid_stage_overrides_raises(mocker: MockerFixture) -> N
     """Invalid ``--stage-overrides`` JSON in headless mode fails fast with the
     shared ValueError instead of being silently ignored."""
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        "vllm_omni.config.resolver._resolve_stage_configs",
         return_value=("/fake/stages.yaml", [SimpleNamespace(stage_id=0)], None),
     )
 
@@ -323,8 +325,8 @@ def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture)
     fails fast when the launcher's --stage-id doesn't match any entry."""
     other_stage = SimpleNamespace(stage_id=99)
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [other_stage], None),
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(other_stage),
     )
 
     args = _make_headless_args(stage_id=0)
@@ -372,8 +374,8 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     engine_manager = mocker.Mock()
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg], None),
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(stage_cfg),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -452,8 +454,8 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
     manager_b = mocker.Mock()
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg], None),
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(stage_cfg),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -511,8 +513,8 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
     proc.is_alive.return_value = False
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg], None),
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(stage_cfg),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -591,8 +593,8 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
     proc.is_alive.return_value = False
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg], None),
+        "vllm_omni.config.resolver.resolve_omni_config",
+        return_value=_resolved(stage_cfg),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)

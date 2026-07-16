@@ -15,6 +15,19 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.config.resolver import (
+    OmniConfigResolveRequest,
+    _convert_dataclasses_to_dict,
+    _filter_dict_like_object,
+    resolve_model_config_path,
+    resolve_omni_config,
+)
+from vllm_omni.config.resolver import (
+    _filter_stages as filter_stages,
+)
+from vllm_omni.config.resolver import (
+    _load_stage_configs_from_yaml as load_stage_configs_from_yaml,
+)
 from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -173,7 +186,7 @@ class TestFilterDictLikeObject:
             "normal": "value",
         }
 
-        mocker.patch("vllm_omni.entrypoints.utils.logger")
+        mocker.patch("vllm_omni.config.resolver.logger")
         result = _filter_dict_like_object(input_dict)
 
         # Normal key should exist
@@ -195,7 +208,7 @@ class TestFilterDictLikeObject:
             "normal": "value",
         }
 
-        mocker.patch("vllm_omni.entrypoints.utils.logger")
+        mocker.patch("vllm_omni.config.resolver.logger")
         result = _filter_dict_like_object(input_dict)
 
         # Callable should be filtered
@@ -215,7 +228,7 @@ class TestConvertDataclassesToDict:
             "callable": lambda x: x,
         }
 
-        mocker.patch("vllm_omni.entrypoints.utils.logger")
+        mocker.patch("vllm_omni.config.resolver.logger")
         result = _convert_dataclasses_to_dict(input_dict)
 
         # Callable should be filtered out by _filter_dict_like_object
@@ -306,15 +319,15 @@ class TestResolveModelConfigPath:
     def test_glm_image_diffusers_format_resolution(self, mocker: MockerFixture):
         """Test GlmImagePipeline diffusers class resolves to glm_image config."""
         mocker.patch(
-            "vllm_omni.entrypoints.utils.file_or_path_exists",
+            "vllm_omni.config.resolver.file_or_path_exists",
             return_value=True,
         )
         mocker.patch(
-            "vllm_omni.entrypoints.utils._try_get_class_name_from_diffusers_config",
+            "vllm_omni.config.resolver._try_get_class_name_from_diffusers_config",
             return_value="GlmImagePipeline",
         )
         mocker.patch(
-            "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
+            "vllm_omni.config.resolver.current_omni_platform.get_default_stage_config_path",
             return_value="vllm_omni/model_executor/stage_configs",
         )
 
@@ -466,7 +479,7 @@ class TestLoadAndResolveStageConfigs:
             ),
         ]
         load_stage_configs = mocker.patch(
-            "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+            "vllm_omni.config.resolver._load_stage_configs_from_model",
             return_value=(returned_stage_configs, None),
         )
         cli_overrides = {
@@ -490,10 +503,10 @@ class TestLoadAndResolveStageConfigs:
             stage_overrides=None,
             strategy_config_path=None,
         )
-        assert config_path == str(deploy_path)
-        assert len(stage_configs) == 2
-        assert stage_configs[1].runtime.num_replicas == 3
-        assert stage_configs[1].runtime.devices == "1,2,3"
+        assert resolved.config_path == str(deploy_path)
+        assert len(resolved.stage_configs) == 2
+        assert resolved.stage_configs[1].runtime.num_replicas == 3
+        assert resolved.stage_configs[1].runtime.devices == "1,2,3"
 
     def test_filter_stages_selects_mode_stages_without_mutating_stage_config(self, tmp_path):
         config_path = tmp_path / "deploy.yaml"

@@ -22,7 +22,7 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
 import torch
@@ -921,52 +921,6 @@ class AsyncOmniEngine:
             len(companions),
         )
 
-    @staticmethod
-    def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:
-        if cache_backend == "cache_dit":
-            return {
-                "Fn_compute_blocks": 1,
-                "Bn_compute_blocks": 0,
-                "max_warmup_steps": 4,
-                "residual_diff_threshold": 0.24,
-                "max_continuous_cached_steps": 3,
-                "enable_taylorseer": False,
-                "taylorseer_order": 1,
-                "scm_steps_mask_policy": None,
-                "scm_steps_policy": "dynamic",
-            }
-        if cache_backend == "tea_cache":
-            return {
-                "rel_l1_thresh": 0.2,
-            }
-        if cache_backend == "mag_cache":
-            return {
-                "mag_threshold": 0.24,
-                "mag_max_skip_steps": 5,
-                "mag_retention_ratio": 0.1,
-            }
-        if cache_backend == "step_cache":
-            return {
-                "step_cache_dit_enabled": True,
-                "velocity_sim_thresholds": [0.95, 0.93],
-                "velocity_skip_countdowns": [4, 2],
-                "step_cache_dit_min_history": 2,
-                "step_cache_dit_max_history": 2,
-            }
-        return None
-
-    @staticmethod
-    def _normalize_cache_config(cache_backend: str | None, cache_config: Any | None) -> Any | None:
-        if isinstance(cache_config, str):
-            try:
-                cache_config = json.loads(cache_config)
-            except json.JSONDecodeError:
-                logger.warning("Invalid cache_config JSON, using defaults.")
-                cache_config = None
-        if cache_config is None and cache_backend not in (None, "", "none"):
-            cache_config = AsyncOmniEngine._get_default_cache_config(cache_backend)
-        return cache_config
-
     def _detect_pd_config(self) -> dict[str, Any] | None:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
         Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
@@ -1309,6 +1263,10 @@ class AsyncOmniEngine:
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
         )
+        config_path = resolved.config_path
+        stage_configs = list(resolved.stage_configs)
+        strategy_lb_policy = resolved.omni_lb_policy
+        self.endpoint_restrictions = resolved.endpoint_restrictions
 
         # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
         # an orchestrator-level knob (read once at construction), so apply it here

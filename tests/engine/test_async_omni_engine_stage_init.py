@@ -11,6 +11,7 @@ import types
 
 import pytest
 
+from vllm_omni.config.resolver import OmniConfigResolution
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, normalize_omni_diffusion_kwargs
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -1749,8 +1750,8 @@ def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(m
 
     monkeypatch.setattr(
         engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
+        "resolve_omni_config",
+        lambda *args, **kwargs: OmniConfigResolution("dummy-config", (stage_cfg,)),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(
@@ -1783,8 +1784,8 @@ def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
 
     monkeypatch.setattr(
         engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
+        "resolve_omni_config",
+        lambda *args, **kwargs: OmniConfigResolution("dummy-config", (stage_cfg,)),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(
@@ -1845,8 +1846,8 @@ def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stag
 
     monkeypatch.setattr(
         engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
+        "resolve_omni_config",
+        lambda *args, **kwargs: OmniConfigResolution("dummy-config", (stage_cfg,)),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(

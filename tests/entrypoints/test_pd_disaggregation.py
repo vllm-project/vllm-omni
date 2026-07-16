@@ -343,7 +343,7 @@ def mock_get_config(monkeypatch):
     monkeypatch.setattr(
         "vllm.transformers_utils.config.get_config", lambda model, **kwargs: fake_hf_config, raising=False
     )
-    monkeypatch.setattr("vllm_omni.entrypoints.utils.get_config", lambda model, **kwargs: fake_hf_config, raising=False)
+    monkeypatch.setattr("vllm_omni.config.resolver.get_config", lambda model, **kwargs: fake_hf_config, raising=False)
 
     def _mock_cached_file(path_or_repo_id, *args, **kwargs):
         import os

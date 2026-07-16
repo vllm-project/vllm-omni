@@ -53,7 +53,7 @@ from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
-from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor

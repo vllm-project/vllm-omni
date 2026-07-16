@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import dataclasses
 import functools
+import json
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -31,8 +31,7 @@ from vllm_omni.config.stage_config import (
     merge_pipeline_deploy,
     normalize_pipeline_cli_overrides,
 )
-from vllm_omni.config.yaml_util import create_config
-from vllm_omni.diffusion.io_support import get_diffusion_output_type
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -587,65 +586,58 @@ class StageConfigFactory:
 
     @classmethod
     def create_default_diffusion(cls, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
-        """Single-stage diffusion - no YAML needed.
+        """Build the temporary runtime ABI for a generic diffusion stage.
 
-        Creates a default diffusion stage configuration for single-stage
-        diffusion models. Returns a legacy OmegaConf-compatible dict for
-        backward compatibility with OmniStage.
-
-        Args:
-            kwargs: Engine arguments from CLI/API.
-
-        Returns:
-            List containing a single config dict for the diffusion stage.
+        The terminal diffusion config owns engine defaults and normalization;
+        this compatibility builder only adds Omni stage topology, request
+        defaults, and device placement.
         """
-        # Calculate devices based on parallel config
-        devices = "0"
-        if "parallel_config" in kwargs:
-            num_devices = kwargs["parallel_config"].world_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
+        raw_sampling_params = kwargs.get("default_sampling_params")
+        if isinstance(raw_sampling_params, str):
+            try:
+                raw_sampling_params = json.loads(raw_sampling_params)
+            except json.JSONDecodeError:
+                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
+                raw_sampling_params = None
+        if not isinstance(raw_sampling_params, Mapping):
+            raw_sampling_params = None
+        default_sampling_params = dict(raw_sampling_params.get("0", {})) if raw_sampling_params else {}
 
-        engine_args: dict[str, Any] = {}
-        for key, value in kwargs.items():
-            if key in ("parallel_config",):
-                continue
-            engine_args[key] = value
-
-        # Serialize parallel_config as dict for OmegaConf. Test helpers
-        # sometimes pass SimpleNamespace rather than a dataclass instance.
-        if "parallel_config" in kwargs:
-            parallel_config = kwargs["parallel_config"]
-            if dataclasses.is_dataclass(parallel_config) and not isinstance(parallel_config, type):
-                engine_args["parallel_config"] = asdict(parallel_config)
-            elif hasattr(parallel_config, "__dict__"):
-                engine_args["parallel_config"] = dict(vars(parallel_config))
-            else:
-                engine_args["parallel_config"] = parallel_config
-
-        engine_args.setdefault("cache_backend", "none")
+        parallel_config = DiffusionParallelConfig.from_stage_overrides(kwargs)
+        engine_args = OmniDiffusionConfig.normalize_init_kwargs(kwargs)
+        engine_args["parallel_config"] = asdict(parallel_config)
         engine_args["model_stage"] = "diffusion"
 
-        # Convert dtype to string for OmegaConf
-        if "dtype" in engine_args:
-            engine_args["dtype"] = str(engine_args["dtype"])
+        extras = dict(engine_args.get("extras") or {})
+        extras.setdefault("auxiliary_text_encoder", kwargs.get("auxiliary_text_encoder"))
+        extras.setdefault(
+            "default_llama_model_id",
+            kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        )
+        engine_args["extras"] = extras
 
-        engine_args.setdefault("max_num_seqs", 1)
         model_class_name = engine_args.get("model_class_name")
+        final_output_type = "image"
+        if model_class_name:
+            from vllm_omni.diffusion.io_support import supports_audio_output
 
-        config_dict: dict[str, Any] = {
-            "stage_id": 0,
-            "stage_type": StageType.DIFFUSION.value,
-            "runtime": {
-                "process": True,
-                "devices": devices,
-            },
-            "engine_args": create_config(engine_args),
-            "final_output": True,
-            "final_output_type": get_diffusion_output_type(model_class_name),
-        }
+            if supports_audio_output(model_class_name):
+                final_output_type = "audio"
 
-        return [config_dict]
+        return [
+            {
+                "stage_id": 0,
+                "stage_type": StageType.DIFFUSION.value,
+                "runtime": {
+                    "process": True,
+                    "devices": ",".join(str(i) for i in range(parallel_config.world_size)),
+                },
+                "engine_args": engine_args,
+                "default_sampling_params": default_sampling_params,
+                "final_output": True,
+                "final_output_type": final_output_type,
+            }
+        ]
 
     @classmethod
     def _merge_cli_overrides(

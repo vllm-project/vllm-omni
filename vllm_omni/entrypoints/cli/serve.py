@@ -945,6 +945,7 @@ def run_headless(args: TrackingNamespace) -> None:
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
     from vllm.version import __version__ as VLLM_VERSION
 
+    from vllm_omni.config.resolver import OmniConfigResolveRequest, resolve_omni_config
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
     from vllm_omni.engine.stage_engine_startup import (
         get_headless_replica_devices,
@@ -958,10 +959,6 @@ def run_headless(args: TrackingNamespace) -> None:
         inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
-    )
-    from vllm_omni.entrypoints.utils import (
-        load_and_resolve_stage_configs,
-        parse_stage_overrides,
     )
 
     model = args.model
@@ -1012,17 +1009,15 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_overrides=stage_overrides,
         strategy_config_path=args_dict.get("strategy_config"),
     )
+    config_path = resolved.config_path
+    stage_configs = list(resolved.stage_configs)
 
-    # Locate the stage config that matches stage_id.
-    stage_cfg = None
-    for cfg in stage_configs:
-        if cfg.stage_id == stage_id:
-            stage_cfg = cfg
-            break
-    if stage_cfg is None:
+    try:
+        stage_cfg = resolved.stage_by_id(stage_id)
+    except KeyError:
         raise ValueError(
             f"No stage config found for stage_id={stage_id}. Available stage ids: {[c.stage_id for c in stage_configs]}"
-        )
+        ) from None
 
     prepare_engine_environment()
     per_replica_devices = get_headless_replica_devices(stage_cfg, stage_id, omni_dp_size_local)

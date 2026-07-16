@@ -4,8 +4,11 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from vllm_omni.diffusion.data import AttentionConfig
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
@@ -14,9 +17,13 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def _terminal_config(stage_cfg: dict) -> OmniDiffusionConfig:
+    return OmniDiffusionConfig.from_kwargs(**stage_cfg["engine_args"])
+
+
 def test_default_stage_config_includes_cache_backend():
     """Ensure cache knobs survive the default diffusion-stage builder."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "cache_backend": "cache_dit",
             "cache_config": '{"Fn_compute_blocks": 2}',
@@ -30,7 +37,7 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["cache_backend"] == "cache_dit"
     assert engine_args["cache_config"]["Fn_compute_blocks"] == 2
     assert engine_args["vae_use_slicing"] is True
-    assert engine_args["parallel_config"].ulysses_degree == 2
+    assert engine_args["parallel_config"]["ulysses_degree"] == 2
     assert engine_args["model_stage"] == "diffusion"
 
 
@@ -107,20 +114,19 @@ def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocke
 
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "cache_backend": "cache_dit",
         }
     )[0]
 
-    cache_config = stage_cfg["engine_args"]["cache_config"]
-    assert cache_config is not None
-    assert cache_config["Fn_compute_blocks"] == 1
+    cache_config = _terminal_config(stage_cfg).cache_config
+    assert cache_config.Fn_compute_blocks == 1
 
 
 def test_default_stage_devices_from_sequence_parallel():
     """Ensure runtime devices reflect computed diffusion world size."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "ulysses_degree": 2,
             "ring_degree": 2,
@@ -149,7 +155,7 @@ def test_default_stage_devices_and_dp_from_num_gpus():
 
 def test_default_stage_config_uses_parallel_size_kwargs():
     """Ensure default diffusion parallel_config uses CLI/API parallel sizes."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "pipeline_parallel_size": 2,
             "data_parallel_size": 3,
@@ -159,10 +165,10 @@ def test_default_stage_config_uses_parallel_size_kwargs():
     )[0]
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
-    assert parallel_config.pipeline_parallel_size == 2
-    assert parallel_config.data_parallel_size == 3
-    assert parallel_config.tensor_parallel_size == 4
-    assert parallel_config.enable_expert_parallel is True
+    assert parallel_config["pipeline_parallel_size"] == 2
+    assert parallel_config["data_parallel_size"] == 3
+    assert parallel_config["tensor_parallel_size"] == 4
+    assert parallel_config["enable_expert_parallel"] is True
 
 
 def test_default_stage_config_preserves_omitted_dp_for_runtime_inference():
@@ -191,7 +197,7 @@ def test_default_stage_config_preserves_omitted_dp_for_runtime_inference():
 
 def test_default_stage_config_propagates_ulysses_mode():
     """Ensure UAA mode survives default diffusion-stage creation."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "ulysses_degree": 4,
             "ulysses_mode": "advanced_uaa",
@@ -199,13 +205,13 @@ def test_default_stage_config_propagates_ulysses_mode():
     )[0]
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
-    assert parallel_config.ulysses_degree == 4
-    assert parallel_config.ulysses_mode == "advanced_uaa"
+    assert parallel_config["ulysses_degree"] == 4
+    assert parallel_config["ulysses_mode"] == "advanced_uaa"
 
 
 def test_default_stage_config_includes_default_sampling_params():
     """Ensure default sampling params survive the default diffusion-stage builder."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "default_sampling_params": '{"0": {"generator_device":"cpu", "guidance_scale":7.5}}',
         }
@@ -219,13 +225,13 @@ def test_default_stage_config_includes_default_sampling_params():
 
 def test_default_stage_config_includes_diffusion_attention_backend():
     """Ensure diffusion attention shorthand lands in engine_args.diffusion_attention_config."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "diffusion_attention_backend": "FLASH_ATTN",
         }
     )[0]
 
-    diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
+    diffusion_attention_config = _terminal_config(stage_cfg).diffusion_attention_config
     assert isinstance(diffusion_attention_config, AttentionConfig)
     assert diffusion_attention_config.default is not None
     assert diffusion_attention_config.default.backend == "FLASH_ATTN"
@@ -233,7 +239,7 @@ def test_default_stage_config_includes_diffusion_attention_backend():
 
 def test_default_stage_config_includes_diffusion_attention_config():
     """Ensure structured diffusion attention config survives default stage creation."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "diffusion_attention_config": {
                 "default": {"backend": "FLASH_ATTN"},
@@ -242,7 +248,7 @@ def test_default_stage_config_includes_diffusion_attention_config():
         }
     )[0]
 
-    diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
+    diffusion_attention_config = _terminal_config(stage_cfg).diffusion_attention_config
     assert isinstance(diffusion_attention_config, AttentionConfig)
     assert diffusion_attention_config.default is not None
     assert diffusion_attention_config.default.backend == "FLASH_ATTN"
@@ -252,7 +258,7 @@ def test_default_stage_config_includes_diffusion_attention_config():
 def test_default_stage_config_rejects_conflicting_diffusion_attention_inputs():
     """Ensure shorthand and default.backend stay mutually exclusive."""
     with pytest.raises(ValueError, match="mutually exclusive"):
-        AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        StageConfigFactory.create_default_diffusion(
             {
                 "diffusion_attention_backend": "FLASH_ATTN",
                 "diffusion_attention_config": {
@@ -264,7 +270,7 @@ def test_default_stage_config_rejects_conflicting_diffusion_attention_inputs():
 
 def test_default_stage_config_engine_args():
     """Ensure default diffusion-stage builder sets and propagates engine_args."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             "distributed_executor_backend": "ray",
             "boundary_ratio": 0.875,
@@ -283,7 +289,7 @@ def test_default_stage_config_engine_args():
 def test_default_stage_config_whitelist_none_fallback():
     """DeployConfig / StageDeployConfig whitelist fields with value None
     fall back to OmniDiffusionConfig dataclass defaults."""
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+    stage_cfg = StageConfigFactory.create_default_diffusion(
         {
             # DeployConfig pipeline-wide
             "trust_remote_code": None,
@@ -294,12 +300,11 @@ def test_default_stage_config_whitelist_none_fallback():
         }
     )[0]
 
-    engine_args = stage_cfg["engine_args"]
-
-    assert engine_args["trust_remote_code"] is False
-    assert engine_args["distributed_executor_backend"] is None
-    assert engine_args["dtype"] == "auto"
-    assert engine_args["enforce_eager"] is False
+    terminal = _terminal_config(stage_cfg)
+    assert terminal.trust_remote_code is False
+    assert terminal.distributed_executor_backend is None
+    assert terminal.dtype == torch.bfloat16
+    assert terminal.enforce_eager is False
 
 
 def test_serve_cli_accepts_ulysses_mode():
@@ -321,12 +326,12 @@ def test_serve_cli_accepts_ulysses_mode():
     )
 
     explicit_kwargs = args.get_explicit_kwargs_dict()
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
 
     assert args.ulysses_mode == "advanced_uaa"
-    assert parallel_config.ulysses_degree == 4
-    assert parallel_config.ulysses_mode == "advanced_uaa"
+    assert parallel_config["ulysses_degree"] == 4
+    assert parallel_config["ulysses_mode"] == "advanced_uaa"
 
 
 def test_serve_cli_accepts_text_encoder_tp_size():
@@ -390,7 +395,7 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     )
 
     explicit_kwargs = args.get_explicit_kwargs_dict()
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
 
     assert args.enable_diffusion_pipeline_profiler is True
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
@@ -569,7 +574,7 @@ def test_serve_cli_accepts_diffusion_attention_backend():
     )
 
     explicit_kwargs = args.get_explicit_kwargs_dict()
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
     diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
 
     assert args.diffusion_attention_backend == "FASTVIDEO_VSA"
@@ -597,7 +602,7 @@ def test_serve_cli_accepts_request_batch_max_wait_ms():
     )
 
     explicit_kwargs = args.get_explicit_kwargs_dict()
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
 
     assert args.request_batch_max_wait_ms == 250.0
     assert stage_cfg["engine_args"]["request_batch_max_wait_ms"] == 250.0
@@ -637,7 +642,7 @@ def test_serve_cli_accepts_additional_config():
         ]
     )
 
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(vars(args))[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion(vars(args))[0]
 
     engine_args = stage_cfg["engine_args"]
 
@@ -716,8 +721,11 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
         engine_args=SimpleNamespace(),
     )
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
-        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage], None),
+        "vllm_omni.engine.async_omni_engine.resolve_omni_config",
+        return_value=OmniConfigResolution(
+            config_path="dummy.yaml",
+            stage_configs=(fake_llm_stage, fake_diffusion_stage),
+        ),
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
@@ -760,7 +768,7 @@ def test_default_stage_config_includes_quantization_config():
         "weights": "weights.bin",
     }
 
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"quantization_config": quantization_config})[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion({"quantization_config": quantization_config})[0]
 
     assert stage_cfg["engine_args"]["quantization_config"] == quantization_config
 
@@ -771,8 +779,8 @@ def test_resolve_stage_configs_injects_quantization_config_into_diffusion_stage(
         engine_args=SimpleNamespace(quantization_config=None),
     )
     mocker.patch(
-        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
-        return_value=("dummy.yaml", [fake_diffusion_stage], None),
+        "vllm_omni.engine.async_omni_engine.resolve_omni_config",
+        return_value=OmniConfigResolution(config_path="dummy.yaml", stage_configs=(fake_diffusion_stage,)),
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
