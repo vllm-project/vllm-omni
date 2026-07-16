@@ -1,6 +1,18 @@
 [
     {
         "test_name": "test_cosmos3_t2i_official_demo_2gpu",
+        "mark": {
+            "hardware_marks": {
+                "res": {
+                    "cuda": "H100"
+                },
+                "num_cards": 2
+            },
+            "marks": [
+                "full_model",
+                "diffusion"
+            ]
+        },
         "description": "Cosmos3-Nano text-to-image official demo workload on 2 GPUs",
         "server_type": "vllm-omni",
         "benchmark_endpoint": "/v1/images/generations",
@@ -45,6 +57,18 @@
     },
     {
         "test_name": "test_cosmos3_t2v_official_demo_2gpu",
+        "mark": {
+            "hardware_marks": {
+                "res": {
+                    "cuda": "H100"
+                },
+                "num_cards": 2
+            },
+            "marks": [
+                "full_model",
+                "diffusion"
+            ]
+        },
         "description": "Cosmos3-Nano text-to-video official demo workload on 2 GPUs",
         "server_type": "vllm-omni",
         "benchmark_endpoint": "/v1/videos",
@@ -100,6 +124,18 @@
     },
     {
         "test_name": "test_cosmos3_i2v_official_demo_2gpu",
+        "mark": {
+            "hardware_marks": {
+                "res": {
+                    "cuda": "H100"
+                },
+                "num_cards": 2
+            },
+            "marks": [
+                "full_model",
+                "diffusion"
+            ]
+        },
         "description": "Cosmos3-Nano image-to-video official demo workload on 2 GPUs",
         "server_type": "vllm-omni",
         "benchmark_endpoint": "/v1/videos",
@@ -154,6 +190,18 @@
     },
     {
         "test_name": "test_cosmos3_v2v_official_demo_2gpu",
+        "mark": {
+            "hardware_marks": {
+                "res": {
+                    "cuda": "H100"
+                },
+                "num_cards": 2
+            },
+            "marks": [
+                "full_model",
+                "diffusion"
+            ]
+        },
         "description": "Cosmos3-Nano video-to-video official demo workload on 2 GPUs",
         "server_type": "vllm-omni",
         "benchmark_endpoint": "/v1/videos",
