@@ -127,6 +127,33 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v3",
     "indextts2",
 }
+
+# VoxCPM2 generates on a single audio timeline shared with the reference clip
+# (ref-continuation cloning), and its usable timeline tops out around ~30 s of
+# ref + generated audio. As the total approaches that budget the learned stop
+# head starts firing at phrase boundaries and silently drops the final words
+# (measured: a 22 s ref pins generation at exactly 8.0 s, truncating any chunk
+# whose natural rendering is longer; a 10 s ref renders the same chunks fully).
+_VOXCPM2_TIMELINE_BUDGET_S = 30.0
+# ~0.92 decode steps (160 ms audio each) per input text token is the upper end
+# of the measured natural speaking rate for this model.
+_VOXCPM2_EST_SECONDS_PER_TEXT_TOKEN = 0.16 * 0.92
+
+
+def _voxcpm2_timeline_budget_warning(ref_seconds: float, num_text_tokens: int) -> str | None:
+    """Return a warning when ref audio + estimated speech exceed the timeline budget."""
+    est_gen_seconds = num_text_tokens * _VOXCPM2_EST_SECONDS_PER_TEXT_TOKEN
+    if ref_seconds + est_gen_seconds <= _VOXCPM2_TIMELINE_BUDGET_S - 0.5:
+        return None
+    return (
+        f"VoxCPM2 timeline budget: ref_audio {ref_seconds:.1f}s + estimated speech "
+        f"{est_gen_seconds:.1f}s exceeds the ~{_VOXCPM2_TIMELINE_BUDGET_S:.0f}s "
+        f"ref+generation budget; the stop head is likely to truncate the final words "
+        f"at ~{max(0.0, _VOXCPM2_TIMELINE_BUDGET_S - ref_seconds):.1f}s. Use a shorter "
+        f"reference clip (<=15s recommended) or shorter text chunks."
+    )
+
+
 _TTS_LANGUAGES = frozenset(
     {
         "Auto",
@@ -1038,6 +1065,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ref_audio = wav_np.tolist()
         elif request.voice is not None:
             voice_profile = self.precomputed_speakers.get(request.voice.lower())
+
+        if ref_audio is not None and ref_sr:
+            warning = _voxcpm2_timeline_budget_warning(
+                len(ref_audio) / float(ref_sr),
+                len(self._voxcpm2_encode(request.input)),
+            )
+            if warning:
+                logger.warning("%s", warning)
         return build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,

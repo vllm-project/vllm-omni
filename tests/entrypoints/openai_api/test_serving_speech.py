@@ -38,6 +38,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     _TTS_LANGUAGES,
     OmniOpenAIServingSpeech,
     _create_wav_header,
+    _voxcpm2_timeline_budget_warning,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest, SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
@@ -3757,3 +3758,27 @@ class TestTTSAsyncOffloading:
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         assert server._tts_executor is None
         server.shutdown()  # Should not raise
+
+
+class TestVoxCPM2TimelineBudgetWarning:
+    """ref audio + estimated speech must stay under the ~30s VoxCPM2 timeline budget."""
+
+    def test_short_ref_within_budget_returns_none(self):
+        # 10s ref + ~65 tokens (~9.6s speech) is well inside the budget.
+        assert _voxcpm2_timeline_budget_warning(10.0, 65) is None
+
+    def test_long_ref_over_budget_warns(self):
+        # 22s ref + ~65 tokens exceeds ~30s; the message carries actionable numbers.
+        msg = _voxcpm2_timeline_budget_warning(22.0, 65)
+        assert msg is not None
+        assert "22.0s" in msg
+        assert "shorter reference clip" in msg
+
+    def test_long_ref_with_tiny_text_is_fine(self):
+        # A long ref is acceptable as long as the requested speech still fits.
+        assert _voxcpm2_timeline_budget_warning(22.0, 20) is None
+
+    def test_warning_reports_remaining_budget(self):
+        msg = _voxcpm2_timeline_budget_warning(25.0, 65)
+        assert msg is not None
+        assert "at ~5.0s" in msg
