@@ -1539,6 +1539,26 @@ class TestMingFlashOmniPipeline:
         assert stages[1].final_output_type == "image"
 
 
+class TestHunyuanImage3Pipeline:
+    def test_ar_only_stage_is_text_comprehension(self):
+        s = _PIPELINE_REGISTRY["hunyuan_image3_ar"].get_stage(0)
+        assert s.model_stage == "AR"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.owns_tokenizer is True
+        assert s.final_output_type == "text"
+        assert s.engine_output_type == "text"
+
+    def test_ar_deploy_loads_text_stage(self):
+        deploy = load_deploy_config(Path(get_deploy_config_path("hunyuan_image3_ar.yaml")))
+        stages = merge_pipeline_deploy(_PIPELINE_REGISTRY["hunyuan_image3_ar"], deploy)
+
+        assert len(stages) == 1
+        stage = stages[0]
+        assert stage.is_comprehension is True
+        assert stage.final_output_type == "text"
+        assert stage.yaml_engine_args["engine_output_type"] == "text"
+
+
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 

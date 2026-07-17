@@ -3,23 +3,24 @@
 """Smoke test for HunyuanImage-3.0 Image-to-Text (I2T) pipeline."""
 
 from collections.abc import Generator
-from pathlib import Path
 
 import pytest
 import torch
 from PIL import Image
+from transformers import AutoTokenizer
 
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
-from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
+from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
 
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
-REPO_ROOT = Path(__file__).resolve().parents[3]
-STAGE_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_i2t.yaml"
+AR_DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3_ar.yaml")
 
 # First 20 generated token IDs from the HF greedy reference on this input.
-# vllm-omni AR output matches this prefix bitwise; the two implementations
-# diverge past this point.
+# Feed pre-tokenized prompt IDs so vLLM-Omni uses the same segmented chat
+# template tokenization as HF apply_chat_template; whole-string tokenization
+# can merge BPE tokens across template boundaries and drift at token 8.
 EXPECTED_PREFIX_TOKEN_IDS: list[int] = [
     791,
     2217,
@@ -52,7 +53,7 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 def omni() -> Generator[Omni, None, None]:
     with OmniRunner(
         MODEL_NAME,
-        stage_configs_path=str(STAGE_CONFIG_PATH),
+        deploy_config=AR_DEPLOY_CONFIG_PATH,
     ) as runner:
         yield runner.omni
 
@@ -63,14 +64,20 @@ def test_i2t_generates_text(omni: Omni) -> None:
     # Solid-color image keeps the input self-contained and reproducible.
     input_image = Image.new("RGB", (256, 256), color=(128, 200, 100))
 
-    prompt = build_prompt("Describe the content of the picture.", task="i2t")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    prompt_tokens = build_prompt_tokens("Describe the content of the picture.", tokenizer, task="i2t")
+    stop_token_ids = resolve_stop_token_ids(task="i2t", bot_task=None, tokenizer=tokenizer)
     prompt_dict = {
-        "prompt": prompt,
+        "prompt_token_ids": prompt_tokens.token_ids,
         "modalities": ["text"],
         "multi_modal_data": {"image": input_image},
     }
 
-    outputs = omni.generate(prompts=[prompt_dict])
+    sampling_params_list = list(omni.default_sampling_params_list)
+    assert len(sampling_params_list) == 1, f"Expected one I2T stage, got {len(sampling_params_list)}"
+    sampling_params_list[0].stop_token_ids = stop_token_ids
+
+    outputs = omni.generate(prompts=[prompt_dict], sampling_params_list=sampling_params_list)
     assert outputs, "No outputs returned from Omni.generate()"
 
     request_output = outputs[0].request_output
