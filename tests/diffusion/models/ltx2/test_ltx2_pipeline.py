@@ -23,7 +23,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
     LTX_OFFICIAL_X0_GUIDANCE,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
-from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_base import LTXPipelineBase
+from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_runtime import LTXPipelineRuntime
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX2_ONE_STAGE_RECIPE, LTX23_ONE_STAGE_RECIPE
 from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
@@ -31,6 +31,7 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2Pipeline,
     LTX23ImageToVideoPipeline,
     LTX23Pipeline,
+    LTXOneStagePipeline,
 )
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
     LTX2ImageToVideoTwoStagesPipeline,
@@ -80,10 +81,10 @@ def test_ltx_versions_share_runtime_without_cross_version_inheritance():
         DistributedAutoencoderKLLTX2Video,
     )
 
-    assert issubclass(LTX2Pipeline, LTXPipelineBase)
-    assert issubclass(LTX23Pipeline, LTXPipelineBase)
+    assert issubclass(LTX2Pipeline, LTXPipelineRuntime)
+    assert issubclass(LTX23Pipeline, LTXPipelineRuntime)
+    assert issubclass(LTX2TwoStagesPipeline, LTXPipelineRuntime)
     assert not issubclass(LTX23Pipeline, LTX2Pipeline)
-    assert LTX2Pipeline._pack_latents is LTX23Pipeline._pack_latents
     assert LTX2Pipeline.component_profile is LTX2_COMPONENT_PROFILE
     assert LTX23Pipeline.component_profile is LTX23_COMPONENT_PROFILE
     assert LTX2Pipeline.one_stage_recipe is LTX2_ONE_STAGE_RECIPE
@@ -139,7 +140,13 @@ def test_ltx_request_batch_decode_splits_video_and_audio_per_request(pipeline_cl
         num_videos_per_prompt=1,
     )
 
-    outputs = pipe._decode_and_split(forward_ctx, video, audio)
+    outputs = pipe.decode_phase(
+        LTXPhaseResult(
+            forward_context=forward_ctx,
+            video=video,
+            audio=audio,
+        )
+    )
 
     assert len(outputs) == 2
     torch.testing.assert_close(outputs[0].output[0], video[:1])
@@ -149,10 +156,10 @@ def test_ltx_request_batch_decode_splits_video_and_audio_per_request(pipeline_cl
 
 
 def test_ltx_one_stage_variants_share_forward_template():
-    assert LTX2Pipeline._forward_impl is LTXPipelineBase._forward_impl
-    assert LTX2ImageToVideoPipeline._forward_impl is LTXPipelineBase._forward_impl
-    assert LTX23Pipeline._forward_impl is LTXPipelineBase._forward_impl
-    assert LTX23ImageToVideoPipeline._forward_impl is LTXPipelineBase._forward_impl
+    assert LTX2Pipeline._forward_impl is LTXOneStagePipeline._forward_impl
+    assert LTX2ImageToVideoPipeline._forward_impl is LTXOneStagePipeline._forward_impl
+    assert LTX23Pipeline._forward_impl is LTXOneStagePipeline._forward_impl
+    assert LTX23ImageToVideoPipeline._forward_impl is LTXOneStagePipeline._forward_impl
     assert LTX2Pipeline.forward is LTX23Pipeline.forward
     assert LTX2ImageToVideoPipeline.forward is LTX23ImageToVideoPipeline.forward
 
@@ -167,7 +174,7 @@ def test_ltx_versions_share_request_prompt_and_step_templates():
         "_denoise_step",
     )
     for method_name in shared_methods:
-        base_method = getattr(LTXPipelineBase, method_name)
+        base_method = getattr(LTXPipelineRuntime, method_name)
         assert getattr(LTX2Pipeline, method_name) is base_method
         assert getattr(LTX23Pipeline, method_name) is base_method
 
@@ -175,15 +182,15 @@ def test_ltx_versions_share_request_prompt_and_step_templates():
 def test_ltx_versions_select_guidance_without_overriding_control_flow():
     assert LTX2Pipeline.guidance_strategy is LTX_LEGACY_VELOCITY_GUIDANCE
     assert LTX23Pipeline.guidance_strategy is LTX_OFFICIAL_X0_GUIDANCE
-    assert LTX2Pipeline._predict_noise_for_step is LTXPipelineBase._predict_noise_for_step
-    assert LTX23Pipeline._predict_noise_for_step is LTXPipelineBase._predict_noise_for_step
-    assert LTX2Pipeline.combine_cfg_noise is LTXPipelineBase.combine_cfg_noise
-    assert LTX23Pipeline.combine_cfg_noise is LTXPipelineBase.combine_cfg_noise
+    assert LTX2Pipeline._predict_noise_for_step is LTXPipelineRuntime._predict_noise_for_step
+    assert LTX23Pipeline._predict_noise_for_step is LTXPipelineRuntime._predict_noise_for_step
+    assert LTX2Pipeline.combine_cfg_noise is LTXPipelineRuntime.combine_cfg_noise
+    assert LTX23Pipeline.combine_cfg_noise is LTXPipelineRuntime.combine_cfg_noise
 
 
 def test_ltx2_two_stage_variants_share_stage_orchestration():
     assert issubclass(LTX2ImageToVideoTwoStagesPipeline, LTX2TwoStagesPipeline)
-    assert LTX2ImageToVideoTwoStagesPipeline.one_stage_pipeline_cls is LTX2ImageToVideoPipeline
+    assert issubclass(LTX2ImageToVideoTwoStagesPipeline, LTXI2VConditioningMixin)
     assert LTX2ImageToVideoTwoStagesPipeline._run_two_stage is LTX2TwoStagesPipeline._run_two_stage
 
 
@@ -194,15 +201,15 @@ def test_ltx_variants_share_denoise_loop_and_i2v_conditioning():
     assert issubclass(LTX23ImageToVideoPipeline, LTXI2VConditioningMixin)
     assert LTX2ImageToVideoPipeline.prepare_latents is LTXI2VConditioningMixin.prepare_latents
     assert LTX23ImageToVideoPipeline.prepare_latents is LTXI2VConditioningMixin.prepare_latents
-    assert LTX2Pipeline.prepare_latents is LTXPipelineBase.prepare_latents
-    assert LTX23Pipeline.prepare_latents is LTXPipelineBase.prepare_latents
-    assert LTX2Pipeline.prepare_audio_latents is LTXPipelineBase.prepare_audio_latents
-    assert LTX23Pipeline.prepare_audio_latents is LTXPipelineBase.prepare_audio_latents
-    assert LTX2Pipeline._decode_and_split is LTXPipelineBase._decode_and_split
-    assert LTX23Pipeline._decode_and_split is LTXPipelineBase._decode_and_split
+    assert LTX2Pipeline.prepare_latents is LTXPipelineRuntime.prepare_latents
+    assert LTX23Pipeline.prepare_latents is LTXPipelineRuntime.prepare_latents
+    assert LTX2Pipeline.prepare_audio_latents is LTXPipelineRuntime.prepare_audio_latents
+    assert LTX23Pipeline.prepare_audio_latents is LTXPipelineRuntime.prepare_audio_latents
+    assert LTX2Pipeline.decode_phase is LTXPipelineRuntime.decode_phase
+    assert LTX23Pipeline.decode_phase is LTXPipelineRuntime.decode_phase
 
 
-def test_denoise_executor_owns_progress_interrupt_and_current_timestep():
+def test_denoise_executor_owns_progress_and_interrupt():
     updates = []
 
     class Progress:
@@ -216,22 +223,21 @@ def test_denoise_executor_owns_progress_interrupt_and_current_timestep():
             updates.append(True)
 
     pipeline = SimpleNamespace(
-        _current_timestep=None,
         interrupt=False,
         progress_bar=lambda total: Progress(),
     )
-    seen: list[tuple[int, float, float]] = []
+    seen: list[tuple[int, float]] = []
     timesteps = torch.tensor([3.0, 2.0, 1.0])
     initial_state = LTXAVState(video=torch.tensor(0.0), audio=torch.tensor(10.0))
 
     def step(index, timestep, state):
-        seen.append((index, timestep.item(), pipeline._current_timestep.item()))
+        seen.append((index, timestep.item()))
         pipeline.interrupt = True
         return LTXAVState(video=state.video + 1, audio=state.audio + 1)
 
     state = LTXDenoiseExecutor.run(pipeline, initial_state, timesteps, step)
 
-    assert seen == [(0, 3.0, 3.0)]
+    assert seen == [(0, 3.0)]
     assert updates == [True]
     torch.testing.assert_close(state.video, torch.tensor(1.0))
     torch.testing.assert_close(state.audio, torch.tensor(11.0))
@@ -264,34 +270,33 @@ def test_ltx2_two_stage_reuses_prompt_context_between_phases():
     prompt_context = object()
     phase_calls = []
 
-    class FakePipe(torch.nn.Module):
-        def _resolve_request_inputs(self, req, **kwargs):
-            return request_inputs
+    def resolve_request_inputs(req, **kwargs):
+        return request_inputs
 
-        def _run_denoise_phase(self, req, inputs, *, prompt_context=None, **kwargs):
-            phase_calls.append((inputs, prompt_context))
-            if len(phase_calls) == 1:
-                assert prompt_context is None
-                context = prompt_context_sentinel
-                video = torch.tensor([1.0])
-                audio = torch.tensor([2.0])
-            else:
-                assert prompt_context is prompt_context_sentinel
-                torch.testing.assert_close(inputs.latents, torch.tensor([11.0]))
-                torch.testing.assert_close(inputs.audio_latents, torch.tensor([2.0]))
-                assert inputs.guidance_scale == 1.0
-                assert inputs.num_inference_steps == 3
-                context = prompt_context
-                video = torch.tensor([3.0])
-                audio = torch.tensor([4.0])
-            return LTXPhaseResult(
-                forward_context=SimpleNamespace(prompt_context=context),
-                video=video,
-                audio=audio,
-            )
+    def run_phase(req, inputs, *, prompt_context=None, **kwargs):
+        phase_calls.append((inputs, prompt_context))
+        if len(phase_calls) == 1:
+            assert prompt_context is None
+            context = prompt_context_sentinel
+            video = torch.tensor([1.0])
+            audio = torch.tensor([2.0])
+        else:
+            assert prompt_context is prompt_context_sentinel
+            torch.testing.assert_close(inputs.latents, torch.tensor([11.0]))
+            torch.testing.assert_close(inputs.audio_latents, torch.tensor([2.0]))
+            assert inputs.guidance_scale == 1.0
+            assert inputs.num_inference_steps == 3
+            context = prompt_context
+            video = torch.tensor([3.0])
+            audio = torch.tensor([4.0])
+        return LTXPhaseResult(
+            forward_context=SimpleNamespace(prompt_context=context),
+            video=video,
+            audio=audio,
+        )
 
-        def _decode_and_split(self, forward_context, video, audio):
-            return DiffusionOutput(output=(video, audio))
+    def decode_phase(phase):
+        return DiffusionOutput(output=(phase.video, phase.audio))
 
     class FakeUpsampler(torch.nn.Module):
         def forward(self, *, latents, output_type, return_dict):
@@ -303,8 +308,10 @@ def test_ltx2_two_stage_reuses_prompt_context_between_phases():
     pipeline = object.__new__(LTX2TwoStagesPipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.distilled = True
-    pipeline.pipe = FakePipe()
     pipeline.upsample_pipe = FakeUpsampler()
+    object.__setattr__(pipeline, "_resolve_request_inputs", resolve_request_inputs)
+    object.__setattr__(pipeline, "run_phase", run_phase)
+    object.__setattr__(pipeline, "decode_phase", decode_phase)
 
     output = pipeline.forward(SimpleNamespace())
 
@@ -586,7 +593,7 @@ class TestPipelineComponents:
 
 class TestLTX23DecodeConditioning:
     def test_decode_conditioning_expands_per_prompt_values_to_effective_batch(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import _expand_per_prompt_decode_value
+        from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_runtime import _expand_per_prompt_decode_value
 
         assert _expand_per_prompt_decode_value(
             [0.1, 0.2],
@@ -608,7 +615,7 @@ class TestLTX23DecodeConditioning:
         ) == [0.1, 0.2, 0.3, 0.4]
 
     def test_decode_conditioning_rejects_ambiguous_lengths(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import _expand_per_prompt_decode_value
+        from vllm_omni.diffusion.models.ltx2.ltx2_pipeline_runtime import _expand_per_prompt_decode_value
 
         with pytest.raises(ValueError, match="decode_timestep"):
             _expand_per_prompt_decode_value(

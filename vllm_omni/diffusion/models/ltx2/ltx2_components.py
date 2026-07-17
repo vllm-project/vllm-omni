@@ -59,14 +59,14 @@ class LTXComponentProfile:
     video_vae_cls: type = AutoencoderKLLTX2Video
     vocoder_cls: type = LTX2Vocoder
     vocoder_fallback_cls: type | None = None
-    managed_aux_placement: bool = False
 
 
 LTX2_COMPONENT_PROFILE = LTXComponentProfile(
     name="ltx2",
     dit_modules=("transformer",),
-    encoder_modules=("text_encoder",),
+    encoder_modules=("text_encoder", "connectors"),
     vae_modules=("vae", "audio_vae"),
+    resident_modules=("vocoder",),
     video_vae_cls=DistributedAutoencoderKLLTX2Video,
 )
 
@@ -79,7 +79,6 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
     video_vae_cls=DistributedAutoencoderKLLTX2Video,
     vocoder_cls=LTX2VocoderWithBWE or LTX2Vocoder,
     vocoder_fallback_cls=LTX2Vocoder,
-    managed_aux_placement=True,
 )
 
 
@@ -134,10 +133,7 @@ def _load_component(
     )
 
 
-def _place_aux_components(pipeline: Any, profile: LTXComponentProfile) -> None:
-    if not profile.managed_aux_placement:
-        return
-
+def _place_aux_components(pipeline: Any) -> None:
     parallel_config = getattr(pipeline.od_config, "parallel_config", None)
     use_managed_placement = bool(
         getattr(pipeline.od_config, "enable_cpu_offload", False)
@@ -172,80 +168,63 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     ]
     prefetch_subfolders(model, _LTX_COMPONENT_SUBFOLDERS, local_files_only=local_files_only)
 
-    def place_on_load(module: Any) -> Any:
-        if not profile.managed_aux_placement:
-            module.to(pipeline.device)
-        return module
-
     pipeline.tokenizer = AutoTokenizer.from_pretrained(
         model,
         subfolder="tokenizer",
         local_files_only=local_files_only,
     )
     with torch.device("cpu"):
-        pipeline.text_encoder = place_on_load(
-            _load_component(
-                Gemma3ForConditionalGeneration,
-                model,
-                "text_encoder",
-                local_files_only=local_files_only,
-                dtype=dtype,
-            )
-        )
-    pipeline.connectors = place_on_load(
-        _load_component(
-            LTX2TextConnectors,
+        pipeline.text_encoder = _load_component(
+            Gemma3ForConditionalGeneration,
             model,
-            "connectors",
+            "text_encoder",
             local_files_only=local_files_only,
             dtype=dtype,
         )
+    pipeline.connectors = _load_component(
+        LTX2TextConnectors,
+        model,
+        "connectors",
+        local_files_only=local_files_only,
+        dtype=dtype,
     )
-    pipeline.vae = place_on_load(
-        _load_component(
-            profile.video_vae_cls,
-            model,
-            "vae",
-            local_files_only=local_files_only,
-            dtype=dtype,
-        )
+    pipeline.vae = _load_component(
+        profile.video_vae_cls,
+        model,
+        "vae",
+        local_files_only=local_files_only,
+        dtype=dtype,
     )
-    pipeline.audio_vae = place_on_load(
-        _load_component(
-            AutoencoderKLLTX2Audio,
-            model,
-            "audio_vae",
-            local_files_only=local_files_only,
-            dtype=dtype,
-        )
+    pipeline.audio_vae = _load_component(
+        AutoencoderKLLTX2Audio,
+        model,
+        "audio_vae",
+        local_files_only=local_files_only,
+        dtype=dtype,
     )
     try:
-        pipeline.vocoder = place_on_load(
-            _load_component(
-                profile.vocoder_cls,
-                model,
-                "vocoder",
-                local_files_only=local_files_only,
-                dtype=dtype,
-            )
+        pipeline.vocoder = _load_component(
+            profile.vocoder_cls,
+            model,
+            "vocoder",
+            local_files_only=local_files_only,
+            dtype=dtype,
         )
     except (TypeError, OSError, ValueError):
         if profile.vocoder_fallback_cls is None or profile.vocoder_fallback_cls is profile.vocoder_cls:
             raise
-        pipeline.vocoder = place_on_load(
-            _load_component(
-                profile.vocoder_fallback_cls,
-                model,
-                "vocoder",
-                local_files_only=local_files_only,
-                dtype=dtype,
-            )
+        pipeline.vocoder = _load_component(
+            profile.vocoder_fallback_cls,
+            model,
+            "vocoder",
+            local_files_only=local_files_only,
+            dtype=dtype,
         )
 
     transformer_config = load_transformer_config(model, "transformer", local_files_only)
     quant_config = getattr(od_config, "quantization_config", None)
     pipeline.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
-    _place_aux_components(pipeline, profile)
+    _place_aux_components(pipeline)
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         model,
         subfolder="scheduler",
@@ -272,10 +251,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
 
     pipeline._guidance_scale = None
     pipeline._guidance_rescale = None
-    pipeline._attention_kwargs = None
     pipeline._interrupt = False
-    pipeline._num_timesteps = None
-    pipeline._current_timestep = None
 
 
 def load_transformer_config(

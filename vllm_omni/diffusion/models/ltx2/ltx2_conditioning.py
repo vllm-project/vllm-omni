@@ -14,6 +14,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
+from . import ltx2_latents as latent_ops
 from .ltx2_denoise import I2VVideoAudioScheduler
 
 if TYPE_CHECKING:
@@ -324,7 +325,7 @@ class LTXI2VConditioningMixin:
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_frames, height, width = self._resolve_video_latent_shape(
+        num_frames, height, width = latent_ops.resolve_video_latent_shape(
             height,
             width,
             num_frames,
@@ -340,18 +341,18 @@ class LTXI2VConditioningMixin:
                 mask_shape = (batch_size, 1, num_frames, height, width)
                 conditioning_mask = latents.new_zeros(mask_shape)
                 conditioning_mask[:, :, 0] = 1.0
-                latents = self._normalize_latents(
+                latents = latent_ops.normalize_latents(
                     latents,
                     self.vae.latents_mean,
                     self.vae.latents_std,
                     self.vae.config.scaling_factor,
                 )
-                latents = self._create_noised_state(
+                latents = latent_ops.create_noised_state(
                     latents,
                     noise_scale * (1 - conditioning_mask),
                     generator,
                 )
-                latents = self._pack_latents(
+                latents = latent_ops.pack_latents(
                     latents,
                     self.transformer_spatial_patch_size,
                     self.transformer_temporal_patch_size,
@@ -360,7 +361,7 @@ class LTXI2VConditioningMixin:
                 conditioning_mask = latents.new_zeros(mask_shape)
                 conditioning_mask[:, :, 0] = 1.0
 
-            conditioning_mask = self._pack_latents(
+            conditioning_mask = latent_ops.pack_latents(
                 conditioning_mask,
                 self.transformer_spatial_patch_size,
                 self.transformer_temporal_patch_size,
@@ -413,7 +414,7 @@ class LTXI2VConditioningMixin:
         init_latents = torch.cat(init_latents, dim=0).to(dtype)
         if num_videos_per_prompt > 1:
             init_latents = init_latents.repeat_interleave(num_videos_per_prompt, dim=0)
-        init_latents = self._normalize_latents(
+        init_latents = latent_ops.normalize_latents(
             init_latents,
             self.vae.latents_mean,
             self.vae.latents_std,
@@ -425,12 +426,12 @@ class LTXI2VConditioningMixin:
         noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         latents = init_latents * conditioning_mask + noise * (1 - conditioning_mask)
 
-        conditioning_mask = self._pack_latents(
+        conditioning_mask = latent_ops.pack_latents(
             conditioning_mask,
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         ).squeeze(-1)
-        latents = self._pack_latents(
+        latents = latent_ops.pack_latents(
             latents,
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
@@ -446,7 +447,7 @@ class LTXI2VConditioningMixin:
         latent_height: int,
         latent_width: int,
     ) -> torch.Tensor:
-        noise_pred_video = self._unpack_latents(
+        noise_pred_video = latent_ops.unpack_latents(
             noise_pred_video,
             latent_num_frames,
             latent_height,
@@ -454,7 +455,7 @@ class LTXI2VConditioningMixin:
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         )
-        latents_unpacked = self._unpack_latents(
+        latents_unpacked = latent_ops.unpack_latents(
             latents,
             latent_num_frames,
             latent_height,
@@ -471,7 +472,7 @@ class LTXI2VConditioningMixin:
             return_dict=False,
         )[0]
         latents_unpacked = torch.cat([latents_unpacked[:, :, :1], pred_latents], dim=2)
-        return self._pack_latents(
+        return latent_ops.pack_latents(
             latents_unpacked,
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,

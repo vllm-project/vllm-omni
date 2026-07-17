@@ -10,17 +10,20 @@ from contextlib import nullcontext
 from typing import Any, ClassVar
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 from . import ltx2_latents as latent_ops
+from .ltx2_components import LTXComponentProfile, initialize_pipeline_components
 from .ltx2_conditioning import LTXPromptContext, LTXTextConditioningMixin
 from .ltx2_denoise import (
     LTXDenoiseContext,
@@ -29,41 +32,95 @@ from .ltx2_denoise import (
     LTXPhaseResult,
     VideoAudioScheduler,
     build_transformer_kwargs,
-    prepare_rope_coords_stage,
-    prepare_scheduler_stage,
     step_denoised_latents,
 )
 from .ltx2_guidance import LTXGuidanceStrategy
+from .ltx2_recipes import LTXOneStageRecipe
 from .ltx2_request import LTXRequestInputs, LTXRequestMixin
 
 
-class LTXPipelineBase(
+def _expand_per_prompt_decode_value(
+    value: float | list[float],
+    *,
+    prompt_batch_size: int,
+    effective_batch_size: int,
+    field_name: str,
+) -> list[float]:
+    if not isinstance(value, list):
+        return [value] * effective_batch_size
+    if len(value) == 1:
+        return value * effective_batch_size
+    if len(value) == effective_batch_size:
+        return value
+    if prompt_batch_size > 0 and len(value) == prompt_batch_size and effective_batch_size % prompt_batch_size == 0:
+        repeats = effective_batch_size // prompt_batch_size
+        return [item for item in value for _ in range(repeats)]
+    raise ValueError(
+        f"`{field_name}` must have length 1, prompt batch size ({prompt_batch_size}), or effective batch size"
+        f" ({effective_batch_size}); got {len(value)}."
+    )
+
+
+def _prepare_decode_timestep_conditioning(
+    *,
+    decode_timestep: float | list[float],
+    decode_noise_scale: float | list[float] | None,
+    prompt_batch_size: int,
+    effective_batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    decode_timestep_values = _expand_per_prompt_decode_value(
+        decode_timestep,
+        prompt_batch_size=prompt_batch_size,
+        effective_batch_size=effective_batch_size,
+        field_name="decode_timestep",
+    )
+    decode_noise_scale_values = (
+        decode_timestep_values
+        if decode_noise_scale is None
+        else _expand_per_prompt_decode_value(
+            decode_noise_scale,
+            prompt_batch_size=prompt_batch_size,
+            effective_batch_size=effective_batch_size,
+            field_name="decode_noise_scale",
+        )
+    )
+    return (
+        torch.tensor(decode_timestep_values, device=device, dtype=dtype),
+        torch.tensor(decode_noise_scale_values, device=device, dtype=dtype)[:, None, None, None, None],
+    )
+
+
+class LTXPipelineRuntime(
     LTXRequestMixin,
     LTXTextConditioningMixin,
     nn.Module,
     CFGParallelMixin,
     ProgressBarMixin,
     SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
 ):
-    """Common state and primitives shared by LTX2 and LTX2.3 pipelines."""
+    """Shared Omni runtime for explicitly composed LTX denoise phases."""
 
+    component_profile: ClassVar[LTXComponentProfile]
     guidance_strategy: ClassVar[LTXGuidanceStrategy]
+    one_stage_recipe: ClassVar[LTXOneStageRecipe]
+    supports_request_batch = False
+    connector_batches_cfg = False
+    distributed_video_decode = True
+    support_image_input = False
+    dummy_run_num_frames = 2
     preserve_sp_padded_audio_duration = False
-    scheduler_shift_uses_max_sequence_length = False
     reports_stage_durations = False
 
-    _pack_latents = staticmethod(latent_ops.pack_latents)
-    _unpack_latents = staticmethod(latent_ops.unpack_latents)
-    _normalize_latents = staticmethod(latent_ops.normalize_latents)
-    _normalize_audio_latents = staticmethod(latent_ops.normalize_audio_latents)
-    _denormalize_latents = staticmethod(latent_ops.denormalize_latents)
-    _denormalize_audio_latents = staticmethod(latent_ops.denormalize_audio_latents)
-    _create_noised_state = staticmethod(latent_ops.create_noised_state)
-    _pack_audio_latents = staticmethod(latent_ops.pack_audio_latents)
-    _unpack_audio_latents = staticmethod(latent_ops.unpack_audio_latents)
-    _unpad_audio_latents = staticmethod(latent_ops.unpad_audio_latents)
-    _get_sp_padded_audio_latent_length = staticmethod(latent_ops.get_sp_padded_audio_latent_length)
-    _resolve_video_latent_shape = staticmethod(latent_ops.resolve_video_latent_shape)
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
+        del prefix
+        super().__init__()
+        initialize_pipeline_components(self, od_config)
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def prepare_latents(
         self,
@@ -130,18 +187,6 @@ class LTXPipelineBase(
         return self._guidance_scale is not None and self._guidance_scale > 1.0
 
     @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
-    @property
-    def current_timestep(self):
-        return self._current_timestep
-
-    @property
-    def attention_kwargs(self):
-        return self._attention_kwargs
-
-    @property
     def interrupt(self):
         return self._interrupt
 
@@ -205,9 +250,8 @@ class LTXPipelineBase(
     ) -> bool:
         self._guidance_scale = request_inputs.guidance_scale
         self._guidance_rescale = request_inputs.guidance_rescale
-        self._attention_kwargs = attention_kwargs
+        del attention_kwargs
         self._interrupt = False
-        self._current_timestep = None
         cfg_world_size = get_classifier_free_guidance_world_size()
         if self.do_classifier_free_guidance:
             self.guidance_strategy.validate_cfg_world_size(cfg_world_size)
@@ -245,6 +289,68 @@ class LTXPipelineBase(
             )
         return DiffusionOutput(output=output)
 
+    def _decode_output(
+        self,
+        *,
+        latents: torch.Tensor,
+        audio_latents: torch.Tensor,
+        output_type: str,
+        connector_prompt_embeds: torch.Tensor,
+        generator: torch.Generator | list[torch.Generator] | None,
+        device: torch.device,
+        decode_timestep: float | list[float],
+        decode_noise_scale: float | list[float] | None,
+        prompt_batch_size: int,
+    ) -> DiffusionOutput:
+        if output_type == "latent":
+            return self._make_output((latents, audio_latents))
+
+        latents = latents.to(connector_prompt_embeds.dtype)
+        if not self.vae.config.timestep_conditioning:
+            timestep_decode = None
+        else:
+            noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+            timestep_decode, decode_noise_scale_t = _prepare_decode_timestep_conditioning(
+                decode_timestep=decode_timestep,
+                decode_noise_scale=decode_noise_scale,
+                prompt_batch_size=prompt_batch_size,
+                effective_batch_size=latents.shape[0],
+                device=device,
+                dtype=latents.dtype,
+            )
+            latents = (1 - decode_noise_scale_t) * latents + decode_noise_scale_t * noise
+
+        dist_initialized = torch.distributed.is_initialized()
+        is_output_rank = not dist_initialized or torch.distributed.get_rank() == 0
+        vae_decode_needs_all_ranks = False
+        is_distributed_vae_enabled = getattr(self.vae, "is_distributed_enabled", None)
+        if self.distributed_video_decode and dist_initialized and callable(is_distributed_vae_enabled):
+            try:
+                # Distributed tiled decode is collective, so every rank must enter it.
+                vae_decode_needs_all_ranks = bool(is_distributed_vae_enabled())
+            except Exception:
+                pass
+
+        should_decode_video = not self.distributed_video_decode or is_output_rank or vae_decode_needs_all_ranks
+        if should_decode_video:
+            video = self.vae.decode(latents.to(self.vae.dtype), timestep_decode, return_dict=False)[0]
+        else:
+            video = torch.empty(0, device=latents.device, dtype=latents.dtype)
+
+        if self.distributed_video_decode and not is_output_rank:
+            return self._make_output(
+                (
+                    torch.empty(0, device=video.device, dtype=video.dtype),
+                    torch.empty(0, device=audio_latents.device, dtype=audio_latents.dtype),
+                )
+            )
+
+        if video.numel() > 0:
+            video = self.video_processor.postprocess_video(video, output_type=output_type)
+        generated_mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype), return_dict=False)[0]
+        audio = self.vocoder(generated_mel)
+        return self._make_output((video, audio))
+
     def _prepare_video_latents_stage(
         self,
         request_inputs: LTXRequestInputs,
@@ -269,7 +375,7 @@ class LTXPipelineBase(
         return latents, None
 
     def _resolve_video_latent_dimensions(self, request_inputs: LTXRequestInputs) -> tuple[int, int, int]:
-        latent_num_frames, latent_height, latent_width = self._resolve_video_latent_shape(
+        latent_num_frames, latent_height, latent_width = latent_ops.resolve_video_latent_shape(
             request_inputs.height,
             request_inputs.width,
             request_inputs.num_frames,
@@ -330,18 +436,8 @@ class LTXPipelineBase(
             return provided_length
 
         sp_size = getattr(self.od_config.parallel_config, "sequence_parallel_size", 1) or 1
-        padded_length = self._get_sp_padded_audio_latent_length(requested_length, int(sp_size))
+        padded_length = latent_ops.get_sp_padded_audio_latent_length(requested_length, int(sp_size))
         return requested_length if provided_length in {requested_length, padded_length} else provided_length
-
-    def _scheduler_shift_sequence_length(
-        self,
-        latent_num_frames: int,
-        latent_height: int,
-        latent_width: int,
-    ) -> int:
-        if self.scheduler_shift_uses_max_sequence_length:
-            return self.scheduler.config.get("max_image_seq_len", 4096)
-        return latent_num_frames * latent_height * latent_width
 
     def _make_video_audio_scheduler(
         self,
@@ -351,36 +447,6 @@ class LTXPipelineBase(
         latent_width: int,
     ) -> Any:
         return VideoAudioScheduler(self.scheduler, audio_scheduler)
-
-    def _prepare_scheduler_stage(
-        self,
-        request_inputs: LTXRequestInputs,
-        *,
-        device: torch.device,
-        sigmas: list[float] | None,
-        timesteps: list[int] | None,
-        latent_num_frames: int,
-        latent_height: int,
-        latent_width: int,
-    ) -> tuple[Any, Any, torch.Tensor]:
-        return prepare_scheduler_stage(
-            self,
-            request_inputs,
-            device=device,
-            sigmas=sigmas,
-            timesteps=timesteps,
-            latent_num_frames=latent_num_frames,
-            latent_height=latent_height,
-            latent_width=latent_width,
-        )
-
-    def _prepare_rope_coords_stage(
-        self,
-        forward_ctx: LTXForwardContext,
-        latents: torch.Tensor,
-        audio_latents: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return prepare_rope_coords_stage(self, forward_ctx, latents, audio_latents)
 
     def _prepare_denoise_context_for_cfg(
         self,
@@ -423,23 +489,6 @@ class LTXPipelineBase(
             ts=ts,
         )
 
-    def _step_denoised_latents(
-        self,
-        forward_ctx: LTXForwardContext,
-        denoise_ctx: LTXDenoiseContext,
-        noise_pred_video: torch.Tensor,
-        noise_pred_audio: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return step_denoised_latents(
-            self,
-            forward_ctx,
-            denoise_ctx,
-            noise_pred_video,
-            noise_pred_audio,
-            timestep,
-        )
-
     def _predict_noise_for_step(
         self,
         index: int,
@@ -474,7 +523,8 @@ class LTXPipelineBase(
             forward_ctx,
             denoise_ctx,
         )
-        video, audio = self._step_denoised_latents(
+        video, audio = step_denoised_latents(
+            self,
             forward_ctx,
             denoise_ctx,
             noise_pred_video,
@@ -489,7 +539,7 @@ class LTXPipelineBase(
         latents: torch.Tensor,
         audio_latents: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        latents = self._unpack_latents(
+        latents = latent_ops.unpack_latents(
             latents,
             forward_ctx.latent_num_frames,
             forward_ctx.latent_height,
@@ -497,27 +547,27 @@ class LTXPipelineBase(
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         )
-        latents = self._denormalize_latents(
+        latents = latent_ops.denormalize_latents(
             latents,
             self.vae.latents_mean,
             self.vae.latents_std,
             self.vae.config.scaling_factor,
         )
 
-        audio_latents = self._unpad_audio_latents(audio_latents, forward_ctx.original_audio_num_frames)
-        audio_latents = self._denormalize_audio_latents(
+        audio_latents = latent_ops.unpad_audio_latents(audio_latents, forward_ctx.original_audio_num_frames)
+        audio_latents = latent_ops.denormalize_audio_latents(
             audio_latents,
             self.audio_vae.latents_mean,
             self.audio_vae.latents_std,
         )
-        audio_latents = self._unpack_audio_latents(
+        audio_latents = latent_ops.unpack_audio_latents(
             audio_latents,
             forward_ctx.original_audio_num_frames,
             num_mel_bins=forward_ctx.latent_mel_bins,
         )
         return latents, audio_latents
 
-    def _run_denoise_phase(
+    def run_phase(
         self,
         req: DiffusionRequestBatch,
         request_inputs: LTXRequestInputs,
@@ -542,16 +592,13 @@ class LTXPipelineBase(
             prompt_context=prompt_context,
         )
 
-    def _decode_and_split(
-        self,
-        forward_ctx: LTXForwardContext,
-        latents: torch.Tensor,
-        audio_latents: torch.Tensor,
-    ):
+    def decode_phase(self, phase: LTXPhaseResult) -> DiffusionOutput | list[DiffusionOutput]:
+        """Decode one completed phase and restore per-request outputs."""
+        forward_ctx = phase.forward_context
         request_inputs = forward_ctx.request_inputs
         output = self._decode_output(
-            latents=latents,
-            audio_latents=audio_latents,
+            latents=phase.video,
+            audio_latents=phase.audio,
             output_type=request_inputs.output_type,
             connector_prompt_embeds=forward_ctx.prompt_context.connector_prompt_embeds,
             generator=request_inputs.generator,
@@ -567,29 +614,6 @@ class LTXPipelineBase(
             forward_ctx.req,
             num_outputs_per_prompt=forward_ctx.num_videos_per_prompt,
         )
-
-    def _forward_impl(
-        self,
-        req: DiffusionRequestBatch,
-        request_inputs: LTXRequestInputs,
-        *,
-        noise_scale: float,
-        sigmas: list[float] | None,
-        timesteps: list[int] | None,
-        attention_kwargs: dict[str, Any] | None,
-        image: Any | None = None,
-    ):
-        """Execute one LTX phase and decode its AV output."""
-        phase = self._run_denoise_phase(
-            req,
-            request_inputs,
-            noise_scale=noise_scale,
-            sigmas=sigmas,
-            timesteps=timesteps,
-            attention_kwargs=attention_kwargs,
-            image=image,
-        )
-        return self._decode_and_split(phase.forward_context, phase.video, phase.audio)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)

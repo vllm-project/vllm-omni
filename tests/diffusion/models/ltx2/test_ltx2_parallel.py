@@ -125,7 +125,7 @@ class TestCFGParallelForwardPath:
 
     @pytest.mark.parametrize("pipeline_cls_name", ["LTX2Pipeline", "LTX23Pipeline"])
     def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch, pipeline_cls_name):
-        from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_base
+        from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_runtime
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -136,7 +136,7 @@ class TestCFGParallelForwardPath:
         torch.nn.Module.__init__(pipe)
         pipe.device = torch.device("cpu")
         pipe.tokenizer_max_length = 4
-        monkeypatch.setattr(ltx2_pipeline_base, "get_classifier_free_guidance_world_size", lambda: 1)
+        monkeypatch.setattr(ltx2_pipeline_runtime, "get_classifier_free_guidance_world_size", lambda: 1)
 
         class StopAtEncodePromptError(Exception):
             pass
@@ -233,7 +233,7 @@ class TestCFGParallelForwardPath:
         audio_sampling_rate,
         expected_frame_rate,
     ):
-        from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_guidance, ltx2_pipeline_base
+        from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_guidance, ltx2_pipeline_runtime
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -278,7 +278,7 @@ class TestCFGParallelForwardPath:
                     return [audio_pos, audio_neg]
                 raise AssertionError(f"Unexpected gathered tensor: {tensor}")
 
-        monkeypatch.setattr(ltx2_pipeline_base, "get_classifier_free_guidance_world_size", lambda: 2)
+        monkeypatch.setattr(ltx2_pipeline_runtime, "get_classifier_free_guidance_world_size", lambda: 2)
         monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_world_size", lambda: 2)
         monkeypatch.setattr(ltx2_guidance, "get_classifier_free_guidance_rank", lambda: cfg_rank)
         monkeypatch.setattr(ltx2_guidance, "get_cfg_group", lambda: FakeCfgGroup())

@@ -76,8 +76,6 @@ class LTXPhaseResult:
 class LTXDenoisePipeline(Protocol):
     """Pipeline state required by :class:`LTXDenoiseExecutor`."""
 
-    _current_timestep: torch.Tensor | None
-
     @property
     def interrupt(self) -> bool: ...
 
@@ -107,7 +105,6 @@ class LTXDenoiseExecutor:
             for index, timestep in enumerate(timesteps):
                 if pipeline.interrupt:
                     continue
-                pipeline._current_timestep = timestep
                 state = step(index, timestep, state)
                 progress_bar.update()
         return state
@@ -197,7 +194,7 @@ def prepare_scheduler_stage(
         else sigmas
     )
     mu = calculate_shift(
-        pipeline._scheduler_shift_sequence_length(latent_num_frames, latent_height, latent_width),
+        pipeline.scheduler.config.get("max_image_seq_len", 4096),
         pipeline.scheduler.config.get("base_image_seq_len", 1024),
         pipeline.scheduler.config.get("max_image_seq_len", 4096),
         pipeline.scheduler.config.get("base_shift", 0.95),
@@ -226,7 +223,6 @@ def prepare_scheduler_stage(
         sigmas=sigmas,
         mu=mu,
     )
-    pipeline._num_timesteps = len(timesteps_tensor)
     return audio_scheduler, video_audio_scheduler, timesteps_tensor
 
 
@@ -353,7 +349,8 @@ class LTXPhaseExecutor:
                 noise_scale=noise_scale,
             )
         )
-        audio_scheduler, video_audio_scheduler, timesteps_tensor = pipeline._prepare_scheduler_stage(
+        audio_scheduler, video_audio_scheduler, timesteps_tensor = prepare_scheduler_stage(
+            pipeline,
             request_inputs,
             device=device,
             sigmas=sigmas,
@@ -379,7 +376,7 @@ class LTXPhaseExecutor:
             audio_scheduler=audio_scheduler,
             video_audio_scheduler=video_audio_scheduler,
         )
-        video_coords, audio_coords = pipeline._prepare_rope_coords_stage(forward_ctx, latents, audio_latents)
+        video_coords, audio_coords = prepare_rope_coords_stage(pipeline, forward_ctx, latents, audio_latents)
         denoise_ctx = LTXDenoiseContext(
             latents=latents,
             audio_latents=audio_latents,
