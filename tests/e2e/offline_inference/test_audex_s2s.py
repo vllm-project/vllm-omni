@@ -79,6 +79,7 @@ if os.environ.get("AUDEX_E2E_30B") == "1":
     )
 pytestmark = [
     pytest.mark.slow,
+    pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
 ]
 
