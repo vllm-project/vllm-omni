@@ -56,6 +56,7 @@ def _make_text_omni_output(
     finish_reason: str | None = None,
     index: int = 0,
     num_prompt_tokens: int = 3,
+    num_cached_tokens: int | None = None,
 ) -> OmniRequestOutput:
     """Build an OmniRequestOutput wrapping a text RequestOutput."""
     if token_ids is None:
@@ -77,6 +78,7 @@ def _make_text_omni_output(
             )
         ],
         finished=finish_reason is not None,
+        num_cached_tokens=num_cached_tokens,
     )
     return OmniRequestOutput(
         request_id=request_id,
@@ -158,12 +160,19 @@ def _build_serving_chat():
     return instance
 
 
-def _make_request(modalities: list[str], n: int = 1) -> ChatCompletionRequest:
+def _make_request(
+    modalities: list[str],
+    n: int = 1,
+    *,
+    stream: bool = True,
+    include_usage: bool = False,
+) -> ChatCompletionRequest:
     req = ChatCompletionRequest(
         model="test-model",
         messages=[{"role": "user", "content": "hello"}],
         n=n,
-        stream=True,
+        stream=stream,
+        stream_options={"include_usage": True} if include_usage else None,
     )
     req.modalities = modalities  # type: ignore[attr-defined]
     return req
@@ -228,6 +237,65 @@ async def test_single_modality_text_only_one_stop():
     assert finish_reasons.count("stop") == 1
     for fr in finish_reasons[:-1]:
         assert fr is None
+
+
+@pytest.mark.asyncio
+async def test_stream_prompt_token_details_include_zero_cached_and_multimodal_tokens():
+    serving_chat = _build_serving_chat()
+    serving_chat.enable_prompt_tokens_details = True
+    request = _make_request(modalities=["text"], include_usage=True)
+
+    async def result_generator():
+        yield _make_text_omni_output(
+            token_ids=[10],
+            finish_reason="stop",
+            num_cached_tokens=0,
+        )
+
+    raw_lines = await _collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+            mm_token_counts={"image": 7},
+        )
+    )
+
+    chunks = _parse_sse_chunks(raw_lines)
+    usage = next(chunk["usage"] for chunk in chunks if chunk.get("usage"))
+
+    assert usage["prompt_tokens_details"] == {
+        "cached_tokens": 0,
+        "multimodal_tokens": {"image": 7},
+    }
+
+
+def test_non_stream_prompt_token_details_include_zero_cached_and_multimodal_tokens():
+    serving_chat = _build_serving_chat()
+    serving_chat.enable_prompt_tokens_details = True
+    request = _make_request(modalities=["text"], stream=False)
+    omni_output = _make_text_omni_output(
+        token_ids=[10],
+        finish_reason="stop",
+        num_cached_tokens=0,
+    )
+
+    _, usage, _, _, _ = serving_chat._create_text_choice(
+        request=request,
+        omni_outputs=omni_output,
+        tokenizer=MagicMock(),
+        conversation=[],
+        role="assistant",
+        mm_token_counts={"audio": 5},
+    )
+
+    assert usage.prompt_tokens_details is not None
+    assert usage.prompt_tokens_details.cached_tokens == 0
+    assert usage.prompt_tokens_details.multimodal_tokens == {"audio": 5}
 
 
 @pytest.mark.asyncio
