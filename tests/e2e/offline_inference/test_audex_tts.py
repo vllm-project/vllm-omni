@@ -13,9 +13,9 @@ import os
 
 import numpy as np
 import pytest
-import torch
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import concat_audio
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
@@ -28,17 +28,6 @@ SYNTH_TEXTS = (
     "The weather is so good, and I want to enjoy the beautiful morning in the park.",
     "The quick brown fox jumps over the lazy dog.",
 )
-
-
-def _concat_audio(audio_val) -> np.ndarray:
-    if isinstance(audio_val, list):
-        tensors = [t.detach().cpu().float().reshape(-1) for t in audio_val if isinstance(t, torch.Tensor)]
-        if not tensors:
-            return np.zeros((0,), dtype=np.float32)
-        return torch.cat(tensors, dim=-1).numpy().astype(np.float32, copy=False)
-    if isinstance(audio_val, torch.Tensor):
-        return audio_val.detach().cpu().float().reshape(-1).numpy()
-    return np.asarray(audio_val, dtype=np.float32).reshape(-1)
 
 
 _audex_deployment = get_deploy_config_path("audex_tts.yaml")
@@ -69,7 +58,7 @@ pytestmark = [
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_tts_smoke(omni_runner: OmniRunner, run_level: str) -> None:
     """Audex TTS from the repo root should produce sane 16 kHz audio per prompt.
 
@@ -84,7 +73,7 @@ def test_audex_offline_tts_smoke(omni_runner: OmniRunner, run_level: str) -> Non
     for output in outputs:
         audio_mm = output.multimodal_output
         assert "audio" in audio_mm, f"No audio output found: {list(audio_mm.keys())}"
-        audio = _concat_audio(audio_mm["audio"])
+        audio = concat_audio(audio_mm["audio"])
         assert audio.size > 0, "Generated audio is empty"
 
         sr_val = audio_mm.get("sr", SAMPLE_RATE)
@@ -130,12 +119,8 @@ def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, con
     return params
 
 
-# H100 hardware mark: on the L4 CI tier the audex pipeline stalls
-# nondeterministically after engine init (merge CI hit it in this test on
-# build 12273 and in the plain smoke on 12282; never reproduced on H100).
-# The merge-CI step runs on the H100 pool accordingly.
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_level: str) -> None:
     """A guided request must yield exactly ONE audio stream (companion suppressed)."""
     prompt = build_cond_prompt(SYNTH_TEXTS[0])
@@ -143,7 +128,7 @@ def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_lev
     outputs = omni_runner.omni.generate([prompt], params)
 
     assert len(outputs) == 1, f"expected exactly one output (no companion leak), got {len(outputs)}"
-    audio = _concat_audio(outputs[0].multimodal_output["audio"])
+    audio = concat_audio(outputs[0].multimodal_output["audio"])
     assert audio.size > 0, "Guided generation produced empty audio"
     if run_level in {"advanced_model", "full_model"}:
         rms = float(np.sqrt(np.mean(np.square(audio))))
@@ -153,13 +138,13 @@ def test_audex_offline_cfg_guided_single_stream(omni_runner: OmniRunner, run_lev
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, run_level: str) -> None:
     """cfg_scale=1.0 must be indistinguishable from not passing cfg at all."""
     prompt = build_cond_prompt(SYNTH_TEXTS[1])
 
     baseline = omni_runner.omni.generate([prompt])
-    base_audio = _concat_audio(baseline[0].multimodal_output["audio"])
+    base_audio = concat_audio(baseline[0].multimodal_output["audio"])
 
     import copy
 
@@ -168,7 +153,7 @@ def test_audex_offline_cfg_disabled_is_byte_identical(omni_runner: OmniRunner, r
         params[0].extra_args = {}
     params[0].extra_args["cfg_scale"] = 1.0
     disabled = omni_runner.omni.generate([prompt], params)
-    disabled_audio = _concat_audio(disabled[0].multimodal_output["audio"])
+    disabled_audio = concat_audio(disabled[0].multimodal_output["audio"])
 
     assert base_audio.shape == disabled_audio.shape, (
         f"cfg_scale=1.0 changed output length: {base_audio.shape} vs {disabled_audio.shape}"

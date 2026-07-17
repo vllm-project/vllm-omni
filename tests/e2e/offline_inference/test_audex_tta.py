@@ -16,9 +16,9 @@ import os
 
 import numpy as np
 import pytest
-import torch
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import concat_audio
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.audex.prompt import build_tta_cond_prompt
@@ -59,19 +59,9 @@ if os.environ.get("AUDEX_E2E_30B") == "1":
     )
 pytestmark = [
     pytest.mark.slow,
+    pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
 ]
-
-
-def _concat_audio(audio_val) -> np.ndarray:
-    if isinstance(audio_val, list):
-        tensors = [t.detach().cpu().float().reshape(-1) for t in audio_val if isinstance(t, torch.Tensor)]
-        if not tensors:
-            return np.zeros((0,), dtype=np.float32)
-        return torch.cat(tensors, dim=-1).numpy().astype(np.float32, copy=False)
-    if isinstance(audio_val, torch.Tensor):
-        return audio_val.detach().cpu().float().reshape(-1).numpy()
-    return np.asarray(audio_val, dtype=np.float32).reshape(-1)
 
 
 @pytest.fixture(scope="module")
@@ -115,7 +105,7 @@ def _tta_sampling_params(runner: OmniRunner, cond_prompt: str, tokenizer_bits, c
 
 
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_audex_offline_tta_eight_captions(omni_runner: OmniRunner, run_level: str, tta_tokenizer_bits) -> None:
     """All eight captions decode through XCodec1 to non-silent, finite audio.
 
@@ -136,7 +126,7 @@ def test_audex_offline_tta_eight_captions(omni_runner: OmniRunner, run_level: st
         assert len(outputs) == 1, f"{caption!r}: expected one output, got {len(outputs)}"
         audio_mm = outputs[0].multimodal_output
         assert "audio" in audio_mm, f"{caption!r}: no audio output: {list(audio_mm.keys())}"
-        audio = _concat_audio(audio_mm["audio"])
+        audio = concat_audio(audio_mm["audio"])
         assert audio.size > 0, f"{caption!r}: generated audio is empty"
         assert np.isfinite(audio).all(), f"{caption!r}: audio contains NaN/Inf"
 

@@ -17,10 +17,10 @@ import time
 
 import numpy as np
 import pytest
-import torch
 from vllm.assets.audio import AudioAsset
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import concat_audio
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
@@ -150,17 +150,6 @@ def _chat_once(runner: OmniRunner, prompt: str, seed: int) -> tuple[str, bool]:
     return text, truncated
 
 
-def _concat_audio(audio_val) -> np.ndarray:
-    if isinstance(audio_val, list):
-        tensors = [t.detach().cpu().float().reshape(-1) for t in audio_val if isinstance(t, torch.Tensor)]
-        if not tensors:
-            return np.zeros((0,), dtype=np.float32)
-        return torch.cat(tensors, dim=-1).numpy().astype(np.float32, copy=False)
-    if isinstance(audio_val, torch.Tensor):
-        return audio_val.detach().cpu().float().reshape(-1).numpy()
-    return np.asarray(audio_val, dtype=np.float32).reshape(-1)
-
-
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -> None:
     """ASR → chat → TTS over one deployment; text passes never emit audio."""
@@ -182,7 +171,7 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
     asr_out = asr_outputs[0]
     transcript = (asr_out.outputs[0].text or "").strip()
     mm = getattr(asr_out, "multimodal_output", None) or {}
-    stage1_audio = _concat_audio(mm.get("audio")) if "audio" in mm else np.zeros((0,), dtype=np.float32)
+    stage1_audio = concat_audio(mm.get("audio")) if "audio" in mm else np.zeros((0,), dtype=np.float32)
     assert stage1_audio.size == 0, "Text-modality ASR pass produced stage-1 audio (routing regression)"
 
     # Pass 2 — chat (text-final). The recipe is size-conditional (see the
@@ -226,7 +215,7 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
     for req_output in tts_outputs:
         mm = getattr(req_output, "multimodal_output", None) or {}
         if "audio" in mm:
-            speech = _concat_audio(mm["audio"])
+            speech = concat_audio(mm["audio"])
             break
     assert speech.size > 0, "TTS pass produced empty audio"
 
@@ -265,7 +254,7 @@ def test_audex_s2s_cascade_round_trip(omni_runner: OmniRunner, run_level: str) -
     first_audio_s: float | None = None
     for req_output in omni_runner.omni.generate([tts_prompt], py_generator=True):
         mm = getattr(req_output, "multimodal_output", None) or {}
-        if "audio" in mm and _concat_audio(mm["audio"]).size > 0:
+        if "audio" in mm and concat_audio(mm["audio"]).size > 0:
             if first_audio_s is None:
                 first_audio_s = time.perf_counter() - t_start
     assert first_audio_s is not None, "streaming TTS never produced an audio-bearing chunk"

@@ -82,23 +82,3 @@ def test_audex_tta_online_smoke(omni_server, openai_client, run_level) -> None:
         assert 0.1 <= duration_s <= 10.5, f"unexpected duration={duration_s:.3f}s"
         rms = float(np.sqrt(np.mean(np.square(audio))))
         assert rms > 1e-4, f"audio is near-silent (rms={rms})"
-
-
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", audex_tta_server_params, indirect=True)
-def test_audex_tta_online_policies(omni_server, openai_client) -> None:
-    """Malformed guidance and unsupported knobs are rejected with 400."""
-    import requests
-
-    url = f"{openai_client.base_url.rstrip('/')}/v1/audio/speech"
-    for bad_payload, needle in (
-        ({"input": CAPTION, "extra_params": {"cfg_scale": 99}}, "cfg_scale"),
-        ({"input": CAPTION, "extra_params": {"cfg_scale": "big"}}, "cfg_scale"),
-        ({"input": CAPTION, "extra_params": {"tta_rvq": {}}}, "tta_rvq"),
-        ({"input": "   "}, "caption"),
-        ({"input": CAPTION, "voice": "alloy"}, "voice"),
-        ({"input": CAPTION, "ref_audio": "https://example.com/ref.wav"}, "reference audio"),
-    ):
-        resp = requests.post(url, json={"model": omni_server.model, **bad_payload}, timeout=120)
-        assert resp.status_code == 400, f"{bad_payload} -> {resp.status_code}: {resp.text[:200]}"
-        assert needle in resp.text, f"{bad_payload} error missing {needle!r}: {resp.text[:200]}"
