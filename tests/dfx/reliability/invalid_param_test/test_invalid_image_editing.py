@@ -62,8 +62,8 @@ def _finalize_edits_form_data(template: dict[str, Any], server_model: str) -> di
         ),
         pytest.param(
             True,
-            {"prompt": "edit", "model": _IMAGE_EDITS_SERVER_MODEL, "layers": "2"},
-            ("Invalid layers", "3", "1"),
+            {"prompt": "edit", "model": _IMAGE_EDITS_SERVER_MODEL, "layers": "1"},
+            ("Invalid layers", "2", "10"),
             400,
             id="invalid_layers",
         ),

@@ -13,7 +13,7 @@ SOULX_PRECOMPUTED_KEYS_BY_KIND: dict[str, tuple[str, ...]] = {
 
 
 # Key under which the SoulX preprocess payload is stored in
-# prompt["additional_information"] or DiffusionOutput.custom_output.
+# prompt["additional_information"] or diffusion output metadata.
 SOULX_PREPROCESSED_KEY = "soulx_preprocessed"
 
 

@@ -16,6 +16,7 @@ from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
 from vllm_omni.config.stage_config import (
     DeployConfig,
@@ -37,6 +38,15 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def clear_config_factory_caches():
+    """Clear cached classmethods from the StageConfigFactory to prevent test pollution."""
+    yield
+    StageConfigFactory.get_hf_config.cache_clear()
+    StageConfigFactory.try_infer_model_type.cache_clear()
+    StageConfigFactory.get_pipeline_config.cache_clear()
 
 
 Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
@@ -666,6 +676,43 @@ class TestPipelineRegistration:
         assert resolved_config is not None
         assert len(resolved_config) > 0
 
+    def test_deploy_override_uses_correct_endpoint_restrictions(self, clean_pipeline_registry, tmp_path):
+        """Ensure endpoint restrictions must come from the final pipeline
+        after deploy config overrides, not the auto-detected pipeline.
+        """
+        # Register two pipeline configs, where one has an endpoint restriction, and one doesn't
+        restriction = EndpointRestriction(
+            OmniServingCapability.COMPLETIONS,
+            "pipeline_a blocks completions",
+        )
+        pipe_a = PipelineConfig(model_type="detect_type", endpoint_restrictions=(restriction,))
+        pipe_b = PipelineConfig(model_type="override_type", endpoint_restrictions=())
+        register_pipeline(pipe_a)
+        register_pipeline(pipe_b)
+
+        # Create a config with the autodetected type, and write the
+        # deploy config specifying the override type to a temp path
+        class FakeConfig(PretrainedConfig):
+            model_type = "detect_type"
+
+        deploy_yaml = tmp_path / "override.yaml"
+        deploy_yaml.write_text("pipeline: override_type\n")
+
+        # Get the endpoint restrictions, passing the deploy config with the override
+        # type + patching the config for the detected type. Ensure that the endpoint
+        # restrictions correspond to the type in the deploy config.
+        with patch(
+            "vllm_omni.config.config_factory.get_config",
+            return_value=FakeConfig(),
+        ):
+            restrictions = StageConfigFactory.get_pipeline_endpoint_restrictions(
+                model="fake/model",
+                trust_remote_code=False,
+                deploy_config_path=str(deploy_yaml),
+            )
+
+        assert restrictions == ()
+
 
 class TestResolveScheduler:
     def test_all_execution_types_handled(self):
@@ -1119,7 +1166,10 @@ class TestQwen3OmniPipeline:
         assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
         assert s.sampling_constraints["stop_token_ids"] == [2150]
-        assert s.custom_process_input_func is not None
+        # thinker2talker was removed: sync_process_input_func always wins.
+        assert s.custom_process_input_func is None
+        assert s.sync_process_input_func is not None
+        assert s.sync_process_input_func.endswith("thinker2talker_token_only")
         assert s.custom_process_next_stage_input_func is not None
 
     def test_code2wav(self):
@@ -1133,7 +1183,7 @@ class TestQwen3OmniPipeline:
         assert isinstance(s, StagePipelineConfig)
         assert s.execution_type == StageExecutionType.LLM_GENERATION
         assert s.final_output_type == "audio"
-        assert s.custom_process_input_func is not None
+        assert s.engine_output_type == "audio"
 
 
 class TestQwen2_5OmniPipeline:
@@ -1671,7 +1721,7 @@ class TestAuraOmniDeploy:
     def test_aura_omni_deploy_resolves_four_native_stages(self):
         pipeline_cfg = StageConfigFactory.resolve_pipeline_config("aura_omni")
 
-        stages = StageConfigFactory._create_from_registry(
+        stages, _ = StageConfigFactory._create_from_registry(
             "qwen3_tts",
             pipeline_cfg,
             cli_overrides={},
@@ -1893,11 +1943,12 @@ class TestSentinelDefaultPrecedence:
             model_type,
             Q3_OMNI_ALL_STAGES_HF_CONFIG,
         )
-        return StageConfigFactory._create_from_registry(
+        stages, _ = StageConfigFactory._create_from_registry(
             "qwen3_omni_moe",
             pipeline_cfg,
             cli_overrides=cli_overrides,
         )
+        return stages
 
     def test_typed_kwarg_overrides_yaml(self):
         stages = self._stages({"max_num_seqs": 999})

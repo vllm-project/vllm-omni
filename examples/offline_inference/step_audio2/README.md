@@ -1,4 +1,4 @@
-# Step-Audio2 Offline Inference Examples
+# Step-Audio2: Offline inference
 
 This directory contains examples for running offline inference with Step-Audio2 using vLLM-Omni.
 

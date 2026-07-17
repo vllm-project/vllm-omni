@@ -474,6 +474,7 @@ class _DiffusionConfigProjection:
     diffusion_kv_cache_skip_layers: str | list[int] | tuple[int, ...] | set[int] | None = None
     diffusion_kv_cache_skip_step_indices: set[int] | None = None
     diffusion_kv_cache_skip_layer_indices: set[int] | None = None
+    moe_backend: str = "auto"
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
@@ -556,7 +557,7 @@ class _DiffusionConfigProjection:
             elif isinstance(self.quantization_config, str):
                 self.quantization_config = build_quant_config(self.quantization_config)
             elif isinstance(self.quantization_config, Mapping):
-                self.quantization_config = build_quant_config(dict(self.quantization_config))
+                self.quantization_config = dict(self.quantization_config)
             else:
                 raise TypeError(
                     "quantization_config must be str, dict, QuantizationConfig, or None, "

@@ -1,0 +1,12 @@
+# Canonical display names for model examples that have both offline and online pages.
+# The docs generator combines these names with the serving mode for each page H1.
+aura_omni: AURA Omni
+covo_audio: Covo-Audio-Chat
+dynin_omni: Dynin-Omni
+lance: Lance
+mimo_audio: MiMo-Audio
+ming_flash_omni: Ming-flash-omni 2.0
+qwen2_5_omni: Qwen2.5-Omni
+qwen3_omni: Qwen3-Omni
+sensenova_u1: SenseNova-U1
+step_audio2: Step-Audio2

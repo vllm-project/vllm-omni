@@ -102,8 +102,9 @@ curl http://localhost:8099/v1/chat/completions \
 ```
 
 **Text + speech in one response** (the headline 4.5 feature). The TTS
-path is gated by a Jinja flag on the chat template, passed through
-`extra_body.chat_template_kwargs.use_tts_template=true`:
+path is gated by a Jinja flag on the chat template. Pass
+`use_tts_template=true` via the **top-level** `chat_template_kwargs`
+field (curl does not flatten nested `extra_body`):
 
 ```bash
 curl http://localhost:8099/v1/chat/completions \
@@ -112,12 +113,18 @@ curl http://localhost:8099/v1/chat/completions \
         "model": "openbmb/MiniCPM-o-4_5",
         "messages": [{"role": "user", "content": "Say hello, then introduce vLLM in one sentence."}],
         "modalities": ["text", "audio"],
-        "extra_body": {"chat_template_kwargs": {"use_tts_template": true}}
+        "chat_template_kwargs": {"use_tts_template": true}
     }'
 ```
 
-Response carries text in `choices[0].message.content` and base64 WAV
-in `choices[0].message.audio.data` (24 kHz mono, see Notes).
+When using the OpenAI Python SDK, the same flag can also be sent as
+`extra_body={"chat_template_kwargs": {"use_tts_template": True}}`
+because the client merges `extra_body` into the request root.
+
+Response carries text in one choice's `message.content` and base64 WAV
+in another choice's `message.audio.data` (24 kHz mono, see Notes). With
+`modalities: ["text", "audio"]` you typically get two `choices` entries
+(one text, one audio).
 
 **Gradio demo (text + image + audio + video UI)**:
 
@@ -209,9 +216,13 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   missing dep raises `ImportError` at first request with the same
   install hint instead of silently emitting empty audio.
 
-- **TTS trigger**: speech output is only emitted when the client passes
-  `extra_body.chat_template_kwargs.use_tts_template=true`. Without it,
-  the response is text-only (which is also faster).
+- **TTS trigger**: speech output requires
+  `chat_template_kwargs.use_tts_template=true` so the chat template
+  appends `<|tts_bos|>` before generation. Without it, Stage-1 talker
+  receives no TTS token span and returns silent audio (not text-only).
+  For **curl**, put `chat_template_kwargs` at the request root; nested
+  `extra_body.chat_template_kwargs` is ignored. The OpenAI Python SDK
+  may use `extra_body` because it flattens those fields into the root.
 
 - **Output audio**: 24 kHz mono WAV inside the OpenAI-style
   `message.audio.data` (base64). The Gradio demo's WAV player decodes

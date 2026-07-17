@@ -9,7 +9,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.engine.output_modality import OutputModality
+from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
 
@@ -434,6 +434,9 @@ class OrchestratorArgs:
     stage_configs_path: str | None = None
     deploy_config: str | None = None
     stage_overrides: str | None = None  # raw JSON string; parsed downstream
+    # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
+    # derived sizing onto merged stages, then drops it before per-stage engine args.
+    strategy_config: str | None = None
 
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
