@@ -82,7 +82,7 @@ def tta_tokenizer_bits():
     from vllm_omni.model_executor.models.audex.tta import build_tta_phase_token_ids
 
     root = ensure_audex_snapshot(_audex_model, profile="tta")
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"))
+    tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"), trust_remote_code=True)
     phase_token_ids, start_tid, end_tid = build_tta_phase_token_ids(tokenizer)
     return tokenizer, phase_token_ids, start_tid, end_tid
 
