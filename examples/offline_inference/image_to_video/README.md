@@ -233,7 +233,7 @@ python image_to_video.py \
   --output i2v_cached.mp4
 ```
 
-### [LTX-2.3](../../../recipes/LTX/LTX-2.md)
+### LTX-2.3
 
 ```bash
 python image_to_video.py \

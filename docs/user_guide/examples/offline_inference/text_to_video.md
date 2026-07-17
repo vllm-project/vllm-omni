@@ -51,7 +51,7 @@ python text_to_video.py \
   --output ltx2_out.mp4
 ```
 
-### [LTX-2.3](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md)
+### LTX-2.3
 
 ```bash
 python text_to_video.py \
