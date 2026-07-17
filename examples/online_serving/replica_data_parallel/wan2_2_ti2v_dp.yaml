@@ -1,0 +1,43 @@
+# Replica data-parallel recipe for Wan2.2 TI2V-5B (video DiT).
+#
+# Fans out `num_replicas` independent DiffusionEngine replicas, one per GPU,
+# and lets the serving layer route each request to a single replica. This
+# scales request throughput near-linearly; it does not change single-request
+# latency. See ./README.md for measured numbers and the `run_server.sh` driver.
+#
+# run_server.sh substitutes __NUM_REPLICAS__ / __DEVICES__ from env before serving.
+# For tensor_parallel_size = 1, `devices` lists one GPU per replica (pool mode):
+# num_replicas=4 -> devices "0,1,2,3".
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      num_replicas: __NUM_REPLICAS__
+      devices: "__DEVICES__"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      # `model_class_name` takes the diffusion registry KEY (WanPipeline), which
+      # resolves to the Wan22Pipeline class. Wan2.2 TI2V-5B is served by the base
+      # WanPipeline, which auto-detects TI2V-5B mode from model_index.json.
+      model_class_name: WanPipeline
+      max_num_seqs: 1
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      vae_use_tiling: true
+      parallel_config:
+        tensor_parallel_size: 1
+
+    final_output: true
+    final_output_type: video
+    is_comprehension: false
+    default_sampling_params:
+      seed: 42
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
