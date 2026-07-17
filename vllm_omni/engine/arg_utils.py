@@ -33,6 +33,25 @@ _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
 }
 
 
+def _read_backbone_torch_dtype(model: str | None, subfolder: str | None) -> str | None:
+    """Return ``torch_dtype`` declared by a backbone config in ``<model>/<subfolder>``.
+
+    Used to run a stage in the precision its checkpoint was trained in rather
+    than a pipeline-wide default. Returns None when the path or field is absent
+    (a local dir only; a bare HF repo id is skipped).
+    """
+    if not model or not subfolder or not os.path.isdir(model):
+        return None
+    cfg = os.path.join(model, subfolder, "config.json")
+    if not os.path.isfile(cfg):
+        return None
+    try:
+        with open(cfg) as f:
+            return json.load(f).get("torch_dtype")
+    except (OSError, ValueError):
+        return None
+
+
 def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
@@ -324,6 +343,25 @@ class OmniEngineArgs(EngineArgs):
                             logger.info("Downloaded tokenizer from %s/%s", model_path, subfolder)
                     except Exception as e:
                         logger.warning("Failed to download tokenizer subfolder: %s", e)
+
+        # The CosyVoice3 talker is a bf16-native Qwen2 backbone, but the deploy
+        # config forces float32 pipeline-wide for the fp32 flow decoder in the
+        # code2wav stage. Running the talker in float32 upcasts a bf16 model for
+        # no benefit, so read its declared dtype from the backbone config and
+        # run the talker stage in it. Only the talker stage is affected, and
+        # only when it would otherwise be upcast to float32.
+        if self.model_stage == "cosyvoice3_talker" and str(self.dtype) in (
+            "float32",
+            "torch.float32",
+        ):
+            native = _read_backbone_torch_dtype(self.model, _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch))
+            if native and native not in ("float32", "float", None):
+                logger.info(
+                    "CosyVoice3 talker: using backbone dtype %s (deploy config requested %s)",
+                    native,
+                    self.dtype,
+                )
+                self.dtype = native
 
         # Build the vLLM config first, then use it to create the Omni config.
         try:
