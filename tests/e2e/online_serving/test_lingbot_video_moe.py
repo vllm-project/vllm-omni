@@ -50,6 +50,7 @@ def test_text_to_video_moe(omni_server: OmniServer, openai_client: OpenAIClientH
             "negative_prompt": NEGATIVE_PROMPT,
             "height": 192,
             "width": 320,
+            "num_frames": 9,
             "fps": 24,
             "flow_shift": 3.0,
             "seed": 42,
