@@ -7,6 +7,7 @@ E2E Online tests for Qwen3-Omni model.
 import os
 
 import pytest
+from openai import BadRequestError
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
@@ -610,3 +611,21 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
     assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params[:1], indirect=True)
+def test_invalid_audio_format_rejected(omni_server, openai_client) -> None:
+    """Ensure invalid audio format is rejected with 400 before streaming starts."""
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt(),
+    )
+    with pytest.raises(BadRequestError, match="audio format"):
+        openai_client.client.chat.completions.create(
+            model=omni_server.model,
+            messages=messages,
+            modalities=["text", "audio"],
+            audio={"voice": "alloy", "format": "aac"},
+            stream=True,
+        )

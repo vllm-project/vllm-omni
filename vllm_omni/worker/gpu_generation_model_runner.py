@@ -76,10 +76,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
-        # Some stateful vocoder model may need to clean the state
-        # to avoid the leak of slots when the requests have been aborted.
-        if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
-            self.model.on_requests_finished(scheduler_output.finished_req_ids)
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
@@ -157,6 +153,13 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+
+            # Notify stateful models of finished requests before the
+            # zero-token early return. Request cleanup is a model lifecycle
+            # concern and does not depend on the inter-stage transfer mode.
+            if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
+                self.model.on_requests_finished(scheduler_output.finished_req_ids)
+
             if not scheduler_output.total_num_scheduled_tokens:
                 return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 

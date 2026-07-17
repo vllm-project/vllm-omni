@@ -613,7 +613,12 @@ def compute_seed_tts_wer_metrics(
                 e,
             )
 
-        wav_16k = _pcm_s16le_to_f32_16k(pcm)
+        # Request functions normalize ``tts_output_pcm_bytes`` to Seed-TTS WER
+        # format before it reaches this evaluator: 24 kHz mono int16 PCM.
+        # Do not apply the streamed-response env format here again; for MOSS
+        # local that would reinterpret already-normalized 24 kHz mono audio as
+        # 48 kHz stereo and corrupt ASR/WER.
+        wav_16k = _pcm_s16le_to_f32_16k(pcm, pcm_sample_rate=24000, channels=1)
         if len(wav_16k) == 0:
             asr_failed += 1
             if include_per_item:
