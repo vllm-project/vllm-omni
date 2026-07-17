@@ -201,23 +201,57 @@ class OmniGPUModelRunner(GPUModelRunner):
         if talker_mtp is None:
             return
         self.talker_mtp = talker_mtp  # type: ignore[assignment]
+        self._talker_mtp_eager = talker_mtp
         self.has_talker_mtp = True
+        self.talker_mtp_uses_outer_graph = False
+        is_cuda = current_omni_platform.is_cuda()
+        graph_batch_limit = getattr(self.model, "talker_mtp_outer_graph_max_batch_size", None) if is_cuda else None
+        self.talker_mtp_outer_graph_max_batch_size = int(graph_batch_limit) if graph_batch_limit is not None else None
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
         has_separate_talker = getattr(self.model, "talker", None) is not None
         talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
         if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
             graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
-            self.talker_mtp = graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+            self.talker_mtp = graph_wrapper_cls(
+                talker_mtp,
+                self.vllm_config,
+                runtime_mode=CUDAGraphMode.FULL,
+            )
+            self.talker_mtp_uses_outer_graph = True
+            logger.info(
+                "Enabled outer talker_mtp graph with max graph batch size %s",
+                self.talker_mtp_outer_graph_max_batch_size or "unlimited",
+            )
         # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
         hidden_size = int(
             getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
         )
-        max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+        capture_sizes = (
+            self._talker_mtp_graph_capture_sizes() if is_cuda else list(self.compilation_config.cudagraph_capture_sizes)
+        )
+        max_batch_size = max(self.max_num_reqs, max(capture_sizes, default=0))
         self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
         self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+
+    def _talker_mtp_graph_capture_sizes(self) -> list[int]:
+        """Return only graph buckets reachable by one-token MTP decode batches."""
+        if not getattr(self, "talker_mtp_uses_outer_graph", False):
+            return []
+        capture_sizes = sorted({int(size) for size in self.compilation_config.cudagraph_capture_sizes if size > 0})
+        if not capture_sizes:
+            return []
+        runtime_limit = int(self.max_num_reqs)
+        graph_limit = getattr(self, "talker_mtp_outer_graph_max_batch_size", None)
+        if graph_limit is not None:
+            runtime_limit = min(runtime_limit, int(graph_limit))
+        sizes = [size for size in capture_sizes if size < runtime_limit]
+        ceiling = next((size for size in capture_sizes if size >= runtime_limit), None)
+        if ceiling is not None:
+            sizes.append(ceiling)
+        return sizes
 
     def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
@@ -1796,11 +1830,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         # When talker_mtp is not wrapped by the platform's full-graph wrapper,
         # it manages its own device graphs internally (code_predictor has its
         # own bucket sizes).
-        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()):
+        graph_batch_limit = getattr(self, "talker_mtp_outer_graph_max_batch_size", None)
+        use_outer_graph = getattr(self, "talker_mtp_uses_outer_graph", False) and (
+            graph_batch_limit is None or decode_batch_size <= graph_batch_limit
+        )
+        if not use_outer_graph:
             _cudagraph_mode = CUDAGraphMode.NONE
             num_tokens_padded = decode_batch_size
+            talker_mtp = getattr(self, "_talker_mtp_eager", self.talker_mtp)
         else:
             num_tokens_padded = batch_desc.num_tokens
+            talker_mtp = self.talker_mtp
         req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
@@ -1832,7 +1872,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                 cache[req_id] = generator
             return generator
 
-        row_generators = [_row_generator(req_id) for req_id in decode_req_ids]
+        accepts_per_row_generators = getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
+        supports_per_row_generators = current_omni_platform.is_cuda() and getattr(
+            self.model, "talker_mtp_supports_per_row_generators", False
+        )
+        can_batch_per_row_generators = accepts_per_row_generators or supports_per_row_generators
+        if use_outer_graph and supports_per_row_generators and not accepts_per_row_generators:
+            # A full CUDA graph configuration owns its RNG state. Keep hybrid
+            # execution on the same batched RNG path instead of scalarizing
+            # every default seeded request.
+            row_generators = [None] * decode_batch_size
+        else:
+            row_generators = [_row_generator(req_id) for req_id in decode_req_ids]
         cache = getattr(self, "_talker_mtp_generators", None)
         if cache:
             # Generators live as long as their request; drop finished ones.
@@ -1842,7 +1893,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         if (
             decode_batch_size > 1
             and any(generator is not None for generator in row_generators)
-            and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
+            and not can_batch_per_row_generators
         ):
             # A torch.Generator is a single stream. Using one generator for a
             # multi-row batch would make explicitly-seeded requests depend on
@@ -1885,7 +1936,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, code_predictor_codes = self.talker_mtp(
+            req_embeds, code_predictor_codes = talker_mtp(
                 req_input_ids,
                 req_embeds,
                 last_talker_hidden,
