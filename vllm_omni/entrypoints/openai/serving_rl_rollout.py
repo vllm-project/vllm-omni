@@ -190,10 +190,7 @@ class ServingRLRollout:
             if req.step_id != expected_step_id:
                 if req.step_id <= committed:
                     code = "step_already_committed"
-                    message = (
-                        f"Step {req.step_id} is already committed; "
-                        f"highest committed step is {committed}."
-                    )
+                    message = f"Step {req.step_id} is already committed; highest committed step is {committed}."
                 else:
                     code = "step_out_of_order"
                     message = f"Expected step_id {expected_step_id}, got {req.step_id}."

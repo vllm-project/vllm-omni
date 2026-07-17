@@ -19,7 +19,6 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 
 
 class _FakeRolloutServing:
-
     def __init__(self, close_error: Exception | None = None) -> None:
         self.close_error = close_error
         self.step_request = None

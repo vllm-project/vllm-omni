@@ -81,8 +81,6 @@ class RolloutSessionStore:
         session = await self.get(session_id)
         expected_step_id = session.committed_step_id + 1
         if step_id != expected_step_id:
-            raise RolloutSessionStepError(
-                f"Expected step_id {expected_step_id}, got {step_id}."
-            )
+            raise RolloutSessionStepError(f"Expected step_id {expected_step_id}, got {step_id}.")
         session.committed_step_id = step_id
         session.context_length += 1
