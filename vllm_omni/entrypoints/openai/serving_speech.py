@@ -92,6 +92,7 @@ _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
+_MOSHI_TTS_MODEL_STAGES = {"moshi_tts_talker"}
 _MOSS_TTS_FULL_MODEL_STAGES = {"moss_tts", "moss_tts_codec"}
 _MOSS_TTS_LOCAL_MODEL_STAGES = {"moss_tts_local", "moss_tts_local_codec"}
 _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
@@ -111,6 +112,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
+    | _MOSHI_TTS_MODEL_STAGES
     | _MOSS_TTS_FULL_MODEL_STAGES
     | _MOSS_TTS_LOCAL_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
@@ -712,6 +714,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ming_tts"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
+        if model_stage in _MOSHI_TTS_MODEL_STAGES:
+            return "moshi_tts"
         if model_stage in _MOSS_TTS_FULL_MODEL_STAGES:
             return "moss_tts"
         if model_stage in _MOSS_TTS_LOCAL_MODEL_STAGES:
@@ -879,6 +883,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
         """Estimate prompt length so the placeholder matches model-side embeddings."""
         try:
+            if self._tts_model_type == "moshi_tts":
+                return 1
             from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
                 Qwen3TTSPromptEmbedsBuilder,
             )
@@ -1511,6 +1517,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_moss_tts_request(request)
         if self._tts_model_type == "glm_tts":
             return self._validate_glm_tts_request(request)
+        if self._tts_model_type == "moshi_tts":
+                return self._validate_moshi_tts_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _validate_voxcpm2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -2943,6 +2951,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None, None
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
+
+    def _validate_moshi_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Moshi TTS request parameters."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        return None
+
+    def _build_moshi_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build additional_information for Moshi TTS.
+
+        Only ``text`` is required; the DSM state machine handles timing.
+        Multi-turn scripts can be passed as newline-separated ``input``.
+        """
+        lines = [t for t in request.input.splitlines() if t.strip()]
+        if not lines:
+            lines = [request.input]
+        return {"text": lines if len(lines) > 1 else [request.input]}
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.

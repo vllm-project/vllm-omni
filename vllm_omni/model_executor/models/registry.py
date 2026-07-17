@@ -220,6 +220,22 @@ _OMNI_MODELS = {
         "hunyuan_image3",
         "HunyuanImage3ForConditionalGeneration",
     ),
+    ## moshi_tts (Moshi DSM TTS)
+    "MoshiTTSTalkerForConditionalGeneration": (
+        "moshi_tts",
+        "moshi_tts_talker",
+        "MoshiTTSTalkerForConditionalGeneration",
+    ),
+    "MoshiMimiEncoder": (
+        "moshi_tts",
+        "moshi_mimi_encoder",
+        "MoshiMimiEncoder",
+    ),
+    "MoshiMimiDecoder": (
+        "moshi_tts",
+        "moshi_mimi_decoder",
+        "MoshiMimiDecoder",
+    ),
     ## fish_speech (Fish Speech S2 Pro)
     "FishSpeechSlowARForConditionalGeneration": (
         "fish_speech",

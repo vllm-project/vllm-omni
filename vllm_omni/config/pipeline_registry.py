@@ -54,6 +54,7 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
     HUNYUAN_IMAGE3_DIT_PIPELINE,
     HUNYUAN_IMAGE3_PIPELINE,
 )
+from vllm_omni.model_executor.models.moshi_tts.pipeline import MOSHI_TTS_PIPELINE
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
@@ -117,6 +118,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_tts_moe": MING_TTS_MOE_PIPELINE,
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
+    "moshi_tts": MOSHI_TTS_PIPELINE,
+    "moshi": MOSHI_TTS_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
     "ming_flash_omni": MING_FLASH_OMNI_PIPELINE,
     "ming_flash_omni_tts": MING_FLASH_OMNI_TTS_PIPELINE,

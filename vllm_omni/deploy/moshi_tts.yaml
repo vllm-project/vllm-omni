@@ -1,0 +1,59 @@
+pipeline: moshi_tts
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 0
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    gpu_memory_utilization: 0.6
+    max_num_batched_tokens: 1
+    max_model_len: 3000
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_k: -1
+      top_p: 1.0
+      max_tokens: 2000
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
+      stop_token_ids: [1]
+
+  - stage_id: 1
+    max_num_seqs: 1
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    gpu_memory_utilization: 0.1
+    # Mimi prefill length is n_q * num_frames; 65536 covers ~200 s at 12.5 fps.
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
