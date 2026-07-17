@@ -1,11 +1,14 @@
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from vllm_omni.diffusion.models.flux2.pipeline_flux2 import (
     Flux2Pipeline,
     _resolve_component_quant_config,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_resolve_component_quant_config_routes_components():
