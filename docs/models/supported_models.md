@@ -45,8 +45,8 @@ th {
 | `LTX2ImageToVideoPipeline` | LTX-2-I2V | `Lightricks/LTX-2` | ✅︎ | ✅︎ | | |
 | `LTX2TwoStagesPipeline` | LTX-2-T2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
 | `LTX2ImageToVideoTwoStagesPipeline` | LTX-2-I2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
-| `LTX23Pipeline` | [LTX-2.3-T2V](../../recipes/LTX/LTX-2.md) | `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
-| `LTX23ImageToVideoPipeline` | [LTX-2.3-I2V](../../recipes/LTX/LTX-2.md) | `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
+| `LTX23Pipeline` | [LTX-2.3-T2V](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md) | `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
+| `LTX23ImageToVideoPipeline` | [LTX-2.3-I2V](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md) | `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
 | `LingBotVideoPipeline` | LingBot-Video dense and MoE T2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | |
