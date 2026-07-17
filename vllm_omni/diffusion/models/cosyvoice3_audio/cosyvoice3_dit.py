@@ -32,6 +32,10 @@ logger = init_logger(__name__)
 # for the byte-identical full-sequence path.
 CHUNK_CAUSAL = os.environ.get("COSYVOICE3_CHUNK_CAUSAL", "1") == "1"
 KV_CACHE = os.environ.get("COSYVOICE3_DIT_KV_CACHE", "1") == "1"
+# Mirrors cfm.FLOW_BF16: under the bf16 flow the dtype-routed diffusion backend
+# would pick FlashAttention (2D-mask only); keep the SDPA math for the 4D
+# chunk-causal mask instead.
+FLOW_BF16 = os.environ.get("COSYVOICE3_FLOW_BF16", "0") == "1"
 
 
 def build_chunk_causal_mask(
@@ -177,6 +181,10 @@ class DiTAttention(nn.Module):
             q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
             query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
             key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+            # RoPE freqs are kept fp32 for position precision; realign q/k to v's
+            # dtype so attention and the KV cache stay uniform (no-op in fp32).
+            query = query.to(value.dtype)
+            key = key.to(value.dtype)
 
         # Reshape for attention: (batch, seq, heads, head_dim)
         query = query.view(batch_size, seq_len, self.heads, self.dim_head)
@@ -190,10 +198,22 @@ class DiTAttention(nn.Module):
                 key = torch.cat([cached_key, key], dim=1)
                 value = torch.cat([cached_value, value], dim=1)
 
-        # Use diffusion attention backend. On the fp32 flow this routes to SDPA,
-        # which consumes attn_metadata.attn_mask directly for a 4D mask.
-        attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
-        out = self.attn(query, key, value, attn_metadata=attn_metadata)
+        # On the fp32 flow the diffusion backend routes to SDPA, which consumes
+        # the 4D attn_mask directly. Under bf16 the dtype-routed backend would
+        # pick FlashAttention (2D-mask only), so call SDPA directly to keep the
+        # same masked-attention math. q/k/v are (batch, seq, heads, head_dim);
+        # SDPA wants (batch, heads, seq, head_dim).
+        if FLOW_BF16:
+            q = query.permute(0, 2, 1, 3)
+            k = key.permute(0, 2, 1, 3)
+            v = value.permute(0, 2, 1, 3)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False, scale=self.scale
+            )
+            out = out.permute(0, 2, 1, 3)
+        else:
+            attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
+            out = self.attn(query, key, value, attn_metadata=attn_metadata)
 
         # Reshape back: (batch, seq, dim). reshape, not view: an attention
         # backend may return a non-contiguous layout, which view rejects.

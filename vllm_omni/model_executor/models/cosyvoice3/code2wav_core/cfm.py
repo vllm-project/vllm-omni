@@ -22,6 +22,14 @@ logger = init_logger(__name__)
 # on; export COSYVOICE3_DIT_KV_CACHE=0 for the full-sequence path.
 KV_CACHE = os.environ.get("COSYVOICE3_DIT_KV_CACHE", "1") == "1"
 
+# Optional bf16 flow (A/B lever). When set, the DiT flow estimator, the Euler
+# solver's CFG input buffers, and the streaming KV cache run in bfloat16, while
+# the flow's input/output contract stays fp32 (mu/cond/spks in, mel out) and the
+# ODE state accumulates in fp32. RoPE frequency/position math is kept in fp32
+# (bf16 rounds absolute positions past ~256, corrupting long-sequence rotary
+# embeddings). Default off; export COSYVOICE3_FLOW_BF16=1 to enable.
+FLOW_BF16 = os.environ.get("COSYVOICE3_FLOW_BF16", "0") == "1"
+
 
 class DiTStreamCache:
     """Per-request incremental streaming state for the DiT flow decoder.
@@ -115,6 +123,21 @@ class ConditionalCFM(BASECFM):
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
 
+    def _maybe_cast_estimator(self):
+        """Cast the DiT estimator to bf16 once when COSYVOICE3_FLOW_BF16 is set.
+
+        RoPE frequency/position math is kept in fp32; the rest of the estimator
+        (projections, attention, FFN, norms, timestep MLP) runs in bf16.
+        """
+        if not FLOW_BF16 or getattr(self, "_flow_bf16_ready", False):
+            return
+        if isinstance(self.estimator, torch.nn.Module):
+            self.estimator.to(torch.bfloat16)
+            rotary = getattr(self.estimator, "rotary_embed", None)
+            if rotary is not None:
+                rotary.to(torch.float32)
+        self._flow_bf16_ready = True
+
     def solve_euler(self, x, t_span, mu, mask, spks, cond, stream_cache=None):
         """
         Fixed euler solver for ODEs.
@@ -132,6 +155,7 @@ class ConditionalCFM(BASECFM):
             stream_cache (DiTStreamCache, optional): when given, only the new
                 frames in ``x`` are denoised against the frozen prefix KV cache.
         """
+        self._maybe_cast_estimator()
         if stream_cache is not None:
             return self._solve_euler_streaming(x, t_span, mu, spks, cond, stream_cache)
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
@@ -142,12 +166,13 @@ class ConditionalCFM(BASECFM):
         # Do not use concat, it may cause memory format changed and trt infer with wrong results!
         # NOTE when flow run in amp mode, x.dtype is float32, which cause nan in trt fp16
         # inference, so set dtype=spks.dtype
-        x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
-        mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=spks.dtype)
-        mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
-        t_in = torch.zeros([2], device=x.device, dtype=spks.dtype)
-        spks_in = torch.zeros([2, 80], device=x.device, dtype=spks.dtype)
-        cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
+        compute_dtype = torch.bfloat16 if FLOW_BF16 else spks.dtype
+        x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=compute_dtype)
+        mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=compute_dtype)
+        mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=compute_dtype)
+        t_in = torch.zeros([2], device=x.device, dtype=compute_dtype)
+        spks_in = torch.zeros([2, 80], device=x.device, dtype=compute_dtype)
+        cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=compute_dtype)
         for step in range(1, len(t_span)):
             # Classifier-Free Guidance inference introduced in VoiceBox
             x_in[:] = x
@@ -178,10 +203,12 @@ class ConditionalCFM(BASECFM):
         are then appended to the caches. Returns the finalized new frames
         ``(1, n_feats, n_new)``.
         """
+        self._maybe_cast_estimator()
         estimator = self.estimator  # DiT
         offset = cache.finalized_len
         n_new = x.size(2)
-        device, dtype = x.device, spks.dtype
+        device = x.device
+        dtype = torch.bfloat16 if FLOW_BF16 else spks.dtype
         n_steps = len(t_span) - 1
 
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
