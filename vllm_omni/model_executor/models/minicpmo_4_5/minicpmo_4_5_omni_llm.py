@@ -1474,9 +1474,7 @@ class SiglipEncoder(nn.Module):
 
         hidden_states = inputs_embeds
         unpadding_metadata = (
-            _get_unpad_data(attention_mask)
-            if self._use_flash_attention_2 and attention_mask is not None
-            else None
+            _get_unpad_data(attention_mask) if self._use_flash_attention_2 and attention_mask is not None else None
         )
         for encoder_layer in self.layers:
             if output_hidden_states:
