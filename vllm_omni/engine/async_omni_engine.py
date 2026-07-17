@@ -269,6 +269,10 @@ class AsyncOmniEngine:
         self._omni_heartbeat_timeout: float = float(kwargs.get("omni_heartbeat_timeout") or 30.0)
         if self._omni_heartbeat_timeout <= 0:
             raise ValueError(f"--omni-heartbeat-timeout must be > 0, got {self._omni_heartbeat_timeout}")
+        # Concurrent same-device stage init (admission + SH/EX phase locks).
+        # Sourced from the parallel_stage_init orchestrator/CLI arg (config,
+        # not an env var); default False preserves serial init.
+        self._parallel_stage_init: bool = bool(kwargs.get("parallel_stage_init") or False)
 
         if single_stage_mode:
             logger.info(
@@ -368,6 +372,7 @@ class AsyncOmniEngine:
             diffusion_batch_size=self.diffusion_batch_size,
             async_chunk=self.async_chunk,
             tokenizer=self.tokenizer,
+            parallel_stage_init=self._parallel_stage_init,
             single_stage_id_filter=self._single_stage_id_filter,
             omni_master_address=self._omni_master_address,
             omni_master_port=self._omni_master_port,

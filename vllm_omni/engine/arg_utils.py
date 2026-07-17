@@ -421,6 +421,10 @@ class OrchestratorArgs:
     # === Lifecycle ===
     stage_init_timeout: int = 300
     init_timeout: int = 600
+    # Initialize stages sharing a physical GPU concurrently, guarded by
+    # pre-launch admission + engine-core SH/EX device locks. Off by default;
+    # enable only when the GPU is dedicated to this deployment.
+    parallel_stage_init: bool = False
 
     # === Cross-stage Communication ===
     shm_threshold_bytes: int = 65536

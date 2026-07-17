@@ -9,6 +9,7 @@ import concurrent.futures
 import copy
 import os
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -126,6 +127,7 @@ class StageRuntime:
         diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
+        parallel_stage_init: bool = False,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -134,6 +136,11 @@ class StageRuntime:
         self._diffusion_batch_size = diffusion_batch_size
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
+        # When True, same-device stages initialize concurrently, coordinated by
+        # pre-launch admission control + the engine-core-held SH/EX device locks
+        # (see VllmOmniOrchestratorConfig.parallel_stage_init). Default False
+        # keeps the legacy per-device LOCK_EX serialization.
+        self._parallel_stage_init = parallel_stage_init
         self._num_stages = len(stage_configs)
 
         # Populated by initialize()
@@ -444,6 +451,11 @@ class StageRuntime:
         init_state_lock = threading.Lock()
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
 
+        if self._parallel_stage_init:
+            # Prove every physical device's summed budget fits BEFORE any stage
+            # spawns. Fail fast here rather than OOM at allocation time.
+            self._run_stage_admission(stage_plans)
+
         init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
         for plan in stage_plans:
             for replica in plan.replicas:
@@ -500,8 +512,55 @@ class StageRuntime:
 
         return initialized_clients_by_stage
 
+    def _run_stage_admission(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+        """Pre-launch per-device admission for parallel stage init (fail-fast)."""
+        from vllm_omni.engine.stage_admission import check_admission
+
+        def _resolve(replica: ReplicaInitPlan) -> list[int] | None:
+            resolved = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
+            if not resolved:
+                return None
+            ids: list[int] = []
+            for tok in str(resolved).split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    ids.append(int(tok))
+                except ValueError:
+                    # Non-integer visibility (UUID / MIG) can't be reasoned about.
+                    return None
+            return ids or None
+
+        def _total_memory(device_id: int) -> int:
+            try:
+                mem = current_omni_platform.get_device_total_memory(device_id)
+                if mem:
+                    return int(mem)
+            except (NotImplementedError, AttributeError, TypeError):
+                pass
+            import torch
+
+            return int(torch.cuda.get_device_properties(device_id).total_memory)
+
+        check_admission(
+            stage_plans,
+            resolve_physical_devices=_resolve,
+            device_total_memory=_total_memory,
+        )
+
     def _replica_init_group_key(self, replica: ReplicaInitPlan) -> str:
-        """Return the scheduling group used during replica initialization."""
+        """Return the scheduling group used during replica initialization.
+
+        Replicas sharing a group initialize sequentially; different groups
+        initialize in parallel threads. Local LLM replicas are keyed by their
+        **resolved canonical physical device set** so stages on different
+        physical GPUs land in different groups (parallel) while stages sharing a
+        device stay in one group (serialized, then further guarded by the
+        per-device ``LOCK_EX`` file lock). Keying on the raw ``runtime.devices``
+        config value instead would fail to parallelize logically-distinct stages
+        that map to different physical GPUs.
+        """
         if replica.launch_mode == "local" and replica.metadata.stage_type == "diffusion":
             # Local diffusion process spawning must stay on the orchestrator
             # thread. Keep all local diffusion replicas in one sequential group.
@@ -509,9 +568,28 @@ class StageRuntime:
         if replica.launch_mode == "remote":
             return f"remote:{replica.metadata.stage_id}:{replica.replica_id}"
 
+        physical_devices = self._resolve_replica_physical_devices(
+            replica.metadata.stage_id,
+            replica.metadata.runtime_cfg,
+        )
+        if self._parallel_stage_init:
+            # Same-device concurrency is coordinated by the engine-core SH/EX
+            # device locks + pre-launch admission, so give every replica its own
+            # group to let them all initialize in parallel.
+            return f"parallel:{replica.metadata.stage_id}:{replica.replica_id}"
+
         runtime_cfg = replica.metadata.runtime_cfg or {}
-        devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-        return f"device:{devices}"
+        raw_devices = (
+            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
+        )
+        if str(raw_devices) != str(physical_devices):
+            logger.debug(
+                "[stage_init] Stage-%s init-group key: raw devices=%s -> resolved physical=%s",
+                replica.metadata.stage_id,
+                raw_devices,
+                physical_devices,
+            )
+        return f"device:{physical_devices}"
 
     def _initialize_replica(
         self,
@@ -560,28 +638,71 @@ class StageRuntime:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing executor_class")
             if plan.engine_args_dict is None:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing engine args")
-            with self._scoped_spawn_device_env(physical_devices):
-                lock_fds = acquire_device_locks(
+            # G3 device locks: in the default (serial) path the parent holds a
+            # per-device LOCK_EX across the whole child init. When parallel stage
+            # init is enabled the engine-core child takes phased SH/EX locks
+            # itself (see stage_phase_lock), so the parent must NOT also hold the
+            # lock here — it would self-deadlock while waiting for the child's
+            # READY handshake.
+            if not self._parallel_stage_init:
+                g3_start = time.perf_counter()
+                with self._scoped_spawn_device_env(physical_devices):
+                    lock_fds = acquire_device_locks(
+                        plan.metadata.stage_id,
+                        plan.engine_args_dict,
+                        stage_init_timeout,
+                    )
+                logger.debug(
+                    "[stage_init] Stage-%s G3 device-lock acquire took %.3fs",
                     plan.metadata.stage_id,
-                    plan.engine_args_dict,
-                    stage_init_timeout,
+                    time.perf_counter() - g3_start,
                 )
-            # Serialize engine-core spawning across all LLM replicas to avoid
-            # ZMQ port-allocation races and simultaneous CUDA context init.
-            with self._replica_launch_lock:
-                with launch_stage_replica(
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    log_stats=False,
-                    stage_id=plan.metadata.stage_id,
-                    replica_id=plan.replica_id,
-                    stage_config=plan.stage_cfg,
-                    omni_master_server=self._get_omni_master_server(),
-                    omni_coordinator_address=self._get_coordinator_address(),
-                    stage_visible_devices=physical_devices,
-                    spawn_device_lock=self._spawn_device_lock,
-                ) as resources:
-                    pass
+
+            launch_cm = launch_stage_replica(
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=False,
+                stage_id=plan.metadata.stage_id,
+                replica_id=plan.replica_id,
+                stage_config=plan.stage_cfg,
+                omni_master_server=self._get_omni_master_server(),
+                omni_coordinator_address=self._get_coordinator_address(),
+                stage_visible_devices=physical_devices,
+                spawn_device_lock=self._spawn_device_lock,
+                omni_parallel_stage_init=self._parallel_stage_init,
+            )
+            # G2 launch lock serializes engine-core *spawning* across replicas
+            # (ZMQ port-allocation races + simultaneous CUDA context init).
+            #   * Default path: hold it across the whole launch context manager,
+            #     whose __exit__ waits for READY — this serializes the full child
+            #     init (spawn + load + profile + KV + capture).
+            #   * Parallel path: hold it only around the spawn (__enter__); run
+            #     the READY-wait (__exit__) outside the lock so replicas init
+            #     concurrently, coordinated by the child SH/EX device locks.
+            if self._parallel_stage_init:
+                g2_start = time.perf_counter()
+                with self._replica_launch_lock:
+                    resources = launch_cm.__enter__()
+                g2_spawned = time.perf_counter()
+                launch_cm.__exit__(None, None, None)
+                logger.debug(
+                    "[stage_init] Stage-%s G2 spawn(locked)=%.3fs, READY(unlocked)=%.3fs",
+                    plan.metadata.stage_id,
+                    g2_spawned - g2_start,
+                    time.perf_counter() - g2_spawned,
+                )
+            else:
+                g2_start = time.perf_counter()
+                with self._replica_launch_lock:
+                    g2_locked = time.perf_counter()
+                    with launch_cm as resources:
+                        pass
+                logger.debug(
+                    "[stage_init] Stage-%s G2 launch-lock wait=%.3fs, spawn+READY=%.3fs",
+                    plan.metadata.stage_id,
+                    g2_locked - g2_start,
+                    time.perf_counter() - g2_locked,
+                )
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
             if resources is None:
@@ -747,6 +868,7 @@ class DistStageRuntime(StageRuntime):
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
         request_queue: janus.Queue[EngineQueueMessage] | None = None,
+        parallel_stage_init: bool = False,
     ) -> None:
         super().__init__(
             stage_configs=stage_configs,
@@ -756,6 +878,7 @@ class DistStageRuntime(StageRuntime):
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            parallel_stage_init=parallel_stage_init,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -1076,6 +1199,7 @@ def create_stage_runtime(
     diffusion_batch_size: int,
     async_chunk: bool,
     tokenizer: str | None = None,
+    parallel_stage_init: bool = False,
     # Distributed-only params:
     single_stage_id_filter: int | None = None,
     omni_master_address: str | None = None,
@@ -1097,6 +1221,7 @@ def create_stage_runtime(
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
+            parallel_stage_init=parallel_stage_init,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1113,4 +1238,5 @@ def create_stage_runtime(
         diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,
         tokenizer=tokenizer,
+        parallel_stage_init=parallel_stage_init,
     )

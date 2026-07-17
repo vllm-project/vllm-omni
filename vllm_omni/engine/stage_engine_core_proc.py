@@ -59,6 +59,7 @@ class StageEngineCoreProc(EngineCoreProc):
         omni_coordinator_address: str | None = None,
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
+        omni_parallel_stage_init: bool = False,
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process.
@@ -123,6 +124,33 @@ class StageEngineCoreProc(EngineCoreProc):
                 "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
                 _vllm_engine_core_module.EngineCoreRequest,
             )
+
+            # When parallel stage init is enabled, wrap this driver's executor
+            # so its memory-mutating phases (load / KV alloc / capture) hold a
+            # per-device LOCK_SH and its profiling measurement holds LOCK_EX.
+            # The wrapper must be installed here (in the engine-core child):
+            # phase boundaries live inside EngineCore.__init__, invisible to the
+            # orchestrator. See vllm_omni.engine.stage_phase_lock.
+            if omni_parallel_stage_init:
+                from vllm_omni.engine.stage_phase_lock import (
+                    DevicePhaseLock,
+                    wrap_executor_with_phase_locks,
+                )
+
+                vllm_config = kwargs.get("vllm_config")
+                executor_class = kwargs.get("executor_class")
+                if vllm_config is not None and executor_class is not None:
+                    locker = DevicePhaseLock.from_child(vllm_config, local_dp_rank)
+                    kwargs["executor_class"] = wrap_executor_with_phase_locks(executor_class, locker)
+                    logger.info(
+                        "[StageEngineCoreProc] parallel_stage_init: SH/EX phase locks on devices %s",
+                        locker.device_ids,
+                    )
+                else:
+                    logger.warning(
+                        "[StageEngineCoreProc] parallel_stage_init set but vllm_config/executor_class "
+                        "missing from kwargs; phase locks NOT installed."
+                    )
 
             engine_core = StageEngineCoreProc(
                 *args,

@@ -850,6 +850,16 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     return input_processor
 
 
+def device_init_lock_path(device_id: int, lock_dir: str = "/tmp") -> str:
+    """Return the per-physical-device initialization lock file path.
+
+    Shared by the orchestrator-side ``acquire_device_locks`` (legacy full-init
+    ``LOCK_EX``) and the engine-core-side ``DevicePhaseLock`` (parallel-stage-init
+    SH/EX phase locks) so both coordinate on the *same* file per device.
+    """
+    return os.path.join(lock_dir, f"vllm_omni_device_{device_id}_init.lock")
+
+
 def _cleanup_stale_lock_if_dead(lock_file: str) -> bool:
     """If *lock_file* exists and its recorded PID is dead, unlink the file.
 
@@ -965,7 +975,7 @@ def acquire_device_locks(
         # Acquire locks
         wait_start = time.time()
         for device_id in devices_to_lock:
-            lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+            lock_file = device_init_lock_path(device_id)
             lock_acquired = False
             already_cleaned_stale = False  # only try stale cleanup once per device
 
