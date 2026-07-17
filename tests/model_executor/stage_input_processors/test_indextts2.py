@@ -7,7 +7,6 @@ import torch
 
 from vllm_omni.model_executor.stage_input_processors.indextts2 import (
     _strip_stop_token,
-    talker2s2mel,
     talker2s2mel_full_payload,
     talker2s2mel_token_only,
 )
@@ -106,118 +105,6 @@ def test_strip_stop_token_all_stop():
     assert lens.tolist() == [0]
     assert c.shape[1] == 0
     assert lat.shape[1] == 0
-
-
-# ── talker2s2mel ──
-
-
-def test_talker2s2mel_basic():
-    mel_codes = torch.tensor([10, 20, 30, STOP_MEL_TOKEN])
-    latent = torch.randn(4, LATENT_DIM)
-    s_ref = torch.randn(1, 128)
-    ref_mel = torch.randn(1, 80, 200)
-    style = torch.randn(1, 256)
-
-    outputs = talker2s2mel(
-        source_outputs=[
-            _make_talker_output(
-                mel_codes=mel_codes,
-                latent=latent,
-                s_ref=s_ref,
-                ref_mel=ref_mel,
-                style=style,
-            )
-        ]
-    )
-
-    assert len(outputs) == 1
-    info = outputs[0]["additional_information"]
-    assert info["mel_codes"].shape == (1, 3)
-    assert info["latent"].shape == (1, 3, LATENT_DIM)
-    assert info["code_lens"].tolist() == [3]
-    assert "S_ref" in info
-    assert "ref_mel" in info
-    assert "style" in info
-    assert outputs[0]["prompt_token_ids"] == [0]
-
-
-def test_talker2s2mel_skips_unfinished():
-    mel_codes = torch.tensor([10, 20])
-    latent = torch.randn(2, LATENT_DIM)
-
-    outputs = talker2s2mel(source_outputs=[_make_talker_output(mel_codes=mel_codes, latent=latent, finished=False)])
-
-    assert len(outputs) == 0
-
-
-def test_talker2s2mel_skips_empty_mel():
-    outputs = talker2s2mel(
-        source_outputs=[
-            _make_talker_output(
-                mel_codes=torch.tensor([]),
-                latent=torch.randn(0, LATENT_DIM),
-            )
-        ]
-    )
-
-    assert len(outputs) == 0
-
-
-def test_talker2s2mel_missing_optional_meta():
-    mel_codes = torch.tensor([10, 20])
-    latent = torch.randn(2, LATENT_DIM)
-
-    outputs = talker2s2mel(source_outputs=[_make_talker_output(mel_codes=mel_codes, latent=latent)])
-
-    assert len(outputs) == 1
-    info = outputs[0]["additional_information"]
-    assert "S_ref" not in info
-    assert "ref_mel" not in info
-    assert "style" not in info
-
-
-def test_talker2s2mel_batch():
-    out0 = _make_talker_output(
-        mel_codes=torch.tensor([1, 2, STOP_MEL_TOKEN]),
-        latent=torch.randn(3, LATENT_DIM),
-        s_ref=torch.randn(1, 64),
-    )
-    out1 = _make_talker_output(
-        mel_codes=torch.tensor([5, 6, 7, 8]),
-        latent=torch.randn(4, LATENT_DIM),
-        ref_mel=torch.randn(1, 80, 100),
-    )
-
-    outputs = talker2s2mel(source_outputs=[out0, out1])
-
-    assert len(outputs) == 2
-    assert outputs[0]["additional_information"]["code_lens"].tolist() == [2]
-    assert outputs[1]["additional_information"]["code_lens"].tolist() == [4]
-
-
-def test_talker2s2mel_tensors_on_cpu():
-    device = torch.device("cpu")
-    mel_codes = torch.tensor([10, 20], device=device)
-    latent = torch.randn(2, LATENT_DIM, device=device)
-    s_ref = torch.randn(1, 64, device=device)
-
-    outputs = talker2s2mel(source_outputs=[_make_talker_output(mel_codes=mel_codes, latent=latent, s_ref=s_ref)])
-
-    info = outputs[0]["additional_information"]
-    assert info["latent"].device.type == "cpu"
-    assert info["mel_codes"].device.type == "cpu"
-    assert info["S_ref"].device.type == "cpu"
-
-
-def test_talker2s2mel_no_multimodal_dict():
-    output = SimpleNamespace(
-        finished=True,
-        outputs=[SimpleNamespace(multimodal_output="not_a_dict")],
-    )
-
-    results = talker2s2mel(source_outputs=[output])
-
-    assert len(results) == 0
 
 
 # ── full-payload connector path ──

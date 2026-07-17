@@ -331,7 +331,10 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         if ro and getattr(ro, "outputs", None):
             cot_text = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
         if not cot_text:
-            ar_text = getattr(out, "custom_output", {}).get("ar_generated_text")
+            multimodal_output = getattr(out, "multimodal_output", {}) or {}
+            metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
+            text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
+            ar_text = text_metadata.get("ar_generated_text") if isinstance(text_metadata, dict) else None
             if isinstance(ar_text, list):
                 cot_text = "\n".join(text for text in ar_text if text)
             else:

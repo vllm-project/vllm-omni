@@ -16,7 +16,34 @@ ROOT_DIR_RELATIVE = "../../../../.."
 EXAMPLE_DIR = ROOT_DIR / "examples"
 EXAMPLE_DOC_DIR = ROOT_DIR / "docs/user_guide/examples"
 NAV_FILE = ROOT_DIR / "docs/.nav.yml"
+MODEL_DISPLAY_NAMES_FILE = EXAMPLE_DIR / "model_display_names.yml"
 MAX_INLINE_MATERIAL_SIZE = 8 * 1024
+
+SERVING_MODE_TITLES = {
+    "offline_inference": "Offline inference",
+    "online_serving": "Online serving",
+}
+
+
+def load_model_display_names() -> dict[str, str]:
+    try:
+        with open(MODEL_DISPLAY_NAMES_FILE, encoding="utf-8") as f:
+            model_display_names = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"Failed to load MODEL_DISPLAY_NAMES_FILE at {MODEL_DISPLAY_NAMES_FILE}: {exc}") from exc
+
+    if not isinstance(model_display_names, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in model_display_names.items()
+    ):
+        raise ValueError(
+            "MODEL_DISPLAY_NAMES_FILE "
+            f"at {MODEL_DISPLAY_NAMES_FILE} must contain a YAML mapping "
+            "of string model IDs to string display names"
+        )
+    return model_display_names
+
+
+MODEL_DISPLAY_NAMES = load_model_display_names()
 
 
 def fix_case(text: str) -> str:
@@ -54,6 +81,7 @@ class Example:
         main_file (Path): The main file in the directory.
         other_files (list[Path]): list of other files in the directory.
         title (str): The title of the document.
+        nav_title (str): The concise title used in navigation.
 
     Methods:
         __post_init__(): Initializes the main_file, other_files, and title attributes.
@@ -77,6 +105,16 @@ class Example:
     @property
     def is_code(self) -> bool:
         return self.main_file.suffix != ".md"
+
+    @property
+    def model_display_name(self) -> str | None:
+        if self.category not in SERVING_MODE_TITLES:
+            return None
+        return MODEL_DISPLAY_NAMES.get(self.path.stem)
+
+    @property
+    def nav_title(self) -> str:
+        return self.model_display_name or self.title
 
     def determine_main_file(self) -> Path:
         """
@@ -151,13 +189,25 @@ class Example:
         return [file for file in self.path.rglob("*") if is_other_file(file)]
 
     def determine_title(self) -> str:
+        model_display_name = self.model_display_name
         if not self.is_code:
             # Specify encoding for building on Windows
             with open(self.main_file, encoding="utf-8") as f:
                 first_line = f.readline().strip()
             match = re.match(r"^#\s+(?P<title>.+)$", first_line)
+            if model_display_name:
+                expected_title = f"{model_display_name}: {SERVING_MODE_TITLES[self.category]}"
+                actual_title = match.group("title") if match else first_line
+                if actual_title != expected_title:
+                    raise ValueError(
+                        f"Model example title mismatch in {self.main_file}: "
+                        f"expected '# {expected_title}', got {first_line!r}"
+                    )
+                return expected_title
             if match:
                 return match.group("title")
+        elif model_display_name:
+            raise ValueError(f"Mapped model example must use a Markdown README: {self.path}")
         return fix_case(self.path.stem.replace("_", " ").title())
 
     def fix_relative_links(self, content: str) -> str:
@@ -300,7 +350,7 @@ def update_nav_file(examples: list[Example]):
         for example in category_examples:
             doc_path = EXAMPLE_DOC_DIR / example.category / f"{example.path.stem}.md"
             rel_path = doc_path.relative_to(ROOT_DIR / "docs")
-            category_items.append({example.title: rel_path.as_posix()})
+            category_items.append({example.nav_title: rel_path.as_posix()})
 
         if category_items:
             # Format category name (e.g., "offline_inference" -> "Offline Inference")

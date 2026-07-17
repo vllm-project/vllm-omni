@@ -20,6 +20,16 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def test_pipeline_declares_layerwise_offload_components() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    assert Cosmos3OmniDiffusersPipeline._dit_modules == ["transformer.language_model", "transformer"]
+    assert Cosmos3OmniDiffusersPipeline._encoder_modules == []
+    assert Cosmos3OmniDiffusersPipeline._vae_modules == ["vae"]
+    assert Cosmos3OmniDiffusersPipeline._resident_modules == []
+    assert hasattr(Cosmos3OmniDiffusersPipeline, "enable_omni_model_cpu_offload")
+
+
 class StubScheduler:
     def __init__(
         self,
@@ -284,7 +294,6 @@ def test_pipeline_registered_and_exported() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
     from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
     from vllm_omni.diffusion.registry import (
-        _DIFFUSION_ACTION_POST_PROCESS_FUNCS,
         _DIFFUSION_IR_OP_PRIORITY_FUNCS,
         _DIFFUSION_MODELS,
         _DIFFUSION_POST_PROCESS_FUNCS,
@@ -301,9 +310,6 @@ def test_pipeline_registered_and_exported() -> None:
     )
     assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_pre_process_func"
     assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_post_process_func"
-    assert (
-        _DIFFUSION_ACTION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_action_post_process_func"
-    )
     assert _DIFFUSION_IR_OP_PRIORITY_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_ir_op_priority_func"
     assert "Cosmos3OmniDiffusersPipeline" in CUSTOM_DIT_ENABLERS
     assert "Cosmos3OmniDiffusersPipeline" in cosmos3.__all__
@@ -708,11 +714,11 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
 def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         RoboLabPolicyInputs,
-        get_cosmos3_action_post_process_func,
+        get_cosmos3_post_process_func,
         make_robolab_action_postprocess_inputs,
     )
 
-    func = get_cosmos3_action_post_process_func(SimpleNamespace())
+    func = get_cosmos3_post_process_func(SimpleNamespace())
     inputs = RoboLabPolicyInputs(
         prompt="Pick the cube.",
         video_tensor=torch.zeros(1, 3, 3, 16, 16),
@@ -736,13 +742,41 @@ def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     )
 
     action = torch.tensor([[[0.0, 0.25], [1.0, 0.75]]])
-    custom_output = {"robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs)}
-    processed = func(action, custom_output=custom_output)
+    processed = func(
+        {
+            "payload": {
+                "actions": action,
+            },
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+                "common": {
+                    "action_only_output": True,
+                },
+                "internal": {
+                    "robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs),
+                },
+            },
+        }
+    )
 
-    assert processed.shape == (1, 2)
-    assert processed.dtype == torch.zeros((), dtype=torch.float32).numpy().dtype
-    torch.testing.assert_close(torch.from_numpy(processed), torch.tensor([[1.0, 0.25]]))
-    assert "robolab_action_postprocess" not in custom_output
+    processed_action = processed["payload"]["actions"]
+    assert processed_action.shape == (1, 2)
+    assert processed_action.dtype == torch.zeros((), dtype=torch.float32).numpy().dtype
+    torch.testing.assert_close(torch.from_numpy(processed_action), torch.tensor([[1.0, 0.25]]))
+    assert processed["metadata"] == {
+        "actions": {
+            "raw_action_dim": 2,
+            "action_mode": "policy",
+            "domain_id": 7,
+        },
+        "common": {
+            "action_only_output": True,
+        },
+    }
 
 
 def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1198,8 +1232,8 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     assert captured["flow_shifts"] == [10.0]
     # Transfer uses the V2V flow-sigma schedule (karras off) so flow_shift applies.
     assert captured["scheduler_use_karras_sigmas"] == [False]
-    assert output.custom_output["fps"] == expected_fps
-    assert output.output["video"].device.type == "meta"
+    assert output.output["metadata"]["video"]["fps"] == expected_fps
+    assert output.output["payload"]["video"].device.type == "meta"
 
 
 def test_forward_transfer_runs_multichunk_overlap_path(
@@ -1268,12 +1302,12 @@ def test_forward_transfer_runs_multichunk_overlap_path(
 
     assert captured["conditional_frames"] == [2, 1]
     assert len(captured["decode_calls"]) == 2
-    assert output.output["video"].shape == (1, 3, 8, 16, 16)
+    assert output.output["payload"]["video"].shape == (1, 3, 8, 16, 16)
     torch.testing.assert_close(
-        output.output["video"][0, 0, :, 0, 0],
+        output.output["payload"]["video"][0, 0, :, 0, 0],
         torch.tensor([-0.6, -0.5, -0.4, -0.3, -0.2, 0.2, 0.3, 0.4]),
     )
-    assert output.custom_output["transfer_controls"]["edge"].shape == (1, 3, 8, 16, 16)
+    assert output.output["metadata"]["transfer"]["controls"]["edge"].shape == (1, 3, 8, 16, 16)
     torch.testing.assert_close(captured["targets"][0][:, :, 0], torch.full((1, 3, 16, 16), -1.0))
     torch.testing.assert_close(captured["targets"][0][:, :, 1], torch.full((1, 3, 16, 16), 1.0))
     torch.testing.assert_close(captured["targets"][0][:, :, 2:], torch.full((1, 3, 3, 16, 16), 1.0))
@@ -1497,8 +1531,13 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
-        assert output.custom_output["action"].shape == (1, 2, 2)
-        assert "action_only_output" not in output.custom_output
+        assert output.output["payload"]["actions"].shape == (1, 2, 2)
+        assert output.output["metadata"]["actions"] == {
+            "raw_action_dim": 2,
+            "action_mode": "policy",
+            "domain_id": 7,
+        }
+        assert "common" not in output.output["metadata"]
 
     def test_forward_dispatches_robolab_policy_flow(
         self,
@@ -1582,12 +1621,15 @@ class TestForwardRouting:
         assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
-        assert output.output == {}
-        assert output.custom_output["action_only_output"] is True
-        assert output.custom_output["action"].shape == (1, 2, 2)
-        assert "actions" not in output.custom_output
-        assert "robolab_action_postprocess" in output.custom_output
-        assert "robolab_policy_inputs" not in output.custom_output
+        assert output.output["payload"]["actions"].shape == (1, 2, 2)
+        assert output.output["metadata"]["actions"] == {
+            "raw_action_dim": 2,
+            "action_mode": "policy",
+            "domain_id": 7,
+        }
+        assert output.output["metadata"]["common"]["action_only_output"] is True
+        assert "robolab_action_postprocess" in output.output["metadata"]["internal"]
+        assert "robolab_policy_inputs" not in output.output["metadata"]
 
     @pytest.mark.parametrize(
         ("prompt", "sampling_params", "message"),

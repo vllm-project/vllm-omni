@@ -13,12 +13,33 @@ container_name="xpu_${BUILDKITE_COMMIT}_$(
 )"
 
 cd "${omni_source_dir}"
+
+# The XPU base image is ~37GB; the default gzip layer exporter is single-threaded
+# and takes ~16min to compress it. zstd is multi-threaded (uses all cores) at a
+# similar ratio; set EXPORT_COMPRESSION=uncompressed to skip compression entirely
+# for local-only images. This requires the containerd image store (buildx docker
+# driver), which is the default here.
+EXPORT_COMPRESSION="${EXPORT_COMPRESSION:-zstd}"
+if [ "${EXPORT_COMPRESSION}" = "uncompressed" ]; then
+    export_args=(--output "type=image,name={{IMAGE}},compression=uncompressed")
+else
+    export_args=(--output "type=image,name={{IMAGE}},compression=${EXPORT_COMPRESSION},compression-level=3,force-compression=true")
+fi
+
+docker_build() {
+    # $1 = image name; remaining args passed through to docker build.
+    local image="$1"
+    shift
+    local out=("${export_args[@]/'{{IMAGE}}'/${image}}")
+    docker build "${out[@]}" "$@" -f docker/Dockerfile.xpu .
+}
+
 if [ -z "$(docker images -q "${base_image_name}")" ]; then
-    docker build --target vllm-base -t "${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}" -f docker/Dockerfile.xpu .
+    docker_build "${base_image_name}" --target vllm-base --build-arg "VLLM_VERSION=${VLLM_VERSION}"
 fi
 
 # Try building the docker image
-docker build --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}" -t "${image_name}" -f docker/Dockerfile.xpu .
+docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
 
 # Setup cleanup
 remove_docker_container() {
