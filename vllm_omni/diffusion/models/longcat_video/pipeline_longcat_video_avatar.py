@@ -639,7 +639,10 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
-        device = torch.device(args[0]) if args else torch.device(kwargs.get("device", self.device))
+        # .to() is overloaded (device / dtype / tensor); only treat args[0] as
+        # a device when it actually is one, otherwise keep self.device.
+        candidate = kwargs.get("device", args[0] if args else None)
+        device = torch.device(candidate) if isinstance(candidate, (str, torch.device, int)) else self.device
         self.device = device
         for name in ("text_encoder", "vae", "transformer", "audio_encoder"):
             module = getattr(self, name, None)

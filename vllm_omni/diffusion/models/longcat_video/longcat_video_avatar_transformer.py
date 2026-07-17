@@ -132,7 +132,7 @@ class PatchEmbed3D(nn.Module):
 
 
 def modulate_fp32(norm_func, x, shift, scale):
-    assert shift.dtype == torch.float32, scale.dtype == torch.float32
+    assert shift.dtype == torch.float32 and scale.dtype == torch.float32
     dtype = x.dtype
     x = norm_func(x.to(torch.float32))
     x = x * (scale + 1) + shift
@@ -1642,6 +1642,8 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            if name not in params_dict:
+                continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
