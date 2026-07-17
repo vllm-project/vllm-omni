@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     _scheduler_path,
     _select_processor_funcs,
     build_stage_runtime_overrides,
+    get_default_async_chunk_enabled,
     load_deploy_config,
 )
 
@@ -177,21 +178,6 @@ def _first_defined(*values: Any) -> Any:
         if value is not None:
             return _copy_value(value)
     return None
-
-
-def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
-    has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
-    if (
-        deploy.async_chunk
-        and has_inter_stage_edges
-        and not any(stage.async_chunk_process_next_stage_input_func for stage in pipeline.stages)
-    ):
-        raise ValueError(
-            f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a dedicated async-chunk next-stage processor "
-            "(``async_chunk_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
-        )
 
 
 def _resolve_execution_mode(execution_type: StageExecutionType) -> tuple[StageType, str | None]:
@@ -1255,22 +1241,22 @@ class VllmOmniConfig:
                 f"Pipeline {pipeline_key!r} did not resolve to a concrete PipelineConfig without an HF config"
             )
 
-        deploy_for_registry = copy.deepcopy(deploy)
-        if cli_overrides.get("async_chunk") is not None:
-            deploy_for_registry.async_chunk = bool(cli_overrides["async_chunk"])
+        if "async_chunk" in cli_overrides:
+            deploy.async_chunk = bool(cli_overrides["async_chunk"])
+
         for name in _PIPELINE_DEPLOY_CLI_FIELDS:
             if cli_overrides.get(name) is not None:
-                setattr(deploy_for_registry, name, _copy_value(cli_overrides[name]))
+                setattr(deploy, name, _copy_value(cli_overrides[name]))
 
-        deploy_for_registry = _apply_platform_overrides(deploy_for_registry)
-        _validate_async_chunk_support(pipeline, deploy_for_registry)
-        deploy_by_id = {stage.stage_id: stage for stage in deploy_for_registry.stages}
+        deploy = _apply_platform_overrides(deploy)
+        deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        deploy.async_chunk = get_default_async_chunk_enabled(pipeline, deploy)
         model = cli_overrides.get("model")
 
         stage_configs = tuple(
             _build_stage_config(
                 pipeline,
-                deploy_for_registry,
+                deploy,
                 topology,
                 deploy_by_id.get(topology.stage_id),
                 _stage_engine_values(

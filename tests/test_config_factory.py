@@ -2094,14 +2094,10 @@ class TestSentinelDefaultPrecedence:
         assert stage1.sync_process_input_func is not None
         assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
 
-        # async_chunk=True must now be rejected: removing the fake hook means
-        # there is no next-stage input processor for the validator to accept.
-        # (Positive consequence -- users can't accidentally enable async_chunk
-        # on an arch that doesn't actually support it.)
-        import pytest as _pytest
-
-        with _pytest.raises(ValueError, match="async_chunk=True"):
-            merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+        # ensure merging the pipeline deploy with async chunk set to True disables it,
+        # since currently it is not supported for this pipeline.
+        stage_configs = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+        assert all([not stg_cfg.yaml_engine_args["async_chunk"] for stg_cfg in stage_configs])
 
         # async_chunk=False merges cleanly and stage-0 yaml_engine_args carries
         # no spurious full-payload hook.
@@ -2142,3 +2138,71 @@ class TestPipelineConfigResolvers:
             pass
 
         assert resolver(NotTheRightHfConfig()) is None
+
+
+class TestAsyncChunkDefaults:
+    def test_async_chunk_auto_disabled_without_processor(self):
+        """Ensure a multi-stage model that doesn't support async chunk turns it off by default."""
+        pipeline = PipelineConfig(
+            model_type="test_no_async",
+            model_arch="TestNoAsync",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                    final_output=True,
+                ),
+                StagePipelineConfig(
+                    stage_id=1,
+                    model_stage="generation",
+                    execution_type=StageExecutionType.LLM_GENERATION,
+                    input_sources=(0,),
+                ),
+            ),
+        )
+
+        deploy = DeployConfig()
+        # async chunk should not try to default to True in this case,
+        # since doing so will just raise a ValueError in validation.
+        merge_pipeline_deploy(pipeline, deploy)
+        assert not deploy.async_chunk
+
+    def test_async_chunk_auto_disabled_when_yaml_omits_key(self, tmp_path):
+        """Ensure a multi-stage model that doesn't support async chunk turns it off by default
+        when a deploy config is provided that doesn't explicitly set it."""
+
+        deploy_path = tmp_path / "no_async_chunk.yaml"
+        deploy_path.write_text(
+            """
+stages:
+  - stage_id: 0
+    devices: "0"
+  - stage_id: 1
+    devices: "0"
+""",
+            encoding="utf-8",
+        )
+        deploy = load_deploy_config(deploy_path)
+
+        pipeline = PipelineConfig(
+            model_type="test_no_async",
+            model_arch="TestNoAsync",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                    final_output=True,
+                ),
+                StagePipelineConfig(
+                    stage_id=1,
+                    model_stage="generation",
+                    execution_type=StageExecutionType.LLM_GENERATION,
+                    input_sources=(0,),
+                ),
+            ),
+        )
+
+        merge_pipeline_deploy(pipeline, deploy)
+        assert not deploy.async_chunk

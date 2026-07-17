@@ -366,7 +366,7 @@ class StageConfigFactory:
         if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
 
-        stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
+        stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg)
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
         applied = cls._apply_strategy_specs(stages, strategy_specs)
