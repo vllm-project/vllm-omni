@@ -1,0 +1,59 @@
+# Benchmark-only MiniCPM-o 4.5 layout for a single 96 GiB GPU with stage-0
+# torch memory profiling enabled. Profiling adds substantial overhead and is
+# not intended for production serving.
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_model_len: 4096
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.60
+    enforce_eager: true
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 16384
+    devices: "0"
+    limit_mm_per_prompt:
+      image: 1
+      audio: 1
+      video: 1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: ./results/profiles
+      torch_profiler_use_gzip: true
+      torch_profiler_record_shapes: true
+      torch_profiler_with_stack: true
+      torch_profiler_with_memory: true
+      torch_profiler_with_flops: false
+      torch_profiler_dump_cuda_time_total: true
+      delay_iterations: 0
+      max_iterations: 0
+      wait_iterations: 0
+      warmup_iterations: 0
+      active_iterations: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 128
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.20
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+platforms: {}
