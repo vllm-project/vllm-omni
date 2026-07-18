@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from time import time
 from typing import Any
@@ -535,23 +536,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
 
         # [Omni] Cleanup state for finished requests
-        for req in stopped_running_reqs:
+        for req in stopped_running_reqs | stopped_preempted_reqs:
             if req.request_id not in self.waiting_for_transfer_free:
-                if req.request_id in self.transfer_triggered_requests:
-                    self.transfer_triggered_requests.remove(req.request_id)
-                if req.request_id in self.active_kv_transfers:
-                    self.active_kv_transfers.remove(req.request_id)
+                self.transfer_triggered_requests.discard(req.request_id)
+                self.active_kv_transfers.discard(req.request_id)
                 self.pending_stop_after_extraction.discard(req.request_id)
-
-        # Same for preempted
-        for req in stopped_preempted_reqs:
-            if req.request_id not in self.waiting_for_transfer_free:
-                if req.request_id in self.transfer_triggered_requests:
-                    self.transfer_triggered_requests.remove(req.request_id)
-                if req.request_id in self.active_kv_transfers:
-                    self.active_kv_transfers.remove(req.request_id)
-                self.pending_stop_after_extraction.discard(req.request_id)
-
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
@@ -629,15 +618,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     if req_id in self.waiting_for_transfer_free:
                         req = self.requests.get(req_id)
                         if req:
-                            self.kv_cache_manager.free(req)
-                            if req_id in self.requests:
-                                del self.requests[req_id]
-                            if req_id in self.transfer_triggered_requests:
-                                self.transfer_triggered_requests.remove(req_id)
+                            self._free_blocks(req)
+                            self.transfer_triggered_requests.discard(req_id)
                             self.active_kv_transfers.discard(req_id)
                             self.pending_stop_after_extraction.discard(req_id)
                             logger.debug(f"Freed blocks for {req_id} after transfer extraction")
-                        self.waiting_for_transfer_free.remove(req_id)
+                        self.waiting_for_transfer_free.discard(req_id)
                 except Exception:
                     init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
 
@@ -823,11 +809,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finally:
             self._free_input_coordinator_request(request_id)
 
-    def _free_blocks(self, request: Request):
-        # Helper to match base class structure if not directly available
-        # VLLMScheduler has _free_blocks
-        super()._free_blocks(request)
-
     def _mark_request_for_kv_transfer(self, req_id: str, seq_len: int) -> None:
         """Mark a request as needing KV cache transfer when it finishes."""
         # Avoid duplicate marking (if already pending in queue)
@@ -911,6 +892,56 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free:
             return True
         return super().has_unfinished_requests()
+
+    def finish_requests(
+        self,
+        request_ids: str | Iterable[str] | None,
+        finished_status: RequestStatus,
+    ) -> list[tuple[str, int]]:
+        """Override to clean up KV transfer tracking sets on abort.
+
+        Without this, an aborted request with an active KV transfer
+        leaves stale entries in tracking sets, causing
+        has_unfinished_requests() to return True forever and the
+        engine loop to spin indefinitely.
+
+        We capture the requested IDs before calling super() because
+        the base class skips already-finished requests.  With the
+        deferred-stop flow (pending_stop_after_extraction) most
+        aborted requests are still RUNNING and will be processed by
+        super(), but if a request finished naturally (EOS/max_tokens)
+        while extraction was active, it is already FINISHED_STOPPED
+        in waiting_for_transfer_free and the base class skips it.
+        The post-super cleanup must run for those skipped IDs too,
+        and also free their held KV blocks.
+        """
+        if isinstance(request_ids, str):
+            ids_to_clean: set[str] = {request_ids}
+        elif request_ids is not None:
+            ids_to_clean = set(request_ids)
+        else:
+            ids_to_clean = set(self.requests.keys())
+
+        result = super().finish_requests(request_ids, finished_status)
+
+        for req_id in ids_to_clean:
+            blocks_held_for_transfer = req_id in self.waiting_for_transfer_free
+            self.requests_needing_kv_transfer.pop(req_id, None)
+            self.active_kv_transfers.discard(req_id)
+            self.transfer_triggered_requests.discard(req_id)
+            self.waiting_for_transfer_free.discard(req_id)
+            self.pending_stop_after_extraction.discard(req_id)
+            self._omits_kv_transfer_cache.pop(req_id, None)
+
+            # Blocks in waiting_for_transfer_free are held until the
+            # model runner sends an extraction ack.  An aborted request
+            # will never receive that ack, so free the blocks now.
+            if blocks_held_for_transfer:
+                req = self.requests.get(req_id)
+                if req is not None and req.is_finished():
+                    self._free_blocks(req)
+
+        return result
 
     def get_finished_requests_needing_kv_transfer(self) -> dict[str, dict]:
         """Get and clear the list of requests needing KV cache transfer.
