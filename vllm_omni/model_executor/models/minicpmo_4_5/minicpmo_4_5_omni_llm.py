@@ -4051,16 +4051,29 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         for i, num_patches_item in enumerate(num_patches):
             patch_attn_mask[i, :num_patches_item] = True
 
-        vision_embedding = self.vpm(
-            all_pixel_values,
-            patch_attention_mask=patch_attn_mask.unsqueeze(1),
-            tgt_sizes=tgt_sizes,
-        )
+        patch_attn_mask = patch_attn_mask.unsqueeze(1)
 
-        if not isinstance(vision_embedding, torch.Tensor):
-            vision_embedding = vision_embedding.last_hidden_state
+        def encode_vision(start: int, end: int) -> torch.Tensor:
+            chunk_tgt_sizes = tgt_sizes[start:end]
+            vision_embedding = self.vpm(
+                all_pixel_values[start:end],
+                patch_attention_mask=patch_attn_mask[start:end],
+                tgt_sizes=chunk_tgt_sizes,
+            )
 
-        return self.resampler(vision_embedding, tgt_sizes)
+            if not isinstance(vision_embedding, torch.Tensor):
+                vision_embedding = vision_embedding.last_hidden_state
+
+            return vision_embedding
+
+        vision_batch_size = self.config.vision_batch_size
+        if B <= vision_batch_size:
+            return self.resampler(encode_vision(0, B), tgt_sizes)
+
+        vision_embeddings = [
+            encode_vision(start, min(start + vision_batch_size, B)) for start in range(0, B, vision_batch_size)
+        ]
+        return self.resampler(torch.cat(vision_embeddings, dim=0), tgt_sizes)
 
     def _process_vision_input(
         self,
@@ -4177,9 +4190,17 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
         audio_attention_mask[audio_attention_mask_] = float("-inf")
-        audio_states = self.apm(wavforms, attention_mask=audio_attention_mask, output_hidden_states=True).hidden_states[
-            self.audio_encoder_layer
-        ]
+        output_hidden_states = self.audio_encoder_layer != -1
+        audio_outputs = self.apm(
+            wavforms,
+            attention_mask=audio_attention_mask,
+            output_hidden_states=output_hidden_states,
+        )
+        audio_states = (
+            audio_outputs.hidden_states[self.audio_encoder_layer]
+            if output_hidden_states
+            else audio_outputs.last_hidden_state
+        )
         audio_embeds = self.audio_projection_layer(audio_states)
 
         audio_embeds = audio_embeds.transpose(1, 2)
