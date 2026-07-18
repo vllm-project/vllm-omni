@@ -81,8 +81,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
 
-        # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
+        try:
+            processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
+        except Exception:
+            # _launch_workers already terminated the worker processes; clean up
+            # the broadcast MessageQueue/ZMQ/shm resources that were allocated
+            # before the launch attempt.
+            try:
+                self._broadcast_mq = None
+            except Exception:
+                pass
+            raise
+
         self._result_mq = self._init_result_queue(result_handle)
         self._processes = processes
 
@@ -226,23 +236,44 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for writer in scheduler_pipe_writers:
             writer.close()
 
-        for i, reader in enumerate(scheduler_pipe_readers):
-            try:
-                data = reader.recv()
-            except EOFError:
-                logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
-                processes[i].join()
-                logger.error(f"Exit code: {processes[i].exitcode}")
-                raise
+        try:
+            for i, reader in enumerate(scheduler_pipe_readers):
+                try:
+                    data = reader.recv()
+                except EOFError:
+                    logger.error(
+                        "Rank %d scheduler is dead. Please check if there are relevant logs.", i
+                    )
+                    processes[i].join(timeout=10)
+                    logger.error("Exit code: %s", processes[i].exitcode)
+                    raise
 
-            if data["status"] != "ready":
-                raise RuntimeError("Initialization failed. Please see the error messages above.")
+                if data["status"] != "ready":
+                    raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-            if i == 0:
-                result_handle = data.get("result_handle")
+                if i == 0:
+                    result_handle = data.get("result_handle")
 
-            scheduler_infos.append(data)
-            reader.close()
+                scheduler_infos.append(data)
+                reader.close()
+        except Exception:
+            # Close any pipe readers not yet consumed to avoid FD leaks.
+            for reader in scheduler_pipe_readers:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+            # Terminate all already-started workers so they don't leak GPU memory.
+            for j, proc in enumerate(processes):
+                if proc.is_alive():
+                    logger.warning("Terminating DiffusionWorker-%d after init failure", j)
+                    proc.terminate()
+            for proc in processes:
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=5)
+            raise
 
         logger.debug("All workers are ready")
 
