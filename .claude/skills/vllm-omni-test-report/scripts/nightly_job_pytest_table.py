@@ -166,8 +166,14 @@ def http_text_tail(
     raise last_err
 
 
-def resolve_latest_scheduled_nightly_number(token: str) -> int | None:
-    url = f"https://api.buildkite.com/v2/organizations/{ORG}/pipelines/{PIPELINE}/builds?branch={BRANCH}&per_page=50"
+def resolve_latest_scheduled_nightly_number(
+    token: str,
+    *,
+    org: str = ORG,
+    pipeline: str = PIPELINE,
+    branch: str = BRANCH,
+) -> int | None:
+    url = f"https://api.buildkite.com/v2/organizations/{org}/pipelines/{pipeline}/builds?branch={branch}&per_page=50"
     builds = http_json(url, token)
     for b in builds:
         if re.search(r"scheduled\s+nightly", b.get("message") or "", re.I):
@@ -175,26 +181,45 @@ def resolve_latest_scheduled_nightly_number(token: str) -> int | None:
     return None
 
 
-def latest_scheduled_nightly_number(token: str) -> int:
-    n = resolve_latest_scheduled_nightly_number(token)
+def latest_scheduled_nightly_number(
+    token: str,
+    *,
+    org: str = ORG,
+    pipeline: str = PIPELINE,
+    branch: str = BRANCH,
+) -> int:
+    n = resolve_latest_scheduled_nightly_number(token, org=org, pipeline=pipeline, branch=branch)
     if n is None:
-        sys.exit("No scheduled nightly build found on main (per_page=50).")
+        sys.exit(f"No scheduled nightly build found on {org}/{pipeline} (branch={branch}, per_page=50).")
     return n
 
 
-def fetch_nightly_build(token: str, build_number: int | None) -> dict[str, Any]:
+def fetch_nightly_build(
+    token: str,
+    build_number: int | None,
+    *,
+    org: str = ORG,
+    pipeline: str = PIPELINE,
+    branch: str = BRANCH,
+) -> dict[str, Any]:
     """Load build JSON; ``build_number=None`` = latest scheduled nightly on ``main``."""
     if build_number is None:
-        n = resolve_latest_scheduled_nightly_number(token)
+        n = resolve_latest_scheduled_nightly_number(token, org=org, pipeline=pipeline, branch=branch)
         if n is None:
-            raise RuntimeError("No scheduled nightly build found on main (per_page=50).")
+            raise RuntimeError(f"No scheduled nightly build found on {org}/{pipeline} (branch={branch}, per_page=50).")
     else:
         n = build_number
-    url = f"https://api.buildkite.com/v2/organizations/{ORG}/pipelines/{PIPELINE}/builds/{n}"
+    url = f"https://api.buildkite.com/v2/organizations/{org}/pipelines/{pipeline}/builds/{n}"
     return http_json(url, token)
 
 
-def collect_nightly_job_log_analyses(build: dict[str, Any], token: str) -> list[dict[str, Any]]:
+def collect_nightly_job_log_analyses(
+    build: dict[str, Any],
+    token: str,
+    *,
+    org: str = ORG,
+    pipeline: str = PIPELINE,
+) -> list[dict[str, Any]]:
     """
     One record per reportable job: name, state, step_link, raw_url,
     info (``parse_pytest_log`` output) or log_error.
@@ -210,7 +235,7 @@ def collect_nightly_job_log_analyses(build: dict[str, Any], token: str) -> list[
         jid = j.get("id") or ""
         name = j.get("name") or ""
         state = j.get("state") or ""
-        link = job_anchor(build_no, jid)
+        link = job_anchor(build_no, jid, org=org, pipeline=pipeline)
         raw_url = j.get("raw_log_url") or j.get("log_url")
         rec: dict[str, Any] = {
             "name": name,
@@ -242,8 +267,14 @@ def should_skip_job(name: str) -> bool:
     return any(r.match(n) for r in SKIP_NON_PYTEST_JOB_RES)
 
 
-def job_anchor(build_no: int, job_id: str) -> str:
-    return f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{build_no}#{job_id}"
+def job_anchor(
+    build_no: int,
+    job_id: str,
+    *,
+    org: str = ORG,
+    pipeline: str = PIPELINE,
+) -> str:
+    return f"https://buildkite.com/{org}/{pipeline}/builds/{build_no}#{job_id}"
 
 
 def md_cell(s: str) -> str:
@@ -344,9 +375,9 @@ def append_markdown_rows_for_nightly_job(rows: list[list[str]], rec: dict[str, A
         )
 
 
-def emit_markdown(build: dict[str, Any], token: str) -> None:
+def emit_markdown(build: dict[str, Any], token: str, *, org: str = ORG, pipeline: str = PIPELINE) -> None:
     rows: list[list[str]] = []
-    for rec in collect_nightly_job_log_analyses(build, token):
+    for rec in collect_nightly_job_log_analyses(build, token, org=org, pipeline=pipeline):
         append_markdown_rows_for_nightly_job(rows, rec)
     print("## Per-job test execution (pytest)")
     print()

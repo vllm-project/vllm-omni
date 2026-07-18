@@ -5,10 +5,12 @@ Prepare the vllm-omni-kanban checkout before generating a nightly/release HTML r
 Workflow (run from ``skills/vllm-omni-test-report/`` after log sync):
 
 1. ``git pull --rebase`` on the local https://github.com/hsliuustc0106/vllm-omni-kanban clone.
-2. When ``$REPO_ROOT/logs/.kanban_perf_source`` (or local-only ``nightly_jobs_local_*`` sync) contains perf JSON,
-   sync into ``data/local_nightly_raw/manual_YYYYMMDD/`` (``YYYYMMDD`` from **``nightly_jobs_local_*``** only;
-   **stability** ``nightly_jobs_stability_*`` and **general** ``nightly_jobs_YYYYMMDD-*`` perf JSON
-   are **not** copied to kanban):
+2. When ``$REPO_ROOT/logs/.kanban_perf_source`` (or local-only ``nightly_jobs_local_*`` sync)
+   contains perf JSON, sync into ``data/local_nightly_raw/manual_YYYYMMDD/``
+   (``YYYYMMDD`` from **``nightly_jobs_local_*``** only;
+   **stability** ``nightly_stability_jobs_*`` (NOTE: order is ``stability_jobs`` not
+   ``jobs_stability``) and **general** ``nightly_jobs_YYYYMMDD-*`` perf JSON are
+   **not** copied to kanban):
    copy result JSON and
    ``logs/nightly_jobs/local_pytest_hunyuan_image.log`` (or ``test_hunyuan_image3.log``) as
    ``test_hunyuan_image3.log``.

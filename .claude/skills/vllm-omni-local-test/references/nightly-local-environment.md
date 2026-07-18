@@ -180,11 +180,11 @@ Apply confirmed env **before** **`cd "$REPO_ROOT"`**, optional **`git pull`** ([
 - Each cluster run should write to a **timestamped/suffixed** **`LOG_DIR`** that matches the run kind, e.g.:
   - Default full nightly → **`$REPO_ROOT/logs/nightly_jobs_$(date -u +%Y%m%d-%H%M%S)`**
   - `--test-type local` → **`$REPO_ROOT/logs/nightly_jobs_local_$(date -u +%Y%m%d-%H%M%S)`**
-  - `--test-type stability` → **`$REPO_ROOT/logs/nightly_jobs_stability_$(date -u +%Y%m%d-%H%M%S)`**
+  - `--test-type stability` → **`$REPO_ROOT/logs/nightly_stability_jobs_$(date -u +%Y%m%d-%H%M%S)`**
 
   Pass the chosen path via **`run_nightly_jobs.sh --log-dir …`**. DFX perf JSON for that run stays under the same **`LOG_DIR`** tree (e.g. **`results/`** subdir or alongside **`*.log`**).
 
-- **Laptop sync:** pull per [nightly-local-log-fetch.md](../vllm-omni-local-test/references/nightly-local-log-fetch.md) **sync scope** (`local` = **`nightly_jobs_local_*` only**; `stability` = **`nightly_jobs_stability_*` only**; `default` = **`nightly_jobs_YYYYMMDD-*` only**; `all` = local + stability + general nightly) → merge into **`$REPO_ROOT/logs/nightly_jobs`** — see [nightly-local-log-fetch.md](../vllm-omni-local-test/references/nightly-local-log-fetch.md). When the user started the session by running tests, the scope is **auto-detected** from the run's `--test-type` so all related logs are pulled. Job logs and perf JSON live under that path for **`nightly_local_log_report.py`** and kanban **`manual_*`** → **`docs/assets/charts/*_history.json`** ([kanban prep](../../vllm-omni-test-report/references/kanban-pre-report-prep.md)).
+- **Laptop sync:** pull per [nightly-local-log-fetch.md](../vllm-omni-local-test/references/nightly-local-log-fetch.md) **sync scope** (`local` = **`nightly_jobs_local_*` only**; `stability` = **`nightly_stability_jobs_*` only**; `default` = **`nightly_jobs_YYYYMMDD-*` only**; `all` = local + stability + general nightly) → merge into **`$REPO_ROOT/logs/nightly_jobs`** — see [nightly-local-log-fetch.md](../vllm-omni-local-test/references/nightly-local-log-fetch.md). When the user started the session by running tests, the scope is **auto-detected** from the run's `--test-type` so all related logs are pulled. Job logs and perf JSON live under that path for **`nightly_local_log_report.py`** and kanban **`manual_*`** → **`docs/assets/charts/*_history.json`** ([kanban prep](../../vllm-omni-test-report/references/kanban-pre-report-prep.md)).
 - **Before each laptop sync:** delete local **`$REPO_ROOT/logs`** so old artifacts are not merged with the new pull ([clear local trees](nightly-local-log-fetch.md#clear-local-trees)).
 - If the run used a custom **`LOG_DIR`** outside **`logs/nightly_jobs_*`**, sync that directory explicitly or symlink into **`logs/nightly_jobs`**, then pass **`--log-dir`** when running **`vllm-omni-test-report`** `nightly_local_log_report.py`.
 
@@ -244,7 +244,7 @@ When you cannot use tmux (e.g. automation-only **`ssh` `BatchMode`** one-shot), 
 # Default full nightly:
 LOG_DIR="$REPO_ROOT/logs/nightly_jobs_$(date -u +%Y%m%d-%H%M%S)"
 # --test-type local:    LOG_DIR="$REPO_ROOT/logs/nightly_jobs_local_$(date -u +%Y%m%d-%H%M%S)"
-# --test-type stability: LOG_DIR="$REPO_ROOT/logs/nightly_jobs_stability_$(date -u +%Y%m%d-%H%M%S)"
+# --test-type stability: LOG_DIR="$REPO_ROOT/logs/nightly_stability_jobs_$(date -u +%Y%m%d-%H%M%S)"
 mkdir -p "$LOG_DIR"
 LOG="${LOG_DIR}/nightly_runner.nohup.log"
 nohup bash tools/nightly/run_nightly_jobs.sh --log-dir "$LOG_DIR" >>"$LOG" 2>&1 &
@@ -296,7 +296,7 @@ bash tools/nightly/run_nightly_jobs.sh \
 # Stability jobs
 bash tools/nightly/run_nightly_jobs.sh \
   --test-type stability \
-  --log-dir "$REPO_ROOT/logs/nightly_jobs_stability_$(date -u +%Y%m%d-%H%M%S)"
+  --log-dir "$REPO_ROOT/logs/nightly_stability_jobs_$(date -u +%Y%m%d-%H%M%S)"
 ```
 
 <a id="cuda_visible_devices-empty-gpus"></a>

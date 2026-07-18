@@ -47,8 +47,12 @@ EDITORIAL_THEME_CSS = """
   --accent-hover: #2563eb;
   --accent-soft: rgba(59, 130, 246, 0.22);
   --accent-tint: rgba(59, 130, 246, 0.08);
-  --ci: #2563eb;
-  --ci-soft: rgba(59, 130, 246, 0.16);
+  /* Buildkite panels & icons use violet so they read distinctly from
+     Local Test (blue). Affects top-border, panel gradient, cloud icon,
+     sub-card markers, and "▸/▾" disclosure markers in Buildkite chapters. */
+  --ci: #7c3aed;
+  --ci-soft: rgba(124, 58, 237, 0.18);
+  --ci-tint: rgba(124, 58, 237, 0.08);
   --danger: var(--dashboard-alert);
   --danger-strong: #b91c1c;
   --danger-bg: rgba(209, 67, 67, 0.08);
@@ -100,8 +104,9 @@ EDITORIAL_THEME_CSS = """
     --accent-hover: #3b82f6;
     --accent-soft: rgba(96, 165, 250, 0.28);
     --accent-tint: rgba(96, 165, 250, 0.12);
-    --ci: #60a5fa;
-    --ci-soft: rgba(96, 165, 250, 0.2);
+    --ci: #a78bfa;
+    --ci-soft: rgba(167, 139, 250, 0.22);
+    --ci-tint: rgba(167, 139, 250, 0.1);
     --danger-strong: #fecaca;
     --danger-bg: rgba(209, 67, 67, 0.14);
     --unknown-bg: rgba(148, 163, 184, 0.08);
@@ -199,6 +204,101 @@ body {
 }
 .panel-bk h2 {
   border-bottom-color: var(--ci-soft);
+}
+/* Buildkite chapter strips (CUDA / NPU) — share the visual language of the
+   existing sub-card summaries (Summary / Performance baseline / Failure
+   analysis): subtle gradient strip, ▸/▾ marker, thin border-bottom, font
+   weight 780. The H3 inside the summary inherits the strip's typography
+   so the chapter title looks like a sibling sub-card heading rather than a
+   separate heavy card. */
+details.bk-chapter {
+  margin: 0 0 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--dashboard-border);
+  background: var(--dashboard-panel-bg);
+  box-shadow: var(--dashboard-shadow);
+  overflow: hidden;
+}
+details.bk-chapter:last-child {
+  margin-bottom: 0;
+}
+summary.bk-chapter-summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 0.78rem 1rem 0.78rem 2.45rem;
+  position: relative;
+  font-weight: 780;
+  font-size: 1.02rem;
+  color: var(--dashboard-text);
+  background: linear-gradient(180deg, var(--dashboard-panel-strong) 0%, var(--dashboard-panel-bg) 100%);
+  border-bottom: 1px solid var(--dashboard-border);
+  display: block;
+}
+summary.bk-chapter-summary::-webkit-details-marker {
+  display: none;
+}
+summary.bk-chapter-summary::before {
+  content: "▸";
+  position: absolute;
+  left: 0.88rem;
+  top: 0.9rem;
+  font-size: 0.95rem;
+  font-weight: 800;
+  color: var(--ci);
+  line-height: 1;
+  pointer-events: none;
+}
+details.bk-chapter[open] > summary.bk-chapter-summary::before {
+  content: "▾";
+}
+summary.bk-chapter-summary > h3.bk-chapter-heading {
+  margin: 0;
+  font-size: inherit;
+  font-weight: inherit;
+  color: inherit;
+  letter-spacing: normal;
+  border-bottom: none;
+  padding-bottom: 0;
+  font-family: inherit;
+}
+summary.bk-chapter-summary .heading-row {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  min-width: 0;
+}
+summary.bk-chapter-summary .heading-ico {
+  display: flex;
+  margin-top: 0.18rem;
+  color: var(--ci);
+}
+summary.bk-chapter-summary .heading-sub {
+  font-size: 0.78em;
+  font-weight: 500;
+  color: var(--muted);
+}
+.bk-chapter-body {
+  padding: 0.85rem 1.1rem 0.2rem;
+}
+.bk-chapter-body > details.report-subcard:last-child {
+  margin-bottom: 0;
+}
+/* Top-level Buildkite section: the H2 "Buildkite Test" is also collapsible.
+   Wrap the whole section in <details class="bk-section">; the H2 inside
+   <summary> is the toggle and keeps its heavy card look (via .panel h2). */
+details.bk-section > summary.bk-section-summary {
+  list-style: none;
+  cursor: pointer;
+  display: block;
+}
+details.bk-section > summary.bk-section-summary::-webkit-details-marker {
+  display: none;
+}
+details.bk-section > summary.bk-section-summary > h2 {
+  margin: 0;
+}
+details.bk-section[open] > .bk-section-body {
+  padding-top: 1rem;
 }
 .heading-row {
   display: inline-flex;

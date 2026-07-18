@@ -1,15 +1,37 @@
 ---
 name: vllm-omni-local-test
-description: **H200** or **H800** cluster nightly runs — confirm default **`REPO_ROOT`**, **`HF_HOME`**, **`CUDA_VISIBLE_DEVICES`** with user before run; after connect, **`cd "$REPO_ROOT"`** and **ask whether to `git pull`** before cases; then **`source /rebase/.venv/bin/activate`**, `run_nightly_jobs.sh` (optional **`--test-type local|stability|local,stability`**, **`--label-substr`**, **`--log-dir logs/nightly_jobs_*`**). **Log sync scope:** user says **local** → latest **`nightly_jobs_local_*` only**; **stability** → latest **`nightly_jobs_stability_*` only**; **default** → latest **`nightly_jobs_YYYYMMDD-*` only** (general nightly, not local/stability); when the user **starts the session by running test cases first**, sync scope is auto-detected from the run's effective `--test-type` so all related logs are pulled. Defaults: **`REPO_ROOT=/rebase/vllm-omni`**; H200 **`HF_HOME=/models/`**, **`CUDA_VISIBLE_DEVICES=0,1,2,3`**; H800 **`HF_HOME=/home/models/`**, GPU via **`nvidia-smi`** or explicit list. Use when user specifies H200/H800, local/stability nightly jobs, or fetching nightly logs.
+description: **H200** or **H800** cluster nightly runs. **WARNING on H800:** `/rebase/vllm-omni` is NFS storage only visible inside the slurm allocation (or H200 container shell) — never on the bare SSH login node. Always `srun --overlap` (or `salloc`) before any log-listing or tarball; see SKILL §1. — confirm default **`REPO_ROOT`**, **`HF_HOME`**, **`CUDA_VISIBLE_DEVICES`** with user before run; after connect, **`cd "$REPO_ROOT"`** and **ask whether to `git pull`** before cases; then **`source /rebase/.venv/bin/activate`**, `run_nightly_jobs.sh` (optional **`--test-type local|stability|local,stability`**, **`--label-substr`**, **`--log-dir logs/nightly_jobs_*`**). **Log sync scope:** user says **local** → latest **`nightly_jobs_local_*` only**; **stability** → latest **`nightly_stability_jobs_*` only**; **default** → latest **`nightly_jobs_YYYYMMDD-*` only** (general nightly, not local/stability); when the user **starts the session by running test cases first**, sync scope is auto-detected from the run's effective `--test-type` so all related logs are pulled. Defaults: **`REPO_ROOT=/rebase/vllm-omni`**; H200 **`HF_HOME=/models/`**, **`CUDA_VISIBLE_DEVICES=0,1,2,3`**; H800 **`HF_HOME=/home/models/`**, GPU via **`nvidia-smi`** or explicit list. Use when user specifies H200/H800, local/stability nightly jobs, or fetching nightly logs.
 ---
 
 # vLLM-Omni Local Test (cluster run & log sync)
 
 ## Overview
 
-1. **Login** — **H200:** **`ssh`** → run in container shell (**no `docker exec`**). **H800:** **`ssh`** → Slurm → **`srun --overlap docker exec`**.
+1. **Login** — **H200:** **`ssh`** → run in container shell (**no `docker exec`**). **H800:** **`ssh`** → Slurm → **`srun --overlap docker exec`**. **⚠️ The default `CLUSTER_REPO_ROOT` (`/rebase/vllm-omni`) is on shared NFS storage that is only mounted on the compute nodes, NOT on the SSH login node.** A plain `ssh <host> "ls /rebase/vllm-omni"` will return `No such file or directory`. **Before any log-listing, `cd "$REPO_ROOT"`, or tarball step, you MUST be inside the slurm allocation (H800) or the H200 container shell.** Concretely:
+   - **H800:**
+   ```bash
+   # Step 1: SSH to the login node and find YOUR OWN jobid
+   ssh <host> "bash -lc 'type module >/dev/null 2>&1 && module load slurm 2>/dev/null; squeue -u $SLURM_USER -t RUNNING -h -o %i'"
+
+   # Step 2: srun --overlap into your allocation to check the storage
+   ssh <host> "srun --jobid=<JOBID> --overlap --gres=gpu:0 bash -lc 'ls /rebase/vllm-omni/logs/'"
+
+   # Step 3: enter the WORKLOAD CONTAINER to pull logs
+   ssh <host> "srun --jobid=<JOBID> --overlap docker exec <CONTAINER_NAME> bash -lc 'cd /rebase/vllm-omni/logs && tar czf - nightly_stability_jobs_*' > nightly_logs.tgz"
+   ```
+   The remote pack step in [references/nightly-local-log-fetch.md](references/nightly-local-log-fetch.md) wraps `srun --overlap docker exec <CONTAINER_NAME> ...` for you. **Logs are only inside the workload container, not in the bare slurm allocation.**sh -lc 'type module >/dev/null 2>&1 && module load slurm 2>/dev/null; squeue -u $SLURM_USER -t RUNNING -h -o %i'"
+
+   # Step 2: srun --overlap into your allocation to check the storage
+   ssh <host> "srun --jobid=<JOBID> --overlap --gres=gpu:0 bash -lc 'ls /rebase/vllm-omni/logs/'"
+
+   # Step 3: enter the WORKLOAD CONTAINER to pull logs
+   ssh <host> "srun --jobid=<JOBID> --overlap docker exec <CONTAINER_NAME> bash -lc 'cd /rebase/vllm-omni/logs && tar czf - nightly_stability_jobs_*' > nightly_logs.tgz"
+   ```
+   The remote pack step in [references/nightly-local-log-fetch.md](references/nightly-local-log-fetch.md) wraps `srun --overlap docker exec <CONTAINER_NAME> ...` for you. **Logs are only inside the workload container, not in the bare slurm allocation.**
+   - **H200:** `ssh <host> bash -lc '…'` — the login IS the compute node, no slurm needed.
+   - **Test:** if `ssh <host> "ls -d /rebase/vllm-omni"` returns "No such file or directory", you are on the wrong node and must slurm-attach first.
 2. **Run cases** — venv, HF / vLLM, **`CUDA_VISIBLE_DEVICES`**, **`cd "$REPO_ROOT"`**, **ask user → optional `git pull`**, then **`run_nightly_jobs.sh`** with the right **`--test-type` / `--label-substr`** — [Test run mode](#test-run-mode) and [references/nightly-local-environment.md](references/nightly-local-environment.md).
-3. **Sync logs** — [references/nightly-local-log-fetch.md](references/nightly-local-log-fetch.md).
+3. **Sync logs** — [references/nightly-local-log-fetch.md](references/nightly-local-log-fetch.md). The remote pack step (`tar czf - nightly_stability_jobs_* …`) MUST run inside the slurm allocation (H800) — see **§1** above.
 
 **HTML report:** [vllm-omni-test-report](../vllm-omni-test-report/SKILL.md) **`nightly_local_log_report.py --html-report …`**.
 
@@ -74,7 +96,7 @@ Examples: **`--label-substr Qwen`**, **`--label-substr Wan`**, **`--label-substr
 > **Log-dir convention (so the sync scope picks the run up):**
 > - Default full nightly → `--log-dir "$REPO_ROOT/logs/nightly_jobs_$(date -u +%Y%m%d-%H%M%S)"`
 > - `--test-type local` → `--log-dir "$REPO_ROOT/logs/nightly_jobs_local_$(date -u +%Y%m%d-%H%M%S)"`
-> - `--test-type stability` → `--log-dir "$REPO_ROOT/logs/nightly_jobs_stability_$(date -u +%Y%m%d-%H%M%S)"`
+> - `--test-type stability` → `--log-dir "$REPO_ROOT/logs/nightly_stability_jobs_$(date -u +%Y%m%d-%H%M%S)"`
 > - Combined runs may use either a single timestamped dir or one per kind — keep the `_local` / `_stability` suffix so the auto-detected sync scope matches.
 
 ## Required user inputs
@@ -187,7 +209,7 @@ srun --jobid="$JOBID" --overlap docker exec "$CONTAINER_NAME" bash -lc '
 | User intent (or auto-detected from the run) | **`SYNC_SCOPE`** | Remote directories pulled |
 |---|---|---|
 | User says **pull local logs** / *local test logs* / *only local nightly* | `local` | latest **`nightly_jobs_local_*`** |
-| User says **pull stability logs** / *stability test logs* / *only stability nightly* | `stability` | latest **`nightly_jobs_stability_*`** |
+| User says **pull stability logs** / *stability test logs* / *only stability nightly* | `stability` | latest **`nightly_stability_jobs_*`** |
 | User says **pull nightly logs** / general nightly report / no keyword specified | `default` | latest **`nightly_jobs_YYYYMMDD-*`** (general nightly, **not** local/stability) |
 | Combined `--test-type local,stability` / `--test-type all,local,stability` | `all` | all three: local + stability + general nightly |
 

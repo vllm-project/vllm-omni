@@ -25,8 +25,13 @@ _LOCAL_PERF_STEM_PREFIXES = (
     "result_",
 )
 _TIMESTAMP_SUFFIX_RE = re.compile(r"_(\d{8})[-_]\d{6}$")
+# Verified on hk01dgx012 / omni_wy_24g (2026-07-13): the cluster uses
+# ``nightly_stability_jobs_*`` (NOT ``nightly_jobs_stability_*``) for long-stability
+# runs, and the merged ``logs/nightly_jobs/`` contains the union of all three
+# families. The source-marker file (.nightly_jobs_source) records the original
+# per-run dir basenames so we can match the right glob back.
 _NIGHTLY_JOBS_RUN_DIR_RE = re.compile(
-    r"^nightly_jobs(?:_local)?_(\d{8})(?:-\d{6})?$",
+    r"^nightly_(?:jobs_(?:local)?|stability_jobs)_(\d{8})(?:[-_]\d{6})?$",
     re.I,
 )
 NIGHTLY_JOBS_SOURCE_MARKER = ".nightly_jobs_source"

@@ -20,7 +20,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
@@ -62,6 +62,24 @@ from report_naming import (  # noqa: E402
 )
 
 _SKILL_DIR = _SCRIPTS.parent
+
+
+class BkTarget(NamedTuple):
+    """A Buildkite org/pipeline pair to query for scheduled nightly builds.
+
+    ``label`` is the human-readable name used as the chapter heading
+    (e.g. ``CUDA`` / ``NPU``).
+    """
+
+    label: str
+    org: str
+    pipeline: str
+    branch: str = "main"
+
+
+CUDA_TARGET = BkTarget(label="CUDA", org="vllm", pipeline="vllm-omni")
+NPU_TARGET = BkTarget(label="NPU", org="vllm", pipeline="vllm-omni-npu-ci")
+ALL_BK_TARGETS: tuple[BkTarget, ...] = (CUDA_TARGET, NPU_TARGET)
 
 
 def _buildkite_token() -> str | None:
@@ -2874,10 +2892,23 @@ def _append_buildkite_markdown(
     bk_jobs: list[dict[str, Any]] | None,
     bk_note: str | None,
     kanban_cfg: KanbanAssetsConfig,
+    target: BkTarget,
     *,
     log_dir: Path | None = None,
 ) -> None:
-    lines.append("## Buildkite: latest scheduled nightly (main)")
+    """Render one collapsible Buildkite chapter (Markdown).
+
+    Each chapter is wrapped in a ``<details>`` block so it can be folded in
+    the rendered Markdown viewer. The chapter content mirrors the existing
+    Buildkite rendering (build metadata, per-job summary, perf comparison,
+    per-step failure analysis) — only ``build_url`` and the chapter label
+    change per target.
+    """
+    lines.append(f"### Buildkite ({target.label}): latest scheduled nightly")
+    lines.append("")
+    lines.append(
+        f"<details><summary><strong>{target.label} — Buildkite ({target.org}/{target.pipeline})</strong></summary>"
+    )
     lines.append("")
     if bk_note:
         lines.append(bk_note)
@@ -2890,9 +2921,12 @@ def _append_buildkite_markdown(
             exclude_local_overlap=log_dir is not None,
         )
         _append_buildkite_perf_markdown(lines, summary, grouped_rows)
+        lines.append("")
+        lines.append("</details>")
+        lines.append("")
         return
     if not bk_build or bk_jobs is None:
-        lines.append("*(Buildkite section not available.)*")
+        lines.append(f"*(Buildkite ({target.label}) section not available.)*")
         lines.append("")
         lines.append("### Performance baseline comparison")
         lines.append("")
@@ -2902,9 +2936,12 @@ def _append_buildkite_markdown(
             exclude_local_overlap=log_dir is not None,
         )
         _append_buildkite_perf_markdown(lines, summary, grouped_rows)
+        lines.append("")
+        lines.append("</details>")
+        lines.append("")
         return
     bn = int(bk_build["number"])
-    build_url = f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{bn}"
+    build_url = f"https://buildkite.com/{target.org}/{target.pipeline}/builds/{bn}"
     lines.append(f"- **Build:** [{bn}]({build_url})")
     lines.append(f"- **State:** `{bk_build.get('state') or ''}`")
     lines.append(f"- **Message:** {_md_cell((bk_build.get('message') or '')[:500])}")
@@ -2977,6 +3014,8 @@ def _append_buildkite_markdown(
             )
         )
         lines.append("")
+    lines.append("</details>")
+    lines.append("")
 
 
 def _excerpt_md_cell(excerpt: str, limit: int = 900) -> str:
@@ -3016,9 +3055,7 @@ def emit_report(
     repo_root: Path,
     log_dir: Path,
     out_fp: Any,
-    bk_build: dict[str, Any] | None = None,
-    bk_jobs: list[dict[str, Any]] | None = None,
-    bk_note: str | None = None,
+    bk_results: dict[BkTarget, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
     kanban_cfg: KanbanAssetsConfig | None = None,
 ) -> None:
     groups = discover_job_logs(log_dir)
@@ -3027,6 +3064,8 @@ def emit_report(
             assets_dir=DEFAULT_KANBAN_ASSETS_DIR,
             repo_root=DEFAULT_KANBAN_REPO_ROOT,
         )
+    if bk_results is None:
+        bk_results = {t: (None, None, None) for t in ALL_BK_TARGETS}
 
     lines: list[str] = [
         f"# {_md_cell(title)}",
@@ -3034,17 +3073,34 @@ def emit_report(
     ]
 
     job_rows = _local_job_rows_with_info(groups) if groups else []
+    # Daily Focus uses the CUDA (canonical) Buildkite data — that is the
+    # pipeline that matches the local H200/H800/A100 runs by default.
+    cuda_build, cuda_jobs, _ = bk_results.get(CUDA_TARGET, (None, None, None))
     _append_daily_focus_markdown(
         lines,
         _daily_focus_data(
-            bk_jobs=bk_jobs,
+            bk_jobs=cuda_jobs,
             local_job_rows=job_rows,
             kanban_cfg=kanban_cfg,
             log_dir=log_dir,
         ),
     )
 
-    _append_buildkite_markdown(lines, bk_build, bk_jobs, bk_note, kanban_cfg, log_dir=log_dir)
+    lines.append("## Buildkite Test")
+    lines.append("")
+    lines.append("Scheduled nightly — CUDA & NPU chapters. Click a chapter to expand.")
+    lines.append("")
+    for target in ALL_BK_TARGETS:
+        bk_build, bk_jobs, bk_note = bk_results.get(target, (None, None, None))
+        _append_buildkite_markdown(
+            lines,
+            bk_build,
+            bk_jobs,
+            bk_note,
+            kanban_cfg,
+            target,
+            log_dir=log_dir,
+        )
 
     lines.append("## Local cluster (nightly_jobs)")
     lines.append("")
@@ -3185,13 +3241,18 @@ def _th_labeled(icon_paths: str, text: str, *, col_class: str = "") -> str:
     )
 
 
-def _buildkite_build_url(build: dict[str, Any] | None) -> str:
+def _buildkite_build_url(
+    build: dict[str, Any] | None,
+    target: BkTarget | None = None,
+) -> str:
     if not build:
         return ""
     bn = build.get("number")
     if bn is None:
         return ""
-    return f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{int(bn)}"
+    org = target.org if target is not None else ORG
+    pipeline = target.pipeline if target is not None else PIPELINE
+    return f"https://buildkite.com/{org}/{pipeline}/builds/{int(bn)}"
 
 
 def _issue_row_data_attrs(
@@ -3306,18 +3367,27 @@ def _render_buildkite_section_html(
     *,
     note: str | None,
     kanban_cfg: KanbanAssetsConfig,
+    target: BkTarget,
     log_dir: Path | None = None,
+    open_default: bool = False,
 ) -> str:
+    """Render one Buildkite chapter as a collapsible ``<details>`` block.
+
+    Each chapter (CUDA / NPU) is wrapped in its own ``<details>`` element so
+    the user can fold or expand the whole chapter independently. Inner
+    sub-cards (Summary / Performance / Failure analysis) retain their
+    existing per-section collapsibility.
+    """
     summary_inner: list[str] = []
     fail_inner = '<p class="note">No data: Buildkite step logs were not loaded.</p>'
 
     if note:
         summary_inner.append(f'<p class="note">{html.escape(note)}</p>')
     elif build is None or job_records is None:
-        summary_inner.append('<p class="note">Buildkite section not available.</p>')
+        summary_inner.append(f'<p class="note">Buildkite ({target.label}) section not available.</p>')
     else:
         bn = int(build["number"])
-        build_url = f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{bn}"
+        build_url = f"https://buildkite.com/{target.org}/{target.pipeline}/builds/{bn}"
         meta_lines: list[str] = [
             '<div class="meta">',
             f'<div><strong>Build:</strong> <a href="{html.escape(build_url)}">#{bn}</a></div>',
@@ -3384,7 +3454,9 @@ def _render_buildkite_section_html(
                 ),
                 _render_failures_table_html(
                     info,
-                    report_context=(f"Buildkite scheduled nightly (main) · build #{bn} · step: {rec['name']}"),
+                    report_context=(
+                        f"Buildkite ({target.label}) scheduled nightly · build #{bn} · step: {rec['name']}"
+                    ),
                     issue_env="ci",
                     issue_vllm_version=(rec.get("ci_versions") or {}).get("vllm", ""),
                     issue_vllm_omni_version=(rec.get("ci_versions") or {}).get("vllm_omni", ""),
@@ -3407,22 +3479,35 @@ def _render_buildkite_section_html(
         else:
             fail_inner = '<p class="note">No failed steps currently, or no failure/error excerpts for any job.</p>'
 
-    return "\n".join(
-        [
-            '<section class="panel nightly-root nightly-root--buildkite">',
-            _heading_html(
-                "h2",
-                _SVG_CLOUD,
-                html.escape("Buildkite Test"),
-                sub=html.escape("Latest scheduled nightly (main)"),
-            ),
-            _details_subcard(
-                "Summary (per-job execution)",
-                "\n".join(summary_inner),
-                open_default=False,
-                details_class="report-subcard--bk",
-                icon_paths=_SVG_LIST,
-            ),
+    chapter_heading = _heading_html(
+        "h3",
+        _SVG_CLOUD,
+        html.escape(f"Buildkite ({target.label})"),
+        sub=html.escape(f"{target.org}/{target.pipeline} · latest scheduled nightly"),
+        klass="bk-chapter-heading",
+    )
+    sub_cards: list[str] = [
+        _details_subcard(
+            "Summary (per-job execution)",
+            "\n".join(summary_inner),
+            open_default=False,
+            details_class="report-subcard--bk",
+            icon_paths=_SVG_LIST,
+        ),
+        _details_subcard(
+            "Failure analysis",
+            fail_inner,
+            open_default=False,
+            details_class="report-subcard--bk-fail",
+            icon_paths=_SVG_ALERT,
+        ),
+    ]
+    # CUDA keeps the kanban-backed Performance baseline comparison.
+    # NPU pipeline has no kanban-side perf history yet, so the perf sub-card
+    # is omitted there. Toggle by adding/removing this `if` branch.
+    if target is not NPU_TARGET:
+        sub_cards.insert(
+            1,
             _details_subcard(
                 "Performance baseline comparison",
                 _render_buildkite_perf_inner_html(
@@ -3434,19 +3519,22 @@ def _render_buildkite_section_html(
                 details_class="report-subcard--bk-perf",
                 icon_paths=_SVG_CHART_BARS,
             ),
-            _details_subcard(
-                "Failure analysis",
-                fail_inner,
-                open_default=False,
-                details_class="report-subcard--bk-fail",
-                icon_paths=_SVG_ALERT,
-            ),
-            "</section>",
-        ]
+        )
+    chapter_body = "\n".join(sub_cards)
+
+    op = " open" if open_default else ""
+    return (
+        f'<details class="bk-chapter bk-chapter--{target.label.lower()}"{op}>'
+        f'<summary class="bk-chapter-summary">{chapter_heading}</summary>'
+        f'<div class="bk-chapter-body">'
+        f"{chapter_body}"
+        f"</div>"
+        f"</details>"
     )
 
 
-def _render_buildkite_note_html(note: str) -> str:
+def _render_buildkite_note_html(note: str, target: BkTarget | None = None) -> str:
+    label = target.label if target is not None else "CUDA"
     inner = f'<p class="note">{html.escape(note)}</p>'
     return "\n".join(
         [
@@ -3454,7 +3542,7 @@ def _render_buildkite_note_html(note: str) -> str:
             _heading_html(
                 "h2",
                 _SVG_CLOUD,
-                html.escape("Buildkite Test"),
+                html.escape(f"Buildkite ({label})"),
                 sub=html.escape("Latest scheduled nightly (main)"),
             ),
             _details_subcard(
@@ -3482,9 +3570,7 @@ def emit_report_html(
     repo_root: Path,
     log_dir: Path,
     out_fp: Any,
-    bk_build: dict[str, Any] | None = None,
-    bk_jobs: list[dict[str, Any]] | None = None,
-    bk_note: str | None = None,
+    bk_results: dict[BkTarget, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
     kanban_cfg: KanbanAssetsConfig | None = None,
 ) -> None:
     groups = discover_job_logs(log_dir)
@@ -3493,6 +3579,8 @@ def emit_report_html(
             assets_dir=DEFAULT_KANBAN_ASSETS_DIR,
             repo_root=DEFAULT_KANBAN_REPO_ROOT,
         )
+    if bk_results is None:
+        bk_results = {t: (None, None, None) for t in ALL_BK_TARGETS}
 
     css = EDITORIAL_THEME_CSS
 
@@ -3510,10 +3598,13 @@ def emit_report_html(
     job_rows: list[tuple[str, list[Path], dict[str, Any]]] = []
     if groups:
         job_rows = _local_job_rows_with_info(groups)
+    # Daily Focus uses the CUDA (canonical) Buildkite data — that is the
+    # pipeline that matches the local H200/H800/A100 runs by default.
+    cuda_build, cuda_jobs, _ = bk_results.get(CUDA_TARGET, (None, None, None))
     body_parts.append(
         _render_daily_focus_html(
             _daily_focus_data(
-                bk_jobs=bk_jobs,
+                bk_jobs=cuda_jobs,
                 local_job_rows=job_rows,
                 kanban_cfg=kanban_cfg,
                 log_dir=log_dir,
@@ -3522,14 +3613,32 @@ def emit_report_html(
     )
 
     body_parts.append(
-        _render_buildkite_section_html(
-            bk_build,
-            bk_jobs,
-            note=bk_note,
-            kanban_cfg=kanban_cfg,
-            log_dir=log_dir,
+        '<details class="bk-section panel nightly-root nightly-root--buildkite"><summary class="bk-section-summary">'
+    )
+    body_parts.append(
+        _heading_html(
+            "h2",
+            _SVG_CLOUD,
+            html.escape("Buildkite Test"),
+            sub=html.escape("Scheduled nightly — CUDA & NPU chapters (click to expand)"),
         )
     )
+    body_parts.append("</summary>")
+    body_parts.append('<div class="bk-section-body">')
+    for target in ALL_BK_TARGETS:
+        bk_build, bk_jobs, bk_note = bk_results.get(target, (None, None, None))
+        body_parts.append(
+            _render_buildkite_section_html(
+                bk_build,
+                bk_jobs,
+                note=bk_note,
+                kanban_cfg=kanban_cfg,
+                target=target,
+                log_dir=log_dir,
+            )
+        )
+    body_parts.append("</div>")
+    body_parts.append("</details>")
 
     local_chunks: list[str] = [
         '<section class="panel nightly-root nightly-root--local">',
@@ -3571,7 +3680,9 @@ def emit_report_html(
     )
 
     fail_local_parts: list[str] = []
-    local_bk_build_url = _buildkite_build_url(bk_build)
+    # Local failures link back to the canonical CUDA Buildkite build URL
+    # (the same CI pipeline the local H200/H800/A100 runs target).
+    local_bk_build_url = _buildkite_build_url(cuda_build, CUDA_TARGET)
     if job_rows:
         full_log_i = 0
         for job_name, paths, info in job_rows:
@@ -3658,29 +3769,55 @@ def _html_document(title: str, css: str, body: str, *, tail: str = "") -> str:
 """
 
 
-def _resolve_buildkite_for_report(
-    include: bool,
+def _resolve_buildkite_target(
+    tok: str | None,
+    target: BkTarget,
     build_no: int | None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]:
-    """Return ``(build, job_records, note)``. ``note`` set when section skipped or errored."""
-    if not include:
-        return None, None, None
-    tok = _buildkite_token()
+    """Return ``(build, job_records, note)`` for one Buildkite target.
+
+    ``note`` is set when the section is skipped or errored; ``build``/``job_records``
+    are ``None`` in those cases.
+    """
     if not tok:
         return (
             None,
             None,
             (
-                "Buildkite section skipped: set BUILDKITE_TOKEN or BUILDKITE_API_TOKEN "
-                "to fetch the latest scheduled nightly on main (vllm/vllm-omni)."
+                f"Buildkite ({target.label}) section skipped: set BUILDKITE_TOKEN or "
+                f"BUILDKITE_API_TOKEN to fetch the latest scheduled nightly on "
+                f"{target.org}/{target.pipeline}."
             ),
         )
     try:
-        bk_build = fetch_nightly_build(tok, build_no)
-        bk_jobs = collect_nightly_job_log_analyses(bk_build, tok)
+        bk_build = fetch_nightly_build(
+            tok,
+            build_no,
+            org=target.org,
+            pipeline=target.pipeline,
+            branch=target.branch,
+        )
+        bk_jobs = collect_nightly_job_log_analyses(bk_build, tok, org=target.org, pipeline=target.pipeline)
         return bk_build, bk_jobs, None
     except Exception as e:
-        return None, None, f"Buildkite section failed: {e}"
+        return None, None, f"Buildkite ({target.label}) section failed: {e}"
+
+
+def _resolve_buildkite_for_report(
+    include: bool,
+    build_no: int | None,
+    targets: tuple[BkTarget, ...] = ALL_BK_TARGETS,
+) -> dict[BkTarget, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]]:
+    """Resolve the latest scheduled nightly for each target.
+
+    Returns a mapping keyed by target → ``(build, jobs, note)``. When ``include``
+    is ``False``, every entry is ``(None, None, None)`` so renderers show the
+    section as a no-op.
+    """
+    if not include:
+        return {t: (None, None, None) for t in targets}
+    tok = _buildkite_token()
+    return {t: _resolve_buildkite_target(tok, t, build_no) for t in targets}
 
 
 def main() -> None:
@@ -3811,9 +3948,10 @@ def main() -> None:
 
     log_dir = args.log_dir.resolve() if args.log_dir else default_log_dir(repo)
 
-    bk_build, bk_jobs, bk_note = _resolve_buildkite_for_report(
+    bk_results = _resolve_buildkite_for_report(
         include=not args.no_buildkite,
         build_no=args.buildkite_build,
+        targets=ALL_BK_TARGETS,
     )
     kanban_cfg = KanbanAssetsConfig(
         assets_dir=args.kanban_assets_dir.resolve() if args.kanban_assets_dir else None,
@@ -3840,9 +3978,7 @@ def main() -> None:
                 repo_root=repo,
                 log_dir=log_dir,
                 out_fp=fp,
-                bk_build=bk_build,
-                bk_jobs=bk_jobs,
-                bk_note=bk_note,
+                bk_results=bk_results,
                 kanban_cfg=kanban_cfg,
             )
         print(f"Wrote {out}")
@@ -3855,9 +3991,7 @@ def main() -> None:
                 repo_root=repo,
                 log_dir=log_dir,
                 out_fp=fp,
-                bk_build=bk_build,
-                bk_jobs=bk_jobs,
-                bk_note=bk_note,
+                bk_results=bk_results,
                 kanban_cfg=kanban_cfg,
             )
         print(f"Wrote {out}")
@@ -3868,9 +4002,7 @@ def main() -> None:
                 repo_root=repo,
                 log_dir=log_dir,
                 out_fp=sys.stdout,
-                bk_build=bk_build,
-                bk_jobs=bk_jobs,
-                bk_note=bk_note,
+                bk_results=bk_results,
                 kanban_cfg=kanban_cfg,
             )
         else:
@@ -3879,9 +4011,7 @@ def main() -> None:
                 repo_root=repo,
                 log_dir=log_dir,
                 out_fp=sys.stdout,
-                bk_build=bk_build,
-                bk_jobs=bk_jobs,
-                bk_note=bk_note,
+                bk_results=bk_results,
                 kanban_cfg=kanban_cfg,
             )
 

@@ -2,6 +2,20 @@
 
 Part of **vllm-omni-local-test**. Pull run directories from the cluster/container **before** running **`vllm-omni-test-report`** `scripts/nightly_local_log_report.py` on your machine.
 
+**⚠️ `/rebase/vllm-omni/logs/` is on shared NFS storage that is only visible on the compute nodes, NOT on the SSH login node.** Every `ssh` command in this file that touches `$REPO_ROOT` (or runs `ls … /rebase/vllm-omni/logs/nightly_jobs_*`, the pick-latest block, or the `tar czf - …` pack) **MUST be wrapped in an slurm allocation**:
+
+```bash
+# H800: pick a running job (or `salloc -w <node>` if none) and `srun --overlap` everything
+ssh -o BatchMode=yes -o ConnectTimeout=60 "<SSH_CONNECTION_NAME>" \
+  "bash -lc 'type module >/dev/null 2>&1 && module load slurm 2>/dev/null; \
+     srun --jobid=\"<JOBID>\" --overlap --gres=gpu:0 bash -lc \"\
+       export CLUSTER_REPO_ROOT=\${CLUSTER_REPO_ROOT:-/rebase/vllm-omni} && \
+       export SYNC_SCOPE=… && <the pick + pack block from below> \
+     \"'" > nightly_logs.tgz
+```
+
+If `ssh <host> "ls -d /rebase/vllm-omni"` returns "No such file or directory", you are on the login node and MUST slurm-attach first.
+
 **Before sync:** confirm laptop path defaults with the user — **`REPO_ROOT=~/vllm-omni`**, **`KANBAN_REPO_ROOT=~/vllm-omni-kanban`** — see [confirm-laptop-path-defaults.md](../../vllm-omni-test-report/references/confirm-laptop-path-defaults.md).
 
 **H200 and H800 use the same laptop-side workflow** (clear local **`logs/`** → resolve remote run dir(s) → tarball → extract → merge into **`logs/nightly_jobs`** → report). Only the **remote pack command** differs: **H200** = direct **`ssh`** (already in container); **H800** = **`ssh` + `srun --overlap docker exec`**.
@@ -17,13 +31,13 @@ Three **suffix families** exist under **`$CLUSTER_REPO_ROOT/logs/`**:
 | Pattern | Meaning |
 |---------|---------|
 | **`nightly_jobs_local_*`** | Local-test nightly runs (`--test-type local`, etc.) |
-| **`nightly_jobs_stability_*`** | Stability-test nightly runs (`--test-type stability`, etc.) |
+| **`nightly_stability_jobs_*`** | Long-stability nightly runs (`--test-type stability`, etc.) — **NOTE the order: `…stability_jobs…` not `…jobs_stability…`** |
 | **`nightly_jobs_YYYYMMDD-HHMMSS`** | General / full nightly runs (**not** local/stability) |
 
 ```text
 $CLUSTER_REPO_ROOT/logs/
   nightly_jobs_local_20250628-143022/      ← local-test run (example)
-  nightly_jobs_stability_20250628-143022/  ← stability-test run (example)
+  nightly_stability_jobs_20250628-143022/  ← stability-test run (example)
   nightly_jobs_20250628-091530/            ← general nightly run (example)
   nightly_jobs_20250627-091530/
     …
@@ -36,7 +50,7 @@ $CLUSTER_REPO_ROOT/logs/
 | User intent | Remote directories to pull |
 |-------------|----------------------------|
 | Explicit **local** log sync (e.g. "拉取 local 日志", "local test logs", "only local nightly") | **Only** the latest **`nightly_jobs_local_*`** |
-| Explicit **stability** log sync (e.g. "拉取 stability 日志", "stability test logs", "only stability nightly") | **Only** the latest **`nightly_jobs_stability_*`** |
+| Explicit **stability** log sync (e.g. "拉取 stability 日志", "stability test logs", "only stability nightly") | **Only** the latest **`nightly_stability_jobs_*`** |
 | **Default** (unspecified, or "拉取 nightly 日志", general nightly report) | **Only** the latest **`nightly_jobs_YYYYMMDD-*`** (general nightly, **not** local/stability) |
 
 If one family is missing on the remote, sync what exists and note the skip in chat.
@@ -44,7 +58,7 @@ If one family is missing on the remote, sync what exists and note the skip in ch
 **Implicit scope (auto-detected after a test run):** when the user starts the session by running test cases first (rather than calling the log-fetch step alone), pull **all logs related to that run** instead of asking for the keyword:
 
 - Ran with `--test-type local` (only) → scope = `local` → pull latest `nightly_jobs_local_*`.
-- Ran with `--test-type stability` (only) → scope = `stability` → pull latest `nightly_jobs_stability_*`.
+- Ran with `--test-type stability` (only) → scope = `stability` → pull latest `nightly_stability_jobs_*`.
 - Ran full nightly (no `--test-type`) → scope = `default` → pull latest `nightly_jobs_YYYYMMDD-*`.
 - Combined `--test-type local,stability` (or `--test-type all,local,stability`) → scope = `all` → pull **all three** latest runs (local + stability + general nightly).
 
@@ -81,8 +95,8 @@ if [[ "$SYNC_SCOPE" == "local" || "$SYNC_SCOPE" == "all" ]]; then
 fi
 
 if [[ "$SYNC_SCOPE" == "stability" || "$SYNC_SCOPE" == "all" ]]; then
-  if _latest_matching "nightly_jobs_stability_*" >/dev/null; then
-    LATEST_STABILITY_RUN="$(_latest_matching "nightly_jobs_stability_*")"
+  if _latest_matching "nightly_stability_jobs_*" >/dev/null; then
+    LATEST_STABILITY_RUN="$(_latest_matching "nightly_stability_jobs_*")"
   fi
 fi
 
@@ -92,7 +106,7 @@ if [[ "$SYNC_SCOPE" == "default" || "$SYNC_SCOPE" == "all" ]]; then
   for _d in "${LOGS_ROOT}"/nightly_jobs_*; do
     _base="$(basename "$_d")"
     [[ "$_base" == nightly_jobs_local_* ]] && continue
-    [[ "$_base" == nightly_jobs_stability_* ]] && continue
+    [[ "$_base" == nightly_stability_jobs_* ]] && continue
     [[ "$_base" =~ ^nightly_jobs_[0-9]{8}- ]] && _nightly+=( "$_d" )
   done
   shopt -u nullglob
@@ -121,7 +135,7 @@ Optional: ask the user to confirm **`PACK_DIRS`** before tarball when multiple r
 | Source | Required | Local destination |
 |--------|----------|-------------------|
 | Latest **`nightly_jobs_local_*`** (when scope = local or all) | Per sync scope above | Merged into **`$REPO_ROOT/logs/nightly_jobs/`** |
-| Latest **`nightly_jobs_stability_*`** (when scope = stability or all) | Per sync scope above | Same merge target |
+| Latest **`nightly_stability_jobs_*`** (when scope = stability or all) | Per sync scope above | Same merge target |
 | Latest **`nightly_jobs_YYYYMMDD-*`** (when scope = default or all) | When scope is **default** or **all** | Same merge target |
 
 Layout after merge: [../../vllm-omni-test-report/references/nightly-local-log-layout.md](../../vllm-omni-test-report/references/nightly-local-log-layout.md).
@@ -175,16 +189,25 @@ Run this **before** remote tarball download (step 2) and again **before** extrac
 
 Pack **`PACK_DIRS`** from [Pick latest run dirs](#pick-latest-run-dirs-remote-shell) in one archive.
 
-**H800** — **`ssh` + Slurm + `docker exec`** ([nightly-local-h800.md](nightly-local-h800.md)) — embed the pick + pack block from above, then:
+**H800** — first **find your own jobid**, then wrap the pick + pack block in `srun --overlap docker exec <CONTAINER_NAME>`:
 
 ```bash
+# Step 1: find YOUR OWN jobid (not "any" job on the node — those will deny access)
+SLURM_USER="<username>"   # the user gave this, e.g. fq9hpsacuser07
+JOBID=$(ssh -o BatchMode=yes "<SSH_CONNECTION_NAME>" \
+  "bash -lc 'type module >/dev/null 2>&1 && module load slurm 2>/dev/null; squeue -u $SLURM_USER -t RUNNING -h -o %i | head -1'")
+echo "Using JOBID=$JOBID"
+
+# Step 2: enter the WORKLOAD CONTAINER (logs are only inside the container, not the slurm allocation)
+CONTAINER_NAME="<container_name>"   # the user gave this, e.g. omni_wy_24g
+
 ssh -o BatchMode=yes "<SSH_CONNECTION_NAME>" \
-  "bash -lc 'type module >/dev/null 2>&1 && module load slurm 2>/dev/null; srun --jobid=\"<JOBID>\" --overlap docker exec \"<CONTAINER_NAME>\" bash -lc \"
-    SYNC_SCOPE=\\\"${SYNC_SCOPE:-default}\\\"
-    # ... insert Pick latest run dirs block ...
-    cd \\\"\\\$LOGS_ROOT\\\" || exit 1
-    tar czf - --ignore-failed-read \\\"\\\${PACK_DIRS[@]}\\\"
-  \"'" \
+  "bash -lc 'type module >/dev/null 2>&1 && module load slurm 2>/dev/null; srun --jobid=\\\"$JOBID\\\" --overlap docker exec \\\"$CONTAINER_NAME\\\" bash -lc \\"
+    SYNC_SCOPE=\\\\\"${SYNC_SCOPE:-default}\\\\\"
+    # ... insert Pick latest run dirs block from above ...
+    cd \\\\\\"\\$LOGS_ROOT\\\\\\" || exit 1
+    tar czf - --ignore-failed-read \\\\\\"\\${PACK_DIRS[@]}\\\\\\"
+  \\""' \
   > nightly_logs.tgz
 ```
 
@@ -245,12 +268,12 @@ merge_local_for_kanban() {
 
 shopt -s nullglob
 _local_dirs=( "$REPO_ROOT/logs"/nightly_jobs_local_* )
-_stability_dirs=( "$REPO_ROOT/logs"/nightly_jobs_stability_* )
+_stability_dirs=( "$REPO_ROOT/logs"/nightly_stability_jobs_* )
 _general_dirs=()
 for _d in "$REPO_ROOT/logs"/nightly_jobs_*; do
   _base="$(basename "$_d")"
   [[ "$_base" == nightly_jobs_local_* ]] && continue
-  [[ "$_base" == nightly_jobs_stability_* ]] && continue
+  [[ "$_base" == nightly_stability_jobs_* ]] && continue
   [[ "$_base" =~ ^nightly_jobs_[0-9]{8}- ]] && _general_dirs+=( "$_d" )
 done
 shopt -u nullglob
@@ -338,7 +361,7 @@ if [[ "$SYNC_SCOPE" == "local" || "$SYNC_SCOPE" == "all" ]]; then
   [[ -n "$REMOTE_LOCAL" ]] && scp -r "${REMOTE_REPO}/${REMOTE_LOCAL}" "$REPO_ROOT/logs/"
 fi
 if [[ "$SYNC_SCOPE" == "stability" || "$SYNC_SCOPE" == "all" ]]; then
-  REMOTE_STABILITY="$(ssh "$REMOTE_REPO" 'ls -dt logs/nightly_jobs_stability_* 2>/dev/null | head -1')"
+  REMOTE_STABILITY="$(ssh "$REMOTE_REPO" 'ls -dt logs/nightly_stability_jobs_* 2>/dev/null | head -1')"
   [[ -n "$REMOTE_STABILITY" ]] && scp -r "${REMOTE_REPO}/${REMOTE_STABILITY}" "$REPO_ROOT/logs/"
 fi
 if [[ "$SYNC_SCOPE" == "default" || "$SYNC_SCOPE" == "all" ]]; then
@@ -350,6 +373,6 @@ fi
 
 ### rsync
 
-Same pattern: pull **`nightly_jobs_local_*`** when scope = `local`/`all`; **`nightly_jobs_stability_*`** when scope = `stability`/`all`; **`nightly_jobs_YYYYMMDD-*`** only when scope = `default`/`all`; then run step 4.
+Same pattern: pull **`nightly_jobs_local_*`** when scope = `local`/`all`; **`nightly_stability_jobs_*`** when scope = `stability`/`all`; **`nightly_jobs_YYYYMMDD-*`** only when scope = `default`/`all`; then run step 4.
 
 Then continue with [Verify and generate report](#5-verify-prepare-kanban-and-generate-report-same-for-h200-and-h800) (step 5 above).
