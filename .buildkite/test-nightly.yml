@@ -1529,11 +1529,28 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-  - group: ":card_index_dividers: Diffusion · Quantization Test"
+  - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "diffusion-x2iat-test"
     steps:
-      - label: ":full_moon: Quantization Test with H100"
+      - label: ":full_moon: Diffusion · Offloader Test"
+        timeout_in_minutes: 40
+        commands:
+          - timeout 40m pytest -s -v tests/diffusion/offloader -m "full_model and cuda"
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
+      - label: ":full_moon: Diffusion · Quantization Test with H100"
         commands:
           - timeout 60m pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
         agents:
@@ -1570,7 +1587,7 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: ":full_moon: Quantization Test with L4"
+      - label: ":full_moon: Diffusion · Quantization Test with L4"
         timeout_in_minutes: 60
         commands:
           - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and L4' --run-level "full_model"

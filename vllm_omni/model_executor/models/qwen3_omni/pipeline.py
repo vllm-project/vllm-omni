@@ -21,6 +21,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_omni"
 
 QWEN3_OMNI_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_moe",
+    default_deploy_config_name="qwen3_omni_moe.yaml",
     model_arch="Qwen3OmniMoeForConditionalGeneration",
     endpoint_restrictions=(
         EndpointRestriction(
