@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from copy import copy, deepcopy
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -17,6 +18,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import logger
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import (
@@ -28,8 +30,8 @@ from vllm.v1.outputs import (
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
-from vllm.v1.worker.mamba_utils import preprocess_mamba
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -38,7 +40,10 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
-from vllm_ascend.utils import enable_sp, global_stream
+from vllm_ascend.utils import enable_sp, global_stream, vllm_version_is
+
+if not vllm_version_is("0.20.2"):
+    from vllm.v1.outputs import RoutedExpertsLists
 from vllm_ascend.worker.model_runner_v1 import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
@@ -337,14 +342,43 @@ class NPUARModelRunner(OmniNPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
         if self.vllm_config.model_config.enable_return_routed_experts:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
-                capturer.finalize_pending_copy()
-        if self.ascend_config.profiling_chunk_config.enabled:
+            if vllm_version_is("0.20.2"):
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    capturer.clear_buffer()
+            elif self.routed_experts_initialized:
+                capturer = self.routed_experts_capturer
+                if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
+                    capturer.finalize_pending_copy()
+                elif capturer is not None and hasattr(capturer, "clear_buffer"):
+                    capturer.clear_buffer()
+
+        profiling_cfg = self.ascend_config.profiling_chunk_config
+        if getattr(profiling_cfg, "need_timing", False):
+            if getattr(scheduler_output, "disable_profiling_timing", False):
+                profiling_cfg.need_timing = False
+            else:
+                self._sync_device()
+                self._execution_start_time = time.perf_counter()
+        elif getattr(profiling_cfg, "enabled", False):
             self._sync_device()
             self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_ngram_gpu()
+        ):
+            num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
+            spec_decode_tokens_copy = scheduler_output.scheduled_spec_decode_tokens.copy()
+            scheduler_output = replace(
+                scheduler_output,
+                num_scheduled_tokens=num_scheduled_tokens_copy,
+                scheduled_spec_decode_tokens=spec_decode_tokens_copy,
+            )
+
+        self._start_dump_data()
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
@@ -413,6 +447,19 @@ class NPUARModelRunner(OmniNPUModelRunner):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
+                if (
+                    self.use_async_scheduling
+                    and self.num_spec_tokens
+                    and self.input_batch.prev_req_id_to_index is not None
+                ):
+                    for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                        if (
+                            req_id not in self.input_batch.prev_req_id_to_index
+                            and (req_state := self.requests.get(req_id)) is not None
+                            and req_state.prev_num_draft_len
+                        ):
+                            req_state.prev_num_draft_len = 0
+
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
 
@@ -435,6 +482,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         if kv_ids:
                             output = copy(output)
                             output.kv_extracted_req_ids = kv_ids
+                        self._finalize_dump_data()
                         return output
 
                 if not num_scheduled_tokens:
@@ -546,7 +594,13 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
                         deferred_state_corrections_fn = None
-                    preprocess_mamba(
+                    if vllm_version_is("0.20.2"):
+                        mamba_bufs = self._get_mamba_copy_bufs()
+                        preprocess_bufs = mamba_bufs
+                    else:
+                        mamba_bufs = self._get_mamba_bufs()
+                        preprocess_bufs = mamba_bufs.preprocess
+                    mamba_utils.preprocess_mamba(
                         scheduler_output,
                         self.kv_cache_config,
                         self.cache_config,
@@ -556,13 +610,39 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         self.compilation_config.static_forward_context,
                         self.model.get_mamba_state_copy_func(),
                         self._get_mamba_copy_bufs(),
+                        preprocess_bufs,
                     )
                     # preprocess_mamba resets num_accepted_tokens_cpu to 1
                     # for requests whose state was copied to a new block.
                     # Re-sync to GPU so the mamba kernel reads from the
                     # correct initial state slot (init_token_idx = 0).
-                    self.num_accepted_tokens.np[:num_reqs] = self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                    self.num_accepted_tokens.np[:num_reqs] = (
+                        self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                    )
                     self.num_accepted_tokens.copy_to_gpu(num_reqs)
+
+                    if not vllm_version_is("0.20.2") and mamba_bufs.postprocess_align is not None:
+                        mamba_utils.stage_postprocess_inputs_to_gpu(
+                            mamba_bufs.postprocess_align,
+                            scheduler_output,
+                            self.input_batch.req_ids,
+                            num_reqs,
+                            self.requests,
+                            self.mamba_state_idx,
+                        )
+
+                if self.use_compress:
+                    if deferred_state_corrections_fn:
+                        deferred_state_corrections_fn()
+                        deferred_state_corrections_fn = None
+                    num_reqs = self.input_batch.num_reqs
+                    req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_np)
+                    dsa_positions_np = self._dsa_positions_np_buf[:total_num_scheduled_tokens]
+                    np.add(
+                        self.input_batch.num_computed_tokens_cpu[req_indices],
+                        self.query_pos.np[:total_num_scheduled_tokens],
+                        out=dsa_positions_np,
+                    )
 
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
@@ -598,6 +678,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
                 )
 
             (
@@ -677,6 +758,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
+                has_sinks=self._has_sinks,
+                input_ids=input_ids,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -739,6 +822,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    self._finalize_dump_data()
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
@@ -749,6 +833,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    self._finalize_dump_data()
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -982,16 +1067,44 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
+                input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
+                    spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+                    <= self.effective_drafter_max_model_len
+                )
                 use_padded_batch = (
                     self.speculative_config
-                    and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
+                    and (
+                        self.speculative_config.use_eagle()
+                        or self.speculative_config.uses_draft_model()
+                        or self.speculative_config.uses_extract_hidden_states()
+                        or self.speculative_config.use_ngram_gpu()
+                    )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
                 if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
+                    sampled_token_ids = sampler_output.sampled_token_ids
+                    if input_fits_in_drafter:
+                        propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    elif self.valid_sampled_token_count_event is not None:
+                        assert spec_decode_common_attn_metadata is not None
+                        if self.drafter is not None:
+                            next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+                                sampled_token_ids,
+                                self.requests,
+                                self.input_batch,
+                                self.discard_request_indices.gpu,
+                                self.num_discarded_requests,
+                            )
+                            self._copy_valid_sampled_token_count(
+                                next_token_ids, valid_sampled_tokens_count
+                            )
+                            self._draft_token_ids = torch.zeros(
+                                1, device=self.device, dtype=torch.int32
+                            ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                            self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+                if self.speculative_config and not use_padded_batch and input_fits_in_drafter:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
@@ -1004,9 +1117,26 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
         routed_experts_lists = None
         if self.model_config.enable_return_routed_experts:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(self.input_batch, "num_tokens_no_spec"):
-                routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
+            if vllm_version_is("0.20.2"):
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    capturer.save_captured_experts(indices=self.cpu_slot_mapping)
+            elif self.routed_experts_initialized:
+                if hasattr(self, "_omni_extract_routed_experts"):
+                    routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
+                else:
+                    buf = self.routed_experts_capturer.get_device_buffer()
+                    total = scheduler_output.total_num_scheduled_tokens
+                    self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
+                    self.routed_experts_slot_mapping_cpu[:total].copy_(
+                        self.routed_experts_slot_mapping_device[:total],
+                        non_blocking=True,
+                    )
+                    torch.npu.current_stream().synchronize()
+                    routed_experts_lists = RoutedExpertsLists(
+                        routing_data=self.routed_experts_cpu[:total].numpy(),
+                        slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+                    )
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
@@ -1185,13 +1315,19 @@ class NPUARModelRunner(OmniNPUModelRunner):
         model_runner_output.routed_experts = routed_experts_lists
         #  -------------------------------------- Omni-new -------------------------------------------------
 
-        if self.ascend_config.profiling_chunk_config.enabled and hasattr(self, "_execution_start_time"):
+        profiling_cfg = self.ascend_config.profiling_chunk_config
+        if (
+            (getattr(profiling_cfg, "need_timing", False) or getattr(profiling_cfg, "enabled", False))
+            and hasattr(self, "_execution_start_time")
+        ):
             self._sync_device()
             model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB update"):
                 self.eplb_updator.forward_end()
+
+        self._finalize_dump_data()
 
         if self.debugger is not None:
             self.debugger.stop()
