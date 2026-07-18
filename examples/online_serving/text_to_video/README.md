@@ -31,6 +31,7 @@ bash run_server.sh
 ```
 
 The script allows overriding:
+
 - `MODEL` (default: `Wan-AI/Wan2.2-T2V-A14B-Diffusers`)
 - `PORT` (default: `8091`)
 - `BOUNDARY_RATIO` (default: `0.875`)
@@ -46,6 +47,7 @@ artifact, poll the job status and then download the completed file from the
 content endpoint.
 
 The main endpoints are:
+
 - `POST /v1/videos`: create a video generation job (async)
 - `POST /v1/videos/sync`: generate a video and return raw bytes (sync, for benchmarks)
 - `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
@@ -289,6 +291,7 @@ Benchmarked on H800, online serving (480×768, 41 frames, 20 steps, `seed=42`).
 | `best-combo` | `--enforce-eager --usp 4 --cache-backend cache_dit` | 4.7 avg | **~2.2×** | Lossless + Lossy |
 
 **Observations**:
+
 - **torch.compile**: On H800, warm-request inference time matches the eager baseline (~10.3s).
   The first request pays ~6s compilation overhead. Benefit depends on model architecture and GPU.
 - **Ulysses SP (4 GPU)**: No measurable speedup alone for 41-frame generation at this resolution.
@@ -301,6 +304,7 @@ Benchmarked on H800, online serving (480×768, 41 frames, 20 steps, `seed=42`).
 - **FP8 quantization**: Reduces VRAM but does not speed up LTX-2 on H800 (compute-bound).
 
 **Deployment Recommendations**:
+
 - For **production with quality priority**: use `baseline` with `--enforce-eager`
 - For **maximum throughput** (4 GPUs, quality tradeoff): use `best-combo` (~2.2× speedup)
 - For **single-GPU throughput**: use `cache-dit` (~1.4× speedup)
