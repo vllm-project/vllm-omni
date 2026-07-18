@@ -14,8 +14,71 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+
+# Install vLLM (CUDA 13.0 build) from precompiled wheel at the selected commit.
+# Must use direct URL because the wheel has a PEP 440 local version identifier
+# (e.g. +gaeee7ef93.cu130) which pip/uv refuse to install from a PEP 503 package index.
+# The cu130 wheel index lives at /<commit>/cu130/vllm/ but the actual wheel files
+# are stored at the top level /<commit>/<wheel>.
+ENV VLLM_PRECOMPILED_WHEEL_COMMIT=0206f10871468bcb9b23f7e8f51320e3cd7ca096
+# Keep the base image's CUDA-12 toolkit libs on the loader path. NOTE: this does
+# NOT resolve libnvJitLink.so.13 (that CUDA-13 lib is not in /usr/local/cuda here) —
+# the .so.13 JIT linker is handled separately via ldconfig after the cu130 wheels
+# are installed (see the nvidia-cuda-nvjitlink-cu13 step below).
+ENV LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}
+RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
+    from urllib.parse import urljoin, quote; \
+    index_url='https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/cu130/vllm/'; \
+    html=urllib.request.urlopen(index_url).read().decode(); \
+    m=re.search(r'href=\"([^\"]*x86_64\.whl)\"',html); \
+    assert m, f'No x86_64 vLLM wheel found at {index_url}'; \
+    print(quote(urljoin(index_url,m.group(1)), safe=':/+%'))") && \
+    echo "Installing vLLM from: ${VLLM_WHEEL_URL}" && \
+    uv pip install --system --force-reinstall "${VLLM_WHEEL_URL}"
+
+
+
 RUN uv pip install --system ".[dev]"
 
+RUN uv pip install --system --upgrade \
+        "flashinfer-python==0.6.13" \
+        "flashinfer-cubin==0.6.13"
+
+RUN uv pip install --system --upgrade \
+    "flashinfer-jit-cache==0.6.13" \
+    --index-url https://flashinfer.ai/whl/cu130
+
+# Force-reinstall torch AFTER flashinfer, because flashinfer --upgrade pulls in
+# a newer torch (2.12.x) whose libtorch_cuda.so lacks
+# at::cuda::getCurrentCUDABlasHandle, causing "undefined symbol" at import time.
+RUN uv pip install --system --force-reinstall \
+    "torch==2.11.0" "torchaudio==2.11.0" "torchvision==0.26.0" \
+    --torch-backend cu130
+
+# CUDA 13 JIT linker: libnvJitLink.so.13 is provided by the nvidia-nvjitlink
+# package that the cu130 torch/vllm wheels above pull into site-packages (the
+# v0.24.0 base image's /usr/local/cuda toolkit is CUDA 12, so the LD_LIBRARY_PATH
+# above never resolves the .so.13). Its lib dir is not on the dynamic-loader path,
+# so bitsandbytes / torch.compile worker subprocesses fail to dlopen it. Locate the
+# already-installed lib and register its dir with ldconfig (system-wide, survives
+# subprocess env resets). Only fall back to the pip wheel (correct name:
+# nvidia-nvjitlink-cu13, NOT nvidia-cuda-nvjitlink-cu13, which does not exist) if
+# the torch deps did not bring it in.
+RUN NVJITLINK_LIB="$(find / -name 'libnvJitLink.so.13*' 2>/dev/null | head -1)" && \
+    if [ -z "$NVJITLINK_LIB" ]; then \
+        uv pip install --system "nvidia-nvjitlink-cu13" && \
+        NVJITLINK_LIB="$(find / -name 'libnvJitLink.so.13*' 2>/dev/null | head -1)"; \
+    fi && \
+    test -n "$NVJITLINK_LIB" && \
+    dirname "$NVJITLINK_LIB" > /etc/ld.so.conf.d/nvjitlink-cu13.conf && \
+    ldconfig && \
+    echo "Registered ${NVJITLINK_LIB} with ldconfig"
+
+# Re-pin numpy LAST. numba requires numpy <= 2.4, but the flashinfer and torch cu130
+# reinstalls above resolve numpy back up to 2.5, which breaks `import numba` at test
+# time ("Numba needs NumPy 2.4 or less"). This must be the final dependency op so
+# nothing can clobber it again.
+RUN uv pip install --system "numpy==2.2.6"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
