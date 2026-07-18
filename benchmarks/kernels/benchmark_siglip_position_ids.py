@@ -1,8 +1,9 @@
 """Microbenchmark MiniCPM-o 4.5 SigLIP position-ID construction.
 
 This isolates the position-ID hot path from patch embedding and the vision
-transformer. It compares the legacy per-item CPU path, the grouped host path
-used by ``SiglipVisionEmbeddings``, and the rejected device-side alternative.
+transformer. It compares the legacy per-item CPU path, an independent copy of
+the grouped host path used by ``SiglipVisionEmbeddings``, and the rejected
+device-side alternative.
 
 Example:
     python benchmarks/kernels/benchmark_siglip_position_ids.py \
@@ -17,9 +18,6 @@ from collections.abc import Callable
 from functools import partial
 
 import torch
-import torch.nn as nn
-
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import SiglipVisionEmbeddings
 
 
 def _parse_int_list(value: str) -> list[int]:
@@ -32,13 +30,6 @@ def _parse_shapes(value: str) -> list[tuple[int, int]]:
         height, width = item.lower().split("x", maxsplit=1)
         shapes.append((int(height), int(width)))
     return shapes
-
-
-def _make_embeddings(num_patches_per_side: int) -> SiglipVisionEmbeddings:
-    embeddings = SiglipVisionEmbeddings.__new__(SiglipVisionEmbeddings)
-    nn.Module.__init__(embeddings)
-    embeddings.num_patches_per_side = num_patches_per_side
-    return embeddings
 
 
 def _make_inputs(
@@ -55,16 +46,16 @@ def _make_inputs(
 
 
 def _legacy_host_position_ids(
-    embeddings: SiglipVisionEmbeddings,
+    num_patches_per_side: int,
     patch_attention_mask: torch.BoolTensor,
     target_sizes: torch.IntTensor,
     device: torch.device,
 ) -> torch.Tensor:
     batch_size, _, max_num_patches = patch_attention_mask.shape
     boundaries = torch.arange(
-        1 / embeddings.num_patches_per_side,
+        1 / num_patches_per_side,
         1.0,
-        1 / embeddings.num_patches_per_side,
+        1 / num_patches_per_side,
     )
     position_ids = torch.zeros((batch_size, max_num_patches), dtype=torch.long)
 
@@ -74,14 +65,70 @@ def _legacy_host_position_ids(
         fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / width)
         bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
         bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
-        grid_ids = (bucket_coords_h[:, None] * embeddings.num_patches_per_side + bucket_coords_w).flatten()
+        grid_ids = (bucket_coords_h[:, None] * num_patches_per_side + bucket_coords_w).flatten()
         position_ids[batch_idx, patch_mask.flatten().cpu()] = grid_ids
 
     return position_ids.to(device=device)
 
 
+def _create_grid_position_ids(
+    num_patches_per_side: int,
+    patch_grid_height: int,
+    patch_grid_width: int,
+    boundaries: torch.Tensor,
+) -> torch.Tensor:
+    fractional_coords_h = torch.arange(
+        0,
+        1 - 1e-6,
+        1 / patch_grid_height,
+        device=boundaries.device,
+    )
+    fractional_coords_w = torch.arange(
+        0,
+        1 - 1e-6,
+        1 / patch_grid_width,
+        device=boundaries.device,
+    )
+    bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
+    bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+    return (bucket_coords_h[:, None] * num_patches_per_side + bucket_coords_w).flatten()
+
+
+def _grouped_host_position_ids(
+    num_patches_per_side: int,
+    patch_attention_mask: torch.BoolTensor,
+    target_sizes: torch.IntTensor,
+    device: torch.device,
+) -> torch.Tensor:
+    batch_size = patch_attention_mask.size(0)
+    flat_patch_attention_mask = patch_attention_mask.reshape(batch_size, -1).to(device="cpu")
+    target_sizes_list = target_sizes.detach().to(device="cpu").tolist()
+    position_ids = torch.zeros(flat_patch_attention_mask.shape, dtype=torch.long)
+    boundaries = torch.arange(
+        1 / num_patches_per_side,
+        1.0,
+        1 / num_patches_per_side,
+    )
+    grid_position_ids: dict[tuple[int, int], torch.Tensor] = {}
+
+    for batch_idx, (patch_grid_height, patch_grid_width) in enumerate(target_sizes_list):
+        grid_shape = (int(patch_grid_height), int(patch_grid_width))
+        grid_ids = grid_position_ids.get(grid_shape)
+        if grid_ids is None:
+            grid_ids = _create_grid_position_ids(
+                num_patches_per_side,
+                *grid_shape,
+                boundaries,
+            )
+            grid_position_ids[grid_shape] = grid_ids
+
+        position_ids[batch_idx, flat_patch_attention_mask[batch_idx]] = grid_ids
+
+    return position_ids.to(device=device)
+
+
 def _device_position_ids(
-    embeddings: SiglipVisionEmbeddings,
+    num_patches_per_side: int,
     patch_attention_mask: torch.BoolTensor,
     target_sizes: torch.IntTensor,
     device: torch.device,
@@ -91,9 +138,9 @@ def _device_position_ids(
     target_sizes_list = target_sizes.cpu().tolist()
     position_ids = torch.zeros(flat_patch_attention_mask.shape, dtype=torch.long, device=device)
     boundaries = torch.arange(
-        1 / embeddings.num_patches_per_side,
+        1 / num_patches_per_side,
         1.0,
-        1 / embeddings.num_patches_per_side,
+        1 / num_patches_per_side,
         device=device,
     )
     grid_position_ids: dict[tuple[int, int], torch.Tensor] = {}
@@ -102,7 +149,11 @@ def _device_position_ids(
         grid_shape = (int(height), int(width))
         grid_ids = grid_position_ids.get(grid_shape)
         if grid_ids is None:
-            grid_ids = embeddings._create_grid_position_ids(*grid_shape, boundaries)
+            grid_ids = _create_grid_position_ids(
+                num_patches_per_side,
+                *grid_shape,
+                boundaries,
+            )
             grid_position_ids[grid_shape] = grid_ids
         position_ids[batch_idx, flat_patch_attention_mask[batch_idx]] = grid_ids
 
@@ -151,7 +202,6 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    embeddings = _make_embeddings(args.grid_size)
     print(f"device={device} grid_size={args.grid_size} shapes={args.shapes}")
     print(
         f"{'batch':>7} {'legacy_us':>12} {'grouped_us':>12} "
@@ -162,20 +212,21 @@ def main() -> None:
         patch_attention_mask, target_sizes = _make_inputs(batch_size, args.shapes, device)
         legacy = partial(
             _legacy_host_position_ids,
-            embeddings,
+            args.grid_size,
             patch_attention_mask,
             target_sizes,
             device,
         )
         grouped = partial(
-            embeddings._create_position_ids,
+            _grouped_host_position_ids,
+            args.grid_size,
             patch_attention_mask,
             target_sizes,
             device=device,
         )
         device_side = partial(
             _device_position_ids,
-            embeddings,
+            args.grid_size,
             patch_attention_mask,
             target_sizes,
             device,
