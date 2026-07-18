@@ -1,6 +1,18 @@
 [
   {
     "test_name": "test_voxcpm2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "tts"
+    ],
     "server_params": {
       "model": "openbmb/VoxCPM2",
       "trust_remote_code": true,

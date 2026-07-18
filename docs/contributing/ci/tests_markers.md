@@ -33,7 +33,8 @@ Defined in `pyproject.toml`:
 | `skipif_rocm`      | Skip if the num of ROCm cards is less than the required * |
 | `skipif_npu`       | Skip if the num of NPU cards is less than the required *  |
 | `slow`             | Slow tests (may skip in quick CI)                         |
-| `benchmark`        | Benchmark tests                                           |
+| `benchmark`        | Benchmark tests (decorator on runner test functions; perf JSON uses `full_model` + type marker instead) |
+| `local_model`      | Tests requiring local / non-HF-hub model weights          |
 
 \* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility).
 
@@ -94,7 +95,7 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
         num_cards=2,
     )
     ```
-- `res` must be a dict; supported resources: CUDA (L4/H100), ROCm (MI325), NPU (A2/A3)
+- `res` must be a dict; supported resources: CUDA (L4/H100), ROCm (MI325), XPU (B60), MUSA (S5000), NPU (A2/A3)
 - `num_cards` can be int (all platforms) or dict (per platform); defaults to 1 when missing
 - Distributed markers (`distributed_cuda`, `distributed_rocm`, `distributed_npu`) are auto-added for multi-card cases
 - Filtering examples:
@@ -119,6 +120,32 @@ MULTI_CARD_MARKS = hardware_marks(
 def test_feature(omni_server):
     ...
 ```
+
+### JSON `mark` field (L4 perf configs)
+
+Perf JSON under `tests/dfx/perf/tests/` can attach pytest marks per **case** (`test_name` block). Parsed by `tests.dfx.conftest.resolve_pytest_marks` and applied to each parametrized run in `run_benchmark.py` / `run_diffusion_benchmark.py`.
+
+When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same semantics as `hardware_marks()` above), followed by registered pytest marker name strings such as `full_model`, `omni`, `tts`, or `diffusion`.
+
+```json
+{
+  "test_name": "test_cosmos3_t2i_official_demo_2gpu",
+  "mark": [
+    {"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}},
+    "full_model",
+    "diffusion"
+  ],
+  "server_type": "vllm-omni",
+  "server_params": { "...": "..." },
+  "benchmark_params": [{ "name": "1024x1024_steps4", "...": "..." }]
+}
+```
+
+- Local bulk load: `pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"`
+- Nightly CI perf steps: `--test-config-file tests/dfx/perf/tests/test_<model>_vllm_omni.json` (file selects cases; no `-m`)
+- Result filenames use **runtime** GPU detection (`get_runtime_resource_label`); `H100` is omitted on the default CI pool
+
+See [L4 performance test examples](./test_examples/l4_performance_tests.inc.md) for the full schema.
 
 ## Add Support for a New Platform
 

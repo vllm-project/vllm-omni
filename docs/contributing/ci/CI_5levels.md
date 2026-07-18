@@ -126,11 +126,12 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         <strong>Interface tests:</strong><br>
         /tests/entrypoints/test_xxx<br>
         <strong>Performance:</strong><br>
-        /tests/dfx/perf/tests/test_qwen_omni.json (Omni), test_tts.json (TTS),<br>
-        and /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
+        /tests/dfx/perf/tests/test_qwen3_omni_*.json (Omni), test_tts.json (TTS),<br>
+        test_voxcpm2.json, test_higgs_audio_v3.json, and<br>
+        /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
         <strong>Doc Test:</strong><br>
-        tests/example/online_serving/test_{model_name}.py<br>
-        tests/example/offline_inference/test_{model_name}.py<br>
+        tests/examples/online_serving/test_{model_name}.py<br>
+        tests/examples/offline_inference/test_{model_name}.py<br>
         <strong>Accuracy Test:</strong><br>
         /tests/e2e/accuracy/test_{model_name}.py
       </td>
@@ -708,16 +709,16 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 ### 3.2 Testing Content and Scope
 
 -   ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
--   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs in the form `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` via `--test-config-file`) to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
+-   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen3_omni_*.json` (Omni), `test_tts.json` / `test_voxcpm2.json` / `test_higgs_audio_v3.json` (TTS), and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` or `run_diffusion_benchmark.py` via `--test-config-file` in nightly **Perf Test** steps) to drive throughput, latency, and memory benchmarks. Each JSON **case** may declare an optional top-level **`mark`** array: exactly one ``hardware_marks`` object plus pytest marker name strings (`full_model`, `omni` / `tts` / `diffusion`, …). Runners attach those marks to each parametrized `(server, benchmark index)` pair so **local** bulk runs can filter with `-m` (for example `-m "full_model and H100 and diffusion"`). Nightly CI perf jobs select workloads by **`--test-config-file`**, not `-m`. Details are in the Performance Tests example below.
 -   ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
 ### 3.3 Test Directory and Execution Files
 
 -   ***Functional Testing***: Same directories as L3.
--   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`)
+-   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen3_omni_*.json`, `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json`). Optional per-case `mark` for local `-m` filtering is documented in Section 3.4 Performance Tests.
 -   ***Documentation Example Tests***:
--   -   `tests/example/online_serving/test_{model_name}.py`
-    -   `tests/example/offline_inference/test_{model_name}.py`
+    -   `tests/examples/online_serving/test_{model_name}.py`
+    -   `tests/examples/offline_inference/test_{model_name}.py`
 
 ### 3.4 Execution Method and Example
 
