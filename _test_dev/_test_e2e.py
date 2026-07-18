@@ -72,7 +72,7 @@ def main() -> None:
     assert pipeline_cls is not None, 'diffusion registry could not load the resolved HiDream-O1 pipeline'
 
     print(
-        f'model={model_dir!r} dtype=bf16 model_type=\'full\' '
+        f'model={model_dir!r} dtype=bf16 '
         f'resolved={resolved_model_class!r} pipeline={pipeline_cls.__name__!r}'
     )
     print(
@@ -134,3 +134,11 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
+
+# output (H100, HiDream-O1-Image 8.8B, torch.bfloat16; HIDREAM_O1_REF_IMAGE unset):
+# model='/workspace/vllm-omni/.hf_models_cache/HiDream-O1-Image' dtype=bf16 resolved='Qwen3VLForConditionalGeneration' pipeline='HiDreamO1ImagePipeline'
+# prompt='a red cat sitting on a wooden chair' h=1920 w=1080 steps=4 seed=42 guidance_scale=5.0
+# output='hidream_o1_e2e.png' type=Image mode=RGB size=(1440, 2560)
+# psnr=skipped
+# pass

@@ -373,9 +373,6 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.od_config = od_config
         self.prefix = prefix
         self.model_dir = od_config.model
-
-        custom_args = od_config.custom_pipeline_args or {}
-        self.model_type: str = str(custom_args.get("model_type", "full"))
         self.dtype = od_config.dtype if od_config.dtype is not None else torch.bfloat16
         self.device = get_local_device()
 
@@ -393,13 +390,6 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self._validate_tms_token_id()
 
     def _validate_static_config(self) -> None:
-        if self.model_type not in ("full", "dev"):
-            raise ValueError(f"unsupported model_type={self.model_type!r}")
-        if self.model_type != "full":
-            # dev needs a separate recipe (28 steps, shift=1.0, flash sched,
-            # guidance=0.0, DEFAULT_TIMESTEPS + noise_scale/noise_clip); see
-            # upstream inference.py.
-            raise NotImplementedError(f"model_type={self.model_type!r} not supported yet")
         if self.dtype != torch.bfloat16:
             raise NotImplementedError(f"only bfloat16 is supported; got {self.dtype!r}")
         cfg_parallel_size = int(self.od_config.parallel_config.cfg_parallel_size)
@@ -430,8 +420,8 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             else self.processor.tokenizer
         )
         logger.info(
-            "HiDreamO1ImagePipeline: ready (model_type=%s, num_params=%.1fB)",
-            self.model_type, sum(p.numel() for p in self.model.parameters()) / 1e9,
+            "HiDreamO1ImagePipeline: ready (num_params=%.1fB)",
+            sum(p.numel() for p in self.model.parameters()) / 1e9,
         )
 
     def _validate_tms_token_id(self) -> None:
@@ -462,8 +452,6 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     ) -> tuple[str, int, int, int, int, float]:
         sp = req.sampling_params
 
-        if sp.generator is not None:
-            raise NotImplementedError("sp.generator not supported; noise seeding is internal")
         if sp.timesteps is not None:
             raise NotImplementedError("sp.timesteps not supported")
         if sp.latents is not None:
@@ -505,9 +493,34 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         if steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {steps}")
 
-        if sp.seed is None:
+        generator = sp.generator
+        if isinstance(generator, list):
+            if len(generator) != 1:
+                raise NotImplementedError(
+                    "generator list only supported for single-output requests "
+                    "with one generator"
+                )
+            generator = generator[0]
+
+        generator_seed: int | None = None
+        if generator is not None:
+            if not hasattr(generator, "initial_seed"):
+                raise TypeError(
+                    "sp.generator must expose initial_seed(); "
+                    f"got {type(generator).__name__}"
+                )
+            generator_seed = int(generator.initial_seed())
+
+        if sp.seed is not None and generator_seed is not None and int(sp.seed) != generator_seed:
+            raise ValueError(
+                "seed/generator mismatch: "
+                f"seed={int(sp.seed)} generator.initial_seed()={generator_seed}"
+            )
+
+        if sp.seed is None and generator_seed is None:
             raise RuntimeError("expected request initialization to resolve a concrete seed")
-        seed = int(sp.seed)
+        seed = int(sp.seed) if sp.seed is not None else generator_seed
+        assert seed is not None
         guidance_scale = float(sp.guidance_scale)
         return prompt, snapped_h, snapped_w, steps, seed, guidance_scale
 

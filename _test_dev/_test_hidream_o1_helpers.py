@@ -478,22 +478,17 @@ class _ParallelStub:
 class _ConfigStub:
     parallel_config: _ParallelStub = field(default_factory=_ParallelStub)
 
-def _make_static_stub(model_type='full', dtype=torch.bfloat16, cfg_ps=1):
+def _make_static_stub(dtype=torch.bfloat16, cfg_ps=1):
     stub = SimpleNamespace()
-    stub.model_type = model_type
     stub.dtype = dtype
     stub.od_config = _ConfigStub(parallel_config=_ParallelStub(cfg_parallel_size=cfg_ps))
     return stub
 
-# Case 13: init static fail-fast -- unknown model_type (ValueError), dev/dtype/cfg_parallel (NotImplementedError)
-_assert_raises(ValueError, lambda: _validate_static(_make_static_stub(model_type='unknown')), 'unknown model_type')
-c13_dev_err = _assert_raises(NotImplementedError, lambda: _validate_static(_make_static_stub(model_type='dev')), 'dev model')
-for kw in ('DEFAULT_TIMESTEPS', 'flash scheduler', 'guidance_scale=0.0'):
-    assert kw in str(c13_dev_err), f'c13 dev error missing keyword {kw!r}: {c13_dev_err}'
+# Case 13: init static fail-fast.
 _assert_raises(NotImplementedError, lambda: _validate_static(_make_static_stub(dtype=torch.float16)), 'dtype=float16')
 _assert_raises(NotImplementedError, lambda: _validate_static(_make_static_stub(cfg_ps=2)), 'cfg_parallel=2')
 _validate_static(_make_static_stub())
-print(f'c13 init static config   : unknown/dev/dtype/cfg_parallel raised; full+bf16+cfg=1 accepted')
+print(f'c13 static config        : dtype/cfg_parallel raised; bf16+cfg=1 accepted')
 
 # Case 14: noise determinism -- same seed twice on CPU is bit-identical
 c14_z1 = _prep_noise(None, 64, 96, seed=42, dtype=torch.float32, device=torch.device('cpu'))
@@ -586,7 +581,7 @@ print('pass')
 # c10 resolve fail-fast x 5: all 5 unsupported request-level checks raised NotImplementedError
 # c11 resolve prompt type  : 3 accepted (str/dict-x/dict-empty-str) + 4 rejected (TypeError)
 # c12 resolve boundary     : h<=0/w<=0/steps<=0 (ValueError) + seed=None+generator=None (RuntimeError)
-# c13 init static config   : unknown/dev/dtype/cfg_parallel raised; full+bf16+cfg=1 accepted
+# c13 static config        : dtype/cfg_parallel raised; bf16+cfg=1 accepted
 # c14 noise determinism    : torch.equal on same-seed CPU noise (64x96)
 # c15 noise shape+dtype+std: shape=(1,6,3072) dtype=fp32 std=8.055 in [6.4, 9.6]
 # c16 _forward_once slice  : shape=(1,6,3072) + slice correct + 0 host sync (.item() calls)

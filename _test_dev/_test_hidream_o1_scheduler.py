@@ -16,7 +16,7 @@ from vllm_omni.diffusion.models.hidream_o1_image.pipeline_hidream_o1_image impor
 )
 
 
-# A1: default full-model config (canonical: shift=3.0, num_inference_steps=50)
+# A1: default recipe config (canonical: shift=3.0, num_inference_steps=50)
 sched = build_hidream_o1_scheduler(num_inference_steps=50, shift=3.0, device='cpu')
 type_ok = type(sched).__name__ == 'FlowUniPCMultistepScheduler'
 shift_ok = sched.config.shift == 3.0
@@ -30,7 +30,7 @@ t_dtype_ok = sched.timesteps.dtype == torch.int64
 t_shape_ok = sched.timesteps.shape == (50,)
 s_shape_ok = sched.sigmas.shape == (51,)
 s_final_ok = sched.sigmas[-1].item() == 0.0
-print(f'A1[default full-model config]  : type_ok={type_ok} shift_ok={shift_ok} n_train_ok={n_train_ok} pred_ok={pred_ok} dyn_ok={dyn_ok} predict_x0_ok={predict_x0_ok} solver_order_ok={solver_order_ok} n_inf_ok={n_inf_ok} timesteps.dtype={sched.timesteps.dtype} timesteps.shape={tuple(sched.timesteps.shape)} sigmas.shape={tuple(sched.sigmas.shape)} sigmas[-1]={sched.sigmas[-1].item()}')
+print(f'A1[default recipe config]      : type_ok={type_ok} shift_ok={shift_ok} n_train_ok={n_train_ok} pred_ok={pred_ok} dyn_ok={dyn_ok} predict_x0_ok={predict_x0_ok} solver_order_ok={solver_order_ok} n_inf_ok={n_inf_ok} timesteps.dtype={sched.timesteps.dtype} timesteps.shape={tuple(sched.timesteps.shape)} sigmas.shape={tuple(sched.sigmas.shape)} sigmas[-1]={sched.sigmas[-1].item()}')
 assert type_ok and shift_ok and n_train_ok and pred_ok and dyn_ok and predict_x0_ok and solver_order_ok and n_inf_ok, 'A1: config semantics mismatch'
 assert t_dtype_ok and t_shape_ok and s_shape_ok and s_final_ok, 'A1: timesteps/sigmas shape or dtype mismatch'
 
@@ -42,10 +42,10 @@ try:
 except NotImplementedError as e:
     raised_flash = True
     msg_flash = str(e)
-msg_flash_ok = ('flash' in msg_flash) or ('default' in msg_flash) or ('dev' in msg_flash)
-print(f"A2a[scheduler_name='flash' guard] : raised={raised_flash} msg_hint_ok={msg_flash_ok} msg={msg_flash!r}")
+msg_flash_ok = msg_flash == "unsupported scheduler_name='flash'"
+print(f"A2a[scheduler_name='flash' guard] : raised={raised_flash} msg_ok={msg_flash_ok} msg={msg_flash!r}")
 assert raised_flash, "A2a: scheduler_name='flash' should raise NotImplementedError"
-assert msg_flash_ok, f"A2a: NotImplementedError message should hint at 'flash'/'default'/'dev', got {msg_flash!r}"
+assert msg_flash_ok, f"A2a: unexpected NotImplementedError message {msg_flash!r}"
 
 # A2b: scheduler_name='flow_match' raises NotImplementedError
 raised_fm = False
@@ -91,13 +91,13 @@ z_abs_max = z.abs().max().item()
 print(f'A4[set_timesteps + step smoke]  : ran={n_iter} steps shape={tuple(z.shape)} final_abs_max={z_abs_max:.3e} finite=True')
 assert n_iter == 4, f'A4: expected 4 iterations, got {n_iter}'
 
-print('pass (build_hidream_o1_scheduler config semantics match HiDream-O1 upstream build_scheduler default branch; unsupported names raise; timesteps_list override + step smoke correct)')
+print('pass (build_hidream_o1_scheduler config semantics match HiDream-O1 upstream default recipe branch; unsupported alternate scheduler names raise; timesteps_list override + step smoke correct)')
 
 
 # output:
-# A1[default full-model config]  : type_ok=True shift_ok=True n_train_ok=True pred_ok=True dyn_ok=True predict_x0_ok=True solver_order_ok=True n_inf_ok=True timesteps.dtype=torch.int64 timesteps.shape=(50,) sigmas.shape=(51,) sigmas[-1]=0.0
-# A2a[scheduler_name='flash' guard] : raised=True msg_hint_ok=True msg="HiDream-O1-Image currently only supports scheduler_name='default'; got 'flash'. 'flash' and 'flow_match' are dev-model schedulers and are not yet supported."
+# A1[default recipe config]      : type_ok=True shift_ok=True n_train_ok=True pred_ok=True dyn_ok=True predict_x0_ok=True solver_order_ok=True n_inf_ok=True timesteps.dtype=torch.int64 timesteps.shape=(50,) sigmas.shape=(51,) sigmas[-1]=0.0
+# A2a[scheduler_name='flash' guard] : raised=True msg_ok=True msg="unsupported scheduler_name='flash'"
 # A2b[scheduler_name='flow_match' guard] : raised=True
 # A3[timesteps_list override]    : shape_eq=True dtype_eq=True torch_equal=True sigmas.shape=(29,) sigmas[-1]=0.0 sigmas_max_diff_vs_t/1000=2.575e-08 (tol 1e-06)
 # A4[set_timesteps + step smoke]  : ran=4 steps shape=(1, 100, 3072) final_abs_max=5.848e+00 finite=True
-# pass (build_hidream_o1_scheduler config semantics match HiDream-O1 upstream build_scheduler default branch; unsupported names raise; timesteps_list override + step smoke correct)
+# pass (build_hidream_o1_scheduler config semantics match HiDream-O1 upstream default recipe branch; unsupported alternate scheduler names raise; timesteps_list override + step smoke correct)

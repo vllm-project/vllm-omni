@@ -15,7 +15,7 @@ from vllm_omni.outputs import OmniRequestOutput
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='HiDream-O1-Image end-to-end inference.')
     p.add_argument('--model', default='HiDream-ai/HiDream-O1-Image', help='HF repo or local path.')
-    p.add_argument('--prompt', default="A cat holds a sign that says 'HiDream-O1 vLLM-Omni'", help='Text prompt.')
+    p.add_argument('--prompt', default="A cat is sitting next to a sign that says 'HiDream-O1 vLLM-Omni'", help='Text prompt.')
     p.add_argument('--height', type=int, default=1024, help='Image height.')
     p.add_argument('--width', type=int, default=1024, help='Image width.')
     p.add_argument('--seed', type=int, default=42, help='Random seed.')

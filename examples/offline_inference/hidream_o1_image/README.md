@@ -1,12 +1,14 @@
 # HiDream-O1-Image
 
 Current support:
-- text-to-image only (`full`, single GPU, `torch.bfloat16`)
+- text-to-image only (single GPU, `torch.bfloat16`)
 
 Not supported yet:
-- `dev`
 - editing / IP / layout / skeleton
 - TP / SP / CFG parallel / HSDP / Cache-DiT
+
+This integration currently follows the default upstream text-to-image recipe.
+It does not expose recipe selectors such as `model_type` or `variant`.
 
 Resolved from `config.json::architectures`; no `model_index.json` rewrite is needed.
 
