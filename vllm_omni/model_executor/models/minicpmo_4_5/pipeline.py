@@ -22,6 +22,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
+    default_deploy_config_name="minicpmo_4_5.yaml",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
     # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
     # `architectures=["MiniCPMO"]` — both shared verbatim with older MiniCPM-o

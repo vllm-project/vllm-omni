@@ -16,6 +16,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.indextts2"
 
 INDEXTTS2_PIPELINE = PipelineConfig(
     model_type="indextts2",
+    default_deploy_config_name="indextts2.yaml",
     model_arch="IndexTTS2TalkerForConditionalGeneration",
     stages=(
         StagePipelineConfig(

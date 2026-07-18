@@ -1,0 +1,64 @@
+# Single-80GB variant of moss_tts.yaml (see #4643): lowers stage-0
+# gpu_memory_utilization and disables codec FlashInfer autotune so both
+# stages initialize on one H100/H800 80GB at full max_model_len.
+# MOSS-TTS (MossTTSDelayModel, 8B, n_vq=32, 24 kHz)
+# HF: OpenMOSS-Team/MOSS-TTS
+# General-purpose TTS with voice cloning. Production-recommended variant.
+async_chunk: true
+trust_remote_code: true  # OpenMOSS-Team/MOSS-TTS ships custom modeling code
+
+connectors:
+  shm:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 0
+      decode_cudagraph_capture_sizes: [4, 8, 16, 25, 32, 50, 64, 100, 128, 200, 256]
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.60
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: shm
+    default_sampling_params:
+      temperature: 1.7
+      top_p: 0.8
+      top_k: 25
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0
+      stop_token_ids: [151645]  # <|im_end|> — terminates the talker AR loop
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    enable_flashinfer_autotune: false
+    enable_prefix_caching: false
+    async_scheduling: true
+    # Talker can emit up to max_tokens=4096 frames × n_vq=32 = 131072 codec
+    # tokens per request; cap codec stage above that so a single long output
+    # doesn't trigger "could not broadcast (>65536,) into (65536,)".
+    max_num_batched_tokens: 196608
+    max_model_len: 196608
+    devices: "0"
+    input_connectors:
+      from_stage_0: shm
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0

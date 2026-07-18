@@ -33,7 +33,7 @@ ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets" / "indextts2"
 REF_AUDIO = str(ASSETS_DIR / "ref_audio.wav")
 
 pytestmark = [
-    pytest.mark.advanced_model,
+    pytest.mark.slow,
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
