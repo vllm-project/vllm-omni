@@ -123,15 +123,17 @@ def main(args):
 
     ref_audio = args.ref_audio
 
-    # Pre-compute exact prompt length before creating the engine.
-    # Using an over-estimated placeholder causes 292+ zero-padded positions,
-    # degrading conditioning and causing early EOS.
-    print(f"Computing prompt length for model {args.model}...")
-    prompt_len = compute_prompt_len(texts[0], ref_audio, args.model)
-    print(f"Prompt length: {prompt_len} tokens")
+    # Compute the exact prompt length per prompt before creating the engine.
+    # The length depends on the text token count, so it must be recomputed for
+    # every line of a --txt-prompts batch: reusing one length would zero-pad the
+    # shorter prompts (292+ padded positions), degrading conditioning and causing
+    # early EOS -- exactly what compute_prompt_len exists to prevent.
+    print(f"Computing prompt lengths for model {args.model}...")
 
     inputs = []
     for text in texts:
+        prompt_len = compute_prompt_len(text, ref_audio, args.model)
+
         additional_information = {
             "text": [text],
         }

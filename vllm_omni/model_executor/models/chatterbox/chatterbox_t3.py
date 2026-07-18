@@ -995,6 +995,10 @@ class ChatterboxT3ForGeneration(_ChatterboxT3Base):
             snap = snapshot_download(
                 repo_id=model_path,
                 allow_patterns=["t3_cfg.safetensors"],
+                # Resolve from the local HF cache only. Weights are already
+                # downloaded by vLLM's loader before this probe runs, so a hub
+                # round-trip would only add a network timeout on offline runs.
+                local_files_only=True,
             )
             candidates.append(os.path.join(snap, "t3_cfg.safetensors"))
         except Exception as exc:

@@ -70,10 +70,44 @@ DEFAULT_STAGE_CONFIGS = os.path.join(
 )
 
 
-def estimate_prompt_len(text: str, speech_cond_prompt_len: int = 150) -> int:
-    """Rough estimate of prompt token count for placeholder allocation."""
-    text_len = max(1, len(text) // 4 + 10)
-    return 1 + speech_cond_prompt_len + text_len + 1
+# Fixed size of the Original conditioning block that the model's
+# ``_build_prompt_embeds`` prepends before the text tokens.  It mirrors the
+# native ``T3CondEnc`` layout for the Original variant (which the Turbo variant
+# does NOT share):
+#   speaker_proj        -> 1 token
+#   perceiver(cond)     -> 32 tokens  (fixed pre_attention_query_token; the
+#                          resampler always emits 32 latents regardless of the
+#                          150-frame speech-cond input)
+#   emotion_adv_fc      -> 1 token    (emotion_adv=True for Original)
+#   start_speech_token  -> 1 token    (appended after the text)
+# plus the SOT/EOT wrapping (+2) that ``_tokenize_text`` adds around the text.
+# Over-estimating this (the old rough guess used 150 for the cond block) makes
+# preprocess() zero-pad the prompt, which degrades conditioning and can cause
+# early EOS -- the same failure the Turbo compute_prompt_len avoids.
+_PERCEIVER_LATENTS = 32
+_COND_BLOCK_LEN = 1 + _PERCEIVER_LATENTS + 1  # speaker + perceiver + emotion_adv
+_TEXT_WRAP_LEN = 2  # start_text_token (SOT) + stop_text_token (EOT)
+_START_SPEECH_LEN = 1
+
+
+def compute_prompt_len(text: str, model_path: str) -> int:
+    """Compute the exact prompt token count for placeholder allocation.
+
+    The Original variant tokenizes text with the custom ``EnTokenizer`` (704
+    vocab), not a HuggingFace ``AutoTokenizer`` -- the checkpoint ships a raw
+    ``tokenizer.json`` with no ``tokenizer_config.json``, so ``AutoTokenizer``
+    cannot resolve a class (this is why the stage config sets
+    ``skip_tokenizer_init: true``).  We load the same ``EnTokenizer`` the model
+    uses so the length matches ``_build_prompt_embeds`` exactly.
+    """
+    from chatterbox.models.tokenizers import EnTokenizer
+    from transformers.utils.hub import cached_file
+
+    tok_path = cached_file(model_path, "tokenizer.json")
+    tokenizer = EnTokenizer(tok_path)
+    text_len = len(list(tokenizer.encode(text)))
+
+    return _COND_BLOCK_LEN + text_len + _TEXT_WRAP_LEN + _START_SPEECH_LEN
 
 
 def main(args):
@@ -94,8 +128,15 @@ def main(args):
 
     ref_audio = args.ref_audio
 
+    # Compute the exact prompt length per prompt (see compute_prompt_len): the
+    # text token count varies per line, so a --txt-prompts batch must recompute
+    # it for every entry rather than reuse one length.
+    print(f"Computing prompt lengths for model {args.model}...")
+
     inputs = []
     for text in texts:
+        prompt_len = compute_prompt_len(text, args.model)
+
         additional_information = {
             "text": [text],
         }
@@ -106,7 +147,7 @@ def main(args):
 
         inputs.append(
             {
-                "prompt_token_ids": [0] * estimate_prompt_len(text),
+                "prompt_token_ids": [0] * prompt_len,
                 "additional_information": additional_information,
             }
         )

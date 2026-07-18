@@ -44,7 +44,6 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 logger = init_logger(__name__)
 
 S3GEN_SR = 24000
-S3_SR = 16000
 SPEECH_VOCAB_SIZE = 6561  # Valid speech tokens are [0, 6561); SOS/EOS and padding are >= this
 S3GEN_SIL = 4299  # Silence token
 
