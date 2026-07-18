@@ -211,7 +211,8 @@ class DiffusersPipelineLoader:
             # safetensors file. Using both breaks.
             # Here, we download the `model.safetensors.index.json` and filter
             # any files not found in the index.
-            if not is_local:
+            # Single-file components have no index file; skip the download.
+            if not is_local and index_file:
                 download_safetensors_index_file_from_hf(
                     model_name_or_path,
                     index_file,
