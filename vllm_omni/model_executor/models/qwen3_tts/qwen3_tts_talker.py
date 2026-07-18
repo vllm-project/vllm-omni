@@ -523,7 +523,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             key = self._speaker_cache.make_cache_key(
                 profile["voice_name_lower"],
                 model_type=f"qwen3_tts_{mode}",
-                created_at=0,
+                created_at=int(profile.get("created_at", 0) or 0),
             )
             self._speaker_cache.put(key, artifacts)
             loaded += 1

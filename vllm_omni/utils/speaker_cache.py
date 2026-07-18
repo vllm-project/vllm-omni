@@ -228,6 +228,83 @@ def load_validated_profile_tensors(
     return tensors
 
 
+def save_custom_voice_profile(
+    custom_voice_dir: str | os.PathLike[str],
+    *,
+    expected_model_type: str,
+    voice_name: str,
+    tensors: dict[str, torch.Tensor],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist one custom voice profile using the shared manifest schema."""
+    try:
+        from safetensors.torch import save_file
+    except ImportError as exc:
+        raise ValueError("safetensors is required to save custom voice profiles") from exc
+
+    from vllm_omni.utils.custom_voice_io import safe_voice_stem
+
+    root = Path(custom_voice_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / _CUSTOM_VOICE_MANIFEST
+    manifest = _load_custom_voice_manifest(root) or {
+        "schema_version": _CUSTOM_VOICE_SCHEMA_VERSION,
+        "model_type": expected_model_type,
+        "voices": {},
+    }
+    manifest_model_type = manifest.get("model_type")
+    if manifest_model_type and manifest_model_type != expected_model_type:
+        raise ValueError(f"custom voice manifest model_type={manifest_model_type!r}, expected {expected_model_type!r}")
+    manifest["model_type"] = expected_model_type
+    manifest.setdefault("schema_version", _CUSTOM_VOICE_SCHEMA_VERSION)
+
+    filename = str(profile.get("file") or f"{safe_voice_stem(voice_name)}.safetensors")
+    file_path = (root / filename).resolve()
+    if not file_path.is_relative_to(root):
+        raise ValueError(f"custom voice file path escapes custom_voice_dir: {filename}")
+
+    tmp_path = file_path.with_name(f".{file_path.name}.{os.getpid()}.tmp")
+    try:
+        save_file(tensors, str(tmp_path))
+        os.replace(tmp_path, file_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    entry = dict(profile)
+    entry.update(
+        {
+            "name": voice_name,
+            "file": filename,
+        }
+    )
+    manifest.setdefault("voices", {})[voice_name] = entry
+
+    tmp_manifest = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_manifest.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_manifest, manifest_path)
+    finally:
+        try:
+            tmp_manifest.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    saved = dict(entry)
+    saved.update(
+        {
+            "voice_name_lower": voice_name.lower(),
+            "file_path": str(file_path),
+            "custom_voice_dir": str(root),
+            "model_type": expected_model_type,
+            "schema_version": manifest.get("schema_version", _CUSTOM_VOICE_SCHEMA_VERSION),
+        }
+    )
+    return saved
+
+
 class SpeakerEmbeddingCache:
     """Thread-safe in-memory LRU cache for speaker extraction artifacts."""
 

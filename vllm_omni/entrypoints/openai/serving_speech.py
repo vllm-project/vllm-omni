@@ -72,9 +72,19 @@ from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    save_custom_voice_profile,
 )
 
 logger = init_logger(__name__)
+
+
+class SpeakerNotFoundError(ValueError):
+    """Raised when the requested speaker does not exist in uploaded_speakers."""
+
+
+class SpeakerCacheUnsupportedError(ValueError):
+    """Raised when speaker cache generation is not supported."""
+
 
 # TTS Configuration
 _MING_TTS_MODEL_ARCHS = {"MingTTSForConditionalGeneration"}
@@ -331,6 +341,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._speaker_cache = get_speaker_cache()
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
+        self._speaker_cache_build_locks: dict[str, asyncio.Lock] = {}
         self._restore_uploaded_speakers()
         logger.info(
             "Speaker storage: dir=%s, max_speakers=%d, restored=%d",
@@ -1480,9 +1491,210 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     logger.warning("Failed to delete audio file for '%s': %s", name, e)
 
             self._speaker_cache.clear(voice_name_lower)
+            self._speaker_cache_build_locks.pop(voice_name_lower, None)
 
         logger.info("Deleted voice '%s'", name)
         return True
+
+    def _get_speaker_cache_build_lock(self, speaker_key: str) -> asyncio.Lock:
+        return self._speaker_cache_build_locks.setdefault(speaker_key, asyncio.Lock())
+
+    def _qwen3_speaker_cache_key(self, speaker_key: str, speaker_info: dict[str, Any]) -> tuple[str, str, int]:
+        return self._speaker_cache.make_cache_key(
+            speaker_key,
+            model_type=f"qwen3_tts_{self._qwen3_speaker_cache_mode(speaker_info)}",
+            created_at=int(speaker_info.get("created_at", 0)),
+        )
+
+    @staticmethod
+    def _qwen3_speaker_cache_mode(speaker_info: dict[str, Any]) -> str:
+        ref_text = speaker_info.get("ref_text")
+        return "icl" if isinstance(ref_text, str) and ref_text.strip() else "xvec"
+
+    def _has_qwen3_speaker_cache(self, speaker_key: str, speaker_info: dict[str, Any]) -> bool:
+        return self._speaker_cache.get(self._qwen3_speaker_cache_key(speaker_key, speaker_info)) is not None
+
+    def _qwen3_matching_speaker_profile(self, speaker_key: str, speaker_info: dict[str, Any]) -> dict[str, Any] | None:
+        profile = self.precomputed_speakers.get(speaker_key)
+        if profile is None:
+            return None
+        try:
+            profile_created_at = int(profile.get("created_at", 0) or 0)
+            speaker_created_at = int(speaker_info.get("created_at", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if profile_created_at != speaker_created_at:
+            return None
+        profile_mode = str(profile.get("mode") or "xvec").lower()
+        if profile_mode != self._qwen3_speaker_cache_mode(speaker_info):
+            return None
+        return profile
+
+    def _has_qwen3_speaker_cache_or_profile(self, speaker_key: str, speaker_info: dict[str, Any]) -> bool:
+        return self._has_qwen3_speaker_cache(speaker_key, speaker_info) or (
+            self._qwen3_matching_speaker_profile(speaker_key, speaker_info) is not None
+        )
+
+    @staticmethod
+    def _qwen3_ref_code_length_from_cache_entry(cache_entry: dict[str, Any] | None) -> int | None:
+        if cache_entry is None:
+            return None
+        ref_code = cache_entry.get("ref_code")
+        if isinstance(ref_code, torch.Tensor) and ref_code.ndim >= 1:
+            return int(ref_code.shape[0])
+        if isinstance(ref_code, list) and ref_code:
+            return len(ref_code)
+        return None
+
+    def _custom_voice_profile_output_dir(self) -> Path:
+        custom_voice_dir = self._get_custom_voice_dir()
+        if custom_voice_dir:
+            return Path(custom_voice_dir).expanduser()
+        return self.uploaded_speakers_dir
+
+    def _save_qwen3_uploaded_speaker_profile(
+        self,
+        speaker_key: str,
+        speaker_info: dict[str, Any],
+        *,
+        speaker_embedding: torch.Tensor,
+        ref_code: torch.Tensor | None,
+    ) -> dict[str, Any]:
+        mode = self._qwen3_speaker_cache_mode(speaker_info)
+        tensors = {"speaker_embedding": speaker_embedding.reshape(-1).contiguous().cpu().to(torch.float32)}
+        if mode == "icl":
+            if ref_code is None:
+                raise ValueError(f"ICL voice '{speaker_key}' produced no ref_code")
+            tensors["ref_code"] = ref_code.contiguous().cpu().to(torch.int32)
+
+        created_at = int(speaker_info.get("created_at", 0))
+        profile: dict[str, Any] = {
+            "file": f"{_sanitize_filename(speaker_key)}_{created_at}_qwen3_tts.safetensors",
+            "mode": mode,
+            "created_at": created_at,
+            "embedding_dim": int(tensors["speaker_embedding"].numel()),
+            "source": "uploaded_voice_cache",
+        }
+        ref_text = speaker_info.get("ref_text")
+        if isinstance(ref_text, str) and ref_text.strip():
+            profile["ref_text"] = ref_text.strip()
+        if ref_code is not None:
+            profile["ref_code_length"] = int(ref_code.shape[0])
+        if speaker_info.get("speaker_description"):
+            profile["speaker_description"] = speaker_info["speaker_description"]
+
+        saved_profile = save_custom_voice_profile(
+            self._custom_voice_profile_output_dir(),
+            expected_model_type="qwen3_tts",
+            voice_name=speaker_info.get("name") or speaker_key,
+            tensors=tensors,
+            profile=profile,
+        )
+        validated = load_validated_profile_tensors(
+            saved_profile,
+            expected_model_type="qwen3_tts",
+            qwen3_embedding_dim=self._get_qwen_tts_expected_speaker_embedding_dim(),
+        )
+        if validated is None:
+            raise ValueError(f"Saved Qwen3-TTS custom voice profile for '{speaker_key}' failed validation")
+        return saved_profile
+
+    async def create_voice_cache(self, voice_name: str, force: bool = False) -> dict[str, Any]:
+        """HTTP-boundary wrapper that builds a Qwen3-TTS custom voice profile."""
+        if self._tts_model_type != "qwen3_tts":
+            raise SpeakerCacheUnsupportedError("Voice cache generation is only supported for Qwen3-TTS models")
+        if self._tts_stage is None or not hasattr(self.engine_client, "collective_rpc"):
+            raise SpeakerCacheUnsupportedError("Voice cache generation requires multi-stage engine support")
+
+        speaker_key = voice_name.lower()
+        if speaker_key not in self.uploaded_speakers:
+            raise SpeakerNotFoundError(f"Voice '{voice_name}' not found")
+        speaker_info = self.uploaded_speakers[speaker_key]
+
+        if speaker_info.get("embedding_source") == "direct":
+            raise SpeakerCacheUnsupportedError(
+                f"Voice '{voice_name}' uses a pre-computed speaker embedding. "
+                "Cache generation only supports audio-uploaded voices."
+            )
+        if speaker_info.get("embedding_source", "audio") != "audio":
+            raise SpeakerCacheUnsupportedError(
+                f"Voice '{voice_name}' has unsupported embedding_source={speaker_info.get('embedding_source')!r}"
+            )
+
+        async with self._get_speaker_cache_build_lock(speaker_key):
+            cache_key = self._qwen3_speaker_cache_key(speaker_key, speaker_info)
+            if not force and self._has_qwen3_speaker_cache_or_profile(speaker_key, speaker_info):
+                return {
+                    "voice": voice_name,
+                    "cache_status": "ready",
+                    "message": "Cache already exists and is valid",
+                }
+
+            audio_data = self._load_uploaded_audio(voice_name)
+            if audio_data is None:
+                raise ValueError(
+                    f"Audio file for uploaded voice '{voice_name}' is missing or corrupted. "
+                    f"Delete this voice via DELETE /v1/audio/voices/{voice_name} and re-upload."
+                )
+            wav_np, sr = audio_data
+            payload = await self._build_speaker_cache_payload(wav_np, int(sr), speaker_info.get("ref_text"))
+            ref_code = payload.get("ref_code")
+            ref_code_tensor = torch.tensor(ref_code, dtype=torch.long) if ref_code is not None else None
+            speaker_embedding = torch.tensor(payload["ref_spk_embedding"], dtype=torch.float32)
+            saved_profile = self._save_qwen3_uploaded_speaker_profile(
+                speaker_key,
+                speaker_info,
+                speaker_embedding=speaker_embedding,
+                ref_code=ref_code_tensor,
+            )
+            artifacts = {
+                "ref_code": ref_code_tensor.contiguous().cpu() if ref_code_tensor is not None else None,
+                "ref_spk_embedding": speaker_embedding.reshape(-1).contiguous().cpu(),
+                "icl_mode": bool(payload.get("icl_mode")),
+                "ref_text": payload.get("ref_text"),
+            }
+            self._speaker_cache.put(cache_key, artifacts)
+            self.precomputed_speakers[speaker_key] = saved_profile
+
+        return {"voice": voice_name, "cache_status": "ready"}
+
+    async def _build_speaker_cache_payload(
+        self,
+        wav_np: np.ndarray,
+        sample_rate: int,
+        ref_text: str | None,
+    ) -> dict[str, Any]:
+        wav_np = np.asarray(wav_np, dtype=np.float32)
+        if wav_np.ndim > 1:
+            wav_np = np.mean(wav_np, axis=-1)
+
+        # msgspec IPC requires plain Python types; numpy arrays do not survive
+        # this RPC boundary. This can be expensive for long reference audio.
+        results = await self.engine_client.collective_rpc(
+            method="create_voice_clone_prompt",
+            args=(wav_np.tolist(), int(sample_rate), ref_text),
+            stage_ids=[self._tts_stage.stage_id],
+        )
+        return self._extract_rpc_payload(results)
+
+    @staticmethod
+    def _extract_rpc_payload(results: list[Any]) -> dict[str, Any]:
+        if not results:
+            raise ValueError("Empty RPC response")
+        stage_result = results[0]
+        if isinstance(stage_result, dict) and stage_result.get("supported") is False:
+            raise ValueError(f"Stage RPC failed: {stage_result.get('error', 'unknown')}")
+        if isinstance(stage_result, dict) and stage_result.get("todo"):
+            raise ValueError(f"Stage RPC not supported: {stage_result.get('reason', 'unknown')}")
+        if isinstance(stage_result, list):
+            if not stage_result:
+                raise ValueError("Stage RPC returned empty worker results")
+            payload = stage_result[0]
+        else:
+            payload = stage_result
+        if not isinstance(payload, dict) or "ref_spk_embedding" not in payload:
+            raise ValueError(f"Invalid RPC payload: {type(payload)}")
+        return payload
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -1698,9 +1910,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if voice_lower in self.uploaded_speakers:
                     # Check if data file exists for uploaded speaker
                     speaker_info = self.uploaded_speakers[voice_lower]
-                    file_path = Path(speaker_info["file_path"])
-                    if not file_path.exists():
-                        return f"Data file for uploaded speaker '{request.voice}' not found on disk"
+                    file_path = speaker_info.get("file_path")
+                    if not file_path or not Path(file_path).exists():
+                        has_warm_cache = (
+                            self._tts_model_type == "qwen3_tts"
+                            and speaker_info.get("embedding_source") == "audio"
+                            and self._has_qwen3_speaker_cache_or_profile(voice_lower, speaker_info)
+                        )
+                        if not has_warm_cache:
+                            return f"Data file for uploaded speaker '{request.voice}' not found on disk"
                 elif voice_lower in self.precomputed_speakers:
                     profile = self.precomputed_speakers[voice_lower]
                     mode = str(profile.get("mode") or "xvec").lower()
@@ -2967,6 +3185,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             params["language"] = ["Auto"]
 
+        uploaded_voice_resolved = False
+
         # Speaker (voice)
         if request.voice is not None:
             voice_lower = request.voice.lower()
@@ -2981,8 +3201,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Check if this voice was uploaded with a pre-computed embedding.
                 # Populate request.speaker_embedding so the existing code path
                 # (below) handles voice_clone_prompt and x_vector_only_mode.
-                embedding = self._get_uploaded_speaker_embedding(request.voice)
-                if embedding is not None:
+                if speaker_info.get("embedding_source") == "audio" and self._has_qwen3_speaker_cache_or_profile(
+                    voice_lower, speaker_info
+                ):
+                    stored_ref_text = speaker_info.get("ref_text")
+                    cache_entry = self._speaker_cache.get(self._qwen3_speaker_cache_key(voice_lower, speaker_info))
+                    profile = self._qwen3_matching_speaker_profile(voice_lower, speaker_info)
+                    params["task_type"] = ["Base"]
+                    if stored_ref_text:
+                        params["ref_text"] = [stored_ref_text]
+                        params["x_vector_only_mode"] = [False]
+                        ref_code_length = self._qwen3_ref_code_length_from_cache_entry(cache_entry)
+                        if ref_code_length is None and profile is not None:
+                            ref_code_length = profile.get("ref_code_length")
+                        if ref_code_length:
+                            params["ref_code_length"] = [int(ref_code_length)]
+                    else:
+                        params["x_vector_only_mode"] = [True]
+                    logger.info("Using warmed speaker cache for uploaded voice: %s", request.voice)
+                    uploaded_voice_resolved = True
+                elif (embedding := self._get_uploaded_speaker_embedding(request.voice)) is not None:
                     request.speaker_embedding = embedding
                     params["speaker"] = [voice_lower]
                     params["task_type"] = ["Base"]
@@ -3003,6 +3241,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     logger.info(
                         "Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text)
                     )
+                    uploaded_voice_resolved = True
             elif voice_lower in self.precomputed_speakers and request.ref_audio is None:
                 profile = self.precomputed_speakers[voice_lower]
                 mode = str(profile.get("mode") or "xvec").lower()
@@ -3027,21 +3266,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["instruct"] = [""]
 
         # Voice clone: ref_audio resolved in create_speech(), not here.
-        if request.ref_text is not None:
-            params["ref_text"] = [request.ref_text]
-        if request.speaker_embedding is not None:
-            # Store as plain float list (not tensor) so it survives msgspec
-            # serialization through the EngineCore IPC boundary.  The talker's
-            # _build_prompt_embeds converts it back to a tensor on the GPU.
-            params["voice_clone_prompt"] = [
-                {
-                    "ref_spk_embedding": list(request.speaker_embedding),
-                }
-            ]
-            # speaker_embedding implies x_vector_only_mode
-            params["x_vector_only_mode"] = [True]
-        elif request.x_vector_only_mode is not None:
-            params["x_vector_only_mode"] = [request.x_vector_only_mode]
+        if not uploaded_voice_resolved:
+            if request.ref_text is not None:
+                params["ref_text"] = [request.ref_text]
+            if request.speaker_embedding is not None:
+                # Store as plain float list (not tensor) so it survives msgspec
+                # serialization through the EngineCore IPC boundary.  The talker's
+                # _build_prompt_embeds converts it back to a tensor on the GPU.
+                params["voice_clone_prompt"] = [
+                    {
+                        "ref_spk_embedding": list(request.speaker_embedding),
+                    }
+                ]
+                # speaker_embedding implies x_vector_only_mode
+                params["x_vector_only_mode"] = [True]
+            elif request.x_vector_only_mode is not None:
+                params["x_vector_only_mode"] = [request.x_vector_only_mode]
 
         # Generation parameters
         if request.max_new_tokens is not None:

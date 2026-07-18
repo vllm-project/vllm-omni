@@ -126,7 +126,11 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_speech import (
+    OmniOpenAIServingSpeech,
+    SpeakerCacheUnsupportedError,
+    SpeakerNotFoundError,
+)
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
     OmniOpenAIServingVideo,
@@ -1495,6 +1499,61 @@ async def upload_voice(
             f"Failed to upload voice: {str(e)}",
             err_type="InternalServerError",
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+
+@router.post(
+    "/v1/audio/voices/{name}/cache",
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": dict},
+        HTTPStatus.NOT_FOUND.value: {"model": dict},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": dict},
+    },
+)
+async def create_voice_cache(
+    name: str,
+    raw_request: Request,
+    force: bool = Query(
+        False,
+        description=("Force rebuild even if the in-memory speaker cache already exists."),
+    ),
+):
+    """Pre-compute voice clone prompt for an uploaded voice.
+
+    Triggers GPU-side speaker embedding extraction and reference audio
+    codec encoding on the TTS worker. Results are persisted using the
+    shared custom voice profile schema and loaded into the speaker cache
+    for faster subsequent TTS requests.
+
+    Only supports audio-uploaded voices (not direct-embedding uploads).
+    """
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+    try:
+        result = await handler.create_voice_cache(name, force=force)
+        return JSONResponse(content=result)
+    except SpeakerNotFoundError as e:
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=HTTPStatus.NOT_FOUND.value,
+        )
+    except SpeakerCacheUnsupportedError as e:
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except ValueError as e:
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except Exception as e:
+        logger.exception("Failed to create voice cache for '%s': %s", name, e)
+        return JSONResponse(
+            content={"success": False, "error": f"Internal error: {str(e)}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
         )
 
 
