@@ -29,7 +29,7 @@ _DEFAULT_STAGE_CONFIG_PATH = Path(get_deploy_config_path("dynin_omni_ci.yaml"))
 
 models = ["snu-aidas/Dynin-Omni"]
 stage_configs = [str(_DEFAULT_STAGE_CONFIG_PATH)]
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+test_params = [(model, stage_config, {"trust_remote_code": True}) for model in models for stage_config in stage_configs]
 
 DYNIN_CONFIG_PATH = str(_DEFAULT_DYNIN_CONFIG_PATH) if _DEFAULT_DYNIN_CONFIG_PATH is not None else None
 
