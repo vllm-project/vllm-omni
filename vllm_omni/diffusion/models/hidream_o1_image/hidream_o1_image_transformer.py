@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -902,9 +902,9 @@ class TimestepEmbedder(nn.Module):
     @staticmethod
     def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+            device=t.device
+        )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
@@ -1013,7 +1013,6 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         video_grid_thw: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         if video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
             video_grid_thw[:, 0] = 1
@@ -1164,14 +1163,16 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
             raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
+                "Image features and image tokens do not match: "
+                f"tokens: {n_image_tokens}, features {image_features.shape[0]}"
             )
 
         n_video_tokens = special_video_mask.sum()
         special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
             raise ValueError(
-                f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
+                "Video features and video tokens do not match: "
+                f"tokens: {n_video_tokens}, features {video_features.shape[0]}"
             )
 
         return special_image_mask, special_video_mask
@@ -1214,7 +1215,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             )
 
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError('You must specify exactly one of input_ids or inputs_embeds')
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -1263,7 +1264,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
         if position_ids is None:
             attention_mask_tensor = (
-                attention_mask if not isinstance(attention_mask, dict) else attention_mask['full_attention']
+                attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
             )
             if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
                 attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
@@ -1294,9 +1295,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
                 delta = (
-                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
-                    if cache_position is not None
-                    else 0
+                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device) if cache_position is not None else 0
                 )
                 position_ids = torch.arange(seq_length, device=inputs_embeds.device)
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
@@ -1341,12 +1340,12 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
     ) -> Qwen3VLModelOutputWithPast:
         if use_flash_attn:
             raise NotImplementedError(
-                'flash-attention path in _forward_generation is not implemented yet; '
-                'currently only the eager / sdpa standard path is supported'
+                "flash-attention path in _forward_generation is not implemented yet; "
+                "currently only the eager / sdpa standard path is supported"
             )
 
-        precomputed_image_embeds = kwargs.pop('precomputed_image_embeds', None)
-        precomputed_deepstack_image_embeds = kwargs.pop('precomputed_deepstack_image_embeds', None)
+        precomputed_image_embeds = kwargs.pop("precomputed_image_embeds", None)
+        precomputed_deepstack_image_embeds = kwargs.pop("precomputed_deepstack_image_embeds", None)
         cond_image_embeds_out: torch.FloatTensor | None = None
         cond_deepstack_image_embeds_out: torch.FloatTensor | None = None
 
@@ -1360,11 +1359,17 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         if pixel_values is not None:
             if precomputed_image_embeds is not None and precomputed_deepstack_image_embeds is not None:
                 image_embeds = precomputed_image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-                deepstack_image_embeds = [d.to(inputs_embeds.device, inputs_embeds.dtype) for d in precomputed_deepstack_image_embeds]
+                deepstack_image_embeds = [
+                    d.to(inputs_embeds.device, inputs_embeds.dtype) for d in precomputed_deepstack_image_embeds
+                ]
             else:
                 image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
                 image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                image_features=image_embeds,
+            )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             cond_image_embeds_out = image_embeds
             cond_deepstack_image_embeds_out = deepstack_image_embeds
@@ -1372,7 +1377,11 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         if pixel_values_videos is not None:
             video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
+            _, video_mask = self.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                video_features=video_embeds,
+            )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         visual_pos_masks = None
@@ -1403,7 +1412,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         timestep = timestep.to(inputs_embeds.device)
         t_emb = self.t_embedder1(timestep)
 
-        tms_mask = (input_ids == self.tms_token_id)
+        tms_mask = input_ids == self.tms_token_id
         tms_mask_3d = tms_mask.unsqueeze(-1).expand_as(inputs_embeds)
         t_emb_expanded = t_emb.unsqueeze(1).expand_as(inputs_embeds)
         inputs_embeds = torch.where(tms_mask_3d, t_emb_expanded, inputs_embeds)
@@ -1421,8 +1430,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             if visual_pos_masks.shape[0] != batch_size:
                 visual_pos_masks = visual_pos_masks.expand(batch_size, -1)
             vinputs_pad = torch.zeros(
-                visual_pos_masks.shape[0], vinputs_seq_len,
-                dtype=visual_pos_masks.dtype, device=visual_pos_masks.device,
+                visual_pos_masks.shape[0],
+                vinputs_seq_len,
+                dtype=visual_pos_masks.dtype,
+                device=visual_pos_masks.device,
             )
             visual_pos_masks = torch.cat([visual_pos_masks, vinputs_pad], dim=1)
 
@@ -1441,8 +1452,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         attn_masks = []
         for b in range(batch_size):
             causal = torch.full(
-                (total_seq_len, total_seq_len), min_val,
-                device=inputs_embeds.device, dtype=dtype,
+                (total_seq_len, total_seq_len),
+                min_val,
+                device=inputs_embeds.device,
+                dtype=dtype,
             )
             causal = torch.triu(causal, diagonal=1)
             gen_positions = token_types[b].bool()
@@ -1461,7 +1474,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             return_mid_results_layers=return_mid_results_layers,
         )
         hidden_states = outputs.last_hidden_state
-        mid_results = outputs.mid_results if hasattr(outputs, 'mid_results') else None
+        mid_results = outputs.mid_results if hasattr(outputs, "mid_results") else None
 
         x_pred = self.final_layer2(hidden_states)
 
@@ -1476,7 +1489,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
 class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {}
-    _tied_weights_keys = ['lm_head.weight']
+    _tied_weights_keys = ["lm_head.weight"]
     # See gemma3 grad-acc fix (huggingface/transformers#37208): setting False
     # keeps `**loss_kwargs` from being auto-forwarded into `self.loss_function`,
     # which is important because our loss_function does not accept arbitrary
@@ -1513,9 +1526,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     ):
         return self.model.get_video_features(pixel_values_videos, video_grid_thw)
 
-    def get_image_features(
-        self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None
-    ):
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor | None = None):
         return self.model.get_image_features(pixel_values, image_grid_thw)
 
     # Property re-exports so code accustomed to reaching `model.visual` /
@@ -1573,9 +1584,9 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if vinputs is not None:
             return Qwen3VLCausalLMOutputWithPast(
                 x_pred=outputs.x_pred,
-                mid_results=outputs.mid_results if hasattr(outputs, 'mid_results') else None,
-                cond_image_embeds=getattr(outputs, 'cond_image_embeds', None),
-                cond_deepstack_image_embeds=getattr(outputs, 'cond_deepstack_image_embeds', None),
+                mid_results=outputs.mid_results if hasattr(outputs, "mid_results") else None,
+                cond_image_embeds=getattr(outputs, "cond_image_embeds", None),
+                cond_deepstack_image_embeds=getattr(outputs, "cond_deepstack_image_embeds", None),
             )
 
         hidden_states = outputs[0]
@@ -1629,11 +1640,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         # Qwen3-VL position_ids are prepared with rope_deltas inside forward
         # (see Qwen3VLModel.forward M-RoPE section); set to None so the
         # generation loop lets forward re-derive them.
-        model_inputs['position_ids'] = None
+        model_inputs["position_ids"] = None
 
         if cache_position[0] != 0:
-            model_inputs['pixel_values'] = None
-            model_inputs['pixel_values_videos'] = None
+            model_inputs["pixel_values"] = None
+            model_inputs["pixel_values_videos"] = None
 
         return model_inputs
 
@@ -1691,13 +1702,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if expand_size == 1:
             return input_ids, model_kwargs
 
-        visual_keys = ['pixel_values', 'image_grid_thw', 'pixel_values_videos', 'video_grid_thw', 'second_per_grid_ts']
+        visual_keys = ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts"]
 
         def _expand_dict_for_generation_visual(dict_to_expand):
-            image_grid_thw = model_kwargs.get('image_grid_thw', None)
-            video_grid_thw = model_kwargs.get('video_grid_thw', None)
+            image_grid_thw = model_kwargs.get("image_grid_thw", None)
+            video_grid_thw = model_kwargs.get("video_grid_thw", None)
             image_nums, video_nums = self._get_image_nums_and_video_nums(
-                input_ids, inputs_embeds=model_kwargs.get('inputs_embeds', None)
+                input_ids, inputs_embeds=model_kwargs.get("inputs_embeds", None)
             )
 
             def _repeat_interleave_samples(x, lengths, repeat_times):
@@ -1707,29 +1718,29 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 return result
 
             for key in dict_to_expand:
-                if key == 'pixel_values':
+                if key == "pixel_values":
                     samples = torch.split(image_grid_thw, list(image_nums))
                     lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=lengths, repeat_times=expand_size
                     )
-                elif key == 'image_grid_thw':
+                elif key == "image_grid_thw":
                     lengths = list(image_nums)
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=lengths, repeat_times=expand_size
                     )
-                elif key == 'pixel_values_videos':
+                elif key == "pixel_values_videos":
                     samples = torch.split(video_grid_thw, list(video_nums))
                     lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=lengths, repeat_times=expand_size
                     )
-                elif key == 'video_grid_thw':
+                elif key == "video_grid_thw":
                     lengths = list(video_nums)
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=lengths, repeat_times=expand_size
                     )
-                elif key == 'second_per_grid_ts':
+                elif key == "second_per_grid_ts":
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=list(video_nums), repeat_times=expand_size
                     )
@@ -1738,7 +1749,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         def _expand_dict_for_generation(dict_to_expand):
             for key in dict_to_expand:
                 if (
-                    key != 'cache_position'
+                    key != "cache_position"
                     and dict_to_expand[key] is not None
                     and isinstance(dict_to_expand[key], torch.Tensor)
                     and key not in visual_keys
@@ -1754,9 +1765,9 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         model_kwargs = _expand_dict_for_generation(model_kwargs)
 
         if is_encoder_decoder:
-            if model_kwargs.get('encoder_outputs') is None:
-                raise ValueError('If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined.')
-            model_kwargs['encoder_outputs'] = _expand_dict_for_generation(model_kwargs['encoder_outputs'])
+            if model_kwargs.get("encoder_outputs") is None:
+                raise ValueError("If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined.")
+            model_kwargs["encoder_outputs"] = _expand_dict_for_generation(model_kwargs["encoder_outputs"])
 
         return input_ids, model_kwargs
 

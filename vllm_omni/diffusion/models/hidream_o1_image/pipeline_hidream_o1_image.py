@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import os
-from typing import ClassVar, Iterable
+from collections.abc import Iterable
+from typing import ClassVar
 
-from einops import rearrange
 import numpy as np
-from PIL import Image
 import torch
+from einops import rearrange
+from PIL import Image
 from torch import nn
 from vllm.logger import init_logger
 
@@ -32,8 +33,17 @@ T_EPS = 0.001
 
 # upstream: HiDream-O1-Image models/utils.py L7-19 @21bcd30471ac
 PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
-    (2048, 2048), (2304, 1728), (1728, 2304), (2560, 1440), (1440, 2560),
-    (2496, 1664), (1664, 2496), (3104, 1312), (1312, 3104), (2304, 1792), (1792, 2304),
+    (2048, 2048),
+    (2304, 1728),
+    (1728, 2304),
+    (2560, 1440),
+    (1440, 2560),
+    (2496, 1664),
+    (1664, 2496),
+    (3104, 1312),
+    (1312, 3104),
+    (2304, 1792),
+    (1792, 2304),
 )
 
 
@@ -201,9 +211,7 @@ def build_t2i_text_sample(
     )
     input_ids = tokenizer.encode(template_caption, return_tensors="pt", add_special_tokens=False)
 
-    image_grid_thw = torch.tensor(
-        [1, height // PATCH_SIZE, width // PATCH_SIZE], dtype=torch.int64
-    ).unsqueeze(0)
+    image_grid_thw = torch.tensor([1, height // PATCH_SIZE, width // PATCH_SIZE], dtype=torch.int64).unsqueeze(0)
 
     vision_tokens = torch.zeros((1, image_len), dtype=input_ids.dtype) + image_token_id
     vision_tokens[0, 0] = vision_start_token_id
@@ -226,17 +234,17 @@ def build_t2i_text_sample(
 
     token_types = torch.zeros((1, all_seq_len), dtype=input_ids.dtype)
     bgn = txt_seq_len - TIMESTEP_TOKEN_NUM
-    token_types[0, bgn: bgn + image_len + TIMESTEP_TOKEN_NUM] = 1
-    token_types[0, txt_seq_len - TIMESTEP_TOKEN_NUM: txt_seq_len] = 3
+    token_types[0, bgn : bgn + image_len + TIMESTEP_TOKEN_NUM] = 1
+    token_types[0, txt_seq_len - TIMESTEP_TOKEN_NUM : txt_seq_len] = 3
 
-    vinput_mask = (token_types == 1)
+    vinput_mask = token_types == 1
     token_types_bin = (token_types > 0).to(token_types.dtype)
 
     return {
-        'input_ids': input_ids,
-        'position_ids': position_ids,
-        'token_types': token_types_bin,
-        'vinput_mask': vinput_mask,
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "token_types": token_types_bin,
+        "vinput_mask": vinput_mask,
     }
 
 
@@ -260,9 +268,7 @@ def build_hidream_o1_scheduler(
     scheduler.set_timesteps(num_inference_steps, device=device)
 
     if timesteps_list is not None:
-        scheduler.timesteps = torch.tensor(
-            timesteps_list, device=device, dtype=torch.long
-        )
+        scheduler.timesteps = torch.tensor(timesteps_list, device=device, dtype=torch.long)
         sigmas = [t.item() / 1000.0 for t in scheduler.timesteps]
         sigmas.append(0.0)
         scheduler.sigmas = torch.tensor(sigmas, device=device)
@@ -279,17 +285,14 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
         """Convert HiDream-O1 patch-space output to a PIL RGB image."""
         if not isinstance(output_data, tuple) or len(output_data) != 3:
             raise TypeError(
-                "HiDreamO1 postprocess expects "
-                "(patch_tensor, height, width), "
-                f"got {type(output_data).__name__}"
+                f"HiDreamO1 postprocess expects (patch_tensor, height, width), got {type(output_data).__name__}"
             )
 
         z, height, width = output_data
 
         if not torch.is_tensor(z):
             raise TypeError(
-                "HiDreamO1 postprocess expects the first tuple element "
-                f"to be a torch.Tensor, got {type(z).__name__}"
+                f"HiDreamO1 postprocess expects the first tuple element to be a torch.Tensor, got {type(z).__name__}"
             )
 
         height = int(height)
@@ -297,14 +300,12 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
 
         if height <= 0 or width <= 0:
             raise ValueError(
-                f"HiDreamO1 postprocess requires positive height/width, "
-                f"got height={height}, width={width}"
+                f"HiDreamO1 postprocess requires positive height/width, got height={height}, width={width}"
             )
 
         if height % PATCH_SIZE != 0 or width % PATCH_SIZE != 0:
             raise ValueError(
-                "HiDreamO1 output resolution must be divisible by "
-                f"PATCH_SIZE={PATCH_SIZE}, got {width}x{height}"
+                f"HiDreamO1 output resolution must be divisible by PATCH_SIZE={PATCH_SIZE}, got {width}x{height}"
             )
 
         h_patches = height // PATCH_SIZE
@@ -314,16 +315,11 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
 
         if z.ndim != 3:
             raise ValueError(
-                "HiDreamO1 patch tensor must have shape "
-                "(B, image_len, patch_dim), "
-                f"got shape={tuple(z.shape)}"
+                f"HiDreamO1 patch tensor must have shape (B, image_len, patch_dim), got shape={tuple(z.shape)}"
             )
 
         if z.shape[0] != 1:
-            raise ValueError(
-                "HiDreamO1 postprocess currently expects batch size 1, "
-                f"got batch_size={z.shape[0]}"
-            )
+            raise ValueError(f"HiDreamO1 postprocess currently expects batch size 1, got batch_size={z.shape[0]}")
 
         if z.shape[1] != expected_image_len:
             raise ValueError(
@@ -333,10 +329,7 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
             )
 
         if z.shape[2] != expected_patch_dim:
-            raise ValueError(
-                "HiDreamO1 patch dimension mismatch: "
-                f"got {z.shape[2]}, expected {expected_patch_dim}"
-            )
+            raise ValueError(f"HiDreamO1 patch dimension mismatch: got {z.shape[2]}, expected {expected_patch_dim}")
 
         # Preserve upstream decode order exactly:
         #   1. map patch values from [-1, 1] to [0, 1]
@@ -364,6 +357,7 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
         return Image.fromarray(arr).convert("RGB")
 
     return post_process_func
+
 
 class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     dummy_run_num_frames: ClassVar[int] = 0
@@ -398,13 +392,16 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def _init_processor_and_model(self) -> None:
         from transformers import AutoProcessor, PreTrainedTokenizerBase
+
         from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import (
             HiDreamO1ImageTransformer,
         )
 
         logger.info(
             "HiDreamO1ImagePipeline: loading processor + model from %s (dtype=%s, device=%s)",
-            self.model_dir, self.dtype, self.device,
+            self.model_dir,
+            self.dtype,
+            self.device,
         )
         self.processor = AutoProcessor.from_pretrained(self.model_dir)
         self.model = HiDreamO1ImageTransformer.from_pretrained(
@@ -415,9 +412,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         self._add_special_tokens(self.processor)
         self.tokenizer = (
-            self.processor
-            if isinstance(self.processor, PreTrainedTokenizerBase)
-            else self.processor.tokenizer
+            self.processor if isinstance(self.processor, PreTrainedTokenizerBase) else self.processor.tokenizer
         )
         logger.info(
             "HiDreamO1ImagePipeline: ready (num_params=%.1fB)",
@@ -428,19 +423,13 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         actual_tms_ids = self.tokenizer.encode(self.tokenizer.tms_token, add_special_tokens=False)
         expected_tms_id = int(self.model.model.tms_token_id)
         if actual_tms_ids != [expected_tms_id]:
-            raise RuntimeError(
-                f"tms_token maps to {actual_tms_ids}, model expects [{expected_tms_id}]"
-            )
+            raise RuntimeError(f"tms_token maps to {actual_tms_ids}, model expects [{expected_tms_id}]")
 
     @staticmethod
     def _add_special_tokens(processor) -> None:
         from transformers import PreTrainedTokenizerBase
 
-        tok = (
-            processor
-            if isinstance(processor, PreTrainedTokenizerBase)
-            else processor.tokenizer
-        )
+        tok = processor if isinstance(processor, PreTrainedTokenizerBase) else processor.tokenizer
         tok.boi_token = "<|boi_token|>"
         tok.bor_token = "<|bor_token|>"
         tok.eor_token = "<|eor_token|>"
@@ -448,7 +437,8 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         tok.tms_token = "<|tms_token|>"
 
     def _resolve_generation_params(
-        self, req: OmniDiffusionRequest,
+        self,
+        req: OmniDiffusionRequest,
     ) -> tuple[str, int, int, int, int, float]:
         sp = req.sampling_params
 
@@ -457,9 +447,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         if sp.latents is not None:
             raise NotImplementedError("sp.latents not supported")
         if sp.num_outputs_per_prompt != 1:
-            raise NotImplementedError(
-                f"num_outputs_per_prompt={sp.num_outputs_per_prompt} not supported"
-            )
+            raise NotImplementedError(f"num_outputs_per_prompt={sp.num_outputs_per_prompt} not supported")
 
         if not req.prompts:
             raise ValueError("req.prompts is empty")
@@ -471,9 +459,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         elif isinstance(first_prompt, dict):
             raw_prompt = first_prompt.get("prompt")
             if not isinstance(raw_prompt, str):
-                raise TypeError(
-                    f"dict prompt must contain a str 'prompt' field; got {type(raw_prompt).__name__}"
-                )
+                raise TypeError(f"dict prompt must contain a str 'prompt' field; got {type(raw_prompt).__name__}")
             prompt = raw_prompt
         else:
             raise TypeError(f"prompt must be str or dict; got {type(first_prompt).__name__}")
@@ -486,7 +472,10 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         if (snapped_w, snapped_h) != (raw_w, raw_h):
             logger.info(
                 "HiDreamO1: resolution snapped from %dx%d to %dx%d",
-                raw_w, raw_h, snapped_w, snapped_h,
+                raw_w,
+                raw_h,
+                snapped_w,
+                snapped_h,
             )
 
         steps = 50 if sp.num_inference_steps is None else int(sp.num_inference_steps)
@@ -496,26 +485,17 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         generator = sp.generator
         if isinstance(generator, list):
             if len(generator) != 1:
-                raise NotImplementedError(
-                    "generator list only supported for single-output requests "
-                    "with one generator"
-                )
+                raise NotImplementedError("generator list only supported for single-output requests with one generator")
             generator = generator[0]
 
         generator_seed: int | None = None
         if generator is not None:
             if not hasattr(generator, "initial_seed"):
-                raise TypeError(
-                    "sp.generator must expose initial_seed(); "
-                    f"got {type(generator).__name__}"
-                )
+                raise TypeError(f"sp.generator must expose initial_seed(); got {type(generator).__name__}")
             generator_seed = int(generator.initial_seed())
 
         if sp.seed is not None and generator_seed is not None and int(sp.seed) != generator_seed:
-            raise ValueError(
-                "seed/generator mismatch: "
-                f"seed={int(sp.seed)} generator.initial_seed()={generator_seed}"
-            )
+            raise ValueError(f"seed/generator mismatch: seed={int(sp.seed)} generator.initial_seed()={generator_seed}")
 
         if sp.seed is None and generator_seed is None:
             raise RuntimeError("expected request initialization to resolve a concrete seed")
@@ -538,7 +518,8 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         return rearrange(
             noise,
             "B C (H p1) (W p2) -> B (H W) (C p1 p2)",
-            p1=PATCH_SIZE, p2=PATCH_SIZE,
+            p1=PATCH_SIZE,
+            p2=PATCH_SIZE,
         )
 
     def _forward_once(
@@ -560,9 +541,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         if outputs.x_pred is None:
             raise RuntimeError("model returned x_pred=None")
         if outputs.x_pred.shape[-1] != z_in.shape[-1]:
-            raise RuntimeError(
-                f"x_pred patch_dim {outputs.x_pred.shape[-1]} != z_in {z_in.shape[-1]}"
-            )
+            raise RuntimeError(f"x_pred patch_dim {outputs.x_pred.shape[-1]} != z_in {z_in.shape[-1]}")
 
         mask = sample["vinput_mask"][0]
         return outputs.x_pred[0, mask].unsqueeze(0)
@@ -585,32 +564,37 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         actual_image_len = int(sample["vinput_mask"].sum().item())
         if actual_image_len != expected_image_len:
             raise RuntimeError(
-                f"vinput_mask has {actual_image_len} slots, expected {expected_image_len} "
-                f"for {height}x{width}"
+                f"vinput_mask has {actual_image_len} slots, expected {expected_image_len} for {height}x{width}"
             )
-        return {
-            k: (v.to(self.device) if torch.is_tensor(v) else v)
-            for k, v in sample.items()
-        }
+        return {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in sample.items()}
 
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        prompt, height, width, num_inference_steps, seed, guidance_scale = \
-            self._resolve_generation_params(req)
+        prompt, height, width, num_inference_steps, seed, guidance_scale = self._resolve_generation_params(req)
 
         expected_image_len = (height // PATCH_SIZE) * (width // PATCH_SIZE)
         cond_sample = self._build_and_validate_sample(
-            prompt, height, width, expected_image_len,
+            prompt,
+            height,
+            width,
+            expected_image_len,
         )
         samples: list[dict] = [cond_sample]
         if guidance_scale > 1.0:
             uncond_sample = self._build_and_validate_sample(
-                " ", height, width, expected_image_len,
+                " ",
+                height,
+                width,
+                expected_image_len,
             )
             samples.append(uncond_sample)
 
         z = self._prepare_noise_and_patchify(
-            height, width, seed, self.dtype, self.device,
+            height,
+            width,
+            seed,
+            self.dtype,
+            self.device,
         )
 
         sched = build_hidream_o1_scheduler(
@@ -636,11 +620,11 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
             if len(samples) > 1:
                 x_pred_uncond = self._forward_once(
-                    samples[1], z.clone(), t_pixeldit,
+                    samples[1],
+                    z.clone(),
+                    t_pixeldit,
                 )
-                v_uncond = (
-                    x_pred_uncond.to(torch.float32) - z.to(torch.float32)
-                ) / sigma
+                v_uncond = (x_pred_uncond.to(torch.float32) - z.to(torch.float32)) / sigma
                 v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
             else:
                 v_guided = v_cond
@@ -664,7 +648,6 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     def has_real_checkpoint(self) -> bool:
         if not self.model_dir:
             return False
-        return (
-            os.path.exists(os.path.join(self.model_dir, "model.safetensors"))
-            or os.path.exists(os.path.join(self.model_dir, "model.safetensors.index.json"))
+        return os.path.exists(os.path.join(self.model_dir, "model.safetensors")) or os.path.exists(
+            os.path.join(self.model_dir, "model.safetensors.index.json")
         )
