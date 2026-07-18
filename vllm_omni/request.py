@@ -48,6 +48,10 @@ class OmniRequest(Request):
         self.external_req_id: str | None = external_req_id
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
+        # Per-request scheduling state (replaces adapter-side tracking sets)
+        self.omni_chunk_finished: bool = False
+        self.omni_segment_finished: bool = False
+        self.omni_chunk_ready: bool = False
 
     @staticmethod
     def _maybe_decode_prompt_embeds(

@@ -448,7 +448,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         if self.vllm_config.model_config.stage_id != 0:
                             # Downstream async-chunk stages receive real payloads from the
                             # connector. This update only resumes polling for the next segment.
-                            self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
+                            request.omni_segment_finished = False
+                            request.omni_chunk_ready = False
                     request.async_tokens_to_discard = 1
                     request.num_output_placeholders = 0
                     request.spec_token_ids = []
@@ -716,7 +717,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.vllm_config.model_config.stage_id != 0:
                 # Downstream async-chunk stages receive real payloads from the
                 # connector. This update only resumes polling for the next segment.
-                self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
+                session.omni_segment_finished = False
+                session.omni_chunk_ready = False
                 # Do not replace prompt/additional_information here; the next
                 # upstream chunk will populate them in chunk transfer adapter.
                 session.arrival_time = update.arrival_time

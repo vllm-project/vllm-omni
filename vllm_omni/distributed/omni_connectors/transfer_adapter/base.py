@@ -23,14 +23,10 @@ class OmniTransferAdapterBase:
             self.connector = None
         # Requests that are waiting to be polled
         self._pending_load_reqs = deque()
-        # Requests that have successfully retrieved data
-        self._finished_load_reqs = set()
         self._cancelled_load_reqs: set[str] = set()
 
         # Requests that are waiting to be saved
         self._pending_save_reqs = deque()
-        # Requests that have successfully saved data
-        self._finished_save_reqs = set()
 
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
@@ -120,10 +116,6 @@ class OmniTransferAdapterBase:
 
     def save(self, *args, **kwargs):
         """Save data to connector synchronously. To be implemented by subclasses."""
-        raise NotImplementedError
-
-    def get_finished_requests(self):
-        """Get finished loaded or saved requests"""
         raise NotImplementedError
 
     def shutdown(self):
