@@ -510,7 +510,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     if self.chunk_transfer_adapter:
                         self.chunk_transfer_adapter.segment_finished_requests.discard(req_id)
                 if finished:
-                    kv_transfer_params = self._free_request(request)
+                    kv_transfer_params, _ = self._free_request(request)
                     if self.chunk_transfer_adapter is not None:
                         self.chunk_transfer_adapter.cleanup(
                             request.request_id,
@@ -576,7 +576,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             is_segment_finished = not finished
             kv_transfer_params = None
             if finished:
-                kv_transfer_params = self._free_request(request)
+                kv_transfer_params, _ = self._free_request(request)
                 if self.chunk_transfer_adapter is not None:
                     self.chunk_transfer_adapter.cleanup(
                         request.request_id,

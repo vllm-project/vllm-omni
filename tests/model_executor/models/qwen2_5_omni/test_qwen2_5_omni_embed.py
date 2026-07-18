@@ -15,6 +15,7 @@ import functools
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.multimodal.utils import set_mm_embedding_modality
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -171,11 +172,11 @@ def build_mm_embeds(audio_n, image_n, video_n, hidden, audio_val=10.0, image_val
     """
     embs = []
     if audio_n:
-        embs.append(torch.full((audio_n, hidden), audio_val))
+        embs.append(set_mm_embedding_modality(torch.full((audio_n, hidden), audio_val), "audio"))
     if image_n:
-        embs.append(torch.full((image_n, hidden), image_val))
+        embs.append(set_mm_embedding_modality(torch.full((image_n, hidden), image_val), "image"))
     if video_n:
-        embs.append(torch.full((video_n, hidden), video_val))
+        embs.append(set_mm_embedding_modality(torch.full((video_n, hidden), video_val), "video"))
     return embs
 
 
@@ -270,8 +271,8 @@ class TestEmbedInputIds:
         audio_n = sum(audio_chunks)  # 6
 
         mm_embeds = [
-            torch.full((video_n, hidden), video_val),
-            torch.full((audio_n, hidden), audio_val),
+            set_mm_embedding_modality(torch.full((video_n, hidden), video_val), "video"),
+            set_mm_embedding_modality(torch.full((audio_n, hidden), audio_val), "audio"),
         ]
 
         model, _ = make_mock_model(mocker, hidden)
@@ -308,8 +309,8 @@ class TestMergeInterleavedEmbeddings:
 
         inputs_embeds = torch.zeros(len(input_ids), hidden)
         mm_embeds = [
-            torch.full((num_video, hidden), 30.0),
-            torch.full((num_audio, hidden), 10.0),
+            set_mm_embedding_modality(torch.full((num_video, hidden), 30.0), "video"),
+            set_mm_embedding_modality(torch.full((num_audio, hidden), 10.0), "audio"),
         ]
 
         result = m.merge_interleaved_embeddings(
@@ -318,8 +319,6 @@ class TestMergeInterleavedEmbeddings:
             is_video,
             is_audio,
             is_multimodal,
-            num_video,
-            num_audio,
         )
 
         video_pos = is_video.nonzero(as_tuple=True)[0]
