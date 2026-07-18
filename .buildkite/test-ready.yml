@@ -108,6 +108,12 @@ steps:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "Diffusion · Distributed Test"
+        source_file_dependencies:
+          - tests/diffusion/distributed/
+          - vllm_omni/diffusion/distributed/
+          - vllm_omni/diffusion/attention/parallel/
+          - vllm_omni/diffusion/data.py
+          - vllm_omni/diffusion/models/
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda' --run-level "core_model"
         agents:
