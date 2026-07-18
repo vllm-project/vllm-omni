@@ -632,6 +632,21 @@ def compute_seed_tts_wer_metrics(
                 )
             continue
 
+        # Audio artifact collector: buffer this clip; flush picks K representatives
+        # at bench end. No-op when SAVE_AUDIO_SAMPLES is unset.
+        try:
+            from vllm_omni.benchmarks.utils import get_collector
+
+            get_collector().add(
+                utterance_id=req.seed_tts_utterance_id,
+                wav_f32=wav_16k,
+                sample_rate=16000,
+                ref_text=ref,
+                locale=locale,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Audio artifact collector add failed", exc_info=True)
+
         # UTMOS scores synthesized audio only; do not gate on ASR/WER (those can fail independently).
         if utmos_on:
             try:

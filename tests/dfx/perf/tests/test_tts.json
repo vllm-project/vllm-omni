@@ -100,6 +100,8 @@
         ],
         "seed_tts_locale": "en",
         "seed_tts_wer_eval": true,
+        "save_audio_samples": 8,
+        "audio_samples_label": "qwen3_tts_base_voice_clone_quality_en",
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "mean_audio_rtf": [

@@ -470,6 +470,9 @@ steps:
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            # Audio sample artifacts (FLAC + index.json). See docs/ci/audio_artifacts.md.
+            # Best-effort: never let upload failure mask the real pytest exit code.
+            buildkite-agent artifact upload "tests/dfx/perf/results/audio_samples/**/*" || true
             exit $$EXIT
         agents:
           queue: "mithril-h100-pool"

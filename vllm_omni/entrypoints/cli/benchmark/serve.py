@@ -131,6 +131,41 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_audio_artifact_cli_args(parser: argparse.ArgumentParser) -> None:
+    """CLI for the audio sample artifact collector.
+
+    When enabled, the bench buffers every decoded audio clip and writes K
+    representative ones (FLAC) plus an index.json at end of run, so CI can
+    upload them as a Buildkite artifact for reviewers to listen to.
+    See docs/ci/audio_artifacts.md for the policy.
+    """
+    g = parser.add_argument_group("Audio Sample Artifact Options")
+    g.add_argument(
+        "--save-audio-samples",
+        type=int,
+        default=0,
+        help="Save N representative audio clips from this bench run to "
+        "--audio-samples-dir as FLAC + index.json. 0 disables (default). "
+        "Currently active for benches that decode through seed_tts_eval. "
+        "Also enabled by env SAVE_AUDIO_SAMPLES.",
+    )
+    g.add_argument(
+        "--audio-samples-dir",
+        type=str,
+        default=None,
+        help="Directory to write audio artifact bundle into. "
+        "Default tests/dfx/perf/results/audio_samples. Also AUDIO_SAMPLES_DIR.",
+    )
+    g.add_argument(
+        "--audio-samples-label",
+        type=str,
+        default=None,
+        help="Subdirectory label under --audio-samples-dir to keep multiple "
+        "bench runs separated (e.g. qwen3_tts_base_voice_clone_c1). "
+        "Also AUDIO_SAMPLES_LABEL.",
+    )
+
+
 def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add vLLM-Omni specific serving benchmark options."""
     group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
@@ -198,6 +233,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
         # Add Daily-Omni specific arguments
         add_daily_omni_cli_args(parser)
         add_seed_tts_cli_args(parser)
+        add_audio_artifact_cli_args(parser)
         add_omni_benchmark_cli_args(parser)
 
         for action in parser._actions:
