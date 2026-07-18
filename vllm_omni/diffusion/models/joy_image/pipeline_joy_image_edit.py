@@ -819,11 +819,8 @@ class JoyImageEditPipeline(
         num_images_per_prompt = max(req.sampling_params.num_outputs_per_prompt, 1)
         true_cfg_scale = self.resolve_effective_true_cfg_scale(req)
         negative_prompt = "" if isinstance(first_prompt, str) else first_prompt.get("negative_prompt") or ""
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
-        )
-        do_true_cfg = true_cfg_scale > 1.0 and has_neg_prompt
-        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+        do_true_cfg = true_cfg_scale > 1.0
+        self.check_cfg_parallel_validity(true_cfg_scale)
 
         self._current_timestep = None
         self._interrupt = False
