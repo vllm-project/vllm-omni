@@ -251,6 +251,25 @@ def _cast_floating_model_inputs(model_inputs: Any, dtype: torch.dtype) -> Any:
     return model_inputs
 
 
+def _get_single_request_prompts(request: OmniDiffusionRequest) -> tuple[list[Any], bool]:
+    prompts = getattr(request, "prompts", None)
+    if prompts is not None:
+        return list(prompts), True
+    return [request.prompt], False
+
+
+def _set_single_request_prompt(
+    request: OmniDiffusionRequest,
+    prompts: list[Any],
+    *,
+    uses_prompts_attr: bool,
+) -> None:
+    if uses_prompts_attr:
+        request.prompts = prompts
+    else:
+        request.prompt = prompts[0]
+
+
 # Normalize the single reference image into a supported Joy bucket before
 # forward(); default and explicitly requested sizes are both snapped to the
 # nearest bucket, so the final output size can differ from user-provided
@@ -259,9 +278,10 @@ def get_joy_image_edit_pre_process_func(
     od_config: OmniDiffusionConfig,
 ) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        if len(request.prompts) != 1:
+        prompts, uses_prompts_attr = _get_single_request_prompts(request)
+        if len(prompts) != 1:
             raise ValueError("JoyAI-Image-Edit v1 supports exactly one prompt per request.")
-        for prompt_index, prompt in enumerate(request.prompts):
+        for prompt_index, prompt in enumerate(prompts):
             if isinstance(prompt, str):
                 prompt = {"prompt": prompt}
             prompt.setdefault("additional_information", {})
@@ -293,7 +313,8 @@ def get_joy_image_edit_pre_process_func(
             )
             request.sampling_params.height = height
             request.sampling_params.width = width
-            request.prompts[prompt_index] = prompt
+            prompts[prompt_index] = prompt
+        _set_single_request_prompt(request, prompts, uses_prompts_attr=uses_prompts_attr)
         return request
 
     return pre_process_func

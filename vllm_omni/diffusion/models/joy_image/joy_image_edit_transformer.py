@@ -19,6 +19,9 @@ from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -164,6 +167,7 @@ class JoyImageAttention(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         eps: float = 1e-6,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.heads = num_attention_heads
@@ -180,6 +184,18 @@ class JoyImageAttention(nn.Module):
         self.txt_attn_k_norm = nn.RMSNorm(attention_head_dim, eps=eps)
         self.txt_attn_proj = nn.Linear(inner_dim, dim, bias=True)
 
+        self.attn = Attention(
+            num_heads=self.heads,
+            head_size=self.head_dim,
+            softmax_scale=1.0 / math.sqrt(self.head_dim),
+            causal=False,
+            num_kv_heads=self.heads,
+            prefix=prefix,
+            role="joy_image.joint",
+            role_category="self",
+            qkv_layout="BSND",
+        )
+
     def _stream_qkv(
         self,
         qkv_proj: nn.Linear,
@@ -192,6 +208,16 @@ class JoyImageAttention(nn.Module):
         key = key.unflatten(-1, (self.heads, self.head_dim))
         value = value.unflatten(-1, (self.heads, self.head_dim))
         return q_norm(query), k_norm(key), value
+
+    @staticmethod
+    def _normalize_attention_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+        if attention_mask is None:
+            return None
+        if attention_mask.ndim == 4 and attention_mask.shape[1] == 1 and attention_mask.shape[2] == 1:
+            attention_mask = attention_mask[:, 0, 0, :]
+        if attention_mask.ndim == 2:
+            return attention_mask.to(torch.bool).contiguous()
+        return attention_mask
 
     def forward(
         self,
@@ -228,15 +254,9 @@ class JoyImageAttention(nn.Module):
         joint_key = torch.cat([img_key, txt_key], dim=1)
         joint_value = torch.cat([img_value, txt_value], dim=1)
 
-        joint_hidden_states = F.scaled_dot_product_attention(
-            joint_query.transpose(1, 2),
-            joint_key.transpose(1, 2),
-            joint_value.transpose(1, 2),
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        joint_hidden_states = joint_hidden_states.transpose(1, 2).flatten(2, 3)
+        attn_metadata = AttentionMetadata(attn_mask=self._normalize_attention_mask(attention_mask))
+        joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
+        joint_hidden_states = joint_hidden_states.flatten(2, 3)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
         img_attn_output = joint_hidden_states[:, : hidden_states.shape[1], :]
@@ -252,6 +272,7 @@ class JoyImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         mlp_width_ratio: float = 4.0,
         eps: float = 1e-6,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         mlp_hidden_dim = int(dim * mlp_width_ratio)
@@ -271,6 +292,7 @@ class JoyImageTransformerBlock(nn.Module):
             num_attention_heads,
             attention_head_dim,
             eps=eps,
+            prefix=f"{prefix}.attn" if prefix else "",
         )
 
     def forward(
@@ -432,8 +454,9 @@ class JoyImageEditTransformer3DModel(nn.Module):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     mlp_width_ratio=block_mlp_ratio,
+                    prefix=f"double_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
         self.norm_out = FP32LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -587,7 +610,7 @@ class JoyImageEditTransformer3DModel(nn.Module):
                 device=hidden_states.device,
                 dtype=torch.bool,
             )
-            attention_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)[:, None, None, :]
+            attention_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
 
         for block in self.double_blocks:
             image_tokens, text_tokens = block(

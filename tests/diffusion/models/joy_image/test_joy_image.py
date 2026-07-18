@@ -7,14 +7,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.joy_image import (
     pipeline_joy_image_edit as joy_pipeline_module,
 )
 from vllm_omni.diffusion.models.joy_image.cfg_parallel import JoyImageEditCFGParallelMixin
 from vllm_omni.diffusion.models.joy_image.joy_image_edit_transformer import (
+    JoyImageAttention,
     JoyImageEditTransformer3DModel,
 )
 from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
@@ -34,6 +39,86 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def _torch_sdpa_diffusion_config():
+    return SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
+        parallel_config=SimpleNamespace(ring_degree=1),
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+    )
+
+
+def _make_joy_attention(*, dtype: torch.dtype = torch.float32) -> JoyImageAttention:
+    with set_current_diffusion_config(_torch_sdpa_diffusion_config()):
+        attention = JoyImageAttention(
+            dim=32,
+            num_attention_heads=4,
+            attention_head_dim=8,
+            prefix="double_blocks.0.attn",
+        )
+    return attention.to(dtype=dtype)
+
+
+def _reference_joy_attention_output(
+    attention: JoyImageAttention,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    img_query, img_key, img_value = attention._stream_qkv(
+        attention.img_attn_qkv,
+        attention.img_attn_q_norm,
+        attention.img_attn_k_norm,
+        hidden_states,
+    )
+    txt_query, txt_key, txt_value = attention._stream_qkv(
+        attention.txt_attn_qkv,
+        attention.txt_attn_q_norm,
+        attention.txt_attn_k_norm,
+        encoder_hidden_states,
+    )
+    joint_query = torch.cat([img_query, txt_query], dim=1)
+    joint_key = torch.cat([img_key, txt_key], dim=1)
+    joint_value = torch.cat([img_value, txt_value], dim=1)
+
+    if attention_mask is not None and attention_mask.ndim == 2:
+        attention_mask = attention_mask.to(torch.bool)[:, None, None, :]
+
+    joint_hidden_states = F.scaled_dot_product_attention(
+        joint_query.transpose(1, 2),
+        joint_key.transpose(1, 2),
+        joint_value.transpose(1, 2),
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=1.0 / (attention.head_dim**0.5),
+    )
+    joint_hidden_states = joint_hidden_states.transpose(1, 2).flatten(2, 3).to(joint_query.dtype)
+
+    image_seq_len = hidden_states.shape[1]
+    return (
+        attention.img_attn_proj(joint_hidden_states[:, :image_seq_len]),
+        attention.txt_attn_proj(joint_hidden_states[:, image_seq_len:]),
+    )
+
+
+def _assert_attention_outputs_close(
+    actual: tuple[torch.Tensor, torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor],
+    *,
+    dtype: torch.dtype,
+) -> None:
+    atol = rtol = 5e-3 if dtype is torch.bfloat16 else 1e-5
+    max_abs = max(
+        (actual_item - expected_item).abs().max().item()
+        for actual_item, expected_item in zip(actual, expected)
+    )
+    assert max_abs <= atol
+    for actual_item, expected_item in zip(actual, expected):
+        torch.testing.assert_close(actual_item, expected_item, atol=atol, rtol=rtol)
 
 
 def _write_model_configs(tmp_path):
@@ -94,8 +179,21 @@ def _make_request(*, prompt=None, params=None):
         "multi_modal_data": {"image": Image.new("RGB", (2048, 1024), color="white")},
     }
     params = params or _make_params()
-    return OmniDiffusionRequest(
+    return SimpleNamespace(
         prompts=[prompt],
+        sampling_params=params,
+        request_id="joy-test",
+    )
+
+
+def _make_single_omni_request(*, prompt=None, params=None):
+    prompt = prompt or {
+        "prompt": "make it brighter",
+        "multi_modal_data": {"image": Image.new("RGB", (2048, 1024), color="white")},
+    }
+    params = params or _make_params()
+    return OmniDiffusionRequest(
+        prompt=prompt,
         sampling_params=params,
         request_id="joy-test",
     )
@@ -258,6 +356,21 @@ def test_preprocess_uses_diffusers_bucket_for_default_image_size(tmp_path):
     assert info["resized_size"] == (width, height)
     assert request.sampling_params.height == height
     assert request.sampling_params.width == width
+
+
+def test_preprocess_accepts_single_omni_request_prompt(tmp_path):
+    od_config = _write_model_configs(tmp_path)
+    preprocess = get_joy_image_edit_pre_process_func(od_config)
+
+    request = preprocess(_make_single_omni_request())
+    prompt = request.prompt
+    info = prompt["additional_information"]
+
+    assert isinstance(prompt, dict)
+    assert not hasattr(request, "prompts")
+    assert info["image_tensor"].shape == (1, 3, 1, 704, 1408)
+    assert request.sampling_params.height == 704
+    assert request.sampling_params.width == 1408
 
 
 def test_pil_to_tensor_uses_center_crop_instead_of_stretch():
@@ -660,7 +773,68 @@ def test_encode_vae_image_does_not_forward_noise_generator_to_posterior_sample()
     assert pipeline.vae.latent_dist.received_generator is None
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.bfloat16,
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_joy_attention_native_sdpa_matches_torch_sdpa_without_mask(dtype):
+    torch.manual_seed(123)
+    device = torch.device("cuda")
+    attention = _make_joy_attention(dtype=dtype).to(device=device)
+    hidden_states = torch.randn(2, 3, 32, device=device, dtype=dtype)
+    encoder_hidden_states = torch.randn(2, 5, 32, device=device, dtype=dtype)
+
+    actual = attention(hidden_states, encoder_hidden_states)
+    expected = _reference_joy_attention_output(attention, hidden_states, encoder_hidden_states)
+
+    assert isinstance(attention.attn, Attention)
+    assert attention.attn.role == "joy_image.joint"
+    assert attention.attn.role_category == "self"
+    assert attention.attn.qkv_layout == "BSND"
+    _assert_attention_outputs_close(actual, expected, dtype=dtype)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.bfloat16,
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_joy_attention_native_sdpa_matches_torch_sdpa_with_padding_mask(dtype):
+    torch.manual_seed(456)
+    device = torch.device("cuda")
+    attention = _make_joy_attention(dtype=dtype).to(device=device)
+    hidden_states = torch.randn(2, 3, 32, device=device, dtype=dtype)
+    encoder_hidden_states = torch.randn(2, 5, 32, device=device, dtype=dtype)
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 0, 0],
+        ],
+        device=device,
+        dtype=torch.bool,
+    )
+
+    actual = attention(hidden_states, encoder_hidden_states, attention_mask=attention_mask)
+    expected = _reference_joy_attention_output(
+        attention,
+        hidden_states,
+        encoder_hidden_states,
+        attention_mask=attention_mask,
+    )
+
+    _assert_attention_outputs_close(actual, expected, dtype=dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_transformer_shape_and_masked_forward():
+    device = torch.device("cuda")
     transformer = JoyImageEditTransformer3DModel(
         in_channels=4,
         out_channels=4,
@@ -669,20 +843,21 @@ def test_transformer_shape_and_masked_forward():
         num_layers=1,
         num_attention_heads=4,
         patch_size=(1, 2, 2),
-    )
-    hidden_states = torch.randn(2, 2, 4, 1, 4, 4)
-    encoder_hidden_states = torch.randn(2, 5, 16)
-    encoder_hidden_states_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
+    ).to(device=device)
+    hidden_states = torch.randn(2, 2, 4, 1, 4, 4, device=device)
+    encoder_hidden_states = torch.randn(2, 5, 16, device=device)
+    encoder_hidden_states_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], device=device)
 
     output = transformer(
         hidden_states=hidden_states,
-        timestep=torch.tensor([1.0, 2.0]),
+        timestep=torch.tensor([1.0, 2.0], device=device),
         encoder_hidden_states=encoder_hidden_states,
         encoder_hidden_states_mask=encoder_hidden_states_mask,
         return_dict=False,
     )[0]
 
     assert output.shape == hidden_states.shape
+    assert isinstance(transformer.double_blocks[0].attn.attn, Attention)
 
 
 def test_transformer_from_config_file_loads_checkpoint_config(tmp_path):
