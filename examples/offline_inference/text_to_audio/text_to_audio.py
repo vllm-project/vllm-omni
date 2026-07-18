@@ -2,37 +2,70 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Example script for text-to-audio generation using Stable Audio Open.
+Example script for text/video-to-audio generation with diffusion audio models.
 
-This script demonstrates how to generate audio from text prompts using
-the Stable Audio Open model with vLLM-Omni.
+This script supports:
+  * Stable Audio Open (`stabilityai/stable-audio-open-1.0`) — text-to-audio.
+  * AudioX (`zhangj1an/AudioX`) — six tasks: t2a / t2m / v2a / v2m / tv2a / tv2m.
+
+Model-specific generation knobs are declared in `vllm_omni/model_extras` and
+routed into `sampling_params.extra_args` via `apply_declared_extra_args`, so
+the same script serves both models without per-model branching in the engine.
 
 Usage:
+    # Stable Audio Open
     python text_to_audio.py --prompt "The sound of a dog barking"
     python text_to_audio.py --prompt "A piano playing a gentle melody" --audio-length 10.0
     python text_to_audio.py --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
     python text_to_audio.py --prompt "A soft synth pad" --cache-backend tea_cache
+
+    # AudioX (text-to-audio / text-to-music)
+    python text_to_audio.py --model zhangj1an/AudioX --task t2a \
+        --prompt "Fireworks burst twice, then a clock ticking." \
+        --num-inference-steps 250 --guidance-scale 6.0 --audio-length 10.0
+    # AudioX video-conditioned (v2*/tv2*) — pass a video file/URL
+    python text_to_audio.py --model zhangj1an/AudioX --task tv2a \
+        --prompt "drum beating sound and human talking" --video clip.mp4 \
+        --extra-body '{"sigma_min": 0.03, "sigma_max": 1000.0}'
 """
 
 import argparse
+import json
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
 from vllm_omni.platforms import current_omni_platform
+
+AUDIOX_TASKS = ("t2a", "t2m", "v2a", "v2m", "tv2a", "tv2m")
+AUDIOX_VIDEO_TASKS = frozenset({"v2a", "v2m", "tv2a", "tv2m"})
+
+
+def parse_extra_body(value: str) -> dict[str, Any]:
+    """Parse a JSON object string for --extra-body."""
+    try:
+        obj = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
+    return obj
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate audio with Stable Audio Open.")
+    parser = argparse.ArgumentParser(description="Generate audio with supported diffusion audio models.")
     parser.add_argument(
         "--model",
         default="stabilityai/stable-audio-open-1.0",
-        help="Stable Audio model name or local path.",
+        help="Audio diffusion model name or local path. Supported: stabilityai/stable-audio-open-1.0, zhangj1an/AudioX.",
     )
     parser.add_argument(
         "--prompt",
@@ -41,8 +74,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--negative-prompt",
-        default="Low quality.",
-        help="Negative prompt for classifier-free guidance.",
+        default=None,
+        help=(
+            "Negative prompt for classifier-free guidance. Off by default; "
+            'recommended for Stable Audio, e.g. --negative-prompt "Low quality".'
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -60,13 +96,19 @@ def parse_args() -> argparse.Namespace:
         "--audio-start",
         type=float,
         default=0.0,
-        help="Audio start time in seconds.",
+        help=(
+            "Audio start offset in seconds. Applies to both models "
+            "(audio_start_in_s for Stable Audio, seconds_start for AudioX)."
+        ),
     )
     parser.add_argument(
         "--audio-length",
         type=float,
         default=10.0,
-        help="Audio length in seconds (max ~47s for stable-audio-open-1.0).",
+        help=(
+            "Audio duration in seconds. Maps to audio length for Stable Audio "
+            "(max ~47s for stable-audio-open-1.0) and seconds_total for AudioX."
+        ),
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -81,10 +123,40 @@ def parse_args() -> argparse.Namespace:
         help="Number of audio waveforms to generate for the given prompt.",
     )
     parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        choices=list(AUDIOX_TASKS),
+        help=(
+            "[AudioX only] Generation task: t2a/t2m/v2a/v2m/tv2a/tv2m. "
+            "v2*/tv2* require --video. Ignored for Stable Audio Open."
+        ),
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        default=None,
+        help="[AudioX v2*/tv2*] Video file path or URL used for conditioning.",
+    )
+    parser.add_argument(
+        "--extra-body",
+        type=parse_extra_body,
+        default=None,
+        help=(
+            "Model-specific generation params as a JSON object, e.g. "
+            '\'{"sigma_min": 0.03, "sigma_max": 1000.0}\'. Each key is filtered '
+            "against the model's declared extra_body_params (see vllm_omni/model_extras), "
+            "so unknown keys are silently dropped. Values here override the equivalent flags."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=str,
-        default="stable_audio_output.wav",
-        help="Path to save the generated audio (WAV format).",
+        default=None,
+        help=(
+            "Path to save the generated audio (WAV format). Defaults to "
+            "audiox_output.wav for AudioX and stable_audio_output.wav otherwise."
+        ),
     )
     parser.add_argument(
         "--sample-rate",
@@ -203,6 +275,8 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
 
 def main():
     args = parse_args()
+    model_name = str(args.model).lower() if args.model else ""
+    is_audiox = "audiox" in model_name
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     cache_config = None
     if args.cache_backend == "tea_cache":
@@ -211,12 +285,14 @@ def main():
         }
 
     print(f"\n{'=' * 60}")
-    print("Stable Audio Open - Text-to-Audio Generation")
+    print("Text/Video-to-Audio Generation")
     print(f"{'=' * 60}")
     print(f"  Model: {args.model}")
+    if args.task is not None:
+        print(f"  Task: {args.task}")
     print(f"  Prompt: {args.prompt}")
     print(f"  Negative prompt: {args.negative_prompt}")
-    print(f"  Audio length: {args.audio_length}s")
+    print(f"  Duration: {args.audio_length}s")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
@@ -235,8 +311,9 @@ def main():
         hsdp_replicate_size=args.hsdp_replicate_size,
     )
 
-    # Initialize Omni with Stable Audio model
-    omni = Omni(
+    # Initialize Omni. AudioX requires an explicit pipeline class; Stable Audio
+    # is resolved from its config.
+    omni_kwargs: dict[str, Any] = dict(
         model=args.model,
         parallel_config=parallel_config,
         cache_backend=args.cache_backend,
@@ -245,43 +322,68 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         enable_layerwise_offload=args.enable_layerwise_offload,
     )
+    if is_audiox:
+        omni_kwargs["model_class_name"] = "AudioXPipeline"
+    omni = Omni(**omni_kwargs)
+    model_class_name = get_model_class_name(omni)
+    declared_extra_body_params = get_extra_body_params(model_class_name)
 
-    # Calculate audio end time
-    audio_end_in_s = args.audio_start + args.audio_length
+    diffusion_params = OmniDiffusionSamplingParams(
+        generator=generator,
+        guidance_scale=args.guidance_scale,
+        num_inference_steps=args.num_inference_steps,
+        num_outputs_per_prompt=args.num_waveforms,
+        seed=args.seed,
+    )
 
-    # Time profiling for generation
+    # Negative prompt is opt-in for both models (off by default). Including a
+    # non-empty negative prompt enables the separate CFG conditioning branch.
+    prompt: dict[str, Any] = {"prompt": args.prompt}
+    if args.negative_prompt:
+        prompt["negative_prompt"] = args.negative_prompt
+
+    if model_class_name == "AudioXPipeline":
+        if args.task is None:
+            raise ValueError("AudioX requires --task (one of t2a/t2m/v2a/v2m/tv2a/tv2m).")
+        if args.task in AUDIOX_VIDEO_TASKS and not args.video:
+            raise ValueError(f"AudioX task {args.task!r} requires --video.")
+        # AudioX core knobs are surfaced as shared flags; sampler/reference knobs
+        # (sigma_min/sigma_max/cfg_rescale/audio_path) arrive via --extra-body and
+        # are filtered against the declared extra_body contract.
+        user_extra: dict[str, Any] = {
+            "audiox_task": args.task,
+            "seconds_start": args.audio_start,
+            "seconds_total": args.audio_length,
+            "video_path": args.video,
+        }
+        if args.extra_body:
+            user_extra.update(args.extra_body)
+        apply_declared_extra_args(diffusion_params, declared_extra_body_params, user_extra)
+    else:
+        # Stable Audio Open path (backward-compatible).
+        audio_end_in_s = args.audio_start + args.audio_length
+        diffusion_params.extra_args = {
+            "audio_start_in_s": args.audio_start,
+            "audio_end_in_s": audio_end_in_s,
+        }
+        if args.extra_body:
+            diffusion_params.extra_args.update(args.extra_body)
+
     generation_start = time.perf_counter()
 
-    # Generate audio
-    outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-        },
-        OmniDiffusionSamplingParams(
-            generator=generator,
-            guidance_scale=args.guidance_scale,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_waveforms,
-            extra_args={
-                "audio_start_in_s": args.audio_start,
-                "audio_end_in_s": audio_end_in_s,
-            },
-        ),
-    )
+    outputs = omni.generate(prompt, diffusion_params)
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
     print(f"Total generation time: {generation_time:.2f} seconds")
 
-    # Process and save audio
-    output_path = Path(args.output)
+    output = args.output or ("audiox_output.wav" if model_class_name == "AudioXPipeline" else "stable_audio_output.wav")
+    output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix or ".wav"
     stem = output_path.stem or "stable_audio_output"
 
-    # Extract audio from omni.generate() outputs
     if not outputs:
         raise ValueError("No output generated from omni.generate()")
 
@@ -296,7 +398,6 @@ def main():
     if audio is None:
         raise ValueError("No audio output found in request_output")
 
-    # Handle different output formats
     if isinstance(audio, torch.Tensor):
         audio = audio.cpu().float().numpy()
 
@@ -323,7 +424,7 @@ def main():
         save_audio(audio, str(output_path), args.sample_rate)
         print(f"Saved generated audio to {output_path}")
 
-    print(f"\nGenerated {args.audio_length}s of audio at {args.sample_rate} Hz")
+    print(f"\nGenerated ~{args.audio_length}s of audio at {args.sample_rate} Hz")
 
 
 if __name__ == "__main__":

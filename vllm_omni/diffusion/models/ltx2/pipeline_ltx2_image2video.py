@@ -27,7 +27,7 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.lora.request import LoRARequest
 
 from .pipeline_ltx2 import (
@@ -74,6 +74,7 @@ class _I2VVideoAudioScheduler:
 
 
 class LTX2ImageToVideoPipeline(LTX2Pipeline):
+    supports_request_batch = False
     support_image_input = True
 
     def __init__(
@@ -285,7 +286,7 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
     @torch.no_grad()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
@@ -725,15 +726,13 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
             audio = self.vocoder(generated_mel_spectrograms)
 
-        if not return_dict:
-            return DiffusionOutput(output=(video, audio))
-
         return DiffusionOutput(output=(video, audio))
 
 
 class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     """LTXImageToVideoTwoStagesPipeline is for two stages image to video generation"""
 
+    supports_request_batch = False
     support_image_input = True
     dummy_run_num_frames = 2
 
@@ -786,7 +785,7 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     @torch.no_grad()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
@@ -814,8 +813,8 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
-    ):
-        video_latent, audio_latent = self.pipe(
+    ) -> DiffusionOutput:
+        stage1_output = self.pipe(
             req=req,
             image=image,
             prompt=prompt,
@@ -844,7 +843,8 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             return_dict=return_dict,
             attention_kwargs=attention_kwargs,
             max_sequence_length=max_sequence_length,
-        ).output
+        )
+        video_latent, audio_latent = stage1_output.output
 
         upscaled_video_latent = self.upsample_pipe(
             latents=video_latent,
@@ -870,11 +870,16 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             )
             self.pipe.scheduler = new_scheduler
 
+        # `req` is a DiffusionRequestBatch whose `sampling_params` is a
+        # read-only property; clone the underlying request(s) and override
+        # their sampling params instead of assigning to the batch.
         stage_2_req = copy.copy(req)
-        stage_2_req.sampling_params = req.sampling_params.clone()
-        stage_2_req.sampling_params.num_inference_steps = 3
+        stage_2_req.requests = [copy.copy(r) for r in req.requests]
+        for stage_2_request in stage_2_req.requests:
+            stage_2_request.sampling_params = stage_2_request.sampling_params.clone()
+            stage_2_request.sampling_params.num_inference_steps = 3
 
-        video, audio = self.pipe(
+        stage2_output = self.pipe(
             req=stage_2_req,
             latents=upscaled_video_latent,
             audio_latents=audio_latent,
@@ -886,7 +891,8 @@ class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             generator=generator,
             output_type="np",
             return_dict=False,
-        ).output
+        )
+        video, audio = stage2_output.output
 
         return DiffusionOutput(output=(video, audio))
 

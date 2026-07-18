@@ -10,7 +10,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.dmd2.config import DMD2Config
 from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler
 from vllm_omni.diffusion.models.utils import _load_json
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,8 @@ class DMD2PipelineMixin:
             stochastic_sampling=(self.dmd2_config.solver == "sde"),
         )
 
-    def _sanitize_dmd2_request(self, req: OmniDiffusionRequest) -> None:
-        """Sanitize CFG-related fields in-place. Mutates req.sampling_params and req.prompts."""
+    def _sanitize_dmd2_request(self, req) -> None:
+        """Sanitize CFG-related fields in-place. Works with both OmniDiffusionRequest and DiffusionRequestBatch."""
         sp = req.sampling_params
 
         if sp.num_inference_steps and sp.num_inference_steps != self.dmd2_config.num_inference_steps:
@@ -75,15 +75,15 @@ class DMD2PipelineMixin:
                 logger.warning("DMD2: ignoring extra_args.%s.", key)
                 extra_args.pop(key)
 
-        fixed = []
-        for p in req.prompts:
+        # Strip negative_prompt from each request's prompt in-place.
+        requests = req.requests if hasattr(req, "requests") else [req]
+        for request in requests:
+            p = request.prompt
             if isinstance(p, dict) and "negative_prompt" in p:
                 logger.warning("DMD2: ignoring negative_prompt.")
-                p = {k: v for k, v in p.items() if k != "negative_prompt"}
-            fixed.append(p)
-        req.prompts = fixed
+                request.prompt = {k: v for k, v in p.items() if k != "negative_prompt"}
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
         self._sanitize_dmd2_request(req)
         kwargs.pop("guidance_scale", None)
         kwargs.pop("num_inference_steps", None)

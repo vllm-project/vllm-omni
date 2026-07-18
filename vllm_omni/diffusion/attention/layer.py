@@ -231,6 +231,34 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if torch.compiler.is_compiling() and is_forward_context_available():
+            od_config = get_forward_context().omni_diffusion_config
+            parallel_config = getattr(od_config, "parallel_config", None)
+            if getattr(parallel_config, "use_hsdp", False):
+                # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
+                # attention graph; otherwise scheduler dependency analysis can
+                # fail on the fused attention region.
+                return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
+
+        return self._forward_impl(query, key, value, attn_metadata)
+
+    @torch.compiler.disable
+    def _forward_hsdp_compile_boundary(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        return self._forward_impl(query, key, value, attn_metadata)
+
+    def _forward_impl(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
 

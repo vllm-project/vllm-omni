@@ -1,4 +1,4 @@
-# Covo-Audio-Chat (Offline Inference)
+# Covo-Audio-Chat: Offline inference
 
 ## Setup
 

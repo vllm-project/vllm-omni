@@ -60,7 +60,7 @@ class ImageGenerationRequest(BaseModel):
     user: str | None = Field(default=None, description="User identifier for tracking")
     layers: int | None = Field(
         default=None,
-        description="Number of output layers for layered image models. Supported range: 3-10.",
+        description="Number of output layers for layered image models. Supported range: 2-10.",
     )
 
     @field_validator("size")

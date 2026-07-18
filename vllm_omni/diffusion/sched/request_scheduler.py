@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
+from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler, get_request_batch_sampling_params_key
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 class RequestScheduler(_BaseScheduler):
     """Diffusion scheduler with vLLM-style waiting/running queues."""
+
+    def _build_sampling_params_key(self, request: OmniDiffusionRequest):
+        return get_request_batch_sampling_params_key(request)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         return super().add_request(request)
@@ -41,6 +44,9 @@ class RequestScheduler(_BaseScheduler):
             if result is None:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[request_id] = "No output result"
+            elif result.aborted:
+                terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ABORTED
+                terminal_errors[request_id] = None
             elif result.error:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[request_id] = result.error

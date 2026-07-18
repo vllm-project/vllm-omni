@@ -482,6 +482,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             {
                 "stage_id": 1,
                 "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.5,
             },
         ],
     },
@@ -577,10 +578,15 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             {
                 "stage_id": 0,
                 "max_num_seqs": 1,
-                "gpu_memory_utilization": 0.9,
+                # Tuned for the heavier rebased stack (vLLM v0.23.1rc1 + torch 2.11 + CUDA 13
+                # + flashinfer) on a 24 GiB L4: the 16.78 GiB model weights + non-KV overhead
+                # + a 16384-token activation peak left 0 KV cache at util 0.85 (build 2354
+                # OOM). The abort test only needs the engine to init, so a smaller batched-
+                # token budget is fine; outputs are unaffected (chunked prefill is on).
+                "gpu_memory_utilization": 0.90,
                 "enforce_eager": True,
                 "enable_prefix_caching": False,
-                "max_num_batched_tokens": 16384,
+                "max_num_batched_tokens": 2048,
                 "max_model_len": 16384,
                 "skip_mm_profiling": True,
                 "mm_processor_cache_gb": 0,
@@ -627,7 +633,93 @@ def get_deploy_config_path(rel_path: str) -> str:
     return str(_DEPLOY_DIR / rel_path)
 
 
+def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
+    """Return one stage entry from a deploy yaml by ``stage_id``."""
+    with open(get_deploy_config_path(rel_path), encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    stage_key = "stages" if "stages" in cfg else "stage_args"
+    for stage in cfg.get(stage_key, []):
+        if stage.get("stage_id") == stage_id:
+            return stage
+    raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
+
+
+def _get_config_value_by_path(config_dict: dict, path: str) -> Any:
+    """Read a dot-separated path from a nested dict (e.g. ``engine_args.load_format``)."""
+    current: Any = config_dict
+    for key in path.split("."):
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _stage_load_format_paths(stage_config_path: str) -> tuple[str, str, list[int]]:
+    """Return ``(stage_key, load_format_field_path, stage_ids)`` for a deploy YAML."""
+    with open(stage_config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    new_schema_stages = cfg.get("stages")
+    stage_key = "stages" if new_schema_stages is not None else "stage_args"
+    load_format_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+    stage_entries = cfg.get(stage_key, [])
+    stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
+    return stage_key, load_format_path, stage_ids
+
+
+def _add_dummy_load_format(
+    stage_config_path: str | None,
+    run_level: str,
+) -> str | None:
+    """For ``core_model`` runs, patch every stage in the deploy YAML to ``load_format: dummy``."""
+    if run_level != "core_model" or stage_config_path is None:
+        return stage_config_path
+    stage_key, load_format_path, stage_ids = _stage_load_format_paths(stage_config_path)
+    return modify_stage_config(
+        stage_config_path,
+        updates={stage_key: {stage_id: {load_format_path: "dummy"} for stage_id in stage_ids}},
+    )
+
+
+def _delete_dummy_load_format(
+    stage_config_path: str | None,
+    run_level: str,
+) -> str | None:
+    """For ``advanced_model`` / ``full_model``, strip ``load_format: dummy`` so real weights load."""
+    if run_level not in {"advanced_model", "full_model"} or stage_config_path is None:
+        return stage_config_path
+    stage_key, load_format_path, _stage_ids = _stage_load_format_paths(stage_config_path)
+    with open(stage_config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    stage_entries = cfg.get(stage_key, [])
+
+    deletes: dict[int, list[str]] = {}
+    for stage in stage_entries:
+        stage_id = stage.get("stage_id")
+        if stage_id is None:
+            continue
+        if _get_config_value_by_path(stage, load_format_path) == "dummy":
+            deletes[stage_id] = [load_format_path]
+
+    if not deletes:
+        return stage_config_path
+
+    return modify_stage_config(
+        stage_config_path,
+        deletes={stage_key: deletes},
+    )
+
+
+def stage_config_path_for_run_level(stage_config_path: str | None, run_level: str) -> str | None:
+    """Apply run-level deploy YAML tweaks for weight loading (dummy vs real)."""
+    if run_level in {"advanced_model", "full_model"}:
+        return _delete_dummy_load_format(stage_config_path, run_level)
+    return _add_dummy_load_format(stage_config_path, run_level)
+
+
 __all__ = [
-    "modify_stage_config",
     "get_deploy_config_path",
+    "get_deploy_config_stage",
+    "modify_stage_config",
+    "stage_config_path_for_run_level",
 ]

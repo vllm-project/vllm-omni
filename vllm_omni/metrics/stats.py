@@ -48,7 +48,6 @@ class StageRequestStats:
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
-    audio_rtf: float = 0.0
     image_pixels: int = 0
     denoise_step_latency_ms: float = 0.0
     pipeline_timings: dict[str, float] | None = None
@@ -471,7 +470,6 @@ class OrchestratorAggregator:
                 defs.AUDIO_FRAMES: int(evt.audio_generated_frames),
                 defs.AUDIO_SAMPLE_RATE: int(evt.audio_sample_rate),
                 f"{defs.AUDIO_DURATION}_s": float(evt.audio_duration_s),
-                defs.AUDIO_RTF: float(evt.audio_rtf),
                 defs.IMAGE_PIXELS: int(evt.image_pixels),
                 defs.DENOISE_STEP_LATENCY_MS: float(evt.denoise_step_latency_ms),
                 "output_unit_type": evt.output_unit_type,
@@ -541,10 +539,6 @@ class OrchestratorAggregator:
             0.0,
         )
         current[defs.TIME_PER_OUTPUT_UNIT_MS] = remaining_ms / float(output_count - 1) if output_count > 1 else 0.0
-        duration_s = float(current.get(f"{defs.AUDIO_DURATION}_s", 0.0))
-        current[defs.AUDIO_RTF] = defs.compute_audio_rtf(
-            float(current.get(defs.STAGE_GEN_TIME_MS, 0.0)) / 1000.0, duration_s
-        )
         return current
 
     def _build_stage_metrics_snapshot(self, req_id: str) -> dict[str, dict[str, Any]]:

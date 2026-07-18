@@ -754,4 +754,7 @@ def scatter_latents(
     )
 
 
-DiffusionInputBatch = InputBatch
+# Alias: InputBatch is the step/tensor-level batch.
+# DiffusionRequestBatch (in request_batch.py) is the request-level batch.
+StepInputBatch = InputBatch
+DiffusionInputBatch = StepInputBatch

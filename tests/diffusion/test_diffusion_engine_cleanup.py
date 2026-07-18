@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _make_request(request_id: str) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompts=[f"prompt_{request_id}"],
+        prompt=f"prompt_{request_id}",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         request_id=request_id,
     )

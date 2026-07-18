@@ -97,7 +97,7 @@ Existing references: `tests/e2e/offline_inference/test_qwen2_5_omni.py` (L2-styl
 | **Offline inference e2e** | `tests/e2e/offline_inference/` | **Module (default):** `omni_runner` + `omni_runner_handler`. **Function (isolation only):** `omni_runner_function` + `omni_runner_handler_function`. Diffusion/TTS may use `Omni(...).generate` directly | L2: `core_model` + **one of** `omni` / `tts` / `diffusion`; `@hardware_test(...)` when GPU/NPU is required |
 | **Online serving e2e** | `tests/e2e/online_serving/` | **Module (default):** `omni_server` + `openai_client`. **Function (isolation only):** `omni_server_function` + `openai_client_function`. Clients: `send_omni_request` (omni), `send_audio_speech_request` (tts), `send_diffusion_request` / `send_video_diffusion_request` / `send_images_generations_request` (diffusion) | Baseline smoke: **`core_model` + `advanced_model`**; heavier paths: `advanced_model` only; L4 expansion: `full_model` |
 | **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/test-nightly.yml`). Full conventions: [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
-| **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: `full_model` + `benchmark`; wire `test-nightly.yml` Perf steps |
+| **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: JSON `mark` with `full_model` + `omni`/`tts`/`diffusion`; wire `test-nightly.yml` Perf steps |
 | **Invalid parameter / negative HTTP validation** | `tests/dfx/reliability/invalid_param_test/` | Live `omni_server` + low-level `send_*_http_request` with `err_code` / `err_message` | `pytest.mark.slow` + `omni` / `tts` / `diffusion` + `@hardware_marks` (`H100` or `L4`); CI in **`test-weekly.yml`** (not ready/merge/nightly) |
 
 **If the user’s test plan includes invalid parameter validation / invalid params / negative HTTP / 400 validation:** do **not** add those `test_*` functions to `tests/e2e/online_serving/test_*.py` or `*_expansion.py`. **Move or author them** under `tests/dfx/reliability/invalid_param_test/` in the **endpoint-matching script** (see **Invalid parameter validation** below). Success-path e2e and invalid-param dfx tests must stay in separate modules.
@@ -270,7 +270,7 @@ def test_text_to_video_001(omni_server, openai_client) -> None:
 
 *Documentation example tests:* follow the **Preferred Test Strategy** in [l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md): dynamic extraction for offline READMEs; explicit copied client code for online pages until extraction is justified; use the documented **naming**, **output directory** (page folder + case id), and **skipping** rules (e.g. Gradio-only scripts).
 
-*Performance tests:* add or extend entries under `tests/perf/` (and JSON configs where the project uses them), with **explicit baselines** and the same marker/run-level pairing as the CI step that will execute them.
+*Performance tests:* add or extend entries under `tests/dfx/perf/tests/` (and JSON configs where the project uses them), with **explicit baselines**, **`mark`** on each case (`hardware_marks` + `full_model` + type marker), and the same nightly Perf step pattern as in-tree configs.
 
 **3. Cross-cutting rules**
 
@@ -592,27 +592,31 @@ Implementation strategy:
 **When the user explicitly asks for L4 perf (or full L4 including perf):**
 
 1. **Do not** put throughput/latency assertions inside `test_*_expansion.py` — perf uses the **dfx benchmark harness**, not `omni_server` e2e fixtures.
-2. Add or extend a **JSON config** under `tests/dfx/perf/tests/` (mirror in-tree names: `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`).
-3. Each JSON entry: `test_name`, `server_params` (`model`, `serve_args`), `benchmark_params[]` with explicit **`baseline`** (`throughput_qps`, `latency_mean`, `peak_memory_mb_mean`, …).
+2. Add or extend a **JSON config** under `tests/dfx/perf/tests/` (mirror in-tree names: `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, `test_qwen3_omni_async_chunk.json`).
+3. Each JSON **case**: `test_name`, optional **`mark`** (`hardware_marks` required when present; `marks`: `full_model` + `omni`/`tts`/`diffusion`), `server_params` (`model`, `serve_args` or `stage_config_name`), `benchmark_params[]` with **`name`** and explicit **`baseline`** (`throughput_qps`, `latency_mean`, `peak_memory_mb_mean`, …). Diffusion cases also set `server_type` (e.g. `"vllm-omni"`) and usually `benchmark_endpoint`.
 4. Run locally via the matching script (model type → runner):
 
 | Model type | Runner script | Example config |
 |------------|---------------|----------------|
 | **Diffusion X2I/X2V** | `tests/dfx/perf/scripts/run_diffusion_benchmark.py` | `tests/dfx/perf/tests/test_qwen_image_vllm_omni.json` |
 | **TTS** | `tests/dfx/perf/scripts/run_benchmark.py` | `tests/dfx/perf/tests/test_tts.json` (shared) or `test_{slug}.json` (dedicated; use when the model must not join the shared nightly matrix before integration — e.g. `test_voxcpm2.json`, `test_coqui_tts.json`) |
-| **Omni** | (see existing Omni Perf steps — `run_benchmark.py` / dedicated omni configs in-tree) | `tests/dfx/perf/tests/test_omni*.json` |
+| **Omni** | `tests/dfx/perf/scripts/run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` |
 
-5. Wire **`test-nightly.yml` · Perf Test** step for that model (separate from Function Test): export `DIFFUSION_BENCHMARK_DIR` / `BENCHMARK_DIR`, run pytest on the script with `--test-config-file`, **upload artifacts** (`buildkite-agent artifact upload`), often **multi-GPU H100** for diffusion perf.
+5. Wire **`test-nightly.yml` · Perf Test** step for that model (separate from Function Test): export `DIFFUSION_BENCHMARK_DIR` / `BENCHMARK_DIR`, run pytest on the script with **`--test-config-file`** (nightly perf steps do not use `-m`), **upload artifacts** (`buildkite-agent artifact upload`), often **multi-GPU H100** for diffusion perf.
 6. **One benchmark scenario → one `test_name` block** in JSON (same spirit as one `test_*` per function case). Combine server `serve_args` + workload in one entry; use multiple `benchmark_params` rows for size/step sweeps under the same server config.
 
-**Perf local command (diffusion example):**
+**Perf local commands:**
 
 ```bash
 cd tests
 export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
 export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+# Single file (CI-like)
 pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py \
   --test-config-file dfx/perf/tests/test_<model>_vllm_omni.json
+# Bulk load + filter by JSON mark
+pytest -sv dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"
+pytest -sv dfx/perf/scripts/run_benchmark.py -m "full_model and omni and H100"
 ```
 
 **Clarify in the test plan** which L4 pillars you deliver: `Function only` | `Function + Perf` | `Function + Accuracy + Perf`.

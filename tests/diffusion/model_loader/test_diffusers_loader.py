@@ -16,7 +16,6 @@ from vllm.config.load import LoadConfig
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.registry import initialize_model
 
@@ -111,27 +110,6 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
         loader.load_weights(model)
 
 
-def test_qwen_model_class_selects_qwen_gguf_adapter():
-    od_config = type(
-        "Config",
-        (),
-        {
-            "model_class_name": "QwenImagePipeline",
-            "tf_model_config": {"model_type": "qwen_image"},
-        },
-    )()
-    source = DiffusersPipelineLoader.ComponentSource(
-        model_or_path="dummy",
-        subfolder="transformer",
-        revision=None,
-        prefix="transformer.",
-    )
-
-    adapter = get_gguf_adapter("dummy.gguf", object(), source, od_config)
-
-    assert adapter.__class__.__name__ == "QwenImageGGUFAdapter"
-
-
 class _ConfigAwareModel(nn.Module):
     def __init__(self, *, od_config):
         super().__init__()
@@ -186,7 +164,6 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
     loader.load_weights = lambda model: None  # type: ignore[assignment]
     loader._process_weights_after_loading = lambda model, target_device: None  # type: ignore[assignment]
-    loader._is_gguf_quantization = lambda: False  # type: ignore[assignment]
 
     monkeypatch.setattr(loader_mod, "resolve_obj_by_qualname", lambda _name: _ConfigAwareModel)
     monkeypatch.setattr(loader_mod.torch, "device", lambda _name: _DeviceContext("cpu"))
@@ -200,6 +177,59 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
     assert model.captured_config is od_config
     assert model.seen_config_during_init is od_config
     assert get_current_diffusion_config_or_none() is None
+
+
+def test_hsdp_processes_quantized_weights_before_sharding(mocker):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader.quant_config = object()
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    events: list[str] = []
+
+    loader._init_from_load_format = mocker.Mock(return_value=model)  # type: ignore[method-assign]
+    loader.load_weights = mocker.Mock(side_effect=lambda _model: events.append("load"))  # type: ignore[method-assign]
+    loader._process_weights_after_loading = mocker.Mock(  # type: ignore[method-assign]
+        side_effect=lambda _model, _device: events.append("process")
+    )
+    mocker.patch.object(
+        loader_mod.ModuleDiscovery,
+        "discover",
+        return_value=PipelineModules(
+            dits=[model.transformer],
+            dit_names=["transformer"],
+            vaes=[],
+            encoders=[],
+            encoder_names=[],
+            resident_modules=[],
+            resident_names=[],
+        ),
+    )
+    mocker.patch(
+        "vllm_omni.diffusion.quantization.hsdp_fp8.prepare_fp8_layers_for_fsdp",
+        side_effect=lambda _model: events.append("prepare"),
+    )
+    mocker.patch.object(
+        loader_mod,
+        "apply_hsdp_to_model",
+        side_effect=lambda *_args, **_kwargs: events.append("shard"),
+    )
+
+    loader._load_model_with_hsdp(torch.device("cpu"))
+
+    assert events == ["load", "process", "prepare", "shard"]
 
 
 def test_get_all_weights(prefetch_helios_model, mock_tp_group):

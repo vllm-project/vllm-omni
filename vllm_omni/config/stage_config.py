@@ -18,6 +18,7 @@ from transformers import PretrainedConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -63,7 +64,12 @@ def build_stage_runtime_overrides(
     if internal_keys is None:
         from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
-        internal_keys = internal_blacklist_keys() | SHARED_FIELDS
+        # Some fields are modeled as orchestrator-owned for top-level CLI
+        # parsing, but are also legitimate deploy-time stage overrides. Keep
+        # the default blacklist for true orchestrator/shared fields while
+        # allowing any field explicitly represented by the deploy schema to
+        # continue flowing into per-stage overrides.
+        internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
 
     result: dict[str, Any] = {}
 
@@ -223,6 +229,7 @@ class StagePipelineConfig:
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
+    scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
     # stage's config/tokenizer lives in a subdirectory (e.g. GLM-Image's AR
     # config is in ``vision_language_encoder/``).  Consumed at stage-init time
@@ -262,6 +269,10 @@ class PipelineConfig:
     # this value to auto-detect the pipeline.  Only needed for diffusers-style
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
+    endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Bundled deploy defaults for this concrete pipeline topology. The file is
+    # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
+    default_deploy_config_name: str | None = None
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""
@@ -303,7 +314,7 @@ class StageDeployConfig:
     the top level of ``DeployConfig`` and propagated to every stage.
     """
 
-    # === Omni fields ===
+    # === Omni stage wrapper fields ===
     # Stage identity and Omni runtime placement.
     stage_id: int
     devices: str | None = None
@@ -316,33 +327,23 @@ class StageDeployConfig:
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
 
-    # === vLLM EngineArgs fields ===
-    # Parallelism and scheduler/memory capacity.
+    # === Generic stage engine fields ===
+    # Parallelism, scheduler, and memory-capacity controls.
     tensor_parallel_size: int | None = None
+    enable_expert_parallel: bool | None = None
     gpu_memory_utilization: float | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
 
-    # Execution, scheduling, and KV/cache behavior.
+    # Generic execution, scheduling, and KV/cache behavior.
     enforce_eager: bool | None = None
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
 
-    # Diffusion parallel_config deploy override fields.
-    enable_expert_parallel: bool | None = None
-    ulysses_degree: int | None = None
-    ulysses_mode: str | None = None
-    ring_degree: int | None = None
-    sequence_parallel_size: int | None = None
-    cfg_parallel_size: int | None = None
-    vae_patch_parallel_size: int | None = None
-    use_hsdp: bool | None = None
-    hsdp_shard_size: int | None = None
-    hsdp_replicate_size: int | None = None
-
-    # Compilation, profiling, tokenizer/config parsing, and model loading.
+    # Generic compilation, profiling, tokenizer/config parsing, and model
+    # loading controls.
     compilation_config: dict[str, Any] | None = None
     profiler_config: dict[str, Any] | None = None
     skip_mm_profiling: bool | None = None
@@ -351,7 +352,57 @@ class StageDeployConfig:
     load_format: str | None = None
     tokenizer_mode: str | None = None
 
-    # Pass-through vLLM EngineArgs fields that are not represented above.
+    # === Diffusion stage runtime fields ===
+    # Diffusion parallel_config deploy/runtime override fields.
+    ulysses_degree: int | None = None
+    ulysses_mode: str | None = None
+    ring_degree: int | None = None
+    sequence_parallel_size: int | None = None
+    cfg_parallel_size: int | None = None
+    vae_patch_parallel_size: int | None = None
+    vae_parallel_mode: str | None = None
+    use_hsdp: bool | None = None
+    hsdp_shard_size: int | None = None
+    hsdp_replicate_size: int | None = None
+
+    # Diffusion model loading and adapter construction.
+    model_class_name: str | None = None
+    diffusion_load_format: str | None = None
+    diffusers_load_kwargs: dict[str, Any] | None = None
+    diffusers_call_kwargs: dict[str, Any] | None = None
+    diffusion_quantization_config: str | None = None
+    diffusion_attention_backend: str | None = None
+    diffusion_attention_config: dict[str, Any] | None = None
+
+    # Diffusion execution, cache, and VAE behavior.
+    cache_backend: str | None = None
+    cache_config: dict[str, Any] | None = None
+    enable_cache_dit_summary: bool | None = None
+    step_execution: bool | None = None
+    vae_use_slicing: bool | None = None
+    vae_use_tiling: bool | None = None
+    boundary_ratio: float | None = None
+    flow_shift: float | None = None
+    diffusion_kv_cache_dtype: str | None = None
+    diffusion_kv_cache_skip_steps: str | None = None
+    diffusion_kv_cache_skip_layers: str | None = None
+    auxiliary_text_encoder: str | None = None
+
+    # Runtime optimizations used by diffusion loading/execution.
+    enable_multithread_weight_load: bool | None = None
+    num_weight_load_threads: int | None = None
+    enable_cpu_offload: bool | None = None
+    enable_layerwise_offload: bool | None = None
+
+    # Diffusion-specific debug and observability knobs.
+    enable_diffusion_pipeline_profiler: bool | None = None
+
+    # Modality/service constraints consumed outside the core engine config.
+    max_generated_image_size: int | None = None
+    tts_max_instructions_length: int | None = None
+
+    # === Pass-through stage engine fields ===
+    # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -408,10 +459,22 @@ _STAGE_RESERVED_KEYS = frozenset(
 _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 
 
+def deploy_runtime_override_keys() -> frozenset[str]:
+    """Return deploy-schema fields that are valid CLI/runtime overrides.
+
+    These keys form the positive contract for stage override propagation:
+    stage-scoped deploy knobs plus top-level pipeline-wide engine settings.
+    They must remain overridable even if they are also modeled on
+    ``OrchestratorArgs`` for top-level CLI parsing.
+    """
+    return frozenset(_STAGE_DEPLOY_FIELDS) | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
+
+
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
     # Get the non-reserved keys for this stage
     flat_args = {k: v for k, v in stage_data.items() if k not in _STAGE_RESERVED_KEYS}
+    explicit_engine_extras = dict(stage_data.get("engine_extras") or {})
     runtime_cfg = dict(stage_data.get("runtime", {}))
     devices = runtime_cfg.get("devices", stage_data.get("devices"))
     num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
@@ -439,7 +502,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
-    kwargs["engine_extras"] = flat_args
+    kwargs["engine_extras"] = _get_recursively_merged_dict(explicit_engine_extras, flat_args)
     return StageDeployConfig(**kwargs)
 
 
@@ -602,7 +665,8 @@ def _apply_platform_overrides(
     if platform is None:
         from vllm_omni.platforms import current_omni_platform
 
-        platform = current_omni_platform.device_name.lower()
+        device_name = current_omni_platform.device_name
+        platform = device_name.lower() if device_name is not None else None
     if platform is None or deploy.platforms is None:
         return deploy
     platform_section = deploy.platforms.get(platform)
@@ -690,6 +754,7 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "active_stream_window",
     "custom_voice_dir",
 )
+PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
 
 
 def _build_engine_args(
@@ -706,6 +771,8 @@ def _build_engine_args(
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
+    if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
+        engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:
         engine_args["engine_output_type"] = ps.engine_output_type
     if next_stage_proc:
@@ -780,21 +847,27 @@ def merge_pipeline_deploy(
     if len(pipeline.stages) <= 1:
         deploy.async_chunk = False
 
-    # A pipeline supports async_chunk if any stage has either an explicit
-    # async-chunk-only processor slot OR a custom next-stage processor (some
-    # pipelines like qwen3_omni wire async-chunk processing directly through
-    # ``custom_process_next_stage_input_func``). Only raise when neither is
-    # present — that's the "user enabled async_chunk but pipeline has no
-    # inter-stage processing at all" case.
-    if deploy.async_chunk and not any(
-        ps.async_chunk_process_next_stage_input_func or ps.custom_process_next_stage_input_func
-        for ps in pipeline.stages
+    # async_chunk only applies to multi-stage pipelines: a pipeline with no
+    # consumer stages (every stage has empty input_sources) has no inter-stage
+    # edges, so async_chunk is a no-op and we skip the check entirely.
+    # For pipelines that DO have inter-stage edges, require a dedicated per-step
+    # async producer (``async_chunk_process_next_stage_input_func``).
+    # ``custom_process_next_stage_input_func`` is the full-payload / connector-path
+    # producer and does NOT imply async_chunk support — pipelines like qwen2_5_omni
+    # and covo_audio have it but removed their consumer-side ``custom_process_input_func``
+    # because they don't support async_chunk, so accepting them here would silently
+    # miswire the consumer stage instead of raising a clear error.
+    _has_inter_stage_edges = any(ps.input_sources for ps in pipeline.stages)
+    if (
+        deploy.async_chunk
+        and _has_inter_stage_edges
+        and not any(ps.async_chunk_process_next_stage_input_func for ps in pipeline.stages)
     ):
         raise ValueError(
             f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a next-stage input processor "
-            "(``async_chunk_process_next_stage_input_func`` or ``custom_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk processor on the pipeline."
+            "declares a dedicated async-chunk next-stage processor "
+            "(``async_chunk_process_next_stage_input_func``). "
+            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
         )
 
     result: list[StageConfig] = []
@@ -829,7 +902,7 @@ def merge_pipeline_deploy(
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
                 worker_type=worker_type,
-                scheduler_cls=_scheduler_path(sched_cls),
+                scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
                 yaml_engine_args=engine_args,

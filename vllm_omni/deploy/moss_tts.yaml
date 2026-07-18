@@ -2,6 +2,7 @@
 # HF: OpenMOSS-Team/MOSS-TTS
 # General-purpose TTS with voice cloning. Production-recommended variant.
 async_chunk: true
+trust_remote_code: true  # OpenMOSS-Team/MOSS-TTS ships custom modeling code
 
 connectors:
   shm:

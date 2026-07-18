@@ -294,6 +294,12 @@ _OMNI_MODELS = {
         "modeling_moss_tts_talker",
         "MossTTSRealtimeTalkerForGeneration",
     ),
+    # MossTTSLocalModel: MOSS-TTS-Local-Transformer-v1.5
+    "MossTTSLocalModel": (
+        "moss_tts",
+        "modeling_moss_tts_talker",
+        "MossTTSLocalTalkerForGeneration",
+    ),
     # Stage-1 codec decoder (shared by all 5 variants)
     "MossTTSCodecDecoder": (
         "moss_tts",

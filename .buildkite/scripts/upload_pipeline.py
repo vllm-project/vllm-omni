@@ -13,7 +13,7 @@ Test pipeline mode (e.g. test-merge.yml):
     recognize this uploader-only key).
 
 Usage:
-  python3 upload_pipeline.py [--upload] [--all] <pipeline.yml>
+  python3 upload_pipeline.py [--upload] [--all | --e2e] <pipeline.yml>
 
   # Bootstrap (replaces upload_pipeline_with_skip_ci.sh):
   python3 upload_pipeline.py --upload .buildkite/pipeline.yml
@@ -23,6 +23,9 @@ Usage:
 
   # Full suite (rebase pipeline): keep all steps, still strip the uploader-only key:
   python3 upload_pipeline.py --upload --all .buildkite/test-merge.yml
+
+  # Nightly L2 E2E only: keep the E2E Test group, ignore source_file_dependencies:
+  python3 upload_pipeline.py --upload --e2e .buildkite/test-ready.yml
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ LOG = "upload_pipeline"
 ROOT = Path(__file__).resolve().parent.parent.parent
 DOC_SEP = "\n---\n"
 BOOTSTRAP_MARKER = "__IMAGE_BUILD_IF__"
+E2E_GROUP_MARKER = "E2E Test"
 
 
 def _log(message: str) -> None:
@@ -322,18 +326,18 @@ def render_bootstrap_pipeline(text: str, *, skip_ci: bool) -> str:
     nightly_only = (
         '(build.pull_request.labels includes "nightly-test") || (build.branch == "main" && build.env("NIGHTLY") == "1")'
     )
+    nightly_main = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
+    ready_pr = 'build.branch != "main" && build.pull_request.labels includes "ready"'
+    merge_main = 'build.branch == "main" && build.env("NIGHTLY") != "1" && build.env("WEEKLY") != "1"'
+    merge_pr = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
     if skip_ci:
         image_if = f"'{nightly_only}'"
-        ready_if = "'false'"
-        merge_if = "'false'"
+        ready_if = f"'({nightly_main})'"
+        merge_if = f"'({nightly_main})'"
     else:
         image_if = "'true'"
-        ready_if = '\'build.branch != "main" && build.pull_request.labels includes "ready"\''
-        merge_if = (
-            '\'(build.branch == "main" && build.env("NIGHTLY") != "1" '
-            '&& build.env("WEEKLY") != "1") || '
-            '(build.branch != "main" && build.pull_request.labels includes "merge-test")\''
-        )
+        ready_if = f"'(({nightly_main}) || ({ready_pr}))'"
+        merge_if = f"'(({nightly_main}) || (({merge_main}) || ({merge_pr})))'"
 
     return (
         continuation.replace("__IMAGE_BUILD_IF__", image_if)
@@ -396,6 +400,20 @@ def _filter_steps(steps: list[Any], changed_files: list[str]) -> list[Any]:
     return filtered
 
 
+def _is_e2e_group(step: dict[str, Any]) -> bool:
+    group = step.get("group")
+    return isinstance(group, str) and E2E_GROUP_MARKER in group
+
+
+def _select_e2e_group_steps(steps: list[Any]) -> list[Any]:
+    selected = [step for step in steps if isinstance(step, dict) and _is_e2e_group(step)]
+    if not selected:
+        _log(f"no group matching {E2E_GROUP_MARKER!r} found")
+    else:
+        _log(f"keep {len(selected)} group(s) matching {E2E_GROUP_MARKER!r}")
+    return selected
+
+
 def _strip_uploader_metadata_from_steps(steps: list[Any]) -> list[Any]:
     """Remove uploader-only keys while keeping all steps (no diff filtering)."""
     stripped: list[Any] = []
@@ -422,11 +440,16 @@ def _strip_uploader_metadata_from_steps(steps: list[Any]) -> list[Any]:
 def render_test_pipeline(
     doc: dict[str, Any],
     changed_files: list[str] | None,
+    *,
+    e2e_only: bool = False,
 ) -> dict[str, Any]:
     steps = doc.get("steps")
     if not isinstance(steps, list):
         return doc
-    if changed_files is not None:
+    if e2e_only:
+        steps = _select_e2e_group_steps(steps)
+        steps = _strip_uploader_metadata_from_steps(steps)
+    elif changed_files is not None:
         steps = _filter_steps(steps, changed_files)
     else:
         steps = _strip_uploader_metadata_from_steps(steps)
@@ -440,7 +463,12 @@ def resolve_pipeline_path(arg: str) -> Path:
     return ROOT / path
 
 
-def render_pipeline(path: Path, *, force_all: bool = False) -> str:
+def render_pipeline(
+    path: Path,
+    *,
+    force_all: bool = False,
+    e2e_only: bool = False,
+) -> str:
     text = path.read_text(encoding="utf-8")
     diff_range = resolve_diff_range()
     changed_files = resolve_changed_files()
@@ -448,7 +476,7 @@ def render_pipeline(path: Path, *, force_all: bool = False) -> str:
     # ``--all`` forces the keep-all-steps path (no diff-aware skipping) while still
     # stripping ``source_file_dependencies``. Used by the rebase pipeline so main builds
     # run the full e2e suite (see .buildkite/rebase-pipeline.yaml).
-    if force_all:
+    if force_all or e2e_only:
         changed_files = None
 
     if BOOTSTRAP_MARKER in text:
@@ -462,7 +490,7 @@ def render_pipeline(path: Path, *, force_all: bool = False) -> str:
     if not isinstance(doc, dict):
         raise ValueError(f"invalid pipeline YAML: {path}")
 
-    doc = render_test_pipeline(doc, changed_files)
+    doc = render_test_pipeline(doc, changed_files, e2e_only=e2e_only)
 
     return yaml.safe_dump(doc, sort_keys=False)
 
@@ -489,10 +517,16 @@ def main() -> int:
         action="store_true",
         help="Pipe rendered YAML to buildkite-agent pipeline upload",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--all",
         action="store_true",
         help="Keep all steps (disable diff-aware skipping); still strips source_file_dependencies",
+    )
+    mode.add_argument(
+        "--e2e",
+        action="store_true",
+        help="Keep only the E2E Test group; disable diff-aware skipping for those steps",
     )
     args = parser.parse_args()
 
@@ -501,7 +535,7 @@ def main() -> int:
         _log(f"missing pipeline file: {path}")
         return 1
 
-    rendered = render_pipeline(path, force_all=args.all)
+    rendered = render_pipeline(path, force_all=args.all, e2e_only=args.e2e)
     if args.upload:
         upload_to_buildkite(rendered)
     else:

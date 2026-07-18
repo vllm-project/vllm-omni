@@ -16,10 +16,8 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import msgspec
-import torch
 import zmq
 import zmq.asyncio
-from PIL import Image
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
@@ -161,7 +159,7 @@ class StageDiffusionProc:
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
 
         request = OmniDiffusionRequest(
-            prompts=[prompt],
+            prompt=prompt,
             sampling_params=sampling_params,
             request_id=request_id,
             kv_sender_info=kv_sender_info,
@@ -184,7 +182,7 @@ class StageDiffusionProc:
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
 
         request = OmniDiffusionRequest(
-            prompts=[prompt],
+            prompt=prompt,
             sampling_params=sampling_params,
             request_id=request_id,
             kv_sender_info=kv_sender_info,
@@ -195,85 +193,6 @@ class StageDiffusionProc:
             if not result.request_id:
                 result.request_id = request_id
             yield result
-
-    async def _process_batch_request(
-        self,
-        request_id: str,
-        prompts: list[Any],
-        sampling_params_dict: dict,
-        kv_sender_info: dict[str, Any] | None = None,
-    ) -> OmniRequestOutput:
-        """Build a batched diffusion request and run DiffusionEngine.step().
-
-        All prompts are processed in a single step() call.  The per-prompt
-        results are merged into one :class:`OmniRequestOutput` whose
-        ``images`` list contains every generated image, matching the
-        contract expected by the orchestrator and tests.
-        """
-        if self._od_config.streaming_output:
-            raise NotImplementedError("Streaming output is not supported for batched requests")
-
-        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
-
-        request = OmniDiffusionRequest(
-            prompts=prompts,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            kv_sender_info=kv_sender_info,
-        )
-
-        results = await self._engine.step(request)
-
-        # Merge per-prompt results into a single combined output.
-        all_images: list = []
-        merged_mm: dict[str, Any] = {}
-        merged_metrics: dict[str, Any] = {}
-        merged_durations: dict[str, float] = {}
-        merged_custom: dict[str, Any] = {}
-        peak_mem = 0.0
-        latents = None
-        trajectory_latents: list[torch.Tensor] | None = None
-        trajectory_timesteps: list[torch.Tensor] | None = None
-        trajectory_log_probs: torch.Tensor | None = None
-        trajectory_decoded: list[Image.Image] | None = None
-        final_output_type = "image"
-
-        for r in results:
-            all_images.extend(r.images)
-            merged_mm.update(r._multimodal_output)
-            merged_metrics.update(r.metrics)
-            merged_durations.update(r.stage_durations)
-            merged_custom.update(r._custom_output)
-            peak_mem = max(peak_mem, r.peak_memory_mb)
-            if latents is None and r.latents is not None:
-                latents = r.latents
-            if trajectory_latents is None:
-                trajectory_latents = r.trajectory_latents
-            if trajectory_timesteps is None:
-                trajectory_timesteps = r.trajectory_timesteps
-            if trajectory_log_probs is None:
-                trajectory_log_probs = r.trajectory_log_probs
-            if trajectory_decoded is None:
-                trajectory_decoded = r.trajectory_decoded
-            if r.final_output_type != "image":
-                final_output_type = r.final_output_type
-
-        return OmniRequestOutput.from_diffusion(
-            request_id=request_id,
-            images=all_images,
-            prompt=prompts[0] if len(prompts) == 1 else None,
-            metrics=merged_metrics,
-            latents=latents,
-            trajectory_latents=trajectory_latents,
-            trajectory_timesteps=trajectory_timesteps,
-            trajectory_log_probs=trajectory_log_probs,
-            trajectory_decoded=trajectory_decoded,
-            custom_output=merged_custom or None,
-            multimodal_output=merged_mm or None,
-            final_output_type=final_output_type,
-            stage_durations=merged_durations,
-            peak_memory_mb=peak_mem,
-        )
 
     # ------------------------------------------------------------------
     # Collective RPC dispatch
@@ -494,61 +413,6 @@ class StageDiffusionProc:
                         _dispatch_request(
                             request_id,
                             msg["prompt"],
-                            msg["sampling_params"],
-                            msg.get("kv_sender_info"),
-                        )
-                    )
-                    tasks[request_id] = task
-
-                elif msg_type == "add_batch_request":
-                    request_id = msg["request_id"]
-
-                    async def _dispatch_batch(
-                        rid: str,
-                        prompts: list,
-                        sp_dict: dict,
-                        kv_sender_info: dict[str, Any] | None = None,
-                    ) -> None:
-                        try:
-                            result = await self._process_batch_request(
-                                rid,
-                                prompts,
-                                sp_dict,
-                                kv_sender_info=kv_sender_info,
-                            )
-                            await response_socket.send(encoder.encode({"type": "result", "output": result}))
-                        except DiffusionRequestAbortedError as e:
-                            logger.info(
-                                "request_id: %s aborted: %s",
-                                rid,
-                                str(e),
-                            )
-                        except Exception as e:
-                            logger.exception("Batch diffusion request %s failed: %s", rid, e)
-                            status_code, error_type = client_error_metadata(e)
-                            await response_socket.send(
-                                encoder.encode(
-                                    {
-                                        "type": "error",
-                                        "request_id": rid,
-                                        "error": str(e),
-                                        "status_code": status_code,
-                                        "error_type": error_type,
-                                    }
-                                )
-                            )
-                            # Same rationale as the single-request path: a
-                            # closed executor turns every subsequent batch
-                            # into a 500, so escalate now.
-                            if self._is_executor_dead():
-                                self._signal_fatal_engine_failure(f"add_batch_request {rid}: {e!s}")
-                        finally:
-                            tasks.pop(rid, None)
-
-                    task = asyncio.create_task(
-                        _dispatch_batch(
-                            request_id,
-                            msg["prompts"],
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
                         )

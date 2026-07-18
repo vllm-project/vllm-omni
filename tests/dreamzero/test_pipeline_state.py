@@ -4,7 +4,6 @@
 from collections import OrderedDict
 
 import pytest
-import torch
 
 from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
@@ -46,14 +45,11 @@ def test_dreamzero_pipeline_state_lru_caps_retained_sessions() -> None:
     assert "session-b" not in pipeline._states
 
 
-def test_dreamzero_state_cache_access_requires_initialization() -> None:
+def test_dreamzero_state_owns_no_kv_caches() -> None:
+    """KV (self- and cross-attention) is engine-owned since the AR-Diffusion
+    paged backend: the model-local cache accessors must be gone so nothing can
+    silently bypass the engine pool."""
     state = DreamZeroState()
 
-    with pytest.raises(RuntimeError, match="KV caches not initialized"):
-        state.get_kv_caches()
-
-    with pytest.raises(RuntimeError, match="Cross-attn caches not initialized"):
-        state.get_crossattn_caches()
-
-    with pytest.raises(RuntimeError, match="create_kv_caches first"):
-        state.update_kv_cache(0, torch.empty(0))
+    for removed in ("get_kv_caches", "create_kv_caches", "update_kv_cache", "get_crossattn_caches"):
+        assert not hasattr(state, removed)

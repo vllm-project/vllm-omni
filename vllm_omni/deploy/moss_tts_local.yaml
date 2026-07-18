@@ -1,0 +1,58 @@
+# MOSS-TTS-Local-Transformer-v1.5 (MossTTSLocalModel, n_vq=12, 48 kHz stereo)
+# HF: OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5
+# Codec: OpenMOSS-Team/MOSS-Audio-Tokenizer-v2 (48 kHz, stereo, channel-interleaved RVQ)
+# Uses a 1-layer GPT2-style local depth transformer (no delay warm-up), reset every
+# frame — same per-frame timing (80 ms/frame, 12.5 fps) as MOSS-TTS-Realtime.
+async_chunk: true
+
+connectors:
+  shm:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: true
+      connector_get_sleep_s: 0.005
+      connector_get_max_wait_first_chunk: 1000
+      connector_get_max_wait: 300
+      initial_codec_chunk_frames: 1   # 1 frame * 80 ms/frame = 80 ms first audio chunk
+      codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
+      codec_left_context_frames: 0
+      codec_stream_slots: 8
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.60
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: shm
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: shm
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0

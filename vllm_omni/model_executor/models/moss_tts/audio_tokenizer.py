@@ -45,6 +45,8 @@ class MossAudioTokenizerConfig(PretrainedConfig):
         causal_transformer_context_duration: float = 10.0,
         encoder_kwargs: list[dict[str, Any]] | None = None,
         decoder_kwargs: list[dict[str, Any]] | None = None,
+        number_channels: int = 1,
+        enable_channel_interleave: bool = True,
         quantizer_type: str = "rlfq",
         quantizer_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
@@ -54,6 +56,8 @@ class MossAudioTokenizerConfig(PretrainedConfig):
         self.sampling_rate = sampling_rate
         self.downsample_rate = downsample_rate
         self.causal_transformer_context_duration = causal_transformer_context_duration
+        self.number_channels = number_channels
+        self.enable_channel_interleave = enable_channel_interleave
         self.encoder_kwargs = encoder_kwargs or _default_encoder_kwargs()
         self.decoder_kwargs = decoder_kwargs or _default_decoder_kwargs()
         if quantizer_kwargs is None:
@@ -201,13 +205,21 @@ class _Attention(nn.Module):
     """Causal multi-head self-attention with RoPE, no streaming KV cache."""
 
     def __init__(
-        self, embed_dim: int, num_heads: int, causal: bool, max_period: float, device=None, dtype=None
+        self,
+        embed_dim: int,
+        num_heads: int,
+        causal: bool,
+        max_period: float,
+        context: int | None = None,
+        device=None,
+        dtype=None,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.causal = causal
         self.max_period = max_period
+        self.context = context
         kw = {"device": device, "dtype": dtype}
         self.in_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False, **kw)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False, **kw)
@@ -234,7 +246,38 @@ class _Attention(nn.Module):
         qkv = self.in_proj(x).reshape(B, T, 3, H, D).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, T, D)
         q, k = _apply_rope(q, k, self.max_period)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
+        if self.context is not None and self.context < T:
+            # Local-windowed causal attention: query i may only see keys in
+            # [i - context + 1, i]. Matches upstream's per-stage receptive
+            # field — wider context windows are not numerically equivalent.
+            #
+            # A dense (T, T) mask is O(T^2) memory (e.g. 4 GiB at T=65536) —
+            # for long utterances decoded in a single non-streaming call this
+            # OOMs. Process queries in blocks against only their reachable
+            # key range so peak mask memory is O(block * (block + context))
+            # regardless of T.
+            block = 4096
+            if T <= block:
+                positions = torch.arange(T, device=x.device)
+                delta = positions.view(-1, 1) - positions.view(1, -1)
+                mask = (delta >= 0) & (delta < self.context)
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            else:
+                outs = []
+                for start in range(0, T, block):
+                    end = min(start + block, T)
+                    k_start = max(0, start - self.context + 1)
+                    q_pos = torch.arange(start, end, device=x.device)
+                    k_pos = torch.arange(k_start, end, device=x.device)
+                    delta = q_pos.view(-1, 1) - k_pos.view(1, -1)
+                    blk_mask = (delta >= 0) & (delta < self.context)
+                    out_blk = F.scaled_dot_product_attention(
+                        q[:, :, start:end], k[:, :, k_start:end], v[:, :, k_start:end], attn_mask=blk_mask
+                    )
+                    outs.append(out_blk)
+                out = torch.cat(outs, dim=2)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         out = out.transpose(1, 2).reshape(B, T, self.embed_dim)
         return self.out_proj(out)
 
@@ -248,6 +291,7 @@ class _TransformerLayer(nn.Module):
         causal: bool,
         max_period: float,
         layer_scale: float | None,
+        context: int | None = None,
         device=None,
         dtype=None,
     ) -> None:
@@ -255,7 +299,7 @@ class _TransformerLayer(nn.Module):
         kw = {"device": device, "dtype": dtype}
         self.norm1 = nn.LayerNorm(d_model, eps=1e-5, **kw)
         self.norm2 = nn.LayerNorm(d_model, eps=1e-5, **kw)
-        self.attn = _Attention(d_model, num_heads, causal, max_period, device, dtype)
+        self.attn = _Attention(d_model, num_heads, causal, max_period, context, device, dtype)
         self.ff1 = nn.Linear(d_model, dim_feedforward, bias=False, **kw)
         self.ff2 = nn.Linear(dim_feedforward, d_model, bias=False, **kw)
         ls_kw = cast(dict[str, object], kw)
@@ -282,13 +326,16 @@ class _Transformer(nn.Module):
         causal: bool,
         max_period: float,
         layer_scale: float | None,
+        context: int | None = None,
         device=None,
         dtype=None,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
             [
-                _TransformerLayer(d_model, num_heads, dim_feedforward, causal, max_period, layer_scale, device, dtype)
+                _TransformerLayer(
+                    d_model, num_heads, dim_feedforward, causal, max_period, layer_scale, context, device, dtype
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -307,11 +354,12 @@ class _ProjectedTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.downsample_ratio: int = 1
-        self.in_proj = nn.Linear(input_dimension, d_model, bias=False) if d_model != input_dimension else nn.Identity()
+        # Upstream always materializes a learned Linear here regardless of
+        # whether input_dimension == d_model — substituting Identity when
+        # the dims happen to match silently drops a trained projection.
+        self.in_proj = nn.Linear(input_dimension, d_model, bias=False)
         self.transformer = _Transformer(d_model=d_model, **kwargs)
-        self.out_proj = (
-            nn.Linear(d_model, output_dimension, bias=False) if d_model != output_dimension else nn.Identity()
-        )
+        self.out_proj = nn.Linear(d_model, output_dimension, bias=False)
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.in_proj(x.transpose(1, 2))  # (B, D, T) → (B, T, d_model)
@@ -456,10 +504,21 @@ class _ResidualQ(nn.Module):
 
 
 def _build_modules(
-    specs: list[dict[str, Any]], is_downsample: bool, context_duration: float, sampling_rate: float
-) -> nn.ModuleList:
+    specs: list[dict[str, Any]], is_downsample: bool, default_context_duration: float, frame_rate: float
+) -> tuple[nn.ModuleList, float]:
+    """Build encoder/decoder stage modules.
+
+    ``frame_rate`` tracks the running frames-per-second at the current stage
+    (updated after each module by its downsample/upsample ratio, mirroring
+    upstream's ``current_frame_rate``). Each ``Transformer`` module's local
+    attention window (``context``, in frames) is derived from its own
+    ``context_duration`` (seconds) at the rate *at that point in the stack* —
+    not a global constant — so it must be computed here, not by the caller.
+    Returns the final rate too, since the decoder's starting rate is the
+    encoder's bottleneck rate, not the raw sampling rate.
+    """
     modules: list[nn.Module] = []
-    rate = float(sampling_rate)
+    rate = float(frame_rate)
     for spec in specs:
         spec = dict(spec)
         if spec["module_type"] == "PatchedPretransform":
@@ -471,16 +530,18 @@ def _build_modules(
             spec.pop("positional_embedding", None)
             spec.pop("norm", None)
             spec.pop("causal", None)
+            context_duration = float(spec.pop("context_duration", default_context_duration))
             m = _ProjectedTransformer(
                 module_type="Transformer",
                 causal=True,
                 max_period=spec.pop("max_period", 10000),
                 layer_scale=spec.pop("layer_scale", None),
+                context=int(round(rate * context_duration)),
                 **spec,
             )
         modules.append(m)
         rate = rate / m.downsample_ratio if is_downsample else rate * m.downsample_ratio
-    return nn.ModuleList(modules)
+    return nn.ModuleList(modules), rate
 
 
 class MossAudioTokenizerModel(PreTrainedModel):
@@ -494,12 +555,27 @@ class MossAudioTokenizerModel(PreTrainedModel):
         super().__init__(config)
         self.sampling_rate = config.sampling_rate
         self.downsample_rate = config.downsample_rate
+        # Real v1 checkpoints store these as an explicit JSON `null` rather
+        # than omitting the key, so `getattr(..., default)` doesn't apply —
+        # normalize None to the same defaults here.
+        self.number_channels = getattr(config, "number_channels", 1) or 1
+        self.enable_channel_interleave = getattr(config, "enable_channel_interleave", True)
+        if self.enable_channel_interleave is None:
+            self.enable_channel_interleave = True
 
         ctx = config.causal_transformer_context_duration
-        sr = float(config.sampling_rate)
-        self.encoder = _build_modules(config.encoder_kwargs, is_downsample=True, context_duration=ctx, sampling_rate=sr)
-        self.decoder = _build_modules(
-            copy.deepcopy(config.decoder_kwargs), is_downsample=False, context_duration=ctx, sampling_rate=sr
+        channel_interleave_factor = (
+            self.number_channels if (self.enable_channel_interleave and self.number_channels > 1) else 1
+        )
+        frame_rate = float(config.sampling_rate) * channel_interleave_factor
+        self.encoder, bottleneck_rate = _build_modules(
+            config.encoder_kwargs, is_downsample=True, default_context_duration=ctx, frame_rate=frame_rate
+        )
+        self.decoder, _ = _build_modules(
+            copy.deepcopy(config.decoder_kwargs),
+            is_downsample=False,
+            default_context_duration=ctx,
+            frame_rate=bottleneck_rate,
         )
 
         kw = dict(config.quantizer_kwargs)
@@ -512,15 +588,29 @@ class MossAudioTokenizerModel(PreTrainedModel):
         wav_list: list[torch.Tensor],
         num_quantizers: int | None = None,
     ) -> MossAudioTokenizerEncoderOutput:
-        """Encode a list of 1-D waveform tensors → RVQ codes (NQ, B, T)."""
+        """Encode a list of waveform tensors → RVQ codes (NQ, B, T).
+
+        Each element of ``wav_list`` is ``(T,)``/``(1, T)`` for a mono codec
+        (``number_channels == 1``) or ``(number_channels, T)`` otherwise.
+        """
         device = wav_list[0].device
         B = len(wav_list)
-        max_len = max(w.shape[-1] for w in wav_list)
-        x = torch.zeros(B, 1, max_len, device=device)
+        C = self.number_channels
+        normalized: list[torch.Tensor] = []
         lengths = torch.zeros(B, device=device, dtype=torch.long)
         for i, w in enumerate(wav_list):
-            x[i, 0, : w.shape[-1]] = w
-            lengths[i] = w.shape[-1]
+            if C == 1:
+                w_i = w.unsqueeze(0) if w.dim() == 1 else w
+            else:
+                if w.dim() != 2 or w.shape[0] != C:
+                    raise ValueError(f"Expected wav_list[{i}] to have shape ({C}, T), got {tuple(w.shape)}.")
+                w_i = w
+            normalized.append(w_i)
+            lengths[i] = w_i.shape[-1]
+        max_len = int(lengths.max().item())
+        x = torch.zeros(B, C, max_len, device=device, dtype=wav_list[0].dtype)
+        for i, w_i in enumerate(normalized):
+            x[i, :, : w_i.shape[-1]] = w_i
         return self._encode(x, lengths, num_quantizers)
 
     @torch.no_grad()
@@ -541,6 +631,45 @@ class MossAudioTokenizerModel(PreTrainedModel):
             lengths[i] = c.shape[-1]
         return self._decode(codes, lengths)
 
+    def _flatten_channels_for_codec(
+        self,
+        input_values: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pad to a ``downsample_rate`` multiple, then interleave channels into one stream.
+
+        Mirrors upstream's ``_flatten_channels_for_codec``: for a stereo
+        codec, ``(B, C, T)`` becomes ``(B, 1, T*C)`` with samples interleaved
+        frame-by-frame across channels, so the mono encoder/decoder stack can
+        process a multi-channel waveform unchanged.
+        """
+        if input_values.shape[-1] % self.downsample_rate != 0:
+            pad_length = self.downsample_rate - (input_values.shape[-1] % self.downsample_rate)
+            input_values = F.pad(input_values, (0, pad_length))
+        if self.number_channels > 1 and self.enable_channel_interleave:
+            input_values = input_values.transpose(1, 2).contiguous().view(input_values.shape[0], 1, -1)
+            input_lengths = input_lengths * self.number_channels
+        return input_values, input_lengths
+
+    def _restore_channels_from_codec(
+        self,
+        output_values: torch.Tensor,
+        output_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inverse of ``_flatten_channels_for_codec``: de-interleave back to ``(B, C, T)``."""
+        if self.number_channels == 1 or not self.enable_channel_interleave:
+            return output_values.float(), output_lengths
+        output_values = (
+            output_values.squeeze(1)
+            .contiguous()
+            .view(output_values.shape[0], -1, self.number_channels)
+            .transpose(1, 2)
+            .contiguous()
+            .float()
+        )
+        output_lengths = torch.div(output_lengths, self.number_channels, rounding_mode="floor")
+        return output_values, output_lengths
+
     def _encode(
         self,
         x: torch.Tensor,
@@ -549,9 +678,7 @@ class MossAudioTokenizerModel(PreTrainedModel):
     ) -> MossAudioTokenizerEncoderOutput:
         if x.dim() == 2:
             x = x.unsqueeze(1)
-        T = x.shape[-1]
-        if T % self.downsample_rate:
-            x = F.pad(x, (0, self.downsample_rate - T % self.downsample_rate))
+        x, lengths = self._flatten_channels_for_codec(x, lengths)
         e, e_len = x, lengths
         for m in self.encoder:
             e, e_len = m(e, e_len)
@@ -567,6 +694,7 @@ class MossAudioTokenizerModel(PreTrainedModel):
         d, d_len = z, lengths
         for m in self.decoder:
             d, d_len = m(d, d_len)
+        d, d_len = self._restore_channels_from_codec(d, d_len)
         return MossAudioTokenizerDecoderOutput(audio=d, audio_lengths=d_len)
 
 

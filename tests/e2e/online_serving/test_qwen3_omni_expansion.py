@@ -7,6 +7,7 @@ E2E Online tests for Qwen3-Omni model.
 import os
 
 import pytest
+from openai import BadRequestError
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
@@ -40,11 +41,21 @@ def get_batch_token_config(default_path):
     Uses the new flat-stage schema (``stages.<id>.<field>``); the legacy
     ``stage_args.<id>.engine_args.<field>`` path no longer applies because
     the deploy YAML doesn't nest engine fields under ``engine_args:``.
+
+    Note:
+        64 was the original value but caused a GPU hang (NVIDIA watchdog killed
+        the process after ~2 s) when 5 concurrent requests arrived, due to an
+        upstream scheduler change (``throttle_prefills`` API in vLLM commit
+        0b131b16c). 512 was first tried but caused output quality degradation for
+        long audio (~120 s) inputs. 2048 gives the scheduler enough token budget
+        to handle 5 concurrent requests even with multi-second audio prefill,
+        while still being well below the default 32768.
+        If the upstream scheduler changes again, this value may need adjustment.
     """
     return modify_stage_config(
         default_path,
         updates={
-            "stages": {0: {"max_num_batched_tokens": 64}, 1: {"max_num_batched_tokens": 64}},
+            "stages": {0: {"max_num_batched_tokens": 2048}, 1: {"max_num_batched_tokens": 2048}},
         },
     )
 
@@ -63,8 +74,6 @@ test_params = [
             use_stage_cli=True,
             server_args=[
                 "--no-async-chunk",
-                "--stage-overrides",
-                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
             ],
         ),
         id="default",
@@ -404,6 +413,44 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_client) -> None:
+    """
+    Regression: ``use_audio_in_video`` with default video loader sampling (no
+    ``media_io_kwargs.video.fps``) after a prior request that pinned fps.
+
+    Before the fix the second request could partial-hit mm-cache (audio cached,
+    video re-processed without audio) and fail with ``StopIteration`` in
+    ``replace_multimodal_special_tokens``.
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 128, embed_audio=True)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        content_text="Reply with one word: OK.",
+    )
+
+    base_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "use_audio_in_video": True,
+        "modalities": ["text"],
+    }
+
+    # Prime mm-cache with explicit loader fps (historical failure mode).
+    openai_client.send_omni_request(
+        {
+            **base_config,
+            "extra_body": {"media_io_kwargs": {"video": {"fps": 1, "num_frames": 128}}},
+        }
+    )
+
+    # Default loader sampling: must succeed without explicit media_io fps.
+    openai_client.send_omni_request(dict(base_config))
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_one_word_prompt_001(omni_server, openai_client) -> None:
     """
     Input Modal: text only (one-word answer constraint).
@@ -564,3 +611,21 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
     assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params[:1], indirect=True)
+def test_invalid_audio_format_rejected(omni_server, openai_client) -> None:
+    """Ensure invalid audio format is rejected with 400 before streaming starts."""
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt(),
+    )
+    with pytest.raises(BadRequestError, match="audio format"):
+        openai_client.client.chat.completions.create(
+            model=omni_server.model,
+            messages=messages,
+            modalities=["text", "audio"],
+            audio={"voice": "alloy", "format": "aac"},
+            stream=True,
+        )

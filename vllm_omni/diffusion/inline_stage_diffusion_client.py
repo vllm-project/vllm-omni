@@ -12,8 +12,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
-import torch
-from PIL import Image
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -128,7 +126,7 @@ class InlineStageDiffusionClient(StageClientBase):
     ) -> None:
         try:
             request = OmniDiffusionRequest(
-                prompts=[prompt],
+                prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
@@ -150,113 +148,6 @@ class InlineStageDiffusionClient(StageClientBase):
             logger.info("request_id: %s aborted: %s", request_id, str(e))
         except Exception as e:
             logger.exception("Diffusion request %s failed: %s", request_id, e)
-            status_code, error_type = client_error_metadata(e)
-            error_output = OmniRequestOutput.from_error(
-                request_id=request_id,
-                error_message=str(e),
-                status_code=status_code,
-                error_type=error_type,
-            )
-            self._output_queue.put_nowait(error_output)
-        finally:
-            self._tasks.pop(request_id, None)
-
-    async def add_batch_request_async(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None:
-        logger.debug(
-            "[InlineStageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
-            self.stage_id,
-            self.replica_id,
-            request_id,
-            len(prompts),
-        )
-        task = asyncio.create_task(
-            self._dispatch_batch(
-                request_id,
-                prompts,
-                sampling_params,
-                kv_sender_info,
-            )
-        )
-        self._tasks[request_id] = task
-
-    async def _dispatch_batch(
-        self,
-        request_id: str,
-        prompts: list[Any],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[str, Any] | None = None,
-    ) -> None:
-        try:
-            request = OmniDiffusionRequest(
-                prompts=prompts,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                kv_sender_info=kv_sender_info,
-            )
-
-            results = await self._engine.step(request)
-
-            all_images: list = []
-            merged_mm: dict[str, Any] = {}
-            merged_metrics: dict[str, Any] = {}
-            merged_durations: dict[str, float] = {}
-            merged_custom: dict[str, Any] = {}
-            peak_mem = 0.0
-            latents = None
-            trajectory_latents: list[torch.Tensor] | None = None
-            trajectory_timesteps: list[torch.Tensor] | None = None
-            trajectory_log_probs: torch.Tensor | None = None
-            trajectory_decoded: list[Image.Image] | None = None
-            final_output_type = "image"
-
-            for r in results:
-                all_images.extend(r.images)
-                merged_mm.update(r._multimodal_output)
-                merged_metrics.update(r.metrics)
-                merged_durations.update(r.stage_durations)
-                merged_custom.update(r._custom_output)
-                peak_mem = max(peak_mem, r.peak_memory_mb)
-                if latents is None and r.latents is not None:
-                    latents = r.latents
-                if trajectory_latents is None:
-                    trajectory_latents = r.trajectory_latents
-                if trajectory_timesteps is None:
-                    trajectory_timesteps = r.trajectory_timesteps
-                if trajectory_log_probs is None:
-                    trajectory_log_probs = r.trajectory_log_probs
-                if trajectory_decoded is None:
-                    trajectory_decoded = r.trajectory_decoded
-                if r.final_output_type != "image":
-                    final_output_type = r.final_output_type
-
-            result = OmniRequestOutput.from_diffusion(
-                request_id=request_id,
-                images=all_images,
-                prompt=prompts[0] if len(prompts) == 1 else None,
-                metrics=merged_metrics,
-                latents=latents,
-                trajectory_latents=trajectory_latents,
-                trajectory_timesteps=trajectory_timesteps,
-                trajectory_log_probs=trajectory_log_probs,
-                trajectory_decoded=trajectory_decoded,
-                custom_output=merged_custom or None,
-                multimodal_output=merged_mm or None,
-                final_output_type=final_output_type,
-                stage_durations=merged_durations,
-                peak_memory_mb=peak_mem,
-            )
-
-            self._output_queue.put_nowait(result)
-        except DiffusionRequestAbortedError as e:
-            logger.info("request_id: %s aborted: %s", request_id, str(e))
-        except Exception as e:
-            logger.exception("Batch diffusion request %s failed: %s", request_id, e)
             status_code, error_type = client_error_metadata(e)
             error_output = OmniRequestOutput.from_error(
                 request_id=request_id,

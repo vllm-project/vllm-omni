@@ -80,6 +80,17 @@ models:
     task_extra_body:
       voice_clone: {}
 
+  # MOSS-TTS-Local-Transformer-v1.5: Qwen3 backbone + 1-layer GPT2-style local
+  # depth transformer (n_vq=12), paired with the 48 kHz stereo
+  # MOSS-Audio-Tokenizer-v2 codec. Same voice-clone request shape as the
+  # other MOSS-TTS variants.
+  OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
   # MOSS-TTSD synthesizes [S1]/[S2] dialogue. The seed-tts voice_clone dataset
   # has single-speaker rows; bench piggybacks on it (both speakers share the
   # same ref_audio). For real dialogue evaluation use the ttsd dataset.

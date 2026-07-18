@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -309,6 +309,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # tensor read; postprocess receives the tail-only slice instead, which
         # avoids ~18 ms merge + ~6 ms write per step (Sy0307 profile, #3665).
         self.requires_full_prefix_cached_hidden_states = False
+        # Stage 1 (code2wav) consumes runtime audio codes, not hidden states,
+        # so the inter-stage pooler payload never needs a CPU hidden-states
+        # view. Opting out lets the runner skip the per-step blocking
+        # ``hidden_states[:n].to("cpu")`` (measured at 24% of stage-0 on-CPU
+        # samples at c=64 on H20).
+        self.omni_pooler_payload_include_hidden = False
         # ``codes.audio`` is only needed for future prefix-hit reconstruction
         # after a request has produced codec rows. Keep per-step rows on GPU and
         # materialize the CPU OmniTensorPrefixCache entry once at completion.
@@ -318,7 +324,33 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
-
+        self.talker_mtp_graph_safe = True
+        # talker_mtp samples with per-row generators, so explicitly-seeded
+        # requests stay batched instead of one scalar forward per row (#4883).
+        # This is only valid while talker_mtp receives the *unpadded* active
+        # batch, i.e. when it is NOT graph-wrapped. The runner wraps talker_mtp
+        # (padded batches + a single captured RNG stream) whenever full
+        # cudagraphs are enabled, so disable per-row generators in that case.
+        # Consequence: under full cudagraphs, per-request ``tts_local_seed`` is
+        # not reproducible (matching Qwen3-Omni, which has no per-row seeding);
+        # eager mode keeps the per-row generator fast-path.
+        # TODO(#4923): the model should not read ``cudagraph_mode`` — it is an
+        # upstream (runner) concern, and the runner already re-derives the same
+        # wrap decision in ``_init_talker_mtp``. Once all TTS models declare
+        # ``talker_mtp_graph_safe`` we should move this gating into the model
+        # runner (models only expose the static capability flag, and users can
+        # then configure ``cudagraph_mode`` freely). This also means mtp seeding
+        # is silently dropped when the decode batch > 1 under full cudagraphs;
+        # the follow-up should refactor the per-row generator in the runner to
+        # be cudagraph-safe so seeded batches stay reproducible.
+        cudagraph_mode = getattr(vllm_config.compilation_config, "cudagraph_mode", None)
+        talker_mtp_graph_wrapped = (
+            self.talker_mtp_graph_safe and cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
+        )
+        self.talker_mtp_accepts_per_row_generators = not talker_mtp_graph_wrapped
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
@@ -592,7 +624,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         audio_codes = torch.cat(audio_codes_list, dim=0)
         span_len = int(audio_codes.shape[0])
-        hidden = hidden[:span_len]
         mm: OmniPayload = {"codes": {"audio": audio_codes}}
         if ref_code_len_list:
             mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
@@ -717,6 +748,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
             info_update.setdefault("codes", {})["audio"] = zeros
             return input_ids_out, prompt_embeds, info_update
+
+        if span_len > 1:
+            inputs_embeds_out = (
+                self.embed_input_ids(input_ids.reshape(-1, 1).to(torch.long))
+                .to(device=input_ids.device, dtype=dtype)
+                .reshape(span_len, -1)
+            )
+            return input_ids, inputs_embeds_out, {"meta": {"codec_streaming": codec_streaming}}
 
         # Decode: span_len == 1
         # Pop one text-step vector from tailing_text_hidden queue.
@@ -1049,6 +1088,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         top_k: int | None = None,
         top_p: float | None = None,
         generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
@@ -1088,6 +1128,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             top_k=top_k,
             top_p=top_p,
             generator=generator,
+            generators=generators,
         )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.

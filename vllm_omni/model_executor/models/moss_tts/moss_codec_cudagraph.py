@@ -1,6 +1,6 @@
 """CUDA Graph acceleration for the MOSS Audio Tokenizer codec decoder.
 
-Captures MossAudioTokenizerModel._decode for a set of fixed frame-count
+Captures MossAudioTokenizerModel._decode_frame for a set of fixed frame-count
 bucket sizes, then replays the captured graph at inference time to eliminate
 kernel-launch overhead.  Inputs that exceed all captured sizes fall back to
 eager execution transparently.
@@ -24,7 +24,7 @@ logger = init_logger(__name__)
 
 
 class MossTTSCUDAGraphCodecWrapper:
-    """CUDA Graph wrapper for MossAudioTokenizerModel._decode.
+    """CUDA Graph wrapper for MossAudioTokenizerModel._decode_frame.
 
     Graphs are keyed by padded_T (int).  On each call the actual T is
     bucket-matched to the smallest pre-captured size >= T.  The static code
@@ -99,7 +99,7 @@ class MossTTSCUDAGraphCodecWrapper:
             dummy_codes = torch.zeros(nq, 1, size, dtype=torch.long, device=device)
             dummy_lengths = torch.tensor([size], dtype=torch.long, device=device)
             with torch.no_grad():
-                _ = self.model._decode(dummy_codes, dummy_lengths)
+                _ = self.model._decode_frame(dummy_codes, dummy_lengths)
 
         torch.accelerator.synchronize(device)
 
@@ -132,13 +132,13 @@ class MossTTSCUDAGraphCodecWrapper:
 
         # Extra eager warmup inside capture to ensure all kernels are compiled.
         with torch.no_grad():
-            _ = self.model._decode(static_codes, static_lengths)
+            _ = self.model._decode_frame(static_codes, static_lengths)
         torch.accelerator.synchronize(device)
 
         graph = CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                static_out = self.model._decode(static_codes, static_lengths)
+                static_out = self.model._decode_frame(static_codes, static_lengths)
 
         self.graphs[size] = graph
         self.static_codes[size] = static_codes

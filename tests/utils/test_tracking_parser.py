@@ -16,7 +16,12 @@ from vllm_omni.config.stage_config import (
     StageDeployConfig,
     StagePipelineConfig,
 )
-from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
+from vllm_omni.utils.tracking_parser import (
+    UNSET,
+    TrackingArgumentParser,
+    TrackingNamespace,
+    build_shadow_kwargs,
+)
 
 ### Fake pipeline/deploy config for integration tests
 
@@ -44,6 +49,11 @@ _TEST_DEPLOY = DeployConfig(
 @pytest.fixture()
 def mock_stages(monkeypatch):
     """Register a fake pipeline and mock deploy YAML loading."""
+    from vllm_omni import platforms
+
+    platform = platforms.current_omni_platform
+    monkeypatch.setattr(platform, "device_name", "cpu", raising=False)
+    monkeypatch.setattr(platform, "device_type", "cpu", raising=False)
     monkeypatch.setitem(OMNI_PIPELINES, _TEST_MODEL, _TEST_PIPELINE)
     monkeypatch.setattr(
         "vllm_omni.config.config_factory.load_deploy_config",
@@ -326,6 +336,132 @@ def test_omitted_nargs():
     assert ns.items is None
 
 
+### Tests for in-place mutating actions (append / extend / count).
+# These actions mutate their default in place, which would crash on the bare
+# ``UNSET`` sentinel. The shadow parser remaps them to a non-mutating store-style
+# action (see build_shadow_kwargs in tracking_parser), so the real namespace
+# still accumulates while explicit-arg tracking keeps working.
+def test_append_action_omitted():
+    """Omitted append args parse without error and aren't marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--tag", action="append")
+    ns = p.parse_args([])
+    assert ns.explicit_keys == set()
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.tag is None
+
+
+def test_append_action_explicit():
+    """Repeated append args are collected and marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--tag", action="append")
+    ns = p.parse_args(["--tag", "a", "--tag", "b"])
+    assert ns.explicit_keys == {"tag"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.tag == ["a", "b"]
+
+
+def test_append_const_action_omitted():
+    """Omitted append_const args aren't marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--dbg", action="append_const", const="x", dest="flags")
+    ns = p.parse_args([])
+    assert ns.explicit_keys == set()
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.flags is None
+
+
+def test_append_const_action_explicit():
+    """Repeated append_const args accumulate the const and are explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--dbg", action="append_const", const="x", dest="flags")
+    ns = p.parse_args(["--dbg", "--dbg"])
+    assert ns.explicit_keys == {"flags"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.flags == ["x", "x"]
+
+
+def test_extend_action_omitted():
+    """Omitted extend args parse without error and aren't marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--items", action="extend", nargs="+")
+    ns = p.parse_args([])
+    assert ns.explicit_keys == set()
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.items is None
+
+
+def test_extend_action_explicit():
+    """Repeated extend args are flattened into one list and marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("--items", action="extend", nargs="+")
+    ns = p.parse_args(["--items", "a", "b", "--items", "c"])
+    assert ns.explicit_keys == {"items"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.items == ["a", "b", "c"]
+
+
+def test_count_action_omitted():
+    """Omitted count args keep their default and aren't marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    ns = p.parse_args([])
+    assert ns.explicit_keys == set()
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.verbose == 0
+
+
+def test_count_action_explicit():
+    """Repeated count flags increment and are marked explicit."""
+    p = TrackingArgumentParser()
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    ns = p.parse_args(["-vv"])
+    assert ns.explicit_keys == {"verbose"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.verbose == 2
+
+
+def test_group_append_action_explicit():
+    """append args added via a group go through the same shadow-default path."""
+    p = TrackingArgumentParser()
+    g = p.add_argument_group("TestGroup")
+    g.add_argument("--tag", action="append")
+    ns = p.parse_args(["--tag", "a", "--tag", "b"])
+    assert ns.explicit_keys == {"tag"}
+    assert isinstance(ns, TrackingNamespace)
+    assert ns.tag == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("append", "store"),
+        ("extend", "store"),
+        ("append_const", "store_const"),
+        ("count", "store_const"),
+    ],
+)
+def test_build_shadow_kwargs_remaps_mutating_actions(action, expected):
+    """Mutating actions are remapped to a store-style action with an UNSET default."""
+    shadow = build_shadow_kwargs({"action": action, "const": "c"})
+    assert shadow["action"] == expected
+    assert shadow["default"] is UNSET
+
+
+def test_build_shadow_kwargs_count_gets_marker_const():
+    """count carries no const, so the remapped store_const gets a non-UNSET marker."""
+    shadow = build_shadow_kwargs({"action": "count"})
+    assert shadow["action"] == "store_const"
+    assert shadow["const"] is not UNSET
+
+
+def test_build_shadow_kwargs_leaves_other_actions_untouched():
+    """Non-mutating actions keep their action and only get the UNSET default."""
+    shadow = build_shadow_kwargs({"action": "store_true"})
+    assert shadow["action"] == "store_true"
+    assert shadow["default"] is UNSET
+
+
 def test_parse_known_args_tracking():
     """Ensure parse_known_args is also trackable"""
     p = TrackingArgumentParser()
@@ -453,6 +589,12 @@ def test_cli_overrides_config(tmp_path):
 
 
 ### Integration tests for arg resolution through StageConfigFactory
+#
+# These tests still target the transitional legacy StageConfig path because the
+# current runtime reads explicit CLI values from ``stage.runtime_overrides``.
+# After RFC #4021 migrates engine startup to consume ``VllmOmniConfig`` directly,
+# these assertions should move to the structured config/runtime boundary and the
+# ``_create_legacy_from_registry`` calls should be removed.
 def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
     """Explicitly passed CLI values reach runtime_overrides on all stages."""
     p = TrackingArgumentParser()
@@ -460,8 +602,7 @@ def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
     ns = p.parse_args(["--max-num-seqs", "999"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -477,8 +618,7 @@ def test_omitted_default_not_in_runtime_overrides(mock_stages):
     ns = p.parse_args([])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -499,8 +639,7 @@ def test_config_file_args_reach_runtime_overrides(mock_stages):
         ns = p.parse_args(["--config", "fake.yaml"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -517,8 +656,7 @@ def test_per_stage_override_routes_correctly(mock_stages):
     ns = p.parse_args(["--stage-0-gpu-memory-utilization", "0.42"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -539,8 +677,7 @@ def test_explicit_args_omitted_from_yaml(mock_stages):
     ns = p.parse_args(["--enforce-eager"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,

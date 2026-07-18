@@ -11,6 +11,7 @@ import json
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -43,22 +44,17 @@ class MockVideoResult:
         videos,
         audios=None,
         sample_rate=None,
-        custom_output=None,
+        multimodal_output=None,
         stage_durations=None,
         peak_memory_mb=0.0,
     ):
-        self.multimodal_output = {"video": videos}
+        self.multimodal_output = dict(multimodal_output or {"video": videos})
         if audios is not None:
             self.multimodal_output["audio"] = audios
         if sample_rate is not None:
             self.multimodal_output["audio_sample_rate"] = sample_rate
-        self._custom_output = custom_output or {}
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
-
-    @property
-    def custom_output(self):
-        return self._custom_output
 
 
 class FakeAsyncOmni:
@@ -99,6 +95,14 @@ class BlockingVideoHandler:
             raise
 
 
+class FakeServerSocket:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture(autouse=True)
 def isolated_video_backends(tmp_path, monkeypatch):
     """Use isolated in-memory metadata and local storage for each test."""
@@ -109,6 +113,91 @@ def isolated_video_backends(tmp_path, monkeypatch):
     monkeypatch.setattr(api_server, "VIDEO_TASKS", tasks)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
     return store, tasks, storage
+
+
+@pytest.mark.asyncio
+async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch):
+    events: list[str] = []
+    serve_started = asyncio.Event()
+    http_shutdown = asyncio.Event()
+    engine_context_exited = asyncio.Event()
+    sock = FakeServerSocket()
+
+    class FakeEngine:
+        stage_configs = []
+
+        async def get_supported_tasks(self):
+            return ("generate",)
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*args, **kwargs):
+        del args, kwargs
+        events.append("engine_enter")
+        try:
+            yield FakeEngine()
+        finally:
+            events.append("engine_exit")
+            engine_context_exited.set()
+
+    async def fake_serve_http(*args, **kwargs):
+        del args, kwargs
+        events.append("serve_http")
+        serve_started.set()
+
+        async def wait_for_shutdown():
+            await http_shutdown.wait()
+            events.append("http_shutdown")
+
+        return asyncio.create_task(wait_for_shutdown())
+
+    async def fake_storage_start():
+        events.append("storage_start")
+
+    async def fake_get_vllm_config(engine_client):
+        del engine_client
+        return None
+
+    async def fake_init_app_state(engine_client, state, args):
+        del engine_client, state, args
+        events.append("init_app_state")
+
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
+    monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
+
+    args = SimpleNamespace(
+        tool_parser_plugin="",
+        reasoning_parser_plugin="",
+        reasoning_parser=None,
+        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
+        enable_ssl_refresh=False,
+        host="127.0.0.1",
+        port=0,
+        uvicorn_log_level="info",
+        disable_uvicorn_access_log=True,
+        ssl_keyfile=None,
+        ssl_certfile=None,
+        ssl_ca_certs=None,
+        ssl_cert_reqs=None,
+        ssl_ciphers=None,
+        h11_max_incomplete_event_size=None,
+        h11_max_header_count=None,
+    )
+
+    worker_task = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:0", sock, args))
+    await asyncio.wait_for(serve_started.wait(), timeout=2)
+
+    assert not engine_context_exited.is_set()
+
+    http_shutdown.set()
+    await asyncio.wait_for(worker_task, timeout=2)
+
+    assert sock.closed
+    assert events.index("http_shutdown") < events.index("engine_exit")
 
 
 @pytest.fixture
@@ -741,7 +830,13 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
         engine.captured_sampling_params_list = sampling_params_list
         import numpy as np
 
-        yield MockVideoResult([np.zeros((1, 64, 64, 3), dtype=np.uint8)], custom_output={"video_fps_multiplier": 2})
+        yield MockVideoResult(
+            [np.zeros((1, 64, 64, 3), dtype=np.uint8)],
+            multimodal_output={
+                "video": [np.zeros((1, 64, 64, 3), dtype=np.uint8)],
+                "metadata": {"video": {"video_fps_multiplier": 2}},
+            },
+        )
 
     engine.generate = _generate
 
@@ -845,11 +940,16 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
 
         yield MockVideoResult(
             [object()],
-            custom_output={
-                "action": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
-                "raw_action_dim": 2,
-                "action_mode": "policy",
-                "domain_id": 7,
+            multimodal_output={
+                "video": [object()],
+                "actions": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": 2,
+                        "action_mode": "policy",
+                        "domain_id": 7,
+                    },
+                },
             },
         )
 
@@ -887,11 +987,16 @@ def test_video_job_persists_action_metadata(test_client, mocker: MockerFixture):
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
             [object()],
-            custom_output={
-                "action": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
-                "raw_action_dim": 2,
-                "action_mode": "policy",
-                "domain_id": 7,
+            multimodal_output={
+                "video": [object()],
+                "actions": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": 2,
+                        "action_mode": "policy",
+                        "domain_id": 7,
+                    },
+                },
             },
         )
 
@@ -925,12 +1030,41 @@ def test_action_extraction_accepts_unbatched_action():
 
     result = MockVideoResult(
         [object()],
-        custom_output={
-            "action": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
-            "raw_action_dim": 2,
-            "action_mode": "policy",
-            "domain_id": 7,
+        multimodal_output={
+            "video": [object()],
+            "actions": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+            },
         },
+    )
+
+    actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
+
+    assert actions and actions[0] is not None
+    assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
+    assert actions[0].shape == [2, 2]
+
+
+def test_action_extraction_accepts_multimodal_actions_payload():
+    import numpy as np
+
+    result = MockVideoResult([object()])
+    result.multimodal_output.update(
+        {
+            "actions": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+            },
+        }
     )
 
     actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
@@ -938,6 +1072,9 @@ def test_action_extraction_accepts_unbatched_action():
     assert actions[0] is not None
     assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
     assert actions[0].shape == [2, 2]
+    assert actions[0].raw_action_dim == 2
+    assert actions[0].action_mode == "policy"
+    assert actions[0].domain_id == 7
 
 
 def test_missing_handler_returns_503():
@@ -1746,7 +1883,13 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     async def _generate(prompt, request_id, sampling_params_list):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
-        yield MockVideoResult([object()], custom_output={"video_fps_multiplier": 2})
+        yield MockVideoResult(
+            [object()],
+            multimodal_output={
+                "video": [object()],
+                "metadata": {"video": {"video_fps_multiplier": 2}},
+            },
+        )
 
     engine.generate = _generate
 

@@ -62,7 +62,7 @@ stages:
       max_tokens: 8192
       detokenize: true
       skip_special_tokens: false
-      include_stop_str_in_output: true,
+      include_stop_str_in_output: true
 
   - stage_id: 1
     max_num_seqs: 1
@@ -71,6 +71,8 @@ stages:
     distributed_executor_backend: "mp"
     omni_kv_config:
       need_recv_cache: true
+      enable_kv_async_prefetch: true
+      kv_prefetch_min_free_mem_ratio: 0.2
     parallel_config:
       tensor_parallel_size: 2
       enable_expert_parallel: true

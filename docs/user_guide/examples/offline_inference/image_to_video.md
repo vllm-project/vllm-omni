@@ -3,7 +3,9 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video>.
 
 
-This example demonstrates how to generate videos from images using Wan2.2 Image-to-Video models with vLLM-Omni's offline inference API.
+This example demonstrates how to generate videos from images using Wan2.2,
+LTX-2/LTX-2.3, and HunyuanVideo-1.5 Image-to-Video models with vLLM-Omni's
+offline inference API.
 
 ## Local CLI Usage
 
@@ -51,13 +53,41 @@ python image_to_video.py \
   --output i2v_output.mp4
 ```
 
+### LTX-2.3
+
+```bash
+python image_to_video.py \
+  --model dg845/LTX-2.3-Diffusers \
+  --model-class-name LTX23ImageToVideoPipeline \
+  --image cherry_blossom.jpg \
+  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
+  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
+  --height 384 \
+  --width 512 \
+  --num-frames 25 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 20 \
+  --frame-rate 24 \
+  --fps 24 \
+  --output ltx23_i2v_output.mp4
+```
+
+Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers`; the
+upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
+this pipeline. Pass `--model-class-name LTX23ImageToVideoPipeline` to select
+the LTX-2.3 image-to-video pipeline.
+
 Key arguments:
 
-- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V).
+- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, or
+  LTX-2/LTX-2.3).
 - `--image`: Path to input image (required).
 - `--prompt`: Text description of desired motion/animation.
-- `--height/--width`: Output resolution (auto-calculated from image if not set). Dimensions should be multiples of 16.
-- `--num-frames`: Number of frames (default 81).
+- `--height/--width`: Output resolution (auto-calculated from image if not set).
+  Wan dimensions should be multiples of 16; LTX dimensions should be multiples
+  of 32.
+- `--num-frames`: Number of frames (model-specific default; LTX-style models
+  work best with `8k + 1`).
 - `--guidance-scale` and `--guidance-scale-high`: CFG scale (applied to low/high-noise stages for MoE).
 - `--negative-prompt`: Optional list of artifacts to suppress.
 - `--boundary-ratio`: Boundary split ratio for two-stage MoE models.
@@ -65,6 +95,7 @@ Key arguments:
 - `--sample-solver`: Wan2.2 sampling solver. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
 - `--num-inference-steps`: Number of denoising steps (default 50).
 - `--fps`: Frames per second for the saved MP4 (requires `diffusers` export_to_video).
+- `--audio-sample-rate`: fallback audio sample rate for embedded audio.
 - `--output`: Path to save the generated video.
 - `--vae-use-slicing`: Enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: Enable VAE tiling for memory optimization.

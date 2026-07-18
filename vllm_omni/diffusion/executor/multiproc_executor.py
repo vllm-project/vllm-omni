@@ -308,36 +308,68 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._failure_callbacks.append(callback)
 
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Adapt request-mode scheduler output to worker execute_model RPC."""
-        from vllm_omni.diffusion.worker.utils import RunnerOutput
+        """Adapt request-mode scheduler output to worker execute_model RPCs.
+
+        Returns a BatchRunnerOutput with one RunnerOutput per scheduled request.
+        """
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
         self._ensure_open()
-        if scheduler_output.num_scheduled_reqs != 1:
-            raise ValueError(
-                f"Request mode currently supports batch_size=1, "
-                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
-            )
+        runner_outputs: list[RunnerOutput] = []
 
-        new_req = scheduler_output.scheduled_new_reqs[0]
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req = new_req.req
+            try:
+                result = self.collective_rpc(
+                    "execute_model",
+                    args=(req, self.od_config, scheduler_output.kv_prefetch_jobs),
+                    unique_reply_rank=0,
+                    exec_all_ranks=True,
+                )
+                if not isinstance(result, DiffusionOutput):
+                    raise RuntimeError(f"Unexpected response type: {type(result)!r}")
+                runner_outputs.append(
+                    RunnerOutput(
+                        request_id=new_req.request_id,
+                        step_index=None,
+                        finished=True,
+                        result=result,
+                    )
+                )
+            except Exception as exc:
+                runner_outputs.append(
+                    RunnerOutput(
+                        request_id=new_req.request_id,
+                        step_index=None,
+                        finished=True,
+                        result=DiffusionOutput(error=str(exc)),
+                    )
+                )
+
+        return BatchRunnerOutput.from_list(runner_outputs)
+
+    def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Execute request-mode work through a single batched worker RPC.
+
+        The worker builds DiffusionRequestBatch from scheduler output and returns
+        BatchRunnerOutput with one RunnerOutput per scheduled request.
+        """
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+
+        self._ensure_open()
         result = self.collective_rpc(
-            "execute_model",
-            args=(new_req.req, self.od_config),
+            "execute_model_batch",
+            args=(scheduler_output, self.od_config),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
-        if not isinstance(result, DiffusionOutput):
-            raise RuntimeError(f"Unexpected response type for execute_request: {type(result)!r}")
-
-        return RunnerOutput(
-            request_id=new_req.request_id,
-            step_index=None,
-            finished=True,
-            result=result,
-        )
+        if not isinstance(result, BatchRunnerOutput):
+            raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
+        return result
 
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
-        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, RunnerOutput
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
         self._ensure_open()
         result = self.collective_rpc(
@@ -349,18 +381,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         if isinstance(result, BaseRunnerOutput):
             return result
-        # TODO: Remove this fallback; DiffusionOutput cannot faithfully represent
-        # failed multi-request step batches.
-        if isinstance(result, DiffusionOutput):
-            request_id = scheduler_output.scheduled_request_ids[0] if scheduler_output.scheduled_request_ids else ""
-            return RunnerOutput(
-                request_id=request_id,
-                step_index=None,
-                finished=True,
-                result=result,
-            )
-        else:
-            raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+        raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
     def collective_rpc(
         self,
