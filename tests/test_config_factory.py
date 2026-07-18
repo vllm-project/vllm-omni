@@ -1155,11 +1155,17 @@ stages:
         assert runtime_config == expected_runtime_config
 
     @pytest.mark.parametrize(
-        ("deploy_name", "pipeline_name", "stage_count", "final_output_type"),
+        ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
-            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image"),
-            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text"),
-            ("omnivoice.yaml", "omnivoice", 1, "audio"),
+            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
+            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
+            ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
+            ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
+            ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
+            ("step_audio_2_asr.yaml", "step_audio_2_asr", 1, "text", "step_audio_2_asr"),
+            ("step_audio_2_async_chunk.yaml", "step_audio_2", 2, "audio", None),
+            ("hunyuan_video_15.yaml", "hunyuan_video_15", 1, "video", None),
+            ("wan2_2_ti2v.yaml", "wan2_2_ti2v", 1, "video", None),
         ],
     )
     def test_load_new_registry_backed_deploy_configs(
@@ -1168,10 +1174,11 @@ stages:
         pipeline_name: str,
         stage_count: int,
         final_output_type: str,
+        declared_pipeline: str | None,
     ):
         deploy_path = Path(get_deploy_config_path(deploy_name))
         deploy = load_deploy_config(deploy_path)
-        assert deploy.pipeline == pipeline_name
+        assert deploy.pipeline == declared_pipeline
 
         with patch("vllm_omni.platforms.current_omni_platform") as platform:
             platform.device_name = "cuda"
@@ -1179,6 +1186,70 @@ stages:
         assert len(stages) == stage_count
         assert stages[-1].final_output is True
         assert stages[-1].final_output_type == final_output_type
+        if deploy.trust_remote_code is not None:
+            assert {s.yaml_engine_args.get("trust_remote_code") for s in stages} == {deploy.trust_remote_code}
+
+    @pytest.mark.parametrize(
+        ("config_json", "model_index", "expected_pipeline"),
+        [
+            ({"model_type": "step_audio_2"}, None, "step_audio_2"),
+            (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15"),
+            (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v"),
+        ],
+    )
+    def test_migrated_models_are_discovered_without_explicit_deploy(
+        self,
+        config_json,
+        model_index,
+        expected_pipeline,
+    ):
+        def get_model_file(filename, _model, revision=None):
+            del revision
+            if filename == "config.json":
+                return config_json
+            if filename == "model_index.json":
+                return model_index
+            return None
+
+        with (
+            patch.object(StageConfigFactory, "get_hf_config", return_value=None),
+            patch("vllm_omni.config.config_factory.get_hf_file_to_dict", side_effect=get_model_file),
+        ):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                model="/models/unrelated-checkpoint-name",
+                trust_remote_code=False,
+            )
+
+        assert pipeline is not None
+        assert pipeline.model_type == expected_pipeline
+
+    @pytest.mark.parametrize("deploy_name", ["step_audio_2.yaml", "step_audio_2_async_chunk.yaml"])
+    def test_step_audio2_deploy_configs_fit_two_gpus(self, deploy_name):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+
+        assert deploy.stages[0].devices == "0,1"
+        assert deploy.stages[0].tensor_parallel_size == 2
+        assert deploy.stages[1].devices == "1"
+
+    def test_step_audio2_dispatches_sync_and_async_chunk_processors(self):
+        pipeline = StageConfigFactory.resolve_pipeline_config("step_audio_2")
+        assert isinstance(pipeline, PipelineConfig)
+
+        sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
+        assert "custom_process_next_stage_input_func" not in sync_stages[0].yaml_engine_args
+        assert sync_stages[1].custom_process_input_func.endswith("thinker2token2wav")
+
+        async_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+        assert (
+            async_stages[0]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("thinker2token2wav_async_chunk")
+        )
+        assert async_stages[1].custom_process_input_func is None
+
+    def test_no_bundled_legacy_stage_config_yamls(self):
+        stage_config_dir = Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
+        assert not list(stage_config_dir.glob("*.yaml"))
 
     def test_merge_pipeline_deploy(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
