@@ -25,7 +25,7 @@ Usage:
   python3 upload_pipeline.py --upload --all .buildkite/cuda/test-merge.yml
 
   # Nightly L2 E2E only: keep the E2E Test group, ignore source_file_dependencies:
-  python3 upload_pipeline.py --upload --e2e .buildkite/cuda/test-ready.yml
+  python3 upload_pipeline.py --upload --e2e .buildkite/cuda/test-merge.yml
 """
 
 from __future__ import annotations
