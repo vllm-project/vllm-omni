@@ -60,6 +60,23 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
+      - label: "Diffusion · Offloader Test"
+        timeout_in_minutes: 40
+        commands:
+          - timeout 40m pytest -s -v tests/diffusion/offloader -m "advanced_model and cuda"
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Distributed Test"
     depends_on: upload-merge-pipeline
     timeout_in_minutes: 60
@@ -150,7 +167,7 @@ steps:
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4" --run-level "advanced_model"
         agents:
-          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+          queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
