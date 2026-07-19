@@ -248,6 +248,7 @@ datasets/
 
 # Output files
 outputs/
+!vllm_omni/outputs/
 results/
 generated/
 output_*/

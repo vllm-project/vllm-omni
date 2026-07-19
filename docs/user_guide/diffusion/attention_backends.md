@@ -83,7 +83,7 @@ When constructing `OmniDiffusionConfig` directly:
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
 
 config = OmniDiffusionConfig(
-    attention_config=AttentionConfig(
+    diffusion_attention_config=AttentionConfig(
         default=AttentionSpec(backend="FLASH_ATTN"),
         per_role={
             "cross": AttentionSpec(backend="TORCH_SDPA"),

@@ -381,10 +381,9 @@ class DiffusersPipelineLoader:
                     cast(DiffusersAdapterPipeline, model).load_weights()
                 else:
                     self.load_weights(model)
-
-            # Process weights after loading for quantization (e.g., FP8 online quantization)
-            # This is needed for vLLM's quantization methods that need to transform weights
-            self._process_weights_after_loading(model, target_device)
+                # HSDP processes quantized weights before wrapping parameters as
+                # DTensors. The non-HSDP path can process them here as usual.
+                self._process_weights_after_loading(model, target_device)
 
             if offload_after_quant:
                 model.to("cpu")
@@ -392,16 +391,77 @@ class DiffusersPipelineLoader:
 
         return model.eval()
 
+    @staticmethod
+    def _has_online_quant(model: nn.Module) -> bool:
+        """Whether any layer uses an online-quant method that defers weight
+        materialization onto the ``meta`` device (upstream vLLM
+        ``uses_meta_device=True``, e.g. online FP8)."""
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if getattr(quant_method, "uses_meta_device", False):
+                return True
+        return False
+
     def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
         """Process weights after loading for quantization methods.
 
         This handles vLLM's quantization methods that need to process weights
         after loading (e.g., FP8 online quantization from BF16/FP16 weights).
         """
+        # Newer upstream vLLM online-quant methods (uses_meta_device=True) create
+        # weights on the ``meta`` device and materialize them just-in-time as each
+        # layer's weights finish loading (via the layerwise online-process loader).
+        # Any "straggler" layers whose weights were not fully materialized during
+        # load (padded / partially-loaded layers) remain on ``meta``. Upstream's
+        # base_loader calls finalize_layerwise_processing() to materialize them;
+        # the diffusion loader must mirror that, otherwise the module.to() below
+        # raises "Cannot copy out of meta tensor; no data!". This whole meta-device
+        # handling is gated on online quant actually being in use, so that the
+        # proven code path for everything else (in particular FSDP/HSDP-sharded
+        # params, whose per-parameter .data cannot be cross-device reassigned) is
+        # left untouched. Import lazily so older vLLM (no meta-device quant) is
+        # unaffected.
+        has_online_quant = self._has_online_quant(model)
+        if has_online_quant:
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                finalize_layerwise_processing,
+            )
+
+            # model_config is only dereferenced by finalize for vLLM Attention /
+            # MLAAttention layers; diffusion DiT models use their own attention and
+            # have none, so passing None is safe here.
+            finalize_layerwise_processing(model, model_config=None)
+
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None and isinstance(quant_method, QuantizeMethodBase):
-                # Move module to target device for processing if needed
+            if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
+                continue
+
+            if has_online_quant:
+                # Online quant may leave straggler params on the ``meta`` device.
+                # Move only real (non-meta) params onto the target device for
+                # processing and restore them afterward, mirroring upstream vLLM's
+                # device_loading_context — a blanket module.to(target_device) would
+                # raise NotImplementedError on meta params. Online quant initializes
+                # on the accelerator, so params are normally already on the target
+                # device and this loop is a no-op move; the point is to skip meta.
+                original_devices: dict[str, torch.device] = {}
+                for name, param in module.named_parameters():
+                    if param.device.type != "meta" and param.device != target_device:
+                        original_devices[name] = param.device
+                        param.data = param.data.to(target_device)
+
+                quant_method.process_weights_after_loading(module)
+
+                # Restore pre-existing params to their original device; leave any
+                # newly created (e.g. quantized) params on the target device.
+                for name, param in module.named_parameters():
+                    if name in original_devices:
+                        param.data = param.data.to(original_devices[name])
+            else:
+                # No meta params possible here. Preserve the original FSDP/HSDP-aware
+                # whole-module move (module.to()), which correctly handles sharded
+                # DTensor params that per-parameter .data reassignment cannot.
                 module_device = next(module.parameters(), None)
                 if module_device is not None:
                     module_device = module_device.device
@@ -568,12 +628,25 @@ class DiffusersPipelineLoader:
         model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
         self.load_weights(model)
 
+        # Quantization methods must finish while parameters are ordinary local
+        # tensors. Some post-load transforms use operations (for example,
+        # torch.unique in ModelOpt NVFP4) that do not support DTensor inputs.
+        self._process_weights_after_loading(model, target_device)
+
         # Discover pipeline components (DiT, encoders, VAEs) via
         # ModuleDiscovery, which consults SupportsComponentDiscovery
         # when available and falls back to well-known attribute names.
         # This supports nested pipelines (e.g. LTX2TwoStagesPipeline
         # where the transformer lives at "pipe.transformer").
         discovered_modules = ModuleDiscovery.discover(model)
+
+        # Shard only the outermost DiTs. A pipeline may list a DiT and one of its
+        # submodules as separate DiTs (e.g. Cosmos3's transformer and the nested
+        # transformer.language_model) for offload's independent rings; for HSDP an
+        # inner DiT is already covered by its ancestor's _hsdp_shard_conditions, so
+        # sharding it again would double-wrap blocks and require the inner stack to
+        # declare its own conditions.
+        outer_dit_names, outer_dits = discovered_modules.outermost_dits()
 
         # Online FP8 quantization (Fp8OnlineLinearMethod) leaves layer weights
         # as non-contiguous transpose views (qweight.t()) so the Cutlass kernel
@@ -586,14 +659,14 @@ class DiffusersPipelineLoader:
                 prepare_fp8_layers_for_fsdp,
             )
 
-            for trans in discovered_modules.dits:
+            for trans in outer_dits:
                 prepare_fp8_layers_for_fsdp(trans)
 
-        if not discovered_modules.dits:
+        if not outer_dits:
             raise ValueError("No DiT modules discovered for HSDP sharding")
 
-        # Apply HSDP sharding to all discovered DiT transformers
-        for name, trans in zip(discovered_modules.dit_names, discovered_modules.dits):
+        # Apply HSDP sharding to each outermost DiT transformer
+        for name, trans in zip(outer_dit_names, outer_dits):
             logger.debug("Applying HSDP to %s", name)
             apply_hsdp_to_model(trans, hsdp_config, target_device=target_device)
 

@@ -44,22 +44,17 @@ class MockVideoResult:
         videos,
         audios=None,
         sample_rate=None,
-        custom_output=None,
+        multimodal_output=None,
         stage_durations=None,
         peak_memory_mb=0.0,
     ):
-        self.multimodal_output = {"video": videos}
+        self.multimodal_output = dict(multimodal_output or {"video": videos})
         if audios is not None:
             self.multimodal_output["audio"] = audios
         if sample_rate is not None:
             self.multimodal_output["audio_sample_rate"] = sample_rate
-        self._custom_output = custom_output or {}
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
-
-    @property
-    def custom_output(self):
-        return self._custom_output
 
 
 class FakeAsyncOmni:
@@ -835,7 +830,13 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
         engine.captured_sampling_params_list = sampling_params_list
         import numpy as np
 
-        yield MockVideoResult([np.zeros((1, 64, 64, 3), dtype=np.uint8)], custom_output={"video_fps_multiplier": 2})
+        yield MockVideoResult(
+            [np.zeros((1, 64, 64, 3), dtype=np.uint8)],
+            multimodal_output={
+                "video": [np.zeros((1, 64, 64, 3), dtype=np.uint8)],
+                "metadata": {"video": {"video_fps_multiplier": 2}},
+            },
+        )
 
     engine.generate = _generate
 
@@ -939,11 +940,16 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
 
         yield MockVideoResult(
             [object()],
-            custom_output={
-                "action": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
-                "raw_action_dim": 2,
-                "action_mode": "policy",
-                "domain_id": 7,
+            multimodal_output={
+                "video": [object()],
+                "actions": np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32),
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": 2,
+                        "action_mode": "policy",
+                        "domain_id": 7,
+                    },
+                },
             },
         )
 
@@ -981,11 +987,16 @@ def test_video_job_persists_action_metadata(test_client, mocker: MockerFixture):
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
             [object()],
-            custom_output={
-                "action": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
-                "raw_action_dim": 2,
-                "action_mode": "policy",
-                "domain_id": 7,
+            multimodal_output={
+                "video": [object()],
+                "actions": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": 2,
+                        "action_mode": "policy",
+                        "domain_id": 7,
+                    },
+                },
             },
         )
 
@@ -1019,12 +1030,41 @@ def test_action_extraction_accepts_unbatched_action():
 
     result = MockVideoResult(
         [object()],
-        custom_output={
-            "action": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
-            "raw_action_dim": 2,
-            "action_mode": "policy",
-            "domain_id": 7,
+        multimodal_output={
+            "video": [object()],
+            "actions": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+            },
         },
+    )
+
+    actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
+
+    assert actions and actions[0] is not None
+    assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
+    assert actions[0].shape == [2, 2]
+
+
+def test_action_extraction_accepts_multimodal_actions_payload():
+    import numpy as np
+
+    result = MockVideoResult([object()])
+    result.multimodal_output.update(
+        {
+            "actions": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+            },
+        }
     )
 
     actions = OmniOpenAIServingVideo._extract_action_outputs(result, expected_count=1)
@@ -1032,6 +1072,9 @@ def test_action_extraction_accepts_unbatched_action():
     assert actions[0] is not None
     assert actions[0].data == [[1.0, 2.0], [3.0, 4.0]]
     assert actions[0].shape == [2, 2]
+    assert actions[0].raw_action_dim == 2
+    assert actions[0].action_mode == "policy"
+    assert actions[0].domain_id == 7
 
 
 def test_missing_handler_returns_503():
@@ -1840,7 +1883,13 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     async def _generate(prompt, request_id, sampling_params_list):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
-        yield MockVideoResult([object()], custom_output={"video_fps_multiplier": 2})
+        yield MockVideoResult(
+            [object()],
+            multimodal_output={
+                "video": [object()],
+                "metadata": {"video": {"video_fps_multiplier": 2}},
+            },
+        )
 
     engine.generate = _generate
 

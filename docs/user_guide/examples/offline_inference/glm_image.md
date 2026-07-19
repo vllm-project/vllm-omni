@@ -26,18 +26,22 @@ Stage 0 (AR Model)                Stage 1 (Diffusion)
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 if __name__ == "__main__":
     omni = Omni(model="zai-org/GLM-Image")
     outputs = omni.generate(
         "A photorealistic mountain landscape at sunset",
-        sampling_params={
-            "height": 1024,
-            "width": 1024,
-            "num_inference_steps": 50,
-            "guidance_scale": 1.5,
-            "seed": 42,
-        },
+        sampling_params_list=[
+            omni.default_sampling_params_list[0],
+            OmniDiffusionSamplingParams(
+                height=1024,
+                width=1024,
+                num_inference_steps=50,
+                guidance_scale=1.5,
+                seed=42,
+            ),
+        ],
     )
     outputs[0].request_output.images[0].save("output.png")
 ```
@@ -46,6 +50,7 @@ if __name__ == "__main__":
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 if __name__ == "__main__":
     omni = Omni(model="zai-org/GLM-Image")
@@ -56,13 +61,16 @@ if __name__ == "__main__":
                 "image": "input.png",
             },
         },
-        sampling_params={
-            "height": 1024,
-            "width": 1024,
-            "num_inference_steps": 50,
-            "guidance_scale": 1.5,
-            "seed": 42,
-        },
+        sampling_params_list=[
+            omni.default_sampling_params_list[0],
+            OmniDiffusionSamplingParams(
+                height=1024,
+                width=1024,
+                num_inference_steps=50,
+                guidance_scale=1.5,
+                seed=42,
+            ),
+        ],
     )
     outputs[0].request_output.images[0].save("output.png")
 ```

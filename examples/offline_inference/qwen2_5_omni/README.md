@@ -1,4 +1,4 @@
-# Qwen2.5-Omni
+# Qwen2.5-Omni: Offline inference
 
 ## Setup
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.

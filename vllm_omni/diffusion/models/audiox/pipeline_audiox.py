@@ -60,6 +60,15 @@ def get_audiox_post_process_func(od_config: OmniDiffusionConfig):
     """Convert the pipeline's float audio tensor to a CPU numpy array for serving."""
 
     def post_process_func(audio: torch.Tensor) -> Any:
+        if isinstance(audio, dict) and isinstance(audio.get("payload"), dict):
+            payload = dict(audio["payload"])
+            audio_payload = payload.get("audio")
+            if isinstance(audio_payload, torch.Tensor):
+                payload["audio"] = audio_payload.detach().cpu().float().numpy()
+            return {
+                "payload": payload,
+                "metadata": audio.get("metadata") or {},
+            }
         if isinstance(audio, torch.Tensor):
             return audio.detach().cpu().float().numpy()
         return audio
@@ -915,9 +924,10 @@ class AudioXPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMix
             audio = audio[..., :target_samples]
 
         stage_durations = self.stage_durations if getattr(self, "enable_diffusion_pipeline_profiler", False) else None
-        custom_output = {"audiox_task": task_norm}
         return DiffusionOutput(
-            output=audio,
-            custom_output=custom_output,
+            output={
+                "payload": {"audio": audio},
+                "metadata": {"audio": {"audiox_task": task_norm}},
+            },
             stage_durations=stage_durations,
         )
