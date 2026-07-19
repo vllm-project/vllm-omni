@@ -88,7 +88,7 @@
 #   #     queue: "ascend-a3"
 #   #     resource_class: "npu-2"
 #   #   command: |
-#   #     buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml
+#   #     buildkite-agent pipeline upload .buildkite/npu/test-npu-ready.yml
 
   # # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
   # - label: "Upload Nightly Pipeline"
@@ -104,7 +104,7 @@
   #       build.pull_request.labels includes "diffusion-x2v-test"
   #     ))
   #   commands:
-  #     - buildkite-agent pipeline upload .buildkite/test-npu-nightly.yaml
+  #     - buildkite-agent pipeline upload .buildkite/npu/test-npu-nightly.yml
   #   agents:
   #     queue: "ascend-a3"
   #     resource_class: "npu-2"

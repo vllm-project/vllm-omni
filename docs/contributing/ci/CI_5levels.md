@@ -319,7 +319,7 @@ Before entering specific testing levels, the project establishes two common spec
 
 ### Diff-aware Buildkite uploads (`source_file_dependencies`)
 
-L2 (`.buildkite/test-ready.yml`) and L3 (`.buildkite/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
+L2 (`.buildkite/cuda/test-ready.yml`) and L3 (`.buildkite/cuda/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/cuda/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
 
 #### What `source_file_dependencies` is
 
@@ -334,14 +334,14 @@ L2 (`.buildkite/test-ready.yml`) and L3 (`.buildkite/test-merge.yml`) pipelines 
 | `main` branch push | `git diff --name-only <commit>^..<commit>` |
 | Other (e.g. local dry-run, non-PR branch) | Diff cannot be resolved → **no filtering**; all steps are uploaded and `source_file_dependencies` is still stripped |
 
-Docs-only PRs are handled earlier in bootstrap (`pipeline.yml`) via skip-ci logic; `source_file_dependencies` applies only to the **uploaded** L2/L3 test pipelines.
+Docs-only PRs are handled earlier in bootstrap (`.buildkite/cuda/pipeline.yml`) via skip-ci logic; `source_file_dependencies` applies only to the **uploaded** L2/L3 test pipelines.
 
 #### Where it is configured
 
 | Level | Pipeline file | Upload entry |
 | --- | --- | --- |
-| L2 | `.buildkite/test-ready.yml` | `upload_pipeline.py --upload .buildkite/test-ready.yml` (from `pipeline.yml`) |
-| L3 | `.buildkite/test-merge.yml` | `upload_pipeline.py --upload .buildkite/test-merge.yml` (from `pipeline.yml`) |
+| L2 | `.buildkite/cuda/test-ready.yml` | `upload_pipeline.py --upload .buildkite/cuda/test-ready.yml` (from `cuda/pipeline.yml`) |
+| L3 | `.buildkite/cuda/test-merge.yml` | `upload_pipeline.py --upload .buildkite/cuda/test-merge.yml` (from `cuda/pipeline.yml`) |
 
 Steps **without** `source_file_dependencies` are always uploaded (subject to the usual label conditions: `ready` for L2, `merge-test` for L3).
 
@@ -393,10 +393,10 @@ A **group** may also define `source_file_dependencies`; nested steps inherit fil
 
 ```bash
 # Render filtered YAML to stdout (no upload)
-python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-ready.yml
+python3 .buildkite/cuda/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
 
 # Confirm uploader-only keys are stripped
-python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-merge.yml | grep source_file_dependencies
+python3 .buildkite/cuda/scripts/upload_pipeline.py .buildkite/cuda/test-merge.yml | grep source_file_dependencies
 # (no output expected)
 ```
 
@@ -404,7 +404,7 @@ On a PR build, Buildkite logs from `upload_pipeline.py` include lines such as `s
 
 #### Related
 
-- Implementation: `.buildkite/scripts/upload_pipeline.py`
+- Implementation: `.buildkite/cuda/scripts/upload_pipeline.py`
 - L2/L3 diff skip does **not** replace label-based triggers (`ready`, `merge-test`); it only reduces which steps appear **after** the pipeline is already scheduled.
 
 ### Test helper environment variables
@@ -871,7 +871,7 @@ Reliability tests are **short fault-injection** integration runs (L5 **(b)** in 
 
 #### CI trigger
 
-Weekly Buildkite (`.buildkite/test-weekly.yml`) runs one step per model suite (trigger: `WEEKLY=1` or PR label `weekly-test`), for example:
+Weekly Buildkite (`.buildkite/cuda/test-weekly.yml`) runs one step per model suite (trigger: `WEEKLY=1` or PR label `weekly-test`), for example:
 
 | Buildkite step | Test file | CI hardware |
 | -------------- | --------- | ----------- |
@@ -902,12 +902,12 @@ pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m slow
 1. Add `test_reliability_<model>.py` under `tests/dfx/reliability/`.
 2. Define **`RELIABILITY_SCENARIOS`** and pass them through **`create_reliability_omni_server_params()`** with the correct deploy or e2e stage-config directory (same pattern as existing files).
 3. Reuse **`helpers`** for OOM / kill / raw HTTP; prefer **`assert_fault_exception()`** and **`resolve_oom_device_spec()`** from `tests/dfx/conftest.py` for consistent device selection vs stage YAML.
-4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/test-weekly.yml`** when the suite should run in weekly L5.
+4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/cuda/test-weekly.yml`** when the suite should run in weekly L5.
 
 </details>
 
 -   -   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
-    -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `voxcpm2`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/test-weekly.yml` for new models)
+    -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `voxcpm2`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/cuda/test-weekly.yml` for new models)
 
 ## Summary
 

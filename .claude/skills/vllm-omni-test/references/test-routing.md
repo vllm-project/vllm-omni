@@ -2,7 +2,7 @@
 
 Use this reference to map testing goals to levels, markers, and runnable commands.
 
-**Repo paths** (`.buildkite/`, `docs/contributing/…`): link with repo-relative paths from this file (e.g. `../../../../.buildkite/test-ready.yml`, `../../../../docs/contributing/ci/CI_5levels.md`).
+**Repo paths** (`.buildkite/`, `docs/contributing/…`): link with repo-relative paths from this file (e.g. `../../../../.buildkite/cuda/test-ready.yml`, `../../../../docs/contributing/ci/CI_5levels.md`).
 
 ## Model-centric e2e filename convention (L2–L4)
 
@@ -224,7 +224,7 @@ When the user’s test plan includes **invalid parameter validation**, **invalid
 | Sleep / wakeup / server control | `test_invalid_server_control.py` |
 
 3. **Style:** `pytestmark = [pytest.mark.slow, pytest.mark.<type>]`; `_PARAMS` + `hardware_marks`; `send_*_http_request` with `err_code` + `err_message`; parametrized `body_spec` rows with `id=`; `_minimal_*_json()` helpers; `_SKIP_ISSUE_3649` when tracked in [#3649](https://github.com/vllm-project/vllm-omni/issues/3649).
-4. **CI:** [`.buildkite/test-weekly.yml`](../../../../.buildkite/test-weekly.yml) group **Reliability Test - Invalid parameters Test** — **not** ready/merge/nightly.
+4. **CI:** [`.buildkite/cuda/test-weekly.yml`](../../../../.buildkite/cuda/test-weekly.yml) group **Reliability Test - Invalid parameters Test** — **not** ready/merge/nightly.
 
 ```bash
 # Weekly H100 (diffusion / omni / video invalid-param)
@@ -291,10 +291,10 @@ When adding or modifying tests, do not stop at “where the file lives” — al
 
 | Level | Repo file | Model-type grouping |
 |-------|-----------|---------------------|
-| L1, L2 | [`.buildkite/test-ready.yml`](../../../../.buildkite/test-ready.yml) | Steps prefixed **Omni ·**, **TTS ·**, **Diffusion ·** under **E2E Test** — **`source_file_dependencies` required** |
-| L3 | [`.buildkite/test-merge.yml`](../../../../.buildkite/test-merge.yml) | Per-model E2E steps; `-m "advanced_model and …"` — **`source_file_dependencies` required** |
-| L4 | [`.buildkite/test-nightly.yml`](../../../../.buildkite/test-nightly.yml) | **Omni / TTS / Diffusion X2I(&A&T) / X2V** — each group may have **Function**, **Accuracy**, **Perf**, **Doc** steps |
-| Invalid param (weekly) | [`.buildkite/test-weekly.yml`](../../../../.buildkite/test-weekly.yml) | **Invalid parameters Test · H100** / **· L4** — sweeps `tests/dfx/reliability/invalid_param_test/` |
+| L1, L2 | [`.buildkite/cuda/test-ready.yml`](../../../../.buildkite/cuda/test-ready.yml) | Steps prefixed **Omni ·**, **TTS ·**, **Diffusion ·** under **E2E Test** — **`source_file_dependencies` required** |
+| L3 | [`.buildkite/cuda/test-merge.yml`](../../../../.buildkite/cuda/test-merge.yml) | Per-model E2E steps; `-m "advanced_model and …"` — **`source_file_dependencies` required** |
+| L4 | [`.buildkite/cuda/test-nightly.yml`](../../../../.buildkite/cuda/test-nightly.yml) | **Omni / TTS / Diffusion X2I(&A&T) / X2V** — each group may have **Function**, **Accuracy**, **Perf**, **Doc** steps |
+| Invalid param (weekly) | [`.buildkite/cuda/test-weekly.yml`](../../../../.buildkite/cuda/test-weekly.yml) | **Invalid parameters Test · H100** / **· L4** — sweeps `tests/dfx/reliability/invalid_param_test/` |
 
 ### `source_file_dependencies` (E2E Test only — ready & merge)
 
@@ -380,7 +380,7 @@ Common patterns in `test-ready.yml` / `test-merge.yml`:
 
 When extending an existing step (e.g. add `tests/e2e/offline_inference/test_qwen_image.py` to **Diffusion · Qwen Image Test**), update `source_file_dependencies` and `commands` only; **keep the existing `agents` + `plugins` block unchanged** unless the hardware tier changes.
 
-The root [`.buildkite/pipeline.yml`](../../../../.buildkite/pipeline.yml) decides **which** child file is uploaded. To run **L3** on a feature branch, comment out `if: build.branch == "main"` on the merge upload step. To run **L4** without `NIGHTLY=1`, comment out the nightly upload step’s `if: build.env("NIGHTLY") == "1"` and the same `if` on relevant steps inside `test-nightly.yml`. Revert such edits before merging.
+[`.buildkite/cuda/pipeline.yml`](../../../../.buildkite/cuda/pipeline.yml) decides **which** child file is uploaded. To run **L3** on a feature branch, comment out `if: build.branch == "main"` on the merge upload step. To run **L4** without `NIGHTLY=1`, comment out the nightly upload step’s `if: build.env("NIGHTLY") == "1"` and the same `if` on relevant steps inside `test-nightly.yml`. Revert such edits before merging.
 
 Platform-specific pipelines (e.g. AMD) follow the same level → file pairing under `.buildkite/`.
 

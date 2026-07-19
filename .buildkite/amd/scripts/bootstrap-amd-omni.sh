@@ -154,14 +154,14 @@ upload_pipeline() {
     fi
 
     # Use local template file for vllm-omni
-    cp .buildkite/test-template-amd-omni.j2 .buildkite/test-template.j2
+    cp .buildkite/amd/test-template-amd-omni.j2 .buildkite/amd/test-template.j2
 
 
     # (WIP) Use pipeline generator instead of jinja template
-    if [ -e ".buildkite/pipeline_generator/pipeline_generator.py" ]; then
+    if [ -e ".buildkite/amd/pipeline_generator/pipeline_generator.py" ]; then
         python -m pip install click pydantic
-        python .buildkite/pipeline_generator/pipeline_generator.py --run_all=$RUN_ALL --list_file_diff="$LIST_FILE_DIFF" --nightly="$NIGHTLY" --mirror_hw="$AMD_MIRROR_HW"
-        buildkite-agent pipeline upload .buildkite/pipeline.yaml
+        python .buildkite/amd/pipeline_generator/pipeline_generator.py --run_all=$RUN_ALL --list_file_diff="$LIST_FILE_DIFF" --nightly="$NIGHTLY" --mirror_hw="$AMD_MIRROR_HW"
+        buildkite-agent pipeline upload .buildkite/amd/pipeline.yaml
         exit 0
     fi
     echo "List file diff: $LIST_FILE_DIFF"
@@ -171,7 +171,7 @@ upload_pipeline() {
 
     FAIL_FAST=$(fail_fast)
 
-    cd .buildkite
+    cd .buildkite/amd
 
     # Select test definition file: merge suite for main, ready suite for PRs.
     # For debugging, DEBUG_TEST_YAML can override the selection — accepts
@@ -182,7 +182,7 @@ upload_pipeline() {
                 TEST_YAML="test-amd-merge.yml"
                 ;;
             ready)
-                TEST_YAML="test-amd-ready.yaml"
+                TEST_YAML="test-amd-ready.yml"
                 ;;
             *)
                 echo "ERROR: DEBUG_TEST_YAML must be 'merge' or 'ready', got '$DEBUG_TEST_YAML'" >&2
@@ -193,7 +193,7 @@ upload_pipeline() {
     elif [[ $BUILDKITE_BRANCH == "main" ]]; then
         TEST_YAML="test-amd-merge.yml"
     else
-        TEST_YAML="test-amd-ready.yaml"
+        TEST_YAML="test-amd-ready.yml"
     fi
 
     (

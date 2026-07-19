@@ -36,12 +36,12 @@ mkdir -p "$INDICES_OUTPUT_DIR"
 
 # HACK: we do not need regex module here, but it is required by pre-commit hook
 # To avoid any external dependency, we simply replace it back to the stdlib re module
-sed -i.bak 's/import regex as re/import re/g' .buildkite/scripts/generate-nightly-index.py && rm -f .buildkite/scripts/generate-nightly-index.py.bak
+sed -i.bak 's/import regex as re/import re/g' .buildkite/release/scripts/generate-nightly-index.py && rm -f .buildkite/release/scripts/generate-nightly-index.py.bak
 
 # Generate indices -- the version is just the commit hash (not omni/{commit})
 # because relative paths are computed between the index and wheel directories,
 # both of which live under the omni/ prefix in S3.
-$PYTHON .buildkite/scripts/generate-nightly-index.py \
+$PYTHON .buildkite/release/scripts/generate-nightly-index.py \
     --version "$BUILDKITE_COMMIT" \
     --current-objects "$obj_json" \
     --output-dir "$INDICES_OUTPUT_DIR" \
@@ -78,7 +78,7 @@ if [[ "$version" != *"dev"* ]]; then
     rm -rf "${INDICES_OUTPUT_DIR:?}"
     mkdir -p "$INDICES_OUTPUT_DIR"
     # wheel-dir is overridden to be the commit directory, so that the indices point to the correct wheel path
-    $PYTHON .buildkite/scripts/generate-nightly-index.py \
+    $PYTHON .buildkite/release/scripts/generate-nightly-index.py \
         --version "$s3_version" \
         --wheel-dir "$BUILDKITE_COMMIT" \
         --current-objects "$obj_json" \

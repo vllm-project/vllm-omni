@@ -11,7 +11,7 @@ fi
 
 upload_pipeline() {
     echo "--- 🛠 Preparing Intel pipeline"
-    buildkite-agent pipeline upload .buildkite/pipeline-intel.yaml
+    buildkite-agent pipeline upload .buildkite/intel/pipeline-intel.yml
 }
 
 get_diff() {
