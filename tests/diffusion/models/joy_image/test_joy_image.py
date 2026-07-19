@@ -30,8 +30,8 @@ from vllm_omni.diffusion.models.joy_image.pipeline_joy_image_edit import (
     _cast_floating_model_inputs,
     _format_qwen_multimodal_prompt,
     _get_transformer_config_kwargs_from_od_config,
-    _pil_to_tensor,
     _raise_if_unsupported_hsdp,
+    _resize_center_crop,
     _should_defer_component_device_placement,
     get_joy_image_edit_pre_process_func,
 )
@@ -373,7 +373,7 @@ def test_preprocess_accepts_single_omni_request_prompt(tmp_path):
     assert request.sampling_params.width == 1408
 
 
-def test_pil_to_tensor_uses_center_crop_instead_of_stretch():
+def test_resize_center_crop_crops_instead_of_stretching():
     image = Image.new("RGB", (4, 2))
     pixels = image.load()
     colors = [
@@ -386,11 +386,14 @@ def test_pil_to_tensor_uses_center_crop_instead_of_stretch():
         for y in range(2):
             pixels[x, y] = color
 
-    tensor = _pil_to_tensor(image, height=2, width=2)
-    restored = ((tensor.squeeze(0).squeeze(1).permute(1, 2, 0) + 1.0) * 127.5).round().to(torch.uint8)
+    cropped = _resize_center_crop(image, height=2, width=2)
+    cropped_pixels = cropped.load()
 
-    assert restored[:, 0].tolist() == [[0, 255, 0], [0, 255, 0]]
-    assert restored[:, 1].tolist() == [[0, 0, 255], [0, 0, 255]]
+    assert cropped.size == (2, 2)
+    assert [[cropped_pixels[x, y] for x in range(2)] for y in range(2)] == [
+        [(0, 255, 0), (0, 0, 255)],
+        [(0, 255, 0), (0, 0, 255)],
+    ]
 
 
 def test_joy_cfg_normalize_uses_channel_dimension():

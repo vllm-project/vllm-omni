@@ -188,8 +188,7 @@ def _resize_center_crop(
     return image.crop((left, top, left + width, top + height))
 
 
-def _pil_to_tensor(image: PIL.Image.Image, height: int, width: int) -> torch.Tensor:
-    image = _resize_center_crop(image, height, width)
+def _pil_to_tensor(image: PIL.Image.Image) -> torch.Tensor:
     array = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
     return tensor.unsqueeze(2).contiguous()
@@ -300,7 +299,7 @@ def get_joy_image_edit_pre_process_func(
                 )
 
             prompt_image = _resize_center_crop(_to_pil_image(image), height, width)
-            image_tensor = _pil_to_tensor(prompt_image, height, width)
+            image_tensor = _pil_to_tensor(prompt_image)
             prompt["additional_information"].update(
                 {
                     "image_tensor": image_tensor,
@@ -820,7 +819,6 @@ class JoyImageEditPipeline(
         true_cfg_scale = self.resolve_effective_true_cfg_scale(req)
         negative_prompt = "" if isinstance(first_prompt, str) else first_prompt.get("negative_prompt") or ""
         do_true_cfg = true_cfg_scale > 1.0
-        self.check_cfg_parallel_validity(true_cfg_scale)
 
         self._current_timestep = None
         self._interrupt = False

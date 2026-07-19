@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 class JoyImageEditCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
     def cfg_normalize_function(self, noise_pred: torch.Tensor, comb_pred: torch.Tensor) -> torch.Tensor:
         cond_norm = torch.norm(noise_pred, dim=2, keepdim=True)
-        noise_norm = torch.norm(comb_pred, dim=2, keepdim=True)
-        return comb_pred * (cond_norm / noise_norm.clamp_min(1e-6))
+        comb_norm = torch.norm(comb_pred, dim=2, keepdim=True)
+        return comb_pred * (cond_norm / comb_norm.clamp_min(1e-6))
 
     def diffuse(
         self,
