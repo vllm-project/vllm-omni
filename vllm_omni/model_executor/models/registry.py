@@ -365,6 +365,22 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    ## Alpamayo VLA (autonomous-driving Vision-Language-Action)
+    "Alpamayo1_5": (
+        "alpamayo",
+        "alpamayo",
+        "Alpamayo15ForConditionalGeneration",
+    ),
+    "Alpamayo15ForConditionalGeneration": (
+        "alpamayo",
+        "alpamayo",
+        "Alpamayo15ForConditionalGeneration",
+    ),
+    "AlpamayoR1": (
+        "alpamayo",
+        "alpamayo",
+        "Alpamayo15ForConditionalGeneration",
+    ),
 }
 
 

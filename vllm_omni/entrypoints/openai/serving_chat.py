@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -25,7 +25,10 @@ from vllm.entrypoints.chat_utils import (
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
+from vllm_omni.entrypoints.openai.protocol.chat_completion import (
+    OmniChatCompletionResponse,
+    OmniChatMessage,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import definitions as _metric_defs
@@ -1130,6 +1133,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             extra_args = dict(getattr(params, "extra_args", {}) or {})
             extra_args["target_h"] = int(height)
             extra_args["target_w"] = int(width)
+            params.extra_args = extra_args
+
+        # vLLM's chat protocol surfaces request-level pass-through under
+        # ``vllm_xargs`` — propagate into ``sampling_params.extra_args`` so
+        # model-side hooks (e.g. Alpamayo's prepare_runner_inputs reading
+        # ``robot_obs_json``) can see request-scoped data without us adding
+        # a custom OpenAI field per model.
+        vllm_xargs = getattr(request, "vllm_xargs", None) or {}
+        if vllm_xargs:
+            extra_args = dict(getattr(params, "extra_args", {}) or {})
+            extra_args.update(vllm_xargs)
             params.extra_args = extra_args
 
         return params
@@ -2383,7 +2397,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
                 and request.tool_choice != "required"
             ):
-                message = ChatMessage(role=role, reasoning=reasoning, content=content)
+                # Surface model-side multimodal artifacts (e.g. Alpamayo's
+                # sampled action trajectory) to HTTP clients. The actions tensor
+                # is JSON-serialized as a nested list. ``mm`` is a Mapping
+                # (e.g. ``MultimodalPayload``) — checking ``Mapping`` instead of
+                # ``dict`` so subclasses round-trip too.
+                mm = getattr(output, "multimodal_output", None)
+                if isinstance(mm, Mapping) and mm:
+                    serializable = {k: (v.tolist() if isinstance(v, torch.Tensor) else v) for k, v in mm.items()}
+                    message = OmniChatMessage(
+                        role=role,
+                        reasoning=reasoning,
+                        content=content,
+                        multimodal_output=serializable,
+                    )
+                else:
+                    message = ChatMessage(role=role, reasoning=reasoning, content=content)
 
             # if the request uses tools and specified a tool choice
             elif request.tool_choice and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam:

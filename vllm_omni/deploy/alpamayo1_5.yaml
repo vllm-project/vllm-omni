@@ -1,0 +1,32 @@
+# Alpamayo-1.5-10B single-stage deploy.
+#
+# One stage: AR (Qwen3-VL VLM + flow-matching expert + action heads inside the
+# same model class — sglang single-model pattern). When the trajectory trigger
+# token <|traj_future_start|> is emitted, the model's forward() dispatches to
+# flow matching internally.
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    # Cap max_model_len so KV-cache sizing is bounded: the model config default
+    # (262144) needs ~36 GiB KV and makes engine init fail when profiling leaves
+    # less; Alpamayo prompts are a few thousand tokens, so 32768 is ample.
+    max_model_len: 32768
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.6
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enforce_eager: true
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.98
+      max_tokens: 400
+      detokenize: true
+      # Non-empty extra_args turns on has_sampling_extra_args so the engine
+      # injects per-request sampling_params.extra_args into forward() as the
+      # ``sampling_extra_args`` kwarg (robot_obs history fusion + n_samples) —
+      # no model-runner hook needed.
+      extra_args:
+        n_samples: 1
