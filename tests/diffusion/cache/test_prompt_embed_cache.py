@@ -8,9 +8,10 @@ Covers the module :mod:`vllm_omni.diffusion.cache.prompt_embed_cache`:
 
 * :class:`PromptEmbedCache` LRU semantics, stats and thread-safety.
 * :func:`_hashable` safe-input classification (scalars, torch dtype/device,
-  numpy scalars, nested containers, tensors/PIL bypass).
+  token tensors, numpy scalars, nested containers, unsupported tensor/PIL
+  bypass).
 * :func:`install_prompt_embed_cache` / :func:`uninstall_prompt_embed_cache`
-  behaviour: caching, bypass on tensors, bypass on precomputed embeds,
+  behaviour: caching, bypass on unsupported tensors and precomputed embeds,
   idempotent install, restore on uninstall, detachment of cached tensors.
 * :func:`resolve_prompt_embed_cache_config` env-var overrides.
 """
@@ -84,7 +85,24 @@ class TestHashable:
         assert a == b
         assert hash(a) is not None
 
-    def test_tensor_is_not_hashable(self):
+    @pytest.mark.parametrize(
+        ("value", "dtype"),
+        [([1, 2, 3], torch.int64), ([True, False, True], torch.bool)],
+    )
+    def test_token_tensor_is_hashable_by_value(self, value, dtype):
+        tensor = torch.tensor(value, dtype=dtype)
+        cloned = tensor.clone()
+        out = _hashable(tensor)
+        assert out == _hashable(cloned)
+        assert out[0] == "__torch_tensor__"
+        assert hash(out) is not None
+
+    def test_tensor_shape_is_part_of_key(self):
+        flat = torch.tensor([1, 2], dtype=torch.int64)
+        batched = torch.tensor([[1, 2]], dtype=torch.int64)
+        assert _hashable(flat) != _hashable(batched)
+
+    def test_float_tensor_is_not_hashable(self):
         assert _hashable(torch.zeros(2)) is _NOT_HASHABLE
 
     def test_list_containing_tensor_is_not_hashable(self):
@@ -272,12 +290,29 @@ class TestBuildKey:
         sig = _make_sig(encode)
         assert _build_key(sig, "m1", ("a",), {}) != _build_key(sig, "m2", ("a",), {})
 
-    def test_tensor_argument_bypasses(self):
+    def test_float_tensor_argument_bypasses(self):
         def encode(prompt, extra=None):
             return None
 
         sig = _make_sig(encode)
         assert _build_key(sig, "m", ("hi",), {"extra": torch.zeros(1)}) is None
+
+    def test_token_tensor_argument_is_keyed_by_value(self):
+        def encode(prompt_ids, attention_mask=None):
+            return None
+
+        sig = _make_sig(encode)
+        ids = torch.tensor([1, 2, 3], dtype=torch.int64)
+        mask = torch.tensor([True, True, False], dtype=torch.bool)
+        key = _build_key(sig, "m", (), {"prompt_ids": ids, "attention_mask": mask})
+        cloned_key = _build_key(
+            sig,
+            "m",
+            (),
+            {"prompt_ids": ids.clone(), "attention_mask": mask.clone()},
+        )
+        assert key is not None
+        assert key == cloned_key
 
     def test_precomputed_prompt_embeds_bypasses(self):
         def encode(prompt=None, prompt_embeds=None):
@@ -324,6 +359,17 @@ class _FakePipeline:
         return torch.tensor([float(self.call_count)])
 
 
+class _TensorPromptPipeline:
+    """Pipeline matching the token-ID encode contract used by rollout adapters."""
+
+    def __init__(self):
+        self.call_count = 0
+
+    def encode_prompt(self, prompt_ids, attention_mask=None):
+        self.call_count += 1
+        return torch.tensor([float(self.call_count)])
+
+
 class TestInstallAndUninstall:
     def test_returns_none_when_pipeline_has_no_encode_prompt(self):
         class Empty:
@@ -363,22 +409,37 @@ class TestInstallAndUninstall:
         assert pipe.call_count == 2
         assert cache.stats()["misses"] == 2
 
-    def test_tensor_argument_bypasses_and_increments_counter(self):
+    def test_cloned_token_tensors_hit_same_cache_entry(self):
+        pipe = _TensorPromptPipeline()
+        cache = install_prompt_embed_cache(pipe)
+        ids = torch.tensor([1, 2, 3], dtype=torch.int64)
+        mask = torch.tensor([True, True, False], dtype=torch.bool)
+
+        pipe.encode_prompt(ids, attention_mask=mask)
+        pipe.encode_prompt(ids.clone(), attention_mask=mask.clone())
+
+        assert pipe.call_count == 1
+        assert cache.stats()["hits"] == 1
+        assert cache.stats()["bypassed"] == 0
+
+    def test_changed_token_tensor_content_misses(self):
+        pipe = _TensorPromptPipeline()
+        cache = install_prompt_embed_cache(pipe)
+
+        pipe.encode_prompt(torch.tensor([1, 2], dtype=torch.int64))
+        pipe.encode_prompt(torch.tensor([1, 3], dtype=torch.int64))
+
+        assert pipe.call_count == 2
+        assert cache.stats()["misses"] == 2
+
+    def test_unsupported_tensor_argument_bypasses_and_increments_counter(self):
         pipe = _FakePipeline()
         cache = install_prompt_embed_cache(pipe)
-        # Put a tensor into a non-precomputed-embed slot to trigger bypass.
-        pipe.encode_prompt("cat", device=torch.device("cpu"), num_images_per_prompt=1)
-
-        # Now pass a fake tensor via a harmless positional-like call: use
-        # the negative_prompt slot with an unhashable object.
-        class Unhashable:
-            pass
-
-        pipe.encode_prompt("cat", negative_prompt=Unhashable())  # type: ignore[arg-type]
-        pipe.encode_prompt("cat", negative_prompt=Unhashable())  # type: ignore[arg-type]
+        # Float tensors are not token-like and remain on the bypass path.
+        pipe.encode_prompt("cat", negative_prompt=torch.zeros(1))  # type: ignore[arg-type]
+        pipe.encode_prompt("cat", negative_prompt=torch.zeros(1))  # type: ignore[arg-type]
         assert cache.stats()["bypassed"] == 2
-        # All three calls actually executed the underlying function.
-        assert pipe.call_count == 3
+        assert pipe.call_count == 2
 
     def test_precomputed_embeds_bypass_cache(self):
         pipe = _FakePipeline()

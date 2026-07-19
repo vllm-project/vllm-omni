@@ -20,10 +20,10 @@ Design points:
       pipeline has loaded, so each runner process owns its own cache.
     * Cache keys are derived from the bound ``encode_prompt`` arguments. Only
       inputs we can safely hash (``str`` / ``int`` / ``float`` / ``bool`` /
-      ``None`` / ``bytes`` / ``torch.device`` / ``torch.dtype`` / numpy
-      scalars / nested lists/tuples/dicts of those) participate in the key.
-      If any argument is a tensor, PIL image, or other non-trivial object, we
-      bypass the cache for that call to guarantee correctness.
+      ``None`` / ``bytes`` / ``torch.device`` / ``torch.dtype`` / token tensors /
+      numpy scalars / nested lists/tuples/dicts of those) participate in the
+      key. Token tensors are restricted to ``torch.int64`` and ``torch.bool``;
+      other tensors, PIL images, and non-trivial objects bypass the cache.
     * If a caller passes precomputed ``*_embeds`` into ``encode_prompt`` the
       wrapper also bypasses the cache because the call is already short-circuit.
     * Cache values are detached tensors. Downstream pipeline code typically
@@ -67,14 +67,44 @@ _PRECOMPUTED_EMBED_ARGS = (
     "negative_prompt_embeds_mask",
 )
 
+# Token IDs produced by Hugging Face tokenizers use int64, while callers may
+# supply attention masks as either int64 or bool. Restricting tensor keys to
+# these dtypes keeps large floating-point embeddings and latents on the bypass
+# path even when they appear in an argument not covered above.
+_HASHABLE_TENSOR_DTYPES = frozenset((torch.int64, torch.bool))
+
+
+def _hashable_tensor(obj: torch.Tensor) -> Any:
+    """Return an exact value key for a token tensor, or ``_NOT_HASHABLE``.
+
+    Shape, dtype, and device are part of the key. The contiguous CPU bytes make
+    different tensor objects with the same content share a cache entry without
+    converting token values to Python lists.
+    """
+    if obj.dtype not in _HASHABLE_TENSOR_DTYPES or obj.layout != torch.strided or obj.device.type == "meta":
+        return _NOT_HASHABLE
+
+    try:
+        content = obj.detach().to(device="cpu").contiguous().numpy().tobytes()
+    except (RuntimeError, TypeError, ValueError, NotImplementedError):
+        return _NOT_HASHABLE
+    return (
+        "__torch_tensor__",
+        str(obj.dtype),
+        tuple(obj.shape),
+        str(obj.device),
+        content,
+    )
+
 
 def _hashable(obj: Any) -> Any:
     """Convert *obj* into a hashable representation or return ``_NOT_HASHABLE``.
 
-    Only inputs whose textual / scalar identity fully determines the
-    ``encode_prompt`` output are considered safe. Tensors and PIL images (which
-    flow through e.g. image-edit pipelines) deliberately disable caching for
-    that call rather than risk stale results. Common value-like configuration
+    Only inputs whose value identity fully determines the ``encode_prompt``
+    output are considered safe. Int64 token tensors and int64/bool attention
+    masks are keyed by exact content; other tensors and PIL images (which flow
+    through e.g. image-edit pipelines) deliberately disable caching for that
+    call rather than risk stale results. Common value-like configuration
     objects such as ``torch.device`` and ``torch.dtype`` are normalized to
     stable string forms so they can participate in cache keys safely.
     """
@@ -84,6 +114,8 @@ def _hashable(obj: Any) -> Any:
         return ("__torch_device__", str(obj))
     if isinstance(obj, torch.dtype):
         return ("__torch_dtype__", str(obj))
+    if isinstance(obj, torch.Tensor):
+        return _hashable_tensor(obj)
     if type(obj).__module__.split(".", 1)[0] == "numpy" and hasattr(obj, "item"):
         try:
             return _hashable(obj.item())
@@ -105,7 +137,7 @@ def _hashable(obj: Any) -> Any:
                 return _NOT_HASHABLE
             items.append((repr(k), v))
         return ("__dict__", tuple(items))
-    # torch.Tensor, PIL.Image, np.ndarray, and any other object → not safe.
+    # PIL.Image, np.ndarray, and any other object → not safe.
     return _NOT_HASHABLE
 
 
