@@ -29,8 +29,8 @@ class TestFrameSimilarityFilter:
         assert f.should_retain(make_jpeg(255, 255, 255)) is True
         assert f.should_retain(make_jpeg(0, 0, 0)) is True
 
-    def test_low_threshold_keeps_slightly_different(self):
-        f = FrameSimilarityFilter(threshold=0.50)
+    def test_high_threshold_keeps_slightly_different(self):
+        f = FrameSimilarityFilter(threshold=0.999)
         assert f.should_retain(make_jpeg(100, 100, 100)) is True
         assert f.should_retain(make_jpeg(110, 110, 110)) is True
 

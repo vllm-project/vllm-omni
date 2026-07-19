@@ -148,7 +148,7 @@ Do not copy latency or VRAM numbers between commits or machines. Record them
 only after running a latest-head sweep on the target hardware.
 
 For formal PR benchmarking, reuse
-`tests/dfx/perf/tests/test_ltx2_3_vllm_omni.json` with
-`tests/dfx/perf/scripts/run_diffusion_benchmark.py`. That config captures the
+`tests/dfx/perf/tests/test_ltx2_vllm_omni.json` with
+`tests/dfx/perf/scripts/run_diffusion_benchmark.py`. Each case in that file includes a JSON **`mark`** (`hardware_marks` + `full_model` + `diffusion`) for local `-m` filtering. That config captures the
 single-device eager baseline and CFG-parallel=2 case for a small 384x512,
 25-frame, 20-step workload.

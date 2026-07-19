@@ -396,7 +396,6 @@ class TimestepEmbedder(nn.Module):
         hidden_size: int,
         frequency_embedding_size: int = 256,
         max_period: int = 10000,
-        target_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
         # Following diffusers naming pattern here for checkpoint compatibility.
@@ -407,7 +406,7 @@ class TimestepEmbedder(nn.Module):
         self.hidden_size = hidden_size
 
         half = frequency_embedding_size // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=target_dtype) / half)
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half)
         self.register_buffer("freqs", freqs, persistent=False)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
@@ -587,6 +586,7 @@ class Cosmos3CrossAttention(nn.Module):
         head_dim: int,
         rms_norm_eps: float,
         quant_config: QuantizationConfig | None = None,
+        qk_norm: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -636,8 +636,10 @@ class Cosmos3CrossAttention(nn.Module):
             prefix=f"{prefix}.to_out",
         )
 
-        self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.qk_norm = qk_norm
+        if self.qk_norm:
+            self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         self.attn = FrameworkAttention(
             num_heads=self.num_heads,
@@ -721,8 +723,9 @@ class Cosmos3CrossAttention(nn.Module):
         v = self.to_v(hidden_states).view(B, S_gen, self.num_kv_heads_local, self.head_dim)
 
         # Per-head QK norm
-        q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
+        if self.qk_norm:
+            q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, eps=self.norm_q.variance_epsilon)
+            k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, eps=self.norm_k.variance_epsilon)
 
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -806,6 +809,8 @@ class Cosmos3GenDecoderLayer(nn.Module):
         head_dim: int,
         rms_norm_eps: float,
         quant_config: QuantizationConfig | None = None,
+        mlp_cls: type[nn.Module] = Cosmos3GatedMLP,
+        qk_norm: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -817,11 +822,12 @@ class Cosmos3GenDecoderLayer(nn.Module):
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
             quant_config=quant_config,
+            qk_norm=qk_norm,
             prefix=f"{prefix}.cross_attention",
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = Cosmos3GatedMLP(
+        self.mlp = mlp_cls(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             quant_config=quant_config,
@@ -996,6 +1002,9 @@ class Cosmos3VFMTransformer(nn.Module):
 
     packed_modules_mapping = {}
 
+    _language_model_cls = Cosmos3LanguageModel
+    _gen_mlp_cls = Cosmos3GatedMLP
+
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
         return ("gen_layers" in name or "language_model.layers" in name) and name.split(".")[-1].isdigit()
@@ -1032,6 +1041,25 @@ class Cosmos3VFMTransformer(nn.Module):
             if actual != expected:
                 raise ValueError(f"Unsupported Cosmos3 transformer config: {key}={actual!r}; expected {expected!r}.")
 
+    @classmethod
+    def _resolve_rms_norm_eps(cls, model_config: Any) -> float:
+        return float(_tf_config_get(model_config, "rms_norm_eps", 1e-6))
+
+    @classmethod
+    def _resolve_rope_theta(cls, model_config: Any) -> float:
+        return float(_tf_config_get(model_config, "rope_theta", 5_000_000))
+
+    @classmethod
+    def _resolve_mrope_section(cls, model_config: Any) -> list[int]:
+        rope_scaling = _tf_config_get(model_config, "rope_scaling", {}) or {}
+        return list(rope_scaling.get("mrope_section", [24, 20, 20]))
+
+    def _language_model_kwargs(self) -> dict[str, Any]:
+        return {}
+
+    def validate_loaded_weights(self, loaded: set[str]) -> None:
+        del loaded
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
@@ -1044,7 +1072,6 @@ class Cosmos3VFMTransformer(nn.Module):
         super().__init__()
         model_config = od_config.tf_model_config
         self._validate_supported_config(model_config)
-        rope_scaling = _tf_config_get(model_config, "rope_scaling", {}) or {}
 
         self.hidden_size = int(_tf_config_get(model_config, "hidden_size", 4096))
         self.num_hidden_layers = int(_tf_config_get(model_config, "num_hidden_layers", 36))
@@ -1053,9 +1080,10 @@ class Cosmos3VFMTransformer(nn.Module):
         self.head_dim = int(_tf_config_get(model_config, "head_dim", 128))
         self.intermediate_size = int(_tf_config_get(model_config, "intermediate_size", 12288))
         self.vocab_size = int(_tf_config_get(model_config, "vocab_size", 151936))
-        self.rms_norm_eps = float(_tf_config_get(model_config, "rms_norm_eps", 1e-6))
-        self.rope_theta = float(_tf_config_get(model_config, "rope_theta", 5_000_000))
-        self.mrope_section = list(rope_scaling.get("mrope_section", [24, 20, 20]))
+        self.rms_norm_eps = self._resolve_rms_norm_eps(model_config)
+        self.rope_theta = self._resolve_rope_theta(model_config)
+        self.mrope_section = self._resolve_mrope_section(model_config)
+        self.qk_norm_for_diffusion = bool(_tf_config_get(model_config, "qk_norm_for_diffusion", True))
         self.latent_patch_size = int(_tf_config_get(model_config, "latent_patch_size", 2))
         self.latent_channel_size = int(_tf_config_get(model_config, "latent_channel", 48))
         self.timestep_scale = float(_tf_config_get(model_config, "timestep_scale", 0.001))
@@ -1095,10 +1123,12 @@ class Cosmos3VFMTransformer(nn.Module):
         )
         self.patch_latent_dim = (self.latent_patch_size**2) * self.latent_channel_size
 
+        self.use_k_norm_und_for_gen = _tf_config_get(model_config, "use_k_norm_und_for_gen", None)
+
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
 
-        self.language_model = Cosmos3LanguageModel(
+        self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
             num_hidden_layers=self.num_hidden_layers,
@@ -1111,12 +1141,13 @@ class Cosmos3VFMTransformer(nn.Module):
             mrope_section=self.mrope_section,
             quant_config=quant_config,
             prefix="language_model",
+            **self._language_model_kwargs(),
         )
 
         # Video projection layers are small; not worth quantizing.
         self.proj_in = nn.Linear(self.patch_latent_dim, self.hidden_size)
         self.proj_out = nn.Linear(self.hidden_size, self.patch_latent_dim)
-        self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=dtype)
+        self.time_embedder = TimestepEmbedder(self.hidden_size)
         if self.action_gen:
             self.action_proj_in = DomainAwareLinear(
                 self.action_dim,
@@ -1147,6 +1178,8 @@ class Cosmos3VFMTransformer(nn.Module):
                     head_dim=self.head_dim,
                     rms_norm_eps=self.rms_norm_eps,
                     quant_config=quant_config,
+                    mlp_cls=self._gen_mlp_cls,
+                    qk_norm=self.qk_norm_for_diffusion,
                     prefix=f"gen_layers.{i}",
                 )
                 for i in range(self.num_hidden_layers)
