@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from dataclasses import replace
 from functools import cached_property
 
 import torch
@@ -17,6 +18,11 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+
+from vllm_omni.quantization.component_config import (
+    PRE_QUANTIZED_METHODS,
+    ComponentQuantizationConfig,
+)
 
 
 class Qwen2_5OmniTalkerForConditionalGeneration(
@@ -41,6 +47,12 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         super().__init__()
         config: Qwen2_5OmniTalkerConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            quant_config = quant_config.resolve("talker")
+            vllm_config = replace(vllm_config, quant_config=quant_config)
+        elif quant_config is not None and quant_config.get_name() not in PRE_QUANTIZED_METHODS:
+            quant_config = None
+            vllm_config = replace(vllm_config, quant_config=None)
         self.vllm_config = vllm_config
         self.prefix = prefix
         self.quant_config = quant_config
