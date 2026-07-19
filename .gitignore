@@ -243,6 +243,7 @@ datasets/
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 !tests/assets/soulxsinger/*.json
+!vllm_omni/model_executor/layers/fused_moe/configs/*.json
 *.jsonl
 *.parquet
 
