@@ -448,10 +448,19 @@ class _ChatterboxT3Base(nn.Module):
         return self._voice_encoder
 
     def _ensure_s3_tokenizer(self, device: torch.device):
-        """Lazy-load S3Tokenizer for reference audio tokenization.
+        """Lazy-load the S3 tokenizer used to build cond_prompt_speech_tokens.
 
-        S3Tokenizer downloads its own model via ``S3Tokenizer("speech_tokenizer_v2_25hz")``.
-        No local checkpoint needed — it's built into the s3tokenizer package.
+        CRITICAL: we must use the model's OWN tokenizer weights, not the
+        s3tokenizer package defaults. Chatterbox ships a fine-tuned S3 tokenizer
+        inside the s3gen checkpoint (``tokenizer.*`` keys in
+        ``s3gen_meanflow.safetensors`` / ``s3gen.safetensors``), and the S3Gen
+        stage uses that instance for both ``embed_ref`` and — in the native
+        pipeline — the T3 cond prompt tokens (``s3_tokzr = self.s3gen.tokenizer``).
+        A default ``S3Tokenizer("speech_tokenizer_v2_25hz")`` produces a
+        DIFFERENT token vocabulary, so feeding those ids to ``speech_emb``
+        conditions T3 on the wrong tokens and voice cloning degenerates into
+        unintelligible speech (zero-shot is unaffected: it uses the precomputed
+        tokens in conds.pt).
         """
         if self._s3_tokenizer is not None:
             return self._s3_tokenizer
@@ -463,8 +472,39 @@ class _ChatterboxT3Base(nn.Module):
                 "chatterbox-tts package is required for Chatterbox TTS. Install it with: pip install chatterbox-tts"
             )
 
-        self._s3_tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
-        self._s3_tokenizer.to(device).eval()
+        tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
+
+        # Overlay the model-specific tokenizer weights from the s3gen checkpoint.
+        weight_filename = (
+            "s3gen_meanflow.safetensors" if getattr(self.config, "s3gen_meanflow", False) else "s3gen.safetensors"
+        )
+        weight_path = cached_file(self.model_path, weight_filename, _raise_exceptions_for_missing_entries=False)
+        if weight_path is None:
+            logger.warning(
+                "%s not found for %s; falling back to default S3 tokenizer weights. Voice cloning may be degraded.",
+                weight_filename,
+                self.model_path,
+            )
+        else:
+            from safetensors.torch import load_file as _load_file
+
+            all_weights = _load_file(weight_path)
+            prefix = "tokenizer."
+            tok_weights = {k[len(prefix) :]: v for k, v in all_weights.items() if k.startswith(prefix)}
+            if not tok_weights:
+                logger.warning("No tokenizer.* weights in %s; using default S3 tokenizer weights.", weight_filename)
+            else:
+                result = tokenizer.load_state_dict(tok_weights, strict=False)
+                logger.info(
+                    "Loaded model S3 tokenizer weights from %s: %d tensors (missing=%d, unexpected=%d)",
+                    weight_filename,
+                    len(tok_weights),
+                    len(result.missing_keys),
+                    len(result.unexpected_keys),
+                )
+
+        tokenizer.to(device).eval()
+        self._s3_tokenizer = tokenizer
         return self._s3_tokenizer
 
 
