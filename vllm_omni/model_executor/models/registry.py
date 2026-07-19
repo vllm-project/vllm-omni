@@ -2,17 +2,8 @@ from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
     _ModelRegistry,
+    _resolve_module_name,
 )
-
-try:
-    from vllm.model_executor.models.registry import _resolve_module_name as _vllm_resolve_module_name
-except ImportError:
-
-    def _vllm_resolve_module_name(mod_relname: str) -> str:
-        if mod_relname.startswith("vllm."):
-            return mod_relname
-        return f"vllm.model_executor.models.{mod_relname}"
-
 
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (
@@ -374,16 +365,6 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
-    "JanusForImageGeneration": (
-        "deepseek_janus",
-        "deepseek_janus_ar",
-        "JanusForImageGeneration",
-    ),
-    "OmniDeepSeekJanusForConditionalGeneration": (
-        "deepseek_janus",
-        "deepseek_janus_ar",
-        "OmniDeepSeekJanusForConditionalGeneration",
-    ),
 }
 
 
@@ -396,7 +377,7 @@ OmniModelRegistry = _ModelRegistry(
     {
         **{
             model_arch: _LazyRegisteredModel(
-                module_name=_vllm_resolve_module_name(mod_relname),
+                module_name=_resolve_module_name(mod_relname),
                 class_name=cls_name,
             )
             for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()

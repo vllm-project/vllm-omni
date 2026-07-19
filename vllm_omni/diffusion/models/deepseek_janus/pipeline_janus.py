@@ -11,7 +11,7 @@ Upstream reference:
 
 This pipeline loads ``MultiModalityCausalLM`` via Hugging Face ``trust_remote_code``
 and runs text-to-image generation. VL understanding (chat + ``prepare_inputs_embeds``)
-can be added later as a separate AR stage, mirroring ``hunyuan_image3_it2i.yaml``.
+can be added later as a separate implementation.
 
 Optimisation stack (enforce_eager=False):
   - torch.compile (mode="reduce-overhead" → operator fusion + internal CUDA graphs)
@@ -19,7 +19,6 @@ Optimisation stack (enforce_eager=False):
   - flash_attn (HF flash_attention_2 backend, auto-detected)
   - CUDA graph capture via vLLM CUDAGraphWrapper around the decode forward
   - Chunked prefill for long prompts (>512 tokens)
-  - Block-aligned KV cache (PagedAttention-compatible memory layout)
 """
 
 from __future__ import annotations
@@ -35,10 +34,11 @@ import torch.nn as nn
 from PIL import Image
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, LlamaTokenizerFast
 from transformers.cache_utils import StaticCache
+from transformers.modeling_utils import no_init_weights
 from transformers.utils import cached_file
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
-from vllm.config.vllm import VllmConfig
+from vllm.config.vllm import OptimizationLevel, VllmConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -48,10 +48,15 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+_JANUS_IMAGE_TOKEN_NUM = 576
+_JANUS_IMAGE_SIZE = 384
+_JANUS_PATCH_SIZE = 16
+_JANUS_TOKEN_GRID_SIZE = 24
 
 
 def _build_janus_vl_chat_processor(model: str | Path, revision: str | None = None) -> Any:
@@ -96,8 +101,89 @@ def _build_janus_vl_chat_processor(model: str | Path, revision: str | None = Non
 def _resolve_prompt_extra(prompt: Any) -> dict[str, Any]:
     if not isinstance(prompt, dict):
         return {}
+    resolved: dict[str, Any] = {}
     extra = prompt.get("extra")
-    return extra if isinstance(extra, dict) else {}
+    if isinstance(extra, dict):
+        resolved.update(extra)
+    for key in (
+        "height",
+        "width",
+        "img_size",
+        "patch_size",
+        "image_token_num",
+        "image_token_num_per_image",
+        "mm_processor_kwargs",
+    ):
+        if key in prompt and key not in resolved:
+            resolved[key] = prompt[key]
+    return resolved
+
+
+def _get_prompt_int(prompt_extra: dict[str, Any], key: str) -> int | None:
+    value = prompt_extra.get(key)
+    return int(value) if value is not None else None
+
+
+def _get_geometry_int(
+    extra: dict[str, Any],
+    prompt_extra: dict[str, Any],
+    keys: tuple[str, ...],
+    default: int,
+) -> int:
+    for source in (extra, prompt_extra):
+        for key in keys:
+            value = source.get(key)
+            if value is not None:
+                return int(value)
+    return default
+
+
+def _resolve_janus_geometry(sp: Any, prompt_extra: dict[str, Any]) -> tuple[int, int, int]:
+    """Validate Janus's fixed 576-token, 24x24 VQ geometry."""
+    extra = sp.extra_step_kwargs or {}
+    mm_processor_kwargs = prompt_extra.get("mm_processor_kwargs")
+    if not isinstance(mm_processor_kwargs, dict):
+        mm_processor_kwargs = {}
+    prompt_height = (
+        _get_prompt_int(prompt_extra, "height")
+        or _get_prompt_int(prompt_extra, "img_size")
+        or _get_prompt_int(mm_processor_kwargs, "target_h")
+    )
+    prompt_width = _get_prompt_int(prompt_extra, "width") or _get_prompt_int(mm_processor_kwargs, "target_w")
+    image_token_num = _get_geometry_int(
+        extra,
+        prompt_extra,
+        ("image_token_num_per_image", "image_token_num"),
+        _JANUS_IMAGE_TOKEN_NUM,
+    )
+    img_size = int(
+        extra.get(
+            "img_size",
+            prompt_height or getattr(sp, "height", None) or _JANUS_IMAGE_SIZE,
+        )
+    )
+    patch_size = int(extra.get("patch_size", prompt_extra.get("patch_size", _JANUS_PATCH_SIZE)))
+    width = prompt_width or getattr(sp, "width", None)
+    if width is not None and int(width) != img_size:
+        raise ValueError(
+            "DeepSeek Janus uses fixed 576 image tokens decoded as an 8x24x24 VQ grid "
+            "(384x384 output with patch_size=16). "
+            f"Got width={int(width)} and height/img_size={img_size}."
+        )
+    grid = img_size // patch_size if patch_size > 0 else 0
+    if (
+        image_token_num != _JANUS_IMAGE_TOKEN_NUM
+        or img_size != _JANUS_IMAGE_SIZE
+        or patch_size != _JANUS_PATCH_SIZE
+        or grid != _JANUS_TOKEN_GRID_SIZE
+        or grid * grid != image_token_num
+    ):
+        raise ValueError(
+            "DeepSeek Janus uses fixed 576 image tokens decoded as an 8x24x24 VQ grid "
+            "(384x384 output with patch_size=16). "
+            f"Got image_token_num={image_token_num}, img_size={img_size}, patch_size={patch_size}."
+        )
+    return image_token_num, img_size, patch_size
 
 
 def get_janus_post_process_func(od_config: OmniDiffusionConfig):
@@ -114,7 +200,7 @@ class _JanusDecodeWrapper(nn.Module):
 
     CUDAGraphWrapper expects a callable module with signature:
         (inputs_embeds, cache_position) → output
-    where all inputs are pre-allocated persistent tensors.
+    where tensor inputs keep stable addresses for a captured graph replay.
     """
 
     def __init__(self, transformer: nn.Module):
@@ -148,11 +234,9 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
       - Chunked prefill: large prompts split into configurable chunk sizes
 
     Architecture note:
-      The AR loop runs inside the diffusion pipeline. For online serving with
-      continuous batching and tensor parallelism, use the two-stage deployment
-      (``deepseek_janus_two_stage.yaml``) which routes the AR generation through
-      vLLM's GPU model runner with full PagedAttention and CUDAGraphWrapper
-      integration at the engine level.
+      The AR loop runs inside the diffusion pipeline so Janus prompt formatting,
+      CFG pairing, image-token embedding, and VQ decode stay on the same
+      validated path.
     """
 
     _dit_modules: ClassVar[list[str]] = ["mm_model.language_model.model"]
@@ -185,12 +269,8 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     cfg.language_config._attn_implementation = "sdpa"
                 except (TypeError, AttributeError):
                     object.__setattr__(cfg.language_config, "_attn_implementation", "sdpa")
-        self.mm_model = AutoModelForCausalLM.from_pretrained(
-            od_config.model,
-            config=cfg,
-            torch_dtype=dtype,
-            **remote_kw,
-        )
+        with no_init_weights():
+            self.mm_model = AutoModelForCausalLM.from_config(cfg, dtype=dtype)
         rev = getattr(od_config, "revision", None)
         try:
             self.processor = _build_janus_vl_chat_processor(od_config.model, rev)
@@ -216,28 +296,31 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             )
         ]
 
-        if getattr(od_config, "quantization_config", None) is None and not getattr(
-            od_config, "enable_layerwise_offload", False
+        use_hsdp = bool(getattr(getattr(od_config, "parallel_config", None), "use_hsdp", False))
+        if getattr(od_config, "quantization_config", None) is None and not (
+            getattr(od_config, "enable_layerwise_offload", False) or use_hsdp
         ):
             self.mm_model.to(self.device)
 
         self.transformer = self.mm_model.language_model.model
+        decode_transformer = self.transformer
 
-        # --- torch.compile (operator fusion + internal CUDA graphs) ---
+        # --- torch.compile for decode only (operator fusion + internal CUDA graphs) ---
         if not od_config.enforce_eager and current_omni_platform.supports_torch_inductor():
-            logger.info("Janus: torch.compile transformer (mode='reduce-overhead', dynamic=True)")
-            self.transformer = torch.compile(
+            logger.info("Janus: torch.compile decode transformer (mode='reduce-overhead', dynamic=True)")
+            decode_transformer = torch.compile(
                 self.transformer,
                 mode="reduce-overhead",
                 dynamic=True,
             )
+        self._decode_transformer = decode_transformer
 
         # --- CUDAGraphWrapper for decode steps ---
         self._decode_wrapper: _JanusDecodeWrapper | None = None
         self._cudagraph_wrapper: CUDAGraphWrapper | None = None
         self._cudagraph_ready = False
         if not od_config.enforce_eager:
-            self._decode_wrapper = _JanusDecodeWrapper(self.transformer)
+            self._decode_wrapper = _JanusDecodeWrapper(self._decode_transformer)
             vllm_config = self._build_minimal_vllm_config()
             self._cudagraph_wrapper = CUDAGraphWrapper(
                 self._decode_wrapper,
@@ -260,44 +343,17 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         and scheduler_config (for max_num_seqs). We create a skeleton config
         that enables FULL cudagraph mode with default capture sizes.
         """
-        from transformers import PretrainedConfig
         from vllm.config import (
             CacheConfig,
             CompilationConfig,
-            ModelConfig,
             ParallelConfig,
             SchedulerConfig,
-        )
-
-        # Minimal model config
-        hf_config = PretrainedConfig()
-        lang_config = getattr(self.mm_model, "language_model", None)
-        if lang_config is not None and hasattr(lang_config, "config"):
-            lang_cfg = lang_config.config
-            hf_config.hidden_size = getattr(lang_cfg, "hidden_size", 2048)
-            hf_config.num_attention_heads = getattr(lang_cfg, "num_attention_heads", 16)
-            hf_config.num_hidden_layers = getattr(lang_cfg, "num_hidden_layers", 24)
-        else:
-            hf_config.hidden_size = 2048
-            hf_config.num_attention_heads = 16
-            hf_config.num_hidden_layers = 24
-
-        model_config = ModelConfig(
-            model="janus",
-            task="generate",
-            tokenizer="",
-            hf_config=hf_config,
-            hf_text_config=hf_config,
-            max_model_len=8192,
-            dtype="bfloat16",
         )
 
         cache_config = CacheConfig(
             block_size=16,
             gpu_memory_utilization=0.90,
-            swap_space=0,
             cache_dtype="auto",
-            num_gpu_blocks_override=None,
         )
 
         parallel_config = ParallelConfig(
@@ -306,9 +362,11 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
 
         scheduler_config = SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
             max_num_seqs=8,
             max_num_batched_tokens=2048,
-            num_scheduler_steps=1,
+            async_scheduling=False,
         )
 
         compilation_config = CompilationConfig(
@@ -317,15 +375,51 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
 
         return VllmConfig(
-            model_config=model_config,
             cache_config=cache_config,
             parallel_config=parallel_config,
             scheduler_config=scheduler_config,
             compilation_config=compilation_config,
+            optimization_level=OptimizationLevel.O0,
         )
 
+    @staticmethod
+    def _sample_next_token(
+        probs: torch.Tensor,
+        generator: torch.Generator | list[torch.Generator] | None,
+    ) -> torch.Tensor:
+        if isinstance(generator, list):
+            if len(generator) != probs.shape[0]:
+                raise ValueError(
+                    "Janus generator list length must match num_outputs_per_prompt, "
+                    f"got {len(generator)} and {probs.shape[0]}."
+                )
+            return torch.cat(
+                [
+                    torch.multinomial(probs[row : row + 1], num_samples=1, generator=generator[row])
+                    for row in range(probs.shape[0])
+                ],
+                dim=0,
+            )
+        return torch.multinomial(probs, num_samples=1, generator=generator)
+
+    @staticmethod
+    def _resolve_generator(
+        sp: Any,
+        device: torch.device,
+    ) -> torch.Generator | list[torch.Generator] | None:
+        generator = getattr(sp, "generator", None)
+        if generator is not None:
+            return generator
+        seed = getattr(sp, "seed", None)
+        if seed is None:
+            return None
+        gen_device = getattr(sp, "generator_device", None)
+        if gen_device is None:
+            gen_device = "cpu" if device.type == "cpu" else device
+        return torch.Generator(device=gen_device).manual_seed(int(seed))
+
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Text-to-image using Janus AR image-token prediction + VQ decode.
 
         The AR loop has two phases:
@@ -359,15 +453,14 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             ),
         )
         temperature = max(1e-6, float(extra.get("temperature", 1.0)))
-        image_token_num = max(1, int(extra.get("image_token_num_per_image", 576)))
-        img_size = max(16, int(extra.get("img_size", 384)))
-        patch_size = max(1, int(extra.get("patch_size", 16)))
+        generator = self._resolve_generator(sp, device)
 
         images_out: list[Image.Image] = []
 
         for prompt in req.prompts:
             prompt_extra = _resolve_prompt_extra(prompt)
             text = prompt if isinstance(prompt, str) else (prompt.get("prompt") or "")
+            image_token_num, img_size, patch_size = _resolve_janus_geometry(sp, prompt_extra)
             conversation = [
                 {"role": "User", "content": text},
                 {"role": "Assistant", "content": ""},
@@ -418,7 +511,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             logit_uncond = logits[1::2, :]
             logits_merged = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
             probs = torch.softmax(logits_merged / temperature, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = self._sample_next_token(probs, generator)
             generated[:, 0] = next_token.squeeze(-1)
             stacked = torch.cat([next_token.unsqueeze(1), next_token.unsqueeze(1)], dim=1).reshape(-1)
             inputs_embeds = self.mm_model.prepare_gen_img_embeds(stacked).unsqueeze(1).to(dtype=dtype)
@@ -436,6 +529,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         temperature=temperature,
                         dtype=dtype,
                         device=device,
+                        generator=generator,
                     )
                 else:
                     generated = self._decode_manual(
@@ -448,18 +542,17 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         temperature=temperature,
                         dtype=dtype,
                         device=device,
+                        generator=generator,
                     )
 
             # VQ decode
-            prompt_img_size = max(16, int(extra.get("img_size", prompt_extra.get("img_size", img_size))))
-            prompt_patch_size = max(1, int(extra.get("patch_size", prompt_extra.get("patch_size", patch_size))))
             dec = self.mm_model.gen_vision_model.decode_code(
                 generated.to(dtype=torch.int),
                 shape=[
                     parallel_size,
                     8,
-                    prompt_img_size // prompt_patch_size,
-                    prompt_img_size // prompt_patch_size,
+                    img_size // patch_size,
+                    img_size // patch_size,
                 ],
             )
             dec_np = dec.to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
@@ -467,11 +560,9 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             for bi in range(parallel_size):
                 images_out.append(Image.fromarray(dec_np[bi]))
 
-        primary = images_out[0] if images_out else None
         return DiffusionOutput(
-            output=primary,
+            output={"payload": {"image": images_out}},
             trajectory_decoded=None,
-            custom_output={"images": images_out, "num_images": len(images_out)},
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -548,16 +639,21 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         temperature: float,
         dtype: torch.dtype,
         device: torch.device,
+        generator: torch.Generator | list[torch.Generator] | None,
     ) -> torch.Tensor:
         """Run decode steps using vLLM CUDAGraphWrapper for graph capture/replay.
 
         The CUDAGraphWrapper handles capture automatically on first call and
-        replay on subsequent calls with the same batch descriptor shape.
+        replay on subsequent calls with the same batch descriptor shape. Its
+        cache is cleared per request because Janus passes the request-local
+        StaticCache as an input and the wrapper does not copy new runtime
+        inputs into the capture-time addresses.
         """
         assert self._cudagraph_wrapper is not None
         batch_rows = generated.shape[0] * 2  # CFG doubling
+        self._cudagraph_wrapper.clear_graphs()
 
-        # Pre-allocate persistent tensors for CUDA graph I/O
+        # Request-local static tensors keep input addresses stable during replay.
         static_embeds = torch.zeros(
             batch_rows,
             1,
@@ -580,7 +676,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         # Warmup + capture via CUDAGraphWrapper
         with set_forward_context(
             None,
-            self._cudagraph_wrapper._vllm_config,
+            self._cudagraph_wrapper.vllm_config,
             cudagraph_runtime_mode=CUDAGraphMode.FULL,
             batch_descriptor=batch_desc,
         ):
@@ -597,7 +693,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         logit_uncond = logits[1::2, :]
         logits_merged = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
         probs = torch.softmax(logits_merged / temperature, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+        next_token = self._sample_next_token(probs, generator)
         generated[:, 1] = next_token.squeeze(-1)
         stacked = torch.cat([next_token.unsqueeze(1), next_token.unsqueeze(1)], dim=1).reshape(-1)
         inputs_embeds_new = self.mm_model.prepare_gen_img_embeds(stacked).unsqueeze(1).to(dtype=dtype)
@@ -609,7 +705,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
 
             with set_forward_context(
                 None,
-                self._cudagraph_wrapper._vllm_config,
+                self._cudagraph_wrapper.vllm_config,
                 cudagraph_runtime_mode=CUDAGraphMode.FULL,
                 batch_descriptor=batch_desc,
             ):
@@ -625,7 +721,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             logit_uncond = logits[1::2, :]
             logits_merged = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
             probs = torch.softmax(logits_merged / temperature, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = self._sample_next_token(probs, generator)
             generated[:, step_i] = next_token.squeeze(-1)
 
             stacked = torch.cat([next_token.unsqueeze(1), next_token.unsqueeze(1)], dim=1).reshape(-1)
@@ -644,6 +740,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         temperature: float,
         dtype: torch.dtype,
         device: torch.device,
+        generator: torch.Generator | list[torch.Generator] | None,
     ) -> torch.Tensor:
         """Manual decode loop (used when enforce_eager=True or CUDA graph unavailable)."""
         for step_i in range(1, image_token_num):
@@ -661,7 +758,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             logit_uncond = logits[1::2, :]
             logits_merged = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
             probs = torch.softmax(logits_merged / temperature, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = self._sample_next_token(probs, generator)
             generated[:, step_i] = next_token.squeeze(-1)
 
             stacked = torch.cat([next_token.unsqueeze(1), next_token.unsqueeze(1)], dim=1).reshape(-1)

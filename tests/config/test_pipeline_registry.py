@@ -68,7 +68,15 @@ def test_register_resolver_requires_model_type(custom_resolver, clean_pipeline_r
         register_pipeline(custom_resolver)
 
 
-def test_deepseek_janus_pipelines_registered():
-    """Ensure DeepSeek Janus deploy topologies are registered."""
+def test_deepseek_janus_pipeline_registered():
+    """Ensure DeepSeek Janus deploy topology is registered."""
     assert "deepseek_janus_single_stage" in OMNI_PIPELINES
-    assert "deepseek_janus_two_stage" in OMNI_PIPELINES
+
+
+def test_deepseek_janus_pipeline_requires_explicit_config():
+    """Avoid routing every MultiModalityCausalLM checkpoint to Janus."""
+    pipeline = OMNI_PIPELINES["deepseek_janus_single_stage"]
+
+    assert not callable(pipeline)
+    assert pipeline.hf_architectures == ()
+    assert pipeline.get_stage(0).model_arch == "JanusPipeline"

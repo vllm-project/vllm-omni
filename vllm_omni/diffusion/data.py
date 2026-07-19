@@ -34,6 +34,41 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_JANUS_CONFIG_KEYS = frozenset(
+    {
+        "language_config",
+        "vision_config",
+        "aligner_config",
+        "gen_vision_config",
+        "gen_aligner_config",
+        "gen_head_config",
+    }
+)
+
+
+def _model_name_looks_like_janus(model: object) -> bool:
+    model_str = str(model or "").strip().replace("\\", "/").lower()
+    if not model_str:
+        return False
+
+    model_leaf = model_str.rstrip("/").rsplit("/", 1)[-1]
+    return model_str.startswith("deepseek-ai/janus") or model_leaf.startswith("janus")
+
+
+def _looks_like_deepseek_janus(model: str | None, cfg: Mapping[str, Any]) -> bool:
+    """Return True only for Janus-style multi_modality checkpoints."""
+    if cfg.get("model_type") != "multi_modality":
+        return False
+
+    for key in ("_name_or_path", "name_or_path", "model_name"):
+        if _model_name_looks_like_janus(cfg.get(key)):
+            return True
+    if _model_name_looks_like_janus(model):
+        return True
+
+    return _JANUS_CONFIG_KEYS.issubset(cfg)
+
+
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
@@ -539,6 +574,8 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
+    if _looks_like_deepseek_janus(model, cfg):
+        return "JanusPipeline"
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
     if (
@@ -1116,7 +1153,12 @@ class OmniDiffusionConfig:
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
-                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                if _looks_like_deepseek_janus(self.model, cfg):
+                    if self.model_class_name is None:
+                        self.model_class_name = "JanusPipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()

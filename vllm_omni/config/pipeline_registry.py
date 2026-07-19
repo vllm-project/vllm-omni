@@ -43,7 +43,6 @@ from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPEL
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.deepseek_janus.pipeline import (
     DEEPSEEK_JANUS_SINGLE_STAGE_PIPELINE,
-    DEEPSEEK_JANUS_TWO_STAGE_PIPELINE,
 )
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
 from vllm_omni.model_executor.models.dynin_omni.pipeline import DYNIN_OMNI_PIPELINE
@@ -149,7 +148,6 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "dynin_omni": DYNIN_OMNI_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
     "deepseek_janus_single_stage": DEEPSEEK_JANUS_SINGLE_STAGE_PIPELINE,
-    "deepseek_janus_two_stage": DEEPSEEK_JANUS_TWO_STAGE_PIPELINE,
 }
 
 

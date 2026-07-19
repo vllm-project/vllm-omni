@@ -9,6 +9,7 @@ from torch import nn
 
 from vllm_omni.diffusion.models.deepseek_janus.pipeline_janus_vq import JanusVQDecodePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -30,34 +31,67 @@ def _build_pipeline() -> JanusVQDecodePipeline:
     return pipe
 
 
+def _request_batch(request: OmniDiffusionRequest) -> DiffusionRequestBatch:
+    return DiffusionRequestBatch(requests=[request])
+
+
+def _payload_images(output) -> list:
+    assert isinstance(output.output, dict)
+    assert isinstance(output.output["payload"], dict)
+    return output.output["payload"]["image"]
+
+
 def test_vq_pipeline_reads_image_tokens_from_prompt_extra() -> None:
     pipe = _build_pipeline()
     req = OmniDiffusionRequest(
-        prompts=[{"prompt": "p", "extra": {"image_tokens": list(range(576)), "img_size": 384}}],
+        prompt={"prompt": "p", "extra": {"image_tokens": list(range(576)), "img_size": 384}},
         sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=1),
         request_id="req-1",
     )
 
-    output = pipe.forward(req)
+    output = pipe.forward(_request_batch(req))
 
     assert output.error is None
     assert output.aborted is False
-    assert output.custom_output["num_images"] == 1
-    assert output.output is not None
+    assert len(_payload_images(output)) == 1
 
 
 def test_vq_pipeline_prefers_sampling_params_extra_step_kwargs() -> None:
     pipe = _build_pipeline()
     req = OmniDiffusionRequest(
-        prompts=[{"prompt": "p", "extra": {"image_tokens": [999], "img_size": 128}}],
+        prompt={"prompt": "p", "extra": {"image_tokens": [999], "img_size": 128}},
         sampling_params=OmniDiffusionSamplingParams(
             num_outputs_per_prompt=1,
-            extra_step_kwargs={"image_tokens": list(range(576)), "img_size": 384},
+            extra_step_kwargs={"image_tokens": list(range(576)), "img_size": 384, "patch_size": 16},
         ),
         request_id="req-2",
     )
 
-    output = pipe.forward(req)
+    output = pipe.forward(_request_batch(req))
 
     assert output.error is None
-    assert output.custom_output["num_images"] == 1
+    assert len(_payload_images(output)) == 1
+
+
+def test_vq_pipeline_rejects_non_janus_geometry() -> None:
+    pipe = _build_pipeline()
+    req = OmniDiffusionRequest(
+        prompt={"prompt": "p", "extra": {"image_tokens": list(range(576)), "img_size": 512, "patch_size": 32}},
+        sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=1),
+        request_id="req-bad-geometry",
+    )
+
+    with pytest.raises(ValueError, match="fixed 8x24x24 grid"):
+        pipe.forward(_request_batch(req))
+
+
+def test_vq_pipeline_rejects_wrong_token_count() -> None:
+    pipe = _build_pipeline()
+    req = OmniDiffusionRequest(
+        prompt={"prompt": "p", "extra": {"image_tokens": list(range(256))}},
+        sampling_params=OmniDiffusionSamplingParams(num_outputs_per_prompt=1),
+        request_id="req-bad-tokens",
+    )
+
+    with pytest.raises(ValueError, match="exactly 576 image tokens"):
+        pipe.forward(_request_batch(req))

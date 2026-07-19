@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Janus VQ-decode-only pipeline for two-stage deployment.
+"""Janus VQ-decode-only component.
 
-In the two-stage topology, the AR stage runs image token generation through
-vLLM's GPU model runner (with full PagedAttention, CUDAGraphWrapper, chunked
-prefill, etc.).  This pipeline only loads ``gen_vision_model`` and performs
-VQ decode (``decode_code``) to convert the predicted image token grid to an
-RGB image.
-
-This is intentionally minimal — all heavy computation runs in the AR stage.
+This pipeline only loads ``gen_vision_model`` and performs VQ decode
+(``decode_code``) to convert a predicted image-token grid to an RGB image.
+The supported end-to-end Janus deployment remains :class:`JanusPipeline`,
+which keeps prompt formatting, AR token generation, CFG, and VQ decode in one
+validated stage.
 """
 
 from __future__ import annotations
@@ -28,9 +26,14 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
+
+_JANUS_IMAGE_TOKEN_NUM = 576
+_JANUS_IMAGE_SIZE = 384
+_JANUS_PATCH_SIZE = 16
+_JANUS_TOKEN_GRID_SIZE = 24
 
 
 def _model_name_to_cls(cls_name: str):
@@ -41,28 +44,43 @@ def _model_name_to_cls(cls_name: str):
     raise ValueError(f"Unknown gen_vision class: {cls_name}")
 
 
-def _resolve_prompt_extra(req: OmniDiffusionRequest) -> dict[str, Any]:
+def _resolve_prompt_extra(req: DiffusionRequestBatch) -> dict[str, Any]:
     if not req.prompts:
         return {}
     first_prompt = req.prompts[0]
     if not isinstance(first_prompt, dict):
         return {}
+    resolved: dict[str, Any] = {}
     extra = first_prompt.get("extra")
-    return extra if isinstance(extra, dict) else {}
+    if isinstance(extra, dict):
+        resolved.update(extra)
+    for key in ("img_size", "patch_size", "image_tokens"):
+        if key in first_prompt and key not in resolved:
+            resolved[key] = first_prompt[key]
+    return resolved
+
+
+def _resolve_janus_vq_geometry(extra: dict[str, Any], prompt_extra: dict[str, Any]) -> tuple[int, int]:
+    img_size = int(extra.get("img_size", prompt_extra.get("img_size", _JANUS_IMAGE_SIZE)))
+    patch_size = int(extra.get("patch_size", prompt_extra.get("patch_size", _JANUS_PATCH_SIZE)))
+    grid = img_size // patch_size if patch_size > 0 else 0
+    if img_size != _JANUS_IMAGE_SIZE or patch_size != _JANUS_PATCH_SIZE or grid != _JANUS_TOKEN_GRID_SIZE:
+        raise ValueError(
+            "DeepSeek Janus VQ decode uses a fixed 8x24x24 grid "
+            "(384x384 output with patch_size=16). "
+            f"Got img_size={img_size}, patch_size={patch_size}."
+        )
+    return img_size, patch_size
 
 
 class JanusVQDecodePipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
-    """VQ-decode-only pipeline for Janus two-stage deployment.
+    """VQ-decode-only component for Janus image token IDs.
 
-    Stage 0 (AR engine) generates image token IDs via :class:`JanusForImageGeneration`
-    (which inherits all vLLM LLM optimisations).  This pipeline (stage 1) loads
-    the VQ decoder and converts token IDs → image pixels.
+    This pipeline loads the VQ decoder and converts token IDs to image pixels.
 
     Optimisation note:
-      There are no AR steps in this pipeline — it performs a single VQ decode
-      call per request.  The VQ model is a convolutional encoder/decoder that
-      runs in <1ms.  All vLLM optimisations (PagedAttention, CUDA Graph, etc.)
-      apply to the AR stage, not here.
+      There are no AR steps in this pipeline; it performs a single VQ decode
+      call per request. The VQ model is a convolutional encoder/decoder.
     """
 
     _dit_modules: ClassVar[list[str]] = []
@@ -107,7 +125,7 @@ class JanusVQDecodePipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipe
         )
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """VQ decode: image token grid → RGB image.
 
         Expects ``req.extra_kwargs["image_tokens"]`` to contain the
@@ -118,8 +136,7 @@ class JanusVQDecodePipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipe
         prompt_extra = _resolve_prompt_extra(req)
         sp = req.sampling_params
         parallel_size = max(1, int(sp.num_outputs_per_prompt))
-        img_size = max(16, int(extra.get("img_size", prompt_extra.get("img_size", 384))))
-        patch_size = max(1, int(extra.get("patch_size", prompt_extra.get("patch_size", 16))))
+        img_size, patch_size = _resolve_janus_vq_geometry(extra, prompt_extra)
 
         images_out: list[Image.Image] = []
 
@@ -134,6 +151,11 @@ class JanusVQDecodePipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipe
                 image_tokens = torch.tensor(image_tokens, dtype=torch.int, device=self.device)
             if image_tokens.dim() == 1:
                 image_tokens = image_tokens.unsqueeze(0)
+            if image_tokens.shape[-1] != _JANUS_IMAGE_TOKEN_NUM:
+                raise ValueError(
+                    "DeepSeek Janus VQ decode requires exactly 576 image tokens per image, "
+                    f"got {image_tokens.shape[-1]}."
+                )
         else:
             # Fallback: run the full AR pipeline (for testing)
             return DiffusionOutput(
@@ -151,11 +173,9 @@ class JanusVQDecodePipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipe
             dec_np = np.clip((dec_np + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
             images_out.append(Image.fromarray(dec_np[0]))
 
-        primary = images_out[0] if images_out else None
         return DiffusionOutput(
-            output=primary,
+            output={"payload": {"image": images_out}},
             trajectory_decoded=None,
-            custom_output={"images": images_out, "num_images": len(images_out)},
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 

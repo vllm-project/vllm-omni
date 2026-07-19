@@ -27,6 +27,8 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `stepfun-ai/NextStep-1.1` | 512 x 512 | 71.8 | 28.1 |
 | `meituan-longcat/LongCat-Image` | 1024 x 1024 | 71.2 | 27.3 |
 | `AIDC-AI/Ovis-Image-7B` | 1024 x 1024 | 71.8 | 17.1 |
+| `deepseek-ai/Janus-1.3B` | 384 x 384 | 14.8 | 2.6 |
+| `deepseek-ai/Janus-Pro-7B` | 384 x 384 | 14.8 | 14.0 |
 | `OmniGen2/OmniGen2` |  1024 x 1024 | 20.1 | 14.7 |
 | `stabilityai/stable-diffusion-3.5-medium` | 1024 x 1024 | 20.1 | 15.6 |
 | `black-forest-labs/FLUX.1-dev` | 1024 x 1024 | 33.9 | 31.4 |
@@ -160,6 +162,29 @@ python text_to_image.py \
   --output nextstep_output.png \
   --seed 42
 ```
+
+### DeepSeek Janus Models
+
+DeepSeek Janus requires Janus-specific dependencies and an explicit deploy
+config:
+
+```bash
+pip install "addict>=2.4.0" "timm>=0.9.16"
+```
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model deepseek-ai/Janus-Pro-7B \
+  --stage-configs-path vllm_omni/deploy/deepseek_janus_single_stage.yaml \
+  --prompt "A scenic mountain lake at sunset" \
+  --guidance-scale 5.0 \
+  --height 384 \
+  --width 384 \
+  --output janus-pro-7b.png
+```
+
+See [`examples/offline_inference/deepseek_janus/README.md`](../deepseek_janus/README.md)
+for Janus topology details and online serving examples.
 
 ### FLUX.2-dev Models
 

@@ -165,6 +165,14 @@ def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_s
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
 
 
+def test_deepseek_janus_diffusion_stage_uses_janus_pipeline_class():
+    stage = _from_pipeline_key("deepseek_janus_single_stage").stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.model_arch == "JanusPipeline"
+    assert stage.diffusion_config.model_class_name == "JanusPipeline"
+
+
 def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime_bridge():
     omni_config = _from_pipeline_key(
         "qwen3_tts",
