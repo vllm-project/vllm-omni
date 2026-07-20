@@ -117,7 +117,9 @@ def create_noised_state(
         device=latents.device,
         dtype=latents.dtype,
     )
-    return noise_scale * noise + (1 - noise_scale) * latents
+    if isinstance(noise_scale, torch.Tensor):
+        noise_scale = noise_scale.float()
+    return torch.lerp(latents.float(), noise.float(), noise_scale).to(latents.dtype)
 
 
 def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
