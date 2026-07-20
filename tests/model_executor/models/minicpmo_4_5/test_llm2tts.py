@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the MiniCPM-o 4.5 stage 0 -> stage 1 bridge.
+"""Unit tests for MiniCPM-o 4.5 stage processors.
 
-Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2tts``:
+Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni``:
 
+  - ``llm2talker`` and the backward-compatible ``llm2tts`` alias
   - empty ``source_outputs`` raises
   - latent fallback to ``hidden_states`` when ``multimodal_output`` is empty
   - both inputs missing -> raises
-  - additional_information payload carries the keys the talker expects
-    (prompt_embeds, prompt_token_ids, llm_output_token_ids, llm_output_text)
+  - additional_information carries only the Talker token/hidden slice
   - dummy talker prompt ``[BOS, PAD, EOS] = [1, 0, 2]`` (single prefill step)
   - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 tokens
   - MiniCPM-o 2.6 fallback detection on 151691 / 151692 when no 4.5 markers
   - No TTS markers present -> no ``tts_token_ids`` / ``tts_hidden_states`` keys
   - prompt arg is normalized to a list and ``multi_modal_data`` is gated by
     ``requires_multimodal_data``
+  - Talker -> Token2Wav token-only and full-payload handoff
 """
 
 from __future__ import annotations
@@ -24,7 +25,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
+from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
+    llm2talker,
+    llm2tts,
+    talker2token2wav_full_payload,
+    talker2token2wav_token_only,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -36,7 +42,6 @@ def _make_thinker_output(
     *,
     prompt_token_ids: list[int],
     output_token_ids: list[int],
-    text: str = "",
     request_id: str = "req-0",
     latent: torch.Tensor | None = None,
     hidden_states: torch.Tensor | None = None,
@@ -46,12 +51,11 @@ def _make_thinker_output(
     The real ``llm2tts`` only reads a tight slice of fields:
       - top-level: ``request_id``, ``prompt_token_ids``, ``outputs[0]``
       - per-output: ``multimodal_output`` (dict), ``hidden_states`` (opt),
-        ``text``, ``token_ids``
+        ``token_ids``
     """
     output = SimpleNamespace(
         multimodal_output={"latent": latent} if latent is not None else {},
         token_ids=output_token_ids,
-        text=text,
     )
     if hidden_states is not None:
         output.hidden_states = hidden_states
@@ -62,7 +66,29 @@ def _make_thinker_output(
     )
 
 
+def _make_talker_output(
+    audio: torch.Tensor | None,
+    *,
+    request_id: str = "req-0",
+    finished: bool = True,
+):
+    output = SimpleNamespace(
+        multimodal_output={"codes": {"audio": audio}} if audio is not None else {},
+        cumulative_token_ids=[],
+        token_ids=[],
+    )
+    return SimpleNamespace(
+        request_id=request_id,
+        prompt_token_ids=[0],
+        outputs=[output],
+        finished=finished,
+    )
+
+
 class TestInputValidation:
+    def test_llm2tts_alias_points_to_llm2talker(self) -> None:
+        assert llm2tts is llm2talker
+
     def test_empty_source_outputs_raises(self) -> None:
         with pytest.raises(ValueError, match="source_outputs cannot be empty"):
             llm2tts([], prompt=None)
@@ -100,37 +126,12 @@ class TestBasicShape:
         # this is the agreed [BOS, PAD, EOS] minimal payload.
         assert out[0]["prompt_token_ids"] == [1, 0, 2]
 
-    def test_additional_information_carries_thinker_outputs(self) -> None:
-        prompt_ids = [10, 11, 12]
-        out_ids = [20, 21]
-        hidden = torch.randn(len(prompt_ids) + len(out_ids), _HIDDEN_DIM)
-
-        result = llm2tts(
-            [
-                _make_thinker_output(
-                    prompt_token_ids=prompt_ids,
-                    output_token_ids=out_ids,
-                    text="hello",
-                    hidden_states=hidden,
-                )
-            ],
-            prompt=None,
-        )
-        ai = result[0]["additional_information"]
-        assert ai["prompt_token_ids"] == prompt_ids
-        assert ai["llm_output_token_ids"] == out_ids
-        assert ai["llm_output_text"] == ["hello"]
-        # prompt_embeds = float32 view of the prompt-portion of hidden states.
-        assert ai["prompt_embeds"].dtype == torch.float32
-        assert ai["prompt_embeds"].shape == (len(prompt_ids), _HIDDEN_DIM)
-        assert torch.equal(ai["prompt_embeds"], hidden[: len(prompt_ids)].to(torch.float32))
-
     def test_latent_in_multimodal_output_takes_precedence(self) -> None:
         # When both ``multimodal_output["latent"]`` and ``hidden_states`` are
         # present, the latent payload must win (this is the steady-state path
         # produced by the thinker stage).
         prompt_ids = [10, 11]
-        out_ids = [20]
+        out_ids = [151703, 30, 151704]
         latent = torch.ones((len(prompt_ids) + len(out_ids), _HIDDEN_DIM))
         hidden = torch.zeros_like(latent)
 
@@ -147,7 +148,7 @@ class TestBasicShape:
         )
         ai = result[0]["additional_information"]
         # latent (ones) won over hidden_states (zeros)
-        assert torch.equal(ai["prompt_embeds"], latent[: len(prompt_ids)].to(torch.float32))
+        assert torch.equal(ai["tts_hidden_states"], latent[3:4].to(torch.float32))
 
 
 class TestTtsRegionDetection:
@@ -262,3 +263,43 @@ class TestPromptAndMultiModal:
             streaming_context=object(),
         )
         assert len(out) == 1
+
+
+class TestTalkerToToken2Wav:
+    def test_token_only_sizes_prompt_from_audio_codes(self) -> None:
+        out = talker2token2wav_token_only([_make_talker_output(torch.tensor([10, 11, 12]))])
+        assert len(out) == 1
+        assert out[0]["prompt_token_ids"] == [0, 0, 0]
+        assert out[0]["additional_information"] is None
+
+    def test_token_only_empty_audio_keeps_one_placeholder(self) -> None:
+        out = talker2token2wav_token_only([_make_talker_output(torch.empty(0, dtype=torch.long))])
+        assert len(out) == 1
+        assert out[0]["prompt_token_ids"] == [0]
+
+    def test_token_only_skips_unfinished_output(self) -> None:
+        assert talker2token2wav_token_only([_make_talker_output(torch.tensor([1]), finished=False)]) == []
+
+    def test_full_payload_valid_codes(self) -> None:
+        pooling_output = {"codes.audio": torch.tensor([101, 102, 103])}
+        request = SimpleNamespace(request_id="req-a")
+        payload = talker2token2wav_full_payload(None, pooling_output, request)
+        assert payload["codes"]["audio"].tolist() == [101, 102, 103]
+        assert payload["codes"]["audio"].dtype == torch.long
+        assert payload["meta"]["finished"].item() is True
+        assert payload["meta"]["code_flat_numel"] == 3
+        assert payload["meta"]["next_stage_prompt_len"] == 3
+
+    def test_full_payload_nested_codes(self) -> None:
+        pooling_output = {"codes": {"audio": [7, 8]}}
+        payload = talker2token2wav_full_payload(None, pooling_output, SimpleNamespace(request_id="req-b"))
+        assert payload["codes"]["audio"].tolist() == [7, 8]
+        assert payload["meta"]["next_stage_prompt_len"] == 2
+
+    def test_full_payload_missing_codes_returns_empty_finished_payload(self, caplog) -> None:
+        payload = talker2token2wav_full_payload(None, {"other": torch.tensor([1])}, SimpleNamespace(request_id="req-c"))
+        assert payload["codes"]["audio"].numel() == 0
+        assert payload["meta"]["finished"].item() is True
+        assert payload["meta"]["code_flat_numel"] == 0
+        assert payload["meta"]["next_stage_prompt_len"] == 1
+        assert "missing codes.audio" in caplog.text

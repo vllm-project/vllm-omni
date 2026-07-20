@@ -17,14 +17,14 @@ pip install 'vllm-omni[minicpmo]'
 
 The deploy config auto-loads via `--omni`; the default
 `vllm_omni/deploy/minicpmo_4_5.yaml` targets a single-GPU layout (thinker
-and talker + t2w co-located on GPU 0).  For other hardware layouts pick
+talker, and Token2Wav co-located on GPU 0). For other hardware layouts pick
 one of the deploy variants below.
 
 | deploy config | GPUs | Notes |
 |---|---|---|
-| `minicpmo_4_5.yaml` (default) | 1 | Thinker and talker+t2w co-located on GPU0. |
-| `minicpmo_4_5_2gpu.yaml` | 2 | Thinker on GPU0, talker+t2w on GPU1. |
-| `minicpmo_4_5_3gpu.yaml` | 3 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
+| `minicpmo_4_5.yaml` (default) | 1 | Thinker, Talker, and Token2Wav co-located on GPU0. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | Thinker on GPU0; Talker and Token2Wav on GPU1. |
+| `minicpmo_4_5_3gpu.yaml` | 3 | Thinker 2-way TP on GPU0/1; Talker and Token2Wav on GPU2. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 
 Default (single-GPU):
@@ -46,7 +46,8 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 
 ### Stage-based CLI (optional)
 
-Stage 0 (thinker + API) and stage 1 (talker) can run in separate processes:
+Stage 0 (thinker + API), stage 1 (talker), and stage 2 (Token2Wav) can run in
+separate processes:
 
 ```bash
 # Stage 0
@@ -57,6 +58,11 @@ CUDA_VISIBLE_DEVICES=0 vllm serve openbmb/MiniCPM-o-4_5 --omni \
 # Stage 1 (headless)
 CUDA_VISIBLE_DEVICES=1 vllm serve openbmb/MiniCPM-o-4_5 --omni \
     --trust-remote-code --stage-id 1 --headless \
+    --omni-master-address 127.0.0.1 --omni-master-port 26000
+
+# Stage 2 (headless)
+CUDA_VISIBLE_DEVICES=1 vllm serve openbmb/MiniCPM-o-4_5 --omni \
+    --trust-remote-code --stage-id 2 --headless \
     --omni-master-address 127.0.0.1 --omni-master-port 26000
 ```
 
@@ -150,9 +156,17 @@ root; nested `extra_body` is ignored. The OpenAI Python SDK may use
 
 ## Notes
 
+- TTS trigger: the MiniCPM-specific client and demo set
+  `chat_template_kwargs.use_tts_template=true`, which appends `<|tts_bos|>` to
+  the assistant prefix.
+- Uncheck **"Generate speech output (TTS)"** to get text-only responses
+  (faster).
 - Stage 1 is capped at `max_num_seqs: 1` in the deploy YAML (talker shares
   request-0 audio metadata).
-- Output audio is base64 WAV in `message.audio.data` (24 kHz mono).
+- Output audio is base64 WAV in `message.audio.data`, produced by the stage-2
+  Token2Wav stage at 24 kHz mono.
+- Video input is forwarded as a base64 `video_url` entry; the server needs
+  decord/torchvision to decode it.
 - Offline counterpart:
   [`examples/offline_inference/minicpmo/`](../../offline_inference/minicpmo/)
 - Recipe:

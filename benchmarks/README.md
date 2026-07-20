@@ -12,6 +12,14 @@ Model-agnostic serving benchmarks for TTS models, including Qwen3-TTS and VoxCPM
 - **Dataset**: Seed-TTS full or text-only datasets, plus bundled smoke/design prompts under `build_dataset/`
 - **Key metrics**: TTFP (time to first audio packet), E2E latency, RTF (real-time factor), throughput (audio seconds / wall-clock second)
 
+### [MiniCPM-o 4.5](minicpmo/README.md) — Three-Stage TTS
+
+MiniCPM-o 4.5-specific smoke and profiling scripts for the Thinker -> Talker -> Token2Wav split.
+
+- **Layout**: `minicpmo/benchmark_e2e_tts.py` (text + complete WAV serving), `minicpmo/benchmark_token2wav.py` (Stage-2 decode)
+- **Key metrics**: latency p50/p95, RTF, peak GPU memory, waveform duration, finite/NaN/Inf, clipping, RMS/peak
+- **Failure handling**: request failures, timeouts, and OOM rows stay in JSON/CSV outputs
+
 ### [Diffusion](diffusion/README.md) — Image and Video Generation
 
 Online-serving benchmark for diffusion image/video models, sending requests to the configured vLLM serving endpoint (`/v1/chat/completions`, `/v1/images/generations`, or `/v1/videos`, depending on backend/task).

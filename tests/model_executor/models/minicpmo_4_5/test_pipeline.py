@@ -5,8 +5,9 @@
 Covers:
   - pipeline declared in the central registry
   - lazy loader returns the expected ``PipelineConfig``
-  - 2-stage topology (thinker LLM_AR + talker LLM_AR with audio output)
-  - stage 1 routes through ``llm2tts`` custom input processor
+  - 3-stage topology (thinker LLM_AR + talker LLM_AR + token2wav generation)
+  - stage 1 routes through ``llm2talker`` and emits ``codes.audio``
+  - stage 2 consumes the full-payload codec tensor and emits audio
   - ``hf_architectures`` covers both the shared ``MiniCPMO`` alias and the
     explicit 4.5 arch
   - ``hf_config_predicate`` selects MiniCPM-o 4.5 only and rejects 2.6
@@ -35,9 +36,6 @@ class TestRegistryDeclaration:
     def test_declared_in_omni_pipelines(self) -> None:
         assert _PIPELINE_KEY in OMNI_PIPELINES
 
-    def test_visible_in_central_registry(self) -> None:
-        assert _PIPELINE_KEY in OMNI_PIPELINES
-
     def test_lazy_load_returns_pipeline_config(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         assert isinstance(pipeline, PipelineConfig)
@@ -50,9 +48,9 @@ class TestPipelineTopology:
     def pipeline(self) -> PipelineConfig:
         return OMNI_PIPELINES[_PIPELINE_KEY]
 
-    def test_two_stages(self, pipeline: PipelineConfig) -> None:
-        assert len(pipeline.stages) == 2
-        assert [s.stage_id for s in pipeline.stages] == [0, 1]
+    def test_three_stages(self, pipeline: PipelineConfig) -> None:
+        assert len(pipeline.stages) == 3
+        assert [s.stage_id for s in pipeline.stages] == [0, 1, 2]
 
     def test_topology_validates(self, pipeline: PipelineConfig) -> None:
         # ``validate`` returns a list of structural errors; empty == valid.
@@ -72,24 +70,43 @@ class TestPipelineTopology:
     def test_talker_stage(self, pipeline: PipelineConfig) -> None:
         talker = pipeline.get_stage(1)
         assert talker is not None
-        assert talker.model_stage == "tts"
+        assert talker.model_stage == "talker"
         assert talker.execution_type == StageExecutionType.LLM_AR
         # talker consumes thinker output
         assert talker.input_sources == (0,)
-        assert talker.final_output is True
-        assert talker.final_output_type == "audio"
-        assert talker.engine_output_type == "audio"
+        assert talker.final_output is False
+        assert talker.final_output_type is None
+        assert talker.engine_output_type == "latent"
         # scope KV cache / mrope sizing to talker sub-config
         assert talker.hf_config_name == "tts_config"
 
-    def test_talker_routes_through_llm2tts(self, pipeline: PipelineConfig) -> None:
+    def test_talker_routes_through_llm2talker(self, pipeline: PipelineConfig) -> None:
         talker = pipeline.get_stage(1)
         assert talker is not None
         # stage 1's custom_process_input_func is what bridges thinker
         # hidden_states + token ids into the talker; if this drifts the
         # talker silently goes through the dummy path.
         assert talker.custom_process_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2tts"
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2talker"
+        )
+        assert talker.custom_process_next_stage_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni."
+            "talker2token2wav_full_payload"
+        )
+
+    def test_token2wav_stage(self, pipeline: PipelineConfig) -> None:
+        token2wav = pipeline.get_stage(2)
+        assert token2wav is not None
+        assert token2wav.model_stage == "token2wav"
+        assert token2wav.execution_type == StageExecutionType.LLM_GENERATION
+        assert token2wav.input_sources == (1,)
+        assert token2wav.final_output is True
+        assert token2wav.final_output_type == "audio"
+        assert token2wav.engine_output_type == "audio"
+        assert token2wav.hf_config_name == "tts_config"
+        assert token2wav.sync_process_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni."
+            "talker2token2wav_token_only"
         )
 
 

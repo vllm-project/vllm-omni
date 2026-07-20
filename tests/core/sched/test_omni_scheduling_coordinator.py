@@ -114,6 +114,7 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
             ("CovoAudioForConditionalGeneration", "code2wav"),
             ("MiMoAudioModel", "code2wav"),
             ("Qwen3TTSCode2Wav", "code2wav"),
+            ("MiniCPMO45OmniForConditionalGeneration", "token2wav"),
             ("CosyVoice3Model", "cosyvoice3_code2wav"),
             ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
             ("DyninOmniForConditionalGeneration", "token2image"),

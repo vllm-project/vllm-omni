@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MiniCPM-o 4.5 pipeline topology (frozen).
+"""MiniCPM-o 4.5 pipeline topology.
 
 Stage 0: Thinker — multimodal understanding + text generation.
-Stage 1: Talker  — MiniCPMTTS + Token2Wav, emits the final audio waveform.
+Stage 1: Talker  — MiniCPMTTS, emits generated audio tokens.
+Stage 2: Token2Wav — decodes audio tokens into the final waveform.
 
 The thinker -> talker bridge passes the hidden states + token ids extracted
-from the thinker output through ``minicpmo_4_5_omni.llm2tts``; the talker
-runs MiniCPMTTS and the on-device Token2wav vocoder in the same process and
-returns the waveform directly as the pipeline's final audio output.
+from the thinker output through ``minicpmo_4_5_omni.llm2talker``. The
+talker -> token2wav bridge sends a complete ``codes.audio`` payload; async
+chunking remains disabled for PR1.
 """
 
 from vllm_omni.config.stage_config import (
@@ -24,15 +25,8 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
-    # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
-    # `architectures=["MiniCPMO"]` — both shared verbatim with older MiniCPM-o
-    # 1.0 / 2.6 checkpoints. The only field distinguishing the generations is
-    # the top-level ``version`` string, so we register both the shared
-    # ``MiniCPMO`` arch (for auto-detection) and the 4.5-specific arch (for
-    # repos that opt into the explicit name later), then pin the routing to
-    # 4.5 via ``hf_config_predicate``. Without the predicate, loading a 2.6
-    # checkpoint would also intersect ``["MiniCPMO"]`` here and get routed
-    # into the 4.5 pipeline, which would then fail at load time.
+    # MiniCPM-o 2.6 and 4.5 both advertise ``architectures=["MiniCPMO"]``.
+    # The version predicate keeps 2.6 checkpoints out of the 4.5 pipeline.
     hf_architectures=("MiniCPMO", "MiniCPMO45OmniForConditionalGeneration"),
     hf_config_predicate=lambda c: str(getattr(c, "version", "")) == "4.5",
     stages=(
@@ -50,29 +44,29 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
         ),
         StagePipelineConfig(
             stage_id=1,
-            model_stage="tts",
-            # Stage 1 shares the top-level wrapper class
-            # (``MiniCPMO45OmniForConditionalGeneration``) inherited from
-            # ``model_arch`` above. The wrapper dispatches on ``model_stage``
-            # and, for ``"tts"``, instantiates the standalone TTS submodule
-            # (``MiniCPMO45OmniTTSForConditionalGeneration``) internally.
-            # Routing through the wrapper is required so that the runner-side
-            # ``runtime_additional_information`` payload reaches the talker
-            # (the standalone TTS class only reads ``additional_information``,
-            # so wiring stage 1 directly to it would always trigger the dummy
-            # path) and so the resulting waveform is packaged as
-            # ``OmniOutput.multimodal_outputs["model_outputs"]`` instead of
-            # being returned as a bare tuple that the AR runner would mistake
-            # for hidden states. ``hf_config_name="tts_config"`` keeps KV
-            # cache / mrope sizing scoped to the talker sub-config.
+            model_stage="talker",
+            # Keep the wrapper here so runner-side runtime metadata reaches
+            # the Talker; wiring the standalone TTS module directly would hit
+            # the dummy path.
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(0,),
+            hf_config_name="tts_config",
+            engine_output_type="latent",
+            custom_process_input_func=f"{_PROC}.llm2talker",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2token2wav_full_payload",
+            sampling_constraints={"detokenize": False},
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="token2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(1,),
             final_output=True,
             final_output_type="audio",
             hf_config_name="tts_config",
             engine_output_type="audio",
-            custom_process_input_func=f"{_PROC}.llm2tts",
-            sampling_constraints={"detokenize": False},
+            sync_process_input_func=f"{_PROC}.talker2token2wav_token_only",
+            sampling_constraints={"detokenize": True},
         ),
     ),
 )

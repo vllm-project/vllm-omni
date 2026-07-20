@@ -2,14 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from:
 # https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
-"""MiniCPM-o 4.5 Talker + Token2Wav: MiniCPMTTS with hidden_text_merge condition.
+"""MiniCPM-o 4.5 Talker / Token2Wav helpers.
 
 Pipeline:
   1. Receive thinker hidden_states + full token IDs via additional_information
   2. Extract tts_bos..tts_eos region
   3. Build condition: emb_text(tokens) + projector_semantic(hidden) (hidden_text_merge)
   4. Run MiniCPMTTS.generate() -> discrete audio tokens
-  5. Run Token2wav(tokens) -> waveform bytes -> numpy array
+  5. Run Token2wav(tokens) -> waveform bytes -> numpy array in the token2wav stage
 """
 
 import io
@@ -92,7 +92,15 @@ _install_torchaudio_soundfile_shim()
 
 
 class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
-    """MiniCPM-o 4.5 Talker: MiniCPMTTS + Token2wav in a single forward pass."""
+    """MiniCPM-o 4.5 Talker / Token2Wav implementation.
+
+    ``model_stage in {"tts", "talker"}`` runs only MiniCPMTTS.generate() and
+    returns generated audio tokens. ``model_stage="token2wav"`` decodes those
+    tokens into one complete waveform. The legacy ``generate_speech`` method
+    still composes both helpers for direct unit tests and old callers.
+    """
+
+    sample_rate = 24_000
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -101,27 +109,29 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         self.config = config
         self.vllm_config = vllm_config
+        self.model_stage = getattr(vllm_config.model_config, "model_stage", "talker")
 
-        self.tts = None
         self.audio_tokenizer = None
-        self._assets_loaded = False
+        self._talker_assets_loaded = False
+        self._token2wav_assets_loaded = False
 
         tts_config = getattr(config, "tts_config", None)
+        if tts_config is None and any(hasattr(config, attr) for attr in ("num_audio_tokens", "audio_bos_token_id")):
+            tts_config = config
         if tts_config is not None:
             self._tts_config = tts_config
-            self._tts_bos_id = getattr(tts_config, "audio_bos_token_id", 151687)
-            self._text_eos_id = getattr(tts_config, "text_eos_token_id", 151692)
-            self._num_audio_tokens = getattr(tts_config, "num_audio_tokens", 6562)
             self._hidden_size = getattr(tts_config, "hidden_size", 768)
-            self._normalize = getattr(tts_config, "normalize_projected_hidden", True)
         else:
             self._tts_config = None
 
-    def _lazy_init_tts(self):
-        if self._assets_loaded or self._tts_config is None:
+    def _model_path(self) -> str:
+        return self.vllm_config.model_config.model
+
+    def _lazy_init_talker(self):
+        if self._talker_assets_loaded or self._tts_config is None:
             return
         try:
-            model_path = self.vllm_config.model_config.model
+            model_path = self._model_path()
 
             if model_path not in sys.path:
                 sys.path.insert(0, model_path)
@@ -166,7 +176,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 torch.set_default_dtype(prev_dtype)
             self.emb_text = self.tts_obj.emb_text
             self.projector_semantic = self.tts_obj.projector_semantic
+            self._talker_assets_loaded = True
+        except ImportError:
+            raise
+        except Exception:
+            logger.error("Failed to init 4.5 Talker", exc_info=True)
+            raise
 
+    def _lazy_init_token2wav(self):
+        if self._token2wav_assets_loaded:
+            return
+        try:
+            model_path = self._model_path()
             token2wav_dir = os.path.join(model_path, "assets", "token2wav")
             if os.path.isdir(token2wav_dir):
                 if not _stepaudio2_available:
@@ -184,49 +205,48 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 prev_dtype2 = torch.get_default_dtype()
                 torch.set_default_dtype(torch.float32)
                 try:
-                    # NB: this must be the MiniCPM-o-flavored Token2wav from
-                    # the `stepaudio2-minicpmo` PyPI package (or the
-                    # `minicpmo-utils[all]` umbrella), not the upstream
-                    # `stepfun-ai/Step-Audio2` repo. The MiniCPM-o variant's
-                    # __init__ accepts n_timesteps; the upstream signature is
-                    # (model_path, float16=False) and will raise
-                    # TypeError on n_timesteps. See ImportError message below
-                    # for installation guidance.
+                    # MiniCPM-o's Token2wav variant accepts n_timesteps; the
+                    # upstream Step-Audio2 package does not.
                     self.audio_tokenizer = _Token2wav(token2wav_dir, float16=False, n_timesteps=10)
                 finally:
                     torch.set_default_dtype(prev_dtype2)
-                self.tts_obj.audio_tokenizer = self.audio_tokenizer
+                if hasattr(self, "tts_obj"):
+                    self.tts_obj.audio_tokenizer = self.audio_tokenizer
                 logger.info(
                     "Loaded Token2wav from %s (backend=%s)",
                     token2wav_dir,
                     _token2wav_backend,
                 )
+            else:
+                raise FileNotFoundError(f"MiniCPM-o 4.5 token2wav assets not found: {token2wav_dir}")
             # Only mark init as complete after every step succeeds, so a
             # partial failure leaves the next call free to retry the full
             # init instead of short-circuiting back to a silent empty path.
-            self._assets_loaded = True
+            self._token2wav_assets_loaded = True
         except ImportError:
             # Surface missing dependencies directly so users can act on them
             # instead of getting a silent None waveform downstream.
             raise
         except Exception:
-            # Re-raise non-import init failures (bad token2wav assets, missing
-            # weights, OOM during Token2wav construction, etc.) so the server
-            # fails loudly at startup / first request instead of returning
-            # silent empty audio for every subsequent request.
-            logger.error("Failed to init 4.5 TTS", exc_info=True)
+            # Bad assets or OOM should fail the request/server loudly, not
+            # degrade into silent empty audio.
+            logger.error("Failed to init 4.5 Token2Wav", exc_info=True)
             raise
 
-    def generate_speech(
+    def _lazy_init_tts(self):
+        """Compatibility initializer for the old fused TTS path."""
+        self._lazy_init_talker()
+        self._lazy_init_token2wav()
+
+    def prepare_tts_inputs(
         self,
         tts_token_ids: torch.Tensor,
         tts_hidden_states: torch.Tensor,
-    ) -> np.ndarray | None:
-        """Run full 4.5 TTS pipeline using original MiniCPMTTS.generate."""
-        self._lazy_init_tts()
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        """Build MiniCPMTTS.generate inputs from thinker token/hidden slices."""
+        self._lazy_init_talker()
         if not hasattr(self, "tts_obj") or self.tts_obj is None:
-            logger.warning("generate_speech: tts_obj not initialized")
-            return None
+            raise RuntimeError("MiniCPM-o 4.5 Talker is not initialized")
 
         tts = self.tts_obj
         device = tts.emb_text.weight.device
@@ -249,7 +269,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         inputs_embeds = torch.cat([spk_embeds, tts_embeds, text_eos, audio_bos], dim=0).unsqueeze(0)
         inputs_embeds = inputs_embeds.to(dtype=ar_dtype)
-        logger.info("generate_speech: inputs_embeds shape=%s", list(inputs_embeds.shape))
+        logger.info("prepare_tts_inputs: inputs_embeds shape=%s", list(inputs_embeds.shape))
 
         # Scale max_new_token with input text length to avoid mid-stream truncation on long
         # responses (default 2048 can only cover ~300 text tokens at ~6x audio/text ratio).
@@ -259,29 +279,52 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         max_new_token = max(2048, min(16384, num_text * 10))
 
         eos_token = torch.tensor([tts.config.num_audio_tokens - 1], dtype=torch.long, device=device)
+        return inputs_embeds, eos_token, max_new_token, num_text
+
+    def generate_audio_tokens(
+        self,
+        tts_token_ids: torch.Tensor,
+        tts_hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run MiniCPMTTS.generate() and return one-dimensional audio tokens."""
+        inputs_embeds, eos_token, max_new_token, num_text = self.prepare_tts_inputs(
+            tts_token_ids,
+            tts_hidden_states,
+        )
+        tts = self.tts_obj
         outputs = tts.generate(
             inputs_embeds=inputs_embeds,
             eos_token=eos_token,
             max_new_token=max_new_token,
             show_tqdm=False,
         )
-        generated_tokens = outputs.new_ids.squeeze(-1)
+        generated_tokens = outputs.new_ids.squeeze(-1).reshape(-1).to(torch.long)
         logger.info(
-            "generate_speech: generated %d audio tokens (cap=%d, text_tokens=%d)",
-            generated_tokens.shape[-1],
+            "generate_audio_tokens: generated %d audio tokens (cap=%d, text_tokens=%d)",
+            generated_tokens.numel(),
             max_new_token,
             num_text,
         )
+        if generated_tokens.numel() == 0:
+            raise RuntimeError("MiniCPM-o 4.5 Talker generated no audio tokens")
+        return generated_tokens
 
+    def decode_audio_tokens(
+        self,
+        generated_tokens: torch.Tensor | list[int],
+        prompt_wav_path: str | None = None,
+    ) -> np.ndarray:
+        """Decode generated audio tokens with the MiniCPM-o Token2Wav assets."""
+        self._lazy_init_token2wav()
         if self.audio_tokenizer is None:
-            logger.warning("No audio_tokenizer")
-            return None
+            raise RuntimeError("MiniCPM-o 4.5 Token2Wav is not initialized")
 
         import torchaudio
 
-        model_path = self.vllm_config.model_config.model
-        default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
-        prompt_wav_path = default_ref if os.path.exists(default_ref) else None
+        if prompt_wav_path is None:
+            model_path = self._model_path()
+            default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
+            prompt_wav_path = default_ref if os.path.exists(default_ref) else None
 
         _orig_save = torchaudio.save
 
@@ -299,23 +342,28 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # Vocoder path is float32; use the platform abstraction because
             # torch.amp.autocast validates unsupported device types even when
             # autocast is disabled.
+            device = (
+                generated_tokens.device
+                if isinstance(generated_tokens, torch.Tensor)
+                else current_omni_platform.get_torch_device()
+            )
             autocast_device = device.type if isinstance(device, torch.device) else str(device)
             with current_omni_platform.create_autocast_context(
                 device_type=autocast_device,
                 dtype=torch.float32,
                 enabled=False,
             ):
-                token_list = generated_tokens.squeeze(0).tolist()
+                if isinstance(generated_tokens, torch.Tensor):
+                    token_list = generated_tokens.detach().to("cpu", dtype=torch.long).reshape(-1).tolist()
+                else:
+                    token_list = [int(token) for token in generated_tokens]
                 num_tokens = len(token_list)
+                if num_tokens == 0:
+                    return np.asarray([], dtype=np.float32)
 
-                # For long outputs, the one-shot vocoder path
-                # (Token2wav.__call__ -> flow.inference) runs full O(N^2) self-
-                # attention over all audio tokens and OOMs on a 24GB card once
-                # N exceeds a few thousand (e.g. 4964 tokens needs ~3GiB for a
-                # single attention matmul). Switch to the chunked / streaming
-                # vocoder (set_stream_cache + stream) which truncates the flow
-                # attention caches to prompt_len + 100 steps on every chunk,
-                # keeping peak memory bounded regardless of total length.
+                # Preserve the existing long-output vocoder fallback: one-shot
+                # decode has O(N^2) attention memory, while stream() bounds the
+                # cache per chunk.
                 STREAM_THRESHOLD = int(os.environ.get("MINICPMO45_TTS_STREAM_THRESHOLD", "2500"))  # ~100s @ 25Hz
                 CHUNK_SIZE = int(os.environ.get("MINICPMO45_TTS_STREAM_CHUNK", "50"))  # ~2s per chunk
                 MIN_TAIL = 6  # must exceed flow.pre_lookahead_len (typically 3)
@@ -337,7 +385,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                         i = end
 
                     logger.info(
-                        "generate_speech: streaming vocoder, %d tokens -> %d chunks (chunk=%d)",
+                        "decode_audio_tokens: streaming vocoder, %d tokens -> %d chunks (chunk=%d)",
                         num_tokens,
                         len(boundaries),
                         CHUNK_SIZE,
@@ -368,53 +416,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             torch.set_default_dtype(prev_dtype)
             torchaudio.save = _orig_save
 
-        logger.info("generate_speech: waveform %d samples, sr=%d", waveform.shape[0], sr)
+        logger.info("decode_audio_tokens: waveform %d samples, sr=%d", waveform.shape[0], sr)
         return waveform
 
-    def _generate_tokens(self, inputs_embeds: torch.Tensor, max_new_token: int = 2048) -> torch.Tensor | None:
-        """Autoregressive generation of audio tokens using the TTS LlamaModel."""
-        device = inputs_embeds.device
-        eos_token = self._num_audio_tokens - 1
-        condition_length = inputs_embeds.shape[1]
-        num_vq = len(self.emb_code)
+    @staticmethod
+    def package_waveform(waveform: np.ndarray | torch.Tensor | None) -> torch.Tensor | None:
+        """Convert decoded waveform to the tensor form consumed by OmniOutput."""
+        if waveform is None:
+            return None
+        if isinstance(waveform, torch.Tensor):
+            return waveform.to(dtype=torch.float32).reshape(-1)
+        return torch.as_tensor(np.asarray(waveform, dtype=np.float32).reshape(-1), dtype=torch.float32)
 
-        new_tokens = torch.zeros(1, max_new_token, num_vq, device=device, dtype=torch.long)
-        past_key_values = None
-        finished = False
-
-        for t in range(max_new_token):
-            if t == 0:
-                emb = inputs_embeds
-                position_ids = torch.arange(condition_length, device=device).unsqueeze(0)
-            else:
-                code_emb = [self.emb_code[q](new_tokens[:, t - 1 : t, q]) for q in range(num_vq)]
-                emb = torch.stack(code_emb, -1).sum(-1)
-                position_ids = torch.tensor([[condition_length + t - 1]], device=device)
-
-            outputs = self.tts_model(
-                inputs_embeds=emb,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            hidden = outputs.last_hidden_state
-            past_key_values = outputs.past_key_values
-
-            logits = torch.stack([self.head_code[q](hidden[:, -1]) for q in range(num_vq)], dim=-1)
-            logits = logits.float() / 0.8
-
-            if t < 50:
-                logits[:, eos_token, :] = -float("inf")
-
-            probs = F.softmax(logits, dim=1)
-            idx = torch.multinomial(probs.view(-1, probs.shape[1]), 1).view(1, num_vq)
-            new_tokens[:, t] = idx
-
-            if (idx == eos_token).any():
-                finished = True
-                break
-
-        return new_tokens[:, : t + 1 if finished else t, :]
+    def generate_speech(
+        self,
+        tts_token_ids: torch.Tensor,
+        tts_hidden_states: torch.Tensor,
+    ) -> np.ndarray:
+        """Run the old fused 4.5 TTS pipeline for direct callers/tests."""
+        audio_tokens = self.generate_audio_tokens(tts_token_ids, tts_hidden_states)
+        return self.decode_audio_tokens(audio_tokens)
 
     def _dummy_hidden_states(
         self,
@@ -449,28 +470,70 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         additional_information=None,
         **kwargs,
     ):
+        payload_was_provided = (
+            additional_information is not None
+            or kwargs.get("runtime_additional_information") is not None
+        )
         if additional_information is None:
             additional_information = {}
 
+        if self.model_stage == "token2wav":
+            audio_codes = self._extract_token2wav_codes(input_ids, additional_information, kwargs)
+            if audio_codes is None:
+                log = logger.warning if payload_was_provided else logger.debug
+                log("4.5 Token2Wav: missing audio token payload; returning empty waveform")
+                device = input_ids.device if isinstance(input_ids, torch.Tensor) else torch.device("cpu")
+                return torch.empty(0, dtype=torch.float32, device=device)
+            if audio_codes.numel() == 0:
+                logger.debug("4.5 Token2Wav: empty audio token payload; returning empty waveform")
+                device = input_ids.device if isinstance(input_ids, torch.Tensor) else torch.device("cpu")
+                return torch.empty(0, dtype=torch.float32, device=device)
+            logger.info("4.5 Token2Wav: decoding %d audio tokens", audio_codes.numel())
+            waveform = self.decode_audio_tokens(audio_codes)
+            packaged = self.package_waveform(waveform)
+            if packaged is None or packaged.numel() == 0:
+                raise RuntimeError("MiniCPM-o 4.5 Token2Wav decoded empty audio from non-empty tokens")
+            return packaged
+
         tts_token_ids = additional_information.get("tts_token_ids")
         tts_hidden_states = additional_information.get("tts_hidden_states")
-        tts_text = additional_information.get("llm_output_text", [""])
-        if isinstance(tts_text, list):
-            tts_text = tts_text[0] if tts_text else ""
 
         if tts_token_ids is None or tts_hidden_states is None:
             # KV cache profiling / dummy run path — no real TTS input yet.
             logger.debug("4.5 Talker: dummy forward (missing tts_token_ids/tts_hidden_states)")
             return self._dummy_hidden_states(input_ids, positions, inputs_embeds)
 
-        logger.info("4.5 Talker: generating speech for %d tokens", tts_token_ids.shape[0])
-        waveform = self.generate_speech(tts_token_ids, tts_hidden_states)
-        # Tuple layout: (mel_spec, waveform). 4.5 talker emits only waveform,
-        # so mel_spec stays None; the wrapper unpacks in this order and
-        # packages the waveform into ``multimodal_outputs["model_outputs"]``.
-        if waveform is not None:
-            return None, torch.tensor(waveform, dtype=torch.float32)
-        return None, None
+        logger.info("4.5 Talker: generating audio tokens for %d tokens", tts_token_ids.shape[0])
+        return self.generate_audio_tokens(tts_token_ids, tts_hidden_states)
+
+    def _extract_token2wav_codes(
+        self,
+        input_ids: torch.Tensor | None,
+        additional_information: dict[str, object],
+        kwargs: dict[str, object],
+    ) -> torch.Tensor | None:
+        """Resolve Token2Wav codec tokens from connector payload or input_ids."""
+        runtime_info = kwargs.get("runtime_additional_information")
+        if runtime_info is not None and isinstance(runtime_info, list) and runtime_info:
+            first = runtime_info[0]
+            if isinstance(first, dict):
+                additional_information = first
+
+        meta = additional_information.get("meta") if isinstance(additional_information, dict) else None
+        meta = meta if isinstance(meta, dict) else {}
+        if int(meta.get("code_flat_numel", -1)) == 0:
+            device = input_ids.device if isinstance(input_ids, torch.Tensor) else torch.device("cpu")
+            return torch.empty(0, dtype=torch.long, device=device)
+
+        codes = additional_information.get("codes") if isinstance(additional_information, dict) else None
+        audio_codes = codes.get("audio") if isinstance(codes, dict) else None
+        if audio_codes is None:
+            return None
+        if isinstance(audio_codes, torch.Tensor):
+            device = input_ids.device if isinstance(input_ids, torch.Tensor) else audio_codes.device
+            return audio_codes.to(device=device, dtype=torch.long).reshape(-1)
+        device = input_ids.device if isinstance(input_ids, torch.Tensor) else torch.device("cpu")
+        return torch.as_tensor(audio_codes, dtype=torch.long, device=device).reshape(-1)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         # Placeholder logits: one row per sampled request (the scheduler
@@ -490,6 +553,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loaded = set()
+        if self.model_stage == "token2wav":
+            self._lazy_init_token2wav()
+            return loaded
+
         tts_weights = {}
         for k, v in weights:
             if k.startswith("tts."):
@@ -500,7 +567,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 loaded.add(k.replace("tts.", "tts_obj.", 1))
 
         if tts_weights and self._tts_config is not None:
-            self._lazy_init_tts()
+            self._lazy_init_talker()
             if hasattr(self, "tts_obj") and self.tts_obj is not None:
                 missing, unexpected = self.tts_obj.load_state_dict(tts_weights, strict=False)
                 if missing:
@@ -538,7 +605,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def get_input_embeddings(self, input_ids, multimodal_embeddings=None, **kwargs):
         if hasattr(self, "emb_text") and self.emb_text is not None:
             return self.emb_text(input_ids)
-        return torch.zeros(input_ids.shape[0], 1)
+        hidden_size = int(getattr(self, "_hidden_size", 1) or 1)
+        device = input_ids.device if isinstance(input_ids, torch.Tensor) else torch.device("cpu")
+        return torch.zeros(input_ids.shape[0], hidden_size, device=device)
 
     def embed_input_ids(self, input_ids, **kwargs):
         return self.get_input_embeddings(input_ids, **kwargs)

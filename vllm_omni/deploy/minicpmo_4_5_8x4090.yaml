@@ -4,10 +4,8 @@
 #                                  thinker weights take ~17.5 GB per card
 #                                  on 4090, leaving ~3 GB for KV cache /
 #                                  activations).
-# Stage 1 (talker) : GPU 4       — MiniCPMTTS + Token2Wav, ~90% mem
-#                                  (covers both the talker LM and the
-#                                  in-process Token2Wav vocoder that emits
-#                                  the waveform).
+# Stage 1 (talker) : GPU 4       — MiniCPMTTS audio-token generation, ~55% mem.
+# Stage 2 (token2wav): GPU 4     — Token2Wav final waveform decode, ~35% mem.
 #
 # max_model_len is pinned to 4096 because the upstream config.json
 # advertises max_position_embeddings=40960 (tuned for H20 141GB); on a
@@ -20,6 +18,14 @@ async_chunk: false
 
 trust_remote_code: true
 enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
 
 stages:
   - stage_id: 0
@@ -45,15 +51,35 @@ stages:
     # Talker only consumes runtime_additional_information[0]; any value > 1
     # makes concurrent requests share request-0's audio (mm_outputs fallback).
     max_num_seqs: 1
-    gpu_memory_utilization: 0.9
+    gpu_memory_utilization: 0.55
     enforce_eager: true
     max_num_batched_tokens: 8192
     devices: "4"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
       max_tokens: 1
+      seed: 42
+      detokenize: false
+
+  - stage_id: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+    async_scheduling: false
+    max_model_len: 16384
+    max_num_batched_tokens: 16384
+    devices: "4"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 16384
       seed: 42
       detokenize: false
 

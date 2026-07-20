@@ -1,13 +1,17 @@
 # MiniCPM-o 4.5 deploy: 2-GPU layout (thinker on GPU 0, talker on GPU 1).
 #
-# Stage 0 (thinker): GPU 0 — multimodal understanding, ~90% mem (thinker
+# Stage 0 (thinker): GPU 0 — multimodal understanding, ~95% mem (thinker
 #                            gets a dedicated card, so it can take more of
 #                            the GPU than the single-GPU co-located layout).
-# Stage 1 (talker) : GPU 1 — MiniCPMTTS + Token2Wav, ~75% mem
-#                            (covers both the talker LM and the in-process
-#                            Token2Wav vocoder that emits the waveform).
+# Stage 1 (talker) : GPU 1 — MiniCPMTTS audio-token generation, ~40% mem.
+# Stage 2 (token2wav): GPU 1 — Token2Wav final waveform decode, ~35% mem.
 #
-# Use this when you have two GPUs and want the talker + Token2Wav vocoder
+# Keep the single-TP thinker at a 4096-token serving ceiling on 32GB-class
+# cards: the upstream 40k context OOMs during multimodal profiling before the
+# server can accept the first request. The existing stage-0 concurrency is
+# preserved; Stage 1 remains single-seq until Talker batching is fixed.
+#
+# Use this when you have two GPUs and want Talker + Token2Wav
 # on its own card instead of sharing GPU 0 with the thinker (the default
 # single-GPU layout co-locates both and can OOM under load).
 pipeline: minicpmo_4_5
@@ -16,13 +20,22 @@ async_chunk: false
 trust_remote_code: true
 enable_prefix_caching: false
 
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+
 stages:
   - stage_id: 0
     max_num_seqs: 16
-    gpu_memory_utilization: 0.9
+    gpu_memory_utilization: 0.95
     enforce_eager: false
     tensor_parallel_size: 1
-    max_num_batched_tokens: 16384
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
     devices: "0"
     limit_mm_per_prompt:
       video: 1
@@ -39,15 +52,36 @@ stages:
     # Talker only consumes runtime_additional_information[0]; any value > 1
     # makes concurrent requests share request-0's audio (mm_outputs fallback).
     max_num_seqs: 1
-    gpu_memory_utilization: 0.75
+    gpu_memory_utilization: 0.4
     enforce_eager: false
-    max_num_batched_tokens: 8192
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
     devices: "1"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
       max_tokens: 1
+      seed: 42
+      detokenize: false
+
+  - stage_id: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.35
+    enforce_eager: false
+    async_scheduling: false
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    devices: "1"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 16384
       seed: 42
       detokenize: false
 
@@ -59,6 +93,10 @@ platforms:
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
-        max_num_batched_tokens: 8192
+        max_num_batched_tokens: 4096
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 2
+        max_num_batched_tokens: 4096
         compilation_config:
           cudagraph_mode: PIECEWISE

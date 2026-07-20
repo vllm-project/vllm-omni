@@ -3,7 +3,7 @@
 #
 # Prereq:
 #   Start a vllm-omni OpenAI server for MiniCPM-o 4.5 on :8099 (see the
-#   8x4090 stage config under vllm_omni/model_executor/stage_configs).
+#   deploy configs under vllm_omni/deploy/).
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

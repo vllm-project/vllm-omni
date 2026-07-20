@@ -565,6 +565,33 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
     assert torch.equal(stored["codes.audio"], codes)
 
 
+def test_accumulate_full_payload_output_replaces_1d_minicpmo_audio_codes():
+    runner = _make_full_payload_accumulation_runner(
+        model_arch="MiniCPMO45OmniForConditionalGeneration",
+        custom_process_next_stage_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni."
+            "talker2token2wav_full_payload"
+        ),
+    )
+    request = SimpleNamespace(output_token_ids=[10, 11, 12])
+
+    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
+        runner,
+        "r1",
+        {"codes.audio": torch.tensor([10, 11], dtype=torch.long)},
+        request,
+    )
+    OmniConnectorModelRunnerMixin.accumulate_full_payload_output(
+        runner,
+        "r1",
+        {"codes.audio": torch.tensor([10, 11, 12], dtype=torch.long)},
+        request,
+    )
+
+    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    assert stored["codes.audio"].tolist() == [10, 11, 12]
+
+
 def test_full_payload_output_accumulation_hook_matrix():
     """Producer-side gate: fires iff an explicit next-stage payload hook is loaded.
 

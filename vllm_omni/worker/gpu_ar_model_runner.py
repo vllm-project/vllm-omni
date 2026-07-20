@@ -315,6 +315,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "Qwen2_5OmniForConditionalGeneration",
             "CovoAudioForConditionalGeneration",
             "MiMoAudioModel",
+            "MiniCPMO45OmniForConditionalGeneration",
             "Qwen3TTSTalkerForConditionalGeneration",
             "Qwen3TTSCode2Wav",
             "CosyVoice3Model",
