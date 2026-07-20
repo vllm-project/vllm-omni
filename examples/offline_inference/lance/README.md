@@ -11,6 +11,14 @@ This example covers all six Lance modalities from the upstream HF model card:
 `t2i`, `t2v`, `image_edit`, `video_edit`, `x2t_image` (image understanding) and
 `x2t_video` (video understanding).
 
+> **Prefer the shared task examples for image and video generation.**
+> `t2i`, `image_edit`, `t2v` and image-to-video now run through the standard
+> examples (`text_to_image`, `image_to_image`, `text_to_video`,
+> `image_to_video`) with Lance's knobs passed via `--extra-body`. See
+> [`recipes/ByteDance/Lance.md`](../../../recipes/ByteDance/Lance.md) for
+> copy-pasteable commands. This dedicated example remains the only way to run
+> `video_edit`, `x2t_image` and `x2t_video`, which have no shared task example.
+
 ## Hardware
 
 Single NVIDIA GPU with 16 GB+ VRAM in BF16 (we test on B300 / A100). CUDA ≥ 12.4.

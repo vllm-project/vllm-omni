@@ -53,30 +53,69 @@ separate upstream PR).
 - Driver / runtime: CUDA ≥ 12.4
 - vLLM-Omni version: 0.18.x.dev
 
+#### Model-specific parameters (`extra_body`)
+
+Lance's generation knobs are declared in
+[`vllm_omni/model_extras/lance.py`](../../vllm_omni/model_extras/lance.py) and
+passed as a JSON object to the shared task examples. Keys are filtered against
+that declaration, so an undeclared key is **silently dropped** rather than
+raising:
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `cfg_text_scale` | `4.0` | text CFG scale |
+| `cfg_img_scale` | `1.0` | image/ViT CFG scale |
+| `cfg_interval` | `[0.4, 1.0]` | CFG-active timestep range |
+| `cfg_renorm_type` | `"global"` | CFG renorm strategy |
+| `cfg_renorm_min` | `0.0` | CFG renorm floor |
+| `timestep_shift` | `3.5` | flow-match timestep shift |
+| `negative_prompt` | – | also settable via `--negative-prompt` |
+| `think` | `false` | reasoning pass before generation (inherited BAGEL path) |
+| `max_think_tokens` | `1000` | think / x2t decode budget |
+| `do_sample` | `false` | sampling vs greedy for text decode |
+| `text_temperature` | `0.3` | text decode temperature |
+| `system_prompt` | task default | overrides the task system prompt |
+| `num_frames` | `25` | video only (max 121) |
+| `video_height` / `video_width` | `480` / `768` | video only |
+| `origin_fps` | – | source fps for video inputs |
+
+Prompt rendering (the Qwen chat template plus Lance's per-task system prompt)
+is applied automatically by the registry — pass a plain prompt.
+
 #### Command — text-to-image (default)
 
 ```bash
-python examples/offline_inference/lance/end2end.py \
+python examples/offline_inference/text_to_image/text_to_image.py \
     --model bytedance-research/Lance \
-    --prompts "a corgi astronaut on the moon, cinematic" \
-    --steps 30 --cfg-text-scale 4.0 --timestep-shift 3.5 \
+    --deploy-config vllm_omni/deploy/lance.yaml \
+    --prompt "a corgi astronaut on the moon, cinematic" \
     --height 1024 --width 1024 \
-    --seed 42 --output ./out
+    --num-inference-steps 30 --seed 42 \
+    --extra-body '{"cfg_text_scale": 4.0, "timestep_shift": 3.5}' \
+    --output /tmp/lance_t2i.png
 ```
 
 Defaults match upstream `inference_lance.sh`: 30 denoising steps,
-`timestep-shift 3.5`, text CFG 4.0, seed 42, 1024×1024.
+`timestep_shift 3.5`, text CFG 4.0, seed 42, 1024×1024. `lance.yaml` supplies
+the engine knobs (`pipeline: lance`, `trust_remote_code`, `max_num_seqs: 1`,
+`enforce_eager`) — Lance's `config.json` is descriptive metadata, so the
+pipeline cannot always be auto-detected from the model dir alone.
 
 #### Command — image edit (img2img)
 
 ```bash
-python examples/offline_inference/lance/end2end.py \
-    --model bytedance-research/Lance --modality img2img \
-    --image-path /path/to/input.png \
-    --prompts "Convert this into a vibrant cartoon-style illustration" \
-    --steps 30 --cfg-text-scale 4.0 --timestep-shift 3.5 \
-    --output ./out
+python examples/offline_inference/image_to_image/image_edit.py \
+    --model bytedance-research/Lance \
+    --deploy-config vllm_omni/deploy/lance.yaml \
+    --image /path/to/input.png \
+    --prompt "Convert this into a vibrant cartoon-style illustration" \
+    --num-inference-steps 30 --seed 42 \
+    --extra-args '{"cfg_text_scale": 4.0, "timestep_shift": 3.5}' \
+    --output /tmp/lance_i2i.png
 ```
+
+> **Note**: `image_edit.py` spells this flag `--extra-args`, while the other
+> task examples use `--extra-body`. Same mechanism, different flag name.
 
 The Lance-native VAE prefill scatters Wan2.2 latents into the LLM query
 sequence; no separate image encoder is needed.
@@ -84,18 +123,55 @@ sequence; no separate image encoder is needed.
 #### Command — text-to-video
 
 ```bash
-python examples/offline_inference/lance/end2end.py \
-    --model bytedance-research/Lance/Lance_3B_Video --modality text2video \
-    --num-frames 25 --video-height 480 --video-width 768 \
-    --prompts "a cat playing piano, cinematic" \
-    --steps 30 --fps 8 --output ./out
+python examples/offline_inference/text_to_video/text_to_video.py \
+    --model bytedance-research/Lance/Lance_3B_Video \
+    --model-class-name LancePipeline \
+    --prompt "a cat playing piano, cinematic" \
+    --height 480 --width 768 --num-frames 25 \
+    --num-inference-steps 30 --fps 8 --seed 42 \
+    --extra-body '{"cfg_text_scale": 4.0, "timestep_shift": 3.5}' \
+    --output /tmp/lance_t2v.mp4
+```
+
+#### Command — image-to-video
+
+```bash
+python examples/offline_inference/image_to_video/image_to_video.py \
+    --model bytedance-research/Lance/Lance_3B_Video \
+    --model-class-name LancePipeline \
+    --image /path/to/first.png \
+    --prompt "the scene comes to life with smooth camera motion" \
+    --height 480 --width 768 --num-frames 25 \
+    --num-inference-steps 30 --fps 8 --seed 42 \
+    --extra-body '{"cfg_text_scale": 4.0, "timestep_shift": 3.5}' \
+    --output /tmp/lance_i2v.mp4
 ```
 
 Use the `Lance_3B_Video` subfolder for any video path so the 3-D
 `latent_pos_embed` table is loaded; image / understanding paths can point at
 the top-level repo and resolve the right sub-checkpoint automatically.
 
-#### Command — image / video understanding
+> **Note**: the video task examples select the pipeline with
+> `--model-class-name` because they do not (yet) accept `--deploy-config`, and
+> they have no flag for `trust_remote_code` / `max_num_seqs`. If loading fails,
+> fall back to the dedicated example below.
+
+#### Command — video edit and understanding (dedicated example)
+
+`video2video`, `img2text` and `video2text` have no shared task example to run
+through — there is no `video_to_video` example, and the two `x2t` paths are
+autoregressive text generation rather than diffusion. They keep using the
+dedicated example below:
+
+```bash
+# Video edit (video2video)
+python examples/offline_inference/lance/end2end.py \
+    --model bytedance-research/Lance/Lance_3B_Video --modality video2video \
+    --video-path /path/to/clip.mp4 \
+    --prompts "make it look like a watercolor painting" \
+    --num-frames 25 --video-height 480 --video-width 768 \
+    --steps 30 --output ./out
+```
 
 ```bash
 # Image → text (caption / VQA)
