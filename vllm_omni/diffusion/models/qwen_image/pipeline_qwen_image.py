@@ -273,6 +273,27 @@ class QwenImagePipeline(
 
     supports_step_execution: ClassVar[bool] = True
 
+    # Expose the transformer's packed_modules_mapping on the pipeline class so
+    # that configure_quant_config() populates quant_config.packed_modules_mapping
+    # and CompressedTensorsConfig.should_ignore_layer can expand fused attention
+    # projections (to_qkv/add_kv_proj) when matching the ignore list.
+    #
+    # _prepare_diffusion_quant_config() passes this *pipeline* class (not the
+    # transformer) to vLLM's configure_quant_config(), which reads
+    # packed_modules_mapping off model_class. Without this attribute the mapping
+    # stays empty on GPU (the CUDA platform's get_diffusion_packed_modules_mapping
+    # returns None, unlike NPU), so MLP-only (ignore attn) compressed-tensors
+    # checkpoints fail to ignore the fused attn layers and run them with an
+    # uninitialized weight_scale, destroying text conditioning.
+    packed_modules_mapping = dict(QwenImageTransformer2DModel.packed_modules_mapping)
+
+    # The compressed-tensors ignore list uses diffusers names. The attention
+    # output projection is `.attn.to_out.0` in diffusers but the vLLM fused
+    # layer is `.attn.to_out`. load_weights already renames for weight loading;
+    # this mapping lets _prepare_diffusion_quant_config normalise the ignore
+    # list so should_ignore_layer matches the fused layer.
+    _ct_ignore_name_rewrites: dict[str, str] = {".attn.to_out.0": ".attn.to_out"}
+
     def __init__(
         self,
         *,

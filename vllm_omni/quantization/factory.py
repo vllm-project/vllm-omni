@@ -289,23 +289,42 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
 
     Resolution: _OVERRIDES first, then vLLM registry via from_config().
     """
+    raw_method = method
     method = _normalize_method_name(method)
 
     if method in _OVERRIDES:
         return _OVERRIDES[method](**kwargs)
 
-    if method not in QUANTIZATION_METHODS:
-        raise ValueError(f"Unknown quantization method: {method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
+    # QUANTIZATION_METHODS stores the canonical (hyphenated) names from
+    # QuantizationMethods, but _normalize_method_name turns hyphens into
+    # underscores (e.g. "compressed-tensors" -> "compressed_tensors"). Resolve
+    # the canonical spelling against both forms so hyphenated methods match.
+    # compressed-tensors is currently the only vLLM quant method with a hyphen,
+    # so it is the only one affected.
+    canonical = next(
+        (c for c in (str(raw_method), method, method.replace("_", "-")) if c in QUANTIZATION_METHODS),
+        None,
+    )
+    if canonical is None:
+        raise ValueError(f"Unknown quantization method: {raw_method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
 
-    config_cls = get_quantization_config(method)
+    config_cls = get_quantization_config(canonical)
 
     try:
         return config_cls(**kwargs)
-    except TypeError:
-        sig = inspect.signature(config_cls.__init__)
-        raise TypeError(
-            f"Cannot instantiate {config_cls.__name__} with kwargs {kwargs}. Expected signature: {sig}"
-        ) from None
+    except TypeError as direct_exc:
+        # Some configs (e.g. CompressedTensorsConfig) are not constructible from
+        # raw kwargs and must be built via from_config(). Only fall back when the
+        # config actually supports it; otherwise surface the original error so
+        # genuine runtime TypeErrors inside __init__ are not swallowed.
+        if not hasattr(config_cls, "from_config"):
+            raise
+        from_config_kwargs = dict(kwargs)
+        from_config_kwargs.setdefault("quant_method", canonical)
+        try:
+            return config_cls.from_config(from_config_kwargs)
+        except TypeError:
+            raise direct_exc
 
 
 def _is_per_component_dict(spec: dict[str, Any]) -> bool:

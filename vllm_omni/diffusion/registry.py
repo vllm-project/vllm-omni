@@ -336,6 +336,18 @@ _NO_CACHE_ACCELERATION = {
 }
 
 
+def _apply_ignore_rewrite(name: str, rewrites: dict[str, str]) -> str:
+    """Apply suffix-based ignore-name rewrites for compressed-tensors ignore.
+
+    Each entry maps a diffusers suffix to the vLLM fused suffix (e.g.
+    ".attn.to_out.0" -> ".attn.to_out").
+    """
+    for old, new in rewrites.items():
+        if name.endswith(old):
+            return name[: -len(old)] + new
+    return name
+
+
 def _prepare_diffusion_quant_config(
     od_config: OmniDiffusionConfig,
     model_class: type[nn.Module],
@@ -350,6 +362,20 @@ def _prepare_diffusion_quant_config(
     if diffusion_packed_modules_mapping is not None:
         model_class.packed_modules_mapping = diffusion_packed_modules_mapping
     configure_quant_config(quant_config, model_class)
+
+    # Some diffusion models use diffusers names in the compressed-tensors ignore
+    # list that differ from the vLLM fused layer names. Qwen-Image's ignore list
+    # uses `.attn.to_out.0` while the vLLM fused layer is `.attn.to_out`.
+    # load_weights already renames `.to_out.0.` -> `.to_out.` for weight loading,
+    # but should_ignore_layer matches against the raw ignore list, so without
+    # this the output projection is not ignored and MLP-only (ignore attn)
+    # compressed-tensors checkpoints run it as FP8 with an uninitialized
+    # weight_scale. Models opt in via the `_ct_ignore_name_rewrites` mapping.
+    rewrites = getattr(model_class, "_ct_ignore_name_rewrites", None)
+    if rewrites:
+        ignore = getattr(quant_config, "ignore", None)
+        if ignore:
+            quant_config.ignore = [_apply_ignore_rewrite(n, rewrites) for n in ignore]
 
 
 def initialize_model(
