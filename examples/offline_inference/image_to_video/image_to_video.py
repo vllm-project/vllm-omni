@@ -29,7 +29,7 @@ Usage:
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 
     # LTX-2.3 image-to-video
-    python image_to_video.py --model dg845/LTX-2.3-Diffusers \
+    python image_to_video.py --model diffusers/LTX-2.3-Diffusers \
         --model-class-name LTX23ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
         --height 384 --width 512 --num-frames 25 --num-inference-steps 20 \
