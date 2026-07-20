@@ -1,6 +1,7 @@
 # MiniCPM-o 4.5
 
-> Online serving for omni multimodal chat (text / image / audio / video → text + 24 kHz speech)
+> Online serving and offline inference for omni multimodal chat
+> (text / image / audio / video → text + 24 kHz speech)
 
 ## Summary
 
@@ -9,7 +10,7 @@
 - Task: Omni multimodal chat — accepts text / image / audio / video input;
   emits text and 24 kHz mono speech in the same response
 - Mode: Online serving via the OpenAI-compatible `/v1/chat/completions`
-  API, plus a bundled Gradio demo (text + speech UI)
+  API (plus Gradio demo), and offline inference via `Omni.generate`
 - Maintainer: [`@tc-mb`](https://github.com/tc-mb) (MiniCPM-V / MiniCPM-o team)
 
 ## When to use this recipe
@@ -37,6 +38,8 @@ shot. The recipe covers the shipped GPU layouts (single / 2 / 3 / 8 GPUs):
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
 - Online example + Gradio demo:
   [`examples/online_serving/minicpmo/`](../../examples/online_serving/minicpmo/)
+- Offline end-to-end example:
+  [`examples/offline_inference/minicpmo/`](../../examples/offline_inference/minicpmo/)
 - Pipeline / talker source:
   [`vllm_omni/model_executor/models/minicpmo_4_5/`](../../vllm_omni/model_executor/models/minicpmo_4_5/)
 - Stage-input processor (thinker → talker bridge):
