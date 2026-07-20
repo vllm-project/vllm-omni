@@ -8,6 +8,7 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_marks
+from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -41,7 +42,34 @@ def _get_server_cases(model: str):
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_server_cases(MODEL), indirect=True)
-def test_text_to_video_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+def test_text_to_image_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+    responses = openai_client.send_images_generations_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "prompt": PROMPT,
+                "negative_prompt": NEGATIVE_PROMPT,
+                "size": "320x192",
+                "n": 1,
+                "response_format": "b64_json",
+                "num_inference_steps": 2,
+                "guidance_scale": 3.0,
+                "flow_shift": 3.0,
+                "seed": 42,
+            }
+        }
+    )
+    response = responses[0]
+    assert response.success, response.error_message
+    payload = response.json_body
+    assert isinstance(payload, dict)
+    assert payload["data"][0]["b64_json"]
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_server", _get_server_cases(MODEL), indirect=True)
+def test_video_generation_modes_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     request_config = {
         "model": omni_server.model,
         "form_data": {
@@ -56,4 +84,9 @@ def test_text_to_video_moe(omni_server: OmniServer, openai_client: OpenAIClientH
             "seed": 42,
         },
     }
+    openai_client.send_video_diffusion_request(request_config)
+
+    synthetic_image = generate_synthetic_image(320, 192, force_regenerate=True, seed=42)
+    request_config["form_data"]["prompt"] = "the red block moves slowly while the camera remains fixed"
+    request_config["image_reference"] = f"data:image/jpeg;base64,{synthetic_image['base64']}"
     openai_client.send_video_diffusion_request(request_config)

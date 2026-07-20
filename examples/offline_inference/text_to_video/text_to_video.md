@@ -55,6 +55,20 @@ python text_to_video.py \
   --output vace_t2v_output.mp4
 ```
 
+### LingBot-Video
+
+The dedicated LingBot example explicitly selects the video output modality:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --output lingbot_t2v.mp4
+```
+
+Use the same command with `robbyant/lingbot-video-moe-30b-a3b` for the MoE
+checkpoint. Frame counts must be `1` or `4n+1`.
+
 ### LTX-2
 
 ```bash

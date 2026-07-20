@@ -43,6 +43,21 @@ This folder provides several entrypoints for experimenting with text-to-image di
 
 Default model: `Qwen/Qwen-Image`
 
+### LingBot-Video
+
+LingBot-Video uses the same checkpoint for image and video generation. Run the
+dedicated minimal T2I example with:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image_lingbot.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --height 192 --width 320 --num-inference-steps 2 \
+  --output lingbot_t2i.png
+```
+
+The example explicitly selects the `image` output modality and requests one
+frame. Passing an input image is not supported in LingBot T2I mode.
+
 ## Quick Start
 
 ### Python API

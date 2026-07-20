@@ -1,0 +1,50 @@
+# LingBot-Video
+
+LingBot-Video uses one `LingBotVideoPipeline` for text-to-image (T2I),
+text-to-video (T2V), and text-image-to-video (TI2V) generation. Both the dense
+and MoE checkpoints use the same request format.
+
+## Start the server
+
+```bash
+MODEL=robbyant/lingbot-video-dense-1.3b bash run_server.sh
+```
+
+The MoE checkpoint can be selected with
+`MODEL=robbyant/lingbot-video-moe-30b-a3b`. It requires substantially more GPU
+memory than the dense checkpoint.
+
+## Text to image
+
+The image endpoint selects T2I mode and always generates one frame:
+
+```bash
+bash run_curl_text_to_image.sh
+```
+
+The script sends a `320x192`, two-step smoke request and writes
+`lingbot_t2i.png`.
+
+## Text or text-image to video
+
+Pass a first-frame image to select TI2V mode:
+
+```bash
+INPUT_IMAGE=/path/to/input.png bash run_curl_text_image_to_video.sh
+```
+
+Remove the `input_reference` form field from the create request to select T2V.
+The example uses the lightweight `320x192`, 9-frame, two-step configuration.
+
+LingBot video frame counts must be `1` or `4n+1`. An explicit `num_frames`
+takes precedence over `seconds`. When only `seconds` is supplied, the server
+converts `seconds * fps` upward to the next valid `4n+1` frame count.
+
+Official `resolution`/`ratio` presets can be sent through `extra_params`, for
+example `{"resolution":"720p","ratio":"16:9"}`. The `2k` and `4k` entries
+only define output dimensions; whether they run successfully depends on the
+checkpoint, GPU memory, and memory optimizations available in the deployment.
+
+LingBot TI2V accepts exactly one image reference. Image editing, video
+references, audio references, batching, and Refiner execution are not supported
+by this pipeline mode.

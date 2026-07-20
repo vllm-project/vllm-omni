@@ -33,6 +33,22 @@ This folder provides a unified CLI script for image-to-video generation using vL
 
 Default model: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`.
 
+### LingBot-Video TI2V
+
+LingBot-Video accepts exactly one first-frame image and uses the same dense or
+MoE checkpoint as its T2I and T2V modes:
+
+```bash
+python examples/offline_inference/image_to_video/image_to_video_lingbot.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --image /path/to/input.png \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --output lingbot_ti2v.mp4
+```
+
+The input image keeps its original geometry until the LingBot pipeline applies
+its model-specific resize and center crop.
+
 ## Prerequisites
 
 Download the example image used in the snippets below:
