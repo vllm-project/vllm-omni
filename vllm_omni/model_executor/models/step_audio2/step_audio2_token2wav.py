@@ -95,6 +95,22 @@ class StepAudio2Token2WavCore(nn.Module):
         self.source_cache_len = STREAM_SOURCE_CACHE_LEN
         self.speech_window: torch.Tensor | None = None  # created lazily on device
 
+        # On Ascend the talker worker never routes through
+        # ``NPUOmniPlatform.set_device``, so gate on ``current_omni_platform``
+        # and apply the Token2Wav NPU patch here (idempotent) before
+        # ``_ensure_models_loaded`` runs. Covers every
+        # construction site (Step-Audio2 wrapper + MiniCPM-o facade): patched
+        # ``_ensure_models_loaded`` offloads HiFT to CPU and patched ``forward``
+        # expands CosyVoice DiT masks + forces MATH SDPA (avoids FA 161001).
+        from vllm_omni.platforms import current_omni_platform
+
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
+                apply_step_audio2_token2wav_npu_patch,
+            )
+
+            apply_step_audio2_token2wav_npu_patch()
+
     def _ensure_models_loaded(self):
         """Lazy load models on first use"""
         if self._models_loaded:
