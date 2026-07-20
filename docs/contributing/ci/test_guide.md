@@ -49,11 +49,11 @@ Failed jobs: 1/2
     cd tests
     pytest -s -v -m "core_model and cpu"
     ```
-    The latest test command is available in the "Simple Unit Test" step of this [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
+    The latest test command is available in the "Simple Unit Test" step of this [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-ready.yml).
 
 === "L2 level"
 
-    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_ready_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_ready_jobs.sh). The script reads [`.buildkite/test-ready.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/ready_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts) for timing and timeout behavior). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_ready_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_ready_jobs.sh). The script reads [`.buildkite/cuda/test-ready.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-ready.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/ready_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts) for timing and timeout behavior). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
     # All L2 and L1 jobs (default: every pytest step in test-ready.yml)
@@ -85,7 +85,7 @@ Failed jobs: 1/2
 
 === "L3 level"
 
-    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh). The script reads [`.buildkite/test-merge.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-merge.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/merge_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts)). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh). The script reads [`.buildkite/cuda/test-merge.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-merge.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/merge_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts)). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
     # All L3 and L1 jobs (default: every pytest step in test-merge.yml)
@@ -117,7 +117,7 @@ Failed jobs: 1/2
 
 === "L4 level"
 
-    **Recommended:** run CI-aligned nightly jobs from the repo root via [`tools/nightly/run_nightly_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/nightly/run_nightly_jobs.sh). The script reads [`.buildkite/test-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml), generates per-step bash wrappers, runs pytest (perf jobs first, then aggregates perf JSON into Excel), and tees logs under `logs/nightly_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts); `generate_nightly_perf_excel` is included in the timing summary). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+    **Recommended:** run CI-aligned nightly jobs from the repo root via [`tools/nightly/run_nightly_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/nightly/run_nightly_jobs.sh). The script reads [`.buildkite/cuda/test-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml), generates per-step bash wrappers, runs pytest (perf jobs first, then aggregates perf JSON into Excel), and tees logs under `logs/nightly_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts); `generate_nightly_perf_excel` is included in the timing summary). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
     # All nightly jobs (default: test-type all, model-type all)
@@ -189,7 +189,7 @@ Failed jobs: 1/2
 
     ```
 
-    The latest L5 CI jobs (reliability + invalid-parameter weekly steps) are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-weekly.yml).
+    The latest L5 CI jobs (reliability + invalid-parameter weekly steps) are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml).
 
 You can find more information about markers in the documentation: [marker doc](./tests_markers.md)
 

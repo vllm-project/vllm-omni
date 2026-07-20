@@ -16,16 +16,16 @@ Usage:
   python3 upload_pipeline.py [--upload] [--all | --e2e] <pipeline.yml>
 
   # Bootstrap (replaces upload_pipeline_with_skip_ci.sh):
-  python3 upload_pipeline.py --upload .buildkite/pipeline.yml
+  python3 upload_pipeline.py --upload .buildkite/cuda/pipeline.yml
 
   # Test pipeline (replaces upload_test_pipeline_with_diff_skip.py):
-  python3 upload_pipeline.py --upload .buildkite/test-merge.yml
+  python3 upload_pipeline.py --upload .buildkite/cuda/test-merge.yml
 
   # Full suite (rebase pipeline): keep all steps, still strip the uploader-only key:
-  python3 upload_pipeline.py --upload --all .buildkite/test-merge.yml
+  python3 upload_pipeline.py --upload --all .buildkite/cuda/test-merge.yml
 
   # Nightly L2 E2E only: keep the E2E Test group, ignore source_file_dependencies:
-  python3 upload_pipeline.py --upload --e2e .buildkite/test-ready.yml
+  python3 upload_pipeline.py --upload --e2e .buildkite/cuda/test-merge.yml
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ except ImportError:
     import yaml
 
 LOG = "upload_pipeline"
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 DOC_SEP = "\n---\n"
 BOOTSTRAP_MARKER = "__IMAGE_BUILD_IF__"
 E2E_GROUP_MARKER = "E2E Test"
@@ -475,7 +475,7 @@ def render_pipeline(
 
     # ``--all`` forces the keep-all-steps path (no diff-aware skipping) while still
     # stripping ``source_file_dependencies``. Used by the rebase pipeline so main builds
-    # run the full e2e suite (see .buildkite/rebase-pipeline.yaml).
+    # run the full e2e suite (see .buildkite/cuda/rebase-pipeline.yml).
     if force_all or e2e_only:
         changed_files = None
 
@@ -509,8 +509,8 @@ def main() -> int:
     parser.add_argument(
         "pipeline",
         nargs="?",
-        default=".buildkite/pipeline.yml",
-        help="Pipeline YAML path (default: .buildkite/pipeline.yml)",
+        default=".buildkite/cuda/pipeline.yml",
+        help="Pipeline YAML path (default: .buildkite/cuda/pipeline.yml)",
     )
     parser.add_argument(
         "--upload",

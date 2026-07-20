@@ -1232,7 +1232,7 @@ stages:
         assert deploy.stages[1].devices == "1"
 
     def test_step_audio2_dispatches_sync_and_async_chunk_processors(self):
-        pipeline = StageConfigFactory.resolve_pipeline_config("step_audio_2")
+        pipeline = resolve_pipeline_config("step_audio_2")
         assert isinstance(pipeline, PipelineConfig)
 
         sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
