@@ -350,22 +350,15 @@ def load_transformer_config(
     """Load an LTX transformer config from a local model or the HF Hub."""
     if local_files_only:
         config_path = os.path.join(model_path, subfolder, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as config_file:
-                return json.load(config_file)
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"LTX transformer config not found: {config_path}")
     else:
-        try:
-            from huggingface_hub import hf_hub_download
-
-            config_path = hf_hub_download(
-                repo_id=model_path,
-                filename=f"{subfolder}/config.json",
-            )
-            with open(config_path) as config_file:
-                return json.load(config_file)
-        except Exception:
-            pass
-    return {}
+        config_path = hf_hub_download(
+            repo_id=model_path,
+            filename=f"{subfolder}/config.json",
+        )
+    with open(config_path) as config_file:
+        return json.load(config_file)
 
 
 def create_transformer_from_config(

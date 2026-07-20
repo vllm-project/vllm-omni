@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class TestLTXOutputRank:
     @pytest.mark.parametrize(
         ("distributed_vae_state", "expected_decode_calls"),
-        [(False, 0), (True, 1), (RuntimeError("unavailable"), 0)],
+        [(False, 0), (True, 1), (RuntimeError("unavailable"), None)],
     )
     def test_non_output_rank_only_enters_collective_vae_decode(
         self,
@@ -46,17 +46,24 @@ class TestLTXOutputRank:
         torch.nn.Module.__init__(pipe)
         pipe.vae = FakeVae()
 
-        output = pipe._decode_output(
-            latents=torch.ones(1, 1),
-            audio_latents=torch.ones(1, 1),
-            output_type="np",
-            connector_prompt_embeds=torch.ones(1, 1),
-            generator=None,
-            device=torch.device("cpu"),
-            decode_timestep=0.0,
-            decode_noise_scale=None,
-            prompt_batch_size=1,
-        )
+        decode_kwargs = {
+            "latents": torch.ones(1, 1),
+            "audio_latents": torch.ones(1, 1),
+            "output_type": "np",
+            "connector_prompt_embeds": torch.ones(1, 1),
+            "generator": None,
+            "device": torch.device("cpu"),
+            "decode_timestep": 0.0,
+            "decode_noise_scale": None,
+            "prompt_batch_size": 1,
+        }
+        if isinstance(distributed_vae_state, Exception):
+            with pytest.raises(RuntimeError, match="unavailable"):
+                pipe._decode_output(**decode_kwargs)
+            assert pipe.vae.decode_calls == 0
+            return
+
+        output = pipe._decode_output(**decode_kwargs)
 
         assert pipe.vae.decode_calls == expected_decode_calls
         assert output.output[0].numel() == 0

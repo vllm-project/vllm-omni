@@ -478,7 +478,6 @@ class LTX2AudioVideoAttnProcessor:
         query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         perturbation_mask: torch.Tensor | None = None,
-        all_perturbed: bool = False,
     ) -> torch.Tensor:
         is_self_attention = encoder_hidden_states is None
         batch_size, sequence_length, _ = hidden_states.shape if is_self_attention else encoder_hidden_states.shape
@@ -506,39 +505,36 @@ class LTX2AudioVideoAttnProcessor:
             is_self_attention=is_self_attention,
         )
 
-        if all_perturbed:
-            hidden_states = value
-        else:
-            query = attn.norm_q(query)
-            key = attn.norm_k(key)
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
 
-            if query_rotary_emb is not None:
-                query_rotary_emb = self._slice_rope_for_tp(query_rotary_emb, attn)
-                if key_rotary_emb is not None:
-                    key_rotary_emb = self._slice_rope_for_tp(key_rotary_emb, attn)
-                if attn.rope_type == "interleaved":
-                    query = apply_interleaved_rotary_emb(query, query_rotary_emb)
-                    key = apply_interleaved_rotary_emb(
-                        key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
-                    )
-                elif attn.rope_type == "split":
-                    query = apply_split_rotary_emb(query, query_rotary_emb, head_dim=attn.head_dim)
-                    key = apply_split_rotary_emb(
-                        key,
-                        key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
-                        head_dim=attn.head_dim,
-                    )
+        if query_rotary_emb is not None:
+            query_rotary_emb = self._slice_rope_for_tp(query_rotary_emb, attn)
+            if key_rotary_emb is not None:
+                key_rotary_emb = self._slice_rope_for_tp(key_rotary_emb, attn)
+            if attn.rope_type == "interleaved":
+                query = apply_interleaved_rotary_emb(query, query_rotary_emb)
+                key = apply_interleaved_rotary_emb(
+                    key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
+                )
+            elif attn.rope_type == "split":
+                query = apply_split_rotary_emb(query, query_rotary_emb, head_dim=attn.head_dim)
+                key = apply_split_rotary_emb(
+                    key,
+                    key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
+                    head_dim=attn.head_dim,
+                )
 
-            query = query.unflatten(2, (attn.heads, attn.head_dim))
-            key = key.unflatten(2, (attn.heads, attn.head_dim))
-            value_heads = value.unflatten(2, (attn.heads, attn.head_dim))
+        query = query.unflatten(2, (attn.heads, attn.head_dim))
+        key = key.unflatten(2, (attn.heads, attn.head_dim))
+        value_heads = value.unflatten(2, (attn.heads, attn.head_dim))
 
-            attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
-            hidden_states = attn.attn(query, key, value_heads, attn_metadata)
-            hidden_states = hidden_states.flatten(2, 3)
-            hidden_states = hidden_states.to(query.dtype)
-            if perturbation_mask is not None:
-                hidden_states = hidden_states * perturbation_mask + value * (1 - perturbation_mask)
+        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        hidden_states = attn.attn(query, key, value_heads, attn_metadata)
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+        if perturbation_mask is not None:
+            hidden_states = hidden_states * perturbation_mask + value * (1 - perturbation_mask)
 
         # LTX-2.3: per-head gated attention
         if attn.to_gate_logits is not None:

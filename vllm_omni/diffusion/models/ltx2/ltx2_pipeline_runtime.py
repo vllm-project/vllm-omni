@@ -21,6 +21,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.platforms import current_omni_platform
 
 from . import ltx2_latents as latent_ops
 from .ltx2_components import LTXComponentProfile, initialize_pipeline_components
@@ -249,9 +250,7 @@ class LTXPipelineRuntime(
         # CUDA async execution otherwise permits numerical drift to accumulate
         # across CFG-parallel denoise steps.
         latents = tuple(tensor.contiguous() for tensor in latents)
-        device = next((tensor.device for tensor in latents if tensor.is_cuda), None)
-        if device is not None:
-            torch.cuda.current_stream(device).synchronize()
+        current_omni_platform.synchronize()
         return latents
 
     def _setup_forward_runtime(
@@ -350,11 +349,8 @@ class LTXPipelineRuntime(
         vae_decode_needs_all_ranks = False
         is_distributed_vae_enabled = getattr(self.vae, "is_distributed_enabled", None)
         if self.distributed_video_decode and dist_initialized and callable(is_distributed_vae_enabled):
-            try:
-                # Distributed tiled decode is collective, so every rank must enter it.
-                vae_decode_needs_all_ranks = bool(is_distributed_vae_enabled())
-            except Exception:
-                pass
+            # Distributed tiled decode is collective, so every rank must enter it.
+            vae_decode_needs_all_ranks = bool(is_distributed_vae_enabled())
 
         should_decode_video = not self.distributed_video_decode or is_output_rank or vae_decode_needs_all_ranks
         if should_decode_video:
@@ -599,7 +595,6 @@ class LTXPipelineRuntime(
         )
         audio_latents = latent_ops.unpack_audio_latents(
             audio_latents,
-            forward_ctx.original_audio_num_frames,
             num_mel_bins=forward_ctx.latent_mel_bins,
         )
         return latents, audio_latents

@@ -111,8 +111,8 @@ def test_unpad_audio_latents_restores_original_frames_before_unpack():
     padded = torch.cat([original, torch.full((1, 2, 4), 999.0)], dim=1)
 
     unpadded = latent_ops.unpad_audio_latents(padded, 10)
-    unpacked = latent_ops.unpack_audio_latents(unpadded, latent_length=10, num_mel_bins=2)
-    expected = latent_ops.unpack_audio_latents(original, latent_length=10, num_mel_bins=2)
+    unpacked = latent_ops.unpack_audio_latents(unpadded, num_mel_bins=2)
+    expected = latent_ops.unpack_audio_latents(original, num_mel_bins=2)
 
     assert unpacked.shape == (1, 2, 10, 2)
     assert not (unpacked == 999.0).any()

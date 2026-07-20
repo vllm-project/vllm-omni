@@ -120,45 +120,14 @@ def create_noised_state(
     return noise_scale * noise + (1 - noise_scale) * latents
 
 
-def pack_audio_latents(
-    latents: torch.Tensor,
-    patch_size: int | None = None,
-    patch_size_t: int | None = None,
-) -> torch.Tensor:
-    if patch_size is not None and patch_size_t is not None:
-        batch_size, _, latent_length, latent_mel_bins = latents.shape
-        post_patch_latent_length = latent_length / patch_size_t
-        post_patch_mel_bins = latent_mel_bins / patch_size
-        latents = latents.reshape(
-            batch_size,
-            -1,
-            post_patch_latent_length,
-            patch_size_t,
-            post_patch_mel_bins,
-            patch_size,
-        )
-        return latents.permute(0, 2, 4, 1, 3, 5).flatten(3, 5).flatten(1, 2)
+def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
     return latents.transpose(1, 2).flatten(2, 3)
 
 
 def unpack_audio_latents(
     latents: torch.Tensor,
-    latent_length: int,
     num_mel_bins: int,
-    patch_size: int | None = None,
-    patch_size_t: int | None = None,
 ) -> torch.Tensor:
-    if patch_size is not None and patch_size_t is not None:
-        batch_size = latents.size(0)
-        latents = latents.reshape(
-            batch_size,
-            latent_length,
-            num_mel_bins,
-            -1,
-            patch_size_t,
-            patch_size,
-        )
-        return latents.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
     return latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
 
 
