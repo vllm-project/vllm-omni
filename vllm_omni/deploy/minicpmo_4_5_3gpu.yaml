@@ -30,7 +30,8 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    # Conservative default; use a validated batching variant before raising.
+    # Talker only consumes runtime_additional_information[0]; any value > 1
+    # makes concurrent requests share request-0's audio (mm_outputs fallback).
     max_num_seqs: 1
     gpu_memory_utilization: 0.75
     enforce_eager: false

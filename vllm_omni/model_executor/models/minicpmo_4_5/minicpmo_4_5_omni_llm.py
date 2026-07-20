@@ -2946,16 +2946,13 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
             if not isinstance(hf_processor, MiniCPMOProcessor):
                 hf_processor = MiniCPMOProcessor(
                     image_processor=hf_processor.image_processor,
-                    feature_extractor=getattr(
-                        hf_processor, "feature_extractor", None
-                    )
+                    feature_extractor=getattr(hf_processor, "feature_extractor", None)
                     or getattr(hf_processor, "audio_processor", None),
                     tokenizer=hf_processor.tokenizer,
                     pool_step=self.get_default_audio_pool_step(),
                 )
                 logger.info(
-                    "Wrapped MiniCPM-o HF processor with vendored MiniCPMOProcessor "
-                    "(pool_step=%s)",
+                    "Wrapped MiniCPM-o HF processor with vendored MiniCPMOProcessor (pool_step=%s)",
                     hf_processor.pool_step,
                 )
         except Exception as e:
@@ -3227,9 +3224,33 @@ class MiniCPMOAudioEmbeddingItems(DictEmbeddingItems):
 
 
 def _minicpmo_field_config(hf_inputs: Mapping[str, torch.Tensor]):
+    audio_features = hf_inputs.get("audio_features")
+    audio_feature_lens = hf_inputs.get("audio_feature_lens")
+    audio_features_cfg = MultiModalFieldConfig.batched("audio")
+
+    if audio_features is not None and audio_feature_lens is not None:
+        num_features = len(audio_features)
+        num_audios = len(audio_feature_lens)
+
+        if num_features > num_audios:
+            chunks_per_audio = [lens.numel() if isinstance(lens, torch.Tensor) else 1 for lens in audio_feature_lens]
+            if sum(chunks_per_audio) != num_features:
+                chunks_per_audio = [
+                    max(int((lens != 0).sum()), 1) if isinstance(lens, torch.Tensor) else 1
+                    for lens in audio_feature_lens
+                ]
+
+            slice_idxs = [0]
+            for num_chunks in chunks_per_audio:
+                slice_idxs.append(slice_idxs[-1] + num_chunks)
+            audio_features_cfg = MultiModalFieldConfig.flat(
+                "audio",
+                [slice(slice_idxs[i], slice_idxs[i + 1]) for i in range(len(chunks_per_audio))],
+            )
+
     return dict(
         **_minicpmv_field_config(hf_inputs),
-        audio_features=MultiModalFieldConfig.batched("audio"),
+        audio_features=audio_features_cfg,
         audio_feature_lens=MultiModalFieldConfig.batched("audio"),
         audio_embeds=MultiModalFieldConfig.batched("audio"),
     )
@@ -3421,11 +3442,17 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 out_keys={"audio_features", "audio_feature_lens"},
             )
 
+            flat_feature_lens: list[int] = []
+            for lens in audio_inputs["audio_feature_lens"]:
+                if isinstance(lens, torch.Tensor):
+                    flat_feature_lens.extend(lens.flatten().tolist())
+                else:
+                    flat_feature_lens.append(int(lens))
             unpadded_audio_features = [
                 feat[:, :feature_len]
                 for feat, feature_len in zip(
                     audio_inputs["audio_features"],
-                    audio_inputs["audio_feature_lens"],
+                    flat_feature_lens,
                 )
             ]
             audio_inputs["audio_features"] = unpadded_audio_features
@@ -4288,15 +4315,11 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             if modality == "images":
                 image_embeddings = self._process_vision_input(multimodal_input)
                 multimodal_embeddings += tuple(image_embeddings)
-                modality_lens.append(
-                    f"image={[e.shape[0] for e in image_embeddings]}"
-                )
+                modality_lens.append(f"image={[e.shape[0] for e in image_embeddings]}")
             if modality == "videos":
                 video_embeddings = self._process_vision_input(multimodal_input)
                 multimodal_embeddings += tuple(video_embeddings)
-                modality_lens.append(
-                    f"video={[e.shape[0] for e in video_embeddings]}"
-                )
+                modality_lens.append(f"video={[e.shape[0] for e in video_embeddings]}")
             if modality == "audios":
                 audio_embeddings = self._process_audio_input(multimodal_input)
                 multimodal_embeddings += tuple(audio_embeddings)

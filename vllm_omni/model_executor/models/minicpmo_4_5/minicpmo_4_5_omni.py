@@ -357,13 +357,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                         waveforms.append(torch.as_tensor(waveform, dtype=torch.float32))
                         valid_waveforms += 1
 
-            logger.info(
-                "MiniCPM-o talker batch complete: requests=%d audio_outputs=%d empty_outputs=%d",
-                len(talker_infos),
-                valid_waveforms,
-                len(talker_infos) - valid_waveforms,
-            )
-
             return OmniOutput(
                 text_hidden_states=dummy_hidden,
                 multimodal_outputs={"model_outputs": waveforms},
