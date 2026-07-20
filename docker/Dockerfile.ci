@@ -45,7 +45,7 @@ RUN uv pip install --system -e ".[dev]"
 # (e.g. +gaeee7ef93.cu130) which pip/uv refuse to install from a PEP 503 package index.
 # The cu130 wheel index lives at /<commit>/cu130/vllm/ but the actual wheel files
 # are stored at the top level /<commit>/<wheel>.
-ENV VLLM_PRECOMPILED_WHEEL_COMMIT=b6ff8a2f509cc7ac9c58176f5115a836aa1e08bd
+ENV VLLM_PRECOMPILED_WHEEL_COMMIT=823eaf667d33125259d2d280b0ed00747fa92440
 # Keep the base image's CUDA-12 toolkit libs on the loader path. NOTE: this does
 # NOT resolve libnvJitLink.so.13 (that CUDA-13 lib is not in /usr/local/cuda here) —
 # the .so.13 JIT linker is handled separately via ldconfig after the cu130 wheels
