@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
@@ -27,6 +30,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-shift", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
+
+
+def _to_pil_image(value: Any) -> Image.Image:
+    if isinstance(value, Image.Image):
+        return value
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().float().numpy()
+    array = np.asarray(value)
+    if array.ndim == 4 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim == 3 and array.shape[0] in (3, 4):
+        array = np.transpose(array, (1, 2, 0))
+    if array.ndim not in (2, 3):
+        raise ValueError(f"Unexpected LingBot image shape {array.shape!r}.")
+    if np.issubdtype(array.dtype, np.floating):
+        array = array * 0.5 + 0.5 if float(array.min()) < 0.0 else array
+        array = np.clip(array, 0.0, 1.0) * 255.0
+    return Image.fromarray(array.astype(np.uint8))
 
 
 def main() -> None:
@@ -62,7 +83,7 @@ def main() -> None:
             raise ValueError("LingBot text-to-image generation returned no image.")
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        outputs[0].images[0].save(output_path)
+        _to_pil_image(outputs[0].images[0]).save(output_path)
         print(f"Saved generated image to {output_path}")
     finally:
         omni.close()

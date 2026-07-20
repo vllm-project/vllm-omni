@@ -265,6 +265,8 @@ def get_lingbot_video_pre_process_func(od_config: OmniDiffusionConfig):
         normalized_multi_modal_data = dict(multi_modal_data)
         normalized_multi_modal_data["image"] = images if multiple else images[0]
         normalized_prompt["multi_modal_data"] = normalized_multi_modal_data
+        if request.is_dummy_run() and "modalities" not in normalized_prompt:
+            normalized_prompt["modalities"] = ["video"]
         request.prompt = normalized_prompt
         return request
 

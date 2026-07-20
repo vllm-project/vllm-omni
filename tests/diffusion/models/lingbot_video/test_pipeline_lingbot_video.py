@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from torch import nn
 
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -86,12 +86,14 @@ def test_preprocess_preserves_geometry_and_converts_rgb(tmp_path):
 
     image_path = tmp_path / "reference.png"
     Image.new("L", (48, 32), color=127).save(image_path)
-    request = SimpleNamespace(
+    request = OmniDiffusionRequest(
         prompt={
             "prompt": "a robot walks",
             "modalities": ["video"],
             "multi_modal_data": {"image": str(image_path)},
-        }
+        },
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_id="lingbot-preprocess-test",
     )
 
     result = get_lingbot_video_pre_process_func(SimpleNamespace())(request)
@@ -99,6 +101,25 @@ def test_preprocess_preserves_geometry_and_converts_rgb(tmp_path):
     image = result.prompt["multi_modal_data"]["image"]
     assert image.mode == "RGB"
     assert image.size == (48, 32)
+
+
+def test_preprocess_marks_internal_image_warmup_as_video():
+    from vllm_omni.diffusion.models.lingbot_video import (
+        get_lingbot_video_pre_process_func,
+    )
+
+    request = OmniDiffusionRequest(
+        prompt={
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": Image.new("RGB", (32, 32))},
+        },
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_id=DUMMY_DIFFUSION_REQUEST_ID,
+    )
+
+    result = get_lingbot_video_pre_process_func(SimpleNamespace())(request)
+
+    assert result.prompt["modalities"] == ["video"]
 
 
 def test_check_inputs_accepts_t2v_shapes_and_rejects_invalid_values():
