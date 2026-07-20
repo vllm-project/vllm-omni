@@ -12,8 +12,10 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
 )
 from vllm_omni.platforms import current_omni_platform
 
+from tests.helpers.mark import hardware_test
+
 # CPU unit tests are marked core_model + cpu. The multi-GPU correctness test at
-# the end of the file carries full_model / diffusion / parallel / distributed_cuda.
+# the end uses hardware_test (H100 x2) plus full_model / diffusion / parallel.
 
 
 @pytest.mark.core_model
@@ -330,7 +332,7 @@ def test_tile_mode_disables_spatial_shard_decode():
 
 
 # =============================================================================
-# Multi-GPU numerical-correctness test (nightly / full_model, distributed CUDA)
+# Multi-GPU numerical-correctness test (nightly Diffusion Test group, H100 x2)
 #
 # Spawns a small process group and verifies that spatial_shard_height/spatial_shard_width decode match
 # a single-process (non-distributed) reference decode of the same latent within
@@ -415,11 +417,7 @@ def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@pytest.mark.distributed_cuda
-@pytest.mark.skipif(
-    current_omni_platform.get_device_count() < _SPATIAL_SHARD_WORLD_SIZE,
-    reason="Requires >= 2 accelerator devices",
-)
+@hardware_test(res={"cuda": "H100"}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
 @pytest.mark.parametrize("split_dim", ["height", "width"])
 def test_spatial_shard_decode_matches_reference(split_dim: str):
     manager = mp.get_context("spawn").Manager()
