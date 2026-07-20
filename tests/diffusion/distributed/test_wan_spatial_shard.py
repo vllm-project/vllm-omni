@@ -15,6 +15,7 @@ from vllm_omni.platforms import current_omni_platform
 # CPU unit tests are marked core_model + cpu. The multi-GPU correctness test at
 # the end of the file carries full_model / diffusion / parallel / distributed_cuda.
 
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_split_for_parallel_decode_pads_uneven_height():
