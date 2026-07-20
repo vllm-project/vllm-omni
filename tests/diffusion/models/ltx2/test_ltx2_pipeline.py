@@ -17,7 +17,9 @@ from vllm_omni.diffusion.models.ltx2 import ltx2_components
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_COMPONENT_PROFILE,
     LTX2_DISTILLED_COMPONENT_PROFILE,
+    LTX2_TWO_STAGE_COMPONENT_PROFILE,
     LTX23_COMPONENT_PROFILE,
+    LTX23_TWO_STAGE_COMPONENT_PROFILE,
     _install_connector_attention,
     detect_ltx_model_version,
 )
@@ -40,7 +42,9 @@ from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX2_DISTILLED_TWO_STAGE_RECIPE,
     LTX2_ONE_STAGE_RECIPE,
+    LTX2_TWO_STAGE_RECIPE,
     LTX23_ONE_STAGE_RECIPE,
+    LTX23_TWO_STAGE_RECIPE,
     LTX_DEFAULT_NEGATIVE_PROMPT,
     LTX_POSITIVE_ONLY_RECIPE,
 )
@@ -51,7 +55,10 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2Pipeline,
     LTX2T2VDMD2Pipeline,
 )
-from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import LTX2DistilledPipeline
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
+    LTX2DistilledPipeline,
+    LTX2TwoStagePipeline,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -104,9 +111,12 @@ def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
     )
 
     assert issubclass(LTX2Pipeline, LTXRuntime)
+    assert issubclass(LTX2TwoStagePipeline, LTXRuntime)
     assert issubclass(LTX2DistilledPipeline, LTXRuntime)
     assert LTX2Pipeline.component_profile is LTX2_COMPONENT_PROFILE
     assert LTX2Pipeline.pipeline_recipe is LTX2_ONE_STAGE_RECIPE
+    assert LTX2TwoStagePipeline.component_profile is LTX2_TWO_STAGE_COMPONENT_PROFILE
+    assert LTX2TwoStagePipeline.pipeline_recipe is LTX2_TWO_STAGE_RECIPE
     assert LTX2DistilledPipeline.component_profile is LTX2_DISTILLED_COMPONENT_PROFILE
     assert LTX2_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
     assert LTX23_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
@@ -144,11 +154,46 @@ def test_ltx23_checkpoint_selects_version_specific_one_stage_profile(tmp_path, m
     assert pipe.reports_stage_durations
 
 
+def test_ltx23_checkpoint_selects_version_specific_two_stage_profiles(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"vocoder": ["ltx2", "LTX2VocoderWithBWE"]}))
+
+    def stub_components(pipe, od_config):
+        pipe.od_config = od_config
+        pipe.vae_spatial_compression_ratio = 32
+
+    monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
+    monkeypatch.setattr(LTXRuntime, "setup_diffusion_pipeline_profiler", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage.resolve_ltx_artifact",
+        lambda *_args: "/tmp/adapter.safetensors",
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage.LTXResidentLoRAController",
+        lambda *_args: SimpleNamespace(),
+    )
+
+    pipe = LTX2TwoStagePipeline(
+        od_config=SimpleNamespace(
+            model=str(tmp_path),
+            enable_diffusion_pipeline_profiler=False,
+            lora_path=None,
+        )
+    )
+
+    assert pipe.model_version == "2.3"
+    assert pipe.component_profile is LTX23_TWO_STAGE_COMPONENT_PROFILE
+    assert pipe.pipeline_recipe is LTX23_TWO_STAGE_RECIPE
+
+
 def test_ltx_one_stage_entry_exposes_batch_image_and_distributed_decode_contracts():
     assert LTX2Pipeline.supports_request_batch
     assert LTX2Pipeline.support_image_input
     assert LTX2Pipeline.unified_text_image_entry
     assert LTX2Pipeline.distributed_video_decode
+    assert not LTX2TwoStagePipeline.supports_request_batch
+    assert not LTX2TwoStagePipeline.support_image_input
     assert not LTX2DistilledPipeline.supports_request_batch
     assert LTX2DistilledPipeline.support_image_input
     assert LTX2DistilledPipeline.unified_text_image_entry
@@ -1477,6 +1522,11 @@ class TestRegistryIntegration:
         from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
 
         assert _DIFFUSION_MODELS["LTX2Pipeline"] == ("ltx2", "pipeline_ltx2", "LTX2Pipeline")
+        assert _DIFFUSION_MODELS["LTX2TwoStagePipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_two_stage",
+            "LTX2TwoStagePipeline",
+        )
         assert _DIFFUSION_MODELS["LTX2DistilledPipeline"] == (
             "ltx2",
             "pipeline_ltx2_two_stage",
@@ -1488,6 +1538,9 @@ class TestRegistryIntegration:
             "LTX23ImageToVideoPipeline",
             "LTX2TwoStagesPipeline",
             "LTX2ImageToVideoTwoStagesPipeline",
+            "LTX2ImageToVideoTwoStagePipeline",
+            "LTX23TwoStagePipeline",
+            "LTX23ImageToVideoTwoStagePipeline",
         }
         assert removed_entries.isdisjoint(_DIFFUSION_MODELS)
 
@@ -1497,6 +1550,7 @@ class TestRegistryIntegration:
 
         expected = [
             "LTX2Pipeline",
+            "LTX2TwoStagePipeline",
             "LTX2DistilledPipeline",
             "LTX2T2VDMD2Pipeline",
             "LTX2I2VDMD2Pipeline",
@@ -1509,6 +1563,7 @@ class TestRegistryIntegration:
         "model_class_name",
         [
             "LTX2Pipeline",
+            "LTX2TwoStagePipeline",
             "LTX2DistilledPipeline",
             "LTX2T2VDMD2Pipeline",
             "LTX2I2VDMD2Pipeline",

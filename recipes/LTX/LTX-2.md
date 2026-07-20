@@ -7,8 +7,10 @@
 | Model | Checkpoint | Task | `--model-class-name` | Batching |
 |---|---|---|---|---|
 | LTX-2 | `Lightricks/LTX-2` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
+| LTX-2 | `Lightricks/LTX-2` | Ordinary two-stage T2V | `LTX2TwoStagePipeline` | No |
 | LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage T2V/I2V | `LTX2DistilledPipeline` | No |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
+| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | Ordinary two-stage T2V | `LTX2TwoStagePipeline` | No |
 
 `LTX2Pipeline` is the unified one-stage entry. Checkpoint metadata selects the
 LTX-2 or LTX-2.3 profile; omitting an image selects T2V, while one initial
@@ -20,6 +22,18 @@ the raw `Lightricks/LTX-2.3` safetensors repository is not directly loadable.
 or provide one initial image for I2V. As in the official LTX pipelines,
 distilled mode is selected explicitly rather than inferred from the checkpoint
 name or metadata; always pass `--model-class-name LTX2DistilledPipeline`.
+
+`LTX2TwoStagePipeline` runs the regular checkpoint at half resolution, then
+upsamples and refines with the matching distilled LoRA. It needs these sidecar
+files from `Lightricks/LTX-2` or `Lightricks/LTX-2.3` respectively:
+
+| Model | Distilled LoRA | Spatial upsampler |
+|---|---|---|
+| LTX-2 | `ltx-2-19b-distilled-lora-384.safetensors` | `ltx-2-spatial-upscaler-x2-1.0.safetensors` |
+| LTX-2.3 | `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` |
+
+The runtime searches the model root, `VLLM_OMNI_LTX_ARTIFACTS_DIR`, then the
+matching Lightricks Hub repository.
 
 ## API Migration
 
@@ -83,6 +97,11 @@ divisible by 64. Both one- and two-stage requests require `num_frames = 8k+1`.
 The distilled recipe fixes both sigma schedules; `num_inference_steps` must be
 `8` when supplied.
 
+Ordinary two-stage defaults to a `1536 × 1024` final output. Stage 1 uses the
+selected one-stage recipe at half resolution; Stage 2 uses the fixed
+three-step positive-only schedule. All two-stage pipelines reject custom sigma
+schedules and request-provided video/audio latents.
+
 ## Serving
 
 Start either checkpoint:
@@ -102,8 +121,18 @@ vllm serve rootonchair/LTX-2-19b-distilled --omni \
   --model-class-name LTX2DistilledPipeline --stage-init-timeout 600
 ```
 
-The same server handles T2V and I2V. A T2V request using the selected recipe's
-default guidance is:
+Start an ordinary two-stage pipeline and optionally point it at predownloaded
+sidecars:
+
+```bash
+VLLM_OMNI_LTX_ARTIFACTS_DIR=/data/models/LTX-2.3-sidecars \
+vllm serve diffusers/LTX-2.3-Diffusers --omni \
+  --model-class-name LTX2TwoStagePipeline --stage-init-timeout 600
+```
+
+The one-stage and distilled entries handle both T2V and I2V; ordinary
+two-stage currently exposes T2V only. A T2V request using the selected
+recipe's default guidance is:
 
 ```bash
 curl -X POST http://localhost:8000/v1/videos/sync \
@@ -116,7 +145,7 @@ curl -X POST http://localhost:8000/v1/videos/sync \
   -o ltx_t2v.mp4
 ```
 
-For I2V, provide exactly one initial image:
+For I2V on the one-stage or distilled entry, provide exactly one initial image:
 
 ```bash
 curl -X POST http://localhost:8000/v1/videos/sync \
@@ -135,8 +164,9 @@ together with `input_reference`.
 
 ## Guidance
 
-LTX supports independent video/audio CFG, spatio-temporal guidance (STG),
-cross-modality guidance, and rescaling:
+One-stage and ordinary two-stage Stage 1 support independent video/audio CFG,
+spatio-temporal guidance (STG), cross-modality guidance, and rescaling. Both
+distilled stages and ordinary Stage 2 use fixed positive-only guidance.
 
 | Parameter | Default | Effect | Alias |
 |---|---:|---|---|
@@ -239,17 +269,17 @@ noted below.
 | Argument | Type/default | Meaning and constraints |
 |---|---|---|
 | `req` | `DiffusionRequestBatch`, required | Only positional argument; contains prompts and per-request sampling parameters. |
-| `image` | image or batch, `None` | Direct value wins over request images; no image selects T2V. I2V accepts one image per prompt, and a batch cannot mix T2V/I2V. |
+| `image` | image or batch, `None` | One-stage and distilled only. Direct value wins over request images; no image selects T2V. I2V accepts one image per prompt, and a batch cannot mix T2V/I2V. |
 | `prompt` | string or list, `None` | Positive-text fallback; request prompts win. Mutually exclusive with `prompt_embeds`. |
 | `negative_prompt` | string or list, `None` | Fallback after request values and before the recipe default; mutually exclusive with negative embeddings. |
-| `height` | `int`, `None` | Request → direct value → recipe default; divisible by 32 one-stage or 64 distilled. |
+| `height` | `int`, `None` | Request → direct value → recipe default; divisible by 32 one-stage or 64 two-stage. |
 | `width` | `int`, `None` | Same precedence and alignment as `height`. |
 | `num_frames` | `int`, `None` | Request → direct value → recipe default; must be `8k+1` and also determines audio duration with `frame_rate`. |
 | `frame_rate` | `float`, `None` | Request `frame_rate` → request `fps` → direct value → recipe default. |
-| `num_inference_steps` | `int`, `None` | Request → direct value → recipe default; minimum 2 one-stage, fixed at 8 for distilled Stage 1. Custom one-stage `sigmas` determine actual steps. |
+| `num_inference_steps` | `int`, `None` | Request → direct value → recipe default; controls one-stage or ordinary Stage 1, and is fixed at 8 for distilled Stage 1. Custom one-stage `sigmas` determine actual steps. |
 | `sigmas` | list of float, `None` | One-stage only. Request values win; every request in a fused batch must use the same schedule. |
 | `timesteps` | list of int, `None` | Compatibility slot; LTX accepts only `None`. Use `sigmas`. |
-| `guidance_scale` | `float`, `None` | One-stage common video/audio CFG fallback; an explicit request value wins. Distilled two-stage uses fixed positive-only guidance. |
+| `guidance_scale` | `float`, `None` | One-stage and ordinary Stage 1 common video/audio CFG fallback; distilled two-stage uses fixed positive-only guidance. |
 | `guidance_rescale` | `float`, `None` | Accepts only `None` or `0.0`; use the modality rescale fields. |
 | `noise_scale` | `float`, `0.0` | Compatibility slot; LTX accepts only `0.0`. |
 | `num_videos_per_prompt` | `int`, `1` | Output-count fallback; positive request `num_outputs_per_prompt` wins. |
@@ -273,13 +303,13 @@ request prompt payload; LTX guidance fields live in sampling `extra_args`.
 
 ### Recipe-Specific Request Capabilities
 
-| Override | One-stage | Distilled two-stage |
-|---|---|---|
-| Guidance | Supported | Fixed positive-only |
-| Negative prompt/embeddings | Supported | Rejected |
-| `num_inference_steps` | Supported | Fixed at 8 for Stage 1; Stage 2 uses 3 |
-| Custom `sigmas` | Supported | Rejected; both phases use fixed schedules |
-| Video/audio latents | Supported | Rejected |
+| Override | One-stage | Ordinary two-stage | Distilled two-stage |
+|---|---|---|---|
+| Guidance | Supported | Stage 1 only; Stage 2 is positive-only | Fixed positive-only |
+| Negative prompt/embeddings | Supported | Supported by Stage 1 | Rejected |
+| `num_inference_steps` | Supported | Controls Stage 1; Stage 2 uses 3 | Fixed at 8 for Stage 1; Stage 2 uses 3 |
+| Custom `sigmas` | Supported | Rejected | Rejected; both phases use fixed schedules |
+| Video/audio latents | Supported | Rejected | Rejected |
 
 These capability checks apply equally to direct `forward` keywords and
 values in `OmniDiffusionSamplingParams`; unsupported values fail instead of
@@ -323,8 +353,8 @@ bundled offline CLI do not currently expose `sigmas`.
   request parameter.
 - For benchmarks, use `tests/dfx/perf/tests/test_ltx2_vllm_omni.json` with
   `tests/dfx/perf/scripts/run_diffusion_benchmark.py`.
-- Current two-stage support is limited to the distilled checkpoint; official
-  LTX two-stage/HQ execution remains out of scope.
+- Ordinary two-stage keeps a base DiT and a second DiT with the Stage 2 LoRA
+  merged; account for two Transformer copies when sizing GPU or host offload.
 
 ## References
 
