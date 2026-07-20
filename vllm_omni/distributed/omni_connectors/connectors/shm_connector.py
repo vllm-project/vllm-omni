@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import warnings
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -25,6 +26,13 @@ class SharedMemoryConnector(OmniConnectorBase):
     """
 
     def __init__(self, config: dict[str, Any]):
+        if "shm_threshold_bytes" in config:
+            warnings.warn(
+                "SharedMemoryConnector.extra.shm_threshold_bytes is deprecated and ignored; "
+                "all payloads are stored in shared memory.",
+                FutureWarning,
+                stacklevel=2,
+            )
         self.stage_id = config.get("stage_id", -1)
         self._pending_keys: set[str] = set()
         self._metrics = {
@@ -63,22 +71,26 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
-    def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
-        obj = None
+    def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
+        deserialized = False
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
-            return obj, int(shm_handle.get("size", 0))
+            result = (obj, int(shm_handle.get("size", 0)))
+            deserialized = True
+            return result
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
-            # If data has been received, delete lock_file.
-            if obj and os.path.exists(lock_file):
-                os.remove(lock_file)
+            if deserialized:
+                try:
+                    os.remove(lock_file)
+                except FileNotFoundError:
+                    pass
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
@@ -121,29 +133,18 @@ class SharedMemoryConnector(OmniConnectorBase):
             if isinstance(metadata, dict) and get_key in metadata:
                 metadata = metadata.get(get_key)
 
-            if not isinstance(metadata, dict):
-                result = self._get_by_key(get_key)
-                if result is not None:
-                    self._metrics["gets"] += 1
-                return result
-
-            if "shm" in metadata:
+            if isinstance(metadata, dict) and "shm" in metadata:
                 shm_handle = metadata["shm"]
                 lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
                 result = self._get_data_with_lock(lock_file, shm_handle)
                 if result is not None:
-                    self._metrics["gets"] += 1
                     self._pending_keys.discard(get_key)
-                return result
-
-            # Metadata is a dict but has no SHM-specific handle (e.g. RDMA-
-            # style source_host/source_port).  Fall back to key-based read.
+            else:
+                # Missing or non-SHM metadata falls back to key-based lookup.
+                result = self._get_by_key(get_key)
+        else:
             result = self._get_by_key(get_key)
-            if result is not None:
-                self._metrics["gets"] += 1
-            return result
 
-        result = self._get_by_key(get_key)
         if result is not None:
             self._metrics["gets"] += 1
         return result

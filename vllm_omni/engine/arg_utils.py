@@ -423,7 +423,8 @@ class OrchestratorArgs:
     init_timeout: int = 600
 
     # === Cross-stage Communication ===
-    shm_threshold_bytes: int = 65536
+    # Deprecated compatibility flag; SharedMemoryConnector always uses SHM.
+    shm_threshold_bytes: int | None = None
     batch_timeout: int = 10
 
     # === Cluster / Backend ===

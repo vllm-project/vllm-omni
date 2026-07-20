@@ -30,6 +30,9 @@ except ImportError:
 # Stale buffer TTL: buffers older than this are automatically reclaimed
 # to prevent memory leaks when receiver crashes or gives up.
 _BUFFER_TTL_SECONDS = 300  # 5 minutes
+_BASE_TRANSFER_TIMEOUT_MS = 30_000
+_TRANSFER_TIMEOUT_STEP_BYTES = 100 * 1024 * 1024
+_TRANSFER_TIMEOUT_PER_STEP_MS = 5_000
 
 # ZMQ Message constants
 TRANS_DONE = b"trans_done"
@@ -687,18 +690,30 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 dst_ptr=dst_ptr,
                 data_size=data_size,
             )
-            _t3 = _time_mod.perf_counter()
-            rdma_ms = (_t3 - _t2) * 1000
-            if resp != TRANS_DONE:
-                self._metrics["errors"] += 1
-                logger.error(f"RDMA Get failed: received {resp} instead of TRANS_DONE")
-                recv_buffer.release()
-                return None
+        except zmq.Again as e:
+            self._metrics["timeouts"] += 1
+            logger.error(f"RDMA Get timed out: {e}", exc_info=True)
+            recv_buffer.release()
+            return None
+        except Exception as e:
+            self._metrics["errors"] += 1
+            logger.error(f"RDMA transfer request failed: {e}", exc_info=True)
+            recv_buffer.release()
+            return None
 
+        _t3 = _time_mod.perf_counter()
+        rdma_ms = (_t3 - _t2) * 1000
+        if resp != TRANS_DONE:
+            self._metrics["errors"] += 1
+            logger.error(f"RDMA Get failed: received {resp} instead of TRANS_DONE")
+            recv_buffer.release()
+            return None
+
+        try:
             sync_ms = self._sync_receive_buffer_if_needed()
         except Exception as e:
-            self._metrics["timeouts"] += 1
-            logger.error(f"RDMA Get error: {e}", exc_info=True)
+            self._metrics["errors"] += 1
+            logger.error(f"Failed to synchronize Mooncake receive buffer: {e}", exc_info=True)
             recv_buffer.release()
             return None
 
@@ -779,9 +794,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         )
 
         # Timeout scales with data size: base 30s + 5s per 100MB.
-        base_timeout_ms = 30000
-        size_timeout_ms = max(0, (data_size // (100 * 1024 * 1024))) * 5000
-        total_timeout_ms = base_timeout_ms + size_timeout_ms
+        size_timeout_ms = (data_size // _TRANSFER_TIMEOUT_STEP_BYTES) * _TRANSFER_TIMEOUT_PER_STEP_MS
+        total_timeout_ms = _BASE_TRANSFER_TIMEOUT_MS + size_timeout_ms
         zmq_addr = f"tcp://{source_host}:{source_port}"
         req_socket = self._get_req_socket(zmq_addr, timeout_ms=total_timeout_ms)
         try:

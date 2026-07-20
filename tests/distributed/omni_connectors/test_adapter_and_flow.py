@@ -145,8 +145,7 @@ def test_shm_connector_flow(mocker: MockerFixture):
     Using real SharedMemoryConnector and key-addressed SHM metadata.
     """
     # 1. Setup Connector
-    config = {"shm_threshold_bytes": 1024}
-    connector = SharedMemoryConnector(config)
+    connector = SharedMemoryConnector({})
     connectors_map = {("0", "1"): connector}
 
     # 2. Setup Data

@@ -8,9 +8,8 @@ auto-configured when no explicit connector is specified for an edge.
 ## How It Works
 
 All payloads are serialized and stored in shared memory (`/dev/shm`); the SHM
-segment name is returned in metadata. The configuration exposes a
-`shm_threshold_bytes` field for a future inline-vs-SHM split, but the current
-implementation always uses shared memory regardless of payload size.
+segment name is returned in metadata. The deprecated `shm_threshold_bytes`
+setting is ignored.
 
 ## Configuration
 
@@ -19,8 +18,6 @@ runtime:
   connectors:
     connector_of_shared_memory:
       name: SharedMemoryConnector
-      extra:
-        shm_threshold_bytes: 65536
 ```
 
 ## Notes
@@ -166,27 +163,11 @@ This path is mainly for older code paths and is not the preferred mode for the c
 
 ### 6. Key Implementation Characteristics
 
-#### 6.1 Threshold Exists, but the Current Code Always Uses SHM
+#### 6.1 All Payloads Use Shared Memory
 
-The class keeps a `shm_threshold_bytes` field and still exposes metrics for inline writes. However, the current implementation uses:
-
-```python
-if True:
-    ...
-```
-
-inside `put()`, which means the current code path always writes to shared memory.
-
-So the design still suggests a future split between:
-
-- small payloads inline
-- large payloads in shared memory
-
-but the current behavior is effectively:
-
-- all payloads go through shared memory
-
-This should be documented because it affects real runtime behavior.
+`put()` writes every serialized payload to shared memory. The former
+`shm_threshold_bytes` option is deprecated and ignored because the connector
+no longer has an inline-payload path.
 
 #### 6.2 Cleanup Is Currently Passive
 

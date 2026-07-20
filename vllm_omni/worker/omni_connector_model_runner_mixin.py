@@ -35,6 +35,7 @@ from vllm_omni.worker.payload_span import (
 _EMBED_SPAN_GROUPS: tuple[tuple[str, str, str], ...] = (("decode", "decode_token_start", "decode_token_end"),)
 
 if TYPE_CHECKING:
+    from vllm_omni.config.model import OmniModelConfig
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
@@ -86,9 +87,8 @@ class OmniConnectorModelRunnerMixin:
 
     def init_omni_connectors(
         self,
-        model_config: Any,
+        model_config: OmniModelConfig,
         kv_transfer_manager: OmniKVTransferManager | None = None,
-        **_ignored_kwargs: Any,
     ) -> None:
         """Initialize connectors and background threads.
 

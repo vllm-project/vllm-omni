@@ -60,7 +60,7 @@ def test_ndarray_serialization():
 
 def test_create_shm_connector():
     """Test creating SharedMemoryConnector via Factory."""
-    spec = ConnectorSpec(name="SharedMemoryConnector", extra={"shm_threshold_bytes": 1024})
+    spec = ConnectorSpec(name="SharedMemoryConnector")
     connector = OmniConnectorFactory.create_connector(spec)
     assert isinstance(connector, SharedMemoryConnector)
 
@@ -74,7 +74,7 @@ def test_create_unknown_connector():
 
 @pytest.fixture
 def shm_connector():
-    connector = SharedMemoryConnector({"shm_threshold_bytes": 100})
+    connector = SharedMemoryConnector({})
     yield connector
     connector.close()
 
@@ -193,3 +193,42 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         assert connector.get_connection_info()["host"] == "10.20.30.40"
     finally:
         connector.close()
+
+
+def test_mooncake_get_counts_zmq_timeout_separately(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
+    connector._closed = False
+    connector._metrics = {"errors": 0, "timeouts": 0}
+    connector._resolve_metadata = mocker.Mock(
+        return_value={"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
+    )
+    recv_buffer = mocker.Mock()
+    connector._alloc_recv_buffer = mocker.Mock(return_value=(recv_buffer, 1000))
+    connector._request_transfer = mocker.Mock(side_effect=mooncake_module.zmq.Again())
+
+    assert connector.get("s0", "s1", "req") is None
+    assert connector._metrics == {"errors": 0, "timeouts": 1}
+    recv_buffer.release.assert_called_once()
+    connector._closed = True
+
+
+def test_mooncake_get_counts_cuda_sync_failure_as_error(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
+    connector._closed = False
+    connector._metrics = {"errors": 0, "timeouts": 0}
+    connector._resolve_metadata = mocker.Mock(
+        return_value={"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
+    )
+    recv_buffer = mocker.Mock()
+    connector._alloc_recv_buffer = mocker.Mock(return_value=(recv_buffer, 1000))
+    connector._request_transfer = mocker.Mock(return_value=mooncake_module.TRANS_DONE)
+    connector._sync_receive_buffer_if_needed = mocker.Mock(side_effect=RuntimeError("CUDA sync failed"))
+
+    assert connector.get("s0", "s1", "req") is None
+    assert connector._metrics == {"errors": 1, "timeouts": 0}
+    recv_buffer.release.assert_called_once()
+    connector._closed = True

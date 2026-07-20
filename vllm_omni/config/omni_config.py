@@ -11,6 +11,7 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -821,8 +822,17 @@ class VllmOmniOrchestratorConfig:
     omni_dp_size_local: int = Field(default=1, ge=1)
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = Field(default=30.0, gt=0.0)
-    shm_threshold_bytes: int = Field(default=65536, ge=0)
+    shm_threshold_bytes: int | None = Field(default=None, ge=0)
     batch_timeout: int = Field(default=10, ge=0)
+
+    def __post_init__(self) -> None:
+        if self.shm_threshold_bytes is not None:
+            warnings.warn(
+                "shm_threshold_bytes is deprecated and ignored; SharedMemoryConnector "
+                "always stores payloads in shared memory.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
