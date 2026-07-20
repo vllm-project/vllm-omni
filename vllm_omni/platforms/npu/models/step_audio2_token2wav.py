@@ -4,9 +4,8 @@
 
 Ascend-specific workarounds that must not live in the shared GPU model file:
 
-1. HiFT vocoder CPU offload — STFT/ISTFT and sine-source generation are
-   unstable on Ascend (aicore 507015). HiFT is tiny, so running it on CPU
-   is acceptable; inputs/outputs are moved transparently.
+1. HiFT sine-source downsample — replace the failing 480x ``linear1d``
+   downsample with its exact midpoint form while keeping HiFT on NPU.
 2. CosyVoice2 DiT SDPA — force MATH backend (+ DiT attn mask expand) to
    avoid fused FA rejecting CosyVoice ``(B,1,1,S)`` masks (error 161001).
 """
@@ -17,7 +16,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from types import MethodType
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -28,52 +29,63 @@ _original_forward = None
 _original_stream_chunk_for = None
 
 
-def patch_hift_module_for_npu(hift: torch.nn.Module) -> None:
-    """Run the entire HiFT vocoder on CPU when on Ascend NPU.
+def _linear_downsample_even_scale(x: torch.Tensor, scale: int) -> torch.Tensor:
+    """Match ``F.interpolate(..., mode="linear")`` for an even integer scale.
 
-    HiFT is tiny, so keeping it on NPU yields negligible speedup while
-    several of its operators are unstable on Ascend and trigger aicore
-    exceptions (runtime error 507015): the STFT/ISTFT as well as the
-    sine-source generation (``f0_upsamp`` + ``m_source`` cumsum/sin over
-    the full waveform length). Running the whole module on CPU sidesteps
-    all of them. Inputs are copied to CPU and outputs are moved back to
-    the original device transparently, so callers stay unchanged.
+    With ``align_corners=False``, every output location for an even integer
+    downsample lies exactly halfway between two source samples. Selecting and
+    averaging those samples avoids Ascend/pytorch#150's ``linear1d`` kernel.
     """
-    if getattr(hift, "_npu_cpu_offload_patched", False):
+    if scale <= 0 or scale % 2:
+        raise ValueError(f"scale must be a positive even integer, got {scale}")
+    if x.shape[-1] % scale:
+        raise ValueError(f"input length {x.shape[-1]} must be divisible by scale {scale}")
+
+    left = scale // 2 - 1
+    right = scale // 2
+    return (x[..., left::scale] + x[..., right::scale]) * 0.5
+
+
+def _f02sine_on_npu(self, f0_values: torch.Tensor) -> torch.Tensor:
+    """HiFT ``SineGen2._f02sine`` with a safe NPU linear downsample."""
+    original_f02sine = self._npu_original_f02sine
+    scale = int(self.upsample_scale)
+    if self.flag_for_pulse or scale != self.upsample_scale or scale % 2 or f0_values.shape[1] % scale:
+        return original_f02sine(f0_values)
+
+    rad_values = (f0_values / self.sampling_rate) % 1
+    rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
+    rand_ini[:, 0] = 0
+    rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
+
+    rad_values = _linear_downsample_even_scale(rad_values.transpose(1, 2), scale).transpose(1, 2)
+    phase = torch.cumsum(rad_values, dim=1) * 2 * np.pi
+    phase = F.interpolate(
+        phase.transpose(1, 2) * self.upsample_scale,
+        scale_factor=self.upsample_scale,
+        mode="linear",
+    ).transpose(1, 2)
+    return torch.sin(phase)
+
+
+def patch_hift_module_for_npu(hift: torch.nn.Module) -> None:
+    """Keep HiFT on NPU and patch its failing linear downsample.
+
+    HiFT uses ``SineGen2._f02sine`` to reduce a full-rate phase tensor by
+    ``1 / 480`` before restoring it to the waveform rate. Ascend's
+    ``upsample_linear1d`` kernel can raise an AIVector UB-address exception
+    (ACL 507015) for that reduction. The equivalent midpoint form avoids the
+    failing kernel; the remaining HiFT forward, including STFT/ISTFT, stays on
+    NPU and does not require per-chunk host transfers.
+    """
+    if getattr(hift, "_npu_linear_downsample_patched", False):
         return
 
-    hift.to("cpu")
-    original_forward = hift.forward
-
-    def _forward_on_cpu(_module, *args, **kwargs):
-        output_device: torch.device | None = None
-
-        def to_cpu(value):
-            nonlocal output_device
-            if isinstance(value, torch.Tensor):
-                if output_device is None and value.device.type != "cpu":
-                    output_device = value.device
-                return value.cpu()
-            return value
-
-        cpu_args = tuple(to_cpu(a) for a in args)
-        cpu_kwargs = {k: to_cpu(v) for k, v in kwargs.items()}
-        output = original_forward(*cpu_args, **cpu_kwargs)
-
-        if output_device is None:
-            return output
-
-        def to_device(value):
-            if isinstance(value, torch.Tensor):
-                return value.to(output_device)
-            return value
-
-        if isinstance(output, tuple):
-            return tuple(to_device(v) for v in output)
-        return to_device(output)
-
-    hift.forward = MethodType(_forward_on_cpu, hift)
-    hift._npu_cpu_offload_patched = True
+    sine_gen = hift.m_source.l_sin_gen
+    sine_gen._npu_original_f02sine = sine_gen._f02sine
+    sine_gen._f02sine = MethodType(_f02sine_on_npu, sine_gen)
+    hift._npu_linear_downsample_patched = True
+    logger.info("Patched HiFT linear downsample for Ascend NPU")
 
 
 @contextmanager
