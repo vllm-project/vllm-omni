@@ -1,140 +1,152 @@
 [
-    {
-        "test_name": "test_hunyuan_image3_ti2i_inline",
-        "description": "AR (TP=2) + 2 * DiT (TP=2) - using inline dataset and deploy-config",
-        "server_type": "vllm-omni",
-        "benchmark_endpoint": "/v1/images/edits",
-        "server_params": {
-            "model": "tencent/HunyuanImage-3.0-Instruct",
-            "serve_args": {
-                "trust-remote-code": true,
-                "deploy-config-inline": {
-                    "type": "yaml",
-                    "content": {
-                        "pipeline": "hunyuan_image_3_moe",
-                        "async_chunk": false,
-                        "trust_remote_code": true,
-                        "connectors": {
-                            "rdma_connector": {
-                                "name": "MooncakeTransferEngineConnector",
-                                "extra": {
-                                    "host": "auto",
-                                    "zmq_port": 50051,
-                                    "protocol": "rdma",
-                                    "device_name": "",
-                                    "memory_pool_size": 17179869184,
-                                    "memory_pool_device": "cpu"
-                                }
-                            }
-                        },
-                        "stages": [
-                            {
-                                "stage_id": 0,
-                                "is_comprehension": true,
-                                "final_output": true,
-                                "final_output_type": "text",
-                                "max_num_seqs": 16,
-                                "gpu_memory_utilization": 0.95,
-                                "enforce_eager": false,
-                                "enable_prefix_caching": false,
-                                "max_num_batched_tokens": 32768,
-                                "devices": "0,1",
-                                "tensor_parallel_size": 2,
-                                "hf_overrides": {
-                                    "rope_parameters": {
-                                        "mrope_section": [
-                                            0,
-                                            32,
-                                            32
-                                        ],
-                                        "rope_type": "default"
-                                    }
-                                },
-                                "omni_kv_config": {
-                                    "need_send_cache": true
-                                },
-                                "output_connectors": {
-                                    "to_stage_1": "rdma_connector"
-                                },
-                                "default_sampling_params": {
-                                    "temperature": 0.0,
-                                    "top_p": 1,
-                                    "top_k": -1,
-                                    "max_tokens": 8192,
-                                    "detokenize": true,
-                                    "skip_special_tokens": false,
-                                    "stop_token_ids": [
-                                        128025
-                                    ]
-                                }
-                            },
-                            {
-                                "stage_id": 1,
-                                "max_num_seqs": 1,
-                                "enforce_eager": true,
-                                "devices": "2,3",
-                                "distributed_executor_backend": "mp",
-                                "omni_kv_config": {
-                                    "need_recv_cache": true
-                                },
-                                "parallel_config": {
-                                    "tensor_parallel_size": 2,
-                                    "vae_patch_parallel_size": 2,
-                                    "enable_expert_parallel": true
-                                },
-                                "input_connectors": {
-                                    "from_stage_0": "rdma_connector"
-                                },
-                                "default_sampling_params": {
-                                    "num_inference_steps": 50,
-                                    "guidance_scale": 0
-                                }
-                            }
-                        ],
-                        "edges": [
-                            {
-                                "from": 0,
-                                "to": 1,
-                                "window_size": -1,
-                                "max_inflight": 1
-                            }
-                        ]
-                    }
-                },
-                "enable-diffusion-pipeline-profiler": true
-            }
-        },
-        "benchmark_params": [
-            {
-                "name": "inline_dataset_5_requests",
-                "dataset": "custom",
-                "dataset-path-inline": {
-                    "type": "jsonl",
-                    "content": [
-                        {
-                            "prompt": "新年宠物海报，Q版圆润的可爱标题“新年快乐汪”，副标题“HAPPY NEW YEAR”。 鱼眼镜头，背景是房间门口，近景，上传的主体歪头笑，围着红色围巾，戴着红色毛线帽，高清，绒毛细节，面部特写。 宝丽莱相纸，超现实主义，写实主义，胶片摄影，打印颗粒感肌理。肌理，超写实，复古感。",
-                            "image_urls": [
-                                "https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/main/assets/demo_instruct_imgs/input_0_0.png"
-                            ],
-                            "num_inference_steps": 8,
-                            "seed": 42,
-                            "guidance_scale": 1.0
-                        }
-                    ]
-                },
-                "task": "ti2i",
-                "bot-task": "think_recaption",
-                "max-concurrency": 16,
-                "num-prompts": 96,
-                "skip-performance-assertion": true,
-                "baseline": {
-                    "throughput_qps": 0.1874,
-                    "latency_p99": 101.852,
-                    "latency_mean": 79.0385,
-                    "peak_memory_mb_max": 70000,
-                    "peak_memory_mb_mean": 70000
+  {
+    "test_name": "test_hunyuan_image3_ti2i_inline",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 4
+        }
+      },
+      "diffusion",
+      "local_model"
+    ],
+    "description": "AR (TP=2) + 2 * DiT (TP=2) - using inline dataset and deploy-config",
+    "server_type": "vllm-omni",
+    "benchmark_endpoint": "/v1/images/edits",
+    "server_params": {
+      "model": "tencent/HunyuanImage-3.0-Instruct",
+      "serve_args": {
+        "trust-remote-code": true,
+        "deploy-config-inline": {
+          "type": "yaml",
+          "content": {
+            "pipeline": "hunyuan_image_3_moe",
+            "async_chunk": false,
+            "trust_remote_code": true,
+            "connectors": {
+              "rdma_connector": {
+                "name": "MooncakeTransferEngineConnector",
+                "extra": {
+                  "host": "auto",
+                  "zmq_port": 50051,
+                  "protocol": "rdma",
+                  "device_name": "",
+                  "memory_pool_size": 17179869184,
+                  "memory_pool_device": "cpu"
                 }
+              }
+            },
+            "stages": [
+              {
+                "stage_id": 0,
+                "is_comprehension": true,
+                "final_output": true,
+                "final_output_type": "text",
+                "max_num_seqs": 16,
+                "gpu_memory_utilization": 0.95,
+                "enforce_eager": false,
+                "enable_prefix_caching": false,
+                "max_num_batched_tokens": 32768,
+                "devices": "0,1",
+                "tensor_parallel_size": 2,
+                "hf_overrides": {
+                  "rope_parameters": {
+                    "mrope_section": [
+                      0,
+                      32,
+                      32
+                    ],
+                    "rope_type": "default"
+                  }
+                },
+                "omni_kv_config": {
+                  "need_send_cache": true
+                },
+                "output_connectors": {
+                  "to_stage_1": "rdma_connector"
+                },
+                "default_sampling_params": {
+                  "temperature": 0.0,
+                  "top_p": 1,
+                  "top_k": -1,
+                  "max_tokens": 8192,
+                  "detokenize": true,
+                  "skip_special_tokens": false,
+                  "stop_token_ids": [
+                    128025
+                  ]
+                }
+              },
+              {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "enforce_eager": true,
+                "devices": "2,3",
+                "distributed_executor_backend": "mp",
+                "omni_kv_config": {
+                  "need_recv_cache": true
+                },
+                "parallel_config": {
+                  "tensor_parallel_size": 2,
+                  "vae_patch_parallel_size": 2,
+                  "enable_expert_parallel": true
+                },
+                "input_connectors": {
+                  "from_stage_0": "rdma_connector"
+                },
+                "default_sampling_params": {
+                  "num_inference_steps": 50,
+                  "guidance_scale": 0
+                }
+              }
+            ],
+            "edges": [
+              {
+                "from": 0,
+                "to": 1,
+                "window_size": -1,
+                "max_inflight": 1
+              }
+            ]
+          }
+        },
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "inline_dataset_5_requests",
+        "dataset": "custom",
+        "dataset-path-inline": {
+          "type": "jsonl",
+          "content": [
+            {
+              "prompt": "新年宠物海报，Q版圆润的可爱标题“新年快乐汪”，副标题“HAPPY NEW YEAR”。 鱼眼镜头，背景是房间门口，近景，上传的主体歪头笑，围着红色围巾，戴着红色毛线帽，高清，绒毛细节，面部特写。 宝丽莱相纸，超现实主义，写实主义，胶片摄影，打印颗粒感肌理。肌理，超写实，复古感。",
+              "image_urls": [
+                "https://raw.githubusercontent.com/Tencent-Hunyuan/HunyuanImage-3.0/main/assets/demo_instruct_imgs/input_0_0.png"
+              ],
+              "num_inference_steps": 8,
+              "seed": 42,
+              "guidance_scale": 1.0
             }
-        ]
-    }
+          ]
+        },
+        "task": "ti2i",
+        "bot-task": "think_recaption",
+        "max-concurrency": 16,
+        "num-prompts": 96,
+        "skip-performance-assertion": true,
+        "baseline": {
+          "throughput_qps": 0.1874,
+          "latency_p99": 101.852,
+          "latency_mean": 79.0385,
+          "peak_memory_mb_max": 70000,
+          "peak_memory_mb_mean": 70000
+        }
+      }
+    ]
+  }
 ]

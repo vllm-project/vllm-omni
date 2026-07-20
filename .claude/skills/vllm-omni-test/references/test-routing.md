@@ -2,7 +2,7 @@
 
 Use this reference to map testing goals to levels, markers, and runnable commands.
 
-**Repo paths** (`.buildkite/`, `docs/contributing/…`): link with repo-relative paths from this file (e.g. `../../../../.buildkite/test-ready.yml`, `../../../../docs/contributing/ci/CI_5levels.md`).
+**Repo paths** (`.buildkite/`, `docs/contributing/…`): link with repo-relative paths from this file (e.g. `../../../../.buildkite/cuda/test-ready.yml`, `../../../../docs/contributing/ci/CI_5levels.md`).
 
 ## Model-centric e2e filename convention (L2–L4)
 
@@ -127,8 +127,12 @@ pytest -s -v e2e/online_serving/test_qwen_image_expansion.py -m "full_model and 
 cd tests
 export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
 export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+# CI-like: single JSON file (nightly Perf Test steps)
 pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py \
   --test-config-file dfx/perf/tests/test_qwen_image_vllm_omni.json
+# Local bulk load: all *.json under tests/dfx/perf/tests/, filter by JSON mark
+pytest -sv dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"
+pytest -sv dfx/perf/scripts/run_benchmark.py -m "full_model and omni and H100"
 ```
 
 Broad marker sweep (when no explicit file shard):
@@ -150,7 +154,26 @@ Nightly **L4** for a model is often **multiple jobs** in `test-nightly.yml`, not
 
 **Rule:** “L4 functional cases” → **Function only** by default. State that Perf/Accuracy are separate pillars; add them only when requested.
 
-**Diffusion perf JSON** (`tests/dfx/perf/tests/test_<slug>_vllm_omni.json`): array of objects with `test_name`, `server_params` (`model`, `serve_args`), `benchmark_params[]`, and per-workload **`baseline`** (`throughput_qps`, `latency_mean`, `peak_memory_mb_mean`). Copy structure from `test_qwen_image_vllm_omni.json` in-tree.
+**Diffusion perf JSON** (`tests/dfx/perf/tests/test_<slug>_vllm_omni.json`): array of **case objects**, each with:
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `test_name` | Yes | Unique server/workload id |
+| `mark` | Recommended | When present: **`hardware_marks` required** + optional `marks` (`full_model`, `diffusion`, `local_model`, …). Parsed by `resolve_pytest_marks`; enables local `-m` filtering. |
+| `server_type` | Diffusion | e.g. `"vllm-omni"` — routes case to `run_diffusion_benchmark.py` |
+| `benchmark_endpoint` | Diffusion | e.g. `/v1/videos`, `/v1/images/generations` |
+| `server_params` | Yes | `model`, `serve_args`, … |
+| `benchmark_params[]` | Yes | Each row: **`name`** (pytest id suffix), workload fields, **`baseline`** |
+
+Copy structure from `test_qwen_image_vllm_omni.json` or `test_cosmos3_vllm_omni.json` (2-GPU mark example).
+
+**Omni perf JSON**: `test_qwen3_omni_*.json` — same `mark` shape with `"marks": ["full_model", "omni"]`; run via `run_benchmark.py`.
+
+**Runner split**: `is_diffusion_perf_config()` → diffusion when `server_type` is set or `"diffusion"` ∈ `mark.marks`; otherwise omni/tts → `run_benchmark.py`.
+
+**Param ids**: `{test_name}-{benchmark_params.name}` (e.g. `test_tts-p0`, not `test_tts-0`).
+
+**Result filenames**: runtime hardware from `get_runtime_resource_label()`; `H100` omitted on default CI pool.
 
 **Diffusion perf nightly step** (under **Diffusion X2I(&A&T)**; copy full `kubernetes` plugins from `· Perf Test · Qwen-Image`):
 
@@ -177,9 +200,9 @@ Nightly **L4** for a model is often **multiple jobs** in `test-nightly.yml`, not
 
 | Model type | Perf runner | Config example |
 |------------|-------------|----------------|
-| Diffusion X2I/X2V | `dfx/perf/scripts/run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json` |
-| TTS | `dfx/perf/scripts/run_benchmark.py` | `test_tts.json` (`BENCHMARK_DIR`) |
-| Omni | `run_benchmark.py` / omni configs in-tree | `test_omni*.json` |
+| Diffusion X2I/X2V | `dfx/perf/scripts/run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json` |
+| TTS | `dfx/perf/scripts/run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
+| Omni | `dfx/perf/scripts/run_benchmark.py` | `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_no_async_chunk.json`, … |
 
 Do **not** put throughput/latency baselines inside `test_*_expansion.py` — that belongs in the dfx perf JSON + nightly Perf job.
 
@@ -201,7 +224,7 @@ When the user’s test plan includes **invalid parameter validation**, **invalid
 | Sleep / wakeup / server control | `test_invalid_server_control.py` |
 
 3. **Style:** `pytestmark = [pytest.mark.slow, pytest.mark.<type>]`; `_PARAMS` + `hardware_marks`; `send_*_http_request` with `err_code` + `err_message`; parametrized `body_spec` rows with `id=`; `_minimal_*_json()` helpers; `_SKIP_ISSUE_3649` when tracked in [#3649](https://github.com/vllm-project/vllm-omni/issues/3649).
-4. **CI:** [`.buildkite/test-weekly.yml`](../../../../.buildkite/test-weekly.yml) group **Reliability Test - Invalid parameters Test** — **not** ready/merge/nightly.
+4. **CI:** [`.buildkite/cuda/test-weekly.yml`](../../../../.buildkite/cuda/test-weekly.yml) group **Reliability Test - Invalid parameters Test** — **not** ready/merge/nightly.
 
 ```bash
 # Weekly H100 (diffusion / omni / video invalid-param)
@@ -268,10 +291,10 @@ When adding or modifying tests, do not stop at “where the file lives” — al
 
 | Level | Repo file | Model-type grouping |
 |-------|-----------|---------------------|
-| L1, L2 | [`.buildkite/test-ready.yml`](../../../../.buildkite/test-ready.yml) | Steps prefixed **Omni ·**, **TTS ·**, **Diffusion ·** under **E2E Test** — **`source_file_dependencies` required** |
-| L3 | [`.buildkite/test-merge.yml`](../../../../.buildkite/test-merge.yml) | Per-model E2E steps; `-m "advanced_model and …"` — **`source_file_dependencies` required** |
-| L4 | [`.buildkite/test-nightly.yml`](../../../../.buildkite/test-nightly.yml) | **Omni / TTS / Diffusion X2I(&A&T) / X2V** — each group may have **Function**, **Accuracy**, **Perf**, **Doc** steps |
-| Invalid param (weekly) | [`.buildkite/test-weekly.yml`](../../../../.buildkite/test-weekly.yml) | **Invalid parameters Test · H100** / **· L4** — sweeps `tests/dfx/reliability/invalid_param_test/` |
+| L1, L2 | [`.buildkite/cuda/test-ready.yml`](../../../../.buildkite/cuda/test-ready.yml) | Steps prefixed **Omni ·**, **TTS ·**, **Diffusion ·** under **E2E Test** — **`source_file_dependencies` required** |
+| L3 | [`.buildkite/cuda/test-merge.yml`](../../../../.buildkite/cuda/test-merge.yml) | Per-model E2E steps; `-m "advanced_model and …"` — **`source_file_dependencies` required** |
+| L4 | [`.buildkite/cuda/test-nightly.yml`](../../../../.buildkite/cuda/test-nightly.yml) | **Omni / TTS / Diffusion X2I(&A&T) / X2V** — each group may have **Function**, **Accuracy**, **Perf**, **Doc** steps |
+| Invalid param (weekly) | [`.buildkite/cuda/test-weekly.yml`](../../../../.buildkite/cuda/test-weekly.yml) | **Invalid parameters Test · H100** / **· L4** — sweeps `tests/dfx/reliability/invalid_param_test/` |
 
 ### `source_file_dependencies` (E2E Test only — ready & merge)
 
@@ -357,7 +380,7 @@ Common patterns in `test-ready.yml` / `test-merge.yml`:
 
 When extending an existing step (e.g. add `tests/e2e/offline_inference/test_qwen_image.py` to **Diffusion · Qwen Image Test**), update `source_file_dependencies` and `commands` only; **keep the existing `agents` + `plugins` block unchanged** unless the hardware tier changes.
 
-The root [`.buildkite/pipeline.yml`](../../../../.buildkite/pipeline.yml) decides **which** child file is uploaded. To run **L3** on a feature branch, comment out `if: build.branch == "main"` on the merge upload step. To run **L4** without `NIGHTLY=1`, comment out the nightly upload step’s `if: build.env("NIGHTLY") == "1"` and the same `if` on relevant steps inside `test-nightly.yml`. Revert such edits before merging.
+[`.buildkite/cuda/pipeline.yml`](../../../../.buildkite/cuda/pipeline.yml) decides **which** child file is uploaded. To run **L3** on a feature branch, comment out `if: build.branch == "main"` on the merge upload step. To run **L4** without `NIGHTLY=1`, comment out the nightly upload step’s `if: build.env("NIGHTLY") == "1"` and the same `if` on relevant steps inside `test-nightly.yml`. Revert such edits before merging.
 
 Platform-specific pipelines (e.g. AMD) follow the same level → file pairing under `.buildkite/`.
 

@@ -126,11 +126,12 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         <strong>Interface tests:</strong><br>
         /tests/entrypoints/test_xxx<br>
         <strong>Performance:</strong><br>
-        /tests/dfx/perf/tests/test_qwen_omni.json (Omni), test_tts.json (TTS),<br>
-        and /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
+        /tests/dfx/perf/tests/test_qwen3_omni_*.json (Omni), test_tts.json (TTS),<br>
+        test_voxcpm2.json, test_higgs_audio_v3.json, and<br>
+        /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
         <strong>Doc Test:</strong><br>
-        tests/example/online_serving/test_{model_name}.py<br>
-        tests/example/offline_inference/test_{model_name}.py<br>
+        tests/examples/online_serving/test_{model_name}.py<br>
+        tests/examples/offline_inference/test_{model_name}.py<br>
         <strong>Accuracy Test:</strong><br>
         /tests/e2e/accuracy/test_{model_name}.py
       </td>
@@ -318,7 +319,7 @@ Before entering specific testing levels, the project establishes two common spec
 
 ### Diff-aware Buildkite uploads (`source_file_dependencies`)
 
-L2 (`.buildkite/test-ready.yml`) and L3 (`.buildkite/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
+L2 (`.buildkite/cuda/test-ready.yml`) and L3 (`.buildkite/cuda/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/cuda/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
 
 #### What `source_file_dependencies` is
 
@@ -333,14 +334,14 @@ L2 (`.buildkite/test-ready.yml`) and L3 (`.buildkite/test-merge.yml`) pipelines 
 | `main` branch push | `git diff --name-only <commit>^..<commit>` |
 | Other (e.g. local dry-run, non-PR branch) | Diff cannot be resolved → **no filtering**; all steps are uploaded and `source_file_dependencies` is still stripped |
 
-Docs-only PRs are handled earlier in bootstrap (`pipeline.yml`) via skip-ci logic; `source_file_dependencies` applies only to the **uploaded** L2/L3 test pipelines.
+Docs-only PRs are handled earlier in bootstrap (`.buildkite/cuda/pipeline.yml`) via skip-ci logic; `source_file_dependencies` applies only to the **uploaded** L2/L3 test pipelines.
 
 #### Where it is configured
 
 | Level | Pipeline file | Upload entry |
 | --- | --- | --- |
-| L2 | `.buildkite/test-ready.yml` | `upload_pipeline.py --upload .buildkite/test-ready.yml` (from `pipeline.yml`) |
-| L3 | `.buildkite/test-merge.yml` | `upload_pipeline.py --upload .buildkite/test-merge.yml` (from `pipeline.yml`) |
+| L2 | `.buildkite/cuda/test-ready.yml` | `upload_pipeline.py --upload .buildkite/cuda/test-ready.yml` (from `cuda/pipeline.yml`) |
+| L3 | `.buildkite/cuda/test-merge.yml` | `upload_pipeline.py --upload .buildkite/cuda/test-merge.yml` (from `cuda/pipeline.yml`) |
 
 Steps **without** `source_file_dependencies` are always uploaded (subject to the usual label conditions: `ready` for L2, `merge-test` for L3).
 
@@ -392,10 +393,10 @@ A **group** may also define `source_file_dependencies`; nested steps inherit fil
 
 ```bash
 # Render filtered YAML to stdout (no upload)
-python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-ready.yml
+python3 .buildkite/cuda/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
 
 # Confirm uploader-only keys are stripped
-python3 .buildkite/scripts/upload_pipeline.py .buildkite/test-merge.yml | grep source_file_dependencies
+python3 .buildkite/cuda/scripts/upload_pipeline.py .buildkite/cuda/test-merge.yml | grep source_file_dependencies
 # (no output expected)
 ```
 
@@ -403,7 +404,7 @@ On a PR build, Buildkite logs from `upload_pipeline.py` include lines such as `s
 
 #### Related
 
-- Implementation: `.buildkite/scripts/upload_pipeline.py`
+- Implementation: `.buildkite/cuda/scripts/upload_pipeline.py`
 - L2/L3 diff skip does **not** replace label-based triggers (`ready`, `merge-test`); it only reduces which steps appear **after** the pipeline is already scheduled.
 
 ### Test helper environment variables
@@ -708,16 +709,16 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 ### 3.2 Testing Content and Scope
 
 -   ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
--   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs in the form `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` via `--test-config-file`) to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
+-   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen3_omni_*.json` (Omni), `test_tts.json` / `test_voxcpm2.json` / `test_higgs_audio_v3.json` (TTS), and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` or `run_diffusion_benchmark.py` via `--test-config-file` in nightly **Perf Test** steps) to drive throughput, latency, and memory benchmarks. Each JSON **case** may declare an optional top-level **`mark`** array: exactly one ``hardware_marks`` object plus pytest marker name strings (`full_model`, `omni` / `tts` / `diffusion`, …). Runners attach those marks to each parametrized `(server, benchmark index)` pair so **local** bulk runs can filter with `-m` (for example `-m "full_model and H100 and diffusion"`). Nightly CI perf jobs select workloads by **`--test-config-file`**, not `-m`. Details are in the Performance Tests example below.
 -   ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
 ### 3.3 Test Directory and Execution Files
 
 -   ***Functional Testing***: Same directories as L3.
--   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`)
+-   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen3_omni_*.json`, `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json`). Optional per-case `mark` for local `-m` filtering is documented in Section 3.4 Performance Tests.
 -   ***Documentation Example Tests***:
--   -   `tests/example/online_serving/test_{model_name}.py`
-    -   `tests/example/offline_inference/test_{model_name}.py`
+    -   `tests/examples/online_serving/test_{model_name}.py`
+    -   `tests/examples/offline_inference/test_{model_name}.py`
 
 ### 3.4 Execution Method and Example
 
@@ -870,7 +871,7 @@ Reliability tests are **short fault-injection** integration runs (L5 **(b)** in 
 
 #### CI trigger
 
-Weekly Buildkite (`.buildkite/test-weekly.yml`) runs one step per model suite (trigger: `WEEKLY=1` or PR label `weekly-test`), for example:
+Weekly Buildkite (`.buildkite/cuda/test-weekly.yml`) runs one step per model suite (trigger: `WEEKLY=1` or PR label `weekly-test`), for example:
 
 | Buildkite step | Test file | CI hardware |
 | -------------- | --------- | ----------- |
@@ -901,12 +902,12 @@ pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m slow
 1. Add `test_reliability_<model>.py` under `tests/dfx/reliability/`.
 2. Define **`RELIABILITY_SCENARIOS`** and pass them through **`create_reliability_omni_server_params()`** with the correct deploy or e2e stage-config directory (same pattern as existing files).
 3. Reuse **`helpers`** for OOM / kill / raw HTTP; prefer **`assert_fault_exception()`** and **`resolve_oom_device_spec()`** from `tests/dfx/conftest.py` for consistent device selection vs stage YAML.
-4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/test-weekly.yml`** when the suite should run in weekly L5.
+4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/cuda/test-weekly.yml`** when the suite should run in weekly L5.
 
 </details>
 
 -   -   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
-    -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `voxcpm2`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/test-weekly.yml` for new models)
+    -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `voxcpm2`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/cuda/test-weekly.yml` for new models)
 
 ## Summary
 

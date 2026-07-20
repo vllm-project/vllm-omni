@@ -250,11 +250,13 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
             num_steps=extra_args.get("num_steps"),
             decode_image=bool(extra_args.get("decode_image", False)),
         )
-        custom_output: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
         if decoded is not None:
-            custom_output["decoded"] = decoded
+            metadata["actions"] = {"decoded": decoded}
         return DiffusionOutput(
-            output=output,
-            custom_output=custom_output,
+            output={
+                "payload": {"actions": output},
+                "metadata": metadata,
+            },
             post_process_func=get_internvla_a1_post_process_func(self.od_config),
         )

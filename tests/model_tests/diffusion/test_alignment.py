@@ -71,6 +71,7 @@ EXCLUDED_MODELS = [
     "OmniVoicePipeline",
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
+    "Cosmos3OmniPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamImagePipeline",
     "DreamZeroPipeline",

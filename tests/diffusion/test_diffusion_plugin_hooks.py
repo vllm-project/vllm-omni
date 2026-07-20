@@ -16,7 +16,6 @@ from unittest.mock import Mock, patch
 import pytest
 
 from vllm_omni.diffusion.registry import (
-    _DIFFUSION_ACTION_POST_PROCESS_FUNCS,
     _DIFFUSION_IR_OP_PRIORITY_FUNCS,
     _DIFFUSION_MODELS,
     _DIFFUSION_POST_PROCESS_FUNCS,
@@ -62,7 +61,6 @@ class TestRegisterDiffusionModel:
         original_models = _DIFFUSION_MODELS.copy()
         original_pre = _DIFFUSION_PRE_PROCESS_FUNCS.copy()
         original_post = _DIFFUSION_POST_PROCESS_FUNCS.copy()
-        original_action_post = _DIFFUSION_ACTION_POST_PROCESS_FUNCS.copy()
         original_ir_op_priority = _DIFFUSION_IR_OP_PRIORITY_FUNCS.copy()
         yield
         _DIFFUSION_MODELS.clear()
@@ -71,8 +69,6 @@ class TestRegisterDiffusionModel:
         _DIFFUSION_PRE_PROCESS_FUNCS.update(original_pre)
         _DIFFUSION_POST_PROCESS_FUNCS.clear()
         _DIFFUSION_POST_PROCESS_FUNCS.update(original_post)
-        _DIFFUSION_ACTION_POST_PROCESS_FUNCS.clear()
-        _DIFFUSION_ACTION_POST_PROCESS_FUNCS.update(original_action_post)
         _DIFFUSION_IR_OP_PRIORITY_FUNCS.clear()
         _DIFFUSION_IR_OP_PRIORITY_FUNCS.update(original_ir_op_priority)
 
@@ -84,7 +80,6 @@ class TestRegisterDiffusionModel:
             class_name="TestPipeline",
             pre_process_func_name="test_pre_process",
             post_process_func_name="test_post_process",
-            action_post_process_func_name="test_action_post_process",
             ir_op_priority_func_name="test_ir_op_priority",
         )
         assert "TestPipeline" in _DIFFUSION_MODELS
@@ -95,8 +90,20 @@ class TestRegisterDiffusionModel:
         )
         assert _DIFFUSION_PRE_PROCESS_FUNCS["TestPipeline"] == "test_pre_process"
         assert _DIFFUSION_POST_PROCESS_FUNCS["TestPipeline"] == "test_post_process"
-        assert _DIFFUSION_ACTION_POST_PROCESS_FUNCS["TestPipeline"] == "test_action_post_process"
         assert _DIFFUSION_IR_OP_PRIORITY_FUNCS["TestPipeline"] == "test_ir_op_priority"
+
+    def test_register_model_accepts_deprecated_action_postprocess_keyword(self):
+        """Deprecated action hook keyword is accepted but not registered."""
+        register_diffusion_model(
+            model_arch="LegacyActionPipeline",
+            module_name="test_plugin.diffusion.pipeline",
+            class_name="LegacyActionPipeline",
+            post_process_func_name="test_post_process",
+            action_post_process_func_name="test_action_post_process",
+        )
+
+        assert "LegacyActionPipeline" in _DIFFUSION_MODELS
+        assert _DIFFUSION_POST_PROCESS_FUNCS["LegacyActionPipeline"] == "test_post_process"
 
 
 class TestWorkerUsesHook:

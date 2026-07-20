@@ -1,6 +1,18 @@
 [
   {
     "test_name": "test_bagel_single_device_single_stage_t2i",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-stage BAGEL (TP=1, CFG=1), t2i Task",
     "server_type": "vllm-omni",
     "server_params": {
@@ -38,6 +50,18 @@
   },
   {
     "test_name": "test_bagel_single_device_single_stage_i2i",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Single-stage BAGEL (TP=1, CFG=1), i2i Task",
     "server_type": "vllm-omni",
     "server_params": {
@@ -76,6 +100,18 @@
   },
   {
     "test_name": "test_bagel_single_device_multi_stage_t2i",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, t2i Task",
     "server_type": "vllm-omni",
     "server_params": {
@@ -113,6 +149,18 @@
   },
   {
     "test_name": "test_bagel_single_device_multi_stage_i2i",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
     "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, i2i Task",
     "server_type": "vllm-omni",
     "server_params": {

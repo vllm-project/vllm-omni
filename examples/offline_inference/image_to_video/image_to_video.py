@@ -102,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override model class name (e.g., LTX2ImageToVideoPipeline or LTX23ImageToVideoPipeline).",
     )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Optional deploy config YAML to use for pipeline-backed runs.",
+    )
     parser.add_argument("--image", help="Path to the first-frame or source image.")
     parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
     parser.add_argument("--mask-image", help="Path to an inpainting mask (used by models such as VACE).")
@@ -453,6 +458,8 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails

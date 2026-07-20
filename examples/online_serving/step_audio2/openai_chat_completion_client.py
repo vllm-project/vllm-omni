@@ -9,7 +9,7 @@ Step-Audio2 is a two-stage model:
 
 Usage examples:
   # Start server first:
-  vllm serve stepfun-ai/Step-Audio2-mini --omni --port 8092
+  vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092
 
   # Audio to text (ASR)
   python openai_chat_completion_client.py --query-type audio_to_text
@@ -311,7 +311,7 @@ def parse_args():
         "--model",
         "-m",
         type=str,
-        default="stepfun-ai/Step-Audio2-mini",
+        default="stepfun-ai/Step-Audio-2-mini",
         help="Model name",
     )
     parser.add_argument(

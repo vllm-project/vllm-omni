@@ -88,6 +88,13 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     return DiffusionInt8Config(**kw)
 
 
+def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
+    """Lazy import for BitsAndBytes 4-bit diffusion config (CUDA only)."""
+    from .bitsandbytes_config import DiffusionBitsAndBytesConfig
+
+    return DiffusionBitsAndBytesConfig(**kw)
+
+
 def _build_mxfp8(**kw: Any) -> QuantizationConfig:
     """Lazy import for W8A8 MXFP8 diffusion config (NPU only)."""
     from .mxfp8_config import DiffusionMXFP8Config
@@ -134,6 +141,7 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
 
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "int8": _build_int8,
+    "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
