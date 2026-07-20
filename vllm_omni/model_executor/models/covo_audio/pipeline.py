@@ -17,6 +17,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.covo_audio"
 
 COVO_AUDIO_PIPELINE = PipelineConfig(
     model_type="covo_audio",
+    default_deploy_config_name="covo_audio.yaml",
     model_arch="CovoAudioForConditionalGeneration",
     stages=(
         StagePipelineConfig(

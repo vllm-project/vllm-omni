@@ -6,7 +6,7 @@ E2E Online expansion tests for higgs-audio v2 against /v1/audio/speech.
 v1 scope is plain text -> 24 kHz speech plus shallow voice clone via
 ref_audio + ref_text (inline) or voice=<name> (after POST /v1/audio/voices).
 The model-aware request validator
-(vllm_omni/entrypoints/openai/serving_speech.py::_validate_higgs_audio_v2_request)
+(vllm_omni/entrypoints/openai/tts_adapters/higgs_audio_v2::validate)
 rejects multi-speaker tags, language overrides, task_type, and bare
 voice=<name> for names that do not match an uploaded speaker — this suite
 exercises both the happy path (plain text in, audio bytes out) and the

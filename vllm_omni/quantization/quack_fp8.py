@@ -94,7 +94,7 @@ def quack_scaled_fp8_mm(
         return None
     out = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=out_dtype)
     alpha = scale_a.reshape(1).float() * scale_b.reshape(1).float()
-    gemm.gemm_tuned(a, b, out, bias=bias, alpha=alpha)
+    gemm.gemm(a, b, out=out, bias=bias, alpha=alpha, tuned=True)
     return out
 
 

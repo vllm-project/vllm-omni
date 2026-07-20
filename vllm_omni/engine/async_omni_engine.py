@@ -293,7 +293,11 @@ class AsyncOmniEngine:
         )
 
         kwargs["trust_remote_code"] = trust_remote_code
-        self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
+        self.config_path, self.stage_configs = self._resolve_stage_configs(
+            model,
+            kwargs,
+            trust_remote_code=trust_remote_code,
+        )
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
@@ -1161,7 +1165,13 @@ class AsyncOmniEngine:
             )
             self._omni_lb_policy = str(derived)
 
-    def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
+    def _resolve_stage_configs(
+        self,
+        model: str,
+        kwargs: dict[str, Any],
+        *,
+        trust_remote_code: bool,
+    ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
@@ -1187,6 +1197,7 @@ class AsyncOmniEngine:
             model,
             stage_configs_path,
             base_kwargs,
+            trust_remote_code=trust_remote_code,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,

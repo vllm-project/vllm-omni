@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from transformers import Qwen3OmniMoeConfig
 
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import omni_config as omni_config_module
 from vllm_omni.config.omni_config import (
     BaseVllmOmniStageConfig,
@@ -26,7 +28,7 @@ from vllm_omni.config.omni_config import (
     VllmOmniDiffusionStageConfig,
     VllmOmniGenerationStageConfig,
 )
-from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
@@ -53,28 +55,39 @@ def _stable_test_platform(monkeypatch):
     monkeypatch.setattr(platform, "device_type", "cpu", raising=False)
 
 
-def _load_default_deploy(model_type: str) -> DeployConfig:
-    deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
-    if deploy_path.exists():
-        return load_deploy_config(deploy_path)
+def _load_default_deploy(pipeline: PipelineConfig) -> DeployConfig:
+    if pipeline.default_deploy_config_name is not None:
+        return load_deploy_config(_DEPLOY_DIR / pipeline.default_deploy_config_name)
     return DeployConfig()
 
 
-def _resolve_pipeline_or_skip(model_type: str) -> PipelineConfig:
-    registered = OMNI_PIPELINES[model_type]
-    pipeline = registered(None) if callable(registered) else registered
+def _resolve_pipeline_or_skip(model_type: str, hf_config=None) -> PipelineConfig:
+    pipeline = resolve_pipeline_config(model_type, hf_config)
     if pipeline is None:
         pytest.skip(f"Pipeline {model_type!r} requires an HF config to resolve")
     return pipeline
 
 
+def _from_pipeline_key(
+    model_type: str,
+    hf_config=None,
+    deploy_config_path: str | None = None,
+    cli_overrides: dict | None = None,
+) -> VllmOmniConfig:
+    return VllmOmniConfig.from_pipeline_config(
+        _resolve_pipeline_or_skip(model_type, hf_config),
+        deploy_config_path=deploy_config_path,
+        cli_overrides=cli_overrides,
+    )
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
-def test_vllm_omni_config_from_registry_matches_merge_pipeline_deploy(model_type: str):
+def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(model_type: str):
     pipeline = _resolve_pipeline_or_skip(model_type)
-    legacy_deploy = _load_default_deploy(model_type)
+    legacy_deploy = _load_default_deploy(pipeline)
 
     legacy_stages = merge_pipeline_deploy(pipeline, legacy_deploy)
-    omni_config = VllmOmniConfig.from_registry(model_type)
+    omni_config = VllmOmniConfig.from_pipeline_config(pipeline)
 
     assert omni_config.pipeline_config is pipeline
     assert len(omni_config.stage_configs) == len(legacy_stages)
@@ -119,7 +132,7 @@ def test_vllm_omni_config_from_registry_matches_merge_pipeline_deploy(model_type
 
 
 def test_stage_by_id_raises_for_unknown_stage():
-    omni_config = VllmOmniConfig.from_registry("qwen3_tts")
+    omni_config = _from_pipeline_key("qwen3_tts")
 
     with pytest.raises(KeyError, match="no stage 99"):
         omni_config.stage_by_id(99)
@@ -130,8 +143,8 @@ def test_resolve_execution_mode_rejects_unknown_execution_type():
         omni_config_module._resolve_execution_mode("unknown_execution_type")
 
 
-def test_from_registry_preserves_current_pipeline_config_object():
-    omni_config = VllmOmniConfig.from_registry("minicpmo_4_5")
+def test_from_pipeline_config_preserves_current_pipeline_config_object():
+    omni_config = _from_pipeline_key("minicpmo_4_5")
     pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")
 
     assert omni_config.pipeline_config is pipeline
@@ -140,11 +153,11 @@ def test_from_registry_preserves_current_pipeline_config_object():
     assert omni_config.pipeline_config.hf_config_predicate is pipeline.hf_config_predicate
 
 
-def test_from_registry_normalizes_stage_engine_extras_without_expanding_stage_deploy_config():
+def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_stage_deploy_config():
     assert not hasattr(StageDeployConfig, "model_config")
     assert not hasattr(StageDeployConfig, "parallel_config")
 
-    stage = VllmOmniConfig.from_registry("dreamzero", deploy_config_path="dreamzero_tp1_cfg2").stage_by_id(0)
+    stage = _from_pipeline_key("dreamzero", deploy_config_path="dreamzero_tp1_cfg2").stage_by_id(0)
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.tensor_parallel_size == 1
@@ -152,8 +165,8 @@ def test_from_registry_normalizes_stage_engine_extras_without_expanding_stage_de
     assert stage.diffusion_config.model_config["default_robot_embodiment"] == "roboarena"
 
 
-def test_from_registry_applies_cli_overrides_without_stage_config_runtime_bridge():
-    omni_config = VllmOmniConfig.from_registry(
+def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime_bridge():
+    omni_config = _from_pipeline_key(
         "qwen3_tts",
         cli_overrides={
             "stage_0_max_num_seqs": 7,
@@ -170,7 +183,7 @@ def test_from_registry_applies_cli_overrides_without_stage_config_runtime_bridge
 
 
 def test_runtime_num_gpus_is_derived_from_parallel_world_size():
-    omni_config = VllmOmniConfig.from_registry("hunyuan_image3_dit")
+    omni_config = _from_pipeline_key("hunyuan_image3_dit")
     stage = omni_config.stage_by_id(0)
 
     assert stage.parallel_config.tensor_parallel_size == 4
@@ -179,7 +192,7 @@ def test_runtime_num_gpus_is_derived_from_parallel_world_size():
 
 
 def test_runtime_num_gpus_ignores_stale_runtime_override():
-    omni_config = VllmOmniConfig.from_registry(
+    omni_config = _from_pipeline_key(
         "hunyuan_image3_dit",
         cli_overrides={
             "stage_0_num_gpus": 1,
@@ -191,8 +204,8 @@ def test_runtime_num_gpus_ignores_stale_runtime_override():
     assert stage.runtime_config.num_gpus == 4
 
 
-def test_from_registry_does_not_route_server_cli_keys_to_diffusion_stage():
-    omni_config = VllmOmniConfig.from_registry(
+def test_from_pipeline_config_does_not_route_server_cli_keys_to_diffusion_stage():
+    omni_config = _from_pipeline_key(
         "dreamzero",
         deploy_config_path="dreamzero_tp1_cfg2",
         cli_overrides={
@@ -220,7 +233,7 @@ def test_pipeline_deploy_cli_fields_reuse_legacy_pipeline_wide_engine_fields():
 
 def test_pipeline_wide_model_fields_are_retained_on_structured_stage_configs(tmp_path):
     custom_voice_dir = tmp_path / "voices"
-    omni_config = VllmOmniConfig.from_registry(
+    omni_config = _from_pipeline_key(
         "qwen3_tts",
         cli_overrides={
             "active_stream_window": 2,
@@ -267,8 +280,8 @@ def test_public_config_exports_use_stage_specific_sub_config_names():
     }.issubset(config_pkg.__all__)
 
 
-def test_from_registry_keeps_worker_backend_separate_from_distributed_executor_backend():
-    omni_config = VllmOmniConfig.from_registry("dreamzero", deploy_config_path="dreamzero_tp1_cfg2")
+def test_from_pipeline_config_keeps_worker_backend_separate_from_distributed_executor_backend():
+    omni_config = _from_pipeline_key("dreamzero", deploy_config_path="dreamzero_tp1_cfg2")
 
     stage = omni_config.stage_by_id(0)
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
@@ -276,8 +289,8 @@ def test_from_registry_keeps_worker_backend_separate_from_distributed_executor_b
     assert omni_config.orchestrator_config.worker_backend == "multi_process"
 
 
-def test_from_registry_maps_orchestrator_cli_overrides():
-    omni_config = VllmOmniConfig.from_registry(
+def test_from_pipeline_config_maps_orchestrator_cli_overrides():
+    omni_config = _from_pipeline_key(
         "qwen3_tts",
         cli_overrides={
             "stage_init_timeout": 1200,
@@ -308,21 +321,21 @@ def test_from_registry_maps_orchestrator_cli_overrides():
     assert orchestrator_config.batch_timeout == 3
 
 
-def test_from_registry_records_loaded_deploy_path_on_orchestrator_config():
-    omni_config = VllmOmniConfig.from_registry("dreamzero", deploy_config_path="dreamzero_tp1_cfg2")
+def test_from_pipeline_config_records_loaded_deploy_path_on_orchestrator_config():
+    omni_config = _from_pipeline_key("dreamzero", deploy_config_path="dreamzero_tp1_cfg2")
 
     assert omni_config.pipeline_config.model_type == "dreamzero"
     assert omni_config.orchestrator_config.deploy_config_path == str(_DEPLOY_DIR / "dreamzero_tp1_cfg2.yaml")
 
 
-def test_from_registry_dispatches_async_chunk_processors_without_mutating_topology():
+def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating_topology():
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
 
-    async_config = VllmOmniConfig.from_registry("qwen3_tts")
+    async_config = _from_pipeline_key("qwen3_tts")
     assert async_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_async_chunk")
     assert async_config.stage_by_id(1).custom_process_input_func is None
 
-    sync_config = VllmOmniConfig.from_registry("qwen3_tts", cli_overrides={"async_chunk": False})
+    sync_config = _from_pipeline_key("qwen3_tts", cli_overrides={"async_chunk": False})
     assert sync_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert sync_config.stage_by_id(1).custom_process_input_func.endswith("talker2code2wav_token_only")
 
@@ -503,8 +516,8 @@ def test_diffusion_parallel_config_rejects_hsdp_with_tp_or_dp():
         OmniStageDiffusionParallelConfig(data_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
 
 
-def test_from_registry_preserves_legacy_pp_dp_for_world_size():
-    cfg = VllmOmniConfig.from_registry("hunyuan_image3_dit").stage_by_id(0).parallel_config
+def test_from_pipeline_config_preserves_legacy_pp_dp_for_world_size():
+    cfg = _from_pipeline_key("hunyuan_image3_dit").stage_by_id(0).parallel_config
 
     assert cfg.pipeline_parallel_size == 1
     assert cfg.data_parallel_size == 1
@@ -512,7 +525,7 @@ def test_from_registry_preserves_legacy_pp_dp_for_world_size():
     assert cfg.world_size == 4
 
 
-def test_from_registry_derives_sequence_parallel_size_from_degrees(tmp_path):
+def test_from_pipeline_config_derives_sequence_parallel_size_from_degrees(tmp_path):
     deploy_path = tmp_path / "dreamzero_derived_parallel.yaml"
     deploy_path.write_text(
         "\n".join(
@@ -529,7 +542,7 @@ def test_from_registry_derives_sequence_parallel_size_from_degrees(tmp_path):
         )
     )
 
-    stage = VllmOmniConfig.from_registry("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.sequence_parallel_size == 6
@@ -542,10 +555,10 @@ def test_diffusion_parallel_config_rejects_cfg_parallel_size_outside_current_bou
 
 
 def test_stage_realizations_use_stage_specific_parallel_config_types():
-    qwen_config = VllmOmniConfig.from_registry("qwen3_tts")
+    qwen_config = _from_pipeline_key("qwen3_tts")
     ar_stage = qwen_config.stage_by_id(0)
     generation_stage = qwen_config.stage_by_id(1)
-    diffusion_stage = VllmOmniConfig.from_registry("hunyuan_image3_dit").stage_by_id(0)
+    diffusion_stage = _from_pipeline_key("hunyuan_image3_dit").stage_by_id(0)
 
     assert isinstance(ar_stage, VllmOmniARStageConfig)
     assert type(ar_stage.parallel_config) is OmniStageParallelConfig
@@ -566,7 +579,7 @@ def test_stage_realizations_use_stage_specific_parallel_config_types():
     assert diffusion_stage.parallel_config.ulysses_degree == 1
 
 
-def test_from_registry_preserves_diffusion_parallel_mask_sp_padding(tmp_path):
+def test_from_pipeline_config_preserves_diffusion_parallel_mask_sp_padding(tmp_path):
     deploy_path = tmp_path / "dreamzero_mask_sp_padding.yaml"
     deploy_path.write_text(
         "\n".join(
@@ -581,17 +594,17 @@ def test_from_registry_preserves_diffusion_parallel_mask_sp_padding(tmp_path):
         )
     )
 
-    stage = VllmOmniConfig.from_registry("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.mask_sp_padding is True
 
 
-def test_from_registry_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
+def test_from_pipeline_config_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
-    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("qwen3_tts"))[0]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
-    omni_stage = VllmOmniConfig.from_registry("qwen3_tts").stage_by_id(legacy_stage.stage_id)
+    omni_stage = _from_pipeline_key("qwen3_tts").stage_by_id(legacy_stage.stage_id)
 
     assert omega_stage.stage_id == omni_stage.stage_id
     assert omega_stage.stage_type == omni_stage.stage_type.value
@@ -606,11 +619,93 @@ def test_from_registry_matches_stage_config_to_omegaconf_behavior_for_representa
     assert omega_stage.runtime.requires_multimodal_data == omni_stage.requires_multimodal_data
 
 
-def test_from_registry_matches_to_omegaconf_diffusion_parallel_config():
+def test_from_pipeline_config_uses_hf_config_for_callable_resolver():
+    hf_config = Qwen3OmniMoeConfig()
+    hf_config.enable_audio_output = False
+
+    omni_config = _from_pipeline_key("qwen3_omni_moe", hf_config=hf_config)
+
+    assert omni_config.pipeline_config.model_type == "qwen3_omni_moe_thinker_only"
+    assert len(omni_config.stage_configs) == 1
+    assert omni_config.orchestrator_config.deploy_config_path is None
+
+    thinker = omni_config.stage_configs[0]
+    assert thinker.model_stage == "thinker"
+    assert thinker.model_config.default_sampling_params == {"detokenize": True}
+
+
+def test_from_pipeline_config_accepts_pre_resolved_pipeline():
+    resolved_pipeline = PipelineConfig(model_type="callable_resolved_variant")
+
+    omni_config = VllmOmniConfig.from_pipeline_config(resolved_pipeline)
+
+    assert omni_config.pipeline_config is resolved_pipeline
+
+
+def test_from_pipeline_config_prefers_loaded_user_deploy_config(monkeypatch):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    user_deploy_config = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0, max_num_seqs=7)],
+    )
+    monkeypatch.setattr(
+        omni_config_module,
+        "load_deploy_config",
+        lambda _path: pytest.fail("default deploy config should not be loaded"),
+    )
+
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=user_deploy_config,
+    )
+
+    assert omni_config.stage_by_id(0).scheduler_config.max_num_seqs == 7
+
+
+def test_from_pipeline_config_default_deploy_name_ignores_cwd(monkeypatch, tmp_path):
+    default_name = "pipeline_default.yaml"
+    (tmp_path / default_name).write_text("stages: []\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    pipeline = PipelineConfig(
+        model_type="pipeline_with_default",
+        default_deploy_config_name=default_name,
+    )
+    loaded_paths = []
+
+    def _load_deploy_config(path):
+        loaded_paths.append(Path(path))
+        return DeployConfig()
+
+    monkeypatch.setattr(omni_config_module, "load_deploy_config", _load_deploy_config)
+
+    omni_config = VllmOmniConfig.from_pipeline_config(pipeline)
+
+    assert omni_config.orchestrator_config.deploy_config_path == str(_DEPLOY_DIR / default_name)
+    assert loaded_paths == [_DEPLOY_DIR / default_name]
+
+
+def test_from_pipeline_config_uses_resolved_deploy_pipeline():
+    deploy_path = get_deploy_config_path("aura_omni.yaml")
+    pipeline = _resolve_pipeline_or_skip("aura_omni")
+
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        deploy_config_path=str(deploy_path),
+    )
+
+    assert omni_config.pipeline_config.model_type == "aura_omni"
+    assert [stage.model_stage for stage in omni_config.stage_configs] == [
+        "asr",
+        "aura",
+        "qwen3_tts",
+        "code2wav",
+    ]
+
+
+def test_from_pipeline_config_matches_to_omegaconf_diffusion_parallel_config():
     pipeline = _resolve_pipeline_or_skip("hunyuan_image3_dit")
-    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("hunyuan_image3_dit"))[0]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
-    omni_stage = VllmOmniConfig.from_registry("hunyuan_image3_dit").stage_by_id(legacy_stage.stage_id)
+    omni_stage = _from_pipeline_key("hunyuan_image3_dit").stage_by_id(legacy_stage.stage_id)
 
     assert (
         omega_stage.engine_args.parallel_config.pipeline_parallel_size
@@ -631,19 +726,19 @@ def test_from_registry_matches_to_omegaconf_diffusion_parallel_config():
     )
 
 
-def test_from_registry_matches_build_engine_args_dict_behavior_for_representative_stage(monkeypatch):
+def test_from_pipeline_config_matches_build_engine_args_dict_behavior_for_representative_stage(monkeypatch):
     from vllm_omni.engine import stage_init_utils
 
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
-    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy("qwen3_tts"))[0]
+    legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
     legacy_engine_args = build_engine_args_dict(
         omega_stage,
         model="/tmp/qwen3-tts",
         stage_connector_spec={"name": "SharedMemoryConnector", "extra": {}},
     )
-    omni_stage = VllmOmniConfig.from_registry("qwen3_tts").stage_by_id(legacy_stage.stage_id)
+    omni_stage = _from_pipeline_key("qwen3_tts").stage_by_id(legacy_stage.stage_id)
 
     assert legacy_engine_args["model"] == "/tmp/qwen3-tts"
     assert legacy_engine_args["stage_id"] == omni_stage.stage_id
@@ -657,8 +752,8 @@ def test_from_registry_matches_build_engine_args_dict_behavior_for_representativ
     assert omni_stage.model_config.has_sampling_extra_args == legacy_engine_args["has_sampling_extra_args"]
 
 
-def test_from_registry_derives_has_sampling_extra_args_from_stage_defaults():
-    stage = VllmOmniConfig.from_registry("voxtral_tts").stage_by_id(0)
+def test_from_pipeline_config_derives_has_sampling_extra_args_from_stage_defaults():
+    stage = _from_pipeline_key("voxtral_tts").stage_by_id(0)
 
     assert (stage.model_config.default_sampling_params or {}).get("extra_args")
     assert stage.model_config.has_sampling_extra_args is True
@@ -709,7 +804,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
-def test_from_registry_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
+def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
     deploy_path = tmp_path / "dreamzero_diffusion_aliases.yaml"
     deploy_path.write_text(
         "\n".join(
@@ -723,7 +818,7 @@ def test_from_registry_normalizes_diffusion_config_aliases_from_engine_args(tmp_
         )
     )
 
-    stage = VllmOmniConfig.from_registry(
+    stage = _from_pipeline_key(
         "dreamzero",
         deploy_config_path=str(deploy_path),
     ).stage_by_id(0)

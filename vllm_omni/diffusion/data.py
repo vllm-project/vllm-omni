@@ -664,6 +664,9 @@ class OmniDiffusionConfig:
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
+    # MoE kernel backend selection
+    moe_backend: str = "auto"
+
     # Compilation
     enforce_eager: bool = False
 

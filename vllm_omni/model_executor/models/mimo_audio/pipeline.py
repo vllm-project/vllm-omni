@@ -23,6 +23,7 @@ _IM_END_TOKEN_ID = 151645
 
 MIMO_AUDIO_PIPELINE = PipelineConfig(
     model_type="mimo_audio",
+    default_deploy_config_name="mimo_audio.yaml",
     # HF ``architectures: ["MiMoAudioModel"]`` is also the registry key in
     # ``model_executor/models/registry.py``; it resolves to the internal
     # class ``MiMoAudioForConditionalGeneration`` in ``mimo_audio.py``.

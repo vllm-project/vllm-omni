@@ -3,7 +3,7 @@
 In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while a deploy configuration controls how those stages run. Models that have not migrated to this split still use legacy stage configurations with a `stage_args` schema.
 
 !!! note
-    Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when neither `--stage-configs-path` nor `--deploy-config` is provided — the model registry resolves the right pipeline + deploy YAML by `model_type`. The bundled defaults have been verified on 1xH100 for Qwen2.5-Omni and 2xH100 for Qwen3-Omni. Models that have not yet migrated to the new schema continue to use the legacy `vllm_omni/model_executor/stage_configs/<model>.yaml` files via `--stage-configs-path`.
+    Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when neither `--stage-configs-path` nor `--deploy-config` is provided — the model registry resolves the right pipeline + deploy YAML by `model_type`. Custom legacy `stage_args` YAMLs are still accepted via `--stage-configs-path`.
 
 ## Deploy configuration schema
 
