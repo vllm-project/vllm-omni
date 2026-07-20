@@ -6,13 +6,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
 )
 from vllm_omni.platforms import current_omni_platform
-
-from tests.helpers.mark import hardware_test
 
 # CPU unit tests are marked core_model + cpu. The multi-GPU correctness test at
 # the end uses hardware_test (H100 x2) plus full_model / diffusion / parallel.
