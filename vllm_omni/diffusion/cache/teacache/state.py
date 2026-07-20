@@ -26,6 +26,7 @@ class TeaCacheState:
         # Caching state
         self.accumulated_rel_l1_distance = 0.0
         self.previous_modulated_input: torch.Tensor | None = None
+        self.previous_cache_indicator: torch.Tensor | None = None
         self.previous_residual: torch.Tensor | None = None
         self.previous_residual_encoder: torch.Tensor | None = None
 
@@ -34,5 +35,6 @@ class TeaCacheState:
         self.cnt = 0
         self.accumulated_rel_l1_distance = 0.0
         self.previous_modulated_input = None
+        self.previous_cache_indicator = None
         self.previous_residual = None
         self.previous_residual_encoder = None

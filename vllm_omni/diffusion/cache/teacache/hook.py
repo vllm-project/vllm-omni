@@ -23,7 +23,9 @@ from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_sp_group,
 )
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
 
 
@@ -114,6 +116,13 @@ class TeaCacheHook(ModelHook):
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
 
+        # Warmup/direct forwards without a denoising-step identity must be a
+        # cache no-op. The extractor may still do model-specific preprocessing
+        # (VACE computes fresh hints here), but no residual is read or retained.
+        if not ctx.cacheable:
+            outputs = ctx.run_transformer_blocks()
+            return ctx.postprocess(outputs[0])
+
         # ============================================================================
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
@@ -122,13 +131,17 @@ class TeaCacheHook(ModelHook):
         #   - cfg_rank 0: positive branch
         #   - cfg_rank > 0: negative branch
         # Without CFG-parallel, branches alternate within a single rank
-        if getattr(module, "do_true_cfg", False):
+        explicit_branch = get_forward_context().cfg_branch if is_forward_context_available() else None
+        if explicit_branch is not None:
+            cache_branch = explicit_branch
+        elif getattr(module, "do_true_cfg", False):
             cfg_parallel_size = get_classifier_free_guidance_world_size()
             if cfg_parallel_size > 1:
                 cfg_rank = get_classifier_free_guidance_rank()
                 cache_branch = "negative" if cfg_rank > 0 else "positive"
             else:
-                # No CFG-parallel: use forward counter to alternate branches
+                # Keep the counter fallback for direct model callers and older
+                # pipelines that do not publish explicit branch identity.
                 cache_branch = "negative" if self._forward_cnt % 2 == 1 else "positive"
         else:
             cache_branch = "positive"
@@ -138,7 +151,12 @@ class TeaCacheHook(ModelHook):
         state = self.state_manager.get_state()
 
         # Decide whether to compute or cache based on modulated input similarity
-        should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
+        should_compute = self._should_compute_full_transformer(
+            state,
+            ctx.modulated_input,
+            ctx.cache_indicator,
+            ctx.synchronize_cache_decision,
+        )
 
         if not should_compute and state.previous_residual is not None:
             # ============================================================================
@@ -180,6 +198,7 @@ class TeaCacheHook(ModelHook):
 
         # Update state
         state.previous_modulated_input = ctx.modulated_input.detach()
+        state.previous_cache_indicator = ctx.cache_indicator.detach() if ctx.cache_indicator is not None else None
         state.cnt += 1
         self._forward_cnt += 1
 
@@ -188,7 +207,13 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         return ctx.postprocess(output)
 
-    def _should_compute_full_transformer(self, state: TeaCacheState, modulated_inp: torch.Tensor) -> bool:
+    def _should_compute_full_transformer(
+        self,
+        state: TeaCacheState,
+        modulated_inp: torch.Tensor,
+        cache_indicator: torch.Tensor | None = None,
+        synchronize_cache_decision: bool = False,
+    ) -> bool:
         """
         Determine whether to compute full transformer or reuse cached residual.
 
@@ -202,7 +227,12 @@ class TeaCacheHook(ModelHook):
 
         Args:
             state: Current TeaCacheState containing counters and cached values
-            modulated_inp: Modulated input extracted from first transformer block
+            modulated_inp: Modulated input extracted from first transformer block.
+            cache_indicator: Optional model-specific signal that must also stay
+                similar before a residual can be reused. Its relative L1 distance
+                is used directly as a conservative, uncalibrated gate.
+            synchronize_cache_decision: Reduce the local cache distance across
+                the sequence-parallel group before applying the threshold.
 
         Returns:
             True to compute full transformer, False to reuse cached residual
@@ -214,6 +244,7 @@ class TeaCacheHook(ModelHook):
 
         # Need previous input for comparison
         if state.previous_modulated_input is None:
+            state.accumulated_rel_l1_distance = 0.0
             return True
 
         # Compute relative L1 distance between consecutive modulated inputs
@@ -227,8 +258,42 @@ class TeaCacheHook(ModelHook):
         )
 
         # Apply model-specific polynomial rescaling
-        rescaled_distance = float(self.rescale_func(rel_distance))
-        state.accumulated_rel_l1_distance += abs(rescaled_distance)
+        rescaled_distance = abs(float(self.rescale_func(rel_distance)))
+
+        # Some architectures have conditioning branches whose outputs are not
+        # represented by the first main-block modulation. VACE is one example:
+        # its hints are injected after selected main blocks. Require that the
+        # model-specific indicator is also stable before reusing a residual.
+        previous_cache_indicator = state.previous_cache_indicator
+        if (cache_indicator is None) != (previous_cache_indicator is None):
+            state.accumulated_rel_l1_distance = 0.0
+            return True
+        if cache_indicator is not None and previous_cache_indicator is not None:
+            indicator_distance = (
+                (
+                    (cache_indicator - previous_cache_indicator).abs().mean()
+                    / (previous_cache_indicator.abs().mean() + 1e-8)
+                )
+                .cpu()
+                .item()
+            )
+            rescaled_distance = max(rescaled_distance, indicator_distance)
+
+        if synchronize_cache_decision:
+            # SP ranks hold different token shards. A single MAX reduction keeps
+            # their skip/full-compute control flow identical without gathering
+            # any activation-sized cache signals.
+            distance_tensor = modulated_inp.new_tensor(rescaled_distance, dtype=torch.float32)
+            rescaled_distance = float(
+                get_sp_group()
+                .all_reduce(
+                    distance_tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                )
+                .item()
+            )
+
+        state.accumulated_rel_l1_distance += rescaled_distance
 
         # Decision: below threshold = cache, above = compute
         if state.accumulated_rel_l1_distance < self.config.rel_l1_thresh:
