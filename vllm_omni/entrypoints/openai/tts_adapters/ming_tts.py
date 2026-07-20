@@ -3,13 +3,14 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
+
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-
-from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -42,6 +43,14 @@ class MingTTSAdapter(ARTTSAdapter):
                 if request.speaker_embedding is None:
                     raise ValueError(f"Speaker embedding for uploaded voice '{request.voice}' is missing")
             else:
+                if request.speaker_embedding is None:
+                    request.speaker_embedding = server._get_uploaded_speaker_embedding(
+                        request.voice,
+                        expected_source="audio",
+                        expected_dim=SPEAKER_EMBEDDING_DIM,
+                    )
+                if request.speaker_embedding is None:
+                    raise ValueError(f"Speaker embedding for uploaded voice '{request.voice}' is missing")
                 ref_audio_source = server._get_uploaded_audio_data(request.voice)
                 if not ref_audio_source:
                     raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing")
@@ -73,11 +82,12 @@ class MingTTSAdapter(ARTTSAdapter):
             if not request.speaker_embedding:
                 return "'speaker_embedding' must be a non-empty list of floats"
             emb_len = len(request.speaker_embedding)
-            if emb_len != 192:
+            if emb_len != SPEAKER_EMBEDDING_DIM:
                 logger.warning(
-                    "speaker_embedding has %d dimensions; Ming dense expects 192. "
+                    "speaker_embedding has %d dimensions; Ming dense expects %d. "
                     "Wrong dimensions will likely fail or degrade output.",
                     emb_len,
+                    SPEAKER_EMBEDDING_DIM,
                 )
 
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
@@ -127,8 +137,10 @@ class MingTTSAdapter(ARTTSAdapter):
                 )
             if embeddings and isinstance(embeddings[0], list):
                 for item in embeddings:
-                    if len(item) != 192:
-                        return "Podcast-style Ming speaker embeddings must each have 192 dimensions"
+                    if len(item) != SPEAKER_EMBEDDING_DIM:
+                        return (
+                            f"Podcast-style Ming speaker embeddings must each have {SPEAKER_EMBEDDING_DIM} dimensions"
+                        )
 
         if request.instructions and len(request.instructions) > server._max_instructions_length:
             return f"Instructions too long (max {server._max_instructions_length} characters)"
