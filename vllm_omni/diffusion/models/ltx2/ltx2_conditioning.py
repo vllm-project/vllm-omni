@@ -297,9 +297,10 @@ class LTXI2VConditioningMixin:
             resample="bilinear",
         )
 
+    @torch.no_grad()
     def forward(self, req: Any, image: Any | None = None, *args: Any, **kwargs: Any) -> Any:
-        """Preserve the public I2V positional API while sharing the T2V runner."""
-        return super().forward(req, *args, image=image, **kwargs)
+        """Route I2V inputs through the task-neutral private runner."""
+        return self._forward_request(req, *args, image=image, **kwargs)
 
     @staticmethod
     def _resolve_single_prompt_image(raw_image: Any) -> Any:

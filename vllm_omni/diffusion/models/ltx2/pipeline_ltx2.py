@@ -62,8 +62,7 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
         )
         return self.decode_phase(phase)
 
-    @torch.no_grad()
-    def forward(
+    def _forward_request(
         self,
         req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
@@ -129,6 +128,57 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
             **forward_kwargs,
         )
 
+    @torch.no_grad()
+    def forward(
+        self,
+        req: DiffusionRequestBatch,
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_frames: int | None = None,
+        frame_rate: float | None = None,
+        num_inference_steps: int | None = None,
+        sigmas: list[float] | None = None,
+        guidance_scale: float | None = None,
+        num_videos_per_prompt: int | None = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        audio_latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        decode_timestep: float | list[float] = 0.0,
+        decode_noise_scale: float | list[float] | None = None,
+        output_type: str = "np",
+        max_sequence_length: int | None = None,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        return self._forward_request(
+            req,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            guidance_scale=guidance_scale,
+            num_videos_per_prompt=num_videos_per_prompt,
+            generator=generator,
+            latents=latents,
+            audio_latents=audio_latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            output_type=output_type,
+            max_sequence_length=max_sequence_length,
+        )
+
 
 class LTX2Pipeline(LTXOneStagePipeline):
     """LTX2 one-stage text-to-video entry."""
@@ -152,70 +202,6 @@ class LTX23Pipeline(LTXOneStagePipeline):
     _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
     _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
     _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
-
-    @torch.no_grad()
-    def forward(
-        self,
-        req: DiffusionRequestBatch,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_frames: int | None = None,
-        frame_rate: float | None = None,
-        num_inference_steps: int | None = None,
-        sigmas: list[float] | None = None,
-        timesteps: list[int] | None = None,
-        guidance_scale: float = 4.0,
-        noise_scale: float = 0.0,
-        num_videos_per_prompt: int | None = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        audio_latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        prompt_attention_mask: torch.Tensor | None = None,
-        negative_prompt_attention_mask: torch.Tensor | None = None,
-        decode_timestep: float | list[float] = 0.0,
-        decode_noise_scale: float | list[float] | None = None,
-        output_type: str = "np",
-        return_dict: bool = True,
-        attention_kwargs: dict[str, Any] | None = None,
-        max_sequence_length: int | None = None,
-        *,
-        image: Any | None = None,
-    ) -> DiffusionOutput | list[DiffusionOutput]:
-        """Preserve the pre-refactor LTX2.3 positional argument order."""
-        return super().forward(
-            req,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            num_inference_steps=num_inference_steps,
-            sigmas=sigmas,
-            timesteps=timesteps,
-            guidance_scale=guidance_scale,
-            guidance_rescale=0.0,
-            noise_scale=noise_scale,
-            num_videos_per_prompt=num_videos_per_prompt,
-            generator=generator,
-            latents=latents,
-            audio_latents=audio_latents,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            decode_timestep=decode_timestep,
-            decode_noise_scale=decode_noise_scale,
-            output_type=output_type,
-            return_dict=return_dict,
-            attention_kwargs=attention_kwargs,
-            max_sequence_length=max_sequence_length,
-            image=image,
-        )
 
 
 class LTX2ImageToVideoPipeline(LTXI2VConditioningMixin, LTX2Pipeline):

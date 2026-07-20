@@ -94,8 +94,7 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         )
         return self.decode_phase(stage2)
 
-    @torch.no_grad()
-    def forward(
+    def _forward_request(
         self,
         req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
@@ -105,10 +104,7 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         num_frames: int | None = None,
         frame_rate: float | None = None,
         num_inference_steps: int | None = None,
-        timesteps: list[int] | None = None,
         guidance_scale: float | None = None,
-        guidance_rescale: float | None = None,
-        noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
@@ -120,13 +116,10 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         decode_timestep: float | list[float] = 0.0,
         decode_noise_scale: float | list[float] | None = None,
         output_type: str = "np",
-        return_dict: bool = True,
-        attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
         *,
         image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
-        del return_dict
         request_inputs = self._resolve_request_inputs(
             req,
             prompt=prompt,
@@ -136,9 +129,7 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
             num_frames=num_frames,
             frame_rate=frame_rate,
             num_inference_steps=num_inference_steps,
-            timesteps=timesteps,
             guidance_scale=guidance_scale,
-            guidance_rescale=guidance_rescale,
             num_videos_per_prompt=num_videos_per_prompt,
             generator=generator,
             latents=latents,
@@ -152,22 +143,17 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
             output_type=output_type,
             max_sequence_length=max_sequence_length,
         )
-        if self.support_image_input:
-            image = self._resolve_request_image(req, image, request_inputs)
+        image = self._resolve_request_image(req, image, request_inputs)
         return self._run_two_stage(
             req,
             request_inputs,
             image=image,
         )
 
-
-class LTX2ImageToVideoTwoStagesPipeline(LTXI2VConditioningMixin, LTX2TwoStagesPipeline):
-    """LTX2 two-stage image-to-video entry."""
-
+    @torch.no_grad()
     def forward(
         self,
         req: DiffusionRequestBatch,
-        image: Any | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -175,22 +161,44 @@ class LTX2ImageToVideoTwoStagesPipeline(LTXI2VConditioningMixin, LTX2TwoStagesPi
         num_frames: int | None = None,
         frame_rate: float | None = None,
         num_inference_steps: int | None = None,
-        sigmas: list[float] | None = None,
-        *args: Any,
-        **kwargs: Any,
+        guidance_scale: float | None = None,
+        num_videos_per_prompt: int | None = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        audio_latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        decode_timestep: float | list[float] = 0.0,
+        decode_noise_scale: float | list[float] | None = None,
+        output_type: str = "np",
+        max_sequence_length: int | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
-        """Preserve the legacy I2V sigma slot, which was ignored by this pipeline."""
-        del sigmas
-        return super().forward(
+        return self._forward_request(
             req,
-            image,
-            prompt,
-            negative_prompt,
-            height,
-            width,
-            num_frames,
-            frame_rate,
-            num_inference_steps,
-            *args,
-            **kwargs,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            num_videos_per_prompt=num_videos_per_prompt,
+            generator=generator,
+            latents=latents,
+            audio_latents=audio_latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            output_type=output_type,
+            max_sequence_length=max_sequence_length,
         )
+
+
+class LTX2ImageToVideoTwoStagesPipeline(LTXI2VConditioningMixin, LTX2TwoStagesPipeline):
+    """LTX2 two-stage image-to-video entry."""
