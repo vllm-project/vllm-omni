@@ -28,6 +28,7 @@ from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationStatus,
+    VideoParams,
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
@@ -438,6 +439,75 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     input_image = prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (96, 64)
+
+
+@pytest.mark.parametrize(
+    ("generation_request", "expected"),
+    [
+        (
+            VideoGenerationRequest(
+                prompt="top-level fields",
+                seconds="4",
+                width=320,
+                height=192,
+                num_frames=121,
+                fps=12,
+                extra_params={"_vllm_request_context": {"user_override": True}},
+            ),
+            {
+                "seconds": "4",
+                "num_frames_explicit": True,
+                "fps_explicit": True,
+                "width_explicit": True,
+                "height_explicit": True,
+                "size_explicit": False,
+            },
+        ),
+        (
+            VideoGenerationRequest(
+                prompt="nested fields",
+                seconds="4",
+                fps=None,
+                video_params=VideoParams(
+                    width=320,
+                    height=192,
+                    num_frames=121,
+                    fps=12,
+                ),
+            ),
+            {
+                "seconds": "4",
+                "num_frames_explicit": True,
+                "fps_explicit": True,
+                "width_explicit": True,
+                "height_explicit": True,
+                "size_explicit": False,
+            },
+        ),
+        (
+            VideoGenerationRequest(prompt="size field", size="320x192"),
+            {
+                "seconds": None,
+                "num_frames_explicit": False,
+                "fps_explicit": False,
+                "width_explicit": False,
+                "height_explicit": False,
+                "size_explicit": True,
+            },
+        ),
+    ],
+)
+def test_video_generation_preserves_request_field_provenance(generation_request, expected):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    )
+
+    asyncio.run(handler._run_and_extract(generation_request, "request-context"))
+
+    context = engine.captured_sampling_params_list[0].extra_args["_vllm_request_context"]
+    assert context == expected
 
 
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
