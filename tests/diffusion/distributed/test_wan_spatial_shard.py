@@ -12,12 +12,11 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-# Module-level markers apply to the CPU unit tests below. The multi-GPU
-# correctness test at the end of the file adds the nightly/distributed markers
-# and a skip guard so it only runs where >= 2 CUDA devices are available.
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+# CPU unit tests are marked core_model + cpu. The multi-GPU correctness test at
+# the end of the file carries full_model / diffusion / parallel / distributed_cuda.
 
-
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_pads_uneven_height():
     x = torch.arange(1 * 1 * 1 * 5 * 2, dtype=torch.float32).reshape(1, 1, 1, 5, 2)
 
@@ -34,6 +33,8 @@ def test_split_for_parallel_decode_pads_uneven_height():
     assert torch.equal(local[..., 1, :], torch.zeros_like(local[..., 1, :]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_pads_uneven_width():
     x = torch.arange(1 * 1 * 1 * 2 * 5, dtype=torch.float32).reshape(1, 1, 1, 2, 5)
 
@@ -51,6 +52,8 @@ def test_split_for_parallel_decode_pads_uneven_width():
     assert torch.equal(local[..., :, 1], torch.zeros_like(local[..., :, 1]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_rejects_invalid_split_dim():
     x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
 
@@ -64,6 +67,8 @@ def test_split_for_parallel_decode_rejects_invalid_split_dim():
         )
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_rejects_zero_world_size():
     x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
 
@@ -76,6 +81,8 @@ def test_split_for_parallel_decode_rejects_zero_world_size():
         )
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_rejects_rank_out_of_range():
     x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
 
@@ -88,6 +95,8 @@ def test_split_for_parallel_decode_rejects_rank_out_of_range():
         )
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_gather_and_trim_height(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 3))
 
@@ -104,6 +113,8 @@ def test_gather_and_trim_height(monkeypatch: pytest.MonkeyPatch):
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_gather_and_trim_width(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 3))
 
@@ -120,6 +131,8 @@ def test_gather_and_trim_width(monkeypatch: pytest.MonkeyPatch):
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_gather_and_trim_rank0_only_assembles_on_rank0(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 3))
 
@@ -136,6 +149,8 @@ def test_gather_and_trim_rank0_only_assembles_on_rank0(monkeypatch: pytest.Monke
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_gather_and_trim_rank0_only_returns_empty_on_non_zero_rank(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (1, 3))
 
@@ -156,6 +171,8 @@ def test_gather_and_trim_rank0_only_returns_empty_on_non_zero_rank(monkeypatch: 
     assert out.numel() == 0
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_reshard_from_trimmed_height_pads_invalid_rows(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (2, 3))
 
@@ -183,6 +200,8 @@ def test_reshard_from_trimmed_height_pads_invalid_rows(monkeypatch: pytest.Monke
     assert torch.equal(out.flatten(), torch.tensor([4.0, 0.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_reshard_from_trimmed_width_pads_invalid_columns(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (2, 3))
 
@@ -210,6 +229,8 @@ def test_reshard_from_trimmed_width_pads_invalid_columns(monkeypatch: pytest.Mon
     assert torch.equal(out.flatten(), torch.tensor([4.0, 0.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_halo_exchange_single_rank_noop(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 1))
 
@@ -225,6 +246,8 @@ def test_halo_exchange_single_rank_noop(monkeypatch: pytest.MonkeyPatch):
     assert recv_bottom is None
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_dist_zero_pad_only_applies_global_height_edges(monkeypatch: pytest.MonkeyPatch):
     x = torch.ones((1, 1, 2, 2))
 
@@ -239,6 +262,8 @@ def test_dist_zero_pad_only_applies_global_height_edges(monkeypatch: pytest.Monk
     assert last.shape == (1, 1, 3, 3)
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_dist_zero_pad_only_applies_global_width_edges(monkeypatch: pytest.MonkeyPatch):
     x = torch.ones((1, 1, 2, 2))
 
@@ -253,6 +278,8 @@ def test_dist_zero_pad_only_applies_global_width_edges(monkeypatch: pytest.Monke
     assert last.shape == (1, 1, 2, 3)
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_spatial_shard_height_gate_falls_back_for_partial_group(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan.dist.get_world_size",
@@ -270,6 +297,8 @@ def test_spatial_shard_height_gate_falls_back_for_partial_group(monkeypatch: pyt
     assert vae._spatial_shard_decode_enabled(z) is False
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_spatial_shard_width_gate_selects_width(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan.dist.get_world_size",
@@ -286,6 +315,8 @@ def test_spatial_shard_width_gate_selects_width(monkeypatch: pytest.MonkeyPatch)
     assert vae._spatial_shard_decode_enabled(z) is True
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_tile_mode_disables_spatial_shard_decode():
     vae = DistributedAutoencoderKLWan.__new__(DistributedAutoencoderKLWan)
     vae.distributed_executor = SimpleNamespace(group=object(), parallel_size=2, parallel_mode="tile")
