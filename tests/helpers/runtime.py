@@ -1795,6 +1795,7 @@ class OpenAIClientHandler:
             "instructions",
             "speed",
             "stream_format",
+            "x_vector_only_mode",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]

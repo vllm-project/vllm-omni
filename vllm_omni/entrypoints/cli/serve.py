@@ -824,6 +824,7 @@ def run_headless(args: TrackingNamespace) -> None:
         model,
         stage_configs_path,
         args_dict,
+        trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
         deploy_config_path=args_dict.get("deploy_config"),
         stage_overrides=stage_overrides,
         strategy_config_path=args_dict.get("strategy_config"),

@@ -28,11 +28,18 @@ def test_dreamzero_config_sets_model_class_and_policy_config(monkeypatch):
         classmethod(lambda _cls, model, trust_remote_code=True: "vla"),
     )
     monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.hf_utils._looks_like_dreamzero",
+        "vllm_omni.config.config_factory.StageConfigFactory.get_hf_config",
+        classmethod(lambda _cls, model, trust_remote_code=True: None),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.config.config_factory._looks_like_dreamzero",
         lambda _model: True,
     )
 
-    stage_configs, _ = load_stage_configs_from_model("GEAR-Dreams/DreamZero-DROID")
+    stage_configs, _ = load_stage_configs_from_model(
+        "GEAR-Dreams/DreamZero-DROID",
+        trust_remote_code=False,
+    )
     engine_args = stage_configs[0].engine_args
 
     assert engine_args.model_class_name == "DreamZeroPipeline"

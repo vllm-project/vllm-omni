@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# Extract steps from .buildkite/test-nightly.yml that contain pytest, synthesize
+# Extract steps from .buildkite/cuda/test-nightly.yml that contain pytest, synthesize
 # small bash wrappers (exports + pytest), run them, and tee output to logs named
 # after each step's Buildkite "key" when present (otherwise a slug of the label).
 # YAML steps whose label contains "Perf Test" run first, then
@@ -51,17 +51,17 @@
 # Usage:
 #   bash path/to/run_nightly_jobs.sh
 #   REPO_ROOT=/path/to/vllm-omni bash path/to/run_nightly_jobs.sh --test-type perf,acc --dry-run
-#   YML=/path/to/vllm-omni/.buildkite/test-nightly.yml bash path/to/run_nightly_jobs.sh
+#   YML=/path/to/vllm-omni/.buildkite/cuda/test-nightly.yml bash path/to/run_nightly_jobs.sh
 #
 # Repository / YAML (no dependency on where this script lives):
-#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/test-nightly.yml
+#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/cuda/test-nightly.yml
 #   • Or set YML (or --yaml) — repo root is inferred as parent of the .buildkite directory
 #   • Or run from inside the clone: git rev-parse --show-toplevel, else walk up from $PWD,
-#     then from the script's directory, until .buildkite/test-nightly.yml exists
+#     then from the script's directory, until .buildkite/cuda/test-nightly.yml exists
 #
 # Optional environment:
 #   REPO_ROOT     - vllm-omni root (working directory for pytest); see above
-#   YML           - path to test-nightly.yml (default: $REPO_ROOT/.buildkite/test-nightly.yml)
+#   YML           - path to test-nightly.yml (default: $REPO_ROOT/.buildkite/cuda/test-nightly.yml)
 #   LOG_DIR       - logs + generated job scripts; when unset, a timestamped directory under
 #                   $REPO_ROOT/logs/ is created:
 #                     nightly_jobs_YYYYMMDD-HHMMSS       (default / YAML nightly steps)
@@ -247,7 +247,7 @@ _nightly_log_dir_basename() {
   fi
 }
 
-BUILDKITE_REL=".buildkite/test-nightly.yml"
+BUILDKITE_REL=".buildkite/cuda/test-nightly.yml"
 
 _find_repo_containing_nightly() {
   local dir="${1:-}"
@@ -267,8 +267,14 @@ _derive_repo_root_from_yml() {
   local yml="$1"
   local d
   d="$(cd "$(dirname "${yml}")" && pwd)"
-  [[ "$(basename "${d}")" == ".buildkite" ]] || return 1
-  printf '%s\n' "$(dirname "${d}")"
+  while [[ "${d}" != "/" ]]; do
+    if [[ "$(basename "${d}")" == ".buildkite" ]]; then
+      printf '%s\n' "$(dirname "${d}")"
+      return 0
+    fi
+    d="$(dirname "${d}")"
+  done
+  return 1
 }
 
 # Resolve REPO_ROOT, YML (no relative path between script and repo)
@@ -278,7 +284,7 @@ if [[ -n "${YML:-}" && -n "${REPO_ROOT:-}" ]]; then
 elif [[ -n "${YML:-}" ]]; then
   YML="$(cd "$(dirname "${YML}")" && pwd)/$(basename "${YML}")"
   if ! REPO_ROOT="$(_derive_repo_root_from_yml "${YML}")"; then
-    echo "Could not derive REPO_ROOT from YML=${YML} (expected file at <repo>/.buildkite/test-nightly.yml)." >&2
+    echo "Could not derive REPO_ROOT from YML=${YML} (expected file at <repo>/.buildkite/cuda/test-nightly.yml)." >&2
     echo "Set REPO_ROOT explicitly (or pass --repo-root) for pytest working directory." >&2
     exit 2
   fi

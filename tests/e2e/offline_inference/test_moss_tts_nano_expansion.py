@@ -29,6 +29,7 @@ STAGE_CONFIG = get_deploy_config_path("moss_tts_nano.yaml")
 _OMNI_RUNNER_PARAM = (
     MODEL_NAME,
     STAGE_CONFIG,
+    {"trust_remote_code": True},
 )
 
 pytestmark = [
