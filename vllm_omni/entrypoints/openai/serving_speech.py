@@ -322,8 +322,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._ref_audio_resolve_cache_bytes = 0
         self._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
         self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
-        self._ref_audio_model_artifact_ready: set[str] = set()
-        self._request_ref_audio_artifact_keys: dict[str, str] = {}
+        # Readiness is keyed by (artifact_key, x_vector_only). An x-vector-only
+        # request caches a speaker embedding but no ref_code, so its artifact
+        # must not satisfy a later ICL request that needs ref_code (#5049).
+        self._ref_audio_model_artifact_ready: set[tuple[str, bool]] = set()
+        self._request_ref_audio_artifact_keys: dict[str, tuple[str, bool]] = {}
         self._higgs_audio_v3_ref_code_cache: OrderedDict[str, tuple[torch.Tensor, int]] = OrderedDict()
         self._higgs_audio_v3_ref_code_cache_bytes = 0
         self._higgs_audio_v3_ref_code_inflight: dict[str, asyncio.Task[torch.Tensor]] = {}
@@ -2069,23 +2072,35 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _discard_ref_audio_artifact_ready_if_unreferenced(self, artifact_key: str) -> None:
         if artifact_key and all(entry[3] != artifact_key for entry in self._ref_audio_resolve_cache.values()):
-            self._ref_audio_model_artifact_ready.discard(artifact_key)
+            self._ref_audio_model_artifact_ready = {
+                (key, mode) for (key, mode) in self._ref_audio_model_artifact_ready if key != artifact_key
+            }
+
+    @staticmethod
+    def _tts_x_vector_only(tts_params: dict[str, Any]) -> bool:
+        return bool((tts_params.get("x_vector_only_mode") or [False])[0])
 
     def _qwen3_tts_can_use_ref_audio_artifact_only(self, tts_params: dict[str, Any], artifact_key: str | None) -> bool:
         if self._tts_model_type != "qwen3_tts":
             return False
-        if not artifact_key or artifact_key not in self._ref_audio_model_artifact_ready:
+        x_vector_only = self._tts_x_vector_only(tts_params)
+        if not artifact_key or (artifact_key, x_vector_only) not in self._ref_audio_model_artifact_ready:
             return False
         return (tts_params.get("task_type") or ["CustomVoice"])[0] == "Base"
 
-    def _track_ref_audio_artifact_warmup(self, request_id: str, artifact_key: str | None) -> None:
+    def _track_ref_audio_artifact_warmup(
+        self, request_id: str, artifact_key: str | None, x_vector_only: bool = False
+    ) -> None:
         if artifact_key:
-            self._request_ref_audio_artifact_keys[request_id] = artifact_key
+            self._request_ref_audio_artifact_keys[request_id] = (artifact_key, bool(x_vector_only))
 
     def _mark_ref_audio_artifact_ready_for_request(self, request_id: str) -> None:
-        artifact_key = self._request_ref_audio_artifact_keys.pop(request_id, None)
+        tracked = self._request_ref_audio_artifact_keys.pop(request_id, None)
+        if tracked is None:
+            return
+        artifact_key, x_vector_only = tracked
         if artifact_key and any(entry[3] == artifact_key for entry in self._ref_audio_resolve_cache.values()):
-            self._ref_audio_model_artifact_ready.add(artifact_key)
+            self._ref_audio_model_artifact_ready.add((artifact_key, x_vector_only))
 
     def _discard_ref_audio_artifact_warmup(self, request_id: str) -> None:
         self._request_ref_audio_artifact_keys.pop(request_id, None)
@@ -3234,7 +3249,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list=sampling_params_list,
             output_modalities=["audio"],
         )
-        self._track_ref_audio_artifact_warmup(request_id, qwen3_ref_audio_warmup_artifact_key)
+        self._track_ref_audio_artifact_warmup(
+            request_id,
+            qwen3_ref_audio_warmup_artifact_key,
+            x_vector_only=self._tts_x_vector_only(tts_params),
+        )
         return request_id, generator, tts_params
 
     async def _generate_pcm_chunks(self, generator, request_id: str, *, include_sample_rate: bool = False):

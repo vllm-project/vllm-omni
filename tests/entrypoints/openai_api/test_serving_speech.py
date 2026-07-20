@@ -3682,7 +3682,7 @@ class TestTTSAsyncOffloading:
             24000,
             artifact_key,
         )
-        qwen3_tts_server._ref_audio_model_artifact_ready.add(artifact_key)
+        qwen3_tts_server._ref_audio_model_artifact_ready.add((artifact_key, False))
         qwen3_tts_server._codec_frame_rate = 25.0
         qwen3_tts_server._tts_tokenizer = lambda _text, padding=False: {"input_ids": list(range(10))}
         qwen3_tts_server.engine_client.model_config.hf_config.talker_config = SimpleNamespace(
@@ -3712,10 +3712,10 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._ref_audio_resolve_cache_max_bytes = 1_000_000
 
         qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
-        qwen3_tts_server._ref_audio_model_artifact_ready.add("artifact-a")
+        qwen3_tts_server._ref_audio_model_artifact_ready.add(("artifact-a", False))
         qwen3_tts_server._put_resolved_ref_audio("ref-b", [0.0] * 8, 24000, "artifact-b")
 
-        assert "artifact-a" not in qwen3_tts_server._ref_audio_model_artifact_ready
+        assert ("artifact-a", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
         assert "artifact-b" in {entry[3] for entry in qwen3_tts_server._ref_audio_resolve_cache.values()}
 
     @pytest.mark.asyncio
@@ -3724,13 +3724,13 @@ class TestTTSAsyncOffloading:
             raise ValueError("boom")
             yield  # pragma: no cover
 
-        qwen3_tts_server._request_ref_audio_artifact_keys["req-fail"] = "artifact-fail"
+        qwen3_tts_server._request_ref_audio_artifact_keys["req-fail"] = ("artifact-fail", False)
 
         with pytest.raises(ValueError, match="boom"):
             await anext(qwen3_tts_server._generate_audio_chunks(failing_generator(), "req-fail"))
 
         assert "req-fail" not in qwen3_tts_server._request_ref_audio_artifact_keys
-        assert "artifact-fail" not in qwen3_tts_server._ref_audio_model_artifact_ready
+        assert ("artifact-fail", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
 
     @pytest.mark.asyncio
     async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
@@ -3743,22 +3743,48 @@ class TestTTSAsyncOffloading:
             )
             await asyncio.sleep(0)
 
-        qwen3_tts_server._request_ref_audio_artifact_keys["req-close"] = "artifact-close"
+        qwen3_tts_server._request_ref_audio_artifact_keys["req-close"] = ("artifact-close", False)
 
         stream = qwen3_tts_server._generate_audio_chunks(pcm_generator(), "req-close")
         assert await anext(stream)
         await stream.aclose()
 
         assert "req-close" not in qwen3_tts_server._request_ref_audio_artifact_keys
-        assert "artifact-close" not in qwen3_tts_server._ref_audio_model_artifact_ready
+        assert ("artifact-close", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
 
     def test_qwen3_ref_audio_artifact_ready_requires_live_resolve_cache_entry(self, qwen3_tts_server):
-        qwen3_tts_server._request_ref_audio_artifact_keys["req-evicted"] = "artifact-evicted"
+        qwen3_tts_server._request_ref_audio_artifact_keys["req-evicted"] = ("artifact-evicted", False)
 
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-evicted")
 
         assert "req-evicted" not in qwen3_tts_server._request_ref_audio_artifact_keys
-        assert "artifact-evicted" not in qwen3_tts_server._ref_audio_model_artifact_ready
+        assert ("artifact-evicted", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
+
+    def test_qwen3_xvector_ready_artifact_does_not_enable_icl_artifact_only(self, qwen3_tts_server):
+        # An x-vector-only artifact (speaker embedding, no ref_code) must not enable
+        # the artifact-only path for a later ICL request with the same ref_audio (#5049).
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
+        qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
+
+        icl_params = {"task_type": ["Base"], "x_vector_only_mode": [False]}
+        assert qwen3_tts_server._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is False
+
+    def test_qwen3_xvector_ready_artifact_still_reusable_by_xvector_request(self, qwen3_tts_server):
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
+        qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
+
+        xvec_params = {"task_type": ["Base"], "x_vector_only_mode": [True]}
+        assert qwen3_tts_server._qwen3_tts_can_use_ref_audio_artifact_only(xvec_params, "artifact-a") is True
+
+    def test_qwen3_icl_ready_artifact_enables_icl_artifact_only(self, qwen3_tts_server):
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._track_ref_audio_artifact_warmup("req-icl", "artifact-a", x_vector_only=False)
+        qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-icl")
+
+        icl_params = {"task_type": ["Base"], "x_vector_only_mode": [False]}
+        assert qwen3_tts_server._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is True
 
     def test_shutdown_is_idempotent(self, mocker: MockerFixture):
         """Calling shutdown() twice should not raise."""
