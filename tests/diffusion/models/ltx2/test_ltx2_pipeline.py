@@ -160,7 +160,6 @@ def test_ltx_one_stage_variants_share_forward_template():
     assert LTX2ImageToVideoPipeline._forward_impl is LTXOneStagePipeline._forward_impl
     assert LTX23Pipeline._forward_impl is LTXOneStagePipeline._forward_impl
     assert LTX23ImageToVideoPipeline._forward_impl is LTXOneStagePipeline._forward_impl
-    assert LTX2Pipeline.forward is LTX23Pipeline.forward
     assert LTX2ImageToVideoPipeline.forward is LTX23ImageToVideoPipeline.forward
 
 

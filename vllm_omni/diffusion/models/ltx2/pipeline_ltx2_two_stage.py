@@ -109,9 +109,8 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         num_frames: int | None = None,
         frame_rate: float | None = None,
         num_inference_steps: int | None = None,
-        sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
-        guidance_scale: float | None = None,
+        guidance_scale: float = 4.0,
         guidance_rescale: float = 0.0,
         noise_scale: float = 0.0,
         num_videos_per_prompt: int | None = 1,
@@ -131,7 +130,7 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         *,
         image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
-        del sigmas, return_dict
+        del return_dict
         request_inputs = self._resolve_request_inputs(
             req,
             prompt=prompt,
@@ -175,3 +174,34 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
 
 class LTX2ImageToVideoTwoStagesPipeline(LTXI2VConditioningMixin, LTX2TwoStagesPipeline):
     """LTX2 two-stage image-to-video entry."""
+
+    def forward(
+        self,
+        req: DiffusionRequestBatch,
+        image: Any | None = None,
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_frames: int | None = None,
+        frame_rate: float | None = None,
+        num_inference_steps: int | None = None,
+        sigmas: list[float] | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        """Preserve the legacy I2V sigma slot, which was ignored by this pipeline."""
+        del sigmas
+        return super().forward(
+            req,
+            image,
+            prompt,
+            negative_prompt,
+            height,
+            width,
+            num_frames,
+            frame_rate,
+            num_inference_steps,
+            *args,
+            **kwargs,
+        )
