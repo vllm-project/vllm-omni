@@ -83,6 +83,8 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
             guidance_scale=1.0,
             latents=upscaled_video_latent,
             audio_latents=stage1.audio,
+            decode_timestep=0.0,
+            decode_noise_scale=None,
             output_type="np",
         )
         stage2 = self.run_phase(
@@ -100,7 +102,6 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
     def forward(
         self,
         req: DiffusionRequestBatch,
-        image: Any | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -127,6 +128,8 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
+        *,
+        image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
         del sigmas, return_dict
         request_inputs = self._resolve_request_inputs(

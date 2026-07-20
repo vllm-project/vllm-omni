@@ -216,7 +216,10 @@ def _run_with_custom_transformer(model: str, output_dir: Path) -> list[Image.Ima
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
 
-    from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import create_transformer_from_config, load_transformer_config
+    from vllm_omni.diffusion.models.ltx2 import (
+        create_transformer_from_config,
+        load_transformer_config,
+    )
 
     vllm_config = VllmConfig()
     ctx = set_current_vllm_config(vllm_config)

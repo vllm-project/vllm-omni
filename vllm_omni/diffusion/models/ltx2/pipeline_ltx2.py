@@ -66,7 +66,6 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
     def forward(
         self,
         req: DiffusionRequestBatch,
-        image: Any | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -93,6 +92,8 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
+        *,
+        image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
         del return_dict
         request_inputs = self._resolve_request_inputs(

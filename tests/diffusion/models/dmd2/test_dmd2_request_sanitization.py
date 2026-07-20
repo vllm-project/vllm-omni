@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImageD
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, WanT2VDMD2Pipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline, WanI2VDMD2Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest, OmniDiffusionSamplingParams
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -154,6 +155,28 @@ def test_string_prompt_not_mutated(pipeline):
     req = _make_request(prompt="a cat dancing")
     pipeline._sanitize_dmd2_request(req)
     assert req.prompt == "a cat dancing"
+
+
+def test_request_batch_sanitizes_each_request(pipeline):
+    requests = [
+        _make_request(
+            prompt={"prompt": f"prompt-{index}", "negative_prompt": "blurry"},
+            num_inference_steps=40 + index,
+            guidance_scale=5.0 + index,
+            guidance_scale_provided=True,
+        )
+        for index in range(2)
+    ]
+
+    pipeline._sanitize_dmd2_request(DiffusionRequestBatch(requests))
+
+    for request in requests:
+        assert request.sampling_params.num_inference_steps == pipeline.dmd2_config.num_inference_steps
+        assert request.sampling_params.guidance_scale == pipeline.dmd2_config.guidance_scale
+        assert request.sampling_params.guidance_scale_provided is False
+        assert request.sampling_params.do_classifier_free_guidance is False
+        assert request.sampling_params.is_cfg_negative is False
+        assert "negative_prompt" not in request.prompt
 
 
 # ---------------------------------------------------------------------------

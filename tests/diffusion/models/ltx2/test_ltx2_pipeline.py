@@ -262,8 +262,8 @@ def test_ltx2_two_stage_reuses_prompt_context_between_phases():
         negative_prompt_embeds=None,
         prompt_attention_mask=None,
         negative_prompt_attention_mask=None,
-        decode_timestep=0.0,
-        decode_noise_scale=None,
+        decode_timestep=0.25,
+        decode_noise_scale=0.5,
         output_type="np",
         max_sequence_length=16,
     )
@@ -277,6 +277,8 @@ def test_ltx2_two_stage_reuses_prompt_context_between_phases():
         phase_calls.append((inputs, prompt_context))
         if len(phase_calls) == 1:
             assert prompt_context is None
+            assert inputs.decode_timestep == 0.25
+            assert inputs.decode_noise_scale == 0.5
             context = prompt_context_sentinel
             video = torch.tensor([1.0])
             audio = torch.tensor([2.0])
@@ -286,6 +288,8 @@ def test_ltx2_two_stage_reuses_prompt_context_between_phases():
             torch.testing.assert_close(inputs.audio_latents, torch.tensor([2.0]))
             assert inputs.guidance_scale == 1.0
             assert inputs.num_inference_steps == 3
+            assert inputs.decode_timestep == 0.0
+            assert inputs.decode_noise_scale is None
             context = prompt_context
             video = torch.tensor([3.0])
             audio = torch.tensor([4.0])
