@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from __future__ import annotations
 
 import hashlib
@@ -8,13 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import av
 import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
-import torchvision
 
-from vllm_omni.diffusion.models.internvla_a1.config import (  # noqa: E402
+from vllm_omni.diffusion.models.internvla_a1.config import (
     OBS_IMAGES,
     OBS_STATE,
     OBS_TASK,
@@ -78,30 +81,34 @@ def unnormalize_vector(values: torch.Tensor, stats: dict[str, torch.Tensor]) -> 
     return values * stats["std"] + stats["mean"]
 
 
-class TorchvisionVideoReaderCache:
-    def __init__(self, backend: str = "pyav") -> None:
-        self.backend = backend
+class PyAVVideoReaderCache:
+    def __init__(self) -> None:
         self._readers: dict[str, Any] = {}
-        torchvision.set_video_backend(backend)
 
     def get(self, path: str) -> Any:
         reader = self._readers.get(path)
         if reader is None:
-            reader = torchvision.io.VideoReader(path, "video")
+            container = av.open(path)
+            reader = {"container": container, "stream": container.streams.video[0]}
             self._readers[path] = reader
         return reader
 
     def decode_frames(self, path: str, timestamps: list[float], tolerance_s: float = 1e-4) -> torch.Tensor:
         reader = self.get(path)
+        container = reader["container"]
+        stream = reader["stream"]
+        time_base = float(stream.time_base)
+
         first_ts = min(timestamps)
         last_ts = max(timestamps)
-        reader.seek(first_ts, keyframes_only=self.backend == "pyav")
+        container.seek(max(0, int(first_ts / time_base)), stream=stream)
 
         loaded_frames: list[torch.Tensor] = []
         loaded_ts: list[float] = []
-        for frame in reader:
-            current_ts = float(frame["pts"])
-            loaded_frames.append(frame["data"])
+        for frame in container.decode(video=0):
+            current_ts = 0.0 if frame.pts is None else float(frame.pts * stream.time_base)
+            data = torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1).contiguous()
+            loaded_frames.append(data)
             loaded_ts.append(current_ts)
             if current_ts >= last_ts:
                 break
@@ -164,7 +171,7 @@ class A2DOpenLoopDataset:
         self.action_stats = _stack_stats(train_stats, self.action_keys)
         self.image_offsets = image_offsets
         self.tolerance_s = tolerance_s
-        self.video_reader = TorchvisionVideoReaderCache(backend="pyav")
+        self.video_reader = PyAVVideoReaderCache()
 
     @property
     def num_episodes(self) -> int:

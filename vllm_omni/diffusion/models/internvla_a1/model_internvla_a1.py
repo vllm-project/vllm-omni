@@ -317,6 +317,7 @@ class Qwen3VLWithExpertModel(nn.Module):
             "mrope_interleaved": True,
             "mrope_section": [24, 20, 20],
             "rope_type": "default",
+            "rope_theta": vlm_config_hf.text_config.rope_parameters["rope_theta"],
         }
         vlm_config_hf.text_config.tie_word_embeddings = True
         vlm_config_hf.tie_word_embeddings = True
@@ -515,7 +516,8 @@ class InternVLAA1(nn.Module):
         image_token_id = self.qwen3_vl_with_expert.und_expert.config.image_token_id
         pixel_values = pixel_values.view(-1, pixel_values.shape[-1])
         image_grid_thw = image_grid_thw.view(-1, 3)
-        image_embs, _ = self.qwen3_vl_with_expert.und_expert.visual(pixel_values, image_grid_thw)
+        vision_out = self.qwen3_vl_with_expert.und_expert.visual(pixel_values, image_grid_thw)
+        image_embs = vision_out.pooler_output
 
         embs = self.qwen3_vl_with_expert.und_expert.get_input_embeddings()(lang_tokens)
         batch_size, seq_len, hidden_dim = embs.shape
@@ -642,8 +644,11 @@ class InternVLAA1(nn.Module):
         attention_mask = pad_masks.to(lang_tokens)
         if image_grid_thw is not None:
             image_grid_thw = image_grid_thw.view(-1, 3)
+        image_token_id = self.qwen3_vl_with_expert.und_expert.config.image_token_id
+        mm_token_type_ids = (padded_lang_tokens == image_token_id).to(dtype=torch.int)
         return self.qwen3_vl_with_expert.und_expert.model.get_rope_index(
             padded_lang_tokens,
+            mm_token_type_ids,
             image_grid_thw,
             attention_mask=attention_mask,
         )
@@ -665,6 +670,8 @@ class InternVLAA1(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if num_steps is None:
             num_steps = self.config.num_inference_steps
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}")
         batch_size = state.shape[0]
         device = state.device
         dtype = state.dtype
@@ -939,6 +946,7 @@ class InternVLAA1Policy(nn.Module):
         batch: dict[str, Any],
         *,
         noise: torch.Tensor | None = None,
+        num_steps: int | None = None,
         decode_image: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         task = self._get_task(batch)
@@ -958,5 +966,6 @@ class InternVLAA1Policy(nn.Module):
             lang_masks,
             state,
             noise=noise,
+            num_steps=num_steps,
             decode_image=decode_image,
         )

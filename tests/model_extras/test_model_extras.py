@@ -60,6 +60,28 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_internvla_a1_extra_registry_declares_request_and_response_params() -> None:
+    from vllm_omni.model_extras.registry import _get_spec
+
+    assert get_extra_body_params("InternVLAA1Pipeline") == frozenset(
+        {
+            "num_steps",
+            "decode_image",
+        }
+    )
+    assert get_extra_output_params("InternVLAA1Pipeline") == frozenset({"decoded"})
+    assert should_init_extra_args_for_non_diffusion_stages("InternVLAA1Pipeline") is False
+
+    spec = _get_spec("InternVLAA1Pipeline")
+    assert spec is not None
+    assert callable(spec.get("observation_builder"))
+    assert callable(spec.get("action_processor"))
+    assert callable(spec.get("eval_context_loader"))
+    assert callable(spec.get("open_loop_runner"))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("pipeline_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
 def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_name: str) -> None:
     assert get_extra_body_params(pipeline_name) == frozenset(

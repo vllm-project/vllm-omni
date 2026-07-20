@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$ROOT_DIR/../../.." && pwd)"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-RESULT_ROOT="${INTERNVLA_A1_RESULT_DIR:-$REPO_ROOT/outputs/internvla_a1/collected_results/$TIMESTAMP}"
+RESULT_ROOT="${INTERNVLA_A1_RESULT_DIR:-$REPO_ROOT/outputs/observation_to_action/collected_results/$TIMESTAMP}"
 
 : "${INTERNVLA_A1_MODEL_DIR:?Please export INTERNVLA_A1_MODEL_DIR=/path/to/InternVLA-A1-3B-ft-pen}"
 : "${INTERNVLA_A1_DATASET_DIR:?Please export INTERNVLA_A1_DATASET_DIR=/path/to/Genie1-Place_Markpen}"
@@ -140,7 +140,7 @@ run_with_artifacts() {
 
 write_manifest() {
   cat >"$RESULT_ROOT/README.txt" <<EOF
-InternVLA-A1 collected results
+InternVLA-A1 collected results (via observation_to_action)
 
 Key files:
 - env_summary.txt: environment and path summary
@@ -185,7 +185,8 @@ run_with_artifacts \
 
 run_with_artifacts \
   "forward_benchmark" \
-  python "$ROOT_DIR/end2end.py" \
+  python "$ROOT_DIR/observation_to_action.py" \
+  --model-class-name InternVLAA1Pipeline \
   --model-dir "$INTERNVLA_A1_MODEL_DIR" \
   --dataset-dir "$INTERNVLA_A1_DATASET_DIR" \
   --benchmark-forward \
@@ -210,7 +211,7 @@ PY
 then
   run_with_artifacts \
     "pytest_e2e" \
-    python -m pytest -sv tests/e2e/offline_inference/test_internvla_a1.py -m advanced_model
+    python -m pytest -sv "$REPO_ROOT/tests/examples/offline_inference/test_internvla_a1.py" -m advanced_model
 else
   write_skip_artifact "pytest_e2e" "pytest is not installed in the current python environment"
 fi

@@ -34,6 +34,22 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.internvla_a1 import (
+    INTERNVLA_A1_EXTRA_BODY_PARAMS,
+    INTERNVLA_A1_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.internvla_a1 import (
+    build_observations as build_internvla_a1_observations,
+)
+from vllm_omni.model_extras.internvla_a1 import (
+    load_eval_context as load_internvla_a1_eval_context,
+)
+from vllm_omni.model_extras.internvla_a1 import (
+    process_actions as process_internvla_a1_actions,
+)
+from vllm_omni.model_extras.internvla_a1 import (
+    run_open_loop as run_internvla_a1_open_loop,
+)
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -170,6 +186,14 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
     },
+    "InternVLAA1Pipeline": {
+        "extra_body_params": INTERNVLA_A1_EXTRA_BODY_PARAMS,
+        "extra_output_params": INTERNVLA_A1_EXTRA_OUTPUT_PARAMS,
+        "observation_builder": build_internvla_a1_observations,
+        "action_processor": process_internvla_a1_actions,
+        "eval_context_loader": load_internvla_a1_eval_context,
+        "open_loop_runner": run_internvla_a1_open_loop,
+    },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
@@ -275,3 +299,39 @@ def build_image_to_video_prompt(
         else default_image_to_video_prompt
     )
     return builder(prompt, negative_prompt, media_inputs, height, width, num_frames)
+
+
+def load_eval_context(model_class_name: str | None, **kwargs: Any) -> dict[str, Any]:
+    """Load model-specific eval/dataset context for observation-to-action examples."""
+    spec = _get_spec(model_class_name)
+    loader = spec.get("eval_context_loader") if spec is not None else None
+    if loader is None:
+        raise ValueError(f"No observation-to-action eval_context_loader registered for {model_class_name!r}.")
+    return loader(**kwargs)
+
+
+def build_observations(model_class_name: str | None, **kwargs: Any) -> dict[str, Any]:
+    """Build robot observations / noise for observation-to-action examples."""
+    spec = _get_spec(model_class_name)
+    builder = spec.get("observation_builder") if spec is not None else None
+    if builder is None:
+        raise ValueError(f"No observation_builder registered for {model_class_name!r}.")
+    return builder(**kwargs)
+
+
+def process_actions(model_class_name: str | None, **kwargs: Any) -> dict[str, Any]:
+    """Post-process predicted actions for observation-to-action examples."""
+    spec = _get_spec(model_class_name)
+    processor = spec.get("action_processor") if spec is not None else None
+    if processor is None:
+        raise ValueError(f"No action_processor registered for {model_class_name!r}.")
+    return processor(**kwargs)
+
+
+def run_open_loop(model_class_name: str | None, **kwargs: Any) -> dict[str, Any]:
+    """Run model-specific open-loop evaluation for observation-to-action examples."""
+    spec = _get_spec(model_class_name)
+    runner = spec.get("open_loop_runner") if spec is not None else None
+    if runner is None:
+        raise ValueError(f"No open_loop_runner registered for {model_class_name!r}.")
+    return runner(**kwargs)

@@ -218,12 +218,14 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         batch_inputs: dict[str, Any],
         *,
         noise: torch.Tensor | None = None,
+        num_steps: int | None = None,
         decode_image: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         logger.debug("InternVLAA1Pipeline forward mode=%s", self.runtime_mode())
         return self.policy.forward(
             batch_inputs,
             noise=noise,
+            num_steps=num_steps,
             decode_image=decode_image,
         )
 
@@ -245,6 +247,7 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         output, decoded = self._predict_actions(
             batch_inputs,
             noise=extra_args.get("noise"),
+            num_steps=extra_args.get("num_steps"),
             decode_image=bool(extra_args.get("decode_image", False)),
         )
         metadata: dict[str, Any] = {}
