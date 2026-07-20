@@ -36,6 +36,7 @@ class LTXPhaseRecipe:
     sigmas: tuple[float, ...] | None = None
     noise_scale: float = 0.0
     input_transform: Literal["initial", "spatial_upsample"] = "initial"
+    transformer_phase: str = "base"
     allow_guidance_override: bool = True
     use_official_sigma_schedule: bool = True
 
@@ -158,9 +159,49 @@ LTX2_DISTILLED_TWO_STAGE_RECIPE = LTXPipelineRecipe(
 )
 
 
+def _official_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipelineRecipe:
+    return LTXPipelineRecipe(
+        height=one_stage_recipe.height * 2,
+        width=one_stage_recipe.width * 2,
+        num_frames=one_stage_recipe.num_frames,
+        frame_rate=one_stage_recipe.frame_rate,
+        num_inference_steps=one_stage_recipe.num_inference_steps,
+        negative_prompt=one_stage_recipe.negative_prompt,
+        phases=(
+            LTXPhaseRecipe(
+                name="generate_lowres",
+                guidance=one_stage_recipe.request_guidance,
+                spatial_downscale=2,
+                noise_scale=1.0,
+                transformer_phase="base",
+            ),
+            LTXPhaseRecipe(
+                name="refine",
+                guidance=LTXGuidanceSpec.positive_only(),
+                sigmas=LTX_STAGE_2_DISTILLED_SIGMAS,
+                noise_scale=LTX_STAGE_2_DISTILLED_SIGMAS[0],
+                input_transform="spatial_upsample",
+                transformer_phase="distilled_lora",
+                allow_guidance_override=False,
+                use_official_sigma_schedule=False,
+            ),
+        ),
+        video_output_phase=1,
+        audio_output_phase=1,
+        allow_request_sigmas=False,
+        allow_request_latents=False,
+    )
+
+
+LTX2_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX2_ONE_STAGE_RECIPE)
+LTX23_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX23_ONE_STAGE_RECIPE)
+
+
 _PIPELINE_RECIPES: dict[tuple[str, str], LTXPipelineRecipe] = {
     ("one_stage", "2"): LTX2_ONE_STAGE_RECIPE,
     ("one_stage", "2.3"): LTX23_ONE_STAGE_RECIPE,
+    ("two_stage", "2"): LTX2_TWO_STAGE_RECIPE,
+    ("two_stage", "2.3"): LTX23_TWO_STAGE_RECIPE,
     ("distilled_two_stage", "2"): LTX2_DISTILLED_TWO_STAGE_RECIPE,
     ("dmd2", "2"): LTX_POSITIVE_ONLY_RECIPE,
     ("dmd2", "2.3"): LTX_POSITIVE_ONLY_RECIPE,

@@ -489,7 +489,7 @@ class LTXGuidanceExecutor:
             attention_kwargs=attention_kwargs,
         )
         with pipeline._transformer_cache_context("guided"):
-            video_velocity, audio_velocity = pipeline.transformer(**kwargs)
+            video_velocity, audio_velocity = pipeline.denoise_transformer(**kwargs)
         video_splits = dict(zip(plan.names, video_velocity.chunk(pass_count), strict=True))
         audio_splits = dict(zip(plan.names, audio_velocity.chunk(pass_count), strict=True))
 

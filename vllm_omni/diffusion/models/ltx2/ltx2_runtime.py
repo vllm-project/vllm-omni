@@ -214,6 +214,13 @@ class LTXRuntime(
             pipeline_name=self.__class__.__name__,
             request_sigmas=request_sigmas,
         )
+        phase_lora_controller = getattr(self, "_phase_lora_controller", None)
+        if phase_lora_controller is not None and any(
+            getattr(sampling, "lora_request", None) is not None for sampling in req.sampling_params_list
+        ):
+            raise ValueError(
+                f"{self.__class__.__name__} cannot compose a request LoRA with its internal stage-2 adapter."
+            )
         return self._run_recipe(req, request_inputs, request_sigmas=request_sigmas, image=image)
 
     def _run_recipe(
@@ -331,15 +338,22 @@ class LTXRuntime(
     def interrupt(self):
         return self._interrupt
 
+    @property
+    def denoise_transformer(self) -> nn.Module:
+        controller = getattr(self, "_phase_lora_controller", None)
+        if controller is not None:
+            return controller.transformer
+        return self.transformer
+
     def _transformer_cache_context(self, context_name: str):
-        cache_context = getattr(self.transformer, "cache_context", None)
+        cache_context = getattr(self.denoise_transformer, "cache_context", None)
         if callable(cache_context):
             return cache_context(context_name)
         return nullcontext()
 
     def predict_noise(self, **kwargs):
         with self._transformer_cache_context("cond_uncond"):
-            noise_pred_video, noise_pred_audio = self.transformer(**kwargs)
+            noise_pred_video, noise_pred_audio = self.denoise_transformer(**kwargs)
         return noise_pred_video.float(), noise_pred_audio.float()
 
     def combine_cfg_noise(
@@ -510,7 +524,7 @@ class LTXRuntime(
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         latents = self.prepare_latents(
             batch_size=prompt_context.batch_size * request_inputs.num_videos_per_prompt,
-            num_channels_latents=self.transformer.config.in_channels,
+            num_channels_latents=self.denoise_transformer.config.in_channels,
             height=request_inputs.height,
             width=request_inputs.width,
             num_frames=request_inputs.num_frames,

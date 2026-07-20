@@ -1498,6 +1498,14 @@ class LTX2VideoTransformer3DModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     _hsdp_shard_conditions = [is_transformer_block_module]
     _sp_plan: dict[str, Any] | None = None
+    stacked_params_mapping = (
+        (".attn1.to_qkv", ".attn1.to_q", "q"),
+        (".attn1.to_qkv", ".attn1.to_k", "k"),
+        (".attn1.to_qkv", ".attn1.to_v", "v"),
+        (".audio_attn1.to_qkv", ".audio_attn1.to_q", "q"),
+        (".audio_attn1.to_qkv", ".audio_attn1.to_k", "k"),
+        (".audio_attn1.to_qkv", ".audio_attn1.to_v", "v"),
+    )
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
@@ -2097,15 +2105,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
         Returns:
             Set of parameter names that were successfully loaded.
         """
-        stacked_params_mapping = [
-            (".attn1.to_qkv", ".attn1.to_q", "q"),
-            (".attn1.to_qkv", ".attn1.to_k", "k"),
-            (".attn1.to_qkv", ".attn1.to_v", "v"),
-            (".audio_attn1.to_qkv", ".audio_attn1.to_q", "q"),
-            (".audio_attn1.to_qkv", ".audio_attn1.to_k", "k"),
-            (".audio_attn1.to_qkv", ".audio_attn1.to_v", "v"),
-        ]
-
         params_dict = dict(self.named_parameters())
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
@@ -2127,7 +2126,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
             return weight
 
         for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 packed_name = name.replace(weight_name, param_name)

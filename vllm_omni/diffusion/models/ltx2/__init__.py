@@ -12,12 +12,16 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2Pipeline,
     LTX2T2VDMD2Pipeline,
 )
-from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import LTX2DistilledPipeline
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
+    LTX2DistilledPipeline,
+    LTX2TwoStagePipeline,
+)
 
 __all__ = [
     "LTX2Pipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
+    "LTX2TwoStagePipeline",
     "LTX2DistilledPipeline",
     "get_ltx2_post_process_func",
     "load_transformer_config",
