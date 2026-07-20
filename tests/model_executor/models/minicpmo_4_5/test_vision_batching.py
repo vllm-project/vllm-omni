@@ -141,6 +141,16 @@ def test_vision_encoder_batches_vpm_before_resampling() -> None:
     torch.testing.assert_close(chunked, unchunked, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("vision_batch_size", [0, -2])
+def test_vision_encoder_clamps_nonpositive_batch_size(vision_batch_size: int) -> None:
+    chunked, vision_batches, resampler_batches = _run_vision_encoder(vision_batch_size)
+    unchunked, _, _ = _run_vision_encoder(16)
+
+    assert vision_batches == [1, 1, 1, 1, 1]
+    assert resampler_batches == [5]
+    torch.testing.assert_close(chunked, unchunked, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("audio_encoder_layer", "expected_value", "expected_hidden_states"),
     [(-1, 2.0, False), (0, 1.0, True)],
