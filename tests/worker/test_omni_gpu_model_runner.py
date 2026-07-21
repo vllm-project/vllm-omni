@@ -569,8 +569,7 @@ def test_accumulate_full_payload_output_replaces_1d_minicpmo_audio_codes():
     runner = _make_full_payload_accumulation_runner(
         model_arch="MiniCPMO45OmniForConditionalGeneration",
         custom_process_next_stage_input_func=(
-            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni."
-            "talker2token2wav_full_payload"
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.talker2token2wav_full_payload"
         ),
     )
     request = SimpleNamespace(output_token_ids=[10, 11, 12])

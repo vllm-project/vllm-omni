@@ -90,8 +90,7 @@ class TestPipelineTopology:
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2talker"
         )
         assert talker.custom_process_next_stage_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni."
-            "talker2token2wav_full_payload"
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.talker2token2wav_full_payload"
         )
 
     def test_token2wav_stage(self, pipeline: PipelineConfig) -> None:
@@ -105,8 +104,7 @@ class TestPipelineTopology:
         assert token2wav.engine_output_type == "audio"
         assert token2wav.hf_config_name == "tts_config"
         assert token2wav.sync_process_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni."
-            "talker2token2wav_token_only"
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.talker2token2wav_token_only"
         )
 
 

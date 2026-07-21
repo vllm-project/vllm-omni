@@ -198,8 +198,7 @@ def talker2token2wav_full_payload(
     audio = _audio_codes_from_mapping(pooling_output)
     if audio is None:
         logger.warning(
-            "talker2token2wav_full_payload: missing codes.audio (keys=%s) for req=%s; "
-            "sending empty finished payload.",
+            "talker2token2wav_full_payload: missing codes.audio (keys=%s) for req=%s; sending empty finished payload.",
             list(pooling_output.keys()),
             rid,
         )

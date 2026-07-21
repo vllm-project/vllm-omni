@@ -471,8 +471,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         **kwargs,
     ):
         payload_was_provided = (
-            additional_information is not None
-            or kwargs.get("runtime_additional_information") is not None
+            additional_information is not None or kwargs.get("runtime_additional_information") is not None
         )
         if additional_information is None:
             additional_information = {}
