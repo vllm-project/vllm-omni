@@ -760,7 +760,12 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         )
 
 
-AutoImageProcessor.register("MiniCPMVImageProcessor", MiniCPMVImageProcessor)
+# transformers >= 5.x requires the config *class* (not a string) as the
+# first arg to AutoImageProcessor.register — it does `key.__module__`
+# internally. Passing "MiniCPMVImageProcessor" raises:
+#   AttributeError: 'str' object has no attribute '__module__'
+# See also processing_gr00t_n1d7.py for the same transformers API change.
+AutoImageProcessor.register(MiniCPMOConfig, MiniCPMVImageProcessor, exist_ok=True)
 
 
 # ============== SigLIP Vision Transformer Classes ==============
