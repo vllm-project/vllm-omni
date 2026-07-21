@@ -384,7 +384,7 @@ A clear directory structure is key to managing test cases efficiently.
 #### 1.4 Execution Method and Example
 
 -   ***Trigger Timing***: **`PR with ready label`**. That is, when a developer adds a "ready for review" or similar label to a PR on platforms like GitHub, L1 and L2 tests are automatically triggered.
--   ***Diff-aware step skipping***: On L2, **E2E Test** jobs may be omitted at pipeline upload when the PR diff does not touch their [`source_file_dependencies`](test_system_overview.md#diff-aware-buildkite-uploads-source_file_dependencies) prefixes (H100 and docker queues alike); non-E2E groups still always upload. See [Diff-aware Buildkite uploads](test_system_overview.md#diff-aware-buildkite-uploads-source_file_dependencies).
+-   ***Diff-aware step skipping***: On L2, **E2E Test** jobs may be omitted at pipeline upload when the PR diff does not touch their [`source_file_dependencies`](ci_settings.md#step-filtering) prefixes; non-E2E groups still always upload. See [CI Settings — Diff-aware CI](ci_settings.md#diff-aware-ci).
 -   ***Execution Environment***: L1 uses ***CPU*** environment; L2 requires ***GPU*** environment.
 -   ***Script Example***:
 
@@ -493,7 +493,7 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 #### 2.4 Execution Method and Example
 
 -   ***Trigger Timing***: **`PR Merged`**. Automatically triggered after code review is approved and merged into the main branch (typically via `merge-test` label on the PR before merge).
--   ***Diff-aware step skipping***: Same [`source_file_dependencies`](test_system_overview.md#diff-aware-buildkite-uploads-source_file_dependencies) mechanism as L2—**all E2E Test** leaf steps are diff-gated; other L3 groups always upload. See [Diff-aware Buildkite uploads](test_system_overview.md#diff-aware-buildkite-uploads-source_file_dependencies).
+-   ***Diff-aware step skipping***: Same [`source_file_dependencies`](ci_settings.md#step-filtering) mechanism as L2—**all E2E Test** leaf steps are diff-gated; other L3 groups always upload. See [CI Settings — Diff-aware CI](ci_settings.md#diff-aware-ci).
 -   ***Execution Environment***: ***GPU*** servers.
 -   ***Script Example***:
 

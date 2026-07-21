@@ -32,7 +32,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>/</td>
       <td>/</td>
       <td>/</td>
-      <td>.github/PULL_REQUEST_TEMPLATE.md <a href="../../.github/PULL_REQUEST_TEMPLATE.md"> PR Checklist</a></td>
+      <td><a href="https://github.com/vllm-project/vllm-omni/blob/main/.github/PULL_REQUEST_TEMPLATE.md">PR Checklist</a></td>
       <td>/</td>
       <td>/</td>
     </tr>
@@ -44,7 +44,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>/</td>
       <td>/</td>
       <td>/</td>
-      <td><a href="../failures/"> CI Failures</a></td>
+      <td><a href="./failures.md">CI Failures</a></td>
       <td>/</td>
       <td>/</td>
     </tr>
@@ -174,101 +174,14 @@ For per-level test authoring (directories, markers, examples), see [Test Writing
 
 Before entering specific testing levels, the project establishes two common specifications aimed at standardizing the development process and quickly locating issues.
 
-1.  ***PR Checklist ([.github/PULL_REQUEST_TEMPLATE.md](../../.github/PULL_REQUEST_TEMPLATE.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
+1.  ***PR Checklist ([`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/.github/PULL_REQUEST_TEMPLATE.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
 2.  ***CI Failure Explanation ([CI Failures](./failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
 
 ## Notes
 
-### Diff-aware Buildkite uploads (`source_file_dependencies`)
+### L2 / L3 diff-aware CI (CUDA)
 
-L2 (`.buildkite/cuda/test-ready.yml`) and L3 (`.buildkite/cuda/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/common/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
-
-#### What `source_file_dependencies` is
-
-- A **uploader-only** YAML key on a Buildkite step or group. **Buildkite does not understand it**; `upload_pipeline.py` always **removes** it from the YAML that is uploaded.
-- A list of path **prefixes** (directories or individual files). If **any** changed file in the diff equals a prefix or starts with `prefix/`, the step is kept; otherwise the step (or entire group) is **omitted** from the uploaded pipeline.
-
-#### When filtering runs
-
-| Build context | Changed files used for matching |
-| --- | --- |
-| Pull request | `git diff --name-only origin/<base>...<BUILDKITE_COMMIT>` |
-| `main` branch push | `git diff --name-only <commit>^..<commit>` |
-| Other (e.g. local dry-run, non-PR branch) | Diff cannot be resolved → **no filtering**; all steps are uploaded and `source_file_dependencies` is still stripped |
-
-Docs-only PRs are handled earlier in bootstrap (`.buildkite/cuda/pipeline.yml`) via skip-ci logic; `source_file_dependencies` applies only to the **uploaded** L2/L3 test pipelines.
-
-#### Where it is configured
-
-| Level | Pipeline file | Upload entry |
-| --- | --- | --- |
-| L2 | `.buildkite/cuda/test-ready.yml` | `upload_pipeline.py --upload .buildkite/cuda/test-ready.yml` (from `cuda/pipeline.yml`) |
-| L3 | `.buildkite/cuda/test-merge.yml` | `upload_pipeline.py --upload .buildkite/cuda/test-merge.yml` (from `cuda/pipeline.yml`) |
-
-Steps **without** `source_file_dependencies` are always uploaded (subject to the usual label conditions: `ready` for L2, `merge-test` for L3).
-
-#### Current skip policy (L2 / L3)
-
-To balance CI cost and coverage:
-
-- **Always run** (no `source_file_dependencies`): baseline groups outside E2E Test—e.g. Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
-- **Diff-gated** (`source_file_dependencies` set): **every leaf job under the E2E Test group** in `test-ready.yml` and `test-merge.yml`, regardless of queue (`mithril-h100-pool`, `gpu_1_queue`, or `gpu_4_queue`). Each step lists the smallest set of prefixes that should trigger it—typically:
-  - pytest file(s) exercised by the job (online and/or offline);
-  - model code under `vllm_omni/model_executor/models/` or `vllm_omni/diffusion/models/`;
-  - related `vllm_omni/model_executor/stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable.
-
-Adding a new E2E step: add `source_file_dependencies` on the leaf job with those prefixes. Prefer **per-step** deps rather than a broad group-level list unless every child shares the same paths.
-
-#### YAML examples
-
-H100 E2E (kubernetes / `mithril-h100-pool`):
-
-```yaml
-      - label: "Diffusion · Qwen Image Test"
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_qwen_image.py
-          - vllm_omni/diffusion/models/qwen_image/
-        commands:
-          - pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' ...
-        agents:
-          queue: "mithril-h100-pool"
-```
-
-Docker E2E (`gpu_1_queue` / `gpu_4_queue`)—same key, same upload-time filtering:
-
-```yaml
-      - label: "TTS · Qwen3-TTS CustomVoice Test"
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
-          - vllm_omni/model_executor/models/qwen3_tts/
-          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
-          - vllm_omni/deploy/qwen3_tts.yaml
-        commands:
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py ...
-        agents:
-          queue: "gpu_4_queue"
-```
-
-A **group** may also define `source_file_dependencies`; nested steps inherit filtering as a unit—the whole group is dropped if no prefix matches.
-
-#### Local dry-run
-
-```bash
-# Render filtered YAML to stdout (no upload)
-python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
-
-# Confirm uploader-only keys are stripped
-python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-merge.yml | grep source_file_dependencies
-# (no output expected)
-```
-
-On a PR build, Buildkite logs from `upload_pipeline.py` include lines such as `skip '…' (no changes under …)` for omitted steps.
-
-#### Related
-
-- [CI Settings](./ci_settings.md) — `.buildkite` layout, platform CI styles, adding Buildkite jobs
-- Implementation: `.buildkite/common/scripts/upload_pipeline.py`
-- L2/L3 diff skip does **not** replace label-based triggers (`ready`, `merge-test`); it only reduces which steps appear **after** the pipeline is already scheduled.
+On CUDA **L2** and **L3**, **E2E Test** Buildkite jobs may be omitted at pipeline upload when the PR diff does not touch their path prefixes; other groups still always upload. Full two-layer mechanics and YAML examples: [CI Settings — Diff-aware CI](./ci_settings.md#diff-aware-ci) ([step filtering](./ci_settings.md#step-filtering)).
 
 ### Test helper environment variables
 

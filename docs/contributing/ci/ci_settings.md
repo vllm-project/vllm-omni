@@ -1,8 +1,8 @@
-# CI Settings (Buildkite Layout & Conventions)
+# CI Settings
 
 This document describes **where** Buildkite YAML lives in the repo, **how each platform organizes CI**, and **how to add a new job**. It does not document agent queues, GPU types, or container plugin details—those belong in infra / preset files (for example `.buildkite/common/ci_mirror_hardwares.yml`).
 
-For CI levels (L1–L5), triggers, and diff-aware skipping behavior, see [Test System Overview](./test_system_overview.md). For test authoring, see [Test Writing Guide](./test_writing_guide.md). For running tests locally or replaying CI jobs, see [Test Execution Guide](./test_execution_guide.md).
+For CI levels (L1–L5) and triggers, see [Test System Overview](./test_system_overview.md). For test authoring, see [Test Writing Guide](./test_writing_guide.md). For running tests locally or replaying CI jobs, see [Test Execution Guide](./test_execution_guide.md).
 
 ## Directory layout
 
@@ -66,122 +66,185 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
 | **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
 
-## CUDA configuration style
+## Platform configuration style
 
-### Two-document bootstrap
+=== "CUDA"
 
-`cuda/pipeline.yml` is parsed twice:
+    **Bootstrap:** two-document [`cuda/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/pipeline.yml)—document 1 runs `upload_pipeline.py --upload`; document 2 builds the CI image and uploads L2–L5 child pipelines. Placeholders such as `__UPLOAD_READY_IF__` are resolved by [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) (see [Diff-aware CI — Bootstrap skip](#bootstrap-skip)).
 
-1. **Document 1** (before `---`): one CPU step runs `upload_pipeline.py --upload cuda/pipeline.yml`.
-2. **Document 2** (after `---`): image build + upload steps for L2–L5 child pipelines.
+    **Test YAML:** `cuda/test-ready.yml` (L2), `test-merge.yml` (L3), `test-nightly.yml` (L4), `test-weekly.yml` (L5). Each file starts with shared `env:` then `steps:`.
 
-Placeholders like `__UPLOAD_READY_IF__` are replaced by `upload_pipeline.py` from [skip-ci decision](./test_system_overview.md#diff-aware-buildkite-uploads-source_file_dependencies) logic.
+    | CI level | File | Typical trigger |
+    | -------- | ---- | ----------------- |
+    | L2 | `cuda/test-ready.yml` | `ready` label |
+    | L3 | `cuda/test-merge.yml` | `merge-test` label / main merge |
+    | L4 | `cuda/test-nightly.yml` | `nightly-test` label or `NIGHTLY=1` |
+    | L5 | `cuda/test-weekly.yml` | `weekly-test` label or `WEEKLY=1` |
 
-### Test pipeline files
+    **Upload:** `upload_pipeline.py --upload` expands uploader-only keys before Buildkite upload.
 
-Each file starts with a shared `env:` block, then `steps:`.
+    **Hardware in YAML:** `mirror_hardwares: <preset>` (string)—preset names in [`common/ci_mirror_hardwares.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_mirror_hardwares.yml). Do **not** set `agents` / `plugins` on the same step.
 
-**Conventions**
+    **Conventions**
 
-- **`depends_on`:** leaf jobs depend on the matching upload step key (`upload-ready-pipeline`, `upload-merge-pipeline`, etc.) so they run only after the child pipeline is uploaded and the CI image exists.
-- **`group`:** use `:card_index_dividers:` groups for related jobs (Simple Test, Diffusion Test, E2E Test, …).
-- **`label`:** `"<Area> · <Short name>"` (for example `Diffusion · Qwen Image Test`, `Omni · Qwen3-Omni Test`).
-- **`commands`:** prefer `timeout … pytest …` with markers and `--run-level` aligned to the pipeline level (see Test Writing Guide).
-- **`mirror_hardwares`:** uploader-only preset name (string). Do **not** set `agents` / `plugins` on the same step. Preset names are defined in `common/ci_mirror_hardwares.yml`.
-- **`source_file_dependencies`:** uploader-only list of path prefixes; required for **E2E Test** leaf jobs in `test-ready.yml` and `test-merge.yml`. Stripped before upload. See [Test System Overview](./test_system_overview.md#diff-aware-buildkite-uploads-source_file_dependencies).
+    - **`depends_on`:** leaf jobs depend on `upload-ready-pipeline`, `upload-merge-pipeline`, etc.
+    - **`group` / `label`:** `:card_index_dividers:` groups; labels like `Diffusion · Qwen Image Test`.
+    - **`commands`:** `timeout … pytest …` with markers and `--run-level` for the pipeline level.
+    - **`source_file_dependencies`:** required on **E2E Test** leaf jobs in L2/L3; see [Step filtering](#step-filtering).
 
-**Which file to edit**
+    **Adding a job**
 
-| CI level | File | Typical PR trigger |
-| -------- | ---- | ------------------ |
-| L2 | `cuda/test-ready.yml` | `ready` label |
-| L3 | `cuda/test-merge.yml` | `merge-test` label / main merge |
-| L4 | `cuda/test-nightly.yml` | `nightly-test` label or `NIGHTLY=1` |
-| L5 | `cuda/test-weekly.yml` | `weekly-test` label or `WEEKLY=1` |
+    1. Pick the level file (ready / merge / nightly / weekly).
+    2. Add a step under the right **group** (usually **E2E Test** for model pytest).
+    3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-<level>-pipeline`.
+    4. For L2/L3 E2E, add `source_file_dependencies` (pytest + model + deploy YAML prefixes).
+    5. Dry-run:
 
-### Adding a CUDA job
+    ```bash
+    python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
+    ```
 
-1. Pick the **level file** (ready / merge / nightly / weekly) from the table above.
-2. Add a step (or nested step under the right **group**), usually under **E2E Test** for model-specific pytest.
-3. Set `label`, `commands`, `mirror_hardwares`, and `depends_on: upload-<level>-pipeline`.
-4. For **L2/L3 E2E**, add `source_file_dependencies` with pytest file + model code + deploy YAML prefixes.
-5. Dry-run locally:
+=== "NPU"
 
-```bash
-python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
-```
+    **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) builds NPU CI images (A2/B3 and A3 tags), then runs `upload_pipeline.py --upload` for child pipelines.
 
-6. Run `pytest tests/buildkite/` if you changed uploader behavior or skip-ci mappings.
+    **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
 
-## NPU configuration style
+    **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
-NPU test pipelines use the same **`mirror_hardwares` preset** mechanism as CUDA. Presets live in `common/ci_mirror_hardwares.yml` (`a2b3_npu_1`, `a2b3_npu_4`, `a3_npu_2`) and expand to `agents`, top-level `image`, and `plugins` at upload time.
+    **Hardware in YAML:** `mirror_hardwares` preset (string), expanded to `agents`, top-level `image`, and `plugins`. Presets: `a2b3_npu_1`, `a2b3_npu_4`, `a3_npu_2` in `common/ci_mirror_hardwares.yml`.
 
-- **Bootstrap:** `npu/pipeline-npu.yml` builds NPU CI images, then runs `upload_pipeline.py --upload` for `test-npu-ready.yml` / `test-npu-nightly.yml`.
-- **Child steps:** set `mirror_hardwares` only—do not duplicate `agents` / `image` / `plugins` on the same step.
-- **`depends_on: upload-ready-pipeline`** (or nightly equivalent) ties jobs to bootstrap upload keys.
+    **Conventions**
 
-### Adding an NPU job
+    - **`depends_on: upload-ready-pipeline`** (or `upload-nightly-pipeline`) ties jobs to bootstrap upload keys.
+    - Do not duplicate `agents` / `image` / `plugins` when using `mirror_hardwares`.
 
-1. Edit `npu/test-npu-ready.yml` (L2) or `npu/test-npu-nightly.yml` (L4).
-2. Add a step with `mirror_hardwares` pointing at an existing preset, or add a new preset under `common/ci_mirror_hardwares.yml` first.
-3. Point `commands` at your pytest file and markers.
-4. Dry-run: `python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/npu/test-npu-ready.yml`
-5. If you add a **new pipeline file**, register it in `skip_ci.py` under `L2_YAML_FILES` or `L45_YAML_FILES`.
+    **Adding a job**
 
-## AMD configuration style
+    1. Edit `test-npu-ready.yml` (L2) or `test-npu-nightly.yml` (L4).
+    2. Add a step with `mirror_hardwares` (add a new preset in `ci_mirror_hardwares.yml` first if needed).
+    3. Set `commands` to your pytest file and markers.
+    4. Dry-run:
 
-AMD separates **data** from **rendering**:
+    ```bash
+    python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/npu/test-npu-ready.yml
+    ```
 
-1. **`test-amd-ready.yml` / `test-amd-merge.yml`** — list of job definitions (label, `agent_pool`, `commands`, optional `mirror_hardwares: [amdproduction]`, `grade`, env).
-2. **`test-template-amd-omni.j2`** — wraps those steps with docker image build (`amd-build`) and agent queue naming (`amd_<agent_pool>`).
-3. **`bootstrap-amd-omni.sh`** — skip-ci, diff filtering, selects ready vs merge YAML, runs `minijinja-cli`, uploads generated `pipeline.yaml`.
+    5. Register new pipeline paths in `skip_ci.py` (`L2_YAML_FILES` or `L45_YAML_FILES`) when applicable.
 
-Step fields in the YAML **data** files:
+=== "AMD"
 
-| Field | Purpose |
-| ----- | ------- |
-| `agent_pool` | Selects ROCm pool (for example `mi325_1`); template maps to `queue: amd_<pool>`. |
-| `mirror_hardwares` | List tag for which mirror HW runs the step (for example `[amdproduction]`). |
-| `depends_on` | Usually implicit via template → `amd-build`. |
-| `commands` | Passed into `run-amd-test.sh` via `TEST_COMMAND`. |
+    **Bootstrap:** [`amd/scripts/bootstrap-amd-omni.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/scripts/bootstrap-amd-omni.sh)—skip-ci, diff filtering, Jinja render, then `buildkite-agent pipeline upload`.
 
-### Adding an AMD job
+    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / PR), `test-amd-merge.yml` (L3 / main).
 
-1. Edit `amd/test-amd-ready.yml` (PR / L2) or `amd/test-amd-merge.yml` (main / L3).
-2. Add a block matching neighbors: `label`, `agent_pool`, `mirror_hardwares`, `commands`, `grade` if needed.
-3. Do **not** hand-edit generated `pipeline.yaml`; regenerate via bootstrap / Jinja.
-4. Ensure `skip_ci.py` still lists the file if you split into a new YAML path.
+    **Rendering:** [`test-template-amd-omni.j2`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-template-amd-omni.j2) wraps data steps with `amd-build` image build and `amd_<agent_pool>` queues. Do **not** hand-edit generated `pipeline.yaml`.
 
-## Intel configuration style
+    **Hardware in YAML:** `agent_pool` (for example `mi325_1`) plus `mirror_hardwares: [amdproduction]` (array—Buildkite template filter, not the CUDA/NPU uploader preset mechanism).
 
-Intel is a **small static pipeline**:
+    **Data file fields**
 
-- **`intel/pipeline-intel.yml`** — steps call shell scripts under `intel/scripts/`.
-- **`bootstrap-intel-omni.sh`** — skip-ci then `pipeline upload pipeline-intel.yml`.
+    | Field | Purpose |
+    | ----- | ------- |
+    | `agent_pool` | ROCm pool; template maps to `queue: amd_<pool>`. |
+    | `mirror_hardwares` | Which mirror HW runs the step (for example `[amdproduction]`). |
+    | `commands` | Passed into `run-amd-test.sh` via `TEST_COMMAND`. |
 
-### Adding an Intel job
+    **Adding a job**
 
-1. Add a step to `intel/pipeline-intel.yml` (or extend `run-xpu-test.sh` if the work fits an existing runner).
-2. Set `agents.queue`, `env`, `timeout_in_minutes`, and `command`/`commands` consistently with existing steps.
-3. Register `pipeline-intel.yml` in `L2_YAML_FILES` in `skip_ci.py` if the bootstrap path changes.
+    1. Edit `test-amd-ready.yml` or `test-amd-merge.yml`.
+    2. Copy a neighboring block: `label`, `agent_pool`, `mirror_hardwares`, `commands`, optional `grade`.
+    3. Regenerate via bootstrap / Jinja; update `skip_ci.py` if you add a new YAML path.
+
+=== "Intel"
+
+    **Bootstrap:** [`intel/scripts/bootstrap-intel-omni.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/intel/scripts/bootstrap-intel-omni.sh)—skip-ci, then direct `pipeline upload`.
+
+    **Test YAML:** steps live inline in [`intel/pipeline-intel.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/intel/pipeline-intel.yml); runners under `intel/scripts/` (for example `run-xpu-test.sh`).
+
+    **Upload:** `buildkite-agent pipeline upload` (no `upload_pipeline.py` mirror expansion).
+
+    **Hardware in YAML:** inline `agents.queue` (for example `intel-gpu-omni`) on each step.
+
+    **Adding a job**
+
+    1. Add a step to `pipeline-intel.yml`, or extend an existing runner script.
+    2. Match `agents`, `env`, `timeout_in_minutes`, and `command`/`commands` with sibling steps.
+    3. Keep `pipeline-intel.yml` listed in `L2_YAML_FILES` in `skip_ci.py`.
 
 ## Cross-cutting conventions
 
-### Skip-ci and CI-YAML-only PRs
+### Diff-aware CI {#diff-aware-ci}
 
-`.buildkite/common/scripts/skip_ci.py` classifies changed files. Whitelisted test pipeline paths are listed in `L2_YAML_FILES`, `L3_YAML_FILES`, and `L45_YAML_FILES`. When a PR touches **only** those files (plus docs/skip marks), bootstrap may skip uploading L2/L3 for unaffected platforms. Any new pipeline file must be added to the correct dict.
+PR diffs drive **two independent skip layers**. Both read changed files from git, but at different pipeline stages and with different granularity:
 
-### Uploader-only keys (CUDA)
+| Layer | Script | When | What is skipped | Where you configure |
+| ----- | ------ | ---- | --------------- | ------------------- |
+| **Bootstrap** | [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) | Before child test pipelines upload (`cuda/pipeline.yml`, AMD/Intel/NPU bootstraps) | Entire default CI, or whole L2/L3 upload for a platform | Whitelists in `skip_ci.py`; `__UPLOAD_READY_IF__` placeholders in bootstrap YAML |
+| **Step filter** | [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | While uploading CUDA L2/L3 YAML | Individual Buildkite steps inside `test-ready.yml` / `test-merge.yml` | `source_file_dependencies` on each step or group |
 
-These keys are **removed** before Buildkite sees the YAML:
+**Changed files** (both layers):
+
+| Build context | Diff command |
+| --- | --- |
+| Pull request | `git diff --name-only origin/<base>...<BUILDKITE_COMMIT>` |
+| `main` push | `git diff --name-only <commit>^..<commit>` |
+| Local dry-run / non-PR | Diff unavailable → bootstrap and step filter both keep all steps; uploader-only keys are still stripped |
+
+Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only reduces what runs **after** a pipeline is already scheduled.
+
+#### Bootstrap skip {#bootstrap-skip}
+
+- **Docs / skip-mark only** → skip the entire default CI upload (`check-skip-all`; `__UPLOAD_READY_IF__` in `cuda/pipeline.yml`).
+- **CI-YAML only** → skip uploading L2 or L3 for platforms whose whitelisted files were not touched. Register paths in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES`.
+
+#### Step filtering {#step-filtering}
+
+CUDA **L2** (`.buildkite/cuda/test-ready.yml`) and **L3** (`.buildkite/cuda/test-merge.yml`) only. Upload entry: `upload_pipeline.py --upload` from `cuda/pipeline.yml`.
+
+**Uploader-only keys** — removed before Buildkite sees the YAML; never used at runtime on agents:
 
 | Key | Purpose |
 | --- | ------- |
-| `mirror_hardwares` | Expand to `agents` + `plugins` from `ci_mirror_hardwares.yml` |
-| `source_file_dependencies` | Omit step when PR diff does not touch listed prefixes |
+| `source_file_dependencies` | List of path **prefixes**. If any changed file equals a prefix or starts with `prefix/`, keep the step (or group); otherwise omit it. |
+| `mirror_hardwares` | Expand to `agents` + `plugins` (+ optional `image`) from `ci_mirror_hardwares.yml`. |
 
-Never rely on them at runtime inside the agent—they exist only for `upload_pipeline.py`.
+**Policy**
+
+- **Always uploaded** (no key): groups outside **E2E Test**—Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
+- **Diff-gated**: every **E2E Test** leaf job. List the smallest prefix set per step—pytest file(s), model code under `vllm_omni/model_executor/models/` or `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable. A **group** may define the key instead; the whole group drops if no prefix matches.
+
+**YAML examples**
+
+```yaml
+      - label: "Diffusion · Qwen Image Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen_image.py
+          - vllm_omni/diffusion/models/qwen_image/
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' ...
+        mirror_hardwares: h100_1
+
+      - label: "TTS · Qwen3-TTS CustomVoice Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py ...
+        mirror_hardwares: l4_4
+```
+
+**Local dry-run**
+
+```bash
+python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
+python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-merge.yml | grep source_file_dependencies
+# (no output expected)
+```
+
+On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for omitted steps.
 
 ### Labels and grouping
 
@@ -199,7 +262,7 @@ Never rely on them at runtime inside the agent—they exist only for `upload_pip
 
 ## Related documentation
 
-- [Test System Overview — Diff-aware uploads](./test_system_overview.md#diff-aware-buildkite-uploads-source_file_dependencies)
+- [Test System Overview](./test_system_overview.md) — L1–L5 scope, triggers, test pyramid
 - [Test Writing Guide](./test_writing_guide.md) — markers, directories, L1–L5 examples
 - [Test Execution Guide](./test_execution_guide.md) — running CI-aligned jobs locally
 - Implementation: `.buildkite/common/scripts/upload_pipeline.py`, `.buildkite/common/scripts/skip_ci.py`
