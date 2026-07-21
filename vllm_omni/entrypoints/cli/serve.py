@@ -981,6 +981,19 @@ def run_headless(args: TrackingNamespace) -> None:
     # Filter down to a dict of things explicitly requested by the user
     args_dict = args.get_explicit_kwargs_dict()
 
+    deploy_config_path = args_dict.get("deploy_config")
+    if stage_configs_path is not None:
+        if deploy_config_path is not None:
+            raise ValueError("--stage-configs-path and --deploy-config are mutually exclusive")
+        logger.warning(
+            "--stage-configs-path is deprecated and now aliases --deploy-config; "
+            "legacy stage_args YAML files are no longer supported."
+        )
+        deploy_config_path = stage_configs_path
+    # This compatibility alias belongs to the CLI boundary and must not leak
+    # into registry/deploy merging as a per-stage engine argument.
+    args_dict.pop("stage_configs_path", None)
+
     # ``--replica-id`` is deprecated and ignored — replica ids are
     # auto-assigned by ``OmniMasterServer`` so headless processes carry
     # no knowledge of their per-replica id at launch time. Warn (don't

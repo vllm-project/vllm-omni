@@ -19,14 +19,7 @@ from vllm_omni.config.resolver import (
     OmniConfigResolveRequest,
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
-    resolve_model_config_path,
     resolve_omni_config,
-)
-from vllm_omni.config.resolver import (
-    _filter_stages as filter_stages,
-)
-from vllm_omni.config.resolver import (
-    _load_stage_configs_from_yaml as load_stage_configs_from_yaml,
 )
 from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -467,20 +460,26 @@ class TestLoadAndResolveStageConfigs:
             'stages:\n  - stage_id: 0\n    devices: "0"\n  - stage_id: 1\n    devices: "1,2,3"\n    num_replicas: 3\n',
             encoding="utf-8",
         )
-
-        returned_stage_configs = [
-            create_config({"stage_id": 0, "runtime": {"devices": "0"}, "engine_args": {"model": "dummy"}}),
-            create_config(
-                {
-                    "stage_id": 1,
-                    "runtime": {"devices": "1,2,3", "num_replicas": 3},
-                    "engine_args": {"model": "dummy"},
-                }
-            ),
-        ]
-        load_stage_configs = mocker.patch(
-            "vllm_omni.config.resolver._load_stage_configs_from_model",
-            return_value=(returned_stage_configs, None),
+        runtime_stage = create_config(
+            {
+                "stage_id": 1,
+                "runtime": {"devices": "1,2,3", "num_replicas": 3},
+                "engine_args": {"model": "dummy-model"},
+            }
+        )
+        legacy_stage = SimpleNamespace(to_omegaconf=lambda: runtime_stage)
+        create_structured = mocker.patch(
+            "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
+            return_value=structured_config,
+        )
+        create_legacy = mocker.patch(
+            "vllm_omni.config.resolver.StageConfigFactory.create_legacy_stage_configs_from_model",
+            return_value=([legacy_stage], "round_robin"),
+        )
+        strategy_specs = {"stage_1": {"dp": 3}}
+        load_strategy = mocker.patch(
+            "vllm_omni.config.resolver._load_strategy_specs",
+            return_value=strategy_specs,
         )
         cli_overrides = {
             "interleave_mm_strings": True,
@@ -495,7 +494,12 @@ class TestLoadAndResolveStageConfigs:
             deploy_config_path=str(deploy_path),
         )
 
-        load_stage_configs.assert_called_once_with(
+        expected_overrides = {
+            "dtype": "bfloat16",
+            "trust_remote_code": True,
+            "stage_1_tensor_parallel_size": 2,
+        }
+        create_structured.assert_called_once_with(
             "dummy-model",
             trust_remote_code=True,
             base_engine_args=cli_overrides,
@@ -503,21 +507,12 @@ class TestLoadAndResolveStageConfigs:
             stage_overrides=None,
             strategy_config_path=None,
         )
-        assert resolved.config_path == str(deploy_path)
-        assert len(resolved.stage_configs) == 2
-        assert resolved.stage_configs[1].runtime.num_replicas == 3
-        assert resolved.stage_configs[1].runtime.devices == "1,2,3"
-
-    def test_filter_stages_selects_mode_stages_without_mutating_stage_config(self, tmp_path):
-        config_path = tmp_path / "deploy.yaml"
-        config_path.write_text(
-            """modes:
-  - mode: text-to-text
-    stages: [0]
-  - mode: text-to-image
-    stages: [0, 1]
-""",
-            encoding="utf-8",
+        create_legacy.assert_called_once_with(
+            "dummy-model",
+            trust_remote_code=True,
+            cli_overrides=expected_overrides,
+            deploy_config_path="deploy.yaml",
+            strategy_specs=strategy_specs,
         )
         stages = [
             create_config(

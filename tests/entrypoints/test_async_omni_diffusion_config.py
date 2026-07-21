@@ -720,7 +720,7 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
         stage_type="llm",
         engine_args=SimpleNamespace(),
     )
-    mocker.patch(
+    resolve_config = mocker.patch(
         "vllm_omni.engine.async_omni_engine.resolve_omni_config",
         return_value=OmniConfigResolution(
             config_path="dummy.yaml",
@@ -741,6 +741,10 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
 
     assert not hasattr(stage_configs[0].engine_args, "additional_config")
     assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}
+    request = resolve_config.call_args.args[0]
+    assert request.deploy_config_path == "dummy.yaml"
+    assert "stage_configs_path" not in request.cli_overrides
+    assert not hasattr(request, "legacy_stage_configs_path")
 
 
 @pytest.mark.parametrize(

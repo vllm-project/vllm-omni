@@ -307,16 +307,41 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
     assert captured["strategy_config_path"] == "/tmp/strategy.yaml"
 
 
-def test_run_headless_invalid_stage_overrides_raises(mocker: MockerFixture) -> None:
+def test_run_headless_invalid_stage_overrides_raises() -> None:
     """Invalid ``--stage-overrides`` JSON in headless mode fails fast with the
     shared ValueError instead of being silently ignored."""
-    mocker.patch(
-        "vllm_omni.config.resolver._resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [SimpleNamespace(stage_id=0)], None),
-    )
-
     args = _make_headless_args(stage_id=0, stage_overrides="{not valid json}")
     with pytest.raises(ValueError, match="--stage-overrides is not valid JSON"):
+        run_headless(args)
+
+
+def test_run_headless_maps_stage_configs_path_to_deploy_config(mocker: MockerFixture) -> None:
+    captured: dict = {}
+
+    def _fake_resolve(request):
+        captured["request"] = request
+        return _resolved(SimpleNamespace(stage_id=99))
+
+    mocker.patch(
+        "vllm_omni.config.resolver.resolve_omni_config",
+        side_effect=_fake_resolve,
+    )
+
+    with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
+        run_headless(_make_headless_args(stage_configs_path="deploy.yaml"))
+
+    request = captured["request"]
+    assert request.deploy_config_path == "deploy.yaml"
+    assert "stage_configs_path" not in request.cli_overrides
+    assert not hasattr(request, "legacy_stage_configs_path")
+
+
+def test_run_headless_rejects_both_config_path_flags() -> None:
+    args = _make_headless_args(
+        stage_configs_path="old-name.yaml",
+        deploy_config="deploy.yaml",
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
         run_headless(args)
 
 
