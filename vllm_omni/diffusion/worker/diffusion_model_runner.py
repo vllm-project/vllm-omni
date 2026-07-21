@@ -286,6 +286,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
         logger.info("Model runner: Initialization complete.")
+        if self._kv_prefetch_enabled:
+            self.kv_transfer_manager.init_prefetch(target_device=self.target_device)
+
+    def receive_kv_cache(self, req: Any) -> None:
+        """Receive KV cache for *req*, using prefetch or sync path."""
+        if self._kv_prefetch_enabled:
+            self.kv_transfer_manager.consume_and_distribute_kv_cache(req, target_device=self.target_device)
+        else:
+            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                req,
+                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                target_device=self.target_device,
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights into the pipeline."""
@@ -343,23 +356,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # consume prior-forward payload, sync-fallback on miss; request-batch
         # execution keeps the synchronous per-request receive path.
         kv_recv_t0 = time.perf_counter()
-        if use_prefetch and self._kv_prefetch_enabled:
-            self.kv_transfer_manager.consume_and_distribute_kv_cache(
-                req,
-                target_device=self.target_device,
-            )
-        else:
-            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                req,
-                cfg_kv_collect_func=getattr(od_config, "cfg_kv_collect_func", None),
-                target_device=self.target_device if use_prefetch else getattr(self.pipeline, "device", None),
-            )
+        self.receive_kv_cache(req)
         kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
-        logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
-
-        # Kick off the next request's prefetch (+ H2D) to overlap this forward.
-        if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
-            self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
+        logger.info("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
 
         if req.sampling_params.generator is None and req.sampling_params.seed is not None:
             if req.sampling_params.generator_device is not None:
@@ -570,6 +569,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Step-before update: cleanup finished requests and get/create one running state."""
         for request_id in scheduler_output.finished_req_ids:
             self.state_cache.pop(request_id, None)
+            if self._kv_prefetch_enabled:
+                self.kv_transfer_manager.abort_prefetch(request_id)
 
         resolved: list[DiffusionRequestState] = []
         new_request_ids: list[str] = []
@@ -588,11 +589,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                    state_req,
-                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self.target_device,
-                )
+                self.receive_kv_cache(state_req)
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
 

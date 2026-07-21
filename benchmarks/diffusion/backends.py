@@ -274,10 +274,16 @@ async def async_request_openai_image_generations(
     if input.num_inference_steps is not None:
         payload["num_inference_steps"] = input.num_inference_steps
 
+    bot_task = input.extra_body.get("bot_task")
+    if bot_task is None and input.default_bot_task is not None:
+        bot_task = input.default_bot_task
+    if bot_task is not None:
+        payload["bot_task"] = bot_task
+
     # Add any extra body parameters
     if input.extra_body:
         for key, value in input.extra_body.items():
-            if key not in payload:
+            if key not in payload and key != "bot_task":
                 payload[key] = value
 
     headers = {

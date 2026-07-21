@@ -1278,7 +1278,7 @@ async def benchmark(args):
         for req in requests_list:
             req.extra_body.update(extra_body)
 
-    if args.endpoint == "/v1/images/edits":
+    if args.endpoint in ("/v1/images/edits", "/v1/images/generations"):
         for req in requests_list:
             req.default_bot_task = args.bot_task
 
@@ -1562,7 +1562,10 @@ if __name__ == "__main__":
         "--bot-task",
         type=str,
         default="think",
-        help=("bot_task form field for --endpoint /v1/images/edits (think, recaption, think_recaption, vanilla)."),
+        help=(
+            "bot_task for --endpoint /v1/images/edits and /v1/images/generations "
+            "(think, recaption, think_recaption, vanilla)."
+        ),
     )
     parser.add_argument(
         "--return-stage-metrics",

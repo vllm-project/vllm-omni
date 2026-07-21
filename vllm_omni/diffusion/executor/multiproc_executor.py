@@ -36,6 +36,7 @@ class BackgroundResources:
 
     broadcast_mq: MessageQueue | None = None
     result_mq: MessageQueue | None = None
+    control_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
 
@@ -54,6 +55,16 @@ class BackgroundResources:
                 self.result_mq = None
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
+
+        # Lightweight control channel: tell each worker's reader thread to exit.
+        if self.control_mq is not None:
+            try:
+                for _ in range(self.num_workers):
+                    self.control_mq.enqueue({"type": "shutdown"}, timeout=1.0)
+            except Exception as exc:
+                logger.warning("Failed to send control-channel shutdown: %s", exc)
+            finally:
+                self.control_mq = None
 
         if self.processes:
             for proc in self.processes:
@@ -81,14 +92,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
 
+        self._control_mq = self._init_control_queue(num_workers)
+        control_handle = self._control_mq.export_handle()
+
         # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
+        processes, result_handle = self._launch_workers(broadcast_handle, control_handle, self.wake_events)
         self._result_mq = self._init_result_queue(result_handle)
         self._processes = processes
 
         self.resources = BackgroundResources(
             broadcast_mq=self._broadcast_mq,
             result_mq=self._result_mq,
+            control_mq=self._control_mq,
             num_workers=num_workers,
             processes=self._processes,
         )
@@ -102,6 +117,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             n_local_reader=num_workers,
             local_reader_ranks=list(range(num_workers)),
         )
+
+    def _init_control_queue(self, num_workers: int) -> MessageQueue:
+        return MessageQueue(
+            n_reader=num_workers,
+            n_local_reader=num_workers,
+            local_reader_ranks=list(range(num_workers)),
+        )
+
+    def send_control(self, msg: dict) -> None:
+        self._ensure_open()
+        self._control_mq.enqueue(msg)
 
     def _init_result_queue(self, result_handle) -> MessageQueue | None:
         if result_handle is None:
@@ -183,7 +209,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         MultiprocDiffusionExecutor._raise_for_rpc_error_dict(response)
         return response
 
-    def _launch_workers(self, broadcast_handle, wake_events):
+    def _launch_workers(self, broadcast_handle, control_handle, wake_events):
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -209,6 +235,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     od_config,
                     writer,
                     broadcast_handle,
+                    control_handle,
                     wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
@@ -322,7 +349,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             try:
                 result = self.collective_rpc(
                     "execute_model",
-                    args=(req, self.od_config, scheduler_output.kv_prefetch_jobs),
+                    args=(req, self.od_config),
                     unique_reply_rank=0,
                     exec_all_ranks=True,
                 )
@@ -439,6 +466,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             logger.error(f"RPC call failed: {e}")
             raise
 
+    def notify_prefetch(self, request_id: str, kv_sender_info: dict) -> None:
+        self.send_control(
+            {
+                "type": "kv_prefetch",
+                "request_id": request_id,
+                "kv_sender_info": kv_sender_info,
+            }
+        )
+
     def check_health(self) -> None:
         if self.is_failed:
             raise EngineDeadError()
@@ -455,5 +491,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         finally:
             self._broadcast_mq = None
             self._result_mq = None
+            self._control_mq = None
             self.resources = None
             self._processes = []

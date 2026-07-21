@@ -12,8 +12,9 @@ import gc
 import multiprocessing as mp
 import os
 import signal
+import threading
 import traceback
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -416,7 +417,6 @@ class DiffusionWorker:
         self,
         req: OmniDiffusionRequest,
         od_config: OmniDiffusionConfig,
-        kv_prefetch_jobs: dict | None = None,
     ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -430,7 +430,7 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+            output = self.model_runner.execute_model(req)
         if profiler:
             profiler.step()
         return output
@@ -757,6 +757,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         gpu_id: int,
         broadcast_handle,
+        control_handle,
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
@@ -770,6 +771,12 @@ class WorkerProc:
 
         # Initialize MessageQueue reader from handle
         self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
+
+        # Lightweight control channel reader (serviced by _control_loop, NOT
+        # the busy loop, so control signals land even mid-forward).
+        self.control_mq = MessageQueue.create_from_handle(control_handle, gpu_id)
+        self._control_handlers: dict[str, Callable[[dict], None]] = {}
+        self._control_thread: threading.Thread | None = None
 
         self.result_mq = None
         self.result_mq_handle = None
@@ -905,6 +912,55 @@ class WorkerProc:
             raise rpc_exception
         return result, should_reply
 
+    def _register_control_handlers(self) -> None:
+        """Register handlers for lightweight control-channel ops.
+
+        Constraint: handlers must only touch ``model_runner``'s prefetch
+        surface (which is internally locked) and MUST NOT touch forward-path
+        state (state_cache / input_batch / pipeline). Any shared workspace
+        touched here must be lock-protected.
+        """
+        runner = self.worker.model_runner
+        if runner is None:
+            return
+        self._control_handlers["kv_prefetch"] = lambda m: runner.kv_transfer_manager.prefetch_submit(
+            m.get("request_id", ""), m.get("kv_sender_info", {})
+        )
+        self._control_handlers["kv_prefetch_cancel"] = lambda m: runner.kv_transfer_manager.abort_prefetch(
+            m.get("request_id", "")
+        )
+
+    def _control_loop(self) -> None:
+        """Reader thread for the lightweight control channel.
+
+        Runs in parallel with ``worker_busy_loop`` so control signals (e.g.
+        kv_prefetch) are delivered even while the busy loop is blocked inside
+        a forward. Fire-and-forget: no replies are sent.
+        """
+        logger.info(f"Worker {self.gpu_id}: control channel reader ready")
+        while self._running:
+            try:
+                msg = self.control_mq.dequeue(timeout=1.0)
+            except Exception:
+                if not self._running:
+                    break
+                continue
+            if msg is None or not isinstance(msg, dict):
+                continue
+            op = msg.get("type")
+            if op == "shutdown":
+                logger.info(f"Worker {self.gpu_id}: control channel shutdown received")
+                break
+            handler = self._control_handlers.get(op)
+            if handler is None:
+                logger.debug("Worker %s: unknown control op %r ignored", self.gpu_id, op)
+                continue
+            try:
+                handler(msg)
+            except Exception:
+                logger.exception("Worker %s: control handler %r failed", self.gpu_id, op)
+        logger.info(f"Worker {self.gpu_id}: control channel reader stopped")
+
     def worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
@@ -976,6 +1032,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
+        control_handle,
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
@@ -1011,10 +1068,22 @@ class WorkerProc:
                 od_config,
                 gpu_id=rank,
                 broadcast_handle=broadcast_handle,
+                control_handle=control_handle,
                 wake_event=wake_event,
                 worker_extension_cls=worker_extension_cls,
                 custom_pipeline_args=custom_pipeline_args,
             )
+            # Register control-channel handlers and start the reader thread so
+            # prefetch/cancel signals are delivered even while the busy loop is
+            # blocked inside a forward.
+            worker_proc._register_control_handlers()
+            worker_proc._control_thread = threading.Thread(
+                target=worker_proc._control_loop,
+                daemon=True,
+                name=f"ctrl-reader-{rank}",
+            )
+            worker_proc._control_thread.start()
+
             logger.info(f"Worker {rank}: Scheduler loop started.")
             pipe_writer.send(
                 {
@@ -1028,6 +1097,12 @@ class WorkerProc:
             raise
         finally:
             if worker_proc is not None:
+                # Stop the control reader thread (it also exits on the
+                # shutdown control message sent during executor teardown).
+                worker_proc._running = False
+                ctrl_thread = worker_proc._control_thread
+                if ctrl_thread is not None and ctrl_thread.is_alive():
+                    ctrl_thread.join(timeout=2.0)
                 try:
                     worker_proc.worker.shutdown()
                 except Exception as exc:
@@ -1155,7 +1230,6 @@ class WorkerWrapperBase:
         self,
         reqs: list[OmniDiffusionRequest],
         od_config: OmniDiffusionConfig,
-        kv_prefetch_jobs: dict | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass.
@@ -1163,12 +1237,11 @@ class WorkerWrapperBase:
         Args:
             reqs: List of diffusion requests
             od_config: OmniDiffusionConfig configuration
-            kv_prefetch_jobs: Optional next-request KV prefetch descriptor.
 
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(reqs, od_config, kv_prefetch_jobs=kv_prefetch_jobs)
+        return self.worker.execute_model(reqs, od_config)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
