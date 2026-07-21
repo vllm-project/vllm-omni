@@ -24,6 +24,13 @@ IMAGE_VIDEO_MODELS = {
 
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
 
+MODEL_MARKS = {
+    "riverclouds/qwen_image_random": pytest.mark.core_model,
+    "Tongyi-MAI/Z-Image-Turbo": pytest.mark.advanced_model,
+    "stabilityai/stable-audio-open-1.0": pytest.mark.full_model,
+    "OmniGen2/OmniGen2": pytest.mark.full_model,
+}
+
 _GATED_MODELS = {"stabilityai/stable-audio-open-1.0"}
 
 # Aliased for backward compatibility (imported by test_diffusion_layerwise_offload.py).
@@ -97,10 +104,12 @@ def check_audio_determinism(audio1, audio2, atol=1e-2):
     return True
 
 
-@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("model_name", list(MODELS.keys()))
+@pytest.mark.parametrize(
+    "model_name",
+    [pytest.param(name, marks=MODEL_MARKS[name]) for name in MODELS],
+)
 def test_cpu_offload_diffusion_model(model_name: str):
     if model_name == "OmniGen2/OmniGen2":
         pytest.skip("issue #4537")

@@ -12,7 +12,7 @@ For backend selection and SageAttention usage, see the [Diffusion Attention Back
 | Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM (BF16) |
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
-| `dg845/LTX-2.3-Diffusers` | 384x512 | 25 | 20 | 4.0 | 96GB-class GPU |
+| `diffusers/LTX-2.3-Diffusers` | 384x512 | 25 | 20 | 4.0 | 96GB-class GPU |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 
@@ -55,7 +55,7 @@ python text_to_video.py \
 
 ```bash
 python text_to_video.py \
-  --model dg845/LTX-2.3-Diffusers \
+  --model diffusers/LTX-2.3-Diffusers \
   --model-class-name LTX23Pipeline \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
   --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
@@ -70,7 +70,7 @@ python text_to_video.py \
   --output ltx23_t2v_output.mp4
 ```
 
-Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers`; the
+Use the Diffusers-format checkpoint `diffusers/LTX-2.3-Diffusers`; the
 upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
 this pipeline. Pass `--model-class-name LTX23Pipeline` to select the LTX-2.3
 text-to-video pipeline explicitly.

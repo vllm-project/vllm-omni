@@ -328,7 +328,7 @@ class MiniCPMOConfig(Qwen2Config):
         tts_config=None,
         use_image_id=True,
         vision_batch_size=16,
-        audio_pool_step=2,
+        audio_pool_step=5,
         audio_chunk_length=1.0,
         stream_input=False,
         init_vision=True,
@@ -760,7 +760,12 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         )
 
 
-AutoImageProcessor.register("MiniCPMVImageProcessor", MiniCPMVImageProcessor)
+# transformers >= 5.x requires the config *class* (not a string) as the
+# first arg to AutoImageProcessor.register — it does `key.__module__`
+# internally. Passing "MiniCPMVImageProcessor" raises:
+#   AttributeError: 'str' object has no attribute '__module__'
+# See also processing_gr00t_n1d7.py for the same transformers API change.
+AutoImageProcessor.register(MiniCPMOConfig, MiniCPMVImageProcessor, exist_ok=True)
 
 
 # ============== SigLIP Vision Transformer Classes ==============
@@ -2834,6 +2839,9 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     ) -> str:
         hf_processor = self.get_hf_processor()
 
+        # Keep prompt placeholders aligned with the encoder's checkpoint config.
+        hf_processor.pool_step = self.get_default_audio_pool_step()
+
         return hf_processor.get_audio_placeholder(
             audio_lens,
             chunk_input=chunk_input,
@@ -2841,7 +2849,7 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         )
 
     def get_default_audio_pool_step(self) -> int:
-        return getattr(self.get_hf_config(), "audio_pool_step", 2)
+        return getattr(self.get_hf_config(), "audio_pool_step", 5)
 
     def get_default_audio_sampling_rate(self) -> int:
         return 16000

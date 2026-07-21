@@ -73,17 +73,17 @@ _DIFFUSION_MODELS = {
     ),
     "LTX2ImageToVideoPipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2",
         "LTX2ImageToVideoPipeline",
     ),
     "LTX2TwoStagesPipeline": (
         "ltx2",
-        "pipeline_ltx2",
+        "pipeline_ltx2_two_stage",
         "LTX2TwoStagesPipeline",
     ),
     "LTX2ImageToVideoTwoStagesPipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2_two_stage",
         "LTX2ImageToVideoTwoStagesPipeline",
     ),
     "LTX2T2VDMD2Pipeline": (
@@ -93,17 +93,17 @@ _DIFFUSION_MODELS = {
     ),
     "LTX2I2VDMD2Pipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2",
         "LTX2I2VDMD2Pipeline",
     ),
     "LTX23Pipeline": (
         "ltx2",
-        "pipeline_ltx2_3",
+        "pipeline_ltx2",
         "LTX23Pipeline",
     ),
     "LTX23ImageToVideoPipeline": (
         "ltx2",
-        "pipeline_ltx2_3_image2video",
+        "pipeline_ltx2",
         "LTX23ImageToVideoPipeline",
     ),
     "StableAudioPipeline": (
@@ -255,6 +255,11 @@ _DIFFUSION_MODELS = {
         "hunyuan_video",
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
+    ),
+    "LingBotVideoPipeline": (
+        "lingbot_video",
+        "pipeline_lingbot_video",
+        "LingBotVideoPipeline",
     ),
     "MagiHumanPipeline": (
         "magi_human",
@@ -536,6 +541,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",

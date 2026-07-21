@@ -16,10 +16,28 @@ class FishSpeechAdapter(ARTTSAdapter):
     name = "fish_tts"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
-        err = self.ctx.server._apply_uploaded_speaker(request)
+        """Validate Fish Speech request parameters. Returns error message or None."""
+        server = self.ctx.server
+        err = server._apply_uploaded_speaker(request)
         if err:
             return err
-        return self.ctx.server._validate_fish_tts_request(request)
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        if request.ref_audio is not None:
+            fmt_err = server._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+            if not request.ref_text or not request.ref_text.strip():
+                return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < self.max_new_tokens_min:
+                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
+            if request.max_new_tokens > self.max_new_tokens_max:
+                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
+
+        return None
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

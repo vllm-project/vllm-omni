@@ -32,6 +32,7 @@ AUDEX_AUDIOGEN_END_TOKEN_ID = 131074
 # size. Decoder stages keep their explicit per-stage model_arch.
 AUDEX_TTS_PIPELINE = PipelineConfig(
     model_type="audex_tts",
+    default_deploy_config_name="audex_tts.yaml",
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -83,6 +84,7 @@ AUDEX_TTS_PIPELINE = PipelineConfig(
 # the codec path. The cascade itself is orchestrated by the client/example.
 AUDEX_S2S_PIPELINE = PipelineConfig(
     model_type="audex_s2s",
+    default_deploy_config_name="audex_s2s.yaml",
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -135,6 +137,7 @@ AUDEX_S2S_PIPELINE = PipelineConfig(
 # Modeled on the ming_flash_omni / qwen2_5_omni thinker-only pipelines.
 AUDEX_THINKER_ONLY_PIPELINE = PipelineConfig(
     model_type="audex_thinker_only",
+    default_deploy_config_name="audex_thinker_only.yaml",
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -156,6 +159,7 @@ AUDEX_THINKER_ONLY_PIPELINE = PipelineConfig(
 
 AUDEX_TTA_PIPELINE = PipelineConfig(
     model_type="audex_tta",
+    default_deploy_config_name="audex_tta.yaml",
     stages=(
         StagePipelineConfig(
             stage_id=0,
