@@ -157,19 +157,20 @@ def run_pipeline_forward(
     noise: torch.Tensor,
     request_id: str,
 ) -> torch.Tensor:
-    output = pipeline.forward(
-        OmniDiffusionRequest(
-            prompts=[""],
-            sampling_params=OmniDiffusionSamplingParams(
-                extra_args={
-                    "batch_inputs": batch_inputs,
-                    "noise": noise,
-                    "decode_image": False,
-                }
-            ),
-            request_id=request_id,
-        )
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+    req = OmniDiffusionRequest(
+        prompt=[""],
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={
+                "batch_inputs": batch_inputs,
+                "noise": noise,
+                "decode_image": False,
+            }
+        ),
+        request_id=request_id,
     )
+    output = pipeline.forward(DiffusionRequestBatch(requests=[req]))
     if output.error:
         raise RuntimeError(output.error)
     if output.output is None:

@@ -313,10 +313,12 @@ class Qwen3VLWithExpertModel(nn.Module):
         vlm_config_hf.text_config.num_hidden_layers = vlm_config.num_hidden_layers
         vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_key_value_heads
         vlm_config_hf.text_config.max_position_embeddings = 262144
-        vlm_config_hf.text_config.rope_scaling = {
+        # transformers v5.x replaced rope_scaling/rope_theta with a single rope_parameters dict.
+        vlm_config_hf.text_config.rope_parameters = {
+            "rope_theta": 5000000,
+            "rope_type": "default",
             "mrope_interleaved": True,
             "mrope_section": [24, 20, 20],
-            "rope_type": "default",
         }
         vlm_config_hf.text_config.tie_word_embeddings = True
         vlm_config_hf.tie_word_embeddings = True
@@ -336,7 +338,7 @@ class Qwen3VLWithExpertModel(nn.Module):
         gen_expert_config_hf.num_hidden_layers = action_expert_config.num_hidden_layers
         gen_expert_config_hf.num_key_value_heads = action_expert_config.num_key_value_heads
         gen_expert_config_hf.max_position_embeddings = self.und_expert.config.text_config.max_position_embeddings
-        gen_expert_config_hf.rope_scaling = self.und_expert.config.text_config.rope_scaling
+        gen_expert_config_hf.rope_parameters = self.und_expert.config.text_config.rope_parameters
         self.gen_expert = Qwen3VLTextModel(config=gen_expert_config_hf)
         self.gen_expert.embed_tokens = None
         self.gen_expert.lm_head = None
@@ -349,7 +351,7 @@ class Qwen3VLWithExpertModel(nn.Module):
         act_expert_config_hf.num_hidden_layers = action_expert_config.num_hidden_layers
         act_expert_config_hf.num_key_value_heads = action_expert_config.num_key_value_heads
         act_expert_config_hf.max_position_embeddings = self.und_expert.config.text_config.max_position_embeddings
-        act_expert_config_hf.rope_scaling = self.und_expert.config.text_config.rope_scaling
+        act_expert_config_hf.rope_parameters = self.und_expert.config.text_config.rope_parameters
         self.act_expert = Qwen3VLTextModel(config=act_expert_config_hf)
         self.act_expert.embed_tokens = None
         self.act_expert.lm_head = None
@@ -515,7 +517,8 @@ class InternVLAA1(nn.Module):
         image_token_id = self.qwen3_vl_with_expert.und_expert.config.image_token_id
         pixel_values = pixel_values.view(-1, pixel_values.shape[-1])
         image_grid_thw = image_grid_thw.view(-1, 3)
-        image_embs, _ = self.qwen3_vl_with_expert.und_expert.visual(pixel_values, image_grid_thw)
+        vision_outputs = self.qwen3_vl_with_expert.und_expert.visual(pixel_values, image_grid_thw)
+        image_embs = vision_outputs.pooler_output
 
         embs = self.qwen3_vl_with_expert.und_expert.get_input_embeddings()(lang_tokens)
         batch_size, seq_len, hidden_dim = embs.shape

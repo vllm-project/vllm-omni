@@ -30,9 +30,33 @@ from vllm_omni.model_extras.cosmos3 import (
 from vllm_omni.model_extras.cosmos3 import (
     build_text_to_image_prompt as build_cosmos3_text_to_image_prompt,
 )
+from vllm_omni.model_extras.dreamzero import (
+    DREAMZERO_EXTRA_BODY_PARAMS,
+    DREAMZERO_EXTRA_OUTPUT_PARAMS,
+    DREAMZERO_WORKER_EXTENSION_CLS,
+)
+from vllm_omni.model_extras.dreamzero import (
+    build_observations as build_dreamzero_observations,
+)
+from vllm_omni.model_extras.dreamzero import (
+    finalize as finalize_dreamzero_robot_run,
+)
+from vllm_omni.model_extras.dreamzero import (
+    process_robot_actions as process_dreamzero_robot_actions,
+)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.internvla_a1 import (
+    INTERNVLA_A1_EXTRA_BODY_PARAMS,
+    INTERNVLA_A1_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.internvla_a1 import (
+    build_observations as build_internvla_a1_observations,
+)
+from vllm_omni.model_extras.internvla_a1 import (
+    process_robot_actions as process_internvla_a1_robot_actions,
 )
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
@@ -88,6 +112,9 @@ ImageToVideoPromptBuilder = Callable[
     ],
     dict[str, Any],
 ]
+RobotObsBuilder = Callable[..., tuple[list[dict[str, Any]] | dict[str, Any], dict[str, Any]]]
+ActionOutputProcessor = Callable[..., dict[str, Any]]
+RobotPolicyFinalizer = Callable[..., Any | None]
 
 
 def default_text_to_image_prompt(
@@ -153,6 +180,14 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
         "text_to_image_prompt_builder": build_cosmos3_text_to_image_prompt,
     },
+    "DreamZeroPipeline": {
+        "extra_body_params": DREAMZERO_EXTRA_BODY_PARAMS,
+        "extra_output_params": DREAMZERO_EXTRA_OUTPUT_PARAMS,
+        "worker_extension_cls": DREAMZERO_WORKER_EXTENSION_CLS,
+        "robot_obs_builder": build_dreamzero_observations,
+        "action_output_processor": process_dreamzero_robot_actions,
+        "robot_policy_finalizer": finalize_dreamzero_robot_run,
+    },
     "Cosmos3OmniPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
@@ -188,6 +223,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
+    "InternVLAA1Pipeline": {
+        "extra_body_params": INTERNVLA_A1_EXTRA_BODY_PARAMS,
+        "extra_output_params": INTERNVLA_A1_EXTRA_OUTPUT_PARAMS,
+        "robot_obs_builder": build_internvla_a1_observations,
+        "action_output_processor": process_internvla_a1_robot_actions,
+    },
 }
 
 
@@ -219,6 +260,11 @@ def get_extra_body_params(model_class_name: str | None) -> frozenset[str]:
 def get_extra_output_params(model_class_name: str | None) -> frozenset[str]:
     spec = _get_spec(model_class_name)
     return spec.get("extra_output_params", frozenset()) if spec is not None else frozenset()
+
+
+def get_worker_extension_class(model_class_name: str | None) -> str | None:
+    spec = _get_spec(model_class_name)
+    return spec.get("worker_extension_cls", None) if spec is not None else None
 
 
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:
@@ -275,3 +321,49 @@ def build_image_to_video_prompt(
         else default_image_to_video_prompt
     )
     return builder(prompt, negative_prompt, media_inputs, height, width, num_frames)
+
+
+def build_robot_observations(
+    model_class_name: str | None,
+    model_dir: str,
+    task: str,
+    data_dir: str,
+    **extra_params,
+) -> tuple[list[dict[str, Any]] | dict[str, Any], dict[str, Any]]:
+    spec = _get_spec(model_class_name)
+    builder: RobotObsBuilder | None = spec.get("robot_obs_builder") if spec is not None else None
+    if builder is None:
+        raise NotImplementedError(
+            f"Model '{model_class_name}' has no robot_obs_builder registered; "
+            "it cannot run through the shared robot_policy example."
+        )
+    return builder(model_dir, task, data_dir, **extra_params)
+
+
+def process_robot_actions(
+    model_class_name: str | None,
+    output,
+    **metadata,
+) -> dict[str, Any]:
+    spec = _get_spec(model_class_name)
+    processor: ActionOutputProcessor | None = spec.get("action_output_processor") if spec is not None else None
+    if processor is None:
+        output_arr = getattr(output, "output", output)
+        if isinstance(output_arr, dict) and "actions" in output_arr:
+            import numpy as np
+
+            return {"actions": np.asarray(output_arr["actions"]), "metadata": {}}
+        # Fallback: treat the whole output as actions
+        import numpy as np
+
+        return {"actions": np.asarray(output_arr), "metadata": {}}
+    return processor(output, **metadata)
+
+
+def finalize_robot_run(model_class_name: str, omni, results: list[dict], output_path):
+    spec = _get_spec(model_class_name)
+    finalizer: RobotPolicyFinalizer | None = spec.get("robot_policy_finalizer") if spec is not None else None
+    if finalizer is None:
+        print(f"No post-process procedures for {model_class_name}.")
+        return
+    return finalizer(omni, results, output_path)

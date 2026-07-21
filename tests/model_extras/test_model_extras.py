@@ -3,17 +3,24 @@
 
 from __future__ import annotations
 
+import cv2
+import numpy as np
 import pytest
+import torch
 from PIL import Image
+from pytest_mock import MockerFixture
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import (
     build_image_to_image_prompt,
     build_image_to_video_prompt,
+    build_robot_observations,
     build_text_to_image_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    get_worker_extension_class,
+    process_robot_actions,
     should_init_extra_args_for_non_diffusion_stages,
 )
 
@@ -329,6 +336,7 @@ def test_vace_extra_registry_has_no_pipeline_params() -> None:
 def test_unknown_pipeline_has_empty_extra_registry() -> None:
     assert get_extra_body_params("UnknownPipeline") == frozenset()
     assert get_extra_output_params("UnknownPipeline") == frozenset()
+    assert get_worker_extension_class("UnknownPipeline") is None
     assert should_init_extra_args_for_non_diffusion_stages("UnknownPipeline") is False
 
 
@@ -516,3 +524,101 @@ def test_mammothmoda2_text_to_image_prompt_builder() -> None:
             "image_width": [768],
         },
     }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamzero_registry_declares() -> None:
+    assert get_extra_body_params("DreamZeroPipeline") == frozenset(
+        {
+            "robot_obs",
+            "reset",
+            "session_id",
+        }
+    )
+    assert get_extra_output_params("DreamZeroPipeline") == frozenset()
+    assert get_worker_extension_class("DreamZeroPipeline") == (
+        "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamzero_build_observations_shape(tmp_path) -> None:
+    num_frames = 24
+    height, width = 10, 12
+    CAMERA_FILES = {
+        "observation/exterior_image_0_left": "exterior_image_1_left.mp4",
+        "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
+        "observation/wrist_image_left": "wrist_image_left.mp4",
+    }
+
+    for file_name in CAMERA_FILES.values():
+        writer = cv2.VideoWriter(
+            str(tmp_path / file_name),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            15.0,
+            (width, height),
+        )
+        for _ in range(num_frames):
+            writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+        writer.release()
+
+    observations, metadata = build_robot_observations("DreamZeroPipeline", "model/dir", "pick up the cup", tmp_path)
+
+    camera_key = next(iter(CAMERA_FILES.keys()))
+    assert metadata == {}
+    assert len(observations) == 2
+    assert observations[0]["robot_obs"][camera_key].shape == (height, width, 3)
+    assert observations[1]["robot_obs"][camera_key].shape == (4, height, width, 3)
+
+
+@pytest.fixture
+def make_dreamzero_output(mocker: MockerFixture):
+    def _make_output(actions, latent):
+        out = mocker.MagicMock()
+        out.multimodal_output = {"actions": actions}
+        out.images = [latent] if latent is not None else []
+        return out
+
+    return _make_output
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamzero_process_robot_actions_5d_latent(make_dreamzero_output):
+    actions = np.array([[1.0, 2.0]])
+    latent = torch.zeros(1, 4, 3, 8, 8)
+    result = process_robot_actions("DreamZeroPipeline", make_dreamzero_output(actions, latent))
+    np.testing.assert_array_equal(result["actions"], actions)
+    assert result["metadata"]["video_latents"].shape == (1, 4, 3, 8, 8)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamzero_process_robot_actions_4d_latent_gets_unsqueezed(make_dreamzero_output):
+    latent = torch.zeros(4, 3, 8, 8)
+    result = process_robot_actions("DreamZeroPipeline", make_dreamzero_output(np.zeros((1, 2)), latent))
+    assert result["metadata"]["video_latents"].shape == (1, 4, 3, 8, 8)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamzero_process_robot_actions_transpose_when_t_lt_c(make_dreamzero_output):
+    latent = torch.zeros(1, 3, 8, 8, 8)
+    result = process_robot_actions("DreamZeroPipeline", make_dreamzero_output(np.zeros((1, 2)), latent))
+    assert result["metadata"]["video_latents"].shape == (1, 8, 3, 8, 8)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamzero_process_robot_actions_raises_when_no_images(make_dreamzero_output):
+    with pytest.raises(RuntimeError, match="video latents"):
+        process_robot_actions("DreamZeroPipeline", make_dreamzero_output(np.zeros((1, 2)), None))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamzero_process_robot_actions_raises_on_non_tensor_latent(make_dreamzero_output):
+    with pytest.raises(TypeError):
+        process_robot_actions("DreamZeroPipeline", make_dreamzero_output(np.zeros((1, 2)), np.zeros((1, 4, 3, 8, 8))))

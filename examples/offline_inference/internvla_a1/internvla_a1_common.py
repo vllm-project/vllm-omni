@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
-import torchvision
+from torchcodec.decoders import VideoDecoder
 
 from vllm_omni.diffusion.models.internvla_a1.config import (  # noqa: E402
     OBS_IMAGES,
@@ -78,44 +78,30 @@ def unnormalize_vector(values: torch.Tensor, stats: dict[str, torch.Tensor]) -> 
     return values * stats["std"] + stats["mean"]
 
 
-class TorchvisionVideoReaderCache:
-    def __init__(self, backend: str = "pyav") -> None:
-        self.backend = backend
-        self._readers: dict[str, Any] = {}
-        torchvision.set_video_backend(backend)
+class TorchCodecVideoReaderCache:
+    def __init__(self) -> None:
+        self._decoders: dict[str, VideoDecoder] = {}
 
-    def get(self, path: str) -> Any:
-        reader = self._readers.get(path)
-        if reader is None:
-            reader = torchvision.io.VideoReader(path, "video")
-            self._readers[path] = reader
-        return reader
+    def get(self, path: str) -> VideoDecoder:
+        decoder = self._decoders.get(path)
+        if decoder is None:
+            decoder = VideoDecoder(path)
+            self._decoders[path] = decoder
+        return decoder
 
     def decode_frames(self, path: str, timestamps: list[float], tolerance_s: float = 1e-4) -> torch.Tensor:
-        reader = self.get(path)
-        first_ts = min(timestamps)
-        last_ts = max(timestamps)
-        reader.seek(first_ts, keyframes_only=self.backend == "pyav")
-
-        loaded_frames: list[torch.Tensor] = []
-        loaded_ts: list[float] = []
-        for frame in reader:
-            current_ts = float(frame["pts"])
-            loaded_frames.append(frame["data"])
-            loaded_ts.append(current_ts)
-            if current_ts >= last_ts:
-                break
+        decoder = self.get(path)
+        frame_batch = decoder.get_frames_played_at(seconds=timestamps)
 
         query_ts = torch.tensor(timestamps, dtype=torch.float32)
-        loaded_ts_tensor = torch.tensor(loaded_ts, dtype=torch.float32)
-        distances = torch.cdist(query_ts[:, None], loaded_ts_tensor[:, None], p=1)
-        min_dist, argmin = distances.min(dim=1)
-        if not torch.all(min_dist < tolerance_s):
+        actual_ts = frame_batch.pts_seconds.to(torch.float32)
+        diff = (query_ts - actual_ts).abs()
+        if not torch.all(diff < tolerance_s):
             raise RuntimeError(
                 f"Video timestamps are outside tolerance: query={query_ts.tolist()} "
-                f"loaded={loaded_ts_tensor.tolist()} path={path}"
+                f"loaded={actual_ts.tolist()} path={path}"
             )
-        return torch.stack([loaded_frames[i] for i in argmin]).float() / 255.0
+        return frame_batch.data.float() / 255.0
 
 
 @dataclass
@@ -164,7 +150,7 @@ class A2DOpenLoopDataset:
         self.action_stats = _stack_stats(train_stats, self.action_keys)
         self.image_offsets = image_offsets
         self.tolerance_s = tolerance_s
-        self.video_reader = TorchvisionVideoReaderCache(backend="pyav")
+        self.video_reader = TorchCodecVideoReaderCache()
 
     @property
     def num_episodes(self) -> int:

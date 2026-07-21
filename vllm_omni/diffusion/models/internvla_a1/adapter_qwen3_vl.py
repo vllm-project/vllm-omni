@@ -15,10 +15,10 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
     Unpack,
     apply_rotary_pos_emb,
-    check_model_inputs,
+    capture_outputs,
     create_causal_mask,
-    deprecate_kwarg,
     eager_attention_forward,
+    merge_with_config_defaults,
 )
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalGeneration,
@@ -38,6 +38,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextRMSNorm as HFQwen3VLTextRMSNorm,
 )
+from transformers.utils.deprecation import deprecate_kwarg
 
 
 class Qwen3VLTextRMSNorm(HFQwen3VLTextRMSNorm):
@@ -134,7 +135,8 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
 
         self.post_init()
 
-    @check_model_inputs
+    @merge_with_config_defaults
+    @capture_outputs
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -230,7 +232,7 @@ class Qwen3VLModel(HFQwen3VLModel):
 
 class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
     _checkpoint_conversion_mapping = {}
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     accepts_loss_kwargs = False
     config: Qwen3VLConfig
 
@@ -239,6 +241,14 @@ class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
         self.model = Qwen3VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()
+
+    @property
+    def language_model(self):
+        return self.model.language_model
+
+    @property
+    def visual(self):
+        return self.model.visual
 
 
 __all__ = [
