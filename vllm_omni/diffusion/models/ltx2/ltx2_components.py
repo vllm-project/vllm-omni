@@ -506,6 +506,12 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
 
     transformer_config = load_transformer_config(model, "transformer", local_files_only)
+    # Keep the complete checkpoint config for pipelines that construct another
+    # Transformer after the shared components have been initialized.  The
+    # runtime Transformer's ``config`` is a SimpleNamespace containing only
+    # the fields needed during inference, so it cannot faithfully recreate an
+    # LTX-2.3 Transformer on its own.
+    pipeline._transformer_init_config = dict(transformer_config)
     quant_config = getattr(od_config, "quantization_config", None)
     pipeline.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
     _place_aux_components(pipeline)
