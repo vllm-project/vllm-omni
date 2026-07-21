@@ -12,6 +12,7 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
@@ -23,8 +24,9 @@ from tests.helpers.stage_config import (
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
+_DEFAULT_STAGE_CONFIG = get_deploy_config_path("qwen3_tts.yaml")
 _STAGE_CONFIG = modify_stage_config(
-    get_deploy_config_path("qwen3_tts.yaml"),
+    _DEFAULT_STAGE_CONFIG,
     updates={"stages": {0: {"default_sampling_params.max_tokens": 500}}},
 )
 
@@ -54,12 +56,24 @@ tts_server_params = [
     )
 ]
 
+default_tts_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=_DEFAULT_STAGE_CONFIG,
+            server_args=["--trust-remote-code"],
+        ),
+        id="async_chunk",
+    )
+]
+
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA Graph startup test requires CUDA")
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+@pytest.mark.parametrize("omni_server", default_tts_server_params, indirect=True)
 def test_default_cuda_graph_startup(omni_server) -> None:
     """Start both stages with the shipped CUDA Graph configuration."""
     stage_1 = get_deploy_config_stage("qwen3_tts.yaml", stage_id=1)
