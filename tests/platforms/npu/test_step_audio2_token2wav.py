@@ -83,7 +83,11 @@ def test_hift_patch_is_exact_idempotent_and_stays_on_device(monkeypatch: pytest.
         upsample_scale = 4
         flag_for_pulse = False
 
+        def __init__(self):
+            self.original_calls = 0
+
         def _f02sine(self, f0_values):
+            self.original_calls += 1
             return _reference_f02sine(self, f0_values)
 
     class FakeHiFT:
@@ -94,9 +98,9 @@ def test_hift_patch_is_exact_idempotent_and_stays_on_device(monkeypatch: pytest.
             raise AssertionError("HiFT must stay on its accelerator")
 
     hift = FakeHiFT()
-    module.patch_hift_module_for_npu(hift)
+    module.patch_step_audio2_hift_for_npu(hift)
     patched_method = hift.m_source.l_sin_gen._f02sine
-    module.patch_hift_module_for_npu(hift)
+    module.patch_step_audio2_hift_for_npu(hift)
     assert hift.m_source.l_sin_gen._f02sine is patched_method
 
     f0_values = torch.rand(1, 16, 3)
@@ -105,4 +109,88 @@ def test_hift_patch_is_exact_idempotent_and_stays_on_device(monkeypatch: pytest.
     torch.manual_seed(7)
     actual = patched_method(f0_values)
 
+    assert hift.m_source.l_sin_gen.original_calls == 0
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("flag_for_pulse", "upsample_scale", "input_length"),
+    [
+        (True, 4, 16),
+        (False, 3, 12),
+        (False, 4.5, 18),
+        (False, 4, 10),
+    ],
+)
+def test_hift_patch_delegates_unsupported_cases_to_original_f02sine_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+    flag_for_pulse: bool,
+    upsample_scale: float,
+    input_length: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    calls: list[str] = []
+
+    class FakeSineGen:
+        def __init__(self):
+            self.flag_for_pulse = flag_for_pulse
+            self.upsample_scale = upsample_scale
+
+        def _f02sine(self, f0_values):
+            calls.append(f0_values.device.type)
+            return f0_values + 1
+
+    hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=FakeSineGen()))
+    module.patch_step_audio2_hift_for_npu(hift)
+
+    f0_values = torch.randn(1, input_length, 3)
+    output = hift.m_source.l_sin_gen._f02sine(f0_values)
+
+    assert calls == ["cpu"]
+    assert output.device == f0_values.device
+    torch.testing.assert_close(output, f0_values + 1)
+
+
+@pytest.mark.parametrize("upsample_scale", [0, -2])
+def test_hift_patch_rejects_non_positive_scale(
+    monkeypatch: pytest.MonkeyPatch,
+    upsample_scale: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class FakeSineGen:
+        flag_for_pulse = False
+
+        def __init__(self):
+            self.upsample_scale = upsample_scale
+
+        def _f02sine(self, f0_values):
+            return f0_values
+
+    hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=FakeSineGen()))
+    module.patch_step_audio2_hift_for_npu(hift)
+
+    with pytest.raises(ValueError, match="upsample_scale must be positive"):
+        hift.m_source.l_sin_gen._f02sine(torch.randn(1, 16, 3))
+
+
+def test_hift_patch_rejects_causal_sinegen(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class FakeCausalSineGen:
+        causal = True
+
+        def _f02sine(self, f0_values):
+            return f0_values
+
+    hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=FakeCausalSineGen()))
+
+    with pytest.raises(ValueError, match="only supports non-causal SineGen2"):
+        module.patch_step_audio2_hift_for_npu(hift)
+
+
+def test_hift_patch_reports_incompatible_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    with pytest.raises(TypeError, match=r"m_source\.l_sin_gen\._f02sine"):
+        module.patch_step_audio2_hift_for_npu(SimpleNamespace())

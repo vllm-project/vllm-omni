@@ -46,12 +46,26 @@ def _linear_downsample_even_scale(x: torch.Tensor, scale: int) -> torch.Tensor:
     return (x[..., left::scale] + x[..., right::scale]) * 0.5
 
 
-def _f02sine_on_npu(self, f0_values: torch.Tensor) -> torch.Tensor:
-    """HiFT ``SineGen2._f02sine`` with a safe NPU linear downsample."""
-    original_f02sine = self._npu_original_f02sine
-    scale = int(self.upsample_scale)
-    if self.flag_for_pulse or scale != self.upsample_scale or scale % 2 or f0_values.shape[1] % scale:
-        return original_f02sine(f0_values)
+def _run_original_f02sine_on_cpu(self, f0_values: torch.Tensor) -> torch.Tensor:
+    """Run the unmodified ``_f02sine`` without invoking NPU ``linear1d``."""
+    output_device = f0_values.device
+    output = self._step_audio2_original_f02sine(f0_values.cpu())
+    return output.to(output_device)
+
+
+def _f02sine_with_npu_safe_downsample(self, f0_values: torch.Tensor) -> torch.Tensor:
+    """Use the exact NPU midpoint path, with a narrow CPU fallback."""
+    if getattr(self, "flag_for_pulse", False):
+        return _run_original_f02sine_on_cpu(self, f0_values)
+
+    upsample_scale = self.upsample_scale
+    if upsample_scale <= 0:
+        raise ValueError(f"upsample_scale must be positive, got {upsample_scale}")
+
+    scale = int(upsample_scale)
+    midpoint_supported = scale == upsample_scale and scale % 2 == 0 and f0_values.shape[1] % scale == 0
+    if not midpoint_supported:
+        return _run_original_f02sine_on_cpu(self, f0_values)
 
     rad_values = (f0_values / self.sampling_rate) % 1
     rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
@@ -68,24 +82,34 @@ def _f02sine_on_npu(self, f0_values: torch.Tensor) -> torch.Tensor:
     return torch.sin(phase)
 
 
-def patch_hift_module_for_npu(hift: torch.nn.Module) -> None:
-    """Keep HiFT on NPU and patch its failing linear downsample.
+def patch_step_audio2_hift_for_npu(hift: torch.nn.Module) -> None:
+    """Patch the non-causal Step-Audio2 HiFT implementation for Ascend.
 
-    HiFT uses ``SineGen2._f02sine`` to reduce a full-rate phase tensor by
-    ``1 / 480`` before restoring it to the waveform rate. Ascend's
-    ``upsample_linear1d`` kernel can raise an AIVector UB-address exception
-    (ACL 507015) for that reduction. The equivalent midpoint form avoids the
-    failing kernel; the remaining HiFT forward, including STFT/ISTFT, stays on
-    NPU and does not require per-chunk host transfers.
+    The ``flashcosyvoice.SineGen2`` instantiated by Step-Audio2 1.0.0 is
+    non-causal and reduces a full-rate phase tensor by ``1 / 480`` before
+    restoring it to the waveform rate. Ascend's ``upsample_linear1d`` kernel
+    can raise an AIVector UB-address exception (ACL 507015) for that reduction.
+
+    The exact midpoint form keeps the common path on NPU. Unsupported or pulse
+    configurations delegate only ``_f02sine`` to CPU, preserving upstream
+    behavior without restoring the old whole-HiFT CPU offload.
     """
-    if getattr(hift, "_npu_linear_downsample_patched", False):
+    if getattr(hift, "_step_audio2_npu_downsample_patched", False):
         return
 
-    sine_gen = hift.m_source.l_sin_gen
-    sine_gen._npu_original_f02sine = sine_gen._f02sine
-    sine_gen._f02sine = MethodType(_f02sine_on_npu, sine_gen)
-    hift._npu_linear_downsample_patched = True
-    logger.info("Patched HiFT linear downsample for Ascend NPU")
+    try:
+        sine_gen = hift.m_source.l_sin_gen
+        original_f02sine = sine_gen._f02sine
+    except AttributeError as exc:
+        raise TypeError("expected a Step-Audio2 flashcosyvoice HiFT with m_source.l_sin_gen._f02sine") from exc
+
+    if getattr(sine_gen, "causal", False):
+        raise ValueError("the Step-Audio2 NPU HiFT patch only supports non-causal SineGen2")
+
+    sine_gen._step_audio2_original_f02sine = original_f02sine
+    sine_gen._f02sine = MethodType(_f02sine_with_npu_safe_downsample, sine_gen)
+    hift._step_audio2_npu_downsample_patched = True
+    logger.info("Patched Step-Audio2 HiFT linear downsample for Ascend NPU")
 
 
 @contextmanager
@@ -111,7 +135,7 @@ def _patched_ensure_models_loaded(self) -> None:
     _original_ensure_models_loaded(self)
     if was_loaded or self.device.type != "npu" or self._hift is None:
         return
-    patch_hift_module_for_npu(self._hift)
+    patch_step_audio2_hift_for_npu(self._hift)
 
 
 def _patched_forward(self, generated_speech_tokens, prompt_wav, return_bytes=True):
