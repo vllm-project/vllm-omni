@@ -1,6 +1,18 @@
+# Document 1: resolve skip-ci / CI-yaml-only level targeting, then upload document 2.
+steps:
+  - label: ":github: Resolve skip-ci (docs / skip marks) & upload pipeline"
+    key: upload-ci-pipeline
+    commands:
+      - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/pipeline-npu.yml"
+    agents:
+      queue: "ascend-a2b3"
+      resource_class: "npu-1"
+
+---
 steps:
   - label: ":buildkit: Build and Push NPU Test Image - A2"
     key: image-build
+    if: __IMAGE_BUILD_IF__
     agents:
       queue: "ascend-a2b3"
       resource_class: "npu-1"
@@ -80,6 +92,7 @@ steps:
 
   - label: ":buildkit: Build and Push NPU Test Image - A3"
     key: image-build-a3
+    if: __IMAGE_BUILD_IF__
     agents:
       queue: "ascend-a2b3"
       resource_class: "npu-1"
@@ -162,11 +175,7 @@ steps:
       - image-build
       - image-build-a3
     key: upload-ready-pipeline
-    if: >-
-      build.branch != "main" && (
-        build.pull_request.labels includes "npu-test" ||
-        build.pull_request.labels includes "ready"
-      )
+    if: __UPLOAD_READY_IF__
     agents:
       queue: "ascend-a2b3"
       resource_class: "npu-1"
@@ -179,15 +188,7 @@ steps:
       - image-build
       - image-build-a3
     key: upload-nightly-pipeline
-    if: >-
-      (build.branch == "main" && build.env("NIGHTLY") == "1") ||
-      (build.branch != "main" && (
-        build.pull_request.labels includes "nightly-test" ||
-        build.pull_request.labels includes "omni-test" ||
-        build.pull_request.labels includes "tts-test" ||
-        build.pull_request.labels includes "diffusion-x2iat-test" ||
-        build.pull_request.labels includes "diffusion-x2v-test"
-      ))
+    if: __UPLOAD_NIGHTLY_IF__
     commands:
       - buildkite-agent pipeline upload .buildkite/npu/test-npu-nightly.yml
     agents:

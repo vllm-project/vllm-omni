@@ -131,7 +131,7 @@ Please run the L1 and L2 test cases locally first and attach the results before 
 
 ### Automatic skip-ci (docs and pytest skip marks)
 
-On pull requests and `main` pushes, the bootstrap step in [`.buildkite/cuda/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/pipeline.yml) runs [`.buildkite/cuda/scripts/upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/scripts/upload_pipeline.py) against the git diff. When every changed file qualifies, **L2 (`ready`) and L3 (`merge-test`) pipelines are not uploaded**, so the default GPU CI jobs are skipped.
+On pull requests and `main` pushes, the bootstrap step in [`.buildkite/cuda/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/pipeline.yml) runs [`.buildkite/common/scripts/upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) against the git diff. When every changed file qualifies, **L2 (`ready`) and L3 (`merge-test`) pipelines are not uploaded**, so the default GPU CI jobs are skipped.
 
 | Change per file | Examples |
 | --- | --- |

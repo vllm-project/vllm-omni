@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
+
+from skip_ci import resolve_ci_decision  # noqa: E402
+from upload_pipeline import (  # noqa: E402
+    BOOTSTRAP_MARKER,
+    DOC_SEP,
+    _expand_mirror_hardwares,
+    _render_bootstrap_pipeline,
+    _render_test_pipeline,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+CUDA_PIPELINE = Path(".buildkite/cuda/pipeline.yml")
+BOOTSTRAP_TEMPLATE = f"""steps: []
+{DOC_SEP}steps:
+  - if: {BOOTSTRAP_MARKER}
+  - if: __UPLOAD_READY_IF__
+  - if: __UPLOAD_NIGHTLY_IF__
+  - if: __UPLOAD_WEEKLY_IF__
+"""
+
+
+def _render(changed_files: list[str]) -> str:
+    decision = resolve_ci_decision(changed_files)
+    return _render_bootstrap_pipeline(
+        BOOTSTRAP_TEMPLATE,
+        decision=decision,
+        path=CUDA_PIPELINE,
+    )
+
+
+def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
+    rendered = _render([".buildkite/cuda/test-nightly.yml"])
+    assert "if: 'true'" not in rendered
+    assert 'build.pull_request.labels includes "nightly-test"' in rendered
+    assert 'build.pull_request.labels includes "weekly-test"' in rendered
+    assert "if: 'false'" in rendered
+
+
+def test_yaml_gated_l2_still_enables_image_via_ready_base() -> None:
+    rendered = _render([".buildkite/cuda/test-ready.yml"])
+    assert 'build.pull_request.labels includes "ready"' in rendered
+    assert "if: 'true'" not in rendered
+
+
+def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins() -> None:
+    doc = {
+        "steps": [
+            {
+                "label": "Simple Test",
+                "mirror_hardwares": "l4_1",
+                "commands": ["pytest -sv tests/example"],
+            },
+        ],
+    }
+    rendered = _render_test_pipeline(doc, changed_files=None)
+    step = rendered["steps"][0]
+    assert "mirror_hardwares" not in step
+    assert step["agents"]["queue"] == "gpu_1_queue"
+    assert step["plugins"][0]["docker#v5.2.0"]["image"].endswith("$BUILDKITE_COMMIT")
+
+
+def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:
+    with pytest.raises(ValueError, match="agents/plugins"):
+        _expand_mirror_hardwares(
+            {"label": "bad", "mirror_hardwares": "l4_1", "agents": {"queue": "gpu_1_queue"}},
+        )

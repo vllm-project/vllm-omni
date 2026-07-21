@@ -319,7 +319,7 @@ Before entering specific testing levels, the project establishes two common spec
 
 ### Diff-aware Buildkite uploads (`source_file_dependencies`)
 
-L2 (`.buildkite/cuda/test-ready.yml`) and L3 (`.buildkite/cuda/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/cuda/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
+L2 (`.buildkite/cuda/test-ready.yml`) and L3 (`.buildkite/cuda/test-merge.yml`) pipelines can **skip unrelated GPU jobs at upload time** based on the PR diff. This is implemented by `.buildkite/common/scripts/upload_pipeline.py`, which filters steps before calling `buildkite-agent pipeline upload`.
 
 #### What `source_file_dependencies` is
 
@@ -393,10 +393,10 @@ A **group** may also define `source_file_dependencies`; nested steps inherit fil
 
 ```bash
 # Render filtered YAML to stdout (no upload)
-python3 .buildkite/cuda/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
+python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
 
 # Confirm uploader-only keys are stripped
-python3 .buildkite/cuda/scripts/upload_pipeline.py .buildkite/cuda/test-merge.yml | grep source_file_dependencies
+python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-merge.yml | grep source_file_dependencies
 # (no output expected)
 ```
 
@@ -404,7 +404,7 @@ On a PR build, Buildkite logs from `upload_pipeline.py` include lines such as `s
 
 #### Related
 
-- Implementation: `.buildkite/cuda/scripts/upload_pipeline.py`
+- Implementation: `.buildkite/common/scripts/upload_pipeline.py`
 - L2/L3 diff skip does **not** replace label-based triggers (`ready`, `merge-test`); it only reduces which steps appear **after** the pipeline is already scheduled.
 
 ### Test helper environment variables

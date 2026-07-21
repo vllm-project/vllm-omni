@@ -9,7 +9,7 @@ steps:
   - label: ":github: Resolve skip-ci (docs / skip marks) & upload pipeline"
     key: upload-ci-pipeline
     commands:
-      - "python3 .buildkite/cuda/scripts/upload_pipeline.py --upload .buildkite/cuda/pipeline.yml"
+      - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/pipeline.yml"
     agents:
       queue: "cpu_queue_premerge"
 
@@ -37,7 +37,7 @@ steps:
         if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--e2e"
         fi
-        python3 .buildkite/cuda/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-ready.yml
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-ready.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -52,7 +52,7 @@ steps:
         if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--e2e"
         fi
-        python3 .buildkite/cuda/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -60,17 +60,9 @@ steps:
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
-    if: >-
-      (build.branch == "main" && build.env("NIGHTLY") == "1") ||
-      (build.branch != "main" && (
-        build.pull_request.labels includes "nightly-test" ||
-        build.pull_request.labels includes "omni-test" ||
-        build.pull_request.labels includes "tts-test" ||
-        build.pull_request.labels includes "diffusion-x2iat-test" ||
-        build.pull_request.labels includes "diffusion-x2v-test"
-      ))
+    if: __UPLOAD_NIGHTLY_IF__
     commands:
-      - buildkite-agent pipeline upload .buildkite/cuda/test-nightly.yml
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-nightly.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -78,10 +70,8 @@ steps:
   - label: "Upload Weekly Pipeline"
     depends_on: image-build
     key: upload-weekly-pipeline
-    if: >-
-      (build.branch == "main" && build.env("WEEKLY") == "1") ||
-      (build.branch != "main" && build.pull_request.labels includes "weekly-test")
+    if: __UPLOAD_WEEKLY_IF__
     commands:
-      - buildkite-agent pipeline upload .buildkite/cuda/test-weekly.yml
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-weekly.yml
     agents:
       queue: "cpu_queue_premerge"
