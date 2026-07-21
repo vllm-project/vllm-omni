@@ -134,6 +134,11 @@ class OmniConnectorModelRunnerMixin:
         # -- chunk index tracking (ported from OmniChunkTransferAdapter) --
         self._put_req_chunk: dict[str, int] = defaultdict(int)
         self._get_req_chunk: dict[str, int] = defaultdict(int)
+        # Segment-local chunk counter: incremented alongside _put_req_chunk
+        # and popped at request cleanup. Note: the mixin path (uniproc mode)
+        # does not have segment boundary infrastructure; multi-segment support
+        # is only available via chunk_transfer_adapter (distributed path).
+        self._ramp_chunk_count: dict[str, int] = defaultdict(int)
         # Send-side async accumulation / staging buffer. Receive-side payload
         # ownership lives in ``_local_stage_payload_cache``.
         self._send_side_request_payload: dict[str, dict[str, Any]] = {}
@@ -283,6 +288,7 @@ class OmniConnectorModelRunnerMixin:
                 self._send_side_request_payload.pop(k, None)
                 self._code_prompt_token_ids.pop(k, None)
                 self._cached_ic.pop(k, None)
+                self._ramp_chunk_count.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
@@ -998,6 +1004,7 @@ class OmniConnectorModelRunnerMixin:
             external_req_id = self._resolve_external_req_id(request, req_id)
             chunk_id = self._put_req_chunk[req_id]
             self._put_req_chunk[req_id] += 1
+            self._ramp_chunk_count[req_id] += 1
             connector_put_key = f"{external_req_id}_{self._stage_id}_{chunk_id}"
 
             logger.debug(
@@ -1123,6 +1130,7 @@ class OmniConnectorModelRunnerMixin:
             return False
 
         self._put_req_chunk[request_id] += 1
+        self._ramp_chunk_count[request_id] += 1
         next_stage_id = self._next_stage_id
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
 
@@ -1583,6 +1591,10 @@ class OmniConnectorModelRunnerMixin:
         return self._put_req_chunk
 
     @property
+    def ramp_chunk_count(self) -> dict[str, int]:
+        return self._ramp_chunk_count
+
+    @property
     def request_payload(self) -> dict[str, dict[str, Any]]:
         return self._send_side_request_payload
 
@@ -1964,6 +1976,7 @@ class OmniConnectorModelRunnerMixin:
                 self._send_side_request_payload.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
                 self._cached_ic.pop(cleanup_req_id, None)
+                self._ramp_chunk_count.pop(cleanup_req_id, None)
 
     # ------------------------------------------------------------------ #
     #  Payload accumulation  (ported from OmniChunkTransferAdapter)
