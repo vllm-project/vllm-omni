@@ -12,9 +12,9 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
-    max_num_seqs: 1
+    max_num_seqs: 16
     gpu_memory_utilization: 0.7
-    enforce_eager: true
+    enforce_eager: false
     tensor_parallel_size: 2
     max_num_batched_tokens: 16384
     devices: "0,1"
@@ -34,7 +34,7 @@ stages:
     # makes concurrent requests share request-0's audio (mm_outputs fallback).
     max_num_seqs: 1
     gpu_memory_utilization: 0.75
-    enforce_eager: true
+    enforce_eager: false
     max_num_batched_tokens: 8192
     devices: "2"
     default_sampling_params:

@@ -137,6 +137,14 @@ except (ImportError, ModuleNotFoundError):
 
 logger = init_logger(__name__)
 
+_THINKER_ARCHITECTURE = "Qwen3OmniMoeThinkerForConditionalGeneration"
+
+
+def _ensure_thinker_architecture(config: PretrainedConfig) -> None:
+    """Give the nested Thinker config the architecture required by MoE LoRA."""
+    if not config.architectures:
+        config.architectures = [_THINKER_ARCHITECTURE]
+
 
 class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
     """Subclass that fixes Qwen2_5_VisionAttention.forward() compatibility.
@@ -1121,6 +1129,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     Qwen3OmniMoeConditionalGenerationMixin,
     SupportsTranscription,
 ):
+    # PEFT stores the expert LoRA matrices with an explicit expert dimension.
+    is_3d_moe_weight: bool = True
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "thinker.lm_head.": "language_model.lm_head.",
@@ -1164,6 +1175,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.vllm_config = vllm_config  # needed for torch compile forward context
         hf_config = vllm_config.model_config.hf_config
         thinker_config: Qwen3OmniMoeThinkerConfig = getattr(hf_config, "thinker_config", None) or hf_config
+        _ensure_thinker_architecture(thinker_config)
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.config = thinker_config
