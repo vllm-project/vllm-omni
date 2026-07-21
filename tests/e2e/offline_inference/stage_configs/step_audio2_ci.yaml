@@ -15,6 +15,7 @@ stage_args:
       tensor_parallel_size: 1
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      async_scheduling: false
       max_model_len: 4096
       max_num_batched_tokens: 4096
       max_num_seqs: 1
