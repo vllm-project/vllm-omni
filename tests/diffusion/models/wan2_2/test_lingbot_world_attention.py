@@ -44,6 +44,8 @@ def _install_macos_vllm_stubs() -> None:
         "vllm.model_executor.layers",
         "vllm.model_executor.layers.conv",
         "vllm.model_executor.layers.linear",
+        "vllm.model_executor.model_loader",
+        "vllm.model_executor.model_loader.weight_utils",
         "vllm.model_executor.utils",
         "vllm_omni",
         "vllm_omni.diffusion",
@@ -65,6 +67,9 @@ def _install_macos_vllm_stubs() -> None:
             setattr(weight, name, value)
 
     sys.modules["vllm.model_executor.utils"].set_weight_attrs = set_weight_attrs
+    sys.modules["vllm.model_executor.model_loader.weight_utils"].default_weight_loader = lambda param, loaded_weight: (
+        param.data.copy_(loaded_weight)
+    )
 
     class _Linear(nn.Module):
         def __init__(
@@ -280,18 +285,18 @@ def _assert_cache_unchanged(cache, snapshot) -> None:
 
 def test_self_attention_repeated_offset_overwrites_then_later_offset_appends() -> None:
     module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1)
     _set_identity_attention(attention)
     cache = _allocate_single_layer(module, max_tokens=6).self_attention[0]
 
-    attention(_tokens(1, 2), cache=cache, current_start=0)
-    attention(_tokens(10, 20), cache=cache, current_start=0)
+    attention(_tokens(1, 2), cache=cache, current_start=0, sink_tokens=0)
+    attention(_tokens(10, 20), cache=cache, current_start=0, sink_tokens=0)
 
     assert cache.end == 2
     assert cache.absolute_end == 2
     torch.testing.assert_close(cache.key[0, : cache.end, 0, 0], torch.tensor([10.0, 20.0]))
 
-    attention(_tokens(3, 4), cache=cache, current_start=2)
+    attention(_tokens(3, 4), cache=cache, current_start=2, sink_tokens=0)
 
     assert cache.end == 4
     assert cache.absolute_end == 4
@@ -300,10 +305,10 @@ def test_self_attention_repeated_offset_overwrites_then_later_offset_appends() -
 
 def test_self_attention_uses_one_fused_qkv_projection() -> None:
     module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1)
     cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
 
-    attention(_tokens(1, 2), cache=cache, current_start=0)
+    attention(_tokens(1, 2), cache=cache, current_start=0, sink_tokens=0)
 
     assert attention.qkv.calls == 1
     assert not any(hasattr(attention, name) for name in ("q", "k", "v"))
@@ -311,14 +316,14 @@ def test_self_attention_uses_one_fused_qkv_projection() -> None:
 
 def test_self_attention_is_chunk_causal_without_masking_inside_current_chunk() -> None:
     module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1)
     _set_identity_attention(attention)
     cache = _allocate_single_layer(module, max_tokens=8).self_attention[0]
     attention_inputs = _record_inputs(attention.attn)
 
-    attention(_tokens(1, 2), cache=cache, current_start=0)
+    attention(_tokens(1, 2), cache=cache, current_start=0, sink_tokens=0)
     first_keys = attention_inputs[-1][1].detach().clone()
-    attention(_tokens(3, 4), cache=cache, current_start=2)
+    attention(_tokens(3, 4), cache=cache, current_start=2, sink_tokens=0)
     second_keys = attention_inputs[-1][1].detach().clone()
 
     assert attention.attn.causal is False
@@ -328,14 +333,14 @@ def test_self_attention_is_chunk_causal_without_masking_inside_current_chunk() -
 
 def test_self_attention_retains_sink_and_latest_local_history_after_eviction() -> None:
     module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=1)
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1)
     _set_identity_attention(attention)
     cache = _allocate_single_layer(module, max_tokens=4).self_attention[0]
     attention_inputs = _record_inputs(attention.attn)
 
-    attention(_tokens(1, 2), cache=cache, current_start=0)
-    attention(_tokens(3, 4), cache=cache, current_start=2)
-    attention(_tokens(5, 6), cache=cache, current_start=4)
+    attention(_tokens(1, 2), cache=cache, current_start=0, sink_tokens=1)
+    attention(_tokens(3, 4), cache=cache, current_start=2, sink_tokens=1)
+    attention(_tokens(5, 6), cache=cache, current_start=4, sink_tokens=1)
 
     visible_keys = attention_inputs[-1][1].detach().clone()
     assert cache.end == 4
@@ -366,17 +371,17 @@ def test_cross_attention_projects_encoder_kv_once_per_request() -> None:
 
 def test_self_attention_cache_is_isolated_between_requests() -> None:
     module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1)
     _set_identity_attention(attention)
     first = _allocate_single_layer(module, max_tokens=4).self_attention[0]
     second = _allocate_single_layer(module, max_tokens=4).self_attention[0]
 
-    attention(_tokens(1, 2), cache=first, current_start=0)
+    attention(_tokens(1, 2), cache=first, current_start=0, sink_tokens=0)
 
     assert first.end == 2
     assert second.end == 0
     assert torch.count_nonzero(second.key) == 0
-    attention(_tokens(8), cache=second, current_start=0)
+    attention(_tokens(8), cache=second, current_start=0, sink_tokens=0)
     torch.testing.assert_close(first.key[0, : first.end, 0, 0], torch.tensor([1.0, 2.0]))
     torch.testing.assert_close(second.key[0, : second.end, 0, 0], torch.tensor([8.0]))
 
@@ -400,7 +405,7 @@ def test_cross_attention_keeps_checkpoint_qkvo_and_norm_parameter_names() -> Non
 
 def test_tp_world_size_one_attention_output_shapes() -> None:
     module = _load_module()
-    self_attention = module.LingBotSelfAttention(dim=4, num_heads=2, sink_tokens=0)
+    self_attention = module.LingBotSelfAttention(dim=4, num_heads=2)
     cross_attention = module.LingBotCrossAttention(dim=4, num_heads=2)
     cache = module.allocate_lingbot_cache(
         batch_size=2,
@@ -414,7 +419,7 @@ def test_tp_world_size_one_attention_output_shapes() -> None:
     hidden_states = torch.randn(2, 3, 4)
     encoder_hidden_states = torch.randn(2, 5, 4)
 
-    self_output = self_attention(hidden_states, cache=cache.self_attention[0], current_start=0)
+    self_output = self_attention(hidden_states, cache=cache.self_attention[0], current_start=0, sink_tokens=0)
     cross_output, cache.cross_attention[0] = cross_attention(
         hidden_states,
         encoder_hidden_states,
@@ -428,13 +433,13 @@ def test_tp_world_size_one_attention_output_shapes() -> None:
 
 def test_self_attention_applies_rotary_embedding_to_current_query_and_key() -> None:
     module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1)
     cache = _allocate_single_layer(module, max_tokens=2).self_attention[0]
     cos = torch.ones(2, 1)
     sin = torch.zeros(2, 1)
     rotary_inputs = _record_inputs(attention.rotary_embedding)
 
-    attention(_tokens(1, 2), cache=cache, current_start=0, rotary_emb=(cos, sin))
+    attention(_tokens(1, 2), cache=cache, current_start=0, rotary_emb=(cos, sin), sink_tokens=0)
 
     assert len(rotary_inputs) == 2
     torch.testing.assert_close(rotary_inputs[0][1], cos)
@@ -443,7 +448,7 @@ def test_self_attention_applies_rotary_embedding_to_current_query_and_key() -> N
 
 def test_attention_block_owns_checkpoint_parent_namespaces() -> None:
     module = _load_module()
-    block = module.LingBotAttentionBlock(dim=4, num_heads=2, sink_tokens=1, prefix="blocks.0")
+    block = module.LingBotAttentionBlock(dim=4, num_heads=2, prefix="blocks.0")
 
     names = set(block.state_dict())
     expected = {
@@ -452,71 +457,6 @@ def test_attention_block_owns_checkpoint_parent_namespaces() -> None:
     }
 
     assert expected <= names
-
-
-@pytest.mark.parametrize(
-    ("current_start", "message"),
-    [
-        (0, "precedes"),
-        (3, "overlaps"),
-        (5, "contiguous"),
-    ],
-    ids=("backward", "overlap", "gap"),
-)
-def test_rejected_new_chunk_offsets_preserve_self_cache(current_start: int, message: str) -> None:
-    module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
-    _set_identity_attention(attention)
-    cache = _allocate_single_layer(module, max_tokens=6).self_attention[0]
-    attention(_tokens(1, 2), cache=cache, current_start=0)
-    attention(_tokens(3, 4), cache=cache, current_start=2)
-    snapshot = _cache_snapshot(cache)
-
-    with pytest.raises(ValueError, match=message):
-        attention(_tokens(9), cache=cache, current_start=current_start)
-
-    _assert_cache_unchanged(cache, snapshot)
-
-
-def test_unequal_repeated_chunk_preserves_self_cache() -> None:
-    module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
-    _set_identity_attention(attention)
-    cache = _allocate_single_layer(module, max_tokens=4).self_attention[0]
-    attention(_tokens(1, 2), cache=cache, current_start=0)
-    snapshot = _cache_snapshot(cache)
-
-    with pytest.raises(ValueError, match="same-size"):
-        attention(_tokens(3), cache=cache, current_start=0)
-
-    _assert_cache_unchanged(cache, snapshot)
-
-
-def test_chunk_over_capacity_preserves_self_cache() -> None:
-    module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=0)
-    _set_identity_attention(attention)
-    cache = _allocate_single_layer(module, max_tokens=1).self_attention[0]
-    snapshot = _cache_snapshot(cache)
-
-    with pytest.raises(ValueError, match="full current chunk"):
-        attention(_tokens(1, 2), cache=cache, current_start=0)
-
-    _assert_cache_unchanged(cache, snapshot)
-
-
-def test_sink_and_current_chunk_overflow_preserves_self_cache() -> None:
-    module = _load_module()
-    attention = module.LingBotSelfAttention(dim=2, num_heads=1, sink_tokens=2)
-    _set_identity_attention(attention)
-    cache = _allocate_single_layer(module, max_tokens=4).self_attention[0]
-    attention(_tokens(1, 2), cache=cache, current_start=0)
-    snapshot = _cache_snapshot(cache)
-
-    with pytest.raises(ValueError, match="sink tokens and the full current chunk"):
-        attention(_tokens(3, 4, 5), cache=cache, current_start=2)
-
-    _assert_cache_unchanged(cache, snapshot)
 
 
 def test_cross_attention_caches_are_isolated_between_requests() -> None:

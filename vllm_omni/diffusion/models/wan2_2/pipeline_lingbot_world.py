@@ -92,24 +92,16 @@ def _positive_finite_flow_shift(value: Any) -> float:
 def _build_shifted_flow_schedule(
     *,
     flow_shift: float,
-    num_train_timesteps: int,
-    timesteps: tuple[int, ...],
 ) -> tuple[tuple[float, float], ...]:
     """Map checkpoint DMD labels to request-local warped timestep/sigma pairs."""
-
-    flow_shift = _positive_finite_flow_shift(flow_shift)
-    if num_train_timesteps <= 0:
-        raise ValueError("num_train_timesteps must be positive")
-    if any(timestep <= 0 or timestep > num_train_timesteps for timestep in timesteps):
-        raise ValueError(f"timesteps must be between 1 and {num_train_timesteps}")
 
     # The checkpoint labels index the unshifted [1, ..., 1 / N] training
     # lattice. Apply the request's flow shift before using the value both as
     # the transformer timestep and the sampling sigma.
-    base_sigmas = torch.tensor(timesteps, dtype=torch.float64) / num_train_timesteps
+    base_sigmas = torch.tensor(LINGBOT_DMD_TIMESTEPS, dtype=torch.float64) / 1000
     shifted_numerators = flow_shift * base_sigmas
     shifted_sigmas = shifted_numerators / ((1.0 - base_sigmas) + shifted_numerators)
-    warped_timesteps = shifted_sigmas * num_train_timesteps
+    warped_timesteps = shifted_sigmas * 1000
     return tuple(
         (float(timestep), float(sigma))
         for timestep, sigma in zip(warped_timesteps.tolist(), shifted_sigmas.tolist(), strict=True)
@@ -262,38 +254,10 @@ def get_lingbot_world_pre_process_func(
 
 def _fold_camera_embedding(
     camera_embedding: torch.Tensor,
-    *,
-    spatial_fold: int = _CAMERA_SPATIAL_FOLD,
 ) -> torch.Tensor:
     """Pixel-unshuffle ``[frames, 6, H, W]`` onto the Wan latent grid."""
 
-    if camera_embedding.ndim != 4 or camera_embedding.shape[1] != 6:
-        raise ValueError(
-            f"camera ray embedding must have shape [frames, 6, height, width], got {tuple(camera_embedding.shape)}"
-        )
-    if spatial_fold <= 0:
-        raise ValueError(f"spatial_fold must be positive, got {spatial_fold}")
-    frames, channels, height, width = camera_embedding.shape
-    if height % spatial_fold or width % spatial_fold:
-        raise ValueError(f"camera ray height and width must be divisible by {spatial_fold}, got {height}x{width}")
-    # Lossless pixel-unshuffle onto the Wan latent grid.
-    folded = (
-        camera_embedding.reshape(
-            frames,
-            channels,
-            height // spatial_fold,
-            spatial_fold,
-            width // spatial_fold,
-            spatial_fold,
-        )
-        .permute(0, 1, 3, 5, 2, 4)
-        .reshape(
-            frames,
-            channels * spatial_fold * spatial_fold,
-            height // spatial_fold,
-            width // spatial_fold,
-        )
-    )
+    folded = F.pixel_unshuffle(camera_embedding, _CAMERA_SPATIAL_FOLD)
     return folded.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
 
 
@@ -306,7 +270,10 @@ def get_lingbot_world_post_process_func(od_config: OmniDiffusionConfig) -> Calla
     def post_process_func(
         video: torch.Tensor,
         output_type: str = "np",
+        sampling_params: Any | None = None,
     ) -> Any:
+        if sampling_params is not None:
+            output_type = getattr(sampling_params, "output_type", None) or output_type
         if output_type == "latent":
             return video
         return {
@@ -597,8 +564,6 @@ class LingBotWorldCausalDMDPipeline(
             image_tensor = image.detach()
             if image_tensor.ndim == 3:
                 image_tensor = image_tensor.unsqueeze(0)
-            if image_tensor.ndim != 4 or image_tensor.shape[0] != 1 or image_tensor.shape[1] != 3:
-                raise ValueError("tensor image must have shape [3, height, width] or [1, 3, height, width].")
             image_tensor = image_tensor.to(dtype=torch.float32)
             if not torch.isfinite(image_tensor).all():
                 raise ValueError("tensor image values must all be finite.")
@@ -697,31 +662,7 @@ class LingBotWorldCausalDMDPipeline(
             device=self.device,
             dtype=dtype,
         )
-        return _fold_camera_embedding(camera_embedding, spatial_fold=_CAMERA_SPATIAL_FOLD)
-
-    def _allocate_request_cache(
-        self,
-        *,
-        latent_height: int,
-        latent_width: int,
-        dtype: torch.dtype,
-    ) -> LingBotTransformerCache:
-        return self.transformer.allocate_cache(
-            batch_size=1,
-            latent_height=latent_height,
-            latent_width=latent_width,
-            device=self.device,
-            dtype=dtype,
-        )
-
-    def _randn(
-        self,
-        shape: torch.Size | tuple[int, ...],
-        *,
-        generator: torch.Generator,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return randn_tensor(shape, generator=generator, device=self.device, dtype=dtype)
+        return _fold_camera_embedding(camera_embedding)
 
     def _generate_block(
         self,
@@ -742,7 +683,12 @@ class LingBotWorldCausalDMDPipeline(
             condition.shape[3],
             condition.shape[4],
         )
-        current_latents = self._randn(block_shape, generator=generator, dtype=torch.float32)
+        current_latents = randn_tensor(
+            block_shape,
+            generator=generator,
+            device=self.device,
+            dtype=torch.float32,
+        )
         for step_index, (timestep_value, sigma) in enumerate(schedule):
             set_forward_context_denoise_step_idx(step_index)
             timestep = torch.full((1,), float(timestep_value), device=self.device, dtype=torch.float32)
@@ -770,7 +716,12 @@ class LingBotWorldCausalDMDPipeline(
             x0 = current_latents - sigma * flow_prediction.float()
             if step_index + 1 < len(schedule):
                 next_sigma = schedule[step_index + 1][1]
-                noise = self._randn(current_latents.shape, generator=generator, dtype=torch.float32)
+                noise = randn_tensor(
+                    current_latents.shape,
+                    generator=generator,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
                 current_latents = (1.0 - next_sigma) * x0 + next_sigma * noise
             else:
                 current_latents = x0
@@ -815,8 +766,6 @@ class LingBotWorldCausalDMDPipeline(
         inputs = self._parse_request(req)
         schedule = _build_shifted_flow_schedule(
             flow_shift=inputs.flow_shift,
-            num_train_timesteps=int(getattr(self.scheduler.config, "num_train_timesteps", 1000)),
-            timesteps=LINGBOT_DMD_TIMESTEPS,
         )
         dtype = self.transformer.dtype
         # Phase 1: turn all three user inputs into DiT-ready conditions.
@@ -836,9 +785,11 @@ class LingBotWorldCausalDMDPipeline(
         # Phase 2: allocate state owned by this request. The Pipeline object is
         # shared, but its causal K/V cache and RNG must never be shared.
         block_frames = int(self.transformer.config.num_frames_per_block)
-        cache = self._allocate_request_cache(
+        cache = self.transformer.allocate_cache(
+            batch_size=1,
             latent_height=condition.shape[-2],
             latent_width=condition.shape[-1],
+            device=self.device,
             dtype=dtype,
         )
         generated_blocks: list[torch.Tensor] = []
