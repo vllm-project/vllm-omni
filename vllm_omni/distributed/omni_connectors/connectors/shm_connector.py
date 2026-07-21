@@ -3,7 +3,6 @@
 
 import fcntl
 import os
-import warnings
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -26,13 +25,6 @@ class SharedMemoryConnector(OmniConnectorBase):
     """
 
     def __init__(self, config: dict[str, Any]):
-        if "shm_threshold_bytes" in config:
-            warnings.warn(
-                "SharedMemoryConnector.extra.shm_threshold_bytes is deprecated and ignored; "
-                "all payloads are stored in shared memory.",
-                FutureWarning,
-                stacklevel=2,
-            )
         self.stage_id = config.get("stage_id", -1)
         self._pending_keys: set[str] = set()
         self._metrics = {

@@ -25,11 +25,6 @@ def connector():
 
 
 class TestKeyBasedReadWrite:
-    def test_deprecated_threshold_warns(self):
-        with pytest.warns(FutureWarning, match="shm_threshold_bytes"):
-            connector = SharedMemoryConnector({"shm_threshold_bytes": 0})
-        connector.close()
-
     def test_put_then_get_by_key(self, connector):
         data = {"hello": "world", "n": 42}
         ok, size, meta = connector.put("s0", "s1", "test_key_1", data)

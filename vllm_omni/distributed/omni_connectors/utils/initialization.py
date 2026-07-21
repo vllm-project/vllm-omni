@@ -41,7 +41,6 @@ KV_REPLICA_PORT_STRIDE = 1024
 
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,
-    default_shm_threshold: int | None = None,
     purpose: str = "request_forwarding",
     caller_stage_id: int | str | None = None,
     is_sender: bool | None = None,
@@ -52,7 +51,7 @@ def initialize_connectors_from_config(
     Returns:
         tuple: (OmniTransferConfig, dict of {(from, to): connector_instance})
     """
-    transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=default_shm_threshold)
+    transfer_config = load_omni_transfer_config(config_path)
 
     if not transfer_config:
         logger.info("No OmniTransferConfig provided")
@@ -189,16 +188,8 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
 def load_omni_transfer_config(
     config_path: str | Path | None = None,
     config_dict: dict[str, Any] | None = None,
-    default_shm_threshold: int | None = None,
 ) -> OmniTransferConfig | None:
     """Load OmniTransferConfig from file or dict."""
-    if default_shm_threshold is not None:
-        warnings.warn(
-            "default_shm_threshold is deprecated and ignored; auto-configured "
-            "SharedMemoryConnector instances always use shared memory.",
-            FutureWarning,
-            stacklevel=2,
-        )
     if config_path is None and config_dict is None:
         # Even if no config provided, we might want to return a default config with SHM connectors
         # But without stage info we can't do much.
@@ -371,19 +362,15 @@ def load_omni_transfer_config(
 
 def initialize_orchestrator_connectors(
     config_path: str | None,
-    worker_backend: str | None = "multi_process",
-    shm_threshold_bytes: int | None = None,
 ) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """Initialize connectors shared at orchestrator level.
     Args:
         config_path: The path to the configuration file.
-        worker_backend: The backend to use for the worker.
     Returns:
         A tuple containing the OmniTransferConfig and a dictionary of connectors.
     """
     transfer_config, connectors = initialize_connectors_from_config(
         config_path,
-        default_shm_threshold=shm_threshold_bytes,
         purpose="request_forwarding",
         caller_stage_id="orchestrator",
         is_sender=True,

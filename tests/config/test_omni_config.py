@@ -290,23 +290,21 @@ def test_from_pipeline_config_keeps_worker_backend_separate_from_distributed_exe
 
 
 def test_from_pipeline_config_maps_orchestrator_cli_overrides():
-    with pytest.warns(FutureWarning, match="shm_threshold_bytes"):
-        omni_config = _from_pipeline_key(
-            "qwen3_tts",
-            cli_overrides={
-                "stage_init_timeout": 1200,
-                "init_timeout": 1800,
-                "worker_backend": "ray",
-                "ray_address": "ray://127.0.0.1:10001",
-                "omni_master_address": "127.0.0.1",
-                "omni_master_port": 12345,
-                "omni_dp_size_local": 2,
-                "omni_lb_policy": "round_robin",
-                "omni_heartbeat_timeout": 9.5,
-                "shm_threshold_bytes": 4096,
-                "batch_timeout": 3,
-            },
-        )
+    omni_config = _from_pipeline_key(
+        "qwen3_tts",
+        cli_overrides={
+            "stage_init_timeout": 1200,
+            "init_timeout": 1800,
+            "worker_backend": "ray",
+            "ray_address": "ray://127.0.0.1:10001",
+            "omni_master_address": "127.0.0.1",
+            "omni_master_port": 12345,
+            "omni_dp_size_local": 2,
+            "omni_lb_policy": "round_robin",
+            "omni_heartbeat_timeout": 9.5,
+            "batch_timeout": 3,
+        },
+    )
 
     orchestrator_config = omni_config.orchestrator_config
     assert orchestrator_config.stage_init_timeout == 1200
@@ -318,7 +316,6 @@ def test_from_pipeline_config_maps_orchestrator_cli_overrides():
     assert orchestrator_config.omni_dp_size_local == 2
     assert orchestrator_config.omni_lb_policy == "round_robin"
     assert orchestrator_config.omni_heartbeat_timeout == 9.5
-    assert orchestrator_config.shm_threshold_bytes == 4096
     assert orchestrator_config.batch_timeout == 3
 
 

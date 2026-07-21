@@ -8,8 +8,7 @@ auto-configured when no explicit connector is specified for an edge.
 ## How It Works
 
 All payloads are serialized and stored in shared memory (`/dev/shm`); the SHM
-segment name is returned in metadata. The deprecated `shm_threshold_bytes`
-setting is ignored.
+segment name is returned in metadata.
 
 ## Configuration
 
@@ -165,9 +164,8 @@ This path is mainly for older code paths and is not the preferred mode for the c
 
 #### 6.1 All Payloads Use Shared Memory
 
-`put()` writes every serialized payload to shared memory. The former
-`shm_threshold_bytes` option is deprecated and ignored because the connector
-no longer has an inline-payload path.
+`put()` writes every serialized payload to shared memory. The connector has no
+inline-payload path or size threshold.
 
 #### 6.2 Cleanup Is Currently Passive
 
