@@ -8,7 +8,7 @@ import math
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -31,7 +31,6 @@ from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
     CameraTrajectory,
-    TrustedActionDirectory,
     build_plucker_embedding,
     interpolate_camera_trajectory,
     load_camera_trajectory,
@@ -40,6 +39,7 @@ from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
 from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import CausalLingBotWorldTransformer3DModel
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 if TYPE_CHECKING:
@@ -54,6 +54,7 @@ _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
 _MAX_RAW_FRAMES = 117
 _MAX_SEQUENCE_LENGTH = 512
 _ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
+_PREPROCESSED_CAMERA_KEY = "_lingbot_camera_trajectory"
 _SOURCE_IMAGE_ERROR = (
     "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
 )
@@ -65,7 +66,7 @@ class _LingBotRequestInputs:
 
     prompt: str
     image: PIL.Image.Image | torch.Tensor
-    action_path: TrustedActionDirectory
+    camera_trajectory: CameraTrajectory
     height: int
     width: int
     num_frames: int
@@ -190,6 +191,75 @@ def _load_source_image(path: str | os.PathLike[str]) -> PIL.Image.Image:
         source_image.close()
 
 
+def get_lingbot_world_pre_process_func(
+    od_config: OmniDiffusionConfig,
+) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
+    """Materialize request-local files once before dispatching GPU workers."""
+
+    model_config = getattr(od_config, "model_config", None) or {}
+    configured_action_root = model_config.get("lingbot_action_root") or os.environ.get(_ACTION_ROOT_ENV)
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        prompt = request.prompt
+        if not isinstance(prompt, dict):
+            raise ValueError("LingBot World requires a prompt mapping containing multi_modal_data.image.")
+        multi_modal_data = prompt.get("multi_modal_data") or {}
+        additional_information = prompt.get("additional_information") or {}
+        if not isinstance(multi_modal_data, dict):
+            raise ValueError("prompt.multi_modal_data must be a mapping containing image.")
+        if not isinstance(additional_information, dict):
+            raise ValueError("prompt.additional_information must be a mapping.")
+        if "action_path" in additional_information:
+            raise ValueError(
+                "prompt.additional_information.action_path is not supported; use "
+                "sampling_params.extra_args.action_path."
+            )
+
+        image = multi_modal_data.get("image")
+        if isinstance(image, list):
+            raise ValueError("LingBot World requires one image and does not accept an image list.")
+        if image is None:
+            raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
+        if isinstance(image, (str, os.PathLike)):
+            image = _load_source_image(image)
+        elif isinstance(image, PIL.Image.Image):
+            image = _decode_source_image(image)
+        elif not isinstance(image, torch.Tensor):
+            raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
+
+        extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+        if not isinstance(extra_args, dict):
+            raise ValueError("sampling_params.extra_args must be a mapping.")
+        action_path = extra_args.get("action_path")
+        if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
+            raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
+        if not configured_action_root:
+            raise ValueError(
+                "sampling_params.extra_args.action_path requires a trusted action root configured by "
+                f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+            )
+        action_directory = resolve_trusted_action_directory(action_path, configured_action_root)
+        try:
+            trajectory = load_camera_trajectory(action_directory)
+        except OSError:
+            raise ValueError(
+                "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
+            ) from None
+
+        updated_prompt = dict(prompt)
+        updated_multi_modal_data = dict(multi_modal_data)
+        updated_multi_modal_data["image"] = image
+        updated_prompt["multi_modal_data"] = updated_multi_modal_data
+        request.prompt = updated_prompt
+        request.sampling_params.extra_args = {
+            **extra_args,
+            _PREPROCESSED_CAMERA_KEY: trajectory,
+        }
+        return request
+
+    return pre_process_func
+
+
 def _fold_camera_embedding(
     camera_embedding: torch.Tensor,
     *,
@@ -236,13 +306,13 @@ def get_lingbot_world_post_process_func(od_config: OmniDiffusionConfig) -> Calla
     def post_process_func(
         video: torch.Tensor,
         output_type: str = "np",
-        sampling_params: Any | None = None,
     ) -> Any:
-        if sampling_params is not None:
-            output_type = getattr(sampling_params, "output_type", None) or output_type
         if output_type == "latent":
             return video
-        return {"video": video_processor.postprocess_video(video, output_type=output_type), "custom_output": {}}
+        return {
+            "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
+            "metadata": {},
+        }
 
     return post_process_func
 
@@ -276,9 +346,9 @@ class LingBotWorldCausalDMDPipeline(
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         local_files_only = os.path.exists(model)
-        model_config = getattr(od_config, "model_config", None) or {}
-        configured_action_root = model_config.get("lingbot_action_root")
-        self._action_root = configured_action_root or os.environ.get(_ACTION_ROOT_ENV)
+        managed_component_placement = bool(
+            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
+        )
 
         # Standard components use from_pretrained; the custom transformer uses the loader.
         self.weights_sources = [
@@ -307,7 +377,9 @@ class LingBotWorldCausalDMDPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        ).to(self.device)
+        )
+        if not managed_component_placement:
+            self.text_encoder = self.text_encoder.to(self.device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLWan.from_pretrained,
             model,
@@ -315,7 +387,9 @@ class LingBotWorldCausalDMDPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        ).to(self.device)
+        )
+        if not managed_component_placement:
+            self.vae = self.vae.to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         self.transformer = CausalLingBotWorldTransformer3DModel.from_config(
@@ -380,23 +454,18 @@ class LingBotWorldCausalDMDPipeline(
 
         prompt_value = req.prompts[0]
         multi_modal_data: dict[str, Any]
-        additional_information: dict[str, Any]
         if isinstance(prompt_value, str):
             prompt = prompt_value
             multi_modal_data = {}
-            additional_information = {}
         elif isinstance(prompt_value, dict):
             prompt = prompt_value.get("prompt") or ""
             multi_modal_data = prompt_value.get("multi_modal_data") or {}
-            additional_information = prompt_value.get("additional_information") or {}
         else:
             raise ValueError("prompt must be a string or prompt mapping.")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt must contain non-empty text.")
         if not isinstance(multi_modal_data, dict):
             raise ValueError("prompt.multi_modal_data must be a mapping containing image.")
-        if not isinstance(additional_information, dict):
-            raise ValueError("prompt.additional_information must be a mapping.")
 
         image = multi_modal_data.get("image")
         if isinstance(image, list):
@@ -404,29 +473,16 @@ class LingBotWorldCausalDMDPipeline(
         if image is None:
             raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
         if isinstance(image, (str, os.PathLike)):
-            image = _load_source_image(image)
-        elif isinstance(image, PIL.Image.Image):
-            image = _decode_source_image(image)
+            raise ValueError("file-path images must be materialized by the LingBot pre-process function.")
         if not isinstance(image, (PIL.Image.Image, torch.Tensor)):
             raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
 
         extra_args = getattr(sampling, "extra_args", None) or {}
         if not isinstance(extra_args, dict):
             raise ValueError("sampling_params.extra_args must be a mapping.")
-        if "action_path" in additional_information:
-            raise ValueError(
-                "prompt.additional_information.action_path is not supported; use "
-                "sampling_params.extra_args.action_path."
-            )
-        action_path = extra_args.get("action_path")
-        if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
-            raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
-        if not self._action_root:
-            raise ValueError(
-                "sampling_params.extra_args.action_path requires a trusted action root configured by "
-                f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
-            )
-        action_path = resolve_trusted_action_directory(action_path, self._action_root)
+        camera_trajectory = extra_args.get(_PREPROCESSED_CAMERA_KEY)
+        if not isinstance(camera_trajectory, CameraTrajectory):
+            raise ValueError("LingBot camera trajectory must be materialized by the pre-process function.")
 
         request_flow_shift = (
             extra_args["flow_shift"] if "flow_shift" in extra_args else getattr(self.scheduler.config, "shift", 5.0)
@@ -522,7 +578,7 @@ class LingBotWorldCausalDMDPipeline(
         return _LingBotRequestInputs(
             prompt=prompt.strip(),
             image=image,
-            action_path=action_path,
+            camera_trajectory=camera_trajectory,
             height=height,
             width=width,
             num_frames=num_frames,
@@ -620,12 +676,7 @@ class LingBotWorldCausalDMDPipeline(
     def _prepare_camera(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
         """Convert raw camera frames to a latent-aligned ray tensor."""
 
-        try:
-            trajectory = load_camera_trajectory(inputs.action_path)
-        except OSError:
-            raise ValueError(
-                "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
-            ) from None
+        trajectory = inputs.camera_trajectory
         available_frames = int(trajectory.poses.shape[0])
         if available_frames < inputs.num_frames:
             raise ValueError(
@@ -826,7 +877,11 @@ class LingBotWorldCausalDMDPipeline(
                     "vae.decode returned an incompatible temporal geometry: "
                     f"expected {inputs.num_frames} frames, got {output.shape[2]}."
                 )
-        return DiffusionOutput(output=output)
+        return DiffusionOutput(
+            output=output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return set(AutoWeightsLoader(self).load_weights(weights))
+        loader = AutoWeightsLoader(self)
+        return cast(set[str], loader.load_weights(weights))

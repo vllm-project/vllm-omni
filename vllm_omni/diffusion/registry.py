@@ -589,6 +589,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
+    "LingBotWorldCausalDMDPipeline": "get_lingbot_world_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",

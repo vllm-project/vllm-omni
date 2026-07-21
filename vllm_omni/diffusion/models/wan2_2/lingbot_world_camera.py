@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import io
 import math
 import os
 import stat
@@ -19,9 +20,9 @@ import torch
 _REFERENCE_HEIGHT = 480
 _REFERENCE_WIDTH = 832
 _MAX_ACTION_FRAMES = 117
-_MAX_NPY_HEADER_BYTES = 16 * 1024
+_MAX_NPY_HEADER_BYTES = 10_000
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-_FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
+_FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 
 
 @dataclass(frozen=True)
@@ -168,18 +169,20 @@ def _load_bounded_npy(
     trailing_shape: tuple[int, ...],
 ) -> np.ndarray:
     with _open_camera_file(action_fd, filename) as (file_handle, file_stat):
+        max_payload_bytes = _MAX_ACTION_FRAMES * math.prod(trailing_shape) * 8
+        max_file_bytes = _MAX_NPY_HEADER_BYTES + max_payload_bytes + 32
+        if file_stat.st_size > max_file_bytes:
+            raise ValueError(f"{filename} byte size exceeds the bounded camera-array limit.")
+        snapshot = file_handle.read(max_file_bytes + 1)
+        if len(snapshot) != file_stat.st_size:
+            raise ValueError(f"{filename} changed while its bounded contents were read.")
+        snapshot_file = io.BytesIO(snapshot)
         try:
-            version = np.lib.format.read_magic(file_handle)
+            version = np.lib.format.read_magic(snapshot_file)
             if version == (1, 0):
-                shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(
-                    file_handle,
-                    max_header_size=_MAX_NPY_HEADER_BYTES,
-                )
+                shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(snapshot_file)
             elif version == (2, 0):
-                shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(
-                    file_handle,
-                    max_header_size=_MAX_NPY_HEADER_BYTES,
-                )
+                shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(snapshot_file)
             else:
                 raise ValueError(f"{filename} must use NPY format version 1.0 or 2.0.")
         except (EOFError, TypeError, ValueError):
@@ -194,13 +197,13 @@ def _load_bounded_npy(
         if dtype.kind not in "fiu" or dtype.hasobject or dtype.itemsize > 8:
             raise ValueError(f"{filename} must contain real numeric values with at most 8 bytes per element.")
 
-        data_offset = file_handle.tell()
+        data_offset = snapshot_file.tell()
         expected_bytes = math.prod(shape) * dtype.itemsize
-        if file_stat.st_size != data_offset + expected_bytes:
+        if len(snapshot) != data_offset + expected_bytes:
             raise ValueError(f"{filename} byte size does not match its NPY header.")
-        file_handle.seek(0)
+        snapshot_file.seek(0)
         try:
-            array = np.load(file_handle, allow_pickle=False)
+            array = np.load(snapshot_file, allow_pickle=False)
         except (EOFError, TypeError, ValueError):
             raise ValueError(f"{filename} does not contain a valid numeric NPY array.") from None
     result: np.ndarray = np.asarray(array, dtype=np.float32)
@@ -237,7 +240,7 @@ def _linear_interpolate(values: torch.Tensor, target_times: np.ndarray) -> torch
 def _rotation_matrices_to_quaternions(matrices: np.ndarray) -> np.ndarray:
     """Convert rotation matrices to normalized ``(w, x, y, z)`` quaternions."""
 
-    quaternions = np.empty((matrices.shape[0], 4), dtype=np.float64)
+    quaternions: np.ndarray = np.empty((matrices.shape[0], 4), dtype=np.float64)
     for index, matrix in enumerate(matrices):
         trace = float(np.trace(matrix))
         if trace > 0.0:
