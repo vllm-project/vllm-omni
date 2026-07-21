@@ -25,6 +25,7 @@ class SharedMemoryConnector(OmniConnectorBase):
     """
 
     def __init__(self, config: dict[str, Any]):
+        self.config = config
         self.stage_id = config.get("stage_id", -1)
         self._pending_keys: set[str] = set()
         self._metrics = {
