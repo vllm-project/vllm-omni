@@ -578,6 +578,14 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Disaggregated-diffusion stage role (RFC #4590). One of
+    # ``encode`` / ``denoise`` / ``decode`` for a disaggregated stage, or
+    # ``diffusion`` / ``None`` for the monolithic single-worker fallback. This
+    # is the single per-worker copy of ``StagePipelineConfig.model_stage``;
+    # ``build_diffusion_config`` sets it from the stage metadata so the runner
+    # can pick its execution path and the loader can gate component construction.
+    model_stage: str | None = None
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)
