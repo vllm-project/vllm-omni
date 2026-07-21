@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Scheduling-side coordination for chunk and full_payload input waiting.
+"""Scheduling-side coordination for full_payload input waiting.
 
-Manages WAITING_FOR_CHUNK and WAITING_FOR_INPUT state transitions
-based on readiness signals from OmniConnectorOutput, without ever
-calling connector.put()/get().
+Manages WAITING_FOR_INPUT state transitions based on readiness signals
+from OmniConnectorOutput, without ever calling connector.put()/get().
 
-This replaces the scheduling half of OmniChunkTransferAdapter; the
-transport half lives in OmniConnectorModelRunnerMixin.
+Chunk waiting (WAITING_FOR_CHUNK) lives on OmniChunkTransferAdapter.
 """
 
 from __future__ import annotations
@@ -83,12 +81,12 @@ def uses_full_payload_input_coordinator(model_config: Any) -> bool:
 
 
 class OmniSchedulingCoordinator:
-    """Pure-scheduling coordinator for chunk and full_payload input waiting.
+    """Pure-scheduling coordinator for full_payload input waiting.
 
     The Scheduler owns an instance of this class.  It consumes readiness
     signals produced by the Model Runner's ``OmniConnectorModelRunnerMixin``
-    (via ``OmniConnectorOutput``) and manages ``WAITING_FOR_CHUNK`` and
-    ``WAITING_FOR_INPUT`` state transitions accordingly.
+    (via ``OmniConnectorOutput``) and manages ``WAITING_FOR_INPUT`` state
+    transitions accordingly.
     """
 
     def __init__(self, scheduler_max_num_seqs: int, stage_id: int = 0, async_chunk: bool = False):
@@ -100,17 +98,6 @@ class OmniSchedulingCoordinator:
         self.requests_with_ready_chunks: set[str] = set()
         self._full_payload_input_received: set[str] = set()
 
-        # TODO(yrr): Dead code
-        self._waiting_for_chunk_waiting: deque[Any] = deque()
-        # TODO(yrr): Dead code
-        self._waiting_for_chunk_running: deque[Any] = deque()
-
-        # TODO(yrr): Dead code
-        # Request IDs that were newly registered for chunk recv this cycle.
-        # The engine/Model Runner should call register_chunk_recv() for these
-        # so the bg thread starts polling.
-        self.pending_chunk_registrations: list[Any] = []
-
         # Requests waiting for full_payload stage input (WAITING_FOR_INPUT).
         self._waiting_for_input: deque[Any] = deque()
         # Per-cycle list of minimal handles to ship to the model runner so it
@@ -120,58 +107,13 @@ class OmniSchedulingCoordinator:
         self.pending_input_registrations: list[OmniChunkRecvHandle] = []
 
         # Monotonic timestamp recording when each request first entered
-        # WAITING_FOR_CHUNK or WAITING_FOR_INPUT.  Used by
-        # collect_timed_out_request_ids() to detect orphaned waits.
+        # WAITING_FOR_INPUT.  Used by collect_timed_out_request_ids() to
+        # detect orphaned waits.
         self._waiting_since: dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
     # ------------------------------------------------------------------ #
-
-    # TODO(yrr): Dead code, only process_pending_chunks in chunk transfer adapter is used
-    def process_pending_chunks(
-        self,
-        waiting_queue: Any,
-        running_queue: list[Request],
-        chunk_ready_req_ids: set[str],
-        chunk_finished_req_ids: set[str],
-    ) -> None:
-        """Transition requests whose chunks have arrived.
-
-        Args:
-            waiting_queue: Scheduler's waiting request queue.
-            running_queue: Scheduler's running request list.
-            chunk_ready_req_ids: IDs with a newly arrived chunk this cycle.
-            chunk_finished_req_ids: IDs whose final chunk has arrived.
-        """
-        if self._stage_id == 0 or not self._async_chunk:
-            return
-
-        terminal_ready_req_ids = chunk_ready_req_ids.intersection(chunk_finished_req_ids)
-        self.finished_requests.update(chunk_finished_req_ids - terminal_ready_req_ids)
-        self.pending_chunk_registrations = []
-
-        self._process_chunk_queue(
-            waiting_queue,
-            self._waiting_for_chunk_waiting,
-            RequestStatus.WAITING,
-            chunk_ready_req_ids,
-        )
-        self._process_chunk_queue(
-            running_queue,
-            self._waiting_for_chunk_running,
-            RequestStatus.RUNNING,
-            chunk_ready_req_ids,
-        )
-        self.finished_requests.update(terminal_ready_req_ids)
-
-        while len(running_queue) > self._scheduler_max_num_seqs:
-            request = running_queue.pop()
-            # Must reset status to WAITING so the scheduler treats it as
-            # schedulable work.  KV blocks are NOT freed here (unlike a
-            # real preemption), so PREEMPTED would be incorrect.
-            request.status = RequestStatus.WAITING
-            waiting_queue.prepend_requests([request])
 
     def process_pending_full_payload_inputs(
         self,
@@ -249,16 +191,6 @@ class OmniSchedulingCoordinator:
                 # repeated O(N) removes from a list-backed queue.
                 waiting_queue.remove_requests(to_remove)
 
-    # TODO(yrr): Dead code, remove this unused method
-    def process_pending_full_payload_inputs_legacy(
-        self,
-        waiting_queue: Any,
-        running_queue: list[Request],
-        stage_recv_req_ids: set[str],
-    ) -> None:
-        """Compatibility wrapper for ``process_pending_full_payload_inputs``."""
-        self.process_pending_full_payload_inputs(waiting_queue, running_queue, stage_recv_req_ids)
-
     def free_finished_request(self, request_id: str) -> None:
         """Prune internal tracking sets for a freed request to prevent unbounded growth."""
         self._full_payload_input_received.discard(request_id)
@@ -295,17 +227,11 @@ class OmniSchedulingCoordinator:
 
         # Defensively remove from coordinator internal queues (may already
         # be empty if restore_queues() has run).
-        for queue_attr in (
-            "_waiting_for_chunk_waiting",
-            "_waiting_for_chunk_running",
-            "_waiting_for_input",
-        ):
-            queue = getattr(self, queue_attr)
-            remaining: deque[Any] = deque()
-            for request in queue:
-                if request.request_id not in timed_out_ids:
-                    remaining.append(request)
-            setattr(self, queue_attr, remaining)
+        remaining: deque[Any] = deque()
+        for request in self._waiting_for_input:
+            if request.request_id not in timed_out_ids:
+                remaining.append(request)
+        self._waiting_for_input = remaining
 
         for req_id in timed_out_ids:
             self._waiting_since.pop(req_id, None)
@@ -323,15 +249,12 @@ class OmniSchedulingCoordinator:
         waiting_queue: Any,
         running_queue: list[Request],
     ) -> None:
-        """Return waiting-for-chunk/input requests to scheduling queues."""
-        for request in self._waiting_for_chunk_waiting:
-            waiting_queue.add_request(request)
-        self._waiting_for_chunk_waiting = deque()
+        """Return waiting-for-input requests to the waiting queue.
 
-        if self._waiting_for_chunk_running:
-            running_queue.extend(self._waiting_for_chunk_running)
-        self._waiting_for_chunk_running = deque()
-
+        ``running_queue`` is unused: chunk waiting restore lives on
+        OmniChunkTransferAdapter.
+        """
+        _ = running_queue
         for request in self._waiting_for_input:
             waiting_queue.add_request(request)
         self._waiting_for_input = deque()
@@ -429,60 +352,3 @@ class OmniSchedulingCoordinator:
                     request._all_token_ids.extend(new_ids)
                     request._output_token_ids.clear()
                     request.num_computed_tokens = 0
-
-    # TODO(yrr): Dead code, only postprocess_scheduler_output in chunk transfer adapter is used
-    def postprocess_scheduler_output(
-        self,
-        scheduler_output: Any,
-        requests: dict[str, Request] | None = None,
-    ) -> None:
-        """Clear per-cycle ready state after scheduler output is materialized."""
-        self._clear_chunk_ready(scheduler_output)
-
-    # ------------------------------------------------------------------ #
-    #  Internal helpers
-    # ------------------------------------------------------------------ #
-
-    # TODO(yrr): Dead code, only process_chunk_queue in chunk transfer adapter is used
-    def _process_chunk_queue(
-        self,
-        queue: Any,
-        waiting_for_chunk_list: deque[Any],
-        target_status: RequestStatus,
-        chunk_ready_req_ids: set[str],
-    ) -> None:
-        queue_snapshot = list(queue)
-        for request in queue_snapshot:
-            if request.status != RequestStatus.WAITING_FOR_CHUNK:
-                if request.request_id in self.requests_with_ready_chunks:
-                    continue
-                if request.request_id in self.finished_requests:
-                    continue
-                if request.status == RequestStatus.WAITING_FOR_INPUT:
-                    continue
-                if request.request_id in chunk_ready_req_ids:
-                    self.requests_with_ready_chunks.add(request.request_id)
-                    continue
-                self.pending_chunk_registrations.append(request)
-                request.status = RequestStatus.WAITING_FOR_CHUNK
-                self._waiting_since.setdefault(request.request_id, time.monotonic())
-            else:
-                if request.request_id in chunk_ready_req_ids:
-                    request.status = target_status
-                    self.requests_with_ready_chunks.add(request.request_id)
-                    self._waiting_since.pop(request.request_id, None)
-                    continue
-            queue.remove(request)
-            waiting_for_chunk_list.append(request)
-
-    # TODO(yrr): Dead code, only postprocess_scheduler_output in chunk transfer adapter is used
-    def _clear_chunk_ready(self, scheduler_output: Any) -> None:
-        if scheduler_output.scheduled_new_reqs:
-            for req_data in scheduler_output.scheduled_new_reqs:
-                self.requests_with_ready_chunks.discard(
-                    getattr(req_data, "req_id", None),
-                )
-
-        if scheduler_output.scheduled_cached_reqs:
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                self.requests_with_ready_chunks.discard(req_id)
