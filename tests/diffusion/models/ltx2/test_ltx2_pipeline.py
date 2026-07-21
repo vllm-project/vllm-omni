@@ -1057,7 +1057,7 @@ def test_ltx_resident_lora_copies_mapping_and_namespace_configs(config):
     assert copied is not config
 
 
-def test_ltx_resident_lora_keeps_two_offloadable_transformers(monkeypatch):
+def test_ltx_resident_lora_premerges_full_weights_for_shared_loader(monkeypatch):
     from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
     from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 
@@ -1071,7 +1071,8 @@ def test_ltx_resident_lora_keeps_two_offloadable_transformers(monkeypatch):
     torch.nn.Module.__init__(pipe)
     pipe.transformer = _TinyTransformer()
     pipe._transformer_init_config = {"num_layers": 1, "cross_attn_mod": True}
-    pipe.od_config = SimpleNamespace(quantization_config=None, dtype=torch.float32)
+    quant_config = SimpleNamespace(is_checkpoint_fp8_serialized=False)
+    pipe.od_config = SimpleNamespace(quantization_config=quant_config, dtype=torch.float32)
     pipe.device = torch.device("cpu")
     pipe.weights_sources = [
         DiffusersPipelineLoader.ComponentSource(
@@ -1082,44 +1083,95 @@ def test_ltx_resident_lora_keeps_two_offloadable_transformers(monkeypatch):
         )
     ]
     created_configs = []
+
+    def create_transformer(config, quant_config=None):
+        created_configs.append((config, quant_config))
+        return _TinyTransformer()
+
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.ltx2.ltx2_lora.create_transformer_from_config",
-        lambda config: (created_configs.append(config), _TinyTransformer())[1],
+        create_transformer,
+    )
+    lora_entries = [
+        _LTXLoRAEntry(
+            module_name="proj",
+            target_name="proj",
+            shard_id=None,
+            lora_a=torch.tensor([[1.0, 2.0]]),
+            lora_b=torch.tensor([[3.0], [4.0]]),
+        )
+    ]
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_lora._load_lora_entries",
+        lambda *args: lora_entries,
     )
 
-    with torch.no_grad():
-        pipe.transformer.proj.weight.copy_(torch.eye(2))
     controller = LTXResidentLoRAController(pipe, "unused.safetensors")
-    assert created_configs == [{"num_layers": 1, "cross_attn_mod": True}]
-    with torch.no_grad():
-        pipe.transformer_2.proj.weight.copy_(pipe.transformer.proj.weight)
+    assert created_configs == [({"num_layers": 1, "cross_attn_mod": True}, quant_config)]
 
-    controller._merge_entries(
+    pipe._phase_lora_controller = controller
+    base_weight = torch.eye(2)
+    loaded = pipe.load_weights(
         [
-            _LTXLoRAEntry(
-                module_name="proj",
-                target_name="proj",
-                shard_id=None,
-                lora_a=torch.tensor([[1.0, 2.0]]),
-                lora_b=torch.tensor([[3.0], [4.0]]),
-            )
+            ("transformer.proj.weight", base_weight),
+            ("transformer_2.proj.weight", base_weight),
         ]
     )
-    controller._merged = True
 
-    modules = ModuleDiscovery.discover(pipe)
-    assert modules.dit_names == ["transformer", "transformer_2"]
-    assert pipe.weights_sources[1].prefix == "transformer_2."
-    torch.testing.assert_close(pipe.transformer.proj.weight, torch.eye(2))
+    assert loaded == {"transformer.proj.weight", "transformer_2.proj.weight"}
+    torch.testing.assert_close(pipe.transformer.proj.weight, base_weight)
     torch.testing.assert_close(
         pipe.transformer_2.proj.weight,
         torch.tensor([[4.0, 6.0], [4.0, 9.0]]),
     )
+    assert controller._merged
+
+    modules = ModuleDiscovery.discover(pipe)
+    assert modules.dit_names == ["transformer", "transformer_2"]
+    assert pipe.weights_sources[1].prefix == "transformer_2."
 
     controller.enter("base")
     assert controller.transformer is pipe.transformer
     controller.enter("distilled_lora")
     assert controller.transformer is pipe.transformer_2
+
+
+def test_ltx_resident_lora_rejects_serialized_quantized_checkpoint():
+    pipe = SimpleNamespace(
+        transformer=SimpleNamespace(config={}),
+        od_config=SimpleNamespace(
+            quantization_config=SimpleNamespace(is_checkpoint_fp8_serialized=True),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="serialized quantized checkpoints"):
+        LTXResidentLoRAController(pipe, "unused.safetensors")
+
+
+def test_ltx_resident_lora_requires_every_adapter_target(monkeypatch):
+    controller = object.__new__(LTXResidentLoRAController)
+    controller.pipeline = SimpleNamespace(
+        transformer_2=SimpleNamespace(),
+        od_config=SimpleNamespace(dtype=torch.float32),
+        device=torch.device("cpu"),
+    )
+    controller.adapter_path = "unused.safetensors"
+    controller._merged = False
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_lora._load_lora_entries",
+        lambda *args: [
+            _LTXLoRAEntry(
+                module_name="missing",
+                target_name="missing",
+                shard_id=None,
+                lora_a=torch.eye(2),
+                lora_b=torch.eye(2),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="missing LoRA target weights"):
+        list(controller.merge_stage2_weights([("transformer_2.proj.weight", torch.eye(2))]))
 
 
 class TestLTXRequestParsing:

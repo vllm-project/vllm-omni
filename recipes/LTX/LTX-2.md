@@ -100,7 +100,9 @@ The distilled recipe fixes both sigma schedules; `num_inference_steps` must be
 Ordinary two-stage defaults to a `1536 × 1024` final output. Stage 1 uses the
 selected one-stage recipe at half resolution; Stage 2 uses the fixed
 three-step positive-only schedule. All two-stage pipelines reject custom sigma
-schedules and request-provided video/audio latents.
+schedules and request-provided video/audio latents. Online Transformer
+quantization is applied to both DiTs after merging the Stage 2 LoRA into full
+checkpoint tensors; already-quantized base checkpoints are unsupported.
 
 ## Serving
 
