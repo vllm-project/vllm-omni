@@ -38,7 +38,6 @@ from PIL import Image
 from torch import Tensor
 from torch.nn.init import _calculate_fan_in_and_fan_out, trunc_normal_
 from transformers import AutoImageProcessor, PretrainedConfig
-from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.image_transforms import to_channel_dimension_format
@@ -51,24 +50,20 @@ from transformers.image_utils import (
 )
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ModelOutput
+from transformers.modeling_outputs import (
+    BaseModelOutput,
+    BaseModelOutputWithPast,
+    BaseModelOutputWithPooling,
+    ModelOutput,
+)
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.whisper.modeling_whisper import ACT2FN
-
-try:
-    from transformers.models.whisper.modeling_whisper import WHISPER_ATTENTION_CLASSES
-except ImportError:
-    from transformers.models.whisper.modeling_whisper import (
-        WhisperAttention,
-    )
-
-    WHISPER_ATTENTION_CLASSES = {
-        "eager": WhisperAttention,
-        "sdpa": WhisperAttention,  # fallback to eager
-    }
-from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from transformers.models.whisper.modeling_whisper import WhisperConfig, WhisperEncoder
+from transformers.models.whisper.modeling_whisper import (
+    ACT2FN,
+    WhisperAttention,
+    WhisperConfig,
+    WhisperEncoder,
+)
 from transformers.utils import (
     TensorType,
     add_start_docstrings,
@@ -94,6 +89,7 @@ from vllm.model_executor.models.utils import (
     _merge_multimodal_embeddings as merge_multimodal_embeddings,
 )
 from vllm.model_executor.models.utils import (
+    cast_overflow_tensors,
     flatten_bn,
     init_vllm_registered_model,
     maybe_prefix,
@@ -2456,12 +2452,13 @@ def _in_projection(
     return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
 
 
-# Copied from transformers.models.whisper.modeling_whisper.WhisperEncoderLayer and add use_cache for streaming inference
 class MiniCPMWhisperEncoderLayer(nn.Module):
-    def __init__(self, config: WhisperConfig, layer_idx: int = None):
+    """Inference-only Whisper encoder layer aligned with vLLM MiniCPMO."""
+
+    def __init__(self, config: WhisperConfig, layer_idx: int):
         super().__init__()
         self.embed_dim = config.d_model
-        self.self_attn = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
+        self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             dropout=config.attention_dropout,
@@ -2480,41 +2477,13 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        layer_head_mask: torch.Tensor,
-        output_attentions: bool = False,
-        past_key_values: EncoderDecoderCache | None = None,
-        use_cache: bool | None = False,
     ) -> torch.Tensor:
-        r"""
-        Args:
-            hidden_states (`torch.FloatTensor` of shape `(batch_size, seq_len, embed_dim)`):
-                Hidden states to be fed into the encoder layer.
-            attention_mask (`torch.FloatTensor` of shape `(batch_size, 1, tgt_len, src_len)`):
-                Attention mask where padding elements are indicated by large negative values.
-            layer_head_mask (`torch.FloatTensor` of shape `(encoder_attention_heads,)`):
-                Mask to nullify selected heads of the attention modules.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attention weights.
-            past_key_values (`EncoderDecoderCache`, *optional*):
-                Past key-value pairs used for incremental decoding.
-            use_cache (`bool`, *optional*):
-                Whether or not to return updated `past_key_values` for caching.
-
-        Returns:
-            A tuple of shape `(hidden_states, optional(attn_weights), optional(past_key_values))`.
-        """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        attn_out = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
-            past_key_value=past_key_values,
         )
-        hidden_states = attn_out[0]
-        attn_weights = attn_out[1] if len(attn_out) > 1 else None
-        past_key_values = attn_out[2] if len(attn_out) > 2 else None
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -2526,25 +2495,17 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
-        if hidden_states.dtype == torch.float16 and (
-            torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
-        ):
-            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+        if hidden_states.dtype == torch.float16:
+            hidden_states = cast_overflow_tensors(hidden_states)
 
         outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        if use_cache:
-            outputs += (past_key_values,)
 
         return outputs
 
 
-# Copied from from transformers.models.whisper.modeling_whisper.WhisperEncoder and add use_cache for streaming inference
 class MiniCPMWhisperEncoder(WhisperEncoder):
+    """Inference-only Whisper encoder aligned with vLLM MiniCPMO."""
+
     def __init__(self, config: WhisperConfig):
         super().__init__(config)
         self.layers = nn.ModuleList(
@@ -2553,122 +2514,9 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
 
     def forward(
         self,
-        input_features,
-        attention_mask=None,
-        head_mask=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        past_key_values: EncoderDecoderCache | None = None,
-        use_cache: bool | None = None,
-    ) -> BaseModelOutputWithPast | tuple:
-        r"""
-        Forward pass of the Whisper encoder.
-
-        Args:
-            input_features (`torch.FloatTensor` of shape `(batch_size, feature_size, sequence_length)`):
-                Float values of log-mel features extracted from the raw audio waveform. Typically generated
-                by a feature extractor (e.g., `WhisperFeatureExtractor`) that processes `.flac` or `.wav`
-                files into padded 2D mel spectrogram frames. These features are projected via convolution layers
-                (`conv1` and `conv2`) and then transformed into embeddings for the encoder.
-
-            attention_mask (`torch.Tensor`, *optional*):
-                Not used by Whisper for masking `input_features`, but included for API compatibility with
-                other models. If provided, it is simply ignored within the model. By default, Whisper
-                effectively ignores silence in the input log-mel spectrogram.
-
-            head_mask (`torch.Tensor` of shape `(encoder_layers, encoder_attention_heads)`, *optional*):
-                Mask to nullify selected attention heads. The elements should be either 1 or 0, where:
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head is **masked** (i.e., the attention head is dropped).
-
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attention tensors of all encoder layers. If set to `True`, the
-                returned tuple (or `BaseModelOutputWithPast`) will contain an additional element with
-                attention weights for each encoder layer.
-
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers. If set to `True`, the returned
-                tuple (or `BaseModelOutputWithPast`) will contain a tuple of hidden states, including the
-                initial embedding output as well as the outputs of each layer.
-
-            return_dict (`bool`, *optional*):
-                Whether or not to return a `BaseModelOutputWithPast` (a subclass of `ModelOutput`) instead
-                of a plain tuple. If set to `True`, the output will be a `BaseModelOutputWithPast` object,
-                otherwise it will be a tuple.
-
-            past_key_values (`EncoderDecoderCache`, *optional*):
-                When using caching for faster inference, this is an object that stores the key-value pairs
-                for attention states. If provided, the model will append new states to the existing cache
-                and return the updated cache. This speeds up sequential decoding or chunked inference.
-
-                - If `past_key_values` is `None`, no past states are used or returned.
-                - If `past_key_values` is not `None` and `use_cache=True`, the model will use the provided
-                cache and return the updated cache (as `next_encoder_cache`).
-
-            use_cache (`bool`, *optional*):
-                Whether or not the model should use caching (`past_key_values`) to speed up processing
-                during inference. When set to `True`, the model will:
-                - Inspect and use `past_key_values` if provided.
-                - Return updated `past_key_values` (under the name `next_encoder_cache` in
-                    `BaseModelOutputWithPast`).
-
-        Returns:
-            `BaseModelOutputWithPast` or `tuple` (depending on `return_dict`):
-                If `return_dict=True`, a `BaseModelOutputWithPast` is returned, which contains:
-                - **last_hidden_state** (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-                The output of the final encoder layer.
-                - **hidden_states** (`tuple(torch.FloatTensor)`, *optional*, returned if `output_hidden_states=True`):
-                Hidden states of the model at each layer (including the initial projection).
-                - **attentions** (`tuple(torch.FloatTensor)`, *optional*, returned if `output_attentions=True`):
-                Attention weights from each encoder layer.
-                - **past_key_values** (an object of type `EncoderDecoderCache` or `None`, *optional*):
-                Updated cache of key-value pairs if `use_cache=True`.
-
-                If `return_dict=False`, a tuple is returned, where the format is:
-                `(last_hidden_state, hidden_states, attentions)`, with `hidden_states` and `attentions`
-                only present if their respective `output_*` arguments are set to `True`.
-
-        Example:
-            >>> from transformers import AutoFeatureExtractor, WhisperConfig, WhisperForConditionalGeneration
-            >>> import torch
-
-            >>> # Load a feature extractor and a Whisper model
-            >>> feature_extractor = AutoFeatureExtractor.from_pretrained("openai/whisper-tiny.en")
-            >>> model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
-
-            >>> # Assume you have audio (list of floats or numpy array) loaded from a file
-            >>> # Then extract the mel features:
-            >>> input_features = feature_extractor(audio, sampling_rate=16000, return_tensors="pt").input_features
-
-            >>> # Forward pass
-            >>> outputs = model.encoder(
-            ...     input_features=input_features,
-            ...     output_hidden_states=True,
-            ...     output_attentions=True,
-            ...     use_cache=True
-            ... )
-
-            >>> # Retrieve the last hidden state
-            >>> last_hidden_state = outputs.last_hidden_state
-            >>> print(last_hidden_state.shape)
-            torch.Size([batch_size, seq_length, hidden_size])
-
-            >>> # Retrieve the intermediate hidden states if output_hidden_states=True
-            >>> all_encoder_hidden_states = outputs.hidden_states
-
-            >>> # Retrieve attention weights if output_attentions=True
-            >>> all_encoder_attentions = outputs.attentions
-
-            >>> # Retrieve updated past key values if use_cache=True
-            >>> encoder_cache = outputs.past_key_values
-        """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> BaseModelOutputWithPast:
         # Ignore copy
         input_features = input_features.to(dtype=self.conv1.weight.dtype, device=self.conv1.weight.device)
 
@@ -2678,51 +2526,16 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
 
         embed_pos = self.embed_positions.weight
-        past_key_values_length = 0
-        if use_cache:
-            if past_key_values is None:
-                past_key_values = EncoderDecoderCache(DynamicCache(), DynamicCache())
-            elif isinstance(past_key_values, list):
-                past_key_values = EncoderDecoderCache(DynamicCache.from_legacy_cache(past_key_values), DynamicCache())
-            elif isinstance(past_key_values, DynamicCache):
-                past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
-            else:
-                pass
-            past_key_values_length = past_key_values.self_attention_cache.get_usable_length(inputs_embeds.shape[1])
-            if inputs_embeds.shape[1] + past_key_values_length > embed_pos.shape[0]:
-                logger.warning("seems the audio is longer than 30s. repeating the last part of the audio")
-                embed_pos_front = embed_pos[past_key_values_length:, :]
-                embed_pos = torch.cat(
-                    (
-                        embed_pos_front,
-                        torch.repeat_interleave(
-                            embed_pos[-1, :].unsqueeze(0),
-                            inputs_embeds.shape[1] - embed_pos.shape[0] + past_key_values_length,
-                            dim=0,
-                        ),
-                    )
-                )
-            else:
-                embed_pos = embed_pos[past_key_values_length : inputs_embeds.shape[1] + past_key_values_length, :]
-        else:
-            embed_pos = embed_pos[: inputs_embeds.shape[1], :]
+
+        embed_pos = embed_pos[: inputs_embeds.shape[1], :]
 
         hidden_states = inputs_embeds + embed_pos
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-
-        # check if head_mask has a correct number of layers specified if desired
-        if head_mask is not None:
-            assert head_mask.size()[0] == (len(self.layers)), (
-                f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
-            )
+        encoder_states = ()
 
         for idx, encoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
-            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            encoder_states = encoder_states + (hidden_states,)
             to_drop = False
             if self.training:
                 dropout_probability = torch.rand([])
@@ -2733,47 +2546,19 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
             if to_drop:
                 layer_outputs = (None, None)
             else:
-                if self.gradient_checkpointing and self.training:
-                    layer_outputs = self._gradient_checkpointing_func(
-                        encoder_layer.__call__,
-                        hidden_states,
-                        attention_mask,
-                        (head_mask[idx] if head_mask is not None else None),
-                        output_attentions,
-                        past_key_values,
-                        use_cache,
-                    )
-                else:
-                    layer_outputs = encoder_layer(
-                        hidden_states,
-                        attention_mask,
-                        layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                        output_attentions=output_attentions,
-                        past_key_values=past_key_values,
-                        use_cache=use_cache,
-                    )
+                layer_outputs = encoder_layer(
+                    hidden_states,
+                    attention_mask,
+                )
 
                 hidden_states = layer_outputs[0]
 
-            if use_cache:
-                next_encoder_cache = layer_outputs[2 if output_attentions else 1]
-            else:
-                next_encoder_cache = None
-
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
-
         hidden_states = self.layer_norm(hidden_states)
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
+        encoder_states = encoder_states + (hidden_states,)
 
-        if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             hidden_states=encoder_states,
-            attentions=all_attentions,
-            past_key_values=next_encoder_cache,
         )
 
 
@@ -2896,7 +2681,10 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self) -> MultiModalDataParser:
         # vLLM >=0.16 expects ``BaseProcessingInfo.get_data_parser`` to construct
         # the per-model multi-modal data parser.
-        return MiniCPMOMultiModalDataParser(target_sr=self.get_default_audio_sampling_rate())
+        return MiniCPMOMultiModalDataParser(
+            target_sr=self.get_default_audio_sampling_rate(),
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
 
     def get_chunk_length(self) -> int:
         return self.get_hf_config().audio_chunk_length
@@ -2939,6 +2727,11 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config()
 
     def get_hf_processor(self, **kwargs: object):
+        """Get MiniCPMO processor with pool_step wired from model config.
+
+        Matches vLLM MiniCPMOProcessingInfo: ensure audio placeholder token
+        counts use ``config.audio_pool_step`` (5 for MiniCPM-o 4.5).
+        """
         # When skip_tokenizer_init=True (e.g. in worker), ctx.tokenizer is None.
         # HF MiniCPM processor requires a tokenizer; use get_tokenizer() which loads lazily.
         if self.ctx.tokenizer is None:
@@ -2953,12 +2746,29 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         else:
             hf_processor = self.ctx.get_hf_processor(**kwargs)
 
-        # NumPy arrays are considered as Iterable but not Sequence in
-        # https://github.com/huggingface/transformers/blob/main/src/transformers/image_transforms.py#L428
+        # Align with vLLM MiniCPMOProcessingInfo: inject pool_step from config
+        # (MiniCPM-o 4.5 uses 5) so placeholder token counts match the audio tower.
+        pool_step = self.get_default_audio_pool_step()
+        from vllm.transformers_utils.processors.minicpmo import MiniCPMOProcessor
+
+        feature_extractor = getattr(hf_processor, "feature_extractor", None)
+        if feature_extractor is None:
+            feature_extractor = getattr(hf_processor, "audio_processor", None)
+        if feature_extractor is not None:
+            hf_processor = MiniCPMOProcessor(
+                image_processor=hf_processor.image_processor,
+                feature_extractor=feature_extractor,
+                tokenizer=hf_processor.tokenizer,
+                pool_step=pool_step,
+            )
+        elif hasattr(hf_processor, "pool_step"):
+            hf_processor.pool_step = pool_step
+
+        # Convert numpy arrays in image processor to lists for serialization
         image_processor = hf_processor.image_processor  # type: ignore
         for attr in ("mean", "std"):
-            val = getattr(image_processor, attr)
-            if isinstance(val, np.ndarray):
+            val = getattr(image_processor, attr, None)
+            if val is not None and isinstance(val, np.ndarray):
                 setattr(image_processor, attr, val.tolist())
 
         return hf_processor
@@ -3399,7 +3209,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
     def get_audio_prompt_texts(
         self,
         audio_lens: int,
-        chunk_input: bool = False,  # it should be False to avoid different process
+        chunk_input: bool = True,
         chunk_length: int = 1,
     ) -> str:
         return self.info.get_audio_placeholder(
@@ -3417,9 +3227,8 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if (audios := mm_data.get("audios")) is None:
             return {}
 
-        parsed_audios = self.data_parser.parse_mm_data({"audio": audios}).get_items(
-            "audio", (MiniCPMOAudioEmbeddingItems, AudioProcessorItems)
-        )
+        mm_items = self.info.parse_mm_data({"audio": audios}, validate=False)
+        parsed_audios = mm_items.get_items("audio", (MiniCPMOAudioEmbeddingItems, AudioProcessorItems))
 
         if isinstance(parsed_audios, MiniCPMOAudioEmbeddingItems):
             audio_inputs = {}
@@ -3439,8 +3248,8 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 else:
                     flat_feature_lens.append(int(lens))
             unpadded_audio_features = [
-                feat[:, :feature_len]
-                for feat, feature_len in zip(
+                feat[:, :length]
+                for feat, length in zip(
                     audio_inputs["audio_features"],
                     flat_feature_lens,
                 )
@@ -3458,13 +3267,14 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if (images := mm_data.get("images")) is None:
             return {}
 
-        parsed_images = self.data_parser.parse_mm_data({"image": images}).get_items(
-            "image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems)
-        )
+        mm_items = self.info.parse_mm_data({"image": images}, validate=False)
+        parsed_images = mm_items.get_items("image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems))
 
         if isinstance(parsed_images, MiniCPMVImageEmbeddingItems):
             image_inputs = {}
         else:
+            # Keep processor kwargs (e.g. max_slice_nums=1 for MiniCPM video-frame
+            # images) aligned with placeholder expansion in _get_prompt_updates.
             image_inputs = self._base_call_hf_processor(
                 prompts=[self.info.image_pattern] * len(parsed_images),
                 mm_data={"images": [[image] for image in parsed_images]},
@@ -3483,9 +3293,8 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if (videos := mm_data.get("videos")) is None:
             return {}
 
-        parsed_videos = self.data_parser.parse_mm_data({"video": videos}).get_items(
-            "video", (MiniCPMVVideoEmbeddingItems, VideoProcessorItems)
-        )
+        mm_items = self.info.parse_mm_data({"video": videos}, validate=False)
+        parsed_videos = mm_items.get_items("video", (MiniCPMVVideoEmbeddingItems, VideoProcessorItems))
 
         if isinstance(parsed_videos, MiniCPMVVideoEmbeddingItems):
             video_inputs = {}
@@ -3576,9 +3385,19 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             images = mm_items.get_items("image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems))
 
             image_size = images.get_image_size(item_idx)
+            # Honor request mm_processor_kwargs so video-frame images can force
+            # max_slice_nums=1 / use_image_id=False (official MiniCPM omni path).
+            max_slice_nums = hf_processor_mm_kwargs.get("max_slice_nums")
+            use_image_id = hf_processor_mm_kwargs.get("use_image_id")
+            placeholder = self.info.get_slice_image_placeholder(
+                image_size,
+                image_idx=item_idx,
+                max_slice_nums=int(max_slice_nums) if max_slice_nums is not None else None,
+                use_image_id=bool(use_image_id) if use_image_id is not None else True,
+            )
 
             return PromptUpdateDetails.select_text(
-                self.get_image_prompt_texts(image_size, item_idx),
+                placeholder,
                 "<unk>",
             )
 
@@ -4159,29 +3978,27 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         device: torch.device = torch.device("cpu"),
         num_lookhead: int = 0,
     ) -> torch.Tensor:
-        """Create mask for subsequent steps (size, size) with chunk size,
-        this is for streaming encoder
-
-        Args:
-            size (int): size of mask
-            chunk_size (int): size of chunk
-            num_left_chunks (int): number of left chunks
-                <0: use full chunk
-                >=0: use num_left_chunks
-            device (torch.device): "cpu" or "cuda" or torch.Tensor.device
-
-        Returns:
-            torch.Tensor: mask
-
-        """
+        """Vectorized subsequent-chunk mask aligned with vLLM MiniCPMO."""
         ret = torch.zeros(size, size, device=device, dtype=torch.bool)
-        for i in range(size):
-            if num_left_chunks < 0:
-                start = 0
-            else:
-                start = max((i // chunk_size - num_left_chunks) * chunk_size, 0)
-            ending = min((i // chunk_size + 1) * chunk_size + num_lookhead, size)
-            ret[i, start:ending] = True
+        # Vectorized computation of row indices and chunk boundaries
+        row_indices = torch.arange(size, device=device)
+        chunk_indices = row_indices // chunk_size
+        if num_left_chunks < 0:
+            # If num_left_chunks < 0, start is always 0 for all rows
+            start_indices = torch.zeros_like(row_indices)
+        else:
+            # Compute start indices vectorially
+            start_chunk_indices = torch.clamp(chunk_indices - num_left_chunks, min=0)
+            start_indices = start_chunk_indices * chunk_size
+        # Compute ending indices vectorially
+        end_chunk_indices = chunk_indices + 1
+        end_indices = torch.clamp(end_chunk_indices * chunk_size + num_lookhead, max=size)
+        # Create column indices for broadcasting
+        col_indices = torch.arange(size, device=device).unsqueeze(0)
+        start_indices = start_indices.unsqueeze(1)
+        end_indices = end_indices.unsqueeze(1)
+        # Vectorized mask creation
+        ret = (col_indices >= start_indices) & (col_indices < end_indices)
         return ret
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
@@ -4254,9 +4071,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
         audio_attention_mask[audio_attention_mask_] = float("-inf")
-        audio_states = self.apm(wavforms, attention_mask=audio_attention_mask, output_hidden_states=True).hidden_states[
-            self.audio_encoder_layer
-        ]
+        audio_states = self.apm(wavforms, attention_mask=audio_attention_mask).hidden_states[self.audio_encoder_layer]
         audio_embeds = self.audio_projection_layer(audio_states)
 
         audio_embeds = audio_embeds.transpose(1, 2)
