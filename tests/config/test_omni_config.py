@@ -1253,6 +1253,47 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
+@pytest.mark.parametrize(
+    ("canonical_key", "alias_key", "canonical_value", "alias_value"),
+    [
+        ("lora_scale", "static_lora_scale", 0.75, 0.25),
+        (
+            "quantization_config",
+            "diffusion_quantization_config",
+            {"method": "canonical"},
+            {"method": "diffusion-alias"},
+        ),
+        (
+            "quantization_config",
+            "quantization",
+            {"method": "canonical"},
+            "legacy-alias",
+        ),
+        ("diffusion_kv_cache_dtype", "kv_cache_dtype", "fp8", "fp16"),
+        ("diffusion_kv_cache_skip_steps", "kv_cache_skip_steps", "0-1", "2-3"),
+        ("diffusion_kv_cache_skip_layers", "kv_cache_skip_layers", "1-2", "3-4"),
+        ("streaming_output", "diffusion_streaming_output", False, True),
+    ],
+)
+def test_diffusion_alias_conflicts_prefer_canonical_key(
+    canonical_key,
+    alias_key,
+    canonical_value,
+    alias_value,
+):
+    from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+
+    normalized = normalize_omni_diffusion_kwargs(
+        {
+            canonical_key: canonical_value,
+            alias_key: alias_value,
+        }
+    )
+
+    assert normalized[canonical_key] == canonical_value
+    assert alias_key not in normalized
+
+
 def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path, monkeypatch):
     from vllm_omni.platforms import current_omni_platform
 

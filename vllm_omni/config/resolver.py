@@ -31,10 +31,17 @@ class OmniConfigResolveRequest:
 
 @dataclass(frozen=True)
 class OmniConfigResolution:
-    """Resolved runtime input while stage consumers still use OmegaConf."""
+    """Migration envelope returned by the production config resolver.
+
+    ``stage_configs`` intentionally carries the current OmegaConf-compatible
+    runtime ABI only until stage startup consumes ``VllmOmniConfig`` directly.
+    It is not a stable authoring or extension API; new production callers
+    should resolve through :func:`resolve_omni_config` and must not construct or
+    merge this compatibility shape themselves.
+    """
 
     config_path: str | None
-    stage_configs: tuple[Any, ...]
+    stage_configs: tuple[Any, ...]  # Temporary StageConfig/OmegaConf bridge.
     omni_lb_policy: str | None = None
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
 

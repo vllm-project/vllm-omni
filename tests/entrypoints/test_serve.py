@@ -9,10 +9,18 @@ import argparse
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 from pytest_mock import MockerFixture
+from transformers import Qwen3OmniMoeConfig
 
+import vllm_omni.config.resolver as resolver_module
+import vllm_omni.engine.async_omni_engine as async_engine_module
+from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.resolver import OmniConfigResolution, _parse_stage_overrides
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
+from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -134,7 +142,7 @@ def _make_headless_args(**kwargs) -> TrackingNamespace:
     ns = argparse.Namespace(**ns_kwargs)
     return TrackingNamespace(
         unfiltered_ns=ns,
-        explicit_keys=frozenset(ns.__dict__.keys()),
+        explicit_keys=frozenset(ns.__dict__.keys()) if explicit_keys is None else explicit_keys,
     )
 
 
@@ -334,6 +342,110 @@ def test_run_headless_maps_stage_configs_path_to_deploy_config(mocker: MockerFix
     assert request.deploy_config_path == "deploy.yaml"
     assert "stage_configs_path" not in request.cli_overrides
     assert not hasattr(request, "legacy_stage_configs_path")
+
+
+def test_standard_and_headless_alias_resolve_identical_effective_config(tmp_path, mocker: MockerFixture) -> None:
+    """Both startup paths must resolve every field from one promoted deploy path."""
+    deploy_path = get_deploy_config_path("qwen3_omni_moe.yaml")
+    strategy_path = tmp_path / "strategy.yaml"
+    strategy_path.write_text(
+        "\n".join(
+            [
+                "strategies:",
+                "  talker:",
+                "    - axis: stage_replica",
+                "      size: 2",
+                "      routing: round_robin",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    hf_config = Qwen3OmniMoeConfig(enable_audio_output=True)
+    mocker.patch.object(StageConfigFactory, "try_infer_model_type", return_value="qwen3_omni_moe")
+    mocker.patch.object(StageConfigFactory, "get_hf_config", return_value=hf_config)
+
+    factory_paths: dict[str, list[str | None]] = {"structured": [], "legacy": []}
+    create_structured = StageConfigFactory.create_from_model
+    create_legacy = StageConfigFactory.create_legacy_stage_configs_from_model
+
+    def _record_create_structured(*args, **kwargs):
+        factory_paths["structured"].append(kwargs.get("deploy_config_path"))
+        return create_structured(*args, **kwargs)
+
+    def _record_create_legacy(*args, **kwargs):
+        factory_paths["legacy"].append(kwargs.get("deploy_config_path"))
+        return create_legacy(*args, **kwargs)
+
+    mocker.patch.object(StageConfigFactory, "create_from_model", side_effect=_record_create_structured)
+    mocker.patch.object(
+        StageConfigFactory,
+        "create_legacy_stage_configs_from_model",
+        side_effect=_record_create_legacy,
+    )
+
+    resolutions: list[OmniConfigResolution] = []
+    resolve = resolver_module.resolve_omni_config
+
+    def _record_resolve(request):
+        resolved = resolve(request)
+        resolutions.append(resolved)
+        return resolved
+
+    mocker.patch.object(async_engine_module, "resolve_omni_config", side_effect=_record_resolve)
+    mocker.patch.object(resolver_module, "resolve_omni_config", side_effect=_record_resolve)
+
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._omni_lb_policy = "random"
+    standard_path, standard_stages = engine._resolve_stage_configs(
+        "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        {
+            "stage_configs_path": deploy_path,
+            "strategy_config": str(strategy_path),
+        },
+        trust_remote_code=False,
+    )
+
+    with pytest.raises(ValueError, match="No stage config found for stage_id=99"):
+        run_headless(
+            _make_headless_args(
+                explicit_keys=frozenset({"stage_configs_path", "strategy_config"}),
+                model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+                stage_id=99,
+                stage_configs_path=deploy_path,
+                strategy_config=str(strategy_path),
+            )
+        )
+
+    assert len(resolutions) == 2
+    standard_resolution, headless_resolution = resolutions
+
+    def _stage_snapshot(resolution: OmniConfigResolution) -> list[dict]:
+        return [OmegaConf.to_container(stage, resolve=True) for stage in resolution.stage_configs]
+
+    assert standard_path == deploy_path
+    assert standard_path == headless_resolution.config_path
+    assert _stage_snapshot(standard_resolution) == _stage_snapshot(headless_resolution)
+    assert [OmegaConf.to_container(stage, resolve=True) for stage in standard_stages] == _stage_snapshot(
+        headless_resolution
+    )
+    assert standard_resolution.omni_lb_policy == headless_resolution.omni_lb_policy == "round-robin"
+    assert (
+        standard_resolution.endpoint_restrictions
+        == headless_resolution.endpoint_restrictions
+        == QWEN3_OMNI_PIPELINE.endpoint_restrictions
+    )
+    assert [stage.engine_args.model_stage for stage in standard_resolution.stage_configs] == [
+        "thinker",
+        "talker",
+        "code2wav",
+    ]
+    assert standard_resolution.stage_configs[1].runtime.num_replicas == 2
+    assert engine._omni_lb_policy == "round-robin"
+    assert factory_paths == {
+        "structured": [deploy_path, deploy_path],
+        "legacy": [deploy_path, deploy_path],
+    }
 
 
 def test_run_headless_rejects_both_config_path_flags() -> None:

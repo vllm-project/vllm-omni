@@ -103,6 +103,11 @@ def with_trust_remote_code_override(
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
 
+    Production startup source selection is owned by
+    :func:`vllm_omni.config.resolver.resolve_omni_config`. Factory methods are
+    lower-level construction primitives for that resolver, config internals,
+    and focused tests; entrypoints and engines must not call them directly.
+
     Handles both single-stage and multi-stage models.
 
     Pipelines are declared in ``vllm_omni/config/pipeline_registry.py`` and
@@ -393,11 +398,13 @@ class StageConfigFactory:
         deploy_config_path: str | None,
         strategy_specs: Mapping[Any, Any] | None = None,
     ) -> tuple[list[StageConfig] | None, str | None]:
-        """Build current runtime stage configs from the shared resolution.
+        """Build the migration-only runtime ABI from the shared resolution.
 
-        The engine still consumes the legacy StageConfig/OmegaConf shape.
-        RFC #4021 will replace this transitional path as runtime consumers move
-        to VllmOmniConfig.
+        The engine still consumes the legacy ``StageConfig``/OmegaConf shape.
+        This method is the resolver's temporary compatibility bridge, not an
+        alternative production source-selection entrypoint and not a stable
+        public contract. RFC #4021 will remove it as runtime consumers move to
+        ``VllmOmniConfig``.
         """
         user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
         pipeline_cfg = cls.get_pipeline_config(
