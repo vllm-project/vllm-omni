@@ -97,6 +97,8 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
     def _forward_request(
         self,
         req: DiffusionRequestBatch,
+        *,
+        image: Any | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -104,6 +106,7 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         num_frames: int | None = None,
         frame_rate: float | None = None,
         num_inference_steps: int | None = None,
+        sigmas: list[float] | None = None,
         guidance_scale: float | None = None,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -117,9 +120,10 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
         decode_noise_scale: float | list[float] | None = None,
         output_type: str = "np",
         max_sequence_length: int | None = None,
-        *,
-        image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
+        if sigmas is not None:
+            raise ValueError(f"{self.__class__.__name__} uses fixed two-stage sigma schedules.")
+
         request_inputs = self._resolve_request_inputs(
             req,
             prompt=prompt,
@@ -148,55 +152,6 @@ class LTX2TwoStagesPipeline(LTXPipelineRuntime):
             req,
             request_inputs,
             image=image,
-        )
-
-    @torch.no_grad()
-    def forward(
-        self,
-        req: DiffusionRequestBatch,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_frames: int | None = None,
-        frame_rate: float | None = None,
-        num_inference_steps: int | None = None,
-        guidance_scale: float | None = None,
-        num_videos_per_prompt: int | None = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        audio_latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        prompt_attention_mask: torch.Tensor | None = None,
-        negative_prompt_attention_mask: torch.Tensor | None = None,
-        decode_timestep: float | list[float] = 0.0,
-        decode_noise_scale: float | list[float] | None = None,
-        output_type: str = "np",
-        max_sequence_length: int | None = None,
-    ) -> DiffusionOutput | list[DiffusionOutput]:
-        return self._forward_request(
-            req,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            num_videos_per_prompt=num_videos_per_prompt,
-            generator=generator,
-            latents=latents,
-            audio_latents=audio_latents,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            decode_timestep=decode_timestep,
-            decode_noise_scale=decode_noise_scale,
-            output_type=output_type,
-            max_sequence_length=max_sequence_length,
         )
 
 

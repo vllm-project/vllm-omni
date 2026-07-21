@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .ltx2_guidance import LTXGuidanceSpec, LTXModalityGuidance
@@ -159,6 +160,99 @@ class LTXRequestMixin:
     """Normalize serving requests without coupling them to a model version."""
 
     supports_request_batch = False
+
+    @staticmethod
+    def _validate_forward_options(
+        *,
+        timesteps: list[int] | None,
+        guidance_rescale: float | None,
+        noise_scale: float,
+        return_dict: bool,
+        attention_kwargs: dict[str, Any] | None,
+    ) -> None:
+        if timesteps is not None:
+            raise ValueError("LTX does not support `timesteps`; use `sigmas` for a custom schedule.")
+        if guidance_rescale not in (None, 0.0):
+            raise ValueError(
+                "LTX does not support the common `guidance_rescale`; use `video_rescale_scale` and "
+                "`audio_rescale_scale`."
+            )
+        if noise_scale != 0.0:
+            raise ValueError("LTX only supports `noise_scale=0.0`.")
+        if return_dict is not True:
+            raise ValueError("LTX only supports `return_dict=True`.")
+        if attention_kwargs is not None:
+            raise ValueError("LTX does not support public `attention_kwargs`.")
+
+    @torch.no_grad()
+    def forward(
+        self,
+        req: DiffusionRequestBatch,
+        *,
+        image: Any | None = None,
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_frames: int | None = None,
+        frame_rate: float | None = None,
+        num_inference_steps: int | None = None,
+        sigmas: list[float] | None = None,
+        timesteps: list[int] | None = None,
+        guidance_scale: float | None = None,
+        guidance_rescale: float | None = None,
+        noise_scale: float = 0.0,
+        num_videos_per_prompt: int | None = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        audio_latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        decode_timestep: float | list[float] = 0.0,
+        decode_noise_scale: float | list[float] | None = None,
+        output_type: str = "np",
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+        max_sequence_length: int | None = None,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        """Validate and normalize the public LTX request surface."""
+        self._validate_forward_options(
+            timesteps=timesteps,
+            guidance_rescale=guidance_rescale,
+            noise_scale=noise_scale,
+            return_dict=return_dict,
+            attention_kwargs=attention_kwargs,
+        )
+        if image is not None and not self.support_image_input:
+            raise ValueError(f"{self.__class__.__name__} does not support `image` input.")
+
+        return self._forward_request(
+            req,
+            image=image,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            guidance_scale=guidance_scale,
+            num_videos_per_prompt=num_videos_per_prompt,
+            generator=generator,
+            latents=latents,
+            audio_latents=audio_latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            output_type=output_type,
+            max_sequence_length=max_sequence_length,
+        )
 
     @staticmethod
     def _resolve_request_sigmas(
