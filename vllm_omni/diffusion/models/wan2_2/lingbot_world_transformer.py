@@ -8,7 +8,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Self
+from typing import Any, Self, cast
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -128,15 +129,12 @@ class LingBotSelfAttention(nn.Module):
         dim: int,
         num_heads: int,
         *,
-        sink_tokens: int = 0,
         eps: float = 1e-6,
         prefix: str = "",
     ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
-        if sink_tokens < 0:
-            raise ValueError(f"sink_tokens must be non-negative, got {sink_tokens}.")
 
         tp_size = get_tensor_model_parallel_world_size()
         if num_heads % tp_size != 0:
@@ -154,7 +152,6 @@ class LingBotSelfAttention(nn.Module):
         )
         self.num_local_heads = self.qkv.num_heads
         self.tp_inner_dim = self.num_local_heads * self.head_dim
-        self.sink_tokens = sink_tokens
         self.o = RowParallelLinear(
             dim,
             dim,
@@ -190,7 +187,6 @@ class LingBotSelfAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         chunk_tokens = key.shape[1]
         capacity = cache.key.shape[1]
-        previous_end = cache.end
         next_sink_end = cache.sink_end
 
         if cache.last_start is None:
@@ -254,9 +250,6 @@ class LingBotSelfAttention(nn.Module):
         if update_cache:
             cache.key[:, :next_end].copy_(next_key)
             cache.value[:, :next_end].copy_(next_value)
-            if next_end < previous_end:
-                cache.key[:, next_end:previous_end].zero_()
-                cache.value[:, next_end:previous_end].zero_()
             cache.end = next_end
             cache.absolute_end = current_start + chunk_tokens
             cache.last_start = current_start
@@ -270,12 +263,9 @@ class LingBotSelfAttention(nn.Module):
         cache: LingBotAttentionCache,
         current_start: int,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        sink_tokens: int | None = None,
+        sink_tokens: int,
         update_cache: bool = True,
     ) -> torch.Tensor:
-        if sink_tokens is None:
-            sink_tokens = self.sink_tokens
-
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
         qkv, _ = self.qkv(hidden_states)
@@ -419,7 +409,6 @@ class LingBotAttentionBlock(nn.Module):
         num_heads: int,
         *,
         ffn_dim: int | None = None,
-        sink_tokens: int = 0,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
         prefix: str = "",
@@ -431,7 +420,6 @@ class LingBotAttentionBlock(nn.Module):
         self.self_attn = LingBotSelfAttention(
             dim,
             num_heads,
-            sink_tokens=sink_tokens,
             eps=eps,
             prefix=_projection_prefix(prefix, "self_attn"),
         )
@@ -498,8 +486,6 @@ class LingBotAttentionBlock(nn.Module):
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
         num_frames = timestep_projection.shape[1]
-        if token_count % num_frames != 0:
-            raise ValueError("The patched token count must be divisible by the timestep frame count.")
         tokens_per_frame = token_count // num_frames
         # Timestep, camera, and text remain separate conditioning paths.
         modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
@@ -537,9 +523,7 @@ class LingBotAttentionBlock(nn.Module):
         normalized = (normalized * (1 + scale_ffn) + shift_ffn).flatten(1, 2).to(hidden_states.dtype)
         ffn_output = self.ffn(normalized).unflatten(1, (num_frames, tokens_per_frame))
         hidden_states = (hidden_grid + ffn_output * gate_ffn).flatten(1, 2).to(hidden_states.dtype)
-        if cross_cache is None:
-            raise RuntimeError("Cross-attention must return a populated request cache.")
-        return hidden_states, cross_cache
+        return hidden_states, cast(LingBotAttentionCache, cross_cache)
 
 
 class _LingBotCameraPatchEmbedding(nn.Module):
@@ -561,12 +545,8 @@ class _LingBotCameraPatchEmbedding(nn.Module):
         nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.ndim != 5:
-            raise ValueError("camera_hidden_states must be rank 5 [batch, channels, frames, height, width].")
         batch_size, channels, frames, height, width = hidden_states.shape
         patch_frames, patch_height, patch_width = self.patch_size
-        if frames % patch_frames or height % patch_height or width % patch_width:
-            raise ValueError("camera_hidden_states dimensions must be divisible by patch_size.")
         # Preserve Conv3d patch order while retaining checkpoint weight/bias names.
         hidden_states = hidden_states.reshape(
             batch_size,
@@ -769,7 +749,6 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                     dim,
                     num_attention_heads,
                     ffn_dim=ffn_dim,
-                    sink_tokens=0,
                     cross_attn_norm=cross_attn_norm,
                     eps=eps,
                     prefix=_projection_prefix(prefix, f"blocks.{index}"),
@@ -1024,13 +1003,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             self.config.out_channels,
         )
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        return hidden_states.reshape(
-            batch_size,
-            self.config.out_channels,
-            frames * patch_frames,
-            height * patch_height,
-            width * patch_width,
-        )
+        return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
     def forward(
         self,
@@ -1140,22 +1113,13 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             if name not in params:
                 raise KeyError(f"Unexpected LingBot model weight name: {checkpoint_name}")
             param = params[name]
-            weight_loader = getattr(param, "weight_loader", None)
-            if weight_loader is not None:
-                if shard_id is None:
-                    weight_loader(param, loaded_weight)
-                else:
-                    weight_loader(param, loaded_weight, shard_id)
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if shard_id is None:
+                weight_loader(param, loaded_weight)
             else:
-                if shard_id is not None:
+                if weight_loader is default_weight_loader:
                     raise RuntimeError(f"Fused LingBot QKV parameter {name} has no stacked weight loader.")
-                if param.shape != loaded_weight.shape:
-                    raise ValueError(
-                        f"Weight shape mismatch for {checkpoint_name}: parameter={tuple(param.shape)}, "
-                        f"checkpoint={tuple(loaded_weight.shape)}."
-                    )
-                with torch.no_grad():
-                    param.copy_(loaded_weight)
+                weight_loader(param, loaded_weight, shard_id)
             # DiffusersPipelineLoader compares this return value with the
             # model parameter namespace.  Packed Q/K/V checkpoint tensors
             # therefore need to report both their source names and the fused

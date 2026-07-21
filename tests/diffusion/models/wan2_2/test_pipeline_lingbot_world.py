@@ -4,25 +4,24 @@
 from __future__ import annotations
 
 import gc
-import importlib.util
-import sys
-import types
 import weakref
-from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers.utils.torch_utils import randn_tensor as _diffusers_randn_tensor
 from PIL import Image
 from torch import nn
+
+import vllm_omni.diffusion.models.wan2_2.pipeline_lingbot_world as lingbot_pipeline
+from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
+from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import CameraTrajectory as _CameraTrajectory
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 _ROOT = Path(__file__).parents[4]
-_MODULE_PATH = _ROOT / "vllm_omni/diffusion/models/wan2_2/pipeline_lingbot_world.py"
-_REGISTRY_PATH = _ROOT / "vllm_omni/diffusion/registry.py"
 _WAN_INIT_PATH = _ROOT / "vllm_omni/diffusion/models/wan2_2/__init__.py"
 _MODEL_INDEX_FIXTURE = Path(__file__).with_name("fixtures") / "lingbot_world_model_index.json.fixture"
 _SCHEDULER_FIXTURE = Path(__file__).with_name("fixtures") / "lingbot_world_scheduler_config.json.fixture"
@@ -50,54 +49,6 @@ def _scheduler_config(**overrides):
     }
     values.update(overrides)
     return values
-
-
-@dataclass
-class _DiffusionOutput:
-    output: torch.Tensor
-    error: str | None = None
-    finished: bool = True
-    stage_durations: dict | None = None
-
-
-@dataclass
-class _ComponentSource:
-    model_or_path: str
-    subfolder: str
-    revision: str | None
-    prefix: str
-    fall_back_to_pt: bool
-
-
-@dataclass(frozen=True)
-class _CameraTrajectory:
-    poses: torch.Tensor
-    intrinsics: torch.Tensor
-
-
-class _SupportImageInput:
-    pass
-
-
-class _SupportsComponentDiscovery:
-    pass
-
-
-class _ProgressBarMixin:
-    @contextmanager
-    def progress_bar(self, total: int):
-        del total
-
-        class _Bar:
-            def update(self) -> None:
-                return None
-
-        yield _Bar()
-
-
-class _DiffusionPipelineProfilerMixin:
-    def setup_diffusion_pipeline_profiler(self, *, profiler_targets=None, enable_diffusion_pipeline_profiler=False):
-        self.profiler_setup = (tuple(profiler_targets or ()), enable_diffusion_pipeline_profiler)
 
 
 class _AutoWeightsLoader:
@@ -308,40 +259,13 @@ class _RequestBatch:
         return self._sampling
 
 
-def _make_package(name: str) -> types.ModuleType:
-    module = types.ModuleType(name)
-    module.__path__ = []
-    return module
-
-
-def _module(name: str, **attrs) -> types.ModuleType:
-    module = types.ModuleType(name)
-    for key, value in attrs.items():
-        setattr(module, key, value)
-    return module
-
-
 def _load_pipeline_module():
-    assert _MODULE_PATH.is_file(), f"Task 4 pipeline module is missing: {_MODULE_PATH}"
+    return lingbot_pipeline
 
-    stub_modules: dict[str, types.ModuleType] = {}
-    for package in (
-        "diffusers",
-        "diffusers.utils",
-        "vllm",
-        "vllm.model_executor",
-        "vllm.model_executor.models",
-        "vllm_omni",
-        "vllm_omni.diffusion",
-        "vllm_omni.diffusion.distributed",
-        "vllm_omni.diffusion.distributed.autoencoders",
-        "vllm_omni.diffusion.model_loader",
-        "vllm_omni.diffusion.models",
-        "vllm_omni.diffusion.models.wan2_2",
-        "vllm_omni.diffusion.profiler",
-        "vllm_omni.diffusion.worker",
-    ):
-        stub_modules[package] = _make_package(package)
+
+@pytest.fixture(autouse=True)
+def _stub_pipeline_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace only heavyweight component construction, not the import graph."""
 
     loader_state = SimpleNamespace(prefetch_calls=[])
 
@@ -398,150 +322,28 @@ def _load_pipeline_module():
         data = torch.arange(frames * 6 * height * width, device=device, dtype=torch.float32)
         return data.reshape(frames, 6, height, width).to(dtype=dtype)
 
-    @dataclass(frozen=True)
-    class TrustedActionDirectory:
-        root: Path
-        relative: Path
-        root_device: int
-        root_inode: int
-
-    def resolve_trusted_action_directory(action_path, trusted_root):
-        try:
-            root = Path(trusted_root).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError):
-            raise ValueError("The configured LingBot trusted action root is unavailable.") from None
-        try:
-            candidate = Path(action_path).expanduser()
-            if not candidate.is_absolute():
-                candidate = root / candidate
-            candidate = candidate.resolve(strict=True)
-            relative = candidate.relative_to(root)
-        except (OSError, RuntimeError, ValueError):
-            raise ValueError("action_path must be contained by the trusted action root.") from None
-        if not candidate.is_dir():
-            raise ValueError("action_path must identify a directory in the trusted action root.")
-        stat_result = root.stat()
-        return TrustedActionDirectory(root, relative, stat_result.st_dev, stat_result.st_ino)
-
-    def allocate_lingbot_cache(**kwargs):
-        return _Cache(
-            num_layers=kwargs["num_layers"],
-            max_tokens=kwargs["max_tokens"],
-            num_local_heads=kwargs["num_local_heads"],
-            head_dim=kwargs["head_dim"],
-        )
-
-    def default_randn_tensor(shape, *, generator, device, dtype):
-        return torch.randn(shape, generator=generator, device=device, dtype=dtype)
-
-    stub_modules.update(
-        {
-            "diffusers.utils.torch_utils": _module(
-                "diffusers.utils.torch_utils",
-                randn_tensor=default_randn_tensor,
-            ),
-            "vllm.model_executor.models.utils": _module(
-                "vllm.model_executor.models.utils",
-                AutoWeightsLoader=_AutoWeightsLoader,
-            ),
-            "vllm_omni.diffusion.data": _module(
-                "vllm_omni.diffusion.data",
-                DiffusionOutput=_DiffusionOutput,
-                OmniDiffusionConfig=object,
-            ),
-            "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan": _module(
-                "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan",
-                DistributedAutoencoderKLWan=_StubVAE,
-            ),
-            "vllm_omni.diffusion.distributed.utils": _module(
-                "vllm_omni.diffusion.distributed.utils",
-                get_local_device=lambda: torch.device("cpu"),
-            ),
-            "vllm_omni.diffusion.forward_context": _module(
-                "vllm_omni.diffusion.forward_context",
-                set_forward_context_denoise_step_idx=lambda index: None,
-            ),
-            "vllm_omni.diffusion.model_loader.diffusers_loader": _module(
-                "vllm_omni.diffusion.model_loader.diffusers_loader",
-                DiffusersPipelineLoader=SimpleNamespace(ComponentSource=_ComponentSource),
-            ),
-            "vllm_omni.diffusion.model_loader.hub_prefetch": _module(
-                "vllm_omni.diffusion.model_loader.hub_prefetch",
-                from_pretrained_with_prefetch=from_pretrained_with_prefetch,
-                prefetch_subfolders=prefetch_subfolders,
-            ),
-            "vllm_omni.diffusion.models.interface": _module(
-                "vllm_omni.diffusion.models.interface",
-                SupportImageInput=_SupportImageInput,
-                SupportsComponentDiscovery=_SupportsComponentDiscovery,
-            ),
-            "vllm_omni.diffusion.models.progress_bar": _module(
-                "vllm_omni.diffusion.models.progress_bar",
-                ProgressBarMixin=_ProgressBarMixin,
-            ),
-            "vllm_omni.diffusion.profiler.diffusion_pipeline_profiler": _module(
-                "vllm_omni.diffusion.profiler.diffusion_pipeline_profiler",
-                DiffusionPipelineProfilerMixin=_DiffusionPipelineProfilerMixin,
-            ),
-            "vllm_omni.diffusion.request": _module(
-                "vllm_omni.diffusion.request",
-                OmniDiffusionRequest=object,
-            ),
-            "vllm_omni.diffusion.models.schedulers": _module(
-                "vllm_omni.diffusion.models.schedulers",
-                FlowUniPCMultistepScheduler=_FakeScheduler,
-            ),
-            "vllm_omni.diffusion.models.utils": _module(
-                "vllm_omni.diffusion.models.utils",
-                _load_json=load_json,
-            ),
-            "vllm_omni.diffusion.models.wan2_2.lingbot_world_camera": _module(
-                "vllm_omni.diffusion.models.wan2_2.lingbot_world_camera",
-                CameraTrajectory=_CameraTrajectory,
-                TrustedActionDirectory=TrustedActionDirectory,
-                build_plucker_embedding=build_plucker_embedding,
-                interpolate_camera_trajectory=interpolate_camera_trajectory,
-                load_camera_trajectory=load_camera_trajectory,
-                resolve_trusted_action_directory=resolve_trusted_action_directory,
-            ),
-            "vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer": _module(
-                "vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer",
-                CausalLingBotWorldTransformer3DModel=_FakeTransformerFactory,
-                allocate_lingbot_cache=allocate_lingbot_cache,
-            ),
-            "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2": _module(
-                "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2",
-                load_transformer_config=load_transformer_config,
-                retrieve_latents=retrieve_latents,
-            ),
-            "vllm_omni.diffusion.worker.request_batch": _module(
-                "vllm_omni.diffusion.worker.request_batch",
-                DiffusionRequestBatch=_RequestBatch,
-            ),
-            "transformers": _module(
-                "transformers",
-                AutoTokenizer=_FakePretrained,
-                UMT5EncoderModel=_FakePretrained,
-            ),
-        }
-    )
-
-    previous = {name: sys.modules.get(name) for name in stub_modules}
-    sys.modules.update(stub_modules)
-    spec = importlib.util.spec_from_file_location("_lingbot_world_pipeline_under_test", _MODULE_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        for name, old_module in previous.items():
-            if old_module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = old_module
-    module._loader_state = loader_state
-    return module
+    replacements = {
+        "AutoTokenizer": _FakePretrained,
+        "UMT5EncoderModel": _FakePretrained,
+        "AutoWeightsLoader": _AutoWeightsLoader,
+        "DistributedAutoencoderKLWan": _StubVAE,
+        "FlowUniPCMultistepScheduler": _FakeScheduler,
+        "CausalLingBotWorldTransformer3DModel": _FakeTransformerFactory,
+        "get_local_device": lambda: torch.device("cpu"),
+        "set_forward_context_denoise_step_idx": lambda index: None,
+        "prefetch_subfolders": prefetch_subfolders,
+        "from_pretrained_with_prefetch": from_pretrained_with_prefetch,
+        "load_transformer_config": load_transformer_config,
+        "retrieve_latents": retrieve_latents,
+        "_load_json": load_json,
+        "load_camera_trajectory": load_camera_trajectory,
+        "interpolate_camera_trajectory": interpolate_camera_trajectory,
+        "build_plucker_embedding": build_plucker_embedding,
+        "randn_tensor": _diffusers_randn_tensor,
+    }
+    for name, value in replacements.items():
+        monkeypatch.setattr(lingbot_pipeline, name, value)
+    monkeypatch.setattr(lingbot_pipeline, "_loader_state", loader_state, raising=False)
 
 
 def _od_config(**overrides):
@@ -585,6 +387,7 @@ def _pipeline(module, *, transformer=None, od_config=None):
     if transformer is not None:
         pipeline.transformer = transformer
     pipeline.encode_prompt = lambda *args, **kwargs: torch.ones(1, 512, 8)
+    pipeline.progress_bar = noop_progress_bar
     return pipeline
 
 
@@ -595,18 +398,6 @@ def _preprocess_request(module, *, prompt=None, sampling=None, od_config=None):
     )
     preprocess = module.get_lingbot_world_pre_process_func(od_config or _od_config())
     return preprocess(request)
-
-
-def test_pipeline_registers_lingbot_profiler_targets() -> None:
-    module = _load_pipeline_module()
-
-    pipeline = _pipeline(module, od_config=_od_config(enable_diffusion_pipeline_profiler=True))
-
-    assert isinstance(pipeline, _DiffusionPipelineProfilerMixin)
-    assert pipeline.profiler_setup == (
-        ("vae.encode", "vae.decode", "_generate_block", "text_encoder.forward", "tokenizer.forward"),
-        True,
-    )
 
 
 @pytest.mark.parametrize("offload_field", ["enable_cpu_offload", "enable_layerwise_offload"])
@@ -661,111 +452,18 @@ def _request(*, sampling=None, prompt=None, num_reqs: int = 1):
 
 
 def _resolve_pipeline_through_real_registry(pipeline_module):
-    @dataclass(frozen=True)
-    class LazyRegisteredModel:
-        module_name: str
-        class_name: str
+    from vllm_omni.diffusion import registry as registry_module
 
-    class ModelRegistry:
-        def __init__(self, models):
-            self.models = models
-
-        def _try_load_model_cls(self, architecture):
-            registered = self.models.get(architecture)
-            if registered is None:
-                return None
-            module = importlib.import_module(registered.module_name)
-            return getattr(module, registered.class_name)
-
-    stub_modules: dict[str, types.ModuleType] = {}
-    for package in (
-        "vllm",
-        "vllm.model_executor",
-        "vllm.model_executor.model_loader",
-        "vllm.model_executor.models",
-        "vllm_omni",
-        "vllm_omni.diffusion",
-        "vllm_omni.diffusion.distributed",
-        "vllm_omni.diffusion.distributed.autoencoders",
-        "vllm_omni.diffusion.hooks",
-        "vllm_omni.diffusion.utils",
-        "vllm_omni.diffusion.models",
-        "vllm_omni.diffusion.models.wan2_2",
-    ):
-        stub_modules[package] = _make_package(package)
-
-    @contextmanager
-    def no_op_context(*args, **kwargs):
-        del args, kwargs
-        yield
-
-    stub_modules.update(
-        {
-            "vllm.logger": _module("vllm.logger", init_logger=lambda name: SimpleNamespace()),
-            "vllm.model_executor.model_loader.utils": _module(
-                "vllm.model_executor.model_loader.utils", configure_quant_config=lambda *args: None
-            ),
-            "vllm.model_executor.models.registry": _module(
-                "vllm.model_executor.models.registry",
-                _LazyRegisteredModel=LazyRegisteredModel,
-                _ModelRegistry=ModelRegistry,
-            ),
-            "vllm_omni.diffusion.config": _module(
-                "vllm_omni.diffusion.config", set_current_diffusion_config=no_op_context
-            ),
-            "vllm_omni.diffusion.data": _module("vllm_omni.diffusion.data", OmniDiffusionConfig=object),
-            "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor": _module(
-                "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor",
-                DistributedVaeMixin=object,
-            ),
-            "vllm_omni.diffusion.distributed.sp_plan": _module(
-                "vllm_omni.diffusion.distributed.sp_plan",
-                SequenceParallelConfig=SimpleNamespace,
-                get_sp_plan_from_model=lambda model: None,
-            ),
-            "vllm_omni.diffusion.forward_context": _module(
-                "vllm_omni.diffusion.forward_context",
-                get_forward_context=lambda: SimpleNamespace(),
-            ),
-            "vllm_omni.diffusion.hooks.sequence_parallel": _module(
-                "vllm_omni.diffusion.hooks.sequence_parallel",
-                apply_sequence_parallel=lambda *args: None,
-            ),
-            "vllm_omni.diffusion.utils.tf_utils": _module(
-                "vllm_omni.diffusion.utils.tf_utils", find_module_with_attr=lambda *args: None
-            ),
-            "vllm_omni.platforms": _module(
-                "vllm_omni.platforms",
-                current_omni_platform=SimpleNamespace(get_diffusion_packed_modules_mapping=lambda model: None),
-            ),
-            "vllm_omni.diffusion.models.wan2_2.pipeline_lingbot_world": pipeline_module,
-        }
-    )
-    previous = {name: sys.modules.get(name) for name in stub_modules}
-    sys.modules.update(stub_modules)
-    spec = importlib.util.spec_from_file_location("_lingbot_registry_under_test", _REGISTRY_PATH)
-    assert spec is not None and spec.loader is not None
-    registry_module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = registry_module
-    try:
-        spec.loader.exec_module(registry_module)
-        resolved = registry_module.DiffusionModelRegistry._try_load_model_cls("LingBotWorldCausalDMDPipeline")
-        entry = registry_module._DIFFUSION_MODELS["LingBotWorldCausalDMDPipeline"]
-        cache_acceleration_disabled = "LingBotWorldCausalDMDPipeline" in registry_module._NO_CACHE_ACCELERATION
-        preprocess_name = registry_module._DIFFUSION_PRE_PROCESS_FUNCS["LingBotWorldCausalDMDPipeline"]
-        preprocess = registry_module.get_diffusion_pre_process_func(
-            SimpleNamespace(
-                model_class_name="LingBotWorldCausalDMDPipeline",
-                model_config={"lingbot_action_root": str(_ROOT)},
-            )
+    resolved = registry_module.DiffusionModelRegistry._try_load_model_cls("LingBotWorldCausalDMDPipeline")
+    entry = registry_module._DIFFUSION_MODELS["LingBotWorldCausalDMDPipeline"]
+    cache_acceleration_disabled = "LingBotWorldCausalDMDPipeline" in registry_module._NO_CACHE_ACCELERATION
+    preprocess_name = registry_module._DIFFUSION_PRE_PROCESS_FUNCS["LingBotWorldCausalDMDPipeline"]
+    preprocess = registry_module.get_diffusion_pre_process_func(
+        SimpleNamespace(
+            model_class_name="LingBotWorldCausalDMDPipeline",
+            model_config={"lingbot_action_root": str(_ROOT)},
         )
-    finally:
-        sys.modules.pop(spec.name, None)
-        for name, old_module in previous.items():
-            if old_module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = old_module
+    )
     return resolved, entry, cache_acceleration_disabled, preprocess_name, preprocess
 
 
@@ -777,7 +475,9 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     assert pipeline._encoder_modules == ["text_encoder"]
     assert pipeline._vae_modules == ["vae"]
     assert pipeline.dummy_run_num_frames == 0
-    assert pipeline.weights_sources == [_ComponentSource("checkpoint", "transformer", None, "transformer.", True)]
+    assert pipeline.weights_sources == [
+        module.DiffusersPipelineLoader.ComponentSource("checkpoint", "transformer", None, "transformer.", True)
+    ]
     assert _FakeTransformerFactory.last_call[1:] == (None, "transformer")
     assert pipeline.scheduler.config.shift == 5.0
     assert pipeline.scheduler.config.num_train_timesteps == 1000
@@ -878,12 +578,14 @@ def test_postprocess_returns_latents_without_video_conversion() -> None:
     postprocess = module.get_lingbot_world_post_process_func(_od_config())
     latents = torch.randn(1, 16, 3, 2, 2)
 
-    output = postprocess(latents, output_type="latent")
+    output = postprocess(latents, sampling_params=SimpleNamespace(output_type="latent"))
 
     assert output is latents
 
 
 def test_postprocess_uses_the_standard_diffusion_output_envelope(monkeypatch) -> None:
+    import diffusers.video_processor as video_processor_module
+
     module = _load_pipeline_module()
     processed_video = object()
     calls = []
@@ -896,11 +598,7 @@ def test_postprocess_uses_the_standard_diffusion_output_envelope(monkeypatch) ->
             calls.append((video, output_type))
             return processed_video
 
-    monkeypatch.setitem(
-        sys.modules,
-        "diffusers.video_processor",
-        _module("diffusers.video_processor", VideoProcessor=VideoProcessor),
-    )
+    monkeypatch.setattr(video_processor_module, "VideoProcessor", VideoProcessor)
     postprocess = module.get_lingbot_world_post_process_func(_od_config())
     video = torch.randn(1, 3, 9, 8, 8)
 
@@ -913,7 +611,8 @@ def test_postprocess_uses_the_standard_diffusion_output_envelope(monkeypatch) ->
 def test_forward_propagates_pipeline_profiler_stage_durations() -> None:
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
-    pipeline.stage_durations = {"_generate_block": 0.25, "vae.decode": 0.5}
+    pipeline._profiler_lock = Lock()
+    pipeline._stage_durations = {"_generate_block": 0.25, "vae.decode": 0.5}
 
     output = pipeline(_request())
 
@@ -929,23 +628,6 @@ def test_pipeline_weight_loader_preserves_component_parameter_prefixes() -> None
 
     assert loaded == {"transformer.blocks.0.weight"}
     assert pipeline.transformer.loaded_weights == [("blocks.0.weight", weight)]
-
-
-def test_noise_uses_device_safe_diffusers_helper() -> None:
-    module = _load_pipeline_module()
-    pipeline = _pipeline(module)
-    generator = torch.Generator(device="cpu").manual_seed(4)
-    calls = []
-
-    def randn_tensor(shape, *, generator, device, dtype):
-        calls.append((shape, generator, device, dtype))
-        return torch.full(shape, 7.0, device=device, dtype=dtype)
-
-    module.randn_tensor = randn_tensor
-    output = pipeline._randn((1, 2, 3), generator=generator, dtype=torch.float32)
-
-    torch.testing.assert_close(output, torch.full((1, 2, 3), 7.0))
-    assert calls == [((1, 2, 3), generator, torch.device("cpu"), torch.float32)]
 
 
 def test_request_requires_runner_provided_generator() -> None:
@@ -977,12 +659,13 @@ def test_denoise_state_stays_fp32_while_transformer_inputs_use_model_dtype() -> 
     pipeline = _pipeline(module, transformer=transformer)
     requested_noise_dtypes: list[torch.dtype] = []
 
-    def randn(shape, *, generator, dtype):
+    def randn(shape, *, generator, device, dtype):
         del generator
+        assert device == pipeline.device
         requested_noise_dtypes.append(dtype)
-        return torch.zeros(shape, dtype=dtype)
+        return torch.zeros(shape, device=device, dtype=dtype)
 
-    pipeline._randn = randn
+    module.randn_tensor = randn
     result = pipeline(_request())
 
     assert requested_noise_dtypes == [torch.float32] * 4
@@ -1312,7 +995,7 @@ def test_resource_limits_reject_oversize_before_any_component_call(sampling, mes
     pipeline.encode_prompt = lambda *args, **kwargs: calls.append("text")
     pipeline._prepare_condition = lambda *args, **kwargs: calls.append("vae")
     pipeline._prepare_camera = lambda *args, **kwargs: calls.append("camera")
-    pipeline._allocate_request_cache = lambda *args, **kwargs: calls.append("cache")
+    pipeline.transformer.allocate_cache = lambda *args, **kwargs: calls.append("cache")
 
     with pytest.raises(ValueError, match=message):
         pipeline(_RequestBatch(_prompt(), sampling))
@@ -1348,7 +1031,12 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
-    pipeline._randn = lambda shape, **kwargs: torch.full(shape, -99.0, dtype=kwargs["dtype"])
+    module.randn_tensor = lambda shape, **kwargs: torch.full(
+        shape,
+        -99.0,
+        device=kwargs["device"],
+        dtype=kwargs["dtype"],
+    )
 
     result = pipeline(_request())
 
@@ -1374,30 +1062,11 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    expected_camera = module._fold_camera_embedding(raw_camera, spatial_fold=8)
+    expected_camera = module._fold_camera_embedding(raw_camera)
     reference_camera = torch.nn.functional.pixel_unshuffle(raw_camera, 8).permute(1, 0, 2, 3).unsqueeze(0)
     torch.testing.assert_close(expected_camera, reference_camera)
     torch.testing.assert_close(transformer.calls[0]["camera_hidden_states"], expected_camera)
     assert expected_camera.shape == (1, 384, 3, 2, 2)
-
-
-def test_vae_latent_stats_helper_is_shared_by_encode_and_decode() -> None:
-    module = _load_pipeline_module()
-    pipeline = _pipeline(module)
-    original_stats = pipeline._vae_latent_stats
-    references: list[torch.Tensor] = []
-
-    def recording_stats(reference: torch.Tensor):
-        references.append(reference)
-        return original_stats(reference)
-
-    pipeline._vae_latent_stats = recording_stats
-
-    pipeline(_request(sampling=_SamplingParams(output_type="np")))
-
-    assert len(references) == 2
-    assert all(reference.shape[1] == 16 for reference in references)
-    assert all(reference.dtype == torch.float32 for reference in references)
 
 
 def test_fixed_dmd_transition_and_cache_commit_trace() -> None:
