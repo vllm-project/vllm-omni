@@ -46,6 +46,18 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "hunyuan_video_15_output.mp4",
     },
+    # JoyAI-Echo PR1: single-shot text -> video+audio, DMD few-step schedule.
+    # Multi-shot 5-minute generation lands in PR2 (PairedAudioVideoMemoryBank).
+    "joyai": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 121,
+        "num_inference_steps": 8,
+        "guidance_scale": 1.0,
+        "fps": 25,
+        "frame_rate": 25,
+        "output": "joyai_echo_output.mp4",
+    },
     "cosmos": {
         "height": 720,
         "width": 1280,
@@ -70,6 +82,8 @@ _MODEL_PRESETS = {
 
 def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
+    if "joyai" in model_lower or "joyai-echo" in model_lower:
+        return _MODEL_PRESETS["joyai"]
     if "vace" in model_lower:
         return _MODEL_PRESETS["vace"]
     if "cosmos" in model_lower:
@@ -435,6 +449,11 @@ def main():
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+    if args.frame_rate is not None:
+        sampling_kwargs["frame_rate"] = float(args.frame_rate)
+    if args.extra_body:
+        # Model-specific knobs (declared in vllm_omni/model_extras/) routed via extra_args.
+        sampling_kwargs["extra_args"] = dict(args.extra_body)
 
     sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
     # Route model-specific knobs through extra_body, filtered against the model's
