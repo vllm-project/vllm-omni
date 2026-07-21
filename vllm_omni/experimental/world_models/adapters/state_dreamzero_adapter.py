@@ -13,18 +13,25 @@ covers the model's non-KV session state. Storage is delegated to typed
 
     * the stitched frame buffer            -> ``LatentBuffer`` (ring)
     * accumulated AR video latents         -> ``LatentBuffer`` (append, CPU)
+    * recent VAE encoder output            -> ``LatentBuffer`` (ring, bounded)
 
-Scalar/tensor metadata (counters, prompt embeds, incremental VAE encoder
-stream) lives in the session's ``attrs`` so a freshly constructed adapter for
-an existing session sees the same data (the manager is the single source of
-truth and the single LRU authority).
+The remaining metadata (counters, conditioning tensors, the Wan encoder
+causal-conv cache) lives in the session's ``attrs``, so a freshly constructed
+adapter for an existing session sees the same data (the manager is the single
+source of truth and the single LRU authority). Which values earn a
+``StateObject`` and which stay attributes follows the rule in
+``docs/features/session_state_manager.md``: a ``StateObject`` when the manager
+must be able to act on the value, an attribute when it only carries it.
 
 The public methods mirror ``DreamZeroState`` statement for statement, so the two
-can be diffed to check equivalence. The only deviations are forced by the two
-buffer members being ``StateObject``s rather than a plain deque/list: a read
+can be diffed to check equivalence. The deviations are forced by the buffer
+members being ``StateObject``s rather than a plain deque/list/tensor: a read
 uses ``.view()`` where the original reads ``list(...)`` or indexes/iterates the
 container, and a wholesale replacement uses ``self._session.put(...)`` where the
-original reassigns the attribute.
+original reassigns the attribute. The one behavioural difference is deliberate
+and documented on ``_ensure_encoder_buffer``: the encoder output is bounded
+here and unbounded in the original, which the pointwise ``quant_conv`` makes
+numerically indistinguishable to the only reader.
 """
 
 from __future__ import annotations
@@ -43,6 +50,12 @@ logger = logging.getLogger(__name__)
 
 _FRAMES = "frames"
 _VIDEO_LATENTS = "video_latents"
+_VAE_ENCODER_OUT = "vae_encoder_out"
+
+# Latent frames of VAE encoder output retained by default. DreamZero passes its
+# own ``num_frame_per_block``; this is only the fallback for callers that build
+# an adapter directly (tests, other entry points).
+DEFAULT_VAE_ENCODER_WINDOW = 2
 
 
 class DreamZeroStateAdapter:
@@ -60,12 +73,27 @@ class DreamZeroStateAdapter:
     prompt_embeds = SessionAttr[torch.Tensor | None](default=None)
     # -- incremental VAE encoder stream --
     vae_stream_initialized = SessionAttr[bool](default=False, coerce=bool)
+    # The Wan encoder's per-layer causal convolution cache: 24 entries, 603 MiB
+    # per session, constant from the first few steps onward and by far the
+    # largest thing a DreamZero session holds. It is an attribute all the same:
+    # it is replaced wholesale, it has no recompute source (rebuilding it means
+    # re-encoding the whole observation history, which is not retained), and
+    # freeing it mid-session breaks the stream, so ending the session is the
+    # only release -- which reclaims attributes anyway.
     vae_enc_feat_map = SessionAttr[list[torch.Tensor | None] | None](default=None)
-    vae_encoder_out = SessionAttr[torch.Tensor | None](default=None)
     vae_pending_body_frames = SessionAttr[torch.Tensor | None](default=None)
 
-    def __init__(self, session_id: str | None, manager: SessionStateManager) -> None:
+    def __init__(
+        self,
+        session_id: str | None,
+        manager: SessionStateManager,
+        *,
+        vae_encoder_window: int = DEFAULT_VAE_ENCODER_WINDOW,
+    ) -> None:
         self._session_id = session_id
+        if vae_encoder_window <= 0:
+            raise ValueError(f"vae_encoder_window must be positive, got {vae_encoder_window}")
+        self.vae_encoder_window = vae_encoder_window
         # Pin the session for this adapter's lifetime. The manager may evict the
         # session from its lookup table to bound memory, but an adapter that is
         # mid-generation keeps its own reference, so the in-progress state is not
@@ -96,6 +124,49 @@ class DreamZeroStateAdapter:
     def _ensure_video_buffer(self) -> LatentBuffer[torch.Tensor]:
         """The accumulated AR video-latent chunks (unbounded, CPU)."""
         return self._session.get_or_create(_VIDEO_LATENTS, self._new_video_buffer, LatentBuffer)
+
+    def _new_encoder_buffer(self) -> LatentBuffer[torch.Tensor]:
+        buffer: LatentBuffer[torch.Tensor] = LatentBuffer()
+        buffer.allocate(maxlen=self.vae_encoder_window)
+        return buffer
+
+    def _ensure_encoder_buffer(self) -> LatentBuffer[torch.Tensor]:
+        """The recent VAE encoder output, as a ring of per-chunk tensors.
+
+        The bespoke state concatenates every encoded chunk into one tensor that
+        is cleared only by a *session* reset -- a window reset deliberately
+        keeps it -- so it grows for as long as the session lives. Its only
+        reader, ``_vae_stream_get_observation_latents``, quantises the whole
+        history and then keeps the last ``num_frame_per_block`` latent frames.
+        ``quant_conv`` is a ``WanCausalConv3d`` of kernel size 1, pointwise in
+        time, so those last frames do not depend on the discarded ones: keeping
+        a ring of ``vae_encoder_window`` frames is numerically identical and
+        bounded.
+        """
+        return self._session.get_or_create(_VAE_ENCODER_OUT, self._new_encoder_buffer, LatentBuffer)
+
+    @property
+    def vae_encoder_out(self) -> torch.Tensor | None:
+        """The retained encoder output as one tensor, or ``None`` when empty."""
+        chunks = self._ensure_encoder_buffer().view()
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return chunks[0]
+        return torch.cat(chunks, dim=2)
+
+    @vae_encoder_out.setter
+    def vae_encoder_out(self, value: torch.Tensor | None) -> None:
+        # Seeding (``_vae_stream_seed``) and clearing (``reset``) both assign
+        # wholesale; growth goes through ``append_vae_encoder_chunk``.
+        buffer = self._new_encoder_buffer()
+        if value is not None:
+            buffer.append(value)
+        self._session.put(_VAE_ENCODER_OUT, buffer)
+
+    def append_vae_encoder_chunk(self, encoder_chunk: torch.Tensor) -> None:
+        """Append one encoded chunk, evicting the oldest beyond the window."""
+        self._ensure_encoder_buffer().append(encoder_chunk)
 
     @property
     def stitched_buffer(self) -> LatentBuffer[np.ndarray]:

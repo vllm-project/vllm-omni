@@ -13,12 +13,12 @@ Historically each model hand-rolled this state. The session state manager
 extracts it into a shared, typed contract:
 
 - `StateObject` — one typed unit of session state (e.g. `LatentBuffer` for
-  accumulated latents, `EncodeOnceKV` for write-once conditioning K/V), with a
-  uniform lifecycle (`allocate` / `commit` / `view` / `reset` / `nbytes`).
+  accumulated latents and bounded rings), with a uniform lifecycle
+  (`allocate` / `commit` / `view` / `reset` / `evict` / `nbytes_by_device`).
 - `SessionStateManager` — maps `session_id -> {name: StateObject}`, caps the
   number of retained sessions by evicting the least recently used one first
-  (matching the bespoke caches it replaces), and reports byte usage via
-  `stats()` for observability.
+  (matching the bespoke caches it replaces), and reports per-device byte usage
+  via `stats()` for observability.
 
 Attention KV is *not* managed here: for DreamZero it is owned by the
 AR-Diffusion engine's paged KV pool (PR
@@ -64,6 +64,56 @@ stress eviction in tests and experiments. It is deliberately not promoted to
 the config, because RFC #4480 Phase 1 replaces count-based capping with a byte
 budget — that budget, not this cap, is the knob that deserves a config field.
 
+## Choosing between an attribute and a `StateObject`
+
+A session holds its values in two places. Named `StateObject`s live in the
+session's object map; everything else lives in `SessionState.attrs`, declared
+one line per value with the `SessionAttr` descriptor. The rule for choosing is:
+
+> A value belongs in a `StateObject` when the **manager** must be able to act on
+> it — release it under budget pressure, accumulate into it, stage and commit
+> it, or rebuild it from a recorded source. It belongs in `attrs` when the
+> manager only needs to **carry** it: the model assigns it wholesale, reads it
+> back, and clears it, and no one but the model can decide its fate.
+
+Byte accounting is independent of that choice. A session reports every byte it
+holds in either bucket, because the number describes what the process is
+holding, not what the manager may do about it.
+
+The consequence is worth stating plainly: **a value left in `attrs` is a value
+the byte-budget planner cannot free.** In Phase 0, which accounts but does not
+enforce, that is legitimate — but it should be a recorded decision rather than
+an accident, which is what the table below records.
+
+Note what the rule does *not* say. "Is it big" is not the criterion, and
+neither is "does it grow". The largest allocation a DreamZero session holds —
+`vae_enc_feat_map`, 603 MiB — is an *attribute*, because nothing the manager
+can do to it is useful: it is replaced wholesale, it has no recompute source,
+and freeing it mid-session breaks the encoder stream. Ending the session is the
+only release available, and that reclaims attributes anyway. Size alone argues
+for counting a value, which the accounting does regardless of bucket; it does
+not argue for a lifecycle.
+
+What would change that answer is a release the manager can perform without
+losing the value — offloading it to host memory and copying it back is
+transparent, needs no recomputation, and suits a large contiguous cache. The
+contract has no such operation: `evict()` frees storage, it does not park it.
+So the bucket follows the operations that exist, and moves if they do.
+
+### Byte accounting
+
+`SessionStateManager.stats()` reports byte totals keyed by device
+(`nbytes:cuda:0`, `nbytes:cpu`) alongside `total_nbytes`. The split is not
+cosmetic: device memory is the contended resource and host memory generally is
+not, so a single figure covering both answers no question. Which pool a budget
+applies to is a question for whoever enforces it, and is not decided here.
+
+Two details make the numbers honest. Bytes are counted per **storage**, not as
+`numel() * element_size()`, so a narrow slice reports the whole allocation it
+keeps alive rather than the part it exposes. And storages are **deduplicated**
+across the whole session, so two views of one buffer — or an alias between an
+attribute and a state object — are counted once.
+
 ## Scope and guarantees
 
 - **Opt-in and equivalent.** With the flag off, models use their bespoke state
@@ -74,11 +124,37 @@ budget — that budget, not this cap, is the knob that deserves a config field.
   the lookup table only; an adapter still holding the session keeps its state
   (matching bespoke behavior, where the caller holds the state object).
 - **Byte budget is recorded, not enforced.** `SessionStateManager.stats()`
-  reports per-manager byte totals; budget *enforcement* (and eviction driven
-  by it) is a later phase of RFC #4480.
+  reports per-manager, per-device byte totals; budget *enforcement* (and
+  eviction driven by it) is a later phase of RFC #4480.
 
 ## Supported models
 
-| Model | State routed through the manager |
-|---|---|
-| DreamZero | Frame stitching buffer, accumulated video latents (`LatentBuffer`), prompt-embed cache, incremental VAE encoder stream, counters and reset heuristics |
+### DreamZero
+
+Sizes measured on one A100 at the shipped deploy config (`180x320` per camera,
+three cameras stitched to `352x640`, bfloat16), over a 400-step session.
+
+| Value | Bucket | Size | Notes |
+|---|---|---|---|
+| `vae_enc_feat_map` | `attrs` | **603 MiB** | Wan encoder causal-conv cache, 24 entries. Constant from ~step 50. The largest thing a session holds: 64 sessions is 37.7 GiB. Counted, not releasable — see the rule above. |
+| `video_latents_across_time` | `LatentBuffer` | grows | AR video latent chunks, host memory (`.cpu()`), kept for decode. |
+| `stitched_buffer` | `LatentBuffer` | bounded | Stitched pixel frames, host memory, ring of `FRAMES_PER_CHUNK`. |
+| `vae_encoder_out` | `LatentBuffer` | 0.43 MiB | Bounded ring of `num_frame_per_block` latent frames — see below. |
+| `clip_feas`, `ys`, `language`, `prompt_embeds` | `attrs` | small | Conditioning tensors, written once per session and reread. |
+| `vae_pending_body_frames` | `attrs` | ≤2.6 MiB | Raw frames awaiting a 4-frame body chunk; bounded by construction. |
+| `call_count`, `current_start_frame`, `vae_stream_initialized` | `attrs` | — | Counters and flags. |
+
+Attention KV does not appear here: it is engine-owned (PR #4534).
+
+**The bounded VAE encoder ring.** The bespoke state concatenates every encoded
+chunk into one tensor and clears it only on a *session* reset — a window reset
+deliberately keeps it — so it grows for as long as the session lives, at
+0.215 MiB per latent frame (one per four steps). Its only reader,
+`_vae_stream_get_observation_latents`, quantises the whole history and then
+keeps the last `num_frame_per_block` latent frames. Since `quant_conv` is a
+`WanCausalConv3d` of kernel size 1, pointwise in time, those frames do not
+depend on the discarded ones. The manager-backed state therefore retains a ring
+of `num_frame_per_block` frames instead: identical output, bounded memory, and
+the per-step quantisation no longer scales with session length. Asking for more
+frames than the ring retains raises rather than silently returning a shorter
+window. The bespoke path is unchanged.

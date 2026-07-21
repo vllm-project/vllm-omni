@@ -438,6 +438,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             use_dynamic_shifting=False,
         )
 
+        # Read before the first `_get_or_create_state` below: the manager-backed
+        # state bounds its VAE encoder history to this many latent frames.
+        self.num_frame_per_block: int = ah_config["num_frame_per_block"]
+
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
         # Opt-in: back per-session state with the shared SessionStateManager
         # (RFC #4480). Default off -> the bespoke DreamZeroState path above.
@@ -463,7 +467,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self.cfg_scale: float = model_config.get("cfg_scale", DEFAULT_CFG_SCALE)
         self.sigma_shift: float = model_config.get("sigma_shift", DEFAULT_SIGMA_SHIFT)
         self.num_frames: int = ah_config["num_frames"]
-        self.num_frame_per_block: int = ah_config["num_frame_per_block"]
         self.action_horizon: int = ah_config["action_horizon"]
 
         self.decouple_inference_noise: bool = ah_config["decouple_inference_noise"]
@@ -524,7 +527,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if getattr(self, "_memory_manager", None) is not None:
             # The manager owns session lifecycle and LRU; the adapter is a thin
             # per-call view over it (no second LRU to drift).
-            return DreamZeroStateAdapter(session_id, self._memory_manager)
+            return DreamZeroStateAdapter(
+                session_id,
+                self._memory_manager,
+                vae_encoder_window=self.num_frame_per_block,
+            )
 
         session_key = str(session_id or "default")
         state = self._states.get(session_key)
@@ -952,7 +959,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 state.vae_pending_body_frames = None
             chunk = self._vae_patchify(body)
             encoder_chunk, feat_map = self._vae_encode_encoder_chunk(chunk, state.vae_enc_feat_map)
-            state.vae_encoder_out = torch.cat([state.vae_encoder_out, encoder_chunk], dim=2)
+            state.append_vae_encoder_chunk(encoder_chunk)
             state.vae_enc_feat_map = feat_map
 
     def _vae_stream_get_observation_latents(
@@ -962,9 +969,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         *,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        if state.vae_encoder_out is None:
+        # Read once: the manager-backed state rebuilds this from its ring.
+        encoder_out = state.vae_encoder_out
+        if encoder_out is None:
             raise RuntimeError("VAE encoder stream has no accumulated encoder output.")
-        latents = self._vae_quantize_encoder_out(state.vae_encoder_out).to(dtype=dtype)
+        # A state that bounds its encoder history keeps only the most recent
+        # frames. Asking for more than it retains would silently return a
+        # shorter (and differently padded) window, so fail instead.
+        window = state.vae_encoder_window
+        if window is not None and num_latent_frames > window:
+            raise ValueError(f"Requested {num_latent_frames} latent frames but the session retains at most {window}.")
+        latents = self._vae_quantize_encoder_out(encoder_out).to(dtype=dtype)
         if latents.shape[2] >= num_latent_frames:
             return latents[:, :, -num_latent_frames:]
         pad_count = num_latent_frames - latents.shape[2]
