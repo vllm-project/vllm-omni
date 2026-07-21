@@ -368,6 +368,7 @@ def _run_online(stage_configs_path: str, output_path: Path) -> tuple[Image.Image
         "300",
         "--init-timeout",
         "900",
+        "--trust-remote-code",
     ]
     try:
         with OmniServer(MODEL_PATH, server_args, use_omni=True) as omni_server:

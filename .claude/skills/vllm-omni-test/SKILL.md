@@ -9,7 +9,7 @@ description: Generate and run tests for vllm-project/vllm-omni with CI-aligned l
 
 Use this skill to generate minimal, stable test cases and run them with the correct marker/level strategy for [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni).
 
-**Link convention:** Paths such as `.buildkite/` and `docs/contributing/` live at the **vllm-omni repo root**. Markdown links use repo-relative paths from this skill file (e.g. `../../../.buildkite/test-ready.yml`, `../../../docs/contributing/ci/CI_5levels.md`).
+**Link convention:** Paths such as `.buildkite/` and `docs/contributing/` live at the **vllm-omni repo root**. Markdown links use repo-relative paths from this skill file (e.g. `../../../.buildkite/cuda/test-ready.yml`, `../../../docs/contributing/ci/CI_5levels.md`).
 
 Default priorities:
 
@@ -96,7 +96,7 @@ Existing references: `tests/e2e/offline_inference/test_qwen2_5_omni.py` (L2-styl
 |----------|------------------|---------------------------|---------------------------|
 | **Offline inference e2e** | `tests/e2e/offline_inference/` | **Module (default):** `omni_runner` + `omni_runner_handler`. **Function (isolation only):** `omni_runner_function` + `omni_runner_handler_function`. Diffusion/TTS may use `Omni(...).generate` directly | L2: `core_model` + **one of** `omni` / `tts` / `diffusion`; `@hardware_test(...)` when GPU/NPU is required |
 | **Online serving e2e** | `tests/e2e/online_serving/` | **Module (default):** `omni_server` + `openai_client`. **Function (isolation only):** `omni_server_function` + `openai_client_function`. Clients: `send_omni_request` (omni), `send_audio_speech_request` (tts), `send_diffusion_request` / `send_video_diffusion_request` / `send_images_generations_request` (diffusion) | Baseline smoke: **`core_model` + `advanced_model`**; heavier paths: `advanced_model` only; L4 expansion: `full_model` |
-| **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/test-nightly.yml`). Full conventions: [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
+| **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/cuda/test-nightly.yml`). Full conventions: [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
 | **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: JSON `mark` with `full_model` + `omni`/`tts`/`diffusion`; wire `test-nightly.yml` Perf steps |
 | **Invalid parameter / negative HTTP validation** | `tests/dfx/reliability/invalid_param_test/` | Live `omni_server` + low-level `send_*_http_request` with `err_code` / `err_message` | `pytest.mark.slow` + `omni` / `tts` / `diffusion` + `@hardware_marks` (`H100` or `L4`); CI in **`test-weekly.yml`** (not ready/merge/nightly) |
 
@@ -460,7 +460,7 @@ When the user asks for **invalid parameter validation**, **invalid request bodie
 
 4. **Adding a new model** to invalid-param coverage: append a `pytest.param(OmniServerParams(model="...", stage_config_path=..., server_args=...), ...)` entry to the script’s `_PARAMS` list — do **not** create `test_invalid_<model>.py` unless the route is new.
 
-5. **CI — `.buildkite/test-weekly.yml` only** (not `test-ready.yml` / `test-merge.yml` / `test-nightly.yml`):
+5. **CI — `.buildkite/cuda/test-weekly.yml` only** (not `test-ready.yml` / `test-merge.yml` / `test-nightly.yml`):
 
 | Weekly step | Command | When your cases run |
 |-------------|---------|---------------------|
@@ -629,10 +629,10 @@ If the test is not already collected by an existing pipeline command (for exampl
 
 | Test level | Edit this file | Typical trigger / intent |
 |------------|----------------|---------------------------|
-| **L1** and **L2** | [`.buildkite/test-ready.yml`](../../../.buildkite/test-ready.yml) | PR **ready** label; L1 CPU + L2 GPU/basic e2e (steps labeled **Omni ·**, **TTS ·**, **Diffusion ·**) |
-| **L3** | [`.buildkite/test-merge.yml`](../../../.buildkite/test-merge.yml) | Post-merge; `advanced_model` integration per model type |
-| **L4** | [`.buildkite/test-nightly.yml`](../../../.buildkite/test-nightly.yml) | Nightly; grouped by model type (see below) |
-| **Invalid param / reliability (weekly)** | [`.buildkite/test-weekly.yml`](../../../.buildkite/test-weekly.yml) | Weekly; `tests/dfx/reliability/invalid_param_test/` — **not** L1–L4 e2e pipelines |
+| **L1** and **L2** | [`.buildkite/cuda/test-ready.yml`](../../../.buildkite/cuda/test-ready.yml) | PR **ready** label; L1 CPU + L2 GPU/basic e2e (steps labeled **Omni ·**, **TTS ·**, **Diffusion ·**) |
+| **L3** | [`.buildkite/cuda/test-merge.yml`](../../../.buildkite/cuda/test-merge.yml) | Post-merge; `advanced_model` integration per model type |
+| **L4** | [`.buildkite/cuda/test-nightly.yml`](../../../.buildkite/cuda/test-nightly.yml) | Nightly; grouped by model type (see below) |
+| **Invalid param / reliability (weekly)** | [`.buildkite/cuda/test-weekly.yml`](../../../.buildkite/cuda/test-weekly.yml) | Weekly; `tests/dfx/reliability/invalid_param_test/` — **not** L1–L4 e2e pipelines |
 
 **Level-specific Buildkite delivery (follow the user’s requested level):**
 
@@ -809,21 +809,21 @@ Use **repo-relative paths** (no leading `./`). Prefer **directory** entries (`..
 
 When extending an **existing** E2E step to run an additional test file, **append** that file (and any new model/deploy paths) to `source_file_dependencies` on the same step. When authoring a PR, mention the dependency list in the **Buildkite change** section of your test plan.
 
-#### L3 / L4: validating Buildkite from a feature branch (root `pipeline.yml`)
+#### L3 / L4: validating Buildkite from a feature branch (`cuda/pipeline.yml`)
 
-Production behavior is driven by [`.buildkite/pipeline.yml`](../../../.buildkite/pipeline.yml): it builds the CI image, then uploads **L2** (`test-ready.yml` on non-`main`), **L3** (`test-merge.yml` when `build.branch == "main"`), and **L4** (`test-nightly.yml` when `build.env("NIGHTLY") == "1"`).
+Production behavior is driven by [`.buildkite/cuda/pipeline.yml`](../../../.buildkite/cuda/pipeline.yml): it builds the CI image, then uploads **L2** (`test-ready.yml` on non-`main`), **L3** (`test-merge.yml` when `build.branch == "main"`), and **L4** (`test-nightly.yml` when `build.env("NIGHTLY") == "1"`).
 
 When you add or debug **L3** or **L4** tests and need those child pipelines to run **off `main`** or **without** `NIGHTLY=1`, apply **temporary** edits (revert before merge):
 
 1. **Point the upload at the right file (optional shortcut)**  
-   In the **Upload Ready Pipeline** step, the command is `buildkite-agent pipeline upload .buildkite/test-ready.yml`. For a one-off run you may change that path to `.buildkite/test-merge.yml` (L3) or `.buildkite/test-nightly.yml` (L4), and adjust the step’s `if:` so it does not conflict with the other upload steps (avoid double-uploading unless intentional).
+   In the **Upload Ready Pipeline** step, the command is `buildkite-agent pipeline upload .buildkite/cuda/test-ready.yml`. For a one-off run you may change that path to `.buildkite/cuda/test-merge.yml` (L3) or `.buildkite/cuda/test-nightly.yml` (L4), and adjust the step’s `if:` so it does not conflict with the other upload steps (avoid double-uploading unless intentional).
 
 2. **L3 — merge pipeline**  
-   The gate `if: build.branch == "main"` lives on the **Upload Merge Pipeline** step in `pipeline.yml` (not inside `test-merge.yml`). **Comment out that `if` line** so `test-merge.yml` is uploaded on your feature branch. Alternatively rely on step (1) instead of the dedicated merge upload step.
+   The gate `if: build.branch == "main"` lives on the **Upload Merge Pipeline** step in `cuda/pipeline.yml` (not inside `test-merge.yml`). **Comment out that `if` line** so `test-merge.yml` is uploaded on your feature branch. Alternatively rely on step (1) instead of the dedicated merge upload step.
 
 3. **L4 — nightly pipeline**  
-   **Comment out** `if: build.env("NIGHTLY") == "1"` on the **Upload Nightly Pipeline** step in `pipeline.yml` so the nightly definition is uploaded without setting the env var.  
-   Child steps in [`test-nightly.yml`](../../../.buildkite/test-nightly.yml) often repeat `if: build.env("NIGHTLY") == "1"`; **comment out those lines on the steps you need to run**, otherwise they will still be skipped after upload.
+   **Comment out** `if: build.env("NIGHTLY") == "1"` on the **Upload Nightly Pipeline** step in `cuda/pipeline.yml` so the nightly definition is uploaded without setting the env var.  
+   Child steps in [`test-nightly.yml`](../../../.buildkite/cuda/test-nightly.yml) often repeat `if: build.env("NIGHTLY") == "1"`; **comment out those lines on the steps you need to run**, otherwise they will still be skipped after upload.
 
 ### Step 6: Run Tests
 
@@ -890,5 +890,5 @@ When completing a request, return:
 ## Additional Resources
 
 - Marker and command routing: [references/test-routing.md](references/test-routing.md)
-- CI pipelines (vllm-omni): [test-ready.yml](../../../.buildkite/test-ready.yml) (L1/L2), [test-merge.yml](../../../.buildkite/test-merge.yml) (L3), [test-nightly.yml](../../../.buildkite/test-nightly.yml) (L4), [test-weekly.yml](../../../.buildkite/test-weekly.yml) (invalid param / reliability)
+- CI pipelines (vllm-omni): [test-ready.yml](../../../.buildkite/cuda/test-ready.yml) (L1/L2), [test-merge.yml](../../../.buildkite/cuda/test-merge.yml) (L3), [test-nightly.yml](../../../.buildkite/cuda/test-nightly.yml) (L4), [test-weekly.yml](../../../.buildkite/cuda/test-weekly.yml) (invalid param / reliability)
 - L4 documentation example tests (naming, extraction vs copied scripts, output dirs, skips): [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) — see also [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910)

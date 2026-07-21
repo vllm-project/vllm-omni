@@ -573,6 +573,16 @@ class TestPipelineDiscovery:
             return
         assert Path(get_deploy_config_path(pipeline.default_deploy_config_name)).is_file()
 
+    @pytest.mark.parametrize(
+        "deploy_path",
+        sorted(_DEPLOY_DIR.glob("*.yaml")),
+        ids=lambda deploy_path: deploy_path.name,
+    )
+    def test_explicit_deploy_pipeline_is_registered(self, deploy_path):
+        deploy = load_deploy_config(deploy_path)
+        if deploy.pipeline is not None:
+            assert deploy.pipeline in OMNI_PIPELINES
+
     def test_registry_returns_none_for_unknown(self):
         """Unknown model_types aren't found and resolve to `None`."""
         assert "definitely_not_a_real_model" not in OMNI_PIPELINES
@@ -1232,7 +1242,7 @@ stages:
         assert deploy.stages[1].devices == "1"
 
     def test_step_audio2_dispatches_sync_and_async_chunk_processors(self):
-        pipeline = StageConfigFactory.resolve_pipeline_config("step_audio_2")
+        pipeline = resolve_pipeline_config("step_audio_2")
         assert isinstance(pipeline, PipelineConfig)
 
         sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))

@@ -82,6 +82,7 @@ class QualityTestConfig:
     gpu: str = "H100"  # minimum GPU requirement
     negative_prompt: str = ""
     guidance_scale: float | None = None
+    enable_cpu_offload: bool = False
 
     def baseline_ref(self) -> str:
         return self.baseline_model or self.model or ""
@@ -180,6 +181,18 @@ QUALITY_CONFIGS = [
         prompt="a cup of coffee on a wooden table, morning light",
         max_lpips=0.20,
         num_inference_steps=10,
+    ),
+    QualityTestConfig(
+        id="fp8_flux2_dev_text_encoder",
+        model="black-forest-labs/FLUX.2-dev",
+        quantization={"text_encoder": "fp8", "transformer": None, "vae": None},
+        task="t2i",
+        prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.15,
+        num_inference_steps=10,
+        enable_cpu_offload=True,
+        height=1024,
+        width=1024,
     ),
     QualityTestConfig(
         id="fp8_qwen_image",
@@ -459,7 +472,10 @@ def test_quantization_quality(config: QualityTestConfig):
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
 
     # --- BF16 baseline ---
-    omni_bl = Omni(model=config.baseline_ref())
+    bl_kwargs: dict = {"model": config.baseline_ref()}
+    if config.enable_cpu_offload:
+        bl_kwargs["enable_cpu_offload"] = True
+    omni_bl = Omni(**bl_kwargs)
     baseline_out, bl_mem = generate_fn(omni_bl, config)
     omni_bl.shutdown()
     del omni_bl
@@ -468,10 +484,13 @@ def test_quantization_quality(config: QualityTestConfig):
 
     # --- Quantized ---
     quantization = config.quantization_ref()
+    qt_kwargs: dict = {"model": config.quantized_ref()}
+    if config.enable_cpu_offload:
+        qt_kwargs["enable_cpu_offload"] = True
     if quantization is None:
-        omni_qt = Omni(model=config.quantized_ref())
+        omni_qt = Omni(**qt_kwargs)
     else:
-        omni_qt = Omni(model=config.quantized_ref(), quantization_config=quantization)
+        omni_qt = Omni(**qt_kwargs, quantization_config=quantization)
     quant_out, qt_mem = generate_fn(omni_qt, config)
     omni_qt.shutdown()
     del omni_qt
