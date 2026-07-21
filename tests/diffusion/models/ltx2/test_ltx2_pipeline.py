@@ -39,6 +39,11 @@ from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
     combine_guided_x0,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
+from vllm_omni.diffusion.models.ltx2.ltx2_lora import (
+    LTXResidentLoRAController,
+    _LTXLoRAEntry,
+    _transformer_config_to_dict,
+)
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX2_DISTILLED_TWO_STAGE_RECIPE,
     LTX2_ONE_STAGE_RECIPE,
@@ -1001,6 +1006,120 @@ def test_ltx_custom_sigmas_bypass_scheduler_shifting():
     torch.testing.assert_close(pipeline.scheduler.sigmas, expected)
     torch.testing.assert_close(audio_scheduler.sigmas, expected)
     torch.testing.assert_close(timesteps, expected[:-1] * scheduler.config.num_train_timesteps)
+
+
+@pytest.mark.parametrize(
+    ("recipe", "steps", "stg_block"),
+    [
+        (LTX2_TWO_STAGE_RECIPE, 40, 29),
+        (LTX23_TWO_STAGE_RECIPE, 30, 28),
+    ],
+)
+def test_ltx_official_two_stage_recipes_only_vary_by_model_defaults(recipe, steps, stg_block):
+    stage1, stage2 = recipe.phases
+    assert (recipe.width, recipe.height) == (1536, 1024)
+    assert recipe.num_inference_steps == steps
+    assert stage1.spatial_downscale == 2
+    assert stage1.transformer_phase == "base"
+    assert stage1.guidance.video.stg_blocks == (stg_block,)
+    assert stage1.guidance.audio.stg_blocks == (stg_block,)
+    assert stage2.input_transform == "spatial_upsample"
+    assert stage2.transformer_phase == "distilled_lora"
+    assert stage2.guidance == LTXGuidanceSpec.positive_only()
+    assert stage2.num_inference_steps == 3
+    assert stage2.sigmas == (0.909375, 0.725, 0.421875, 0.0)
+
+
+def test_ltx_two_stage_entries_select_the_official_transformer_phases():
+    phase_switches = []
+    ordinary_pipeline = object.__new__(LTX2TwoStagePipeline)
+    ordinary_pipeline._phase_lora_controller = SimpleNamespace(enter=phase_switches.append)
+    for phase in LTX2_TWO_STAGE_RECIPE.phases:
+        ordinary_pipeline._enter_phase(phase)
+    assert phase_switches == ["base", "distilled_lora"]
+
+    distilled_pipeline = object.__new__(LTX2DistilledPipeline)
+    for phase in LTX2_DISTILLED_TWO_STAGE_RECIPE.phases:
+        distilled_pipeline._enter_phase(phase)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"num_layers": 2, "cross_attn_mod": True},
+        SimpleNamespace(num_layers=2, cross_attn_mod=True),
+    ],
+)
+def test_ltx_resident_lora_copies_mapping_and_namespace_configs(config):
+    copied = _transformer_config_to_dict(config)
+
+    assert copied == {"num_layers": 2, "cross_attn_mod": True}
+    assert copied is not config
+
+
+def test_ltx_resident_lora_keeps_two_offloadable_transformers(monkeypatch):
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+    class _TinyTransformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=1)
+            self.proj = torch.nn.Linear(2, 2, bias=False)
+
+    pipe = object.__new__(LTX2TwoStagePipeline)
+    torch.nn.Module.__init__(pipe)
+    pipe.transformer = _TinyTransformer()
+    pipe._transformer_init_config = {"num_layers": 1, "cross_attn_mod": True}
+    pipe.od_config = SimpleNamespace(quantization_config=None, dtype=torch.float32)
+    pipe.device = torch.device("cpu")
+    pipe.weights_sources = [
+        DiffusersPipelineLoader.ComponentSource(
+            model_or_path="unused",
+            subfolder="transformer",
+            revision=None,
+            prefix="transformer.",
+        )
+    ]
+    created_configs = []
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_lora.create_transformer_from_config",
+        lambda config: (created_configs.append(config), _TinyTransformer())[1],
+    )
+
+    with torch.no_grad():
+        pipe.transformer.proj.weight.copy_(torch.eye(2))
+    controller = LTXResidentLoRAController(pipe, "unused.safetensors")
+    assert created_configs == [{"num_layers": 1, "cross_attn_mod": True}]
+    with torch.no_grad():
+        pipe.transformer_2.proj.weight.copy_(pipe.transformer.proj.weight)
+
+    controller._merge_entries(
+        [
+            _LTXLoRAEntry(
+                module_name="proj",
+                target_name="proj",
+                shard_id=None,
+                lora_a=torch.tensor([[1.0, 2.0]]),
+                lora_b=torch.tensor([[3.0], [4.0]]),
+            )
+        ]
+    )
+    controller._merged = True
+
+    modules = ModuleDiscovery.discover(pipe)
+    assert modules.dit_names == ["transformer", "transformer_2"]
+    assert pipe.weights_sources[1].prefix == "transformer_2."
+    torch.testing.assert_close(pipe.transformer.proj.weight, torch.eye(2))
+    torch.testing.assert_close(
+        pipe.transformer_2.proj.weight,
+        torch.tensor([[4.0, 6.0], [4.0, 9.0]]),
+    )
+
+    controller.enter("base")
+    assert controller.transformer is pipe.transformer
+    controller.enter("distilled_lora")
+    assert controller.transformer is pipe.transformer_2
 
 
 class TestLTXRequestParsing:

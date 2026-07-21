@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -39,6 +40,16 @@ class _LTXLoRAEntry:
     shard_id: str | int | None
     lora_a: torch.Tensor
     lora_b: torch.Tensor
+
+
+def _transformer_config_to_dict(config: Any) -> dict[str, Any]:
+    """Copy a Diffusers-style mapping or namespace Transformer config."""
+    if isinstance(config, Mapping):
+        return dict(config)
+    attributes = getattr(config, "__dict__", None)
+    if isinstance(attributes, dict):
+        return dict(attributes)
+    raise TypeError(f"Unsupported LTX Transformer config type: {type(config).__name__}.")
 
 
 def _to_diffusers_module_name(name: str) -> str:
@@ -120,7 +131,9 @@ class LTXResidentLoRAController:
         if getattr(pipeline.od_config, "quantization_config", None) is not None:
             raise ValueError("LTX resident LoRA mode does not support quantized Transformer weights yet.")
 
-        transformer_config = dict(pipeline.transformer.config)
+        transformer_config = _transformer_config_to_dict(
+            getattr(pipeline, "_transformer_init_config", pipeline.transformer.config)
+        )
         pipeline.transformer_2 = create_transformer_from_config(transformer_config)
         source = next(
             (source for source in pipeline.weights_sources if source.prefix == "transformer."),
