@@ -285,7 +285,7 @@ def test_parse_stage_overrides_accepts_empty_inner_dict() -> None:
 
 def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture) -> None:
     """Regression: the headless path must parse ``--stage-overrides`` (a JSON
-    string) through the same resolver request as the standard engine path."""
+    string) through the same resolver inputs as the standard engine path."""
     captured: dict = {}
 
     def _fake_resolve(*args, **kwargs):
@@ -326,8 +326,9 @@ def test_run_headless_invalid_stage_overrides_raises() -> None:
 def test_run_headless_maps_stage_configs_path_to_deploy_config(mocker: MockerFixture) -> None:
     captured: dict = {}
 
-    def _fake_resolve(request):
-        captured["request"] = request
+    def _fake_resolve(model, **kwargs):
+        captured["model"] = model
+        captured["kwargs"] = kwargs
         return _resolved(SimpleNamespace(stage_id=99))
 
     mocker.patch(
@@ -338,10 +339,8 @@ def test_run_headless_maps_stage_configs_path_to_deploy_config(mocker: MockerFix
     with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
         run_headless(_make_headless_args(stage_configs_path="deploy.yaml"))
 
-    request = captured["request"]
-    assert request.deploy_config_path == "deploy.yaml"
-    assert "stage_configs_path" not in request.cli_overrides
-    assert not hasattr(request, "legacy_stage_configs_path")
+    assert captured["kwargs"]["deploy_config_path"] == "deploy.yaml"
+    assert "stage_configs_path" not in captured["kwargs"]["cli_overrides"]
 
 
 def test_standard_and_headless_alias_resolve_identical_effective_config(tmp_path, mocker: MockerFixture) -> None:
@@ -387,8 +386,8 @@ def test_standard_and_headless_alias_resolve_identical_effective_config(tmp_path
     resolutions: list[OmniConfigResolution] = []
     resolve = resolver_module.resolve_omni_config
 
-    def _record_resolve(request):
-        resolved = resolve(request)
+    def _record_resolve(*args, **kwargs):
+        resolved = resolve(*args, **kwargs)
         resolutions.append(resolved)
         return resolved
 

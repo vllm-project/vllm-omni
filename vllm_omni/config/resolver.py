@@ -4,7 +4,7 @@ import json
 import types
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any
 
 from vllm.logger import init_logger
@@ -15,18 +15,6 @@ from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.yaml_util import create_config
 
 logger = init_logger(__name__)
-
-
-@dataclass(frozen=True)
-class OmniConfigResolveRequest:
-    """Inputs for one registry-backed Omni configuration resolution."""
-
-    model: str
-    trust_remote_code: bool = False
-    deploy_config_path: str | None = None
-    cli_overrides: Mapping[str, Any] = field(default_factory=dict)
-    stage_overrides: Mapping[str, Mapping[str, Any]] | str | None = None
-    strategy_config_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -164,15 +152,19 @@ def _load_strategy_specs(strategy_config_path: str | None) -> Mapping[Any, Any] 
 
 
 def _resolve_registered_pipeline(
-    request: OmniConfigResolveRequest,
+    model: str,
     cli_overrides: dict[str, Any],
+    *,
+    trust_remote_code: bool,
+    deploy_config_path: str | None,
+    strategy_config_path: str | None,
 ) -> tuple[VllmOmniConfig | None, tuple[Any, ...], str | None]:
     """Resolve registry metadata and the temporary runtime compatibility view."""
     structured_config = StageConfigFactory.create_from_model(
-        request.model,
-        trust_remote_code=request.trust_remote_code,
+        model,
+        trust_remote_code=trust_remote_code,
         cli_overrides=cli_overrides,
-        deploy_config_path=request.deploy_config_path,
+        deploy_config_path=deploy_config_path,
     )
     if structured_config is None:
         return None, (), None
@@ -181,15 +173,15 @@ def _resolve_registered_pipeline(
     # factory-owned compatibility bridge instead of reimplementing legacy YAML
     # discovery and merging in this resolver.
     legacy_stages, omni_lb_policy = StageConfigFactory.create_legacy_stage_configs_from_model(
-        request.model,
-        trust_remote_code=request.trust_remote_code,
+        model,
+        trust_remote_code=trust_remote_code,
         cli_overrides=cli_overrides,
-        deploy_config_path=request.deploy_config_path,
-        strategy_specs=_load_strategy_specs(request.strategy_config_path),
+        deploy_config_path=deploy_config_path,
+        strategy_specs=_load_strategy_specs(strategy_config_path),
     )
     if legacy_stages is None:
         raise RuntimeError(
-            f"Model {request.model!r} resolved to a structured Omni pipeline, "
+            f"Model {model!r} resolved to a structured Omni pipeline, "
             "but the runtime compatibility stage configs could not be built."
         )
 
@@ -215,13 +207,27 @@ def _resolve_generic_diffusion_model_class(
     return supported, str(model_class_name) if model_class_name else None
 
 
-def resolve_omni_config(request: OmniConfigResolveRequest) -> OmniConfigResolution:
+def resolve_omni_config(
+    model: str,
+    *,
+    trust_remote_code: bool = False,
+    deploy_config_path: str | None = None,
+    cli_overrides: Mapping[str, Any] | None = None,
+    stage_overrides: Mapping[str, Mapping[str, Any]] | str | None = None,
+    strategy_config_path: str | None = None,
+) -> OmniConfigResolution:
     """Resolve registry/deploy inputs through the single public entrypoint."""
-    cli_overrides = _convert_dataclasses_to_dict(dict(request.cli_overrides))
-    cli_overrides["trust_remote_code"] = request.trust_remote_code
-    _flatten_stage_overrides(cli_overrides, _parse_stage_overrides(request.stage_overrides))
+    normalized_overrides = _convert_dataclasses_to_dict(dict(cli_overrides or {}))
+    normalized_overrides["trust_remote_code"] = trust_remote_code
+    _flatten_stage_overrides(normalized_overrides, _parse_stage_overrides(stage_overrides))
 
-    structured_config, stage_configs, omni_lb_policy = _resolve_registered_pipeline(request, cli_overrides)
+    structured_config, stage_configs, omni_lb_policy = _resolve_registered_pipeline(
+        model,
+        normalized_overrides,
+        trust_remote_code=trust_remote_code,
+        deploy_config_path=deploy_config_path,
+        strategy_config_path=strategy_config_path,
+    )
     if structured_config is not None:
         return OmniConfigResolution(
             config_path=structured_config.orchestrator_config.deploy_config_path,
@@ -230,23 +236,22 @@ def resolve_omni_config(request: OmniConfigResolveRequest) -> OmniConfigResoluti
             endpoint_restrictions=tuple(structured_config.pipeline_config.endpoint_restrictions),
         )
 
-    supported, model_class_name = _resolve_generic_diffusion_model_class(request.model, cli_overrides)
+    supported, model_class_name = _resolve_generic_diffusion_model_class(model, normalized_overrides)
     if not supported:
         raise ValueError(
-            f"Model {request.model!r} did not resolve to a registered Omni pipeline or a supported diffusion model."
+            f"Model {model!r} did not resolve to a registered Omni pipeline or a supported diffusion model."
         )
     if model_class_name is not None:
-        cli_overrides.setdefault("model_class_name", model_class_name)
-    default_stages = StageConfigFactory.create_default_diffusion(cli_overrides)
+        normalized_overrides.setdefault("model_class_name", model_class_name)
+    default_stages = StageConfigFactory.create_default_diffusion(normalized_overrides)
 
     return OmniConfigResolution(
-        config_path=request.deploy_config_path,
+        config_path=deploy_config_path,
         stage_configs=tuple(create_config(_convert_dataclasses_to_dict(default_stages))),
     )
 
 
 __all__ = [
     "OmniConfigResolution",
-    "OmniConfigResolveRequest",
     "resolve_omni_config",
 ]

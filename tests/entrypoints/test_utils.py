@@ -16,7 +16,6 @@ from pytest_mock import MockerFixture
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.resolver import (
-    OmniConfigResolveRequest,
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
     resolve_omni_config,

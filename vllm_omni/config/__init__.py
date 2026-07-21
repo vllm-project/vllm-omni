@@ -61,7 +61,6 @@ __all__ = [
     "VllmOmniDiffusionStageConfig",
     "StageConfigType",
     "OmniConfigResolution",
-    "OmniConfigResolveRequest",
     "resolve_omni_config",
     # Structured Omni sub-configs.
     "OmniStageCacheConfig",

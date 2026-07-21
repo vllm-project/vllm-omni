@@ -1,6 +1,6 @@
 import pytest
 
-from vllm_omni.config.resolver import OmniConfigResolveRequest, resolve_omni_config
+from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 
@@ -22,10 +22,8 @@ def test_dreamzero_resolves_through_registry_with_model_defaults(monkeypatch):
     )
 
     resolved = resolve_omni_config(
-        OmniConfigResolveRequest(
-            model="GEAR-Dreams/DreamZero-DROID",
-            trust_remote_code=False,
-        )
+        "GEAR-Dreams/DreamZero-DROID",
+        trust_remote_code=False,
     )
     engine_args = resolved.stage_configs[0].engine_args
 

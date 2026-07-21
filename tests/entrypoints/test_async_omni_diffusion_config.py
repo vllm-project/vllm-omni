@@ -547,7 +547,7 @@ def test_serve_cli_accepts_diffusion_compile_controls():
     )
 
     explicit_kwargs = args.get_explicit_kwargs_dict()
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
 
     assert args.diffusion_compile_granularity == "full"
     assert args.diffusion_compile_dynamic is False
@@ -741,10 +741,9 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
 
     assert not hasattr(stage_configs[0].engine_args, "additional_config")
     assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}
-    request = resolve_config.call_args.args[0]
-    assert request.deploy_config_path == "dummy.yaml"
-    assert "stage_configs_path" not in request.cli_overrides
-    assert not hasattr(request, "legacy_stage_configs_path")
+    assert resolve_config.call_args.args == ("dummy-model",)
+    assert resolve_config.call_args.kwargs["deploy_config_path"] == "dummy.yaml"
+    assert "stage_configs_path" not in resolve_config.call_args.kwargs["cli_overrides"]
 
 
 @pytest.mark.parametrize(
