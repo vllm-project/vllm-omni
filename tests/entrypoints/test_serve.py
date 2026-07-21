@@ -395,6 +395,28 @@ def test_standard_and_headless_alias_resolve_identical_effective_config(tmp_path
     mocker.patch.object(async_engine_module, "resolve_omni_config", side_effect=_record_resolve)
     mocker.patch.object(resolver_module, "resolve_omni_config", side_effect=_record_resolve)
 
+    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
+    mocker.patch(
+        "vllm_omni.engine.stage_engine_startup.get_headless_replica_devices",
+        return_value=[None],
+    )
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model",
+        return_value=None,
+    )
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
+        return_value=(None, None, None),
+    )
+    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_vllm_config",
+        return_value=(SimpleNamespace(parallel_config=SimpleNamespace(node_rank_within_dp=0)), object),
+    )
+    launch_headless = mocker.patch("vllm_omni.engine.stage_engine_startup.launch_headless_llm_replicas")
+    mocker.patch("signal.signal")
+
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
     engine._omni_lb_policy = "random"
     standard_path, standard_stages = engine._resolve_stage_configs(
@@ -406,16 +428,15 @@ def test_standard_and_headless_alias_resolve_identical_effective_config(tmp_path
         trust_remote_code=False,
     )
 
-    with pytest.raises(ValueError, match="No stage config found for stage_id=99"):
-        run_headless(
-            _make_headless_args(
-                explicit_keys=frozenset({"stage_configs_path", "strategy_config"}),
-                model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
-                stage_id=99,
-                stage_configs_path=deploy_path,
-                strategy_config=str(strategy_path),
-            )
+    run_headless(
+        _make_headless_args(
+            explicit_keys=frozenset({"stage_configs_path", "strategy_config"}),
+            model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            stage_id=0,
+            stage_configs_path=deploy_path,
+            strategy_config=str(strategy_path),
         )
+    )
 
     assert len(resolutions) == 2
     standard_resolution, headless_resolution = resolutions
@@ -442,6 +463,9 @@ def test_standard_and_headless_alias_resolve_identical_effective_config(tmp_path
     ]
     assert standard_resolution.stage_configs[1].runtime.num_replicas == 2
     assert engine._omni_lb_policy == "round-robin"
+    launch_headless.assert_called_once()
+    assert launch_headless.call_args.kwargs["stage_id"] == 0
+    assert launch_headless.call_args.kwargs["stage_config"] is headless_resolution.stage_by_id(0)
     assert factory_paths == {
         "structured": [deploy_path, deploy_path],
         "legacy": [deploy_path, deploy_path],
