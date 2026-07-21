@@ -46,13 +46,15 @@ _MODEL_COEFFICIENTS = {
         7.61309272e-01,
     ],
     # OmniGen2 transformer coefficients
-    # Copied from Qwen-Image, need to be tuned specifically for OmniGen2 in future
+    # Estimated with the coefficient_estimator recipe: 72 parti-prompts
+    # (strided across all categories) x 50 steps at 1024x1024, CFG disabled,
+    # 3528 rel-L1 pairs, corr(x, y)=0.94, np.polyfit order 4
     "OmniGen2Transformer2DModel": [
-        -4.50000000e02,
-        2.80000000e02,
-        -4.50000000e01,
-        3.20000000e00,
-        -2.00000000e-02,
+        -1.13169970e01,
+        1.28097796e01,
+        -2.35170830e00,
+        1.51188493e00,
+        4.86397212e-04,
     ],
     # Z-Image transformer coefficients
     # Copied from Qwen-Image, need to be tuned specifically for Z-Image in future
