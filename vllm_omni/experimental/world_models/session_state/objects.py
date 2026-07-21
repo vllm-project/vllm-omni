@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Concrete memory objects (RFC #4480).
 
-Both classes back their storage with plain (monolithic) buffers. Attention KV
-is deliberately absent: for DreamZero it is owned by the AR-Diffusion engine's
+``LatentBuffer`` backs its storage with a plain (monolithic) buffer. Attention
+KV is deliberately absent: for DreamZero it is owned by the AR-Diffusion engine's
 paged pool (PR #4534), and the RFC's ``PagedKV`` arrives in Phase 1 as a
 handle wrapping that engine state rather than a dense buffer here. The RFC's
 ``FixedState`` and ``RetrievalStore`` land with their first consumers, but the
@@ -16,61 +16,15 @@ from collections import deque
 from collections.abc import Iterable
 from typing import TypeVar
 
-import numpy as np
-import torch
-
+from vllm_omni.experimental.world_models.session_state.accounting import (
+    SeenStorages,
+    device_bytes,
+)
 from vllm_omni.experimental.world_models.session_state.base import StateObject
-
-# The live ``{"is_init", "k", "v"}`` dict an encode-once cross-attention layer
-# populates on the first forward and reads thereafter.
-CrossKVCache = dict[str, bool | torch.Tensor | None]
 
 # The frame/chunk type a ``LatentBuffer`` holds (e.g. ``np.ndarray`` pixel
 # frames, ``torch.Tensor`` latent chunks).
 ItemT = TypeVar("ItemT")
-
-
-class EncodeOnceKV(StateObject[CrossKVCache, CrossKVCache]):
-    """Encode-once cross-attention KV.
-
-    Wraps an ``{"is_init", "k", "v"}`` dict that a model's cross-attention
-    layers populate once (on the first forward) and read thereafter. ``view()``
-    returns the live dict so the model mutates it in place. A typical use is
-    text-conditioning K/V that a session encodes once and rereads every step.
-    """
-
-    def __init__(self) -> None:
-        self._cache: CrossKVCache | None = None
-
-    def allocate(self) -> None:
-        self._cache = {"is_init": False, "k": None, "v": None}
-
-    def commit(self, payload: CrossKVCache | None = None) -> None:
-        if payload is not None:
-            self._cache = payload
-
-    def view(self, *, include_staged: bool = True) -> CrossKVCache:
-        if self._cache is None:
-            raise RuntimeError("EncodeOnceKV is not allocated; call allocate() first.")
-        return self._cache
-
-    def reset(self) -> None:
-        self._cache = None
-
-    @property
-    def nbytes(self) -> int:
-        if self._cache is None:
-            return 0
-        total = 0
-        for key in ("k", "v"):
-            tensor = self._cache.get(key)
-            if isinstance(tensor, torch.Tensor):
-                total += tensor.numel() * tensor.element_size()
-        return total
-
-    @property
-    def resident(self) -> bool:
-        return self._cache is not None
 
 
 class LatentBuffer(StateObject[ItemT, list[ItemT]]):
@@ -112,17 +66,10 @@ class LatentBuffer(StateObject[ItemT, list[ItemT]]):
     def reset(self) -> None:
         self._buf = None
 
-    @property
-    def nbytes(self) -> int:
+    def nbytes_by_device(self, seen: SeenStorages) -> dict[str, int]:
         if self._buf is None:
-            return 0
-        total = 0
-        for item in self._buf:
-            if isinstance(item, torch.Tensor):
-                total += item.numel() * item.element_size()
-            elif isinstance(item, np.ndarray):
-                total += int(item.nbytes)
-        return total
+            return {}
+        return device_bytes(list(self._buf), seen)
 
     @property
     def resident(self) -> bool:

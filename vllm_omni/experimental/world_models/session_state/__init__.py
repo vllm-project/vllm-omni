@@ -8,6 +8,10 @@ cache onto this contract (e.g. ``state_dreamzero_adapter.DreamZeroStateAdapter``
 See RFC #4480 for the full design and roadmap.
 """
 
+from vllm_omni.experimental.world_models.session_state.accounting import (
+    SeenStorages,
+    device_bytes,
+)
 from vllm_omni.experimental.world_models.session_state.attrs import SessionAttr
 from vllm_omni.experimental.world_models.session_state.base import StateObject
 from vllm_omni.experimental.world_models.session_state.manager import (
@@ -16,18 +20,16 @@ from vllm_omni.experimental.world_models.session_state.manager import (
     SessionStateManager,
     resolve_session_state_config,
 )
-from vllm_omni.experimental.world_models.session_state.objects import (
-    EncodeOnceKV,
-    LatentBuffer,
-)
+from vllm_omni.experimental.world_models.session_state.objects import LatentBuffer
 
 __all__ = [
     "DEFAULT_MAX_SESSIONS",
-    "EncodeOnceKV",
     "LatentBuffer",
+    "SeenStorages",
     "StateObject",
     "SessionAttr",
     "SessionState",
     "SessionStateManager",
+    "device_bytes",
     "resolve_session_state_config",
 ]

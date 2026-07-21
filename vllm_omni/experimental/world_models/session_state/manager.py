@@ -20,6 +20,11 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import TypeVar
 
+from vllm_omni.experimental.world_models.session_state.accounting import (
+    SeenStorages,
+    device_bytes,
+    merge_bytes,
+)
 from vllm_omni.experimental.world_models.session_state.base import StateObject
 
 logger = logging.getLogger(__name__)
@@ -68,9 +73,28 @@ class SessionState:
         # (otherwise language/current_start_frame/clip_feas/ys would survive).
         self.attrs.clear()
 
+    def nbytes_by_device(self, seen: SeenStorages | None = None) -> dict[str, int]:
+        """Bytes this session holds, keyed by device.
+
+        Both buckets are walked. A ``StateObject`` and a session attribute are
+        different in what the *manager* may do with them -- release, accumulate,
+        stage and commit versus merely carry -- but not in whether their bytes
+        occupy memory, so the accounting covers both. One ``seen`` set spans the
+        whole session, so a tensor aliased between the two buckets is counted
+        once.
+        """
+        shared: SeenStorages = set() if seen is None else seen
+        totals: dict[str, int] = {}
+        for obj in self._objects.values():
+            merge_bytes(totals, obj.nbytes_by_device(shared))
+        merge_bytes(totals, device_bytes(self.attrs, shared))
+        return totals
+
     @property
     def nbytes(self) -> int:
-        return sum(obj.nbytes for obj in self._objects.values())
+        """Total bytes held, summed over every device -- see
+        ``StateObject.nbytes`` on why a budget wants the per-device split."""
+        return sum(self.nbytes_by_device().values())
 
 
 class SessionStateManager:
@@ -91,7 +115,9 @@ class SessionStateManager:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")
         self.max_sessions = max_sessions
         # Recorded for observability; enforcement is left to an eviction
-        # planner (see RFC #4480).
+        # planner (see RFC #4480). Not scoped to a device: which pool a budget
+        # applies to is a question for whoever enforces it, so read
+        # ``nbytes_by_device()`` and pick the pool at the point of enforcement.
         self.byte_budget = byte_budget
         self._sessions: OrderedDict[str, SessionState] = OrderedDict()
         # The locking strategy is injected rather than hard-coded: callers
@@ -140,17 +166,43 @@ class SessionStateManager:
         with self._lock:
             return self._key(session_id) in self._sessions
 
-    def stats(self) -> dict[str, int]:
+    def nbytes_by_device(self) -> dict[str, int]:
+        """Bytes held across every live session, keyed by device."""
         with self._lock:
-            total_nbytes = sum(session.nbytes for session in self._sessions.values())
-            return {
+            return self._nbytes_by_device_locked()
+
+    def _nbytes_by_device_locked(self) -> dict[str, int]:
+        # One ``seen`` set across all sessions: sessions can legitimately share
+        # a storage (a conditioning tensor broadcast to several of them), and
+        # the total is what the process holds, not the sum of what each session
+        # would hold alone.
+        shared: SeenStorages = set()
+        totals: dict[str, int] = {}
+        for session in self._sessions.values():
+            merge_bytes(totals, session.nbytes_by_device(shared))
+        return totals
+
+    def stats(self) -> dict[str, int]:
+        """Counters plus per-device byte totals.
+
+        Byte keys are prefixed ``nbytes:`` and named by device -- ``nbytes:cpu``,
+        ``nbytes:cuda:0`` -- because host and device memory are different
+        resources and their sum answers no question. ``total_nbytes`` is kept
+        for callers that only want a single number.
+        """
+        with self._lock:
+            by_device = self._nbytes_by_device_locked()
+            stats: dict[str, int] = {
                 "sessions": len(self._sessions),
                 "max_sessions": self.max_sessions,
-                "total_nbytes": total_nbytes,
+                "total_nbytes": sum(by_device.values()),
                 "hits": self.hits,
                 "misses": self.misses,
                 "evictions": self.evictions,
             }
+            for device, count in sorted(by_device.items()):
+                stats[f"nbytes:{device}"] = count
+            return stats
 
 
 def resolve_session_state_config(

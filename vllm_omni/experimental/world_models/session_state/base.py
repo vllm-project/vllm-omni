@@ -20,6 +20,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Generic, TypeVar
 
+from vllm_omni.experimental.world_models.session_state.accounting import SeenStorages
+
 # What writers pass into ``stage()`` / ``commit()`` / ``append()``.
 PayloadT = TypeVar("PayloadT")
 # What ``view()`` hands to the consumer (not necessarily the payload type:
@@ -123,11 +125,25 @@ class StateObject(ABC, Generic[PayloadT, ViewT]):
     def reset(self) -> None:
         """Clear back to the unallocated state."""
 
-    @property
     @abstractmethod
+    def nbytes_by_device(self, seen: SeenStorages) -> dict[str, int]:
+        """Bytes held in this object's committed storage, keyed by device.
+
+        Staged payloads are not counted. ``seen`` deduplicates storages across
+        the whole session -- pass it through to ``device_bytes`` rather than
+        starting a fresh set, or two views on one buffer are counted twice.
+        """
+
+    @property
     def nbytes(self) -> int:
-        """Bytes held in this object's committed storage; staged payloads are
-        not counted."""
+        """Total bytes held, summed over every device.
+
+        Only meaningful when the caller genuinely does not care where the bytes
+        live (``evict()`` reporting what it freed, for instance). Anything
+        deciding against a budget wants ``nbytes_by_device`` instead: host and
+        device memory are different resources and their sum is not a quantity.
+        """
+        return sum(self.nbytes_by_device(set()).values())
 
     @property
     @abstractmethod
