@@ -171,14 +171,39 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit"],
-        help="Cache backend for acceleration (Wan2.2). Default: None.",
+        choices=["cache_dit", "inter_request", "inter_request+cache_dit"],
+        help=(
+            "Cache backend for acceleration (Wan2.2). "
+            "'inter_request': cross-request DiT cache reuse. "
+            "'inter_request+cache_dit': combine cross-request and intra-request cache_dit. "
+            "Default: None."
+        ),
     )
     parser.add_argument(
         "--enable-cache-dit-summary",
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
+    # Inter-request cache parameters [inter_request only]
+    parser.add_argument(
+        "--persistent-cache-dir",
+        type=str,
+        default="./persistent_cache_video",
+        help="Directory for persistent cross-request cache storage.",
+    )
+    parser.add_argument(
+        "--lmcache-disk-dir",
+        type=str,
+        default=None,
+        help="LMCache disk directory for CPU→Disk tiering.",
+    )
+    parser.add_argument("--lmcache-max-cpu-gb", type=float, default=5.0)
+    parser.add_argument("--lmcache-max-disk-gb", type=float, default=0.0)
+    parser.add_argument("--max-entries", type=int, default=100, help="Max cached entries.")
+    parser.add_argument("--max-memory-gb", type=float, default=16.0, help="Max cache memory (GB).")
+    parser.add_argument("--clip-model-path", type=str, default=None, help="CLIP model path for semantic matching.")
+    parser.add_argument("--clip-threshold", type=float, default=0.75, help="CLIP similarity threshold.")
+    parser.add_argument("--no-t2i-penalty", action="store_true", help="Disable t2i sigmoid penalty.")
     parser.add_argument("--output", type=str, default=None, help="Output path (mp4). Default: model-specific.")
     parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
     parser.add_argument(
@@ -332,7 +357,7 @@ def main():
             setattr(args, key.replace("-", "_"), default_val)
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    # Cache-dit config (Wan2.2 only)
+    # Cache config (Wan2.2)
     cache_config = None
     if args.cache_backend == "cache_dit":
         cache_config = {
@@ -347,6 +372,31 @@ def main():
             "scm_steps_mask_policy": None,
             "scm_steps_policy": "dynamic",
         }
+    elif args.cache_backend and "inter_request" in args.cache_backend:
+        cache_config = {
+            "inter_request_max_entries": args.max_entries,
+            "inter_request_max_memory_gb": args.max_memory_gb,
+            "inter_request_persistent_cache_dir": args.persistent_cache_dir,
+        }
+        if args.lmcache_disk_dir:
+            cache_config["inter_request_lmcache_disk_dir"] = args.lmcache_disk_dir
+            cache_config["inter_request_lmcache_max_cpu_gb"] = args.lmcache_max_cpu_gb
+            cache_config["inter_request_lmcache_max_disk_gb"] = args.lmcache_max_disk_gb
+        if args.clip_model_path:
+            cache_config["inter_request_clip_model_path"] = args.clip_model_path
+            cache_config["inter_request_clip_threshold"] = args.clip_threshold
+        cache_config["inter_request_use_t2i_penalty"] = False  # Video is 5D, no image embedding
+        # When combined with cache_dit, also add cache_dit parameters
+        if "cache_dit" in args.cache_backend:
+            cache_config["Fn_compute_blocks"] = 1
+            cache_config["Bn_compute_blocks"] = 0
+            cache_config["max_warmup_steps"] = 4
+            cache_config["residual_diff_threshold"] = 0.24
+            cache_config["max_continuous_cached_steps"] = 3
+            cache_config["enable_taylorseer"] = False
+            cache_config["taylorseer_order"] = 1
+            cache_config["scm_steps_mask_policy"] = None
+            cache_config["scm_steps_policy"] = "dynamic"
 
     # Configure parallel settings
     parallel_config = DiffusionParallelConfig(
@@ -391,7 +441,7 @@ def main():
     if args.extra_body and "guardrails" in args.extra_body:
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
 
-    omni = Omni(**omni_kwargs)
+    omni = Omni(init_timeout=1800, stage_init_timeout=1800, **omni_kwargs)
     model_class_name = get_model_class_name(omni) or model_class_name
     declared_extra_body_params = get_extra_body_params(model_class_name)
 

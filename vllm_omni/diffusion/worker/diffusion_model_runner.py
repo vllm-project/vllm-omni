@@ -596,6 +596,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     cache_key_hash = self.cache_backend.store(
                         req, output.output, step_latents=step_latents_data
                     )
+                    logger.info("STORE_DEBUG: hash=%s output_shape=%s", cache_key_hash, output.output.shape if hasattr(output.output, "shape") else "N/A")
                     if cache_key_hash is not None:
                         output.custom_output["cache_key_hash"] = cache_key_hash
                         self._update_cache_image_embedding(cache_key_hash, output.output)
