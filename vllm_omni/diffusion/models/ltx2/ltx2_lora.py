@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -50,6 +50,26 @@ def _transformer_config_to_dict(config: Any) -> dict[str, Any]:
     if isinstance(attributes, dict):
         return dict(attributes)
     raise TypeError(f"Unsupported LTX Transformer config type: {type(config).__name__}.")
+
+
+def _uses_serialized_quantization(quant_config: Any) -> bool:
+    """Whether Transformer weights are already quantized in the checkpoint."""
+    if quant_config is None:
+        return False
+    if hasattr(quant_config, "resolve"):
+        quant_config = quant_config.resolve("transformer")
+    if quant_config is None:
+        return False
+    serialized_flags = (
+        "is_checkpoint_quantized",
+        "is_checkpoint_fp8_serialized",
+        "is_checkpoint_nvfp4_serialized",
+        "is_checkpoint_mxfp8_serialized",
+        "is_checkpoint_torchao_serialized",
+    )
+    return getattr(quant_config, "data_type", None) == "mx_fp" or any(
+        bool(getattr(quant_config, name, False)) for name in serialized_flags
+    )
 
 
 def _to_diffusers_module_name(name: str) -> str:
@@ -128,13 +148,17 @@ class LTXResidentLoRAController:
         self.active_transformer_name = "transformer"
         self._merged = False
 
-        if getattr(pipeline.od_config, "quantization_config", None) is not None:
-            raise ValueError("LTX resident LoRA mode does not support quantized Transformer weights yet.")
+        quant_config = getattr(pipeline.od_config, "quantization_config", None)
+        if _uses_serialized_quantization(quant_config):
+            raise ValueError(
+                "LTX resident LoRA mode requires an unquantized base checkpoint so the stage-2 adapter can be "
+                "merged before quantization; serialized quantized checkpoints are not supported."
+            )
 
         transformer_config = _transformer_config_to_dict(
             getattr(pipeline, "_transformer_init_config", pipeline.transformer.config)
         )
-        pipeline.transformer_2 = create_transformer_from_config(transformer_config)
+        pipeline.transformer_2 = create_transformer_from_config(transformer_config, quant_config=quant_config)
         source = next(
             (source for source in pipeline.weights_sources if source.prefix == "transformer."),
             None,
@@ -149,57 +173,53 @@ class LTXResidentLoRAController:
     def transformer(self) -> nn.Module:
         return getattr(self.pipeline, self.active_transformer_name)
 
-    def after_weights_loaded(self) -> None:
+    @torch.no_grad()
+    def merge_stage2_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Merge LoRA into full stage-2 tensors before the standard loader."""
         if self._merged:
-            return
+            raise RuntimeError("LTX resident LoRA weights have already been merged.")
+
         entries = _load_lora_entries(
             self.pipeline.transformer_2,
             self.adapter_path,
             self.pipeline.od_config.dtype,
         )
-        self._merge_entries(entries)
-        self._merged = True
-
-    @torch.no_grad()
-    def _merge_entries(self, entries: list[_LTXLoRAEntry]) -> None:
-        grouped: dict[str, list[_LTXLoRAEntry]] = {}
+        entries_by_module: dict[str, _LTXLoRAEntry] = {}
         for entry in entries:
-            grouped.setdefault(entry.target_name, []).append(entry)
+            if entry.module_name in entries_by_module:
+                raise ValueError(f"Official LTX LoRA contains duplicate module {entry.module_name!r}.")
+            entries_by_module[entry.module_name] = entry
 
-        modules = dict(self.pipeline.transformer_2.named_modules())
         fusion_device = torch.device(self.pipeline.device)
         if fusion_device.type == "cuda" and not torch.cuda.is_available():
             fusion_device = torch.device("cpu")
+        merged_modules: set[str] = set()
+        stage2_prefix = "transformer_2."
+        weight_suffix = ".weight"
 
-        for target_name, target_entries in grouped.items():
-            module = modules.get(target_name)
-            weight = getattr(module, "weight", None)
-            if not isinstance(weight, torch.Tensor):
-                raise TypeError(f"Expected a weight tensor at transformer_2.{target_name}.")
-            if not weight.is_floating_point():
-                raise TypeError(f"Cannot merge LTX LoRA into non-floating weight transformer_2.{target_name}.")
+        for name, weight in weights:
+            module_name = None
+            if name.startswith(stage2_prefix) and name.endswith(weight_suffix):
+                module_name = name[len(stage2_prefix) : -len(weight_suffix)]
+            entry = entries_by_module.get(module_name) if module_name is not None else None
+            if entry is not None:
+                delta = self._compute_delta(entry, fusion_device, weight.dtype)
+                if delta.shape != weight.shape:
+                    raise ValueError(
+                        f"Cannot match LoRA delta {tuple(delta.shape)} to checkpoint tensor "
+                        f"{name} {tuple(weight.shape)}."
+                    )
+                weight = weight.to(device=fusion_device) + delta
+                merged_modules.add(entry.module_name)
+            yield name, weight
 
-            weight_loader = getattr(weight, "weight_loader", None)
-            if weight_loader is None:
-                if len(target_entries) != 1 or target_entries[0].shard_id is not None:
-                    raise ValueError(f"Cannot merge packed LoRA shards into transformer_2.{target_name}.")
-                delta = self._compute_delta(target_entries[0], fusion_device, weight.dtype)
-                weight.add_(delta.to(device=weight.device, dtype=weight.dtype))
-                continue
-
-            base_weight = weight.detach().clone()
-            weight.zero_()
-            try:
-                for entry in target_entries:
-                    delta = self._compute_delta(entry, fusion_device, weight.dtype)
-                    if entry.shard_id is None:
-                        weight_loader(weight, delta)
-                    else:
-                        weight_loader(weight, delta, entry.shard_id)
-                weight.add_(base_weight)
-            except Exception:
-                weight.copy_(base_weight)
-                raise
+        missing = set(entries_by_module) - merged_modules
+        if missing:
+            raise ValueError(f"LTX stage-2 checkpoint is missing LoRA target weights: {sorted(missing)}.")
+        self._merged = True
 
     @staticmethod
     def _compute_delta(entry: _LTXLoRAEntry, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

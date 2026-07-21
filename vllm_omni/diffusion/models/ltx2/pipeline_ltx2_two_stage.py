@@ -52,9 +52,8 @@ class LTX2TwoStagePipeline(LTX2Pipeline):
         self._phase_lora_controller = LTXResidentLoRAController(self, adapter_path)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = super().load_weights(weights)
-        self._phase_lora_controller.after_weights_loaded()
-        return loaded
+        weights = self._phase_lora_controller.merge_stage2_weights(weights)
+        return super().load_weights(weights)
 
     def _enter_phase(self, phase: LTXPhaseRecipe) -> None:
         self._phase_lora_controller.enter(phase.transformer_phase)
