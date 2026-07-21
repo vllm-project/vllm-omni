@@ -21,6 +21,7 @@ import json
 import math
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -30,6 +31,7 @@ import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
+from transformers.cache_utils import DynamicCache
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -483,6 +485,17 @@ def _optimized_scale(positive_flat, negative_flat):
     dot = torch.sum(pos * neg, dim=1, keepdim=True)
     sq_norm = torch.sum(neg**2, dim=1, keepdim=True) + 1e-8
     return dot / sq_norm
+
+
+@dataclass
+class SenseNovaU1DenoiseInputs:
+    """Boundary object between SenseNova-U1 prefix/AR work and DiT denoising."""
+
+    ns: SimpleNamespace
+    caches: dict[str, Any]
+    p: SimpleNamespace
+    think_text: str = ""
+    is_it2i: bool
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1251,155 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
         prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
 
+    @staticmethod
+    def _normalize_injected_cache_tensor(tensor: torch.Tensor, layout: str = "auto") -> torch.Tensor:
+        """Normalize transferred KV tensors to DynamicCache's [B, H, S, D] layout."""
+        if tensor.ndim == 4:
+            if layout == "bshd":
+                return tensor.transpose(1, 2).contiguous()
+            # Default stage metadata should transfer SenseNova tensors as bhsd.
+            return tensor.contiguous()
+        if tensor.ndim == 3:
+            # Common compact transfer shape for one request: [S, H, D].
+            return tensor.permute(1, 0, 2).unsqueeze(0).contiguous()
+        raise ValueError(f"Unsupported SenseNova-U1 injected KV tensor shape: {tuple(tensor.shape)}.")
+
+    def _coerce_injected_kv_cache(self, kv, metadata: dict[str, Any] | None = None):
+        """Convert transferred layer_blocks into the DynamicCache used by SenseNova-U1."""
+        if kv is None or hasattr(kv, "layers"):
+            return kv
+
+        key_cache = getattr(kv, "key_cache", None)
+        value_cache = getattr(kv, "value_cache", None)
+        if key_cache is None or value_cache is None:
+            return kv
+
+        metadata = metadata or {}
+        layout = str(metadata.get("kv_layout", metadata.get("layout", "auto")))
+
+        cache = DynamicCache()
+        for layer_idx, (key_tensor, value_tensor) in enumerate(zip(key_cache, value_cache)):
+            if key_tensor is None or value_tensor is None:
+                continue
+            key_states = self._normalize_injected_cache_tensor(key_tensor, layout)
+            value_states = self._normalize_injected_cache_tensor(value_tensor, layout)
+            cache.update(key_states, value_states, layer_idx)
+        return cache
+
+    @staticmethod
+    def _kv_seq_len(kv) -> int:
+        if kv is None:
+            return 0
+        seq_len = getattr(kv, "seq_len", None)
+        if seq_len is not None:
+            return int(seq_len)
+        get_seq_length = getattr(kv, "get_seq_length", None)
+        if callable(get_seq_length):
+            return int(get_seq_length())
+        layers = getattr(kv, "layers", None)
+        if layers:
+            for layer in layers:
+                keys = getattr(layer, "keys", None)
+                if torch.is_tensor(keys):
+                    return int(keys.shape[2])
+        return 0
+
+    @staticmethod
+    def _dict_attr(obj, name: str) -> dict[str, Any]:
+        value = getattr(obj, name, None) or {}
+        return value if isinstance(value, dict) else {}
+
+    def _external_branch_kv(self, sampling_params, role: str):
+        branch_kvs = self._dict_attr(sampling_params, "cfg_branch_past_key_values")
+        return getattr(sampling_params, f"{role}_past_key_values", None) or branch_kvs.get(role)
+
+    def _external_branch_metadata(self, sampling_params, role: str) -> dict[str, Any]:
+        branch_metadata = self._dict_attr(sampling_params, "cfg_branch_kv_metadata")
+        metadata = self._dict_attr(sampling_params, f"{role}_kv_metadata") or branch_metadata.get(role, {})
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _add_injected_cache_branch(
+        self,
+        caches: dict[str, Any],
+        role: str,
+        kv,
+        metadata: dict[str, Any],
+        ns,
+    ) -> None:
+        kv = self._coerce_injected_kv_cache(kv, metadata)
+        caches[role] = kv
+        caches[f"idx_{role}"] = self._build_t2i_image_indexes(
+            ns.token_h,
+            ns.token_w,
+            self._kv_seq_len(kv),
+            self.device,
+        )
+        caches[f"mask_{role}"] = {"full_attention": None}
+
+    def _build_injected_denoise_inputs(self, req: OmniDiffusionRequest, p: SimpleNamespace):
+        sampling_params = req.sampling_params
+        cond_kv = getattr(sampling_params, "past_key_values", None)
+        if cond_kv is None:
+            return None
+
+        requires_injected_kv = self._requires_injected_kv(req)
+        metadata = self._dict_attr(sampling_params, "kv_metadata")
+        if not requires_injected_kv and metadata.get("stage") not in ("dit", "denoise"):
+            return None
+
+        ns = self._init_noise_and_schedule(p)
+        think_text = str(metadata.get("think_text", ""))
+        caches: dict[str, Any] = {}
+        self._add_injected_cache_branch(caches, "cond", cond_kv, metadata, ns)
+
+        uncond_kv = self._external_branch_kv(sampling_params, "cfg_text")
+        if uncond_kv is not None:
+            self._add_injected_cache_branch(
+                caches,
+                "uncond",
+                uncond_kv,
+                self._external_branch_metadata(sampling_params, "cfg_text"),
+                ns,
+            )
+
+        img_cond_kv = self._external_branch_kv(sampling_params, "cfg_img")
+        if img_cond_kv is not None:
+            self._add_injected_cache_branch(
+                caches,
+                "img_cond",
+                img_cond_kv,
+                self._external_branch_metadata(sampling_params, "cfg_img"),
+                ns,
+            )
+
+        if p.cfg_scale > 1 and "uncond" not in caches and "img_cond" not in caches:
+            raise ValueError(
+                "SenseNova-U1 injected DiT execution requires an uncond/img_cond KV branch when cfg_scale > 1."
+            )
+
+        for key in ("cond", "img_cond", "uncond"):
+            if key in caches:
+                self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
+
+        return SenseNovaU1DenoiseInputs(
+            ns=ns,
+            caches=caches,
+            p=p,
+            think_text=think_text,
+            is_it2i=True,
+        )
+
+    def _requires_injected_kv(self, req: OmniDiffusionRequest) -> bool:
+        injected_kv = req.sampling_params.past_key_values
+        if injected_kv is None:
+            return False
+        od_config = getattr(self, "od_config", None)
+        omni_kv_config = getattr(od_config, "omni_kv_config", None)
+        return omni_kv_config.get("need_recv_cache")
+
+    def _execute_denoise_inputs(self, inputs: SenseNovaU1DenoiseInputs) -> DiffusionOutput:
+        return self._run_denoising_loop(inputs.ns, inputs.caches, inputs.p, inputs.think_text, inputs.is_it2i)
+
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         p = self._parse_request(req)
@@ -1249,12 +1411,20 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
         if is_text_output:
             return self._forward_text(p, input_images)
+        injected_inputs = self._build_injected_denoise_inputs(req, p)
+        if injected_inputs is not None:
+            return self._execute_denoise_inputs(injected_inputs)
+        if self._requires_injected_kv(req):
+            raise RuntimeError("SenseNova-U1 AR+DiT stage requires injected KV.")
         if input_images is not None:
             return self._forward_it2i(p, input_images)
         return self._forward_t2i(p)
 
     def _forward_t2i(self, p) -> DiffusionOutput:
         """Text-to-image generation path."""
+        return self._execute_denoise_inputs(self._prepare_t2i_denoise_inputs(p))
+
+    def _prepare_t2i_denoise_inputs(self, p) -> SenseNovaU1DenoiseInputs:
         ns = self._init_noise_and_schedule(p)
 
         think_content = "<think>\n" if p.think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
@@ -1297,10 +1467,18 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             "idx_uncond": indexes_image_uncond,
             "mask_uncond": {"full_attention": None},
         }
-        return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=False)
+        return SenseNovaU1DenoiseInputs(ns=ns, caches=caches, p=p, think_text=think_text, is_it2i=False)
 
     def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
         """Image-to-image (editing) generation path with dual CFG."""
+        return self._execute_denoise_inputs(self._prepare_it2i_denoise_inputs(p, input_images))
+
+    def _prepare_it2i_denoise_inputs(
+        self,
+        p,
+        input_images: list[Image.Image],
+    ) -> SenseNovaU1DenoiseInputs:
+        """Prepare all prefix/AR artifacts needed by the IT2I denoising loop."""
         ns = self._init_noise_and_schedule(p)
 
         pixel_values, grid_hw = self._prepare_input_images(input_images)
@@ -1413,7 +1591,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             if key in caches and not isinstance(caches[key], dict):
                 self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
 
-        return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=True)
+        return SenseNovaU1DenoiseInputs(ns=ns, caches=caches, p=p, think_text=think_text, is_it2i=True)
 
     def _run_denoising_loop(self, ns, caches, p, think_text="", is_it2i: bool = False) -> DiffusionOutput:
         """Shared denoising loop for both T2I and IT2I."""

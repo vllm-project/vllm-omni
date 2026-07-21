@@ -1,0 +1,55 @@
+# SenseNova-U1 AR + DiT separation deploy.
+#
+# Stage 0 (Thinker) only performs AR prefill and transfers KV to Stage 1
+# (DiT). Keep max_model_len bounded because the HF config advertises a very
+# large context window, which would otherwise over-allocate vLLM KV cache.
+
+pipeline: sensenova_u1
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    max_num_seqs: 3
+    gpu_memory_utilization: 0.45
+    enforce_eager: true
+    trust_remote_code: false
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      temperature: 0.4
+      max_tokens: 1
+      seed: 42
+      detokenize: true
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 42
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+
+  rdma_connector:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      protocol: "rdma"
+      device_name: ""
+      memory_pool_size: 4294967296
+      memory_pool_device: "cpu"

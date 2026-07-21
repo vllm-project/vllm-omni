@@ -12,6 +12,7 @@ SENSENOVA_U1_EXTRA_BODY_PARAMS = frozenset(
         "t_eps",
         "img_cfg_scale",
         "max_tokens",
+        "negative_prompt",
     }
 )
 SENSENOVA_U1_EXTRA_OUTPUT_PARAMS = frozenset(

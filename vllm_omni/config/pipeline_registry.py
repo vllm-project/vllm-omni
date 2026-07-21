@@ -86,6 +86,10 @@ from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.sensenova_u1.pipeline import (
+    SENSENOVA_U1_PIPELINE,
+    SENSENOVA_U1_SINGLE_STAGE_PIPELINE,
+)
 from vllm_omni.model_executor.models.soulx_singer.pipeline import (
     SOULXSINGER_SVC_PIPELINE,
     SOULXSINGER_SVS_PIPELINE,
@@ -116,6 +120,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_think": BAGEL_THINK_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "lance": LANCE_PIPELINE,
+    "sensenova_u1": SENSENOVA_U1_PIPELINE,
+    "sensenova_u1_single_stage": SENSENOVA_U1_SINGLE_STAGE_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,

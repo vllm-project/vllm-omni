@@ -2,16 +2,14 @@
 
 ## Architecture
 
-SenseNova-U1 is a unified Qwen3-based LLM with Mixture-of-Tokenizers (MoT) attention. Unlike two-stage pipelines (e.g., BAGEL), it handles text encoding, optional reasoning ("think mode"), and flow-matching-based image denoising entirely within a single diffusion stage.
+SenseNova-U1 is a unified Qwen3-based LLM with Mixture-of-Tokenizers (MoT) attention. It supports two deployment topologies:
 
-| Feature | Description |
-| :------ | :---------- |
-| **Model type** | Unified LLM (single-stage diffusion pipeline) |
-| **Base LLM** | Qwen3 with MoT attention and 3D RoPE |
-| **Image generation** | Flow-matching Euler sampler, no separate VAE |
-| **Think mode** | Optional chain-of-thought reasoning before image generation |
-| **Parallelism** | Tensor Parallelism (TP) with fused QKV and fused gate/up projections |
-| **Modalities** | text2img, img2img, img2text (understanding), text2text |
+| Topology | Stages | Description |
+| :------- | :----- | :---------- |
+| **Single-stage** (default) | Stage 0 (DiT, Diffusion) only | The diffusion stage contains the LLM, vision encoder, and denoiser. It supports `text2img`, `img2img`, `img2text`, `text2text`, and think mode. |
+| **AR+DiT separation** | Stage 0 (Thinker, AR) + Stage 1 (DiT, Diffusion) | Stage 0 performs AR prefill and transfers KV cache to Stage 1 for denoising. This topology is enabled manually with `--deploy-config vllm_omni/deploy/sensenova_u1.yaml`. |
+
+The default path remains single-stage for compatibility. Use the two stages deploy YAML to enable multi stage separation.
 
 ## Quick Start
 
@@ -20,6 +18,10 @@ cd examples/offline_inference/sensenova_u1
 
 # Text-to-image
 python end2end.py --prompt "A cute cat" --think
+
+# Text-to-image with multi stages separation
+python end2end.py --prompt "A cute cat" \
+                  --deploy-config vllm_omni/deploy/sensenova_u1.yaml
 
 # Image-to-image editing
 python end2end.py --prompt "Turn this into an oil painting" \
@@ -54,6 +56,15 @@ python end2end.py \
     --prompt "Close portrait of an elderly woman by a farmhouse window, textured skin, gentle smile, warm natural light" \
     --width 1536 --height 2720 \
     --think --print-think
+```
+
+Two stages separation for text-to-image:
+
+```bash
+python end2end.py \
+    --prompt "Close portrait of an elderly woman by a farmhouse window, textured skin, gentle smile, warm natural light" \
+    --width 1536 --height 2720 \
+    --deploy-config vllm_omni/deploy/sensenova_u1.yaml
 ```
 
 ## Image-to-Image Editing (img2img)
@@ -138,6 +149,7 @@ python end2end.py \
 | `--output` | `.` | Output directory for saved images |
 | `--tensor-parallel-size` | 1 | Number of GPUs for tensor parallelism |
 | `--enforce-eager` | False | Disable torch.compile |
+| `--deploy-config` | None | Path to deploy YAML. Pass `vllm_omni/deploy/sensenova_u1.yaml` to enable two stages separation |
 | `--enable-cpu-offload` | False | Enable module-wise (sequential) CPU offload to reduce peak VRAM |
 | `--cache-backend` | None | Set to `cache_dit` or `tea_cache` for image generation acceleration |
 | `--enable-cache-dit-summary` | False | Print Cache-DiT cache statistics after generation |

@@ -215,6 +215,11 @@ _OMNI_MODELS = {
         "bagel",
         "OmniBagelForConditionalGeneration",
     ),
+    "OmniSenseNovaU1ForCausalLM": (
+        "sensenova_u1",
+        "sensenova_u1",
+        "OmniSenseNovaU1ForCausalLM",
+    ),
     "HunyuanImage3ForCausalMM": (
         "hunyuan_image3",
         "hunyuan_image3",

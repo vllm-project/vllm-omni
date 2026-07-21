@@ -1219,17 +1219,6 @@ class OmniConnectorModelRunnerMixin:
             target_device=target_device,
         )
 
-    def receive_cfg_companion_kv_payloads(
-        self,
-        cfg_request_ids: dict[str, str],
-        target_device: torch.device | None = None,
-    ) -> dict[str, tuple[dict[str, Any] | None, int]]:
-        """Receive raw CFG companion KV payloads keyed by role."""
-        return {
-            role: self.recv_kv_cache(companion_rid, target_device=target_device)
-            for role, companion_rid in cfg_request_ids.items()
-        }
-
     def receive_multi_kv_cache(
         self,
         req: Any,
@@ -1239,8 +1228,8 @@ class OmniConnectorModelRunnerMixin:
         """Receive primary and optional companion KV caches for a request.
 
         The mixin owns the runner-facing orchestration: primary KV receive,
-        companion payload fetch, and applying any model-specific CFG fields back
-        onto ``req.sampling_params``.
+        model-specific CFG collection, and applying any CFG fields back onto
+        ``req.sampling_params``.
         """
         if self._kv_transfer_manager is None:
             return False
@@ -1264,11 +1253,12 @@ class OmniConnectorModelRunnerMixin:
         cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
         if cfg_ids and cfg_kv_collect_func:
             try:
-                cfg_role_payloads = self.receive_cfg_companion_kv_payloads(
+                cfg_kvs = cfg_kv_collect_func(
+                    request_id,
                     cfg_ids,
-                    target_device=target_device,
+                    self._kv_transfer_manager,
+                    target_device,
                 )
-                cfg_kvs = cfg_kv_collect_func(request_id, cfg_role_payloads)
                 if cfg_kvs and hasattr(req, "sampling_params") and req.sampling_params is not None:
                     for key, value in cfg_kvs.items():
                         setattr(req.sampling_params, key, value)

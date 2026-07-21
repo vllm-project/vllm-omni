@@ -25,12 +25,16 @@ See README.md for more examples.
 """
 
 import argparse
+import copy
 import os
 
 from PIL import Image
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.stage_input_processors.sensenova_u1 import (
+    build_t2i_stage0_prompt,
+)
 
 
 def parse_args():
@@ -41,6 +45,12 @@ def parse_args():
         "--model",
         default="SenseNova/SenseNova-U1-8B-MoT",
         help="HuggingFace model ID or local path.",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Deploy YAML path. Use vllm_omni/deploy/sensenova_u1.yaml to enable multi stages.",
     )
     parser.add_argument(
         "--modality",
@@ -185,6 +195,20 @@ def _resolve_modality(args):
     return "img2img" if has_images else "text2img"
 
 
+def _build_stage_sampling_params(omni: Omni, args, diffusion_params: OmniDiffusionSamplingParams) -> list:
+    """Build per-stage sampling params for multi stage config."""
+    params_list = [copy.deepcopy(params) for params in omni.default_sampling_params_list]
+
+    params_list[0].max_tokens = 1
+    params_list[0].seed = args.seed
+    params_list[0].extra_args = {
+        "cfg_scale": args.cfg_scale,
+        "img_cfg_scale": args.img_cfg_scale,
+    }
+    params_list[1] = diffusion_params
+    return params_list
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -200,6 +224,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         cache_backend=args.cache_backend,
         enable_cache_dit_summary=args.enable_cache_dit_summary,
+        deploy_config=args.deploy_config,
         cfg_parallel_size=args.cfg_parallel_size,
     )
 
@@ -226,6 +251,15 @@ def main():
         num_inference_steps=args.num_steps,
         extra_args=extra_args,
     )
+    sampling_params_list = sampling_params
+    if omni.num_stages > 1:
+        if is_text_output:
+            raise ValueError("SenseNova-U1 multi stage config supports image generation, not text output.")
+        if modality != "text2img":
+            raise ValueError("SenseNova-U1 multi stage config currently supports text2img only.")
+        if args.think:
+            raise ValueError("SenseNova-U1 multi stage config currently does not support think mode. ")
+        sampling_params_list = _build_stage_sampling_params(omni, args, sampling_params)
 
     print(f"\n{'=' * 60}")
     print(f"SenseNova-U1 Configuration ({modality}):")
@@ -268,12 +302,13 @@ def main():
     elif is_text_output:
         prompt_dict = {"prompt": args.prompt, "modalities": ["text"]}
     else:
-        prompt_dict = {"prompt": args.prompt, "modalities": ["image"]}
+        prompt_text = build_t2i_stage0_prompt(args.prompt) if omni.num_stages > 1 else args.prompt
+        prompt_dict = {"prompt": prompt_text, "modalities": ["image"]}
 
     outputs = list(
         omni.generate(
             prompts=prompt_dict,
-            sampling_params_list=sampling_params,
+            sampling_params_list=sampling_params_list,
         )
     )
 
