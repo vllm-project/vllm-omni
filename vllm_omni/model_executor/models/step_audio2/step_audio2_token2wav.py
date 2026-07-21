@@ -100,8 +100,9 @@ class StepAudio2Token2WavCore(nn.Module):
         # and apply the Token2Wav NPU patch here (idempotent) before
         # ``_ensure_models_loaded`` runs. Covers every
         # construction site (Step-Audio2 wrapper + MiniCPM-o facade): patched
-        # ``_ensure_models_loaded`` offloads HiFT to CPU and patched ``forward``
-        # expands CosyVoice DiT masks + forces MATH SDPA (avoids FA 161001).
+        # ``_ensure_models_loaded`` replaces HiFT's failing linear downsample,
+        # while patched ``forward`` expands CosyVoice DiT masks and forces
+        # MATH SDPA (avoids FA 161001).
         from vllm_omni.platforms import current_omni_platform
 
         if current_omni_platform.is_npu():
