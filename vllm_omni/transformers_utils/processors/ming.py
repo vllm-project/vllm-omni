@@ -429,7 +429,7 @@ class MingFlashOmniProcessor(ProcessorMixin):
                         if image_data is not None:
                             from PIL import Image as PILImage
 
-                            num_images = 1 if isinstance(image_data, str | PILImage.Image) else len(image_data)
+                            num_images = 1 if isinstance(image_data, (str, PILImage.Image)) else len(image_data)
                             for _ in range(num_images):
                                 if image_placeholders > 0:
                                     image_placeholders -= 1
@@ -479,18 +479,5 @@ class MingFlashOmniProcessor(ProcessorMixin):
         return list(dict.fromkeys(names))
 
 
-# transformers >= 5.5 requires the config *class* (not a name string) as the
-# first arg to Auto*.register — it does ``key.__module__`` internally, so the
-# old string keys raise AttributeError at import time. This module loads via
-# ``vllm_omni.transformers_utils.processors.__init__``, so the crash also
-# breaks unrelated imports (e.g. the AudioX pipeline). Mirror the
-# ``AutoTokenizer.register`` keys in ``configs/ming_flash_omni.py``.
-from vllm_omni.transformers_utils.configs.ming_flash_omni import (  # noqa: E402
-    BailingMM2Config,
-    MingFlashOmniConfig,
-)
-
-AutoFeatureExtractor.register(BailingMM2Config, MingWhisperFeatureExtractor)
-AutoFeatureExtractor.register(MingFlashOmniConfig, MingWhisperFeatureExtractor)
-AutoProcessor.register(BailingMM2Config, MingFlashOmniProcessor)
-AutoProcessor.register(MingFlashOmniConfig, MingFlashOmniProcessor)
+AutoFeatureExtractor.register("MingWhisperFeatureExtractor", MingWhisperFeatureExtractor)
+AutoProcessor.register("MingFlashOmniProcessor", MingFlashOmniProcessor)
