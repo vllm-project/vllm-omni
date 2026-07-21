@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,8 @@ from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
-from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     DeployConfig,
@@ -31,6 +33,16 @@ from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
+
+
+# Default degree for any parallel axis / replica count that isn't set anywhere
+# (CLI, deploy YAML, or pipeline default): a single, un-parallelized rank.
+# TODO(composable_parallel): this "1" default and the per-axis device-layout
+# fallbacks are currently re-derived in the merge, apply, and reconcile layers.
+# Centralize them in one schema so the pre-spawn device guard and the engine-args
+# defaults can't drift apart. This is the light slice; the full device-layout
+# centralization is tracked as a follow-up.
+_DEFAULT_PARALLEL_DEGREE = 1
 
 
 class StageConfigFactory:
@@ -186,12 +198,12 @@ class StageConfigFactory:
         return None
 
     @classmethod
-    @functools.cache
     def get_pipeline_config(
         cls,
         model: str,
         trust_remote_code: bool,
         deploy_config_path: str | None = None,
+        user_deploy_config: DeployConfig | None = None,
     ) -> PipelineConfig | None:
         """Resolve the PipelineConfig for a model path/name."""
         model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
@@ -199,13 +211,15 @@ class StageConfigFactory:
 
         # Resolve the deploy config & check if the user set the pipeline;
         # If the pipeline is explicitly set, it takes highest priority
-        deploy_config_pipe = cls._get_deploy_override_pipe_config(hf_config, deploy_config_path)
+        if user_deploy_config is None:
+            user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
+        deploy_config_pipe = cls._get_deploy_override_pipe_config(hf_config, user_deploy_config)
         if deploy_config_pipe is not None:
             return deploy_config_pipe
 
         # Pipeline isn't set in the yaml spec, so we need infer it ourselves.
         if model_type and model_type in OMNI_PIPELINES:
-            pipeline_cfg = cls.resolve_pipeline_config(model_type, hf_config)
+            pipeline_cfg = resolve_pipeline_config(model_type, hf_config)
             if pipeline_cfg is not None:
                 return pipeline_cfg
 
@@ -246,91 +260,131 @@ class StageConfigFactory:
     def _get_deploy_override_pipe_config(
         cls,
         hf_config: PretrainedConfig | None,
-        deploy_config_path: str | None,
+        deploy_config: DeployConfig | None,
     ) -> PipelineConfig | None:
-        """Load the deploy config and extract + resolve its pipeline field."""
-        if deploy_config_path is None:
+        """Resolve an explicit pipeline override from a loaded deploy config."""
+        if deploy_config is None or deploy_config.pipeline is None:
             return None
 
+        pipeline_cfg = resolve_pipeline_config(deploy_config.pipeline, hf_config)
+        if pipeline_cfg is None:
+            raise KeyError(
+                f"Pipeline {deploy_config.pipeline!r} from deploy config is not registered "
+                f"to OMNI_PIPELINES. Available: {sorted(OMNI_PIPELINES)}"
+            )
+        return pipeline_cfg
+
+    @staticmethod
+    def _load_user_deploy_config(deploy_config_path: str | None) -> DeployConfig | None:
+        """Load an explicit deploy YAML once for resolution and construction."""
+        if deploy_config_path is None:
+            return None
         deploy_path = Path(deploy_config_path)
-        if deploy_path.exists():
-            deploy_cfg = load_deploy_config(deploy_path)
-            if deploy_cfg.pipeline is not None:
-                return cls.resolve_pipeline_config(deploy_cfg.pipeline, hf_config)
-        return None
+        if not deploy_path.exists() and deploy_path.parent == Path("."):
+            candidate = _DEPLOY_DIR / deploy_path
+            if candidate.exists():
+                deploy_path = candidate
+        if not deploy_path.exists():
+            raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
+        return load_deploy_config(deploy_path)
 
     @classmethod
     def create_from_model(
         cls,
         model: str,
         *,
-        trust_remote_code: bool = False,
-        cli_overrides: dict[str, Any] | None = None,
-        deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
-    ) -> list[StageConfig] | None:
-        """Load pipeline + deploy config, merge with CLI overrides.
-
-        Checks OMNI_PIPELINES first, since supported models should be explicitly
-        registered. If a model is not registered in OMNI_PIPELINES, tries to fall
-        back to using the Transformers config & finding pipelines that have overlapping
-        supported architectures.
-        """
-        if cli_overrides is None:
-            cli_overrides = {}
-
+        trust_remote_code: bool,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None,
+    ) -> VllmOmniConfig | None:
+        """Build the structured Omni config for a model/deploy pair."""
+        user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
         pipeline_cfg = cls.get_pipeline_config(
             model=model,
             trust_remote_code=trust_remote_code,
             deploy_config_path=deploy_config_path,
+            user_deploy_config=user_deploy_config,
         )
-        if pipeline_cfg is not None:
-            return cls._create_from_registry(
-                pipeline_cfg.model_type,
-                pipeline_cfg,
-                cli_overrides,
-                deploy_config_path,
-            )
-        return None
+        if pipeline_cfg is None:
+            return None
+
+        registry_cli_overrides = {
+            **cli_overrides,
+            "trust_remote_code": trust_remote_code,
+            "model": model,
+        }
+        return VllmOmniConfig.from_pipeline_config(
+            pipeline_cfg,
+            user_deploy_config=user_deploy_config,
+            deploy_config_path=deploy_config_path,
+            cli_overrides=registry_cli_overrides,
+        )
 
     @classmethod
-    def _create_from_registry(
+    def create_legacy_stage_configs_from_model(
         cls,
-        model_type: str,
+        model: str,
+        *,
+        trust_remote_code: bool,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None,
+        strategy_specs: Mapping[Any, Any] | None = None,
+    ) -> tuple[list[StageConfig] | None, str | None]:
+        """Build current runtime stage configs from the shared resolution.
+
+        The engine still consumes the legacy StageConfig/OmegaConf shape.
+        RFC #4021 will replace this transitional path as runtime consumers move
+        to VllmOmniConfig.
+        """
+        user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
+        pipeline_cfg = cls.get_pipeline_config(
+            model=model,
+            trust_remote_code=trust_remote_code,
+            deploy_config_path=deploy_config_path,
+            user_deploy_config=user_deploy_config,
+        )
+        if pipeline_cfg is None:
+            return None, None
+
+        legacy_cli_overrides = {
+            **cli_overrides,
+            "trust_remote_code": trust_remote_code,
+        }
+        return cls._create_legacy_from_registry(
+            pipeline_cfg,
+            legacy_cli_overrides,
+            deploy_config_path,
+            user_deploy_config=user_deploy_config,
+            strategy_specs=strategy_specs,
+        )
+
+    @classmethod
+    def _create_legacy_from_registry(
+        cls,
         pipeline_cfg: PipelineConfig,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
-        **deprecated_kwargs: Any,
-    ) -> list[StageConfig]:
-        """Create StageConfigs from pipeline registry + deploy YAML.
+        user_deploy_config: DeployConfig | None = None,
+        strategy_specs: Mapping[Any, Any] | None = None,
+    ) -> tuple[list[StageConfig], str | None]:
+        """Create current runtime StageConfigs from registry + deploy YAML.
 
         Precedence: caller-typed (non-None) value > deploy YAML >
         StageDeployConfig dataclass default.
-        """
-        # Resolve deploy config path
-        if deploy_config_path is None:
-            deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
-        else:
-            deploy_path = Path(deploy_config_path)
 
-        if not deploy_path.exists():
-            logger.warning(
-                "Deploy config not found: %s — using pipeline defaults only",
-                deploy_path,
-            )
-            deploy_cfg = DeployConfig()
+        Returns ``(stages, omni_lb_policy)`` — the strategy-derived pipeline-wide
+        load-balancer policy (``None`` when no strategy set one) travels with the
+        stages instead of through a mutable out-param.
+        """
+        if user_deploy_config is not None:
+            deploy_cfg = user_deploy_config
+        elif deploy_config_path is not None:
+            deploy_cfg = cls._load_user_deploy_config(deploy_config_path)
+            assert deploy_cfg is not None
+        elif pipeline_cfg.default_deploy_config_name is not None:
+            deploy_cfg = load_deploy_config(_DEPLOY_DIR / pipeline_cfg.default_deploy_config_name)
         else:
-            deploy_cfg = load_deploy_config(deploy_path)
-            # Fallback to using the deploy config pipeline class if it's a mismatch
-            if deploy_cfg.pipeline and deploy_cfg.pipeline != model_type:
-                resolved = cls.resolve_pipeline_config(deploy_cfg.pipeline)
-                if resolved is None:
-                    raise KeyError(
-                        f"Pipeline {deploy_cfg.pipeline!r} from {deploy_path.name!r} "
-                        f"not found in OMNI_PIPELINES. Available: "
-                        f"{sorted(OMNI_PIPELINES.keys())}"
-                    )
-                pipeline_cfg = resolved
+            deploy_cfg = DeployConfig()
 
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:
@@ -338,12 +392,127 @@ class StageConfigFactory:
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
+        # Overlay declarative parallel strategies (opt-in) before CLI overrides.
+        applied = cls._apply_strategy_specs(stages, strategy_specs)
+
         explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
 
-        return stages
+        # Re-validate the resolved layout now that CLI overrides are on top.
+        cls._reconcile_strategy_with_cli(stages, applied)
+
+        omni_lb_policy = applied.omni_lb_policy if applied is not None else None
+        return stages, omni_lb_policy
+
+    @staticmethod
+    def _apply_strategy_specs(
+        stages: list[StageConfig],
+        strategy_specs: Mapping[Any, Any] | None,
+    ) -> Any:
+        """Overlay derived parallel sizing onto merged stages (opt-in).
+
+        ``omni_lb_policy`` cannot be set from stage configs (omni reads it once
+        at orchestrator construction), so a derived non-default policy is logged
+        here and carried on the returned ``StrategyApplyResult`` for the caller
+        to hand to the orchestrator.
+
+        Returns the ``StrategyApplyResult`` (or ``None`` when no strategy was
+        supplied) so the caller can re-validate the resolved layout once CLI
+        overrides have been merged on top, and read its ``omni_lb_policy``.
+        """
+        if not strategy_specs:
+            return None
+        from vllm_omni.config.composable_parallel import apply_strategy_specs
+
+        applied = apply_strategy_specs(stages, strategy_specs)
+        if applied.omni_lb_policy is not None:
+            logger.info(
+                "[composable_parallel] strategy derived omni_lb_policy=%r; it will be applied "
+                "to the orchestrator unless an explicit --omni-lb-policy was given.",
+                applied.omni_lb_policy,
+            )
+        return applied
+
+    @staticmethod
+    def _reconcile_strategy_with_cli(
+        stages: list[StageConfig],
+        applied: Any,
+    ) -> None:
+        """Reconcile CLI overrides applied *after* a strategy overlay.
+
+        CLI overrides are applied last (in ``to_omegaconf``), so for any stage a
+        strategy touched we must (a) warn loudly when a CLI arg overrides a
+        strategy-declared axis — the strategy is meant to be the single writer
+        for the axes it declares, so a silent CLI win is surprising — and
+        (b) re-run the device-count check against the *effective* (post-CLI)
+        ``tp``/``dp``/``pp``/``num_replicas``/``devices`` so a CLI
+        ``--devices``/``--tensor-parallel-size``/``--num-replicas`` cannot slip
+        past the pre-spawn guard that exists to prevent silent OOMs.
+        """
+        if applied is None:
+            return
+        from vllm_omni.config.composable_parallel import check_device_layout
+
+        # Axis kind -> (engine-arg field, strategy-derived attribute on the cfg).
+        axis_fields = {
+            "tp": ("tensor_parallel_size", "tensor_parallel_size"),
+            "dp": ("data_parallel_size", "data_parallel_size"),
+            "pp": ("pipeline_parallel_size", "pipeline_parallel_size"),
+        }
+
+        for stage in stages:
+            cfg = applied.per_stage_config.get(stage.stage_id)
+            if cfg is None:
+                continue
+            overrides = stage.runtime_overrides or {}
+            declared = set(cfg.l1_owners.keys())
+
+            for kind, (field_name, attr) in axis_fields.items():
+                if kind in declared and overrides.get(field_name) is not None:
+                    cli_val = overrides[field_name]
+                    derived = getattr(cfg, attr)
+                    if cli_val != derived:
+                        logger.warning(
+                            "[composable_parallel] stage %s: CLI %s=%s overrides the "
+                            "strategy-derived %s=%s. The CLI value wins; remove one to avoid ambiguity.",
+                            stage.stage_id,
+                            field_name,
+                            cli_val,
+                            field_name,
+                            derived,
+                        )
+            if "stage_replica" in declared and overrides.get("num_replicas") is not None:
+                cli_val = overrides["num_replicas"]
+                if cli_val != cfg.stage_replica_size:
+                    logger.warning(
+                        "[composable_parallel] stage %s: CLI num_replicas=%s overrides the "
+                        "strategy-derived num_replicas=%s. The CLI value wins; remove one to avoid ambiguity.",
+                        stage.stage_id,
+                        cli_val,
+                        cfg.stage_replica_size,
+                    )
+
+            def _eff(field_name: str, fallback: Any) -> Any:
+                val = overrides.get(field_name)
+                return val if val is not None else fallback
+
+            def _eff_degree(field_name: str, source: dict[str, Any]) -> int:
+                # Single place the per-axis "default to 1" fallback is applied,
+                # for both the override and the YAML-default sides (see the
+                # _DEFAULT_PARALLEL_DEGREE TODO).
+                value = _eff(field_name, source.get(field_name, _DEFAULT_PARALLEL_DEGREE))
+                return int(value or _DEFAULT_PARALLEL_DEGREE)
+
+            check_device_layout(
+                _eff("devices", stage.yaml_runtime.get("devices")),
+                tensor_parallel_size=_eff_degree("tensor_parallel_size", stage.yaml_engine_args),
+                data_parallel_size=_eff_degree("data_parallel_size", stage.yaml_engine_args),
+                pipeline_parallel_size=_eff_degree("pipeline_parallel_size", stage.yaml_engine_args),
+                num_replicas=_eff_degree("num_replicas", stage.yaml_runtime),
+                role=stage.model_stage,
+            )
 
     @classmethod
     def create_default_diffusion(cls, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
@@ -420,13 +589,3 @@ class StageConfigFactory:
         ``filter_dataclass_kwargs(OmniEngineArgs, ...)``.
         """
         return build_stage_runtime_overrides(stage.stage_id, cli_overrides)
-
-    @staticmethod
-    def resolve_pipeline_config(model_type: str, hf_config: PretrainedConfig | None = None) -> PipelineConfig | None:
-        """Given a model type, resolve to the pipeline to be used. If the pipeline
-        maps to a callable we resolve based on the HF config."""
-        if model_type not in OMNI_PIPELINES:
-            logger.warning("Model type %s is not registered to OMNI_PIPELINES", model_type)
-            return None
-        obj = OMNI_PIPELINES[model_type]
-        return obj(hf_config) if callable(obj) else obj

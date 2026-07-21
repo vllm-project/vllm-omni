@@ -65,7 +65,7 @@ def get_wan22_i2v_post_process_func(
     ):
         if output_type == "latent":
             return video
-        custom_output = {}
+        video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(
                 video,
@@ -73,10 +73,10 @@ def get_wan22_i2v_post_process_func(
                 scale=sampling_params.frame_interpolation_scale,
                 model_path=sampling_params.frame_interpolation_model_path,
             )
-            custom_output["video_fps_multiplier"] = multiplier
+            video_metadata["video_fps_multiplier"] = multiplier
         return {
-            "video": video_processor.postprocess_video(video, output_type=output_type),
-            "custom_output": custom_output,
+            "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
+            "metadata": {"video": video_metadata} if video_metadata else {},
         }
 
     return post_process_func

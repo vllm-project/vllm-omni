@@ -270,6 +270,9 @@ class PipelineConfig:
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Bundled deploy defaults for this concrete pipeline topology. The file is
+    # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
+    default_deploy_config_name: str | None = None
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""

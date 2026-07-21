@@ -29,7 +29,7 @@ Usage:
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 
     # LTX-2.3 image-to-video
-    python image_to_video.py --model dg845/LTX-2.3-Diffusers \
+    python image_to_video.py --model diffusers/LTX-2.3-Diffusers \
         --model-class-name LTX23ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
         --height 384 --width 512 --num-frames 25 --num-inference-steps 20 \
@@ -101,6 +101,11 @@ def parse_args() -> argparse.Namespace:
         "--model-class-name",
         default=None,
         help="Override model class name (e.g., LTX2ImageToVideoPipeline or LTX23ImageToVideoPipeline).",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Optional deploy config YAML to use for pipeline-backed runs.",
     )
     parser.add_argument("--image", help="Path to the first-frame or source image.")
     parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
@@ -220,7 +225,7 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "gguf"],
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
     )
 
@@ -453,6 +458,8 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails

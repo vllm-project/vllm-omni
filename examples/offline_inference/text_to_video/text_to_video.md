@@ -8,7 +8,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | 480x832 | 81 | 30 | 5.0 | ~20 GiB (RTX 5090, VAE tiling) |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
-| `dg845/LTX-2.3-Diffusers` | 384x512 | 25 | 20 | 4.0 | 96GB-class GPU |
+| `diffusers/LTX-2.3-Diffusers` | 384x512 | 25 | 20 | 4.0 | 96GB-class GPU |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
@@ -75,7 +75,7 @@ python text_to_video.py \
 
 ```bash
 python text_to_video.py \
-  --model dg845/LTX-2.3-Diffusers \
+  --model diffusers/LTX-2.3-Diffusers \
   --model-class-name LTX23Pipeline \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
   --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
@@ -90,7 +90,7 @@ python text_to_video.py \
   --output ltx23_t2v_output.mp4
 ```
 
-Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers`; the
+Use the Diffusers-format checkpoint `diffusers/LTX-2.3-Diffusers`; the
 upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
 this pipeline. Pass `--model-class-name LTX23Pipeline` to select the LTX-2.3
 text-to-video pipeline explicitly.
@@ -231,7 +231,7 @@ python text_to_video.py \
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
 - `--audio-sample-rate`: audio sample rate for embedded audio (when the
   pipeline returns audio; LTX-2.3 outputs 48kHz audio).
-- `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
+- `--quantization`: quantization method (such as `fp8` for FP8).
 - `--flow-shift`: scheduler flow_shift parameter.
 - `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
 

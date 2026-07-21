@@ -73,17 +73,17 @@ _DIFFUSION_MODELS = {
     ),
     "LTX2ImageToVideoPipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2",
         "LTX2ImageToVideoPipeline",
     ),
     "LTX2TwoStagesPipeline": (
         "ltx2",
-        "pipeline_ltx2",
+        "pipeline_ltx2_two_stage",
         "LTX2TwoStagesPipeline",
     ),
     "LTX2ImageToVideoTwoStagesPipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2_two_stage",
         "LTX2ImageToVideoTwoStagesPipeline",
     ),
     "LTX2T2VDMD2Pipeline": (
@@ -93,17 +93,17 @@ _DIFFUSION_MODELS = {
     ),
     "LTX2I2VDMD2Pipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2",
         "LTX2I2VDMD2Pipeline",
     ),
     "LTX23Pipeline": (
         "ltx2",
-        "pipeline_ltx2_3",
+        "pipeline_ltx2",
         "LTX23Pipeline",
     ),
     "LTX23ImageToVideoPipeline": (
         "ltx2",
-        "pipeline_ltx2_3_image2video",
+        "pipeline_ltx2",
         "LTX23ImageToVideoPipeline",
     ),
     "StableAudioPipeline": (
@@ -266,6 +266,11 @@ _DIFFUSION_MODELS = {
         "pipeline_micro_world_i2w",
         "MicroWorldI2WPipeline",
     ),
+    "LingBotVideoPipeline": (
+        "lingbot_video",
+        "pipeline_lingbot_video",
+        "LingBotVideoPipeline",
+    ),
     "MagiHumanPipeline": (
         "magi_human",
         "pipeline_magi_human",
@@ -282,6 +287,11 @@ _DIFFUSION_MODELS = {
         "OmniVoicePipeline",
     ),
     "Cosmos3OmniDiffusersPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3",
+        "Cosmos3OmniDiffusersPipeline",
+    ),
+    "Cosmos3OmniPipeline": (
         "cosmos3",
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
@@ -315,6 +325,11 @@ _DIFFUSION_MODELS = {
         "sdxl",
         "pipeline_sdxl",
         "StableDiffusionXLPipeline",
+    ),
+    "Krea2Pipeline": (
+        "krea2",
+        "pipeline_krea2",
+        "Krea2Pipeline",
     ),
 }
 
@@ -538,20 +553,16 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "MicroWorldT2WPipeline": "get_micro_world_t2w_post_process_func",
     "MicroWorldI2WPipeline": "get_micro_world_i2w_post_process_func",
+    "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
-}
-
-_DIFFUSION_ACTION_POST_PROCESS_FUNCS = {
-    # arch: action_post_process_func
-    # `action_post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
-    # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
-    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_action_post_process_func",
+    "Krea2Pipeline": "get_krea2_post_process_func",
 }
 
 _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
@@ -559,6 +570,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # `ir_op_priority_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -585,6 +597,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "MicroWorldI2WPipeline": "get_micro_world_i2w_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_svc_pre_process_func",
 }
@@ -596,8 +609,8 @@ def register_diffusion_model(
     class_name: str,
     pre_process_func_name: str | None = None,
     post_process_func_name: str | None = None,
-    action_post_process_func_name: str | None = None,
     ir_op_priority_func_name: str | None = None,
+    action_post_process_func_name: str | None = None,
 ) -> None:
     """Register a diffusion model pipeline from an out-of-tree plugin.
 
@@ -616,13 +629,23 @@ def register_diffusion_model(
         post_process_func_name: Optional name of the post-process function
             located in *module_name*.  Pass ``None`` to keep the existing
             entry when replacing a built-in model.
-        action_post_process_func_name: Optional name of the action post-process
-            function located in *module_name*.  Pass ``None`` to keep the
-            existing entry when replacing a built-in model.
         ir_op_priority_func_name: Optional name of the IR op priority merge
             function located in *module_name*. Pass ``None`` to keep the
             existing entry when replacing a built-in model.
+        action_post_process_func_name: Deprecated compatibility-only keyword
+            for out-of-tree plugins. Action postprocess hooks are no longer
+            registered separately; move action handling into
+            ``post_process_func_name`` and return a payload/metadata envelope.
     """
+    if action_post_process_func_name is not None:
+        logger.warning(
+            "Ignoring deprecated action_post_process_func_name=%r for diffusion "
+            "model %s. Move action postprocess logic into post_process_func_name "
+            "and return payload/metadata output.",
+            action_post_process_func_name,
+            model_arch,
+        )
+
     # Register model class in DiffusionModelRegistry
     DiffusionModelRegistry.register_model(
         model_arch,
@@ -639,8 +662,6 @@ def register_diffusion_model(
         _DIFFUSION_PRE_PROCESS_FUNCS[model_arch] = pre_process_func_name
     if post_process_func_name is not None:
         _DIFFUSION_POST_PROCESS_FUNCS[model_arch] = post_process_func_name
-    if action_post_process_func_name is not None:
-        _DIFFUSION_ACTION_POST_PROCESS_FUNCS[model_arch] = action_post_process_func_name
     if ir_op_priority_func_name is not None:
         _DIFFUSION_IR_OP_PRIORITY_FUNCS[model_arch] = ir_op_priority_func_name
 
@@ -670,13 +691,6 @@ def get_diffusion_post_process_func(od_config: OmniDiffusionConfig):
     if od_config.model_class_name not in _DIFFUSION_POST_PROCESS_FUNCS:
         return None
     func_name = _DIFFUSION_POST_PROCESS_FUNCS[od_config.model_class_name]
-    return _load_process_func(od_config, func_name)
-
-
-def get_diffusion_action_post_process_func(od_config: OmniDiffusionConfig):
-    if od_config.model_class_name not in _DIFFUSION_ACTION_POST_PROCESS_FUNCS:
-        return None
-    func_name = _DIFFUSION_ACTION_POST_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
 
 

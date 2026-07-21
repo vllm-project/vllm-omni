@@ -23,22 +23,7 @@ from dataclasses import dataclass
 import torch
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
-
-try:
-    from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
-except ModuleNotFoundError:
-
-    def register_kv_cache_spec(*, manager_class, uniform_type_base_spec=None):
-        """Compatibility shim for vLLM versions without kv_cache_spec_registry."""
-
-        def decorator(spec_class):
-            from vllm.v1.core.single_type_kv_cache_manager import spec_manager_map
-
-            spec_manager_map[spec_class] = manager_class
-            return spec_class
-
-        return decorator
-
+from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
 
 # ── Slot mapping ────────────────────────────────────────────────────────────
 

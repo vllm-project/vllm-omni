@@ -1034,7 +1034,7 @@ class Flux2Transformer2DModel(nn.Module):
             name = original_name
             if name not in params_dict and ".to_out.0." in name:
                 name = name.replace(".to_out.0.", ".to_out.")
-            # Some GGUF checkpoints include quantized tensors for modules that
+            # Some quantized checkpoints include tensors for modules that
             # are intentionally left unquantized in this model.
             param = params_dict.get(name)
             if param is None:

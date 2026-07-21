@@ -73,8 +73,19 @@ def get_qwen_image_post_process_func(
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
     def post_process_func(
-        images: torch.Tensor,
+        images: torch.Tensor | dict[str, Any],
     ):
+        if isinstance(images, dict) and isinstance(images.get("payload"), dict):
+            payload = dict(images["payload"])
+            image_payload = payload.get("image")
+            if image_payload is None:
+                raise ValueError("Qwen-Image postprocess expected payload['image'] in output envelope.")
+            payload["image"] = image_processor.postprocess(image_payload)
+            metadata = images.get("metadata") or {}
+            return {
+                "payload": payload,
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            }
         return image_processor.postprocess(images)
 
     return post_process_func

@@ -60,8 +60,9 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_cosmos3_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("Cosmos3OmniDiffusersPipeline") == frozenset(
+@pytest.mark.parametrize("pipeline_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
+def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_name: str) -> None:
+    assert get_extra_body_params(pipeline_name) == frozenset(
         {
             "flow_shift",
             "max_sequence_length",
@@ -98,7 +99,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params() -> None:
             "session_id",
         }
     )
-    assert get_extra_output_params("Cosmos3OmniDiffusersPipeline") == frozenset(
+    assert get_extra_output_params(pipeline_name) == frozenset(
         {
             "action",
             "raw_action_dim",
@@ -106,7 +107,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params() -> None:
             "action_mode",
         }
     )
-    assert should_init_extra_args_for_non_diffusion_stages("Cosmos3OmniDiffusersPipeline") is False
+    assert should_init_extra_args_for_non_diffusion_stages(pipeline_name) is False
 
 
 @pytest.mark.core_model
@@ -224,9 +225,10 @@ def test_ming_flash_omni_image_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
+@pytest.mark.parametrize("pipeline_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
+def test_cosmos3_text_to_image_prompt_builder_selects_image_modality(pipeline_name: str) -> None:
     assert build_text_to_image_prompt(
-        "Cosmos3OmniDiffusersPipeline",
+        pipeline_name,
         prompt="a red sports car at golden hour",
         negative_prompt="blurry, distorted",
         height=1024,
@@ -237,7 +239,7 @@ def test_cosmos3_text_to_image_prompt_builder_selects_image_modality() -> None:
         "negative_prompt": "blurry, distorted",
     }
     assert build_text_to_image_prompt(
-        "Cosmos3OmniDiffusersPipeline",
+        pipeline_name,
         prompt="a red sports car",
         negative_prompt=None,
     ) == {"prompt": "a red sports car", "modalities": ["image"]}

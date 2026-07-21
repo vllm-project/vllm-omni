@@ -1,4 +1,4 @@
-# MiMo-Audio Offline Inference
+# MiMo-Audio: Offline inference
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/mimo_audio>.
 

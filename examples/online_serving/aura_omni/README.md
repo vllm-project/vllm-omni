@@ -1,4 +1,4 @@
-# AURA Omni Native Pipeline
+# AURA Omni: Online serving
 
 `aura_omni` serves AURA as a native multi-stage vLLM-Omni pipeline:
 

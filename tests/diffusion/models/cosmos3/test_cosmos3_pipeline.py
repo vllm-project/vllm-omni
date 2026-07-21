@@ -20,26 +20,52 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def test_pipeline_declares_layerwise_offload_components() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    assert Cosmos3OmniDiffusersPipeline._dit_modules == ["transformer.language_model", "transformer"]
+    assert Cosmos3OmniDiffusersPipeline._encoder_modules == []
+    assert Cosmos3OmniDiffusersPipeline._vae_modules == ["vae"]
+    assert Cosmos3OmniDiffusersPipeline._resident_modules == []
+    assert hasattr(Cosmos3OmniDiffusersPipeline, "enable_omni_model_cpu_offload")
+
+
 class StubScheduler:
     def __init__(
         self,
         timesteps: list[int] | None = None,
         *,
         flow_shift: float = 1.0,
-        use_karras_sigmas: bool = True,
     ) -> None:
         self.timesteps = torch.tensor(timesteps or [9, 3], dtype=torch.int64)
         self.config = SimpleNamespace(
             num_train_timesteps=1000,
             flow_shift=flow_shift,
-            use_karras_sigmas=use_karras_sigmas,
         )
-        self.set_timesteps_calls: list[tuple[int, torch.device]] = []
+        self.set_timesteps_calls: list[dict[str, Any]] = []
         self.step_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    def set_timesteps(self, num_steps: int, device: torch.device) -> None:
-        self.set_timesteps_calls.append((num_steps, device))
-        self.timesteps = torch.arange(num_steps, 0, -1, dtype=torch.int64, device=device)
+    def set_timesteps(
+        self,
+        num_inference_steps: int | None = None,
+        device: str | torch.device | None = None,
+        *,
+        shift: float | None = None,
+        sigmas: list[float] | None = None,
+    ) -> None:
+        self.set_timesteps_calls.append(
+            {
+                "num_inference_steps": num_inference_steps,
+                "device": device,
+                "shift": shift,
+                "sigmas": sigmas,
+            }
+        )
+        if sigmas is not None:
+            self.timesteps = torch.tensor(sigmas, device=device)
+        else:
+            assert num_inference_steps is not None
+            self.timesteps = torch.arange(num_inference_steps, 0, -1, dtype=torch.int64, device=device)
 
     def step(self, noise_pred: torch.Tensor, timestep: torch.Tensor, latents: torch.Tensor, **kwargs):
         del kwargs
@@ -190,6 +216,7 @@ def fake_cosmos3_guardrails(monkeypatch: pytest.MonkeyPatch):
 def make_cosmos3_pipeline():
     def _make():
         from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+            COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT,
             Cosmos3OmniDiffusersPipeline,
         )
 
@@ -203,11 +230,10 @@ def make_cosmos3_pipeline():
         pipeline.vae_scale_factor_temporal = 4
         pipeline.vae_scale_factor_spatial = 8
         pipeline.scheduler = StubScheduler([9, 3], flow_shift=1.0)
-        pipeline._base_scheduler_config = pipeline.scheduler.config
-        pipeline._engine_init_flow_shift = 1.0
-        pipeline._current_flow_shift = 1.0
-        pipeline._base_scheduler_use_karras_sigmas = True
-        pipeline._current_scheduler_use_karras_sigmas = True
+        pipeline._engine_init_flow_shift = COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT
+        pipeline._current_flow_shift = COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT
+        pipeline.is_distilled_model = False
+        pipeline.is_edge_model = False
         pipeline._guidance_scale = None
         pipeline._num_timesteps = None
         pipeline._cosmos3_branch_caches = None
@@ -233,6 +259,7 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "num_frames": None,
         "num_inference_steps": None,
         "guidance_scale": None,
+        "guidance_scale_provided": False,
         "generator": None,
         "seed": 123,
         "num_outputs_per_prompt": 1,
@@ -278,13 +305,171 @@ def _mask() -> torch.Tensor:
     return torch.ones(1, 1, dtype=torch.long)
 
 
+def _capture_tokenize_calls(pipeline: Any) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+
+    def _tokenize(
+        text: str,
+        max_sequence_length: int,
+        use_system_prompt: bool = False,
+        system_prompt: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        index = len(calls) + 1
+        calls.append(
+            {
+                "text": text,
+                "max_sequence_length": max_sequence_length,
+                "use_system_prompt": use_system_prompt,
+                "system_prompt": system_prompt,
+            }
+        )
+        return _ids(index), torch.full((1, 1), index, dtype=torch.long)
+
+    pipeline._tokenize_prompt = _tokenize
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("provided", "value", "default", "is_distilled", "expected"),
+    [
+        (False, 1.0, 7.0, False, 7.0),
+        (True, 1.0, 7.0, False, 1.0),
+        (True, 4.5, 7.0, False, 4.5),
+        (False, 1.0, 7.0, True, 1.0),
+        (True, 4.5, 7.0, True, 1.0),
+    ],
+)
+def test_resolve_guidance_scale(
+    make_cosmos3_pipeline,
+    provided: bool,
+    value: float,
+    default: float,
+    is_distilled: bool,
+    expected: float,
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.is_distilled_model = is_distilled
+    sp = make_sampling_params(
+        guidance_scale=value,
+        guidance_scale_provided=provided,
+    )
+
+    assert pipeline._resolve_guidance_scale(sp, default) == expected
+
+
+def test_distilled_generation_accepts_t2i_and_i2v(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.is_distilled_model = True
+    common = {
+        "action_enabled": False,
+        "transfer_config": None,
+        "is_v2v": False,
+        "sound_enabled": False,
+    }
+
+    pipeline._validate_distilled_generation_mode(
+        is_t2i=True,
+        image_tensor=None,
+        **common,
+    )
+    pipeline._validate_distilled_generation_mode(
+        is_t2i=False,
+        image_tensor=torch.zeros(1),
+        **common,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"action_enabled": True}, "action requests are unsupported"),
+        ({"transfer_config": SimpleNamespace()}, "transfer requests are unsupported"),
+        ({"is_v2v": True}, "video-to-video requests are unsupported"),
+        ({"sound_enabled": True}, "sound generation is unsupported"),
+        (
+            {"is_t2i": False, "image_tensor": None},
+            "text-to-video requests are unsupported",
+        ),
+        (
+            {"is_t2i": True, "image_tensor": torch.zeros(1)},
+            "image-conditioned image generation is unsupported",
+        ),
+    ],
+)
+def test_distilled_generation_rejects_unsupported_modes(
+    make_cosmos3_pipeline,
+    overrides: dict[str, Any],
+    message: str,
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.is_distilled_model = True
+    kwargs = {
+        "is_t2i": True,
+        "image_tensor": None,
+        "action_enabled": False,
+        "transfer_config": None,
+        "is_v2v": False,
+        "sound_enabled": False,
+    }
+    kwargs.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        pipeline._validate_distilled_generation_mode(**kwargs)
+
+
+def test_distilled_generation_rejects_robolab_policy(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.is_distilled_model = True
+
+    with pytest.raises(ValueError, match="RoboLab/action policy requests are unsupported"):
+        pipeline._forward_robolab_policy(make_sampling_params(), None, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "sampling_params", "message"),
+    [
+        (
+            {"prompt": "x", "modalities": ["video"], "generate_sound": True},
+            make_sampling_params(),
+            "do not support sound generation",
+        ),
+        (
+            {"prompt": "x", "modalities": ["video"]},
+            make_sampling_params(extra_args={"edge": {"control_path": "/tmp/control.mp4"}}),
+            "do not support transfer inference",
+        ),
+        (
+            {
+                "prompt": "x",
+                "modalities": ["video"],
+                "additional_information": {
+                    "preprocessed_video": torch.zeros(1, 3, 5, 16, 16),
+                },
+            },
+            make_sampling_params(height=16, width=16, num_frames=5),
+            "do not support video-to-video generation",
+        ),
+    ],
+)
+def test_edge_forward_rejects_unsupported_modes(
+    make_cosmos3_pipeline,
+    prompt: dict[str, Any],
+    sampling_params: SimpleNamespace,
+    message: str,
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.is_edge_model = True
+
+    with pytest.raises(ValueError, match=message):
+        pipeline.forward(SimpleNamespace(prompts=[prompt], sampling_params=sampling_params))
+
+
 def test_pipeline_registered_and_exported() -> None:
     from vllm_omni.diffusion.cache.cache_dit_backend import CUSTOM_DIT_ENABLERS
     from vllm_omni.diffusion.models import cosmos3
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
     from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
     from vllm_omni.diffusion.registry import (
-        _DIFFUSION_ACTION_POST_PROCESS_FUNCS,
         _DIFFUSION_IR_OP_PRIORITY_FUNCS,
         _DIFFUSION_MODELS,
         _DIFFUSION_POST_PROCESS_FUNCS,
@@ -294,19 +479,44 @@ def test_pipeline_registered_and_exported() -> None:
     assert issubclass(Cosmos3OmniDiffusersPipeline, nn.Module)
     assert issubclass(Cosmos3OmniDiffusersPipeline, ProgressBarMixin)
     assert Cosmos3OmniDiffusersPipeline.support_image_input is True
-    assert _DIFFUSION_MODELS["Cosmos3OmniDiffusersPipeline"] == (
-        "cosmos3",
-        "pipeline_cosmos3",
-        "Cosmos3OmniDiffusersPipeline",
-    )
-    assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_pre_process_func"
-    assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_post_process_func"
-    assert (
-        _DIFFUSION_ACTION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_action_post_process_func"
-    )
-    assert _DIFFUSION_IR_OP_PRIORITY_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_ir_op_priority_func"
-    assert "Cosmos3OmniDiffusersPipeline" in CUSTOM_DIT_ENABLERS
     assert "Cosmos3OmniDiffusersPipeline" in cosmos3.__all__
+
+    for pipeline_name in ("Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"):
+        assert _DIFFUSION_MODELS[pipeline_name] == (
+            "cosmos3",
+            "pipeline_cosmos3",
+            "Cosmos3OmniDiffusersPipeline",
+        )
+        assert _DIFFUSION_PRE_PROCESS_FUNCS[pipeline_name] == "get_cosmos3_pre_process_func"
+        assert _DIFFUSION_POST_PROCESS_FUNCS[pipeline_name] == "get_cosmos3_post_process_func"
+        assert _DIFFUSION_IR_OP_PRIORITY_FUNCS[pipeline_name] == "get_cosmos3_ir_op_priority_func"
+        assert pipeline_name in CUSTOM_DIT_ENABLERS
+
+
+@pytest.mark.parametrize(
+    "pipeline_name",
+    ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"],
+)
+def test_cosmos3_model_index_resolves_pipeline(
+    tmp_path,
+    pipeline_name: str,
+) -> None:
+    import json
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        Cosmos3OmniDiffusersPipeline,
+    )
+    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": pipeline_name}))
+
+    config = OmniDiffusionConfig(model=str(tmp_path))
+    config.enrich_config()
+
+    assert config.model_class_name == pipeline_name
+    resolved_pipeline_cls = DiffusionModelRegistry._try_load_model_cls(config.model_class_name)
+    assert resolved_pipeline_cls is Cosmos3OmniDiffusersPipeline
 
 
 @pytest.fixture
@@ -329,25 +539,24 @@ def stub_real_pipeline_init(monkeypatch: pytest.MonkeyPatch):
             return self
 
     class _StubDiffusersScheduler:
+        load_config_calls: list[dict[str, Any]] = []
         from_config_calls: list[dict[str, Any]] = []
 
-        def __init__(self, *, flow_shift: float = 1.0, use_karras_sigmas: bool = True) -> None:
-            self.config = SimpleNamespace(flow_shift=flow_shift, use_karras_sigmas=use_karras_sigmas)
+        def __init__(self, *, flow_shift: float = 1.0) -> None:
+            self.config = SimpleNamespace(flow_shift=flow_shift)
 
         @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            return cls()
+        def load_config(cls, *args, **kwargs):
+            cls.load_config_calls.append({"args": args, "kwargs": dict(kwargs)})
+            return {
+                "_class_name": "UniPCMultistepScheduler",
+                "flow_shift": 1.0,
+            }
 
         @classmethod
         def from_config(cls, config, **kwargs):
             cls.from_config_calls.append({"config": config, "kwargs": dict(kwargs)})
-            return cls(
-                flow_shift=kwargs.get("flow_shift", getattr(config, "flow_shift", 1.0)),
-                use_karras_sigmas=kwargs.get(
-                    "use_karras_sigmas",
-                    getattr(config, "use_karras_sigmas", True),
-                ),
-            )
+            return cls(flow_shift=kwargs.get("shift", config.get("flow_shift", 1.0)))
 
     class _StubVideoProcessor:
         def __init__(self, *args, **kwargs) -> None:
@@ -355,13 +564,18 @@ def stub_real_pipeline_init(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(pipeline_cosmos3, "AutoTokenizer", _StubAutoTokenizer)
     monkeypatch.setattr(pipeline_cosmos3, "DistributedAutoencoderKLWan", _StubDiffusersVAE)
-    monkeypatch.setattr(pipeline_cosmos3, "UniPCMultistepScheduler", _StubDiffusersScheduler)
+    monkeypatch.setattr(pipeline_cosmos3, "FlowUniPCMultistepScheduler", _StubDiffusersScheduler)
     monkeypatch.setattr(pipeline_cosmos3, "VideoProcessor", _StubVideoProcessor)
     monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cpu"))
     return _StubDiffusersScheduler
 
 
-def _make_od_config(*, sound_gen: bool) -> SimpleNamespace:
+def _make_od_config(
+    *,
+    sound_gen: bool,
+    tf_model_config_overrides: dict[str, Any] | None = None,
+    model_config: dict[str, Any] | None = None,
+) -> SimpleNamespace:
     tf_model_config = {
         "hidden_size": 8,
         "num_hidden_layers": 0,
@@ -376,6 +590,8 @@ def _make_od_config(*, sound_gen: bool) -> SimpleNamespace:
     }
     if sound_gen:
         tf_model_config["sound_gen"] = True
+    if tf_model_config_overrides:
+        tf_model_config.update(tf_model_config_overrides)
     return SimpleNamespace(
         enable_cpu_offload=False,
         enable_diffusion_pipeline_profiler=False,
@@ -384,7 +600,7 @@ def _make_od_config(*, sound_gen: bool) -> SimpleNamespace:
         flow_shift=None,
         quantization_config=None,
         custom_pipeline_args={},
-        model_config={},
+        model_config=model_config or {},
         tf_model_config=tf_model_config,
     )
 
@@ -394,16 +610,13 @@ def test_pipeline_init_skips_tokenizer_when_sound_disabled(stub_real_pipeline_in
 
     pipeline = Cosmos3OmniDiffusersPipeline(od_config=_make_od_config(sound_gen=False))
 
-    assert stub_real_pipeline_init.from_config_calls == []
     assert pipeline._sound_tokenizer is None
     assert pipeline.transformer.sound_gen is False
     assert not hasattr(pipeline.transformer, "audio_proj_in")
     assert not hasattr(pipeline.transformer, "audio_proj_out")
-    assert pipeline._base_scheduler_use_karras_sigmas is True
-    assert pipeline._current_scheduler_use_karras_sigmas is True
 
 
-def test_pipeline_init_rebuilds_scheduler_with_cosmos3_defaults(stub_real_pipeline_init) -> None:
+def test_pipeline_init_uses_flow_unipc_with_cosmos3_defaults(stub_real_pipeline_init) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
 
     od_config = _make_od_config(sound_gen=False)
@@ -411,55 +624,301 @@ def test_pipeline_init_rebuilds_scheduler_with_cosmos3_defaults(stub_real_pipeli
 
     pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
-    assert stub_real_pipeline_init.from_config_calls
-    call = stub_real_pipeline_init.from_config_calls[-1]
-    assert getattr(call["config"], "flow_shift") == 1.0
-    assert call["kwargs"] == {"flow_shift": 2.5}
+    assert len(stub_real_pipeline_init.load_config_calls) == 1
+    assert len(stub_real_pipeline_init.from_config_calls) == 1
+    call = stub_real_pipeline_init.from_config_calls[0]
+    assert call["config"]["_class_name"] == "UniPCMultistepScheduler"
+    assert call["kwargs"] == {
+        "shift": 1.0,
+        "use_dynamic_shifting": False,
+        "prediction_type": "flow_prediction",
+    }
+    assert pipeline.is_distilled_model is False
     assert pipeline._engine_init_flow_shift == 2.5
-    assert pipeline._base_scheduler_use_karras_sigmas is True
 
 
-def test_set_flow_shift_restores_checkpoint_scheduler_mode(
-    make_cosmos3_pipeline,
+@pytest.mark.parametrize(
+    ("scheduler_class_name", "expected_distilled"),
+    [
+        ("FlowMatchEulerDiscreteScheduler", True),
+        ("UniPCMultistepScheduler", False),
+    ],
+)
+def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
+    tmp_path,
+    stub_real_pipeline_init,
     monkeypatch: pytest.MonkeyPatch,
+    scheduler_class_name: str,
+    expected_distilled: bool,
 ) -> None:
+    import json
+
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+        FlowUniPCMultistepScheduler as RealFlowUniPCMultistepScheduler,
+    )
 
-    class RecordingScheduler:
-        from_config_calls: list[dict[str, Any]] = []
+    t_list = [1.0, 0.75, 0.5, 0.25]
+    scheduler_dir = tmp_path / "scheduler"
+    scheduler_dir.mkdir()
+    scheduler_config = {"_class_name": scheduler_class_name}
+    if expected_distilled:
+        scheduler_config["fixed_step_sampler_config"] = {"sample_type": "sde", "t_list": t_list}
+    (scheduler_dir / "scheduler_config.json").write_text(json.dumps(scheduler_config))
 
-        def __init__(self, *, flow_shift: float, use_karras_sigmas: bool) -> None:
-            self.config = SimpleNamespace(flow_shift=flow_shift, use_karras_sigmas=use_karras_sigmas)
+    class StubFlowUniPCScheduler(StubScheduler):
+        from_config_calls: list[tuple[Any, dict[str, Any]]] = []
+
+        @classmethod
+        def load_config(cls, *args, **kwargs):
+            return RealFlowUniPCMultistepScheduler.load_config(*args, **kwargs)
 
         @classmethod
         def from_config(cls, config, **kwargs):
-            cls.from_config_calls.append({"config": config, "kwargs": dict(kwargs)})
-            return cls(
-                flow_shift=kwargs.get("flow_shift", getattr(config, "flow_shift", 1.0)),
-                use_karras_sigmas=kwargs.get(
-                    "use_karras_sigmas",
-                    getattr(config, "use_karras_sigmas", True),
-                ),
-            )
+            cls.from_config_calls.append((config, dict(kwargs)))
+            return cls()
 
-    monkeypatch.setattr(pipeline_cosmos3, "UniPCMultistepScheduler", RecordingScheduler)
-    pipeline = make_cosmos3_pipeline()
+    class StubFlowMatchScheduler(StubScheduler):
+        from_config_calls: list[tuple[Any, dict[str, Any]]] = []
 
-    pipeline._set_flow_shift(10.0, use_karras_sigmas=False)
-    assert RecordingScheduler.from_config_calls[-1]["kwargs"] == {
-        "flow_shift": 10.0,
-        "use_karras_sigmas": False,
+        @classmethod
+        def from_config(cls, config, **kwargs):
+            cls.from_config_calls.append((config, dict(kwargs)))
+            scheduler = cls()
+            scheduler.config.fixed_step_sampler_config = config["fixed_step_sampler_config"]
+            return scheduler
+
+    monkeypatch.setattr(pipeline_cosmos3, "FlowUniPCMultistepScheduler", StubFlowUniPCScheduler)
+    monkeypatch.setattr(
+        pipeline_cosmos3,
+        "FlowMatchEulerDiscreteScheduler",
+        StubFlowMatchScheduler,
+    )
+
+    od_config = _make_od_config(sound_gen=False)
+    od_config.model = str(tmp_path)
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+    assert pipeline.is_distilled_model is expected_distilled
+    if expected_distilled:
+        assert len(StubFlowMatchScheduler.from_config_calls) == 1
+        assert StubFlowMatchScheduler.from_config_calls[0][1] == {"stochastic_sampling": True}
+        assert StubFlowUniPCScheduler.from_config_calls == []
+        assert pipeline._scheduler_init_t_list == t_list
+    else:
+        assert len(StubFlowUniPCScheduler.from_config_calls) == 1
+        assert StubFlowMatchScheduler.from_config_calls == []
+        assert not hasattr(pipeline, "_scheduler_init_t_list")
+
+
+def test_distilled_pipeline_initializes_sde_scheduler(
+    stub_real_pipeline_init,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        Cosmos3OmniDiffusersPipeline,
+        FlowMatchEulerDiscreteScheduler,
+    )
+
+    t_list = [1.0, 0.9375, 0.8333333333333334, 0.625]
+    scheduler_config = {
+        "_class_name": "FlowMatchEulerDiscreteScheduler",
+        "shift": 1.0,
+        "stochastic_sampling": False,
+        "fixed_step_sampler_config": {
+            "sample_type": "sde",
+            "t_list": t_list,
+        },
     }
-    assert pipeline._current_flow_shift == 10.0
-    assert pipeline._current_scheduler_use_karras_sigmas is False
+    monkeypatch.setattr(
+        stub_real_pipeline_init,
+        "load_config",
+        classmethod(lambda cls, *args, **kwargs: scheduler_config),
+    )
 
-    pipeline._set_flow_shift(10.0)
-    assert RecordingScheduler.from_config_calls[-1]["kwargs"] == {"flow_shift": 10.0}
-    assert pipeline._current_flow_shift == 10.0
-    assert pipeline._current_scheduler_use_karras_sigmas is True
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=_make_od_config(sound_gen=False))
+    assert pipeline.is_distilled_model is True
+    assert isinstance(pipeline.scheduler, FlowMatchEulerDiscreteScheduler)
+    assert pipeline.scheduler.config.stochastic_sampling is True
+    assert pipeline._scheduler_init_t_list == t_list
 
-    pipeline._set_flow_shift(10.0)
-    assert len(RecordingScheduler.from_config_calls) == 2
+
+@pytest.mark.parametrize(
+    ("fixed_step_config", "error_pattern"),
+    [
+        pytest.param(
+            {"t_list": [1.0, 0.5]},
+            r"fixed_step_sampler_config\.sample_type=sde",
+            id="missing-sample-type",
+        ),
+        pytest.param(
+            {"sample_type": "ode", "t_list": [1.0, 0.5]},
+            r"fixed_step_sampler_config\.sample_type=sde",
+            id="unsupported-sample-type",
+        ),
+        pytest.param(
+            {"sample_type": "sde"},
+            r"non-empty fixed_step_sampler_config\.t_list",
+            id="missing-t-list",
+        ),
+        pytest.param(
+            {"sample_type": "sde", "t_list": []},
+            r"non-empty fixed_step_sampler_config\.t_list",
+            id="empty-t-list",
+        ),
+    ],
+)
+def test_distilled_scheduler_validates_fixed_step_config(
+    stub_real_pipeline_init,
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_step_config: dict[str, Any],
+    error_pattern: str,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        Cosmos3OmniDiffusersPipeline,
+    )
+
+    scheduler_config = {
+        "_class_name": "FlowMatchEulerDiscreteScheduler",
+        "fixed_step_sampler_config": fixed_step_config,
+    }
+    monkeypatch.setattr(
+        stub_real_pipeline_init,
+        "load_config",
+        classmethod(lambda cls, *args, **kwargs: scheduler_config),
+    )
+
+    with pytest.raises(ValueError, match=error_pattern):
+        Cosmos3OmniDiffusersPipeline(od_config=_make_od_config(sound_gen=False))
+
+
+def test_pipeline_init_selects_edge_transformer_from_backbone_type(stub_real_pipeline_init) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_EDGE_VIDEO_DEFAULT_FLOW_SHIFT,
+        Cosmos3OmniDiffusersPipeline,
+    )
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
+        COSMOS3_EDGE_BACKBONE_TYPE,
+        Cosmos3EdgeVFMTransformer,
+    )
+
+    pipeline = Cosmos3OmniDiffusersPipeline(
+        od_config=_make_od_config(
+            sound_gen=False,
+            tf_model_config_overrides={
+                "backbone_type": COSMOS3_EDGE_BACKBONE_TYPE,
+                "qk_norm_for_text": False,
+                "latent_channel": 48,
+                "latent_patch_size": 2,
+                "temporal_compression_factor": 4,
+                "layer_norm_epsilon": 1e-5,
+            },
+        )
+    )
+
+    assert isinstance(pipeline.transformer, Cosmos3EdgeVFMTransformer)
+    assert pipeline.is_edge_model is True
+    assert pipeline._engine_init_flow_shift == COSMOS3_EDGE_VIDEO_DEFAULT_FLOW_SHIFT
+
+
+def test_pipeline_init_does_not_select_edge_from_model_index_class_name(stub_real_pipeline_init) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import Cosmos3EdgeVFMTransformer
+
+    pipeline = Cosmos3OmniDiffusersPipeline(
+        od_config=_make_od_config(
+            sound_gen=False,
+            model_config={"_class_name": "Cosmos3EdgeOmniDiffusersPipeline"},
+        )
+    )
+
+    assert isinstance(pipeline.transformer, Cosmos3VFMTransformer)
+    assert not isinstance(pipeline.transformer, Cosmos3EdgeVFMTransformer)
+
+
+def test_flow_unipc_reuses_scheduler_and_forwards_each_request_shift(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    scheduler = pipeline.scheduler
+
+    assert pipeline._engine_init_flow_shift == 10.0
+    assert pipeline._current_flow_shift == 10.0
+    assert scheduler.config.flow_shift == 1.0
+
+    for shift in (3.0, 10.0):
+        pipeline._set_flow_shift(shift)
+        pipeline._set_timesteps(4, torch.device("cpu"), shift=pipeline._current_flow_shift)
+
+    assert pipeline.scheduler is scheduler
+    assert pipeline._current_flow_shift == 10.0
+    assert [call["shift"] for call in scheduler.set_timesteps_calls] == [3.0, 10.0]
+    assert all(call["num_inference_steps"] == 4 for call in scheduler.set_timesteps_calls)
+    assert all(call["sigmas"] is None for call in scheduler.set_timesteps_calls)
+
+
+def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
+        FlowUniPCMultistepScheduler,
+    )
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler = FlowUniPCMultistepScheduler(
+        shift=1.0,
+        use_dynamic_shifting=False,
+        prediction_type="flow_prediction",
+    )
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (
+        _ids(1),
+        _mask(),
+        _ids(0),
+        _mask(),
+    )
+
+    def run(seed: int) -> torch.Tensor:
+        request = make_request_batch(
+            {"prompt": "A test video.", "modalities": ["video"]},
+            make_sampling_params(
+                seed=seed,
+                guidance_scale=1.0,
+                guidance_scale_provided=True,
+                num_inference_steps=4,
+                num_frames=5,
+                height=16,
+                width=16,
+                extra_args={"flow_shift": 3.0},
+            ),
+        )
+        output = pipeline.forward(request)
+        return output.output["video"]
+
+    first = run(123)
+    second = run(123)
+    different_seed = run(456)
+
+    torch.testing.assert_close(first, second)
+    assert not torch.equal(first, different_seed)
+
+
+def test_distilled_set_timesteps_uses_fixed_sigma_schedule(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.is_distilled_model = True
+    pipeline._scheduler_init_t_list = [1.0, 0.75, 0.5, 0.25]
+
+    pipeline._set_timesteps(
+        num_inference_steps=99,
+        device=torch.device("cpu"),
+        shift=7.0,
+    )
+
+    assert pipeline.scheduler.set_timesteps_calls == [
+        {
+            "num_inference_steps": None,
+            "device": torch.device("cpu"),
+            "shift": None,
+            "sigmas": pipeline._scheduler_init_t_list,
+        }
+    ]
 
 
 def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
@@ -708,11 +1167,11 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
 def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         RoboLabPolicyInputs,
-        get_cosmos3_action_post_process_func,
+        get_cosmos3_post_process_func,
         make_robolab_action_postprocess_inputs,
     )
 
-    func = get_cosmos3_action_post_process_func(SimpleNamespace())
+    func = get_cosmos3_post_process_func(SimpleNamespace())
     inputs = RoboLabPolicyInputs(
         prompt="Pick the cube.",
         video_tensor=torch.zeros(1, 3, 3, 16, 16),
@@ -736,13 +1195,41 @@ def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     )
 
     action = torch.tensor([[[0.0, 0.25], [1.0, 0.75]]])
-    custom_output = {"robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs)}
-    processed = func(action, custom_output=custom_output)
+    processed = func(
+        {
+            "payload": {
+                "actions": action,
+            },
+            "metadata": {
+                "actions": {
+                    "raw_action_dim": 2,
+                    "action_mode": "policy",
+                    "domain_id": 7,
+                },
+                "common": {
+                    "action_only_output": True,
+                },
+                "internal": {
+                    "robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs),
+                },
+            },
+        }
+    )
 
-    assert processed.shape == (1, 2)
-    assert processed.dtype == torch.zeros((), dtype=torch.float32).numpy().dtype
-    torch.testing.assert_close(torch.from_numpy(processed), torch.tensor([[1.0, 0.25]]))
-    assert "robolab_action_postprocess" not in custom_output
+    processed_action = processed["payload"]["actions"]
+    assert processed_action.shape == (1, 2)
+    assert processed_action.dtype == torch.zeros((), dtype=torch.float32).numpy().dtype
+    torch.testing.assert_close(torch.from_numpy(processed_action), torch.tensor([[1.0, 0.25]]))
+    assert processed["metadata"] == {
+        "actions": {
+            "raw_action_dim": 2,
+            "action_mode": "policy",
+            "domain_id": 7,
+        },
+        "common": {
+            "action_only_output": True,
+        },
+    }
 
 
 def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -772,12 +1259,35 @@ def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.Monke
     assert merged.custom_op == ["platform_kernel", "native"]
 
 
-def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> None:
-    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+def test_format_and_tokenize_prompts_leaves_plain_prompts_unchanged_by_default(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import COSMOS3_SYSTEM_PROMPT
 
     pipeline = make_cosmos3_pipeline()
-    captured: list[str] = []
-    pipeline._tokenize_prompt = lambda text, *args, **kwargs: (captured.append(text) or _ids(len(captured)), _mask())
+    calls = _capture_tokenize_calls(pipeline)
+
+    result = pipeline._format_and_tokenize_prompts(
+        "  A robot.  ",
+        "  bad.  ",
+        num_frames=48,
+        frame_rate=24,
+        height=720,
+        width=1280,
+        max_sequence_length=32,
+        sp=SimpleNamespace(extra_args={}),
+        use_system_prompt=False,
+        is_t2i=False,
+    )
+
+    assert [call["text"] for call in calls] == ["A robot.", "bad."]
+    assert all(call["max_sequence_length"] == 32 for call in calls)
+    assert all(call["use_system_prompt"] is False for call in calls)
+    assert all(call["system_prompt"] == COSMOS3_SYSTEM_PROMPT for call in calls)
+    assert [tensor.item() for tensor in result] == [1, 1, 2, 2]
+
+
+def test_format_and_tokenize_prompts_applies_video_templates_and_system_override(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
 
     pipeline._format_and_tokenize_prompts(
         "A robot",
@@ -788,20 +1298,166 @@ def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> No
         width=1280,
         max_sequence_length=32,
         sp=SimpleNamespace(
+            system_prompt="direct system prompt",
             extra_args={
-                "negative_metadata_mode": "inverse",
-                # Duration/resolution metadata templates are off by default
-                # (commit "Change resolution and duration templates to off by
-                # default"); enable them explicitly to exercise the formatting.
+                "use_duration_template": True,
+                "use_resolution_template": True,
+                "system_prompt": "API system prompt",
+            },
+        ),
+        use_system_prompt=True,
+        is_t2i=False,
+    )
+
+    assert calls == [
+        {
+            "text": ("A robot. The video is 2.0 seconds long and is of 24 FPS. This video is of 720x1280 resolution."),
+            "max_sequence_length": 32,
+            "use_system_prompt": True,
+            "system_prompt": "API system prompt",
+        },
+        {
+            "text": (
+                "bad. The video is not 2.0 seconds long and is not of 24 FPS. This video is not of 720x1280 resolution."
+            ),
+            "max_sequence_length": 32,
+            "use_system_prompt": True,
+            "system_prompt": "API system prompt",
+        },
+    ]
+
+
+def test_format_and_tokenize_prompts_uses_image_templates_for_t2i(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import COSMOS3_T2I_SYSTEM_PROMPT
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+
+    pipeline._format_and_tokenize_prompts(
+        "A robot",
+        "bad",
+        num_frames=1,
+        frame_rate=24,
+        height=1024,
+        width=768,
+        max_sequence_length=64,
+        sp=SimpleNamespace(
+            extra_args={
                 "use_duration_template": True,
                 "use_resolution_template": True,
             }
         ),
         use_system_prompt=True,
+        is_t2i=True,
+    )
+
+    assert [call["text"] for call in calls] == [
+        "A robot. This image is of 1024x768 resolution.",
+        "bad. This image is not of 1024x768 resolution.",
+    ]
+    assert all("seconds" not in call["text"] and "FPS" not in call["text"] for call in calls)
+    assert all(call["system_prompt"] == COSMOS3_T2I_SYSTEM_PROMPT for call in calls)
+
+
+def test_format_and_tokenize_prompts_rewrites_json_object_metadata(make_cosmos3_pipeline) -> None:
+    import json
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+
+    pipeline._format_and_tokenize_prompts(
+        ('{"caption": "A robot", "duration": "old", "fps": 1, "resolution": {"H": 1, "W": 2}, "aspect_ratio": "1:1"}'),
+        "bad",
+        num_frames=48,
+        frame_rate=24,
+        height=720,
+        width=1280,
+        max_sequence_length=32,
+        sp=SimpleNamespace(
+            extra_args={
+                "aspect_ratio": "16:9",
+                "use_duration_template": True,
+                "use_resolution_template": True,
+            }
+        ),
         is_t2i=False,
     )
-    assert "The video is 2.0 seconds long" in captured[0]
-    assert "The video is not 2.0 seconds long" in captured[1]
+
+    assert json.loads(calls[0]["text"]) == {
+        "caption": "A robot",
+        "duration": "2s",
+        "fps": 24.0,
+        "resolution": {"H": 720, "W": 1280},
+        "aspect_ratio": "16:9",
+    }
+    assert "The video is 2.0 seconds long" not in calls[0]["text"]
+    assert calls[1]["text"] == (
+        "bad. The video is not 2.0 seconds long and is not of 24 FPS. This video is not of 720x1280 resolution."
+    )
+
+
+def test_format_and_tokenize_prompts_removes_video_metadata_from_t2i_json(make_cosmos3_pipeline) -> None:
+    import json
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+
+    pipeline._format_and_tokenize_prompts(
+        '{"caption": "A robot", "duration": "2s", "fps": 24}',
+        "",
+        num_frames=1,
+        frame_rate=24,
+        height=1024,
+        width=768,
+        max_sequence_length=32,
+        sp=SimpleNamespace(extra_args={}),
+        is_t2i=True,
+    )
+
+    assert json.loads(calls[0]["text"]) == {
+        "caption": "A robot",
+        "resolution": {"H": 1024, "W": 768},
+    }
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "{malformed",
+        '["A robot"]',
+    ],
+)
+def test_format_and_tokenize_prompts_falls_back_for_non_object_json(
+    make_cosmos3_pipeline,
+    prompt: str,
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+
+    pipeline._format_and_tokenize_prompts(
+        prompt,
+        "",
+        num_frames=48,
+        frame_rate=24,
+        height=720,
+        width=1280,
+        max_sequence_length=32,
+        sp=SimpleNamespace(
+            extra_args={
+                "use_duration_template": True,
+                "use_resolution_template": True,
+            }
+        ),
+        is_t2i=False,
+    )
+
+    assert calls[0]["text"] == (
+        f"{prompt}. The video is 2.0 seconds long and is of 24 FPS. This video is of 720x1280 resolution."
+    )
+
+
+def test_checkpoint_key_remap() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
 
     remaps = {
         "embed_tokens.weight": "transformer.language_model.embed_tokens.weight",
@@ -813,9 +1469,14 @@ def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> No
         "layers.3.self_attn.to_q.weight": "transformer.language_model.layers.3.self_attn.to_q.weight",
         "layers.3.self_attn.to_out.weight": "transformer.language_model.layers.3.self_attn.to_out.weight",
         "layers.3.self_attn.norm_q.weight": "transformer.language_model.layers.3.self_attn.norm_q.weight",
+        "layers.3.self_attn.k_norm_und_for_gen.weight": (
+            "transformer.language_model.layers.3.self_attn.k_norm_und_for_gen.weight"
+        ),
         "layers.3.self_attn.add_q_proj.weight": "transformer.gen_layers.3.cross_attention.to_q.weight",
         "layers.3.self_attn.to_add_out.weight": "transformer.gen_layers.3.cross_attention.to_out.weight",
         "layers.3.self_attn.norm_added_q.weight": "transformer.gen_layers.3.cross_attention.norm_q.weight",
+        "layers.3.mlp_moe_gen.up_proj.weight": "transformer.gen_layers.3.mlp.up_proj.weight",
+        "layers.3.mlp_moe_gen.down_proj.weight": "transformer.gen_layers.3.mlp.down_proj.weight",
         "transformer.model.layers.3.self_attn.add_k_proj.weight": (
             "transformer.gen_layers.3.cross_attention.to_k.weight"
         ),
@@ -1159,9 +1820,9 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     pipeline._prepare_transfer_latents = fake_prepare
     pipeline.diffuse_transfer = fake_diffuse_transfer
 
-    def fake_set_flow_shift(target, *, use_karras_sigmas=None):
+    def fake_set_flow_shift(target):
         captured.setdefault("flow_shifts", []).append(target)
-        captured.setdefault("scheduler_use_karras_sigmas", []).append(use_karras_sigmas)
+        pipeline._current_flow_shift = float(target)
 
     pipeline._set_flow_shift = fake_set_flow_shift
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 5, 16, 16, device="meta")
@@ -1196,10 +1857,10 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     assert captured["format_frame_rate"] == expected_fps
     assert captured["shared_kwargs"]["fps"] == expected_fps
     assert captured["flow_shifts"] == [10.0]
-    # Transfer uses the V2V flow-sigma schedule (karras off) so flow_shift applies.
-    assert captured["scheduler_use_karras_sigmas"] == [False]
-    assert output.custom_output["fps"] == expected_fps
-    assert output.output["video"].device.type == "meta"
+    # Transfer applies the V2V flow shift when building its timestep schedule.
+    assert [call["shift"] for call in pipeline.scheduler.set_timesteps_calls] == [10.0]
+    assert output.output["metadata"]["video"]["fps"] == expected_fps
+    assert output.output["payload"]["video"].device.type == "meta"
 
 
 def test_forward_transfer_runs_multichunk_overlap_path(
@@ -1268,12 +1929,12 @@ def test_forward_transfer_runs_multichunk_overlap_path(
 
     assert captured["conditional_frames"] == [2, 1]
     assert len(captured["decode_calls"]) == 2
-    assert output.output["video"].shape == (1, 3, 8, 16, 16)
+    assert output.output["payload"]["video"].shape == (1, 3, 8, 16, 16)
     torch.testing.assert_close(
-        output.output["video"][0, 0, :, 0, 0],
+        output.output["payload"]["video"][0, 0, :, 0, 0],
         torch.tensor([-0.6, -0.5, -0.4, -0.3, -0.2, 0.2, 0.3, 0.4]),
     )
-    assert output.custom_output["transfer_controls"]["edge"].shape == (1, 3, 8, 16, 16)
+    assert output.output["metadata"]["transfer"]["controls"]["edge"].shape == (1, 3, 8, 16, 16)
     torch.testing.assert_close(captured["targets"][0][:, :, 0], torch.full((1, 3, 16, 16), -1.0))
     torch.testing.assert_close(captured["targets"][0][:, :, 1], torch.full((1, 3, 16, 16), 1.0))
     torch.testing.assert_close(captured["targets"][0][:, :, 2:], torch.full((1, 3, 3, 16, 16), 1.0))
@@ -1357,9 +2018,9 @@ class TestForwardRouting:
         pipeline._format_and_tokenize_prompts = fake_format
         pipeline._prepare_latents = fake_prepare
 
-        def fake_set_flow_shift(target, *, use_karras_sigmas=None):
+        def fake_set_flow_shift(target):
             captured.setdefault("flow_shifts", []).append(target)
-            captured.setdefault("scheduler_use_karras_sigmas", []).append(use_karras_sigmas)
+            pipeline._current_flow_shift = float(target)
 
         pipeline._set_flow_shift = fake_set_flow_shift
         pipeline.diffuse = fake_diffuse
@@ -1386,7 +2047,7 @@ class TestForwardRouting:
                 {
                     "key": "video",
                     "is_t2i": False,
-                    "flow": [1.0],
+                    "flow": [10.0],
                     "steps": [35],
                     "frames": 189,
                 },
@@ -1409,8 +2070,8 @@ class TestForwardRouting:
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
         assert captured["format"]["num_frames"] == expected["frames"]
         assert captured["flow_shifts"] == expected["flow"]
-        assert captured["scheduler_use_karras_sigmas"] == [None]
-        assert [call[0] for call in pipeline.scheduler.set_timesteps_calls] == expected["steps"]
+        assert [call["num_inference_steps"] for call in pipeline.scheduler.set_timesteps_calls] == expected["steps"]
+        assert all(call["shift"] == expected["flow"][0] for call in pipeline.scheduler.set_timesteps_calls)
 
     def test_forward_i2v_sound_and_action_routes(self, make_cosmos3_pipeline) -> None:
         pipeline = make_cosmos3_pipeline()
@@ -1457,7 +2118,6 @@ class TestForwardRouting:
             )
         )
         assert captured["flow_shifts"][-1] == 10.0
-        assert captured["scheduler_use_karras_sigmas"][-1] is False
         assert captured["format"]["negative_prompt"] == ""
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is v2v_mask
         assert captured["diffuse_calls"][-1]["condition_latents"] is v2v_condition
@@ -1497,8 +2157,13 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
-        assert output.custom_output["action"].shape == (1, 2, 2)
-        assert "action_only_output" not in output.custom_output
+        assert output.output["payload"]["actions"].shape == (1, 2, 2)
+        assert output.output["metadata"]["actions"] == {
+            "raw_action_dim": 2,
+            "action_mode": "policy",
+            "domain_id": 7,
+        }
+        assert "common" not in output.output["metadata"]
 
     def test_forward_dispatches_robolab_policy_flow(
         self,
@@ -1582,12 +2247,15 @@ class TestForwardRouting:
         assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
-        assert output.output == {}
-        assert output.custom_output["action_only_output"] is True
-        assert output.custom_output["action"].shape == (1, 2, 2)
-        assert "actions" not in output.custom_output
-        assert "robolab_action_postprocess" in output.custom_output
-        assert "robolab_policy_inputs" not in output.custom_output
+        assert output.output["payload"]["actions"].shape == (1, 2, 2)
+        assert output.output["metadata"]["actions"] == {
+            "raw_action_dim": 2,
+            "action_mode": "policy",
+            "domain_id": 7,
+        }
+        assert output.output["metadata"]["common"]["action_only_output"] is True
+        assert "robolab_action_postprocess" in output.output["metadata"]["internal"]
+        assert "robolab_policy_inputs" not in output.output["metadata"]
 
     @pytest.mark.parametrize(
         ("prompt", "sampling_params", "message"),

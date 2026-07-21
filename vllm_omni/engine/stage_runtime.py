@@ -32,7 +32,6 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
 )
-from vllm_omni.engine.output_modality import FinalOutputModalityType
 from vllm_omni.engine.stage_client import StageClient, StagePoolClient
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -63,6 +62,7 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
+from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
