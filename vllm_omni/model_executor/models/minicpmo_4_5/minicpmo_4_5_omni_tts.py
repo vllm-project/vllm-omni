@@ -440,15 +440,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         hidden_size = int(getattr(self, "_hidden_size", 768) or 768)
         return torch.zeros((num_tokens, hidden_size), device=device, dtype=torch.bfloat16)
 
-    def _reset_vocoder_request_state(self) -> None:
-        """Clear mutable Token2Wav state at request boundaries."""
-        if self.audio_tokenizer is None:
-            return
-        if hasattr(self.audio_tokenizer, "stream_cache"):
-            self.audio_tokenizer.stream_cache = None
-        if hasattr(self.audio_tokenizer, "hift_cache_dict"):
-            self.audio_tokenizer.hift_cache_dict = {}
-
     def forward(
         self,
         input_ids=None,
@@ -473,11 +464,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return self._dummy_hidden_states(input_ids, positions, inputs_embeds)
 
         logger.info("4.5 Talker: generating speech for %d tokens", tts_token_ids.shape[0])
-        self._reset_vocoder_request_state()
-        try:
-            waveform = self.generate_speech(tts_token_ids, tts_hidden_states)
-        finally:
-            self._reset_vocoder_request_state()
+        waveform = self.generate_speech(tts_token_ids, tts_hidden_states)
         # Tuple layout: (mel_spec, waveform). 4.5 talker emits only waveform,
         # so mel_spec stays None; the wrapper unpacks in this order and
         # packages the waveform into ``multimodal_outputs["model_outputs"]``.
