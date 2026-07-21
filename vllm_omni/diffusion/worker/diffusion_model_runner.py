@@ -289,6 +289,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # than mid-forward.
         if self.is_disaggregated_stage:
             self._require_disaggregated_pipeline()
+            # Stage-aware continuous batching is not implemented: a disaggregated
+            # stage runs one request at a time through execute_model. Enforce
+            # max_num_seqs==1 at startup so a misconfigured deploy fails fast here
+            # rather than mid-serving when the scheduler tries to batch (the batch
+            # path is also rejected at runtime in execute_model_batch).
+            max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
+            if max_num_seqs != 1:
+                raise ValueError(
+                    f"Disaggregated stage {self.model_stage!r} requires max_num_seqs==1 "
+                    f"(stage-aware continuous batching is not implemented); got "
+                    f"max_num_seqs={max_num_seqs}. Set max_num_seqs: 1 for this stage."
+                )
         self._log_stage_startup()
 
         # Apply CPU offloading
@@ -728,6 +740,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 f"{type(payload).__name__}, expected StagePayload."
             )
         payload.validate()
+        # Request-identity cross-check: the payload the transition processor
+        # routed into this request must belong to this request. A mismatch means
+        # request A's stage output was delivered to request B (a routing/queue
+        # bug) — fail loud before restoring the wrong request's state or KV,
+        # rather than silently denoising A's conditions under B's session.
+        if payload.request_id != req.request_id:
+            raise StagePayloadError(
+                f"Stage {self.model_stage!r} received a StagePayload for request "
+                f"{payload.request_id!r} on request {req.request_id!r} "
+                f"(boundary={payload.boundary.value}); cross-request payload routing is a bug."
+            )
         return payload
 
     def _intermediate_output(
@@ -876,6 +899,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
         must declare ``supports_request_batch = True``.
         """
+        # Stage-aware batch guard (RFC #4590 §B.2): the batch path runs the
+        # monolithic whole-request ``pipeline.forward(batch)``, which composes
+        # encode+denoise+decode in one process. A disaggregated encode/denoise/
+        # decode worker must NEVER take that path — it would silently re-run the
+        # phases this stage does not own (and, for denoise, bypass the per-stage
+        # payload/session plumbing). Stage-aware continuous batching is not yet
+        # implemented, so reject the batch path outright for disaggregated roles
+        # rather than let a role fall through to the monolithic forward.
+        if self.is_disaggregated_stage:
+            raise RuntimeError(
+                f"Disaggregated stage {self.model_stage!r} cannot use the monolithic "
+                "request-batch path (pipeline.forward(batch)); it must run through the "
+                "stage-specific execute_model dispatch. Set max_num_seqs=1 for "
+                "disaggregated stages (stage-aware continuous batching is not implemented)."
+            )
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
         return self._execute_request_list(
             reqs,

@@ -23,7 +23,6 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import MAX_DREAMZERO_SESSIONS
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.stage_payload import STAGE_PAYLOAD_PROMPT_KEY
 from vllm_omni.diffusion.stage_roles import DECODE, DENOISE, ENCODE
@@ -64,14 +63,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # Built after the model is loaded (dimensions known); stays None while KV
         # management is disabled.
         self.kv_cache: ARDiffusionKVCache | None = None
-        # DreamZero KV is session-scoped (persists across a session's forwards),
-        # so AR-Diffusion KV state is keyed by session_id and reused, not created per request.
-        # Bounded by the same LRU cap as DreamZeroPipeline._states: an evicted
-        # session's ARDiffusionKVState owns pool blocks (two CFG adapters), so without a
-        # bound, session-id churn in a long-running server would leak pool ownership
-        # until the KV pool is exhausted. Evicting frees those blocks (state.close()).
+        # AR-Diffusion KV is session-scoped (persists across a session's forwards),
+        # so KV state is keyed by session_id and reused, not created per request.
+        # Bounded by an LRU cap: an evicted session's ARDiffusionKVState owns pool
+        # blocks (two CFG adapters), so without a bound, session-id churn in a
+        # long-running server would leak pool ownership until the KV pool is
+        # exhausted. Evicting frees those blocks (state.close()). The cap comes
+        # from the generic KV config (ARDiffusionKVConfig.max_sessions) rather than
+        # a model-specific constant so the engine layer stays decoupled from any
+        # one model; a model whose pipeline caps its own session map can set the
+        # same value in ar_diffusion_kv_config to keep the two maps in step.
         self._ar_diffusion_states: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
-        self._max_ar_diffusion_states = MAX_DREAMZERO_SESSIONS
+        self._max_ar_diffusion_states = self.ar_diffusion_kv_config.max_sessions
         # Per-request server-side forward E2E times (seconds), recorded in
         # execute_model. This is the worker-side compute time — the analog of the
         # upstream server's per-request E2E — and excludes the engine<->worker IPC
@@ -322,6 +325,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             states = getattr(self.pipeline, "_states", None)
             if states is not None:
                 states.pop(session_id, None)
+            # RFC #4590 Part A: also drop the committed session-progress record so
+            # the torn-down session cannot leave the ordering authority mid-stream.
+            # After teardown the next chunk must arrive as an explicit reset (fresh
+            # epoch), which re-syncs both stages; a bare continuation is then
+            # rejected instead of silently resuming a session whose KV/model state
+            # was wiped. Guarded so non-session pipelines are unaffected.
+            progress = getattr(self.pipeline, "_session_progress", None)
+            if progress is not None and hasattr(progress, "drop"):
+                progress.drop(session_id)
             logger.warning(
                 "AR-Diffusion execute_model failed for session=%s; session state torn down "
                 "(pool blocks freed) — the next request starts a fresh session",

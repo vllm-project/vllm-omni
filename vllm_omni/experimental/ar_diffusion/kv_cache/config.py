@@ -26,6 +26,12 @@ class ARDiffusionKVConfig:
     reset_at_boundary: bool = False
     # Fraction of free device memory budgeted for the AR-Diffusion KV pool.
     gpu_memory_fraction: float = 0.1
+    # Maximum number of concurrently-tracked AR-Diffusion sessions. Each live
+    # session owns pool blocks (two CFG adapters), so the runner LRU-evicts past
+    # this cap to bound pool ownership under session-id churn. Generic default;
+    # a model whose pipeline caps its own session map at a different value can
+    # override this in ``ar_diffusion_kv_config`` to keep the two maps in step.
+    max_sessions: int = 64
     # When CUDA graph / torch.compile is on (not enforce_eager), pre-capture the
     # DiT graphs for every window-fill shape at load time via a synthetic rollout,
     # so the serving run is fast from the first chunk. No effect when eager.

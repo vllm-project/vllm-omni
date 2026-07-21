@@ -160,9 +160,12 @@ return self._execute_monolithic(req, kv_prefetch_jobs=kv_prefetch_jobs)   # unch
   `denoise → decode` payload. It never re-runs encode for a payload-origin
   request — the origin is explicit (payload vs raw), not inferred from a
   new-request id set.
-* **Decode stage** — restores decode state, runs `decode_latents` +
-  `postprocess_outputs`, returns the user-visible `DiffusionOutput`. It never
-  instantiates or runs the DiT or a scheduler.
+* **Decode stage** — restores decode state, runs the `decode` (no-op for
+  DreamZero) + `postprocess` atoms, and returns the user-visible
+  `DiffusionOutput` (denormalized actions + latent video). It never instantiates
+  or runs the DiT or a scheduler, and — for DreamZero — never invokes the VAE
+  decoder (see *Decode ownership matches decode behavior* below). It also
+  cross-checks the incoming payload's `request_id` against the request (RFC §B.1).
 
 The historical "new request ⇒ run `prepare_encode`" coupling (`state.request_id in
 new_request_ids` in the stepwise path) is *not* used by the disaggregated denoise
@@ -203,13 +206,23 @@ component vocabulary: `tokenizer`, `text_encoder`, `image_encoder`,
 |---|---|
 | encode | tokenizer, text encoder, image encoder, VAE **encoder** |
 | denoise | CausalWan DiT, schedulers, action head, AR-Diffusion KV |
-| decode | VAE **decoder**, video/action postprocess |
+| decode | (none built) — action denorm + latent passthrough only |
 
 DreamZero's VAE (`DistributedAutoencoderKLWan`) has a monolithic constructor
 (encoder + decoder together), so a stage needing *either* half builds the full
 module; the denoise stage needs *neither* and skips it entirely, deriving the
 `vae_latents_mean/inv_std` buffers from the Wan-VAE constants instead of the
 module.
+
+**Decode ownership matches decode behavior (RFC §B.3).** DreamZero's user-visible
+decode phase (`_run_decode_phase`) emits **normalized VAE latents + actions**, not
+RGB video: it denormalizes the action tensor and returns `video_out` as the raw
+latent. It never invokes the VAE **decoder** — RGB export is an explicit,
+out-of-band debug/offline step (`decode_video_latents` / `video_export_worker`).
+So `required_components_for_stage(DECODE)` declares **no** heavy component: the
+decode worker must not construct or load a VAE decoder it never calls. (If decode
+is ever changed to emit RGB, re-add `vae_decoder=True` and call the decoder in the
+phase — declaration, construction, and use must agree.)
 
 ## DreamZero stage ownership & session/KV
 
@@ -230,6 +243,61 @@ session state — so the monolithic golden path and the disaggregated path run t
 **same** code, making numerical equivalence structural rather than coincidental.
 The DreamZero-private inter-phase carrier (`DreamZeroStageCarrier`) lives on
 `DiffusionRequestState.extra` (model-private), never on the generic state fields.
+
+## Multi-chunk session progress (RFC §A)
+
+DreamZero is auto-regressive: a session's chunks share a sliding AR window whose
+cursor is `current_start_frame` (csf). In monolithic `forward()` one shared
+`DreamZeroState` advances csf in one process, so ordering is trivially correct.
+In the disaggregated path the encode and denoise workers each keep their **own**
+process-local `DreamZeroState`, and only the denoise worker's DiT/KV loop advances
+csf. Without coordination the encode worker's csf would sit at 0 forever (it
+re-runs first-chunk conditioning every request) and the denoise worker would
+overwrite its correctly-advanced csf with the stale carrier value — every chunk
+silently behaves like the first.
+
+The fix keeps the **denoise stage as the single committed-progress authority** and
+adds a small, model-agnostic, torch-free control plane
+(`vllm_omni/diffusion/session_progress.py`, `SessionProgressCoordinator`) plus
+three routing scalars on the carrier/payload: `session_epoch`, `sequence_no`,
+`attempt_id`.
+
+* **Encode (issuer).** After running the encode phase, encode stamps
+  `(session_epoch, sequence_no, attempt_id)` on the carrier from its coordinator,
+  and advances its **own** csf shadow one AR chunk (mirroring the denoise
+  arithmetic: `0 → 1` on the first chunk of a window, then `+= num_frame_per_block`)
+  so the next request picks the correct encoding path and reset decision. Encode is
+  **not** the commit authority — issuing a sequence does not mean it committed.
+* **Denoise (authority).** Before touching the KV/model state, denoise
+  `authorize()`s the carrier against committed session state and **rejects a
+  stale / duplicate / gapped / pre-reset request** (raising `SessionProgressError`
+  with no mutation). Only after a successful DiT loop + KV commit does it
+  `commit()` the new csf. The pre-existing overwrite of denoise's csf from the
+  carrier is now safe because the guard guarantees the carrier is the expected
+  next chunk.
+* **Sequencing vs windowing.** `sequence_no` is monotonic per `(session, epoch)`
+  and is independent of csf, which resets to 0 at an AR window boundary **without**
+  an epoch bump — so a normal window slide is not mistaken for a stale request.
+  `session_epoch` bumps only on an explicit/session reset, fencing any pre-reset
+  in-flight attempt.
+* **Failure containment.** A denoise failure raises before `commit()`, so
+  committed progress does not advance and the same sequence can be retried; the
+  AR-Diffusion runner tears the KV session down on the exception and also drops
+  the session-progress record, so recovery is via an explicit reset (fresh epoch)
+  that re-syncs both stages.
+
+`forward()` (monolithic) never touches the coordinator — it stays byte-identical,
+preserving it as the golden reference for numerical equivalence.
+
+**Reduced-scope limitation (documented).** The whole-request topology has no
+denoise → encode back-channel, so after a denoise failure the encode stage's csf
+shadow is one chunk ahead of committed progress. The next request on that session
+must be an explicit reset (the runner drops the torn-down session's progress
+record so a bare continuation is rejected rather than silently resuming a wiped
+session). A full cross-process coordinator that pushes committed csf back to the
+encode issuer is deferred as a follow-up; the invariants above (authority,
+monotonic ordering, epoch fencing, commit-after-success, idempotent duplicate
+rejection) hold without it.
 
 ## Generic stage transition
 
@@ -294,19 +362,28 @@ every diffusion model, and a session-memory-manager rewrite.
 
 ## Manual validation commands
 
-Torch-free foundation unit tests (no GPU, no vllm runtime):
+Torch-free foundation unit tests (no GPU, no vllm runtime) — includes the
+multi-chunk session-progress ordering/idempotency/epoch tests (RFC §A) and the
+payload transport/topology/key-drift guards:
 
 ```bash
 python -m pytest tests/diffusion/disaggregated/ -q
+# or just the session-progress control plane:
+python -m pytest tests/diffusion/disaggregated/test_session_progress.py -q
 ```
 
-Full runtime tests (on the gnr XPU node, inside the vllm-omni-xpu container):
+Full runtime tests (on the gnr/B70 XPU node, inside the vllm-omni-xpu container):
 
 ```bash
-# runner stage behavior, DreamZero atoms/payload round-trip, config topology
+# runner stage behavior + guards (request-id cross-check RFC §B.1,
+# disaggregated batch-path rejection RFC §B.2), DreamZero atoms/payload
+# round-trip incl. session-progress scalars, component ownership, config topology
 pytest tests/diffusion/disaggregated/ -m needs_runtime
 
-# numerical equivalence (monolithic forward vs encode->denoise->decode)
+# numerical equivalence (monolithic forward vs encode->denoise->decode),
+# single-chunk AND five-chunk same-session. Set DREAMZERO_MODEL_PATH or rely on
+# the HF cache (models--GEAR-Dreams--DreamZero-DROID). Skips (never fails) when
+# the checkpoint/accelerator is absent.
 DREAMZERO_MODEL_PATH=/models/DreamZero-DROID \
   pytest tests/diffusion/disaggregated/test_dreamzero_disaggregated.py \
   -m needs_runtime -k numerical_equivalence -s

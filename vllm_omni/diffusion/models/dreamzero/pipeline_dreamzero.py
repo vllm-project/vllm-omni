@@ -57,6 +57,10 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
 )
 from vllm_omni.diffusion.models.interface import StageBoundary, StagePayload
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.session_progress import (
+    SessionProgressCoordinator,
+    SessionProgressError,
+)
 from vllm_omni.diffusion.stage_payload import StagePayloadError
 from vllm_omni.diffusion.stage_roles import (
     ALL_COMPONENTS,
@@ -444,6 +448,15 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
         self._max_session_states = MAX_DREAMZERO_SESSIONS
         self.state = self._get_or_create_state("default")
+
+        # Session-progress control plane (RFC #4590 Part A). Small, model-agnostic
+        # ordering authority used ONLY on the disaggregated encode/denoise atoms
+        # (encode issues (epoch, sequence_no); denoise validates + commits). The
+        # monolithic forward() never touches it — its single shared DreamZeroState
+        # already advances csf in one process, so forward() stays byte-identical
+        # (the golden reference for numerical equivalence). Bounded by the same
+        # LRU cap as the model-local state map so the two stay in step.
+        self._session_progress = SessionProgressCoordinator(max_sessions=MAX_DREAMZERO_SESSIONS)
 
         # DiT step cache is configured by StepCacheBackend
         # (cache_backend="step_cache") via pipeline._stepcache_config.
@@ -1772,6 +1785,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         "explicit_reset",
         "do_true_cfg",
         "current_start_frame",
+        # Session-progress routing metadata (RFC #4590 Part A).
+        "session_epoch",
+        "sequence_no",
+        "attempt_id",
         "height",
         "width",
         "seq_len",
@@ -1787,9 +1804,19 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         Derived from the real data dependencies of the phase methods:
         encode owns the tokenizer/text+image encoders and the VAE ENCODER;
         denoise owns the CausalWan DiT + schedulers (+ action head, part of the
-        transformer); decode owns the VAE DECODER for video export. The action
-        norm stats / transforms are lightweight metadata built in __init__ for
-        every stage, so they are not gated here.
+        transformer); decode owns only lightweight postprocess metadata.
+
+        RFC #4590 §B.3 — decode ownership must match decode *behavior*. The
+        user-visible decode phase (:meth:`_run_decode_phase`) emits **normalized
+        VAE latents + actions**, NOT RGB video: it denormalizes the action tensor
+        and returns ``video_out`` as the raw latent (see the ``"video"`` field
+        comment there). It never calls the VAE decoder — RGB export is an
+        explicit, out-of-band debug/offline step (``decode_video_latents`` /
+        ``video_export_worker``). So the decode stage must NOT construct or load a
+        VAE decoder it never invokes. The action norm stats / transforms it does
+        use are lightweight metadata built in __init__ for every stage, so they
+        are not gated here. (If DreamZero's decode is ever changed to emit RGB,
+        re-add ``vae_decoder=True`` here and call the decoder in the phase.)
         """
         role = normalize_stage_role(model_stage)
         if role == ENCODE:
@@ -1806,7 +1833,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 action_modules=True,
             )
         if role == DECODE:
-            return StageComponentSpec(vae_decoder=True)
+            # Latent+actions output: no VAE decoder is constructed or called.
+            return StageComponentSpec()
         # Monolithic / unknown: everything. Reuse the shared all-True singleton so
         # this stays in step with StageComponentSpec if a component is ever added.
         return ALL_COMPONENTS
@@ -1833,10 +1861,29 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return state
 
     def encode(self, state: DiffusionRequestState) -> DiffusionRequestState:
-        """Run the encode phase and stash the DreamZero carrier on state.extra."""
+        """Run the encode phase and stash the DreamZero carrier on state.extra.
+
+        Beyond running :meth:`_run_encode_phase`, the disaggregated encode atom
+        owns two RFC #4590 Part A responsibilities that the monolithic ``forward``
+        does not need (it runs all phases on one shared state in one process):
+
+        1. **Stamp session-progress routing metadata** on the carrier
+           (``session_epoch`` / ``sequence_no`` / ``attempt_id``) from the
+           :class:`SessionProgressCoordinator`, so the denoise stage can validate
+           ordering across the process boundary. A session reset (explicit, or a
+           prompt/language change surfaced as ``reset_reason=="session"``) starts a
+           fresh epoch; a window-boundary reset (``"inference"``) is normal
+           progression and does NOT bump the epoch.
+        2. **Advance the encode-local window cursor** so the NEXT encode request on
+           this session picks the correct encoding path and reset decision. Encode
+           keeps its own ``DreamZeroState`` shadow that no denoise phase ever
+           touches; without this advance it would sit at ``csf==0`` forever and
+           re-run first-chunk conditioning every request (the original bug).
+        """
         extra_args = getattr(state.sampling, "extra_args", None) or {}
         robot_obs = extra_args["robot_obs"]
         session_id = str(extra_args.get("session_id") or state.request_id or "default")
+        explicit_reset = bool(extra_args.get("reset", False))
         # Encode owns no AR-Diffusion KV: resolve a model-local session state only.
         dz_state = self._get_or_create_state(session_id)
         self.state = dz_state
@@ -1844,10 +1891,44 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             robot_obs,
             dz_state,
             session_id,
-            explicit_reset=bool(extra_args.get("reset", False)),
+            explicit_reset=explicit_reset,
         )
+
+        # (1) Session-progress stamping. A session reset starts a fresh epoch so
+        # the denoise authority fences any pre-reset in-flight attempts (invariant
+        # 8); a window-boundary "inference" reset keeps the epoch (sequence stays
+        # monotonic at the session level, invariant 7).
+        if explicit_reset or carrier.reset_reason == "session":
+            self._session_progress.begin_epoch_reset(session_id)
+        epoch, sequence_no = self._session_progress.issue(session_id)
+        carrier.session_epoch = epoch
+        carrier.sequence_no = sequence_no
+        carrier.attempt_id = str(state.request_id)
+
+        # (2) Advance the encode-local window cursor to mirror the denoise
+        # progression (the carrier already captured the pre-chunk csf denoise
+        # aligns to). Mirrors _prefill_kv_cache (csf 0->1 on the first chunk) +
+        # _run_denoise_phase (csf += num_frame_per_block). Denoise remains the
+        # commit authority — this only moves encode's shadow forward.
+        self._advance_encode_window(dz_state)
+
         state.extra[self._CARRIER_KEY] = carrier
         return state
+
+    def _advance_encode_window(self, state: DreamZeroState) -> None:
+        """Advance the encode stage's local ``current_start_frame`` one AR chunk.
+
+        Replicates the denoise-side csf arithmetic so the encode worker's window
+        cursor stays in lockstep with committed progress WITHOUT owning the KV:
+        the first chunk of a (re)started window steps 0 -> 1 (mirroring the
+        ``_prefill_kv_cache`` create branch) before every chunk advances by
+        ``num_frame_per_block`` (mirroring ``_run_denoise_phase``). A
+        window-boundary reset inside ``_run_encode_phase`` already zeroed csf, so
+        the next call re-enters at 0 exactly as the monolithic path would.
+        """
+        if state.current_start_frame == 0:
+            state.current_start_frame = 1
+        state.current_start_frame += self.num_frame_per_block
 
     def prepare(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """No-op atom: the encode phase already prepared initial noise + schedule.
@@ -1881,18 +1962,56 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 f"DreamZero denoise for session {carrier.session_id!r} has no AR-Diffusion KV state; "
                 "the denoise stage must run on the AR-Diffusion engine."
             )
+
+        # RFC #4590 Part A: the denoise stage is the committed-progress AUTHORITY.
+        # Validate the carrier's (epoch, sequence_no) against committed session
+        # state and REJECT a stale / duplicate / gapped / pre-reset request BEFORE
+        # touching the AR-Diffusion KV or the model state (invariants 5-9). This is
+        # what prevents a stale carrier from overwriting newer progress (the
+        # original bug) and a duplicate retry from appending KV twice: on anything
+        # but PROCEED we raise, so the DiT/pool are never entered.
+        decision = self._session_progress.authorize(
+            carrier.session_id,
+            epoch=carrier.session_epoch,
+            sequence_no=carrier.sequence_no,
+            attempt_id=carrier.attempt_id,
+        )
+        if not decision.ok:
+            raise SessionProgressError(
+                f"DreamZero denoise rejected request {state.request_id!r} for session "
+                f"{carrier.session_id!r}: {decision.value} "
+                f"(carrier epoch={carrier.session_epoch} seq={carrier.sequence_no}; "
+                f"committed={self._session_progress.get(carrier.session_id).last_committed_sequence}). "
+                "No KV/model state was mutated."
+            )
+
         # Apply the same engine-KV window reset the encode worker decided. On the
         # denoise worker the KV state is attached, so this drops the pool window.
         if carrier.current_start_frame == 0:
             self._apply_model_local_reset(dz_state, carrier.reset_reason)
         # Realign the model-local window position + conditions with the encode
-        # carrier (the denoise DreamZeroState is a fresh per-session shadow).
+        # carrier (the denoise DreamZeroState is a fresh per-session shadow). This
+        # overwrite is now SAFE: the ordering guard above guarantees the carrier is
+        # the expected next (non-stale) chunk, so it never clobbers newer progress.
         dz_state.current_start_frame = carrier.current_start_frame
         dz_state.clip_feas = carrier.clip_feas
         dz_state.ys = carrier.ys
         if dz_state.prompt_embeds is None:
             dz_state.prompt_embeds = carrier.prompt_embeds
         self._run_denoise_phase(carrier, dz_state)
+
+        # Commit only AFTER a successful denoise + KV commit (invariant 4). A
+        # failure raises out of _run_denoise_phase before we reach here, so
+        # committed progress does not advance and the same sequence can be retried
+        # (the runner tears the KV session down on the exception). Record the
+        # post-chunk window cursor as the authoritative committed position.
+        self._session_progress.commit(
+            carrier.session_id,
+            epoch=carrier.session_epoch,
+            sequence_no=carrier.sequence_no,
+            current_start_frame=dz_state.current_start_frame,
+            attempt_id=carrier.attempt_id,
+        )
         return state
 
     def decode(self, state: DiffusionRequestState) -> DiffusionRequestState:
@@ -1991,6 +2110,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             explicit_reset=bool(meta.get("explicit_reset", False)),
             do_true_cfg=bool(meta.get("do_true_cfg", False)),
             current_start_frame=int(meta.get("current_start_frame", 0)),
+            session_epoch=int(meta.get("session_epoch", 0)),
+            sequence_no=int(meta.get("sequence_no", 0)),
+            attempt_id=str(meta.get("attempt_id", "")),
             height=int(meta.get("height", 0)),
             width=int(meta.get("width", 0)),
             seq_len=int(meta.get("seq_len", 0)),

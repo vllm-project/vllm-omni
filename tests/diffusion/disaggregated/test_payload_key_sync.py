@@ -27,6 +27,8 @@ _PROCESSOR = VLLM_OMNI_ROOT / "model_executor" / "stage_input_processors" / "dif
 
 _KEY_NAMES = {"STAGE_PAYLOAD_OUTPUT_KEY", "STAGE_PAYLOAD_PROMPT_KEY"}
 
+_INTERFACE = VLLM_OMNI_ROOT / "diffusion" / "models" / "interface.py"
+
 
 def _module_string_constants(path: Path, names: set[str]) -> dict[str, str]:
     """Extract top-level ``NAME = "literal"`` assignments for the given names."""
@@ -38,6 +40,35 @@ def _module_string_constants(path: Path, names: set[str]) -> dict[str, str]:
             if isinstance(target, ast.Name) and target.id in names and isinstance(node.value, ast.Constant):
                 found[target.id] = node.value.value
     return found
+
+
+def _module_int_constant(path: Path, name: str) -> int | None:
+    """Extract a top-level ``NAME = <int>`` assignment (no import needed)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if (
+                isinstance(target, ast.Name)
+                and target.id == name
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, int)
+            ):
+                return node.value.value
+    return None
+
+
+def test_schema_version_constants_stay_in_lockstep():
+    """The payload schema version is duplicated in the torch-free leaf and in
+    interface.py (interface must stay importable without the leaf). They MUST be
+    equal — a drift would let one side accept a payload the other rejects. Parsed
+    from source (no torch) so this runs anywhere.
+    """
+    leaf = _module_int_constant(_CANONICAL, "DIFFUSION_STAGE_PAYLOAD_SCHEMA_VERSION")
+    iface = _module_int_constant(_INTERFACE, "STAGE_PAYLOAD_SCHEMA_VERSION")
+    assert leaf is not None, "stage_payload schema-version constant not found"
+    assert iface is not None, "interface schema-version constant not found"
+    assert leaf == iface, f"schema-version drift: stage_payload={leaf} interface={iface}"
 
 
 def test_processor_literals_match_canonical_source():

@@ -38,7 +38,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 #: Bump when the envelope's wire shape changes incompatibly. Consumers reject
 #: payloads whose ``schema_version`` they do not understand.
-DIFFUSION_STAGE_PAYLOAD_SCHEMA_VERSION = 1
+#: v2 (RFC #4590 Part A): DreamZero carriers add session-progress routing scalars
+#: (session_epoch / sequence_no / attempt_id). Kept in lockstep with
+#: ``interface.STAGE_PAYLOAD_SCHEMA_VERSION`` (asserted equal in tests).
+DIFFUSION_STAGE_PAYLOAD_SCHEMA_VERSION = 2
 
 #: The two channels a :class:`StagePayload` travels between stages, kept
 #: here (the torch-free transport leaf every stage layer already imports) as the

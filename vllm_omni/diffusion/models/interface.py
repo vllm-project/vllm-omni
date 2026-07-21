@@ -39,7 +39,8 @@ from typing import (
 # version is duplicated as a module constant below and asserted equal to the leaf's
 # in tests, so this module needs no import-time dependency on the leaf.
 #: Bump in lockstep with ``stage_payload.DIFFUSION_STAGE_PAYLOAD_SCHEMA_VERSION``.
-STAGE_PAYLOAD_SCHEMA_VERSION = 1
+#: v2 (RFC #4590 Part A) adds DreamZero session-progress routing scalars.
+STAGE_PAYLOAD_SCHEMA_VERSION = 2
 
 if TYPE_CHECKING:
     import torch
@@ -190,10 +191,27 @@ class StagePayload:
         a plain ``dict``. The runner's ``_extract_incoming_payload`` and the
         generic transition processor reconstruct the real type via this method
         before validation. ``boundary`` round-trips as its string value.
+
+        Raises :class:`StagePayloadError` (not ``KeyError`` / ``ValueError``) on a
+        malformed or partial dict so a corrupted wire payload surfaces as the same
+        typed transport error the rest of the stage path raises, instead of an
+        opaque low-level exception.
         """
+        error = _transport().StagePayloadError
+        if not isinstance(data, dict):
+            raise error(f"StagePayload.from_dict expected a dict, got {type(data).__name__}.")
+        try:
+            request_id = data["request_id"]
+            raw_boundary = data["boundary"]
+        except KeyError as exc:
+            raise error(f"StagePayload dict is missing required key {exc.args[0]!r}.") from exc
+        try:
+            boundary = StageBoundary(raw_boundary)
+        except ValueError as exc:
+            raise error(f"StagePayload dict has unknown boundary {raw_boundary!r}.") from exc
         return cls(
-            request_id=data["request_id"],
-            boundary=StageBoundary(data["boundary"]),
+            request_id=request_id,
+            boundary=boundary,
             scalar_fields=dict(data.get("scalar_fields") or {}),
             tensor_fields=dict(data.get("tensor_fields") or {}),
             private_scalar_fields=dict(data.get("private_scalar_fields") or {}),

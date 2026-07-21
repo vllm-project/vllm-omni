@@ -39,6 +39,18 @@ class DreamZeroStageCarrier:
 
     # -- identity / control (crosses every boundary) --
     session_id: str = "default"
+    # Session-progress routing metadata (RFC #4590 Part A). Stamped by the encode
+    # stage from the SessionProgressCoordinator so the denoise stage (the commit
+    # authority) can validate ordering across the process boundary without
+    # decoding model-private schema: reject a stale/duplicate/gapped sequence or a
+    # pre-reset epoch BEFORE touching the AR-Diffusion KV. ``session_epoch`` is
+    # bumped on an explicit/session reset (fences old in-flight attempts);
+    # ``sequence_no`` is monotonic per (session, epoch) and is independent of
+    # ``current_start_frame`` (which resets to 0 at an AR window boundary with NO
+    # epoch bump); ``attempt_id`` distinguishes retries of the same sequence.
+    session_epoch: int = 0
+    sequence_no: int = 0
+    attempt_id: str = ""
     embodiment_name: str = ""
     # The exact key passed to get_transform() at encode time, so decode selects
     # the identical transform (preserves monolithic-forward behavior exactly).

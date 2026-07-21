@@ -218,3 +218,98 @@ def test_missing_payload_raises_actionable_error():
     req = _request({"prompt": "no payload here"})
     with pytest.raises(Exception, match="without a StagePayload"):
         runner.execute_denoise_stage(req)
+
+
+# --- RFC #4590 B.1: request-identity cross-check ----------------------------
+
+
+def _payload_for(request_id, boundary=None):
+    return StagePayload.create(
+        request_id=request_id,
+        boundary=boundary or StageBoundary.ENCODE_TO_DIT,
+        scalar_fields={"session_id": "sess"},
+        private_tensor_fields={"prompt_embeds": torch.zeros(1, 4)},
+    )
+
+
+def test_denoise_rejects_cross_request_payload():
+    """A payload built for request A delivered to request B must be rejected
+    before any model/KV work (RFC #4590 B.1)."""
+    runner = _make_runner(DENOISE)
+    # request_id is "req-1" (see _request); route a payload stamped "other-req".
+    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: _payload_for("other-req")}})
+    with pytest.raises(Exception, match="cross-request|other-req"):
+        runner.execute_denoise_stage(req)
+    # The pipeline never ran diffuse — rejection happened before model execution.
+    assert "diffuse" not in runner.pipeline.calls
+
+
+def test_decode_rejects_cross_request_payload():
+    runner = _make_runner(DECODE)
+    req = _request(
+        {"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: _payload_for("other-req", StageBoundary.DIT_TO_DECODE)}}
+    )
+    with pytest.raises(Exception, match="cross-request|other-req"):
+        runner.execute_decode_stage(req)
+    assert "postprocess" not in runner.pipeline.calls
+
+
+def test_matching_request_id_is_accepted():
+    """Sanity: the same-request payload (the normal case) is NOT rejected."""
+    runner = _make_runner(DENOISE)
+    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: _payload_for("req-1")}})
+    # req-1 matches; denoise proceeds and packs a DIT_TO_DECODE payload.
+    out = runner.execute_denoise_stage(req)
+    assert out.custom_output[STAGE_PAYLOAD_OUTPUT_KEY].boundary is StageBoundary.DIT_TO_DECODE
+
+
+def test_malformed_dict_payload_raises_stage_payload_error():
+    """A partial/plain-dict payload (no request_id) surfaces as StagePayloadError,
+    not a raw KeyError, when rehydrated on the consumer side (RFC #4590 B.1)."""
+    from vllm_omni.diffusion.stage_payload import StagePayloadError
+
+    runner = _make_runner(DENOISE)
+    # A dict missing required keys, as if a corrupted wire payload arrived.
+    req = _request({"prompt": "", "extra": {STAGE_PAYLOAD_PROMPT_KEY: {"session_id": "sess"}}})
+    with pytest.raises(StagePayloadError):
+        runner.execute_denoise_stage(req)
+
+
+# --- RFC #4590 B.2: disaggregated stages cannot enter the monolithic batch ---
+
+
+class _NewReq:
+    def __init__(self, req):
+        self.req = req
+
+
+def _scheduler_output(reqs):
+    return types.SimpleNamespace(scheduled_new_reqs=[_NewReq(r) for r in reqs])
+
+
+@pytest.mark.parametrize("stage", [ENCODE, DENOISE, DECODE])
+def test_disaggregated_stage_rejects_monolithic_batch_path(stage):
+    """execute_model_batch runs the monolithic pipeline.forward(batch); a
+    disaggregated role must be rejected there rather than silently composing all
+    phases in one process (RFC #4590 B.2)."""
+    runner = _make_runner(stage)
+    sched = _scheduler_output([_request({"prompt": "hi"})])
+    with pytest.raises(RuntimeError, match="disaggregated|batch"):
+        runner.execute_model_batch(sched, runner.od_config)
+
+
+def test_monolithic_stage_allows_batch_path():
+    """A monolithic ('diffusion') runner is NOT blocked by the disaggregated
+    batch guard — it fails later for an unrelated reason (no real pipeline), not
+    with the disaggregated-role RuntimeError."""
+    runner = _make_runner("diffusion")
+    assert runner.is_disaggregated_stage is False
+    sched = _scheduler_output([_request({"prompt": "hi"})])
+    # The guard must NOT fire for the monolithic role. Any error raised here must
+    # not be the disaggregated-batch rejection.
+    try:
+        runner.execute_model_batch(sched, runner.od_config)
+    except RuntimeError as exc:
+        assert "disaggregated" not in str(exc)
+    except Exception:
+        pass  # other failures (fake pipeline) are fine — the guard didn't fire
