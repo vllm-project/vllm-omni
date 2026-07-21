@@ -1,0 +1,83 @@
+# DreamZero-DROID disaggregated deploy (RFC #4590): encode -> denoise -> decode.
+# Variant: TP=4 applied specifically to the DENOISE stage, to test whether
+# splitting encode/decode off the DiT stage (per required_components_for_stage)
+# relieves the per-device memory pressure seen with the monolithic dreamzero_tp4.yaml
+# (which builds tokenizer + UMT5 + image encoder + VAE encoder + DiT + VAE decoder,
+# fully replicated, on every one of the 4 TP ranks).
+#
+# Topology is declared in vllm_omni/model_executor/models/dreamzero/pipeline.py
+# (DREAMZERO_DISAGGREGATED_PIPELINE). Each stage runs as a native diffusion stage
+# distinguished by model_stage; the generic diffusion transition processor moves
+# the typed DiffusionStagePayload between them.
+#
+# Stage ownership (see StageComponentSpec in
+# DreamZeroPipeline.required_components_for_stage):
+#   stage 0 (encode):  tokenizer + text/image encoders + VAE encoder   (1 device)
+#   stage 1 (denoise): CausalWan DiT + schedulers + action head + AR-Diffusion KV (TP=4, 4 devices)
+#   stage 2 (decode):  VAE decoder + video/action postprocess          (1 device)
+#
+# Engine backends:
+#   - The denoise stage REQUIRES the AR-Diffusion engine (session-scoped paged KV).
+#   - Encode/decode own no KV, so they use the standard diffusion engine.
+#
+# Device placement: 6 devices total (0=encode, 1-4=denoise TP4, 5=decode), to
+# avoid overlapping encode/decode with the TP=4 denoise device set on an 8-GPU node.
+
+pipeline: dreamzero_disaggregated
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  # ---- Stage 0: ENCODE (standard diffusion engine, one device) ----
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+
+  # ---- Stage 1: DENOISE (AR-Diffusion engine; TP=4) ----
+  - stage_id: 1
+    devices: "1,2,3,4"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    # DreamZero denoise runs on the AR-Diffusion engine (engine-level paged KV).
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    parallel_config:
+      tensor_parallel_size: 4
+      cfg_parallel_size: 1
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+
+  # ---- Stage 2: DECODE (standard diffusion engine, one device) ----
+  - stage_id: 2
+    devices: "5"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position

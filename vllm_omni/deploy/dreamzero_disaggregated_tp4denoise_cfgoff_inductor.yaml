@@ -1,0 +1,100 @@
+# DreamZero-DROID disaggregated deploy (RFC #4590): encode -> denoise -> decode.
+# Variant: TP=4 on DENOISE, CFG OFF, torch.compile/inductor ON for denoise
+# (enforce_eager=false). Validated end-to-end on gnr17409 2026-07-14: with the
+# encoder off the DiT's TP ranks, denoise fits resident WITHOUT layerwise offload
+# (peak ~17.9 GiB/card of 22.71 GiB), producing warm generation ~34s vs ~94s for
+# the equivalent monolithic (undisaggregated) run that requires offload. See
+# docs/dreamzero-tp4-disaggregation-results.md for the full before/after numbers.
+#
+# Topology is declared in vllm_omni/model_executor/models/dreamzero/pipeline.py
+# (DREAMZERO_DISAGGREGATED_PIPELINE). Each stage runs as a native diffusion stage
+# distinguished by model_stage; the generic diffusion transition processor moves
+# the typed DiffusionStagePayload between them.
+#
+# Stage ownership (see StageComponentSpec in
+# DreamZeroPipeline.required_components_for_stage):
+#   stage 0 (encode):  tokenizer + text/image encoders + VAE encoder   (1 device)
+#   stage 1 (denoise): CausalWan DiT + schedulers + action head + AR-Diffusion KV (TP=4, 4 devices)
+#   stage 2 (decode):  VAE decoder + video/action postprocess          (1 device)
+#
+# Engine backends:
+#   - The denoise stage REQUIRES the AR-Diffusion engine (session-scoped paged KV).
+#   - Encode/decode own no KV, so they use the standard diffusion engine.
+#
+# Device placement: 6 devices total (0=encode, 1-4=denoise TP4, 5=decode). The
+# `devices:` values below are per-container indices — map them to physical cards
+# with ZE_AFFINITY_MASK at container-launch time (e.g. ZE_AFFINITY_MASK=1,4,5,6,7,0
+# puts denoise on physical cards 4,5,6,7, matching the validated run).
+#
+# ar_diffusion_kv_config.warmup_cudagraph is disabled on the denoise stage: its
+# synthetic warm-up rollout was observed to spike device memory past the per-card
+# ceiling (UR_RESULT_ERROR_OUT_OF_RESOURCES -> DEVICE_LOST) without offload headroom;
+# it already falls back to lazy capture on failure, so disabling it only removes
+# the spike.
+
+pipeline: dreamzero_disaggregated
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  # ---- Stage 0: ENCODE (standard diffusion engine, one device) ----
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      cfg_scale: 1.0
+      num_inference_steps: 16
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+
+  # ---- Stage 1: DENOISE (AR-Diffusion engine; TP=4; CFG off; inductor on) ----
+  - stage_id: 1
+    devices: "1,2,3,4"
+    max_num_seqs: 1
+    enforce_eager: false
+    model_class_name: DreamZeroPipeline
+    # DreamZero denoise runs on the AR-Diffusion engine (engine-level paged KV).
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    parallel_config:
+      tensor_parallel_size: 4
+      cfg_parallel_size: 1
+    model_config:
+      default_robot_embodiment: roboarena
+      cfg_scale: 1.0
+      num_inference_steps: 16
+      ar_diffusion_kv_config:
+        warmup_cudagraph: false
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+
+  # ---- Stage 2: DECODE (standard diffusion engine, one device) ----
+  - stage_id: 2
+    devices: "5"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    model_config:
+      default_robot_embodiment: roboarena
+      cfg_scale: 1.0
+      num_inference_steps: 16
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position

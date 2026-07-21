@@ -153,7 +153,7 @@ class ARDiffusionKVState:
     def reset(self, *, keep_cross_text: bool = False) -> None:
         """Drop this session's KV — mirrors the model-local ``state.reset()``.
 
-        DreamZero resets at the attention-window boundary (``should_reset``); the
+        DreamZero resets at the attention-window boundary (``reset_reason``); the
         model starts a fresh sliding window, so AR-Diffusion must free the resident pool
         blocks and start a fresh adapter for each branch. The ``ARDiffusionKVState``
         object (and thus ``pipeline._ar_diffusion_kv_state``) is preserved across the reset

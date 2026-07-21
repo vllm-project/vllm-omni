@@ -465,7 +465,9 @@ def _prepare_image_latents(
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    image_latents = [getattr(state.sampling, "image_latent", None) for state in states]
+    image_latents = [
+        state.extra.get("image_latents", getattr(state.sampling, "image_latent", None)) for state in states
+    ]
     if all(image_latent is None for image_latent in image_latents):
         return None
     if any(image_latent is None for image_latent in image_latents):
