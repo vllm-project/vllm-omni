@@ -117,12 +117,19 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
+        # Multi-branch CFG: prefer the branch id tagged by CFGParallelMixin
+        # before each forward (consumed per call, one cache state per branch).
+        # Untagged models fall through to the original 2-branch logic below.
+        tagged_branch = getattr(module, "_teacache_branch_id", None)
+        if tagged_branch is not None:
+            module._teacache_branch_id = None  # consume: applies to this call only
+            cache_branch = f"branch_{tagged_branch}"
         # Set context based on CFG branch for separate state tracking
         # With CFG-parallel, each rank processes only one branch:
         #   - cfg_rank 0: positive branch
         #   - cfg_rank > 0: negative branch
         # Without CFG-parallel, branches alternate within a single rank
-        if getattr(module, "do_true_cfg", False):
+        elif getattr(module, "do_true_cfg", False):
             cfg_parallel_size = get_classifier_free_guidance_world_size()
             if cfg_parallel_size > 1:
                 cfg_rank = get_classifier_free_guidance_rank()
