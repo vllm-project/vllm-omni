@@ -47,6 +47,7 @@ th {
 | `LTX2ImageToVideoTwoStagesPipeline` | LTX-2-I2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
 | `LTX23Pipeline` | LTX-2.3-T2V | `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
 | `LTX23ImageToVideoPipeline` | LTX-2.3-I2V | `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
+| `LingBotVideoPipeline` | LingBot-Video dense and MoE T2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | |
 | `MagiHumanPipeline` | MagiHuman | `SII-GAIR/daVinci-MagiHuman-Base-1080p` | ✅︎ | ✅︎ | | |

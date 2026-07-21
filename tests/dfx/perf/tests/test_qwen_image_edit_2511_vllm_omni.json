@@ -36,8 +36,8 @@
         "baseline": {
           "throughput_qps": 0.0721,
           "latency_mean": 13.8398,
-          "peak_memory_mb_max": 54731.4,
-          "peak_memory_mb_mean": 54731.4
+          "peak_memory_mb_max": 57610.0,
+          "peak_memory_mb_mean": 57610.0
         }
       },
       {
@@ -54,8 +54,8 @@
         "baseline": {
           "throughput_qps": 0.0186,
           "latency_mean": 53.6942,
-          "peak_memory_mb_max": 64402.4,
-          "peak_memory_mb_mean": 64402.4
+          "peak_memory_mb_max": 67790.0,
+          "peak_memory_mb_mean": 67790.0
         }
       }
     ]
@@ -101,8 +101,8 @@
         "baseline": {
           "throughput_qps": 0.0538,
           "latency_mean": 18.5591,
-          "peak_memory_mb_max": 53485.0,
-          "peak_memory_mb_mean": 53485.0
+          "peak_memory_mb_max": 56449.4286,
+          "peak_memory_mb_mean": 56449.4286
         }
       }
     ]
@@ -158,8 +158,8 @@
         "baseline": {
           "throughput_qps": 0.2776,
           "latency_mean": 3.5938,
-          "peak_memory_mb_max": 55214.0,
-          "peak_memory_mb_mean": 55214.0
+          "peak_memory_mb_max": 58113.7143,
+          "peak_memory_mb_mean": 58075.1429
         }
       },
       {
@@ -176,8 +176,8 @@
         "baseline": {
           "throughput_qps": 0.1051,
           "latency_mean": 9.4918,
-          "peak_memory_mb_max": 64265.6,
-          "peak_memory_mb_mean": 64265.6
+          "peak_memory_mb_max": 68107.4286,
+          "peak_memory_mb_mean": 68107.4286
         }
       }
     ]
