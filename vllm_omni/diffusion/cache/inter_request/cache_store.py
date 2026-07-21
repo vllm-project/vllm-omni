@@ -64,7 +64,7 @@ class StepLatentData:
 
 @dataclass
 class CacheEntry:
-    latents: torch.Tensor
+    latents: torch.Tensor | None
     cache_key_hash: str
     step_latents: list[StepLatentData] | None = None
     metadata: dict[str, Any] | None = None
@@ -74,7 +74,12 @@ class CacheEntry:
 
 
 class DiTCacheStore:
-    def __init__(self, max_entries: int = 100, max_memory_gb: float = 4.0):
+    def __init__(
+        self,
+        max_entries: int = 100,
+        max_memory_gb: float = 4.0,
+        lmcache_engine: Any | None = None,
+    ):
         self._store: OrderedDict[str, CacheEntry] = OrderedDict()
         self._max_entries = max_entries
         self._max_memory_bytes = max_memory_gb * _GB
@@ -86,6 +91,13 @@ class DiTCacheStore:
         self._all_t2t_sims: list[float] = []  # all t2t_sim values across all queries
         self._search_count: int = 0  # throttle for _flush_sim_stats_to_file
         self._use_t2i_penalty: bool = True  # enable t2i sigmoid penalty in hybrid matching
+
+        # ---- LMCache-backed tiered storage ----
+        # When lmcache_engine is set, put() also writes latents to LMCache (which
+        # manages CPU→Disk tiering + LRU internally). On CPU eviction the entry's
+        # latents are set to None (lightweight shell kept for semantic_search);
+        # a subsequent get() recovers them from LMCache via engine.get().
+        self._lmcache = lmcache_engine
 
         # ---- Pre-stacked embedding matrices for fast vectorized retrieval ----
         # Instead of torch.stack()-ing all embeddings on every semantic_search()
@@ -171,7 +183,9 @@ class DiTCacheStore:
         return sum(self._estimate_tensor_bytes(s.latent) for s in step_latents)
 
     def _estimate_entry_bytes(self, entry: CacheEntry) -> int:
-        total = self._estimate_tensor_bytes(entry.latents)
+        total = 0
+        if entry.latents is not None:
+            total += self._estimate_tensor_bytes(entry.latents)
         if entry.step_latents is not None:
             total += self._estimate_step_latents_bytes(entry.step_latents)
         if entry.clip_embedding is not None:
@@ -180,19 +194,67 @@ class DiTCacheStore:
             total += self._estimate_tensor_bytes(entry.image_embedding)
         return total
 
+    def _estimate_heavy_bytes(self, entry: CacheEntry) -> int:
+        """Bytes of heavy tensors only (latents + step_latents), excluding embeddings."""
+        total = 0
+        if entry.latents is not None:
+            total += self._estimate_tensor_bytes(entry.latents)
+        if entry.step_latents is not None:
+            total += self._estimate_step_latents_bytes(entry.step_latents)
+        return total
+
     def _evict_if_needed(self, required_bytes: int):
+        """Evict the oldest entries to make room.
+
+        When LMCache is enabled, eviction clears the entry's heavy tensors
+        (latents, step_latents) from CPU memory but keeps a lightweight shell
+        (clip_embedding, cache_key) for semantic_search. The data was already
+        written to LMCache at put() time, so a subsequent get() can recover it.
+        Without LMCache, the entry is discarded entirely (original behaviour).
+        """
         while len(self._store) >= self._max_entries or (
-            self._current_memory_bytes + required_bytes > self._max_memory_bytes and len(self._store) > 0
+            self._current_memory_bytes + required_bytes > self._max_memory_bytes
+            and len(self._store) > 0
         ):
-            oldest_key, oldest_entry = self._store.popitem(last=False)
-            freed = self._estimate_entry_bytes(oldest_entry)
+            # Find the oldest entry that still has heavy data in CPU.
+            oldest_key = None
+            oldest_entry = None
+            for kh, entry in self._store.items():
+                if entry.latents is not None:
+                    oldest_key = kh
+                    oldest_entry = entry
+                    break
+            if oldest_key is None:
+                # All entries are shells (latents=None); if we're still over
+                # max_entries, purge the oldest shell entirely.
+                if len(self._store) >= self._max_entries:
+                    purge_key = next(iter(self._store))
+                    self._store.pop(purge_key)
+                    self._matrix_free(purge_key)
+                    continue
+                break
+
+            freed = self._estimate_heavy_bytes(oldest_entry)
             self._current_memory_bytes -= freed
-            self._matrix_free(oldest_key)
-            logger.debug(
-                "Evicted cache entry %s, freed %.2f MB",
-                oldest_key[:8],
-                freed / _MB,
-            )
+
+            if self._lmcache is not None:
+                # Keep shell; clear heavy data (already safe in LMCache).
+                oldest_entry.latents = None
+                oldest_entry.step_latents = None
+                logger.debug(
+                    "Evicted-to-lmcache %s, freed %.2f MB (shell kept)",
+                    oldest_key[:8],
+                    freed / _MB,
+                )
+            else:
+                # No LMCache: discard entirely.
+                self._store.pop(oldest_key)
+                self._matrix_free(oldest_key)
+                logger.debug(
+                    "Evicted %s, freed %.2f MB",
+                    oldest_key[:8],
+                    freed / _MB,
+                )
 
     def put(
         self,
@@ -214,8 +276,6 @@ class DiTCacheStore:
                 self._matrix_free(key_hash)
                 del self._store[key_hash]
 
-            self._evict_if_needed(tensor_bytes)
-
             cached_latents = latents.detach().clone().cpu()
             cached_step_latents = None
             if step_latents is not None:
@@ -228,6 +288,19 @@ class DiTCacheStore:
                     for s in step_latents
                 ]
             cached_clip = clip_embedding.detach().clone().cpu() if clip_embedding is not None else None
+
+            # Persist to LMCache BEFORE inserting into OrderedDict, so that data
+            # is safely on disk even if CPU eviction immediately clears it.
+            if self._lmcache is not None:
+                self._lmcache.put(f"{key_hash}:final", cached_latents)
+                if cached_step_latents:
+                    for s in cached_step_latents:
+                        self._lmcache.put(
+                            f"{key_hash}:step_{s.step_index:04d}", s.latent
+                        )
+
+            self._evict_if_needed(tensor_bytes)
+
             entry = CacheEntry(
                 latents=cached_latents,
                 cache_key_hash=key_hash,
@@ -239,6 +312,11 @@ class DiTCacheStore:
             self._store[key_hash] = entry
             self._matrix_add(key_hash, cached_clip)
             self._current_memory_bytes += tensor_bytes
+
+            # If CPU budget is 0, evict this entry's heavy data immediately
+            # (data is already safe in LMCache from the put above).
+            if self._lmcache is not None:
+                self._evict_if_needed(0)
 
             num_steps = len(cached_step_latents) if cached_step_latents is not None else 0
             logger.info(
@@ -259,6 +337,19 @@ class DiTCacheStore:
                 self._misses += 1
                 logger.debug("Cache MISS for key %s", key_hash[:8])
                 return None
+
+            # LMCache recovery: if heavy tensors were evicted from CPU (latents
+            # set to None by _evict_if_needed), recover from LMCache.
+            if entry.latents is None and self._lmcache is not None:
+                recovered = self._lmcache.get(f"{key_hash}:final", device="cpu")
+                if recovered is not None:
+                    entry.latents = recovered
+                    self._current_memory_bytes += self._estimate_tensor_bytes(recovered)
+                    logger.debug("Recovered %s from LMCache", key_hash[:8])
+                else:
+                    self._misses += 1
+                    logger.warning("LMCache miss for key %s, treating as miss", key_hash[:8])
+                    return None
 
             self._store.move_to_end(key_hash)
             self._hits += 1
@@ -439,6 +530,21 @@ class DiTCacheStore:
             self._store.move_to_end(best_key_hash)
             self._hits += 1
             entry = self._store[best_key_hash]
+
+            # LMCache recovery: if heavy tensors were evicted from CPU, recover.
+            if entry.latents is None and self._lmcache is not None:
+                recovered = self._lmcache.get(f"{best_key_hash}:final", device="cpu")
+                if recovered is not None:
+                    entry.latents = recovered
+                    self._current_memory_bytes += self._estimate_tensor_bytes(recovered)
+                else:
+                    self._misses += 1
+                    logger.warning(
+                        "LMCache miss for semantic hit %s, treating as miss",
+                        best_key_hash[:8],
+                    )
+                    return None, None, best_sim, None, None
+
             cached_prompt = entry.cache_key.prompt if entry.cache_key is not None else None
 
             latents = entry.latents
@@ -490,7 +596,32 @@ class DiTCacheStore:
 
         with self._lock:
             entry = self._store.get(key_hash)
-            if entry is None or entry.step_latents is None:
+            if entry is None:
+                return None
+
+            # LMCache recovery: if step_latents were evicted from CPU, recover.
+            if entry.step_latents is None and self._lmcache is not None:
+                # Recover final latent first (to ensure entry is warm).
+                if entry.latents is None:
+                    recovered_final = self._lmcache.get(f"{key_hash}:final", device="cpu")
+                    if recovered_final is not None:
+                        entry.latents = recovered_final
+                        self._current_memory_bytes += self._estimate_tensor_bytes(recovered_final)
+                # Recover step latents — we don't know how many steps, so try
+                # a reasonable range based on cache_key.num_inference_steps.
+                n_steps = entry.cache_key.num_inference_steps if entry.cache_key else 40
+                recovered_steps = []
+                for i in range(n_steps):
+                    s = self._lmcache.get(f"{key_hash}:step_{i:04d}", device="cpu")
+                    if s is None:
+                        break
+                    recovered_steps.append(StepLatentData(step_index=i, timestep=float(i), latent=s))
+                if recovered_steps:
+                    entry.step_latents = recovered_steps
+                else:
+                    return None
+
+            if entry.step_latents is None:
                 return None
 
             self._store.move_to_end(key_hash)
@@ -599,6 +730,7 @@ class DiTCacheStore:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
+            shell_count = sum(1 for e in self._store.values() if e.latents is None)
             return {
                 "entries": len(self._store),
                 "max_entries": self._max_entries,
@@ -607,7 +739,14 @@ class DiTCacheStore:
                 "hits": self._hits,
                 "misses": self._misses,
                 "hit_rate": self.hit_rate,
+                "lmcache_enabled": self._lmcache is not None,
+                "shells_latents_evicted": shell_count,
             }
+
+    # ==================================================================
+    # Persistent storage (save_to_disk / load_from_disk — for cross-process
+    # reuse without LMCache; kept for backward compatibility)
+    # ==================================================================
 
     def save_to_disk(self, cache_dir: str | Path) -> int:
         cache_dir = Path(cache_dir)

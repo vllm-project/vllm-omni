@@ -454,10 +454,16 @@ class DiffusionCacheConfig:
     force_refresh_step_policy: str = "once"
     # Inter-request cache parameters [inter_request only]
     inter_request_max_entries: int = 100
-    inter_request_max_memory_gb: float = 4.0
+    inter_request_max_memory_gb: float = 0.0  # DiTCacheStore CPU hot-cache budget; 0=shell-only mode (latents in LMCache)
     inter_request_record_step_latents: bool = False
     inter_request_step_latents_dir: str = "./step_latents"
     inter_request_persistent_cache_dir: str | None = None
+    # LMCache-backed CPU→Disk tiering: when disk_dir is set, latent tensors
+    # are stored via LMCache ECCacheEngine (with built-in CPU→Disk layering +
+    # LRU eviction). None = disable tiering (original behaviour).
+    inter_request_lmcache_disk_dir: str | None = None
+    inter_request_lmcache_max_cpu_gb: float = 5.0  # LMCache CPU pool size (GB)
+    inter_request_lmcache_max_disk_gb: float = 100.0  # LMCache disk quota (GB)
     # CLIP-based semantic matching parameters [inter_request only]
     inter_request_clip_model_path: str | None = None
     inter_request_clip_threshold: float = 0.75

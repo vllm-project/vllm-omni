@@ -137,6 +137,14 @@ def parse_args() -> argparse.Namespace:
         help="Directory for persistent cross-request cache storage.",
     )
     parser.add_argument(
+        "--lmcache-disk-dir",
+        type=str,
+        default=None,
+        help="LMCache disk directory for CPU→Disk tiering.",
+    )
+    parser.add_argument("--lmcache-max-cpu-gb", type=float, default=5.0)
+    parser.add_argument("--lmcache-max-disk-gb", type=float, default=0.0)
+    parser.add_argument(
         "--max-entries",
         type=int,
         default=8000,
@@ -428,6 +436,10 @@ def main():
             "inter_request_max_memory_gb": args.max_memory_gb,
             "inter_request_persistent_cache_dir": args.persistent_cache_dir,
         }
+        if args.lmcache_disk_dir:
+            cache_config["inter_request_lmcache_disk_dir"] = args.lmcache_disk_dir
+            cache_config["inter_request_lmcache_max_cpu_gb"] = args.lmcache_max_cpu_gb
+            cache_config["inter_request_lmcache_max_disk_gb"] = args.lmcache_max_disk_gb
         if args.clip_model_path:
             cache_config["inter_request_clip_model_path"] = args.clip_model_path
             cache_config["inter_request_clip_threshold"] = args.clip_threshold

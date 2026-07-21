@@ -59,9 +59,50 @@ class InterRequestCacheBackend(CacheBackend):
         super().__init__(config)
         max_entries = getattr(config, "inter_request_max_entries", 100)
         max_memory_gb = getattr(config, "inter_request_max_memory_gb", 4.0)
+
+        # Initialize LMCache ECCacheEngine for CPU→Disk tiered storage.
+        # ECCacheEngine stores arbitrary tensors by string key with built-in
+        # CPU→Disk layering, LRU eviction, and async persistence.
+        lmcache_disk_dir = getattr(config, "inter_request_lmcache_disk_dir", None)
+        if lmcache_disk_dir:
+            import torch as _torch
+            from lmcache.v1.ec_engine import ECCacheEngine
+            from lmcache.v1.config import LMCacheEngineConfig
+            from lmcache.v1.cache_engine import LMCacheMetadata
+
+            lc_config = LMCacheEngineConfig.from_defaults(
+                local_cpu=True,
+                max_local_cpu_size=getattr(config, "inter_request_lmcache_max_cpu_gb", 5.0),
+                local_disk=lmcache_disk_dir,
+                max_local_disk_size=getattr(config, "inter_request_lmcache_max_disk_gb", 0.0),
+                save_decode_cache=True,
+            )
+            lc_metadata = LMCacheMetadata(
+                model_name="vllm_omni_diffusion",
+                world_size=1,
+                local_world_size=1,
+                worker_id=0,
+                local_worker_id=0,
+                kv_dtype=_torch.float32,
+                kv_shape=(1, 1, 1, 1, 1),  # unused by ECCacheEngine
+            )
+            self._lmcache_engine = ECCacheEngine(
+                config=lc_config,
+                metadata=lc_metadata,
+                encoder_dtype=_torch.float32,
+            )
+            logger.info(
+                "LMCache ECCacheEngine initialized: disk_dir=%s, cpu_gb=%.1f",
+                lmcache_disk_dir,
+                lc_config.max_local_cpu_size,
+            )
+        else:
+            self._lmcache_engine = None
+
         self._cache_store = DiTCacheStore(
             max_entries=max_entries,
             max_memory_gb=max_memory_gb,
+            lmcache_engine=self._lmcache_engine,
         )
         self._pipeline = None
 
@@ -111,7 +152,12 @@ class InterRequestCacheBackend(CacheBackend):
         if self._clip_model_path is not None:
             self._init_clip_encoder()
 
-        if self._persistent_cache_dir is not None:
+        # Restore persisted cache on startup.
+        # When LMCache is enabled, latents are already on disk (managed by
+        # LMCache) and will be recovered on first get(). We only need to
+        # restore the embedding shells for semantic_search.
+        # When persistent_cache_dir is set (without LMCache), do a full load.
+        if self._persistent_cache_dir is not None and self._lmcache_engine is None:
             loaded = self._cache_store.load_from_disk(self._persistent_cache_dir)
             if loaded > 0:
                 logger.info(
@@ -272,17 +318,21 @@ class InterRequestCacheBackend(CacheBackend):
                 feat = feats.last_hidden_state.mean(dim=1).squeeze(0)
             return feat / feat.norm(dim=-1, keepdim=True)
         except Exception as e:
+            logger.info("UPDATE_IMG: encode_image_cpu failed: %s", e)
             return None
 
     def update_image_embedding(self, cache_key_hash: str | None, image_tensor: torch.Tensor) -> None:
+        logger.info("UPDATE_IMG: hash=%s, clip_model_None=%s", cache_key_hash, self._full_clip_model is None)
         if cache_key_hash is None:
             return
         if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:
             return
         # Force CPU for image embedding to avoid NPU async issues in daemon threads
         image_emb = self._encode_image_cpu(image_tensor)
+        logger.info("UPDATE_IMG: encode_image result is None=%s", image_emb is None)
         if image_emb is not None:
             self._cache_store.update_image_embedding(cache_key_hash, image_emb)
+            logger.info("UPDATE_IMG: stored image embedding for %s", cache_key_hash[:8])
 
     def semantic_lookup(
         self, req: Any, target_device: torch.device | str | None = None
@@ -332,10 +382,20 @@ class InterRequestCacheBackend(CacheBackend):
 
     def shutdown(self) -> None:
         logger.info(
-            "InterRequestCacheBackend shutdown: persistent_cache_dir=%s, cache_size=%d",
+            "InterRequestCacheBackend shutdown: persistent_cache_dir=%s, "
+            "lmcache_enabled=%s, cache_size=%d",
             self._persistent_cache_dir,
+            self._lmcache_engine is not None,
             self._cache_store.size,
         )
+
+        # Close LMCache engine (flushes async writes + stops background workers).
+        if self._lmcache_engine is not None:
+            self._lmcache_engine.close()
+            logger.info("LMCache ECCacheEngine closed")
+
+        # Persist hot (in-CPU) entries to persistent_cache_dir for cross-process
+        # reuse (original behaviour, independent of LMCache).
         if self._persistent_cache_dir is not None and self._cache_store.size > 0:
             saved = self._cache_store.save_to_disk(self._persistent_cache_dir)
             logger.info(

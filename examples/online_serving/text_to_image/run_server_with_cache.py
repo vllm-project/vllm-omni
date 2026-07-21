@@ -170,6 +170,12 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--cache-backend", default="inter_request")
     parser.add_argument("--persistent-cache-dir", default="./persistent_cache")
+    parser.add_argument(
+        "--lmcache-disk-dir", default=None,
+        help="LMCache disk directory for CPU→Disk tiering.",
+    )
+    parser.add_argument("--lmcache-max-cpu-gb", type=float, default=5.0)
+    parser.add_argument("--lmcache-max-disk-gb", type=float, default=0.0)
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--max-entries", type=int, default=8000)
     parser.add_argument("--max-memory-gb", type=float, default=800.0)
@@ -205,6 +211,10 @@ def main():
         "inter_request_max_memory_gb": args.max_memory_gb,
         "inter_request_persistent_cache_dir": args.persistent_cache_dir,
     }
+    if args.lmcache_disk_dir:
+        cache_config["inter_request_lmcache_disk_dir"] = args.lmcache_disk_dir
+        cache_config["inter_request_lmcache_max_cpu_gb"] = args.lmcache_max_cpu_gb
+        cache_config["inter_request_lmcache_max_disk_gb"] = args.lmcache_max_disk_gb
     if args.clip_model_path:
         cache_config["inter_request_clip_model_path"] = args.clip_model_path
         cache_config["inter_request_clip_threshold"] = args.clip_threshold
