@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Offline example contract and opt-in LingBot-World v2 GPU smoke test."""
+"""Offline example contract and opt-in LingBot-World v2 GPU tests.
+
+The CUDA matrix uses the repository's H100 resource class, which also covers
+H200. It includes a compiled default-resolution TP=1 run, eager TP=2 sharding, request
+determinism/camera sensitivity, and an 81-frame run that crosses the
+checkpoint's 18-latent-frame sliding window. Set
+``VLLM_OMNI_RUN_LINGBOT_WORLD_V2_E2E=1`` together with checkpoint, image,
+primary-action, and alternate-action path variables defined below. The two
+action directories must be siblings under the same trusted root.
+"""
 
 from __future__ import annotations
 
@@ -13,12 +22,15 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from tests.helpers.mark import hardware_test
+
 _ROOT = Path(__file__).parents[3]
 _EXAMPLE_PATH = _ROOT / "examples/offline_inference/diffusion/lingbot_world_v2.py"
 _RUN_E2E_ENV = "VLLM_OMNI_RUN_LINGBOT_WORLD_V2_E2E"
 _MODEL_ENV = "VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH"
 _IMAGE_ENV = "VLLM_OMNI_LINGBOT_WORLD_V2_IMAGE_PATH"
 _ACTION_ENV = "VLLM_OMNI_LINGBOT_WORLD_V2_ACTION_DIR"
+_ALTERNATE_ACTION_ENV = "VLLM_OMNI_LINGBOT_WORLD_V2_ALTERNATE_ACTION_DIR"
 
 
 def _load_example():
@@ -286,22 +298,260 @@ def _required_e2e_path(env_name: str, *, directory: bool) -> Path:
     return path
 
 
+def _e2e_case(
+    module,
+    *,
+    model: Path,
+    image: Path,
+    action_dir: Path,
+    output_path: Path,
+    num_frames: int,
+    tensor_parallel_size: int,
+    height: int = 64,
+    width: int = 64,
+    enforce_eager: bool = False,
+):
+    argv = [
+        "--model",
+        str(model),
+        "--prompt",
+        "The camera moves slowly forward through the scene.",
+        "--image",
+        str(image),
+        "--action-dir",
+        str(action_dir),
+        "--height",
+        str(height),
+        "--width",
+        str(width),
+        "--num-frames",
+        str(num_frames),
+        "--tensor-parallel-size",
+        str(tensor_parallel_size),
+        "--output",
+        str(output_path),
+    ]
+    if enforce_eager:
+        argv.append("--enforce-eager")
+    args = module.parse_args(argv)
+    return args, module.resolve_cli_paths(args)
+
+
+def _peak_memory_mb(outputs) -> float:
+    peaks = []
+    for output in outputs:
+        request_output = getattr(output, "request_output", None)
+        value = getattr(request_output, "peak_memory_mb", None) if request_output is not None else None
+        if value is None:
+            value = getattr(output, "peak_memory_mb", 0.0)
+        peaks.append(float(value))
+    return max(peaks, default=0.0)
+
+
+def _generate(omni, module, args, paths):
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    prompt, sampling_kwargs = module.build_request(args, paths)
+    outputs = omni.generate(
+        prompt,
+        OmniDiffusionSamplingParams(**sampling_kwargs),
+        use_tqdm=False,
+    )
+    return module.extract_video_array(outputs), _peak_memory_mb(outputs)
+
+
+def _assert_non_degenerate_video(
+    frames: np.ndarray,
+    *,
+    num_frames: int,
+    height: int = 64,
+    width: int = 64,
+) -> None:
+    assert frames.shape == (num_frames, height, width, 3)
+    assert np.issubdtype(frames.dtype, np.number)
+    assert np.isfinite(frames).all()
+    values = frames.astype(np.float32, copy=False)
+    assert float(np.ptp(values)) > 1e-6, "generated video is spatially constant"
+    assert float(np.mean(np.abs(np.diff(values, axis=0)))) > 1e-6, "generated video is temporally constant"
+
+
+def _run_one_block(
+    tmp_path: Path,
+    *,
+    tensor_parallel_size: int,
+    height: int,
+    width: int,
+    enforce_eager: bool,
+) -> None:
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("LingBot-World v2 E2E requires CUDA")
+
+    model = _required_e2e_path(_MODEL_ENV, directory=True)
+    image = _required_e2e_path(_IMAGE_ENV, directory=False)
+    action_dir = _required_e2e_path(_ACTION_ENV, directory=True)
+    module = _load_example()
+
+    from diffusers.utils import export_to_video
+
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.entrypoints.omni import Omni
+    from vllm_omni.model_extras import get_model_class_name
+
+    output_path = tmp_path / f"lingbot-world-v2-tp{tensor_parallel_size}-{height}x{width}-one-block.mp4"
+    args, paths = _e2e_case(
+        module,
+        model=model,
+        image=image,
+        action_dir=action_dir,
+        output_path=output_path,
+        num_frames=9,
+        tensor_parallel_size=tensor_parallel_size,
+        height=height,
+        width=width,
+        enforce_eager=enforce_eager,
+    )
+    parallel_config = DiffusionParallelConfig(tensor_parallel_size=tensor_parallel_size)
+    omni = Omni(**module.build_omni_kwargs(args, paths, parallel_config=parallel_config))
+    try:
+        assert get_model_class_name(omni) == "LingBotWorldCausalDMDPipeline"
+        frames, peak_memory_mb = _generate(omni, module, args, paths)
+        _assert_non_degenerate_video(frames, num_frames=9, height=height, width=width)
+        assert peak_memory_mb > 0.0
+        export_to_video(frames, str(output_path), fps=args.fps)
+        assert output_path.is_file() and output_path.stat().st_size > 0
+        print(
+            f"LingBot-World v2 TP={tensor_parallel_size} artifact={output_path} "
+            f"shape={frames.shape} peak_memory_mb={peak_memory_mb:.2f}"
+        )
+    finally:
+        omni.close()
+
+
 @pytest.mark.full_model
 @pytest.mark.slow
 @pytest.mark.diffusion
-@pytest.mark.gpu
-@pytest.mark.cuda
-@pytest.mark.H100
 @pytest.mark.skipif(
     os.environ.get(_RUN_E2E_ENV) != "1",
     reason=f"set {_RUN_E2E_ENV}=1 and the LingBot asset-path variables to run",
 )
-def test_lingbot_world_v2_real_checkpoint_one_block(tmp_path: Path) -> None:
-    """Auto-discover the official class and generate one 3-latent/9-raw-frame block.
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+def test_lingbot_world_v2_real_checkpoint_tp1_one_block(tmp_path: Path) -> None:
+    """Auto-discover and generate one default-resolution block on one GPU."""
 
-    This is a runtime smoke test; golden-video comparison remains deferred to a
-    separately reviewed real-GPU quality run.
-    """
+    _run_one_block(
+        tmp_path,
+        tensor_parallel_size=1,
+        height=480,
+        width=832,
+        enforce_eager=False,
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.skipif(
+    os.environ.get(_RUN_E2E_ENV) != "1",
+    reason=f"set {_RUN_E2E_ENV}=1 and the LingBot asset-path variables to run",
+)
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+def test_lingbot_world_v2_real_checkpoint_tp2_one_block(tmp_path: Path) -> None:
+    """Load, shard, and generate one block with tensor parallel size two."""
+
+    _run_one_block(
+        tmp_path,
+        tensor_parallel_size=2,
+        height=64,
+        width=64,
+        enforce_eager=True,
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.skipif(
+    os.environ.get(_RUN_E2E_ENV) != "1",
+    reason=f"set {_RUN_E2E_ENV}=1 and the LingBot asset-path variables to run",
+)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+def test_lingbot_world_v2_multi_block_determinism_and_camera_sensitivity(tmp_path: Path) -> None:
+    """Exercise multi-block cache reuse and request isolation on real CUDA."""
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("LingBot-World v2 E2E requires CUDA")
+
+    model = _required_e2e_path(_MODEL_ENV, directory=True)
+    image = _required_e2e_path(_IMAGE_ENV, directory=False)
+    action_dir = _required_e2e_path(_ACTION_ENV, directory=True)
+    alternate_action_dir = _required_e2e_path(_ALTERNATE_ACTION_ENV, directory=True)
+    if alternate_action_dir.parent != action_dir.parent:
+        pytest.skip(f"{_ACTION_ENV} and {_ALTERNATE_ACTION_ENV} must be sibling directories under one trusted root")
+    module = _load_example()
+
+    from diffusers.utils import export_to_video
+
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.entrypoints.omni import Omni
+
+    primary_args, primary_paths = _e2e_case(
+        module,
+        model=model,
+        image=image,
+        action_dir=action_dir,
+        output_path=tmp_path / "lingbot-world-v2-primary.mp4",
+        num_frames=21,
+        tensor_parallel_size=1,
+        enforce_eager=True,
+    )
+    alternate_args, alternate_paths = _e2e_case(
+        module,
+        model=model,
+        image=image,
+        action_dir=alternate_action_dir,
+        output_path=tmp_path / "lingbot-world-v2-alternate.mp4",
+        num_frames=21,
+        tensor_parallel_size=1,
+        enforce_eager=True,
+    )
+    parallel_config = DiffusionParallelConfig(tensor_parallel_size=1)
+    omni = Omni(**module.build_omni_kwargs(primary_args, primary_paths, parallel_config=parallel_config))
+    try:
+        primary, primary_peak = _generate(omni, module, primary_args, primary_paths)
+        repeated, repeated_peak = _generate(omni, module, primary_args, primary_paths)
+        alternate, alternate_peak = _generate(omni, module, alternate_args, alternate_paths)
+    finally:
+        omni.close()
+
+    for frames in (primary, repeated, alternate):
+        _assert_non_degenerate_video(frames, num_frames=21)
+    assert min(primary_peak, repeated_peak, alternate_peak) > 0.0
+    np.testing.assert_allclose(repeated, primary, rtol=1e-3, atol=1e-3)
+    camera_mae = float(np.mean(np.abs(alternate.astype(np.float32) - primary.astype(np.float32))))
+    assert camera_mae > 1e-5, "changing the camera action did not change the generated video"
+
+    export_to_video(primary, str(primary_paths.output), fps=primary_args.fps)
+    export_to_video(alternate, str(alternate_paths.output), fps=alternate_args.fps)
+    assert primary_paths.output.stat().st_size > 0
+    assert alternate_paths.output.stat().st_size > 0
+    print(
+        f"LingBot-World v2 multi-block primary={primary_paths.output} alternate={alternate_paths.output} "
+        f"camera_mae={camera_mae:.6f} peaks_mb={(primary_peak, repeated_peak, alternate_peak)}"
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.skipif(
+    os.environ.get(_RUN_E2E_ENV) != "1",
+    reason=f"set {_RUN_E2E_ENV}=1 and the LingBot asset-path variables to run",
+)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+def test_lingbot_world_v2_real_checkpoint_crosses_sliding_window(tmp_path: Path) -> None:
+    """Generate seven blocks so the 18-latent-frame cache must evict history."""
 
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -316,48 +566,29 @@ def test_lingbot_world_v2_real_checkpoint_one_block(tmp_path: Path) -> None:
 
     from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.entrypoints.omni import Omni
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-    from vllm_omni.model_extras import get_model_class_name
 
-    output_path = tmp_path / "lingbot-world-v2-one-block.mp4"
-    args = module.parse_args(
-        [
-            "--model",
-            str(model),
-            "--prompt",
-            "The camera moves slowly forward through the scene.",
-            "--image",
-            str(image),
-            "--action-dir",
-            str(action_dir),
-            "--height",
-            "64",
-            "--width",
-            "64",
-            "--num-frames",
-            "9",
-            "--output",
-            str(output_path),
-            "--enforce-eager",
-        ]
+    args, paths = _e2e_case(
+        module,
+        model=model,
+        image=image,
+        action_dir=action_dir,
+        output_path=tmp_path / "lingbot-world-v2-sliding-window.mp4",
+        num_frames=81,
+        tensor_parallel_size=1,
+        enforce_eager=True,
     )
-    paths = module.resolve_cli_paths(args)
-    parallel_config = DiffusionParallelConfig(tensor_parallel_size=args.tensor_parallel_size)
+    parallel_config = DiffusionParallelConfig(tensor_parallel_size=1)
     omni = Omni(**module.build_omni_kwargs(args, paths, parallel_config=parallel_config))
     try:
-        assert get_model_class_name(omni) == "LingBotWorldCausalDMDPipeline"
-        prompt, sampling_kwargs = module.build_request(args, paths)
-        outputs = omni.generate(
-            prompt,
-            OmniDiffusionSamplingParams(**sampling_kwargs),
-            use_tqdm=False,
-        )
-        frames = module.extract_video_array(outputs)
-        assert frames.shape == (9, 64, 64, 3)
-        assert np.isfinite(frames).all()
-        export_to_video(frames, str(output_path), fps=args.fps)
-        assert output_path.is_file() and output_path.stat().st_size > 0
-        peak_memory_mb = max(float(getattr(output, "peak_memory_mb", 0.0)) for output in outputs)
-        print(f"LingBot-World v2 E2E artifact={output_path} shape={frames.shape} peak_memory_mb={peak_memory_mb:.2f}")
+        frames, peak_memory_mb = _generate(omni, module, args, paths)
     finally:
         omni.close()
+
+    _assert_non_degenerate_video(frames, num_frames=81)
+    assert peak_memory_mb > 0.0
+    export_to_video(frames, str(paths.output), fps=args.fps)
+    assert paths.output.is_file() and paths.output.stat().st_size > 0
+    print(
+        f"LingBot-World v2 sliding-window artifact={paths.output} "
+        f"shape={frames.shape} peak_memory_mb={peak_memory_mb:.2f}"
+    )

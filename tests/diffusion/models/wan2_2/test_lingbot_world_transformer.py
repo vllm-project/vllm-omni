@@ -125,6 +125,7 @@ def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera
     encoder_hidden_states = torch.randn(1, 3, 6)
     camera_hidden_states = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
     cross_key_outputs = [attention_tests._record_outputs(block.cross_attn.k) for block in model.blocks]
+    text_projection_outputs = attention_tests._record_outputs(model.text_embedding)
     outputs = []
 
     assert model.patch_embedding.in_channels == 36
@@ -166,6 +167,7 @@ def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera
 
     assert len(outputs) == 4
     assert all(len(outputs) == 1 for outputs in cross_key_outputs)
+    assert len(text_projection_outputs) == 1
 
     alternate_cache = _cache(module, model)
     alternate_output = model(
@@ -187,6 +189,43 @@ def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera
         update_cache=False,
     )
     assert not torch.equal(camera_output, alternate_output)
+
+
+def test_partial_cross_attention_cache_projects_text_only_for_missing_layers() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=2).eval()
+    cache = _cache(module, model)
+    hidden_states = torch.randn(1, 36, 1, 4, 4)
+    timestep = torch.tensor([1.0])
+    encoder_hidden_states = torch.randn(1, 3, 6)
+    camera_hidden_states = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
+
+    model(
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        camera_hidden_states,
+        cache=cache,
+        start_frame=0,
+        update_cache=False,
+    )
+    cache.cross_attention[1] = None
+    text_projection_outputs = attention_tests._record_outputs(model.text_embedding)
+    cross_key_outputs = [attention_tests._record_outputs(block.cross_attn.k) for block in model.blocks]
+
+    model(
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        camera_hidden_states,
+        cache=cache,
+        start_frame=0,
+        update_cache=False,
+    )
+
+    assert len(text_projection_outputs) == 1
+    assert [len(outputs) for outputs in cross_key_outputs] == [0, 1]
+    assert all(layer_cache is not None for layer_cache in cache.cross_attention)
 
 
 @pytest.mark.parametrize("frames", [1, 6], ids=("partial", "multiple_blocks"))
@@ -546,7 +585,8 @@ def test_load_weights_uses_parameter_loaders_and_rejects_unknown_model_keys() ->
     qkv_weight.weight_loader = record_loader
     loaded = model.load_weights(iter(checkpoint_weights.items()))
 
-    assert loaded == set(checkpoint_weights)
+    assert set(checkpoint_weights) <= loaded
+    assert set(dict(model.named_parameters())) <= loaded
     assert loader_calls == ["q", "k", "v"]
     for name, param in model.named_parameters():
         torch.testing.assert_close(param, expected_parameters[name])
@@ -554,7 +594,13 @@ def test_load_weights_uses_parameter_loaders_and_rejects_unknown_model_keys() ->
     first_name = next(iter(checkpoint_weights))
     partial = _tiny_model(module, num_layers=1)
     partial_loaded = partial.load_weights([(first_name, checkpoint_weights[first_name])])
-    assert partial_loaded == {first_name}
+    expected_partial = {first_name}
+    for projection in ("q", "k", "v"):
+        marker = f".self_attn.{projection}."
+        if marker in first_name:
+            expected_partial.add(first_name.replace(marker, ".self_attn.qkv."))
+            break
+    assert partial_loaded == expected_partial
 
     with pytest.raises(KeyError, match="unexpected_model.weight"):
         model.load_weights([("unexpected_model.weight", torch.ones(1))])
@@ -571,6 +617,25 @@ def test_load_weights_consumes_checkpoint_iterator_incrementally() -> None:
         torch.testing.assert_close(first_param, loaded_weight)
 
     assert model.load_weights(weights()) == {first_name}
+
+
+def test_real_auto_weights_loader_covers_fused_model_parameter_namespace() -> None:
+    utils = pytest.importorskip("vllm.model_executor.models.utils")
+    module = attention_tests._load_module()
+    transformer = _tiny_model(module, num_layers=1)
+    checkpoint_weights, _ = _checkpoint_weights_for_model(transformer)
+
+    class Pipeline(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transformer = transformer
+
+    pipeline = Pipeline()
+    loaded = utils.AutoWeightsLoader(pipeline).load_weights(
+        (f"transformer.{name}", value) for name, value in checkpoint_weights.items()
+    )
+
+    assert set(dict(pipeline.named_parameters())) <= loaded
 
 
 def test_checkpoint_weight_index_fixture_matches_model_namespaces() -> None:

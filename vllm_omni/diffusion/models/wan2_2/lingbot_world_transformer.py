@@ -1088,14 +1088,18 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             frames=patched_frames,
             dtype=hidden_states.dtype,
         )
-        encoder_hidden_states = self.text_embedding(encoder_hidden_states)
+        projected_text = (
+            self.text_embedding(encoder_hidden_states)
+            if any(value is None for value in cache.cross_attention)
+            else None
+        )
         # Phase 3: each layer receives its own cache entry. Text K/V is passed
         # only when absent; the returned cache is stored for subsequent DMD
         # steps and causal blocks in this request.
         for index, block in enumerate(self.blocks):
             hidden_states, cross_cache = block(
                 hidden_states,
-                encoder_hidden_states if cache.cross_attention[index] is None else None,
+                projected_text if cache.cross_attention[index] is None else None,
                 timestep_projection,
                 camera_hidden_states,
                 self_cache=cache.self_attention[index],
@@ -1152,5 +1156,10 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                     )
                 with torch.no_grad():
                     param.copy_(loaded_weight)
+            # DiffusersPipelineLoader compares this return value with the
+            # model parameter namespace.  Packed Q/K/V checkpoint tensors
+            # therefore need to report both their source names and the fused
+            # model parameter they populated, matching Wan's loader contract.
             loaded.add(checkpoint_name)
+            loaded.add(name)
         return loaded

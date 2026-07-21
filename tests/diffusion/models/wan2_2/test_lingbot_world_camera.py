@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -198,6 +199,65 @@ def test_load_camera_trajectory_rejects_symlinked_camera_file(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="poses.npy.*opened securely"):
         load_camera_trajectory(resolved)
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "mkfifo"), reason="requires POSIX FIFO support")
+def test_load_camera_trajectory_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    import os
+
+    os.mkfifo(tmp_path / "poses.npy")
+    np.save(tmp_path / "intrinsics.npy", np.ones((1, 4), dtype=np.float32))
+    script = """
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("_lingbot_camera_fifo_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+action = module.resolve_trusted_action_directory(".", sys.argv[2])
+try:
+    module.load_camera_trajectory(action)
+except ValueError as error:
+    print(error)
+else:
+    raise AssertionError("FIFO camera input was accepted")
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(_MODULE_PATH), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "poses.npy must be a regular NPY file" in completed.stdout
+
+
+def test_load_camera_trajectory_decodes_the_validated_file_snapshot(tmp_path: Path, monkeypatch) -> None:
+    original_poses = _identity_poses(1)
+    replacement_poses = original_poses.copy()
+    replacement_poses[0, 0, 3] = 123.0
+    _write_trajectory(tmp_path, original_poses, np.ones((1, 4), dtype=np.float32))
+    poses_path = tmp_path / "poses.npy"
+    original_load = _CAMERA_MODULE.np.load
+    mutation_count = 0
+
+    def mutate_source_then_decode(source, *args, **kwargs):
+        nonlocal mutation_count
+        if mutation_count == 0:
+            mutation_count += 1
+            np.save(poses_path, replacement_poses)
+        return original_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(_CAMERA_MODULE.np, "load", mutate_source_then_decode)
+
+    trajectory = load_camera_trajectory(_trusted(tmp_path))
+
+    assert mutation_count == 1
+    torch.testing.assert_close(trajectory.poses, torch.from_numpy(original_poses).float())
 
 
 def test_load_camera_trajectory_ignores_non_camera_event_files(tmp_path: Path) -> None:

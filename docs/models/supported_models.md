@@ -107,9 +107,12 @@ VAE parallelism, quantization, Cache-DiT/TeaCache, cross-request or streaming se
 runtime events, causal-pretrain, or the 1.3B checkpoint.
 Camera directories consume only `poses.npy` and `intrinsics.npy`; any `wasd_action.npy` or
 `ijkl_action.npy` files are ignored rather than converted to runtime action events.
-The repository includes an opt-in H100/CUDA E2E entry; the table remains experimental until a
-real-checkpoint GPU run is recorded. Golden-video quality comparison is deferred to that real GPU
-validation and is not claimed by the local CPU/stub suite. No AMD GPU, Ascend NPU, or Intel GPU
+The repository includes an opt-in H100-class CUDA E2E matrix (also used on H200): a compiled
+default-resolution TP=1 one-block run, an eager TP=2 one-block sharding run, 21-frame determinism and camera-action sensitivity,
+and an 81-frame run that crosses the checkpoint's 18-latent-frame sliding window. The camera comparison
+expects primary and alternate action directories to be siblings under one trusted root. The table
+remains experimental until those real-checkpoint runs and a qualitative reference-video comparison
+are recorded; neither is claimed by the local CPU/stub suite. No AMD GPU, Ascend NPU, or Intel GPU
 support is claimed.
 
 The [LingBot-World checkpoint](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers)

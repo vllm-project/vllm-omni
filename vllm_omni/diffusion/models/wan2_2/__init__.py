@@ -6,6 +6,7 @@ from .patch_diffusers import patch_wan_rms_norm
 from .pipeline_lingbot_world import (
     LingBotWorldCausalDMDPipeline,
     get_lingbot_world_post_process_func,
+    get_lingbot_world_pre_process_func,
 )
 from .pipeline_wan2_2 import (
     Wan22Pipeline,
@@ -59,6 +60,7 @@ __all__ = [
     "CausalLingBotWorldTransformer3DModel",
     "LingBotWorldCausalDMDPipeline",
     "get_lingbot_world_post_process_func",
+    "get_lingbot_world_pre_process_func",
 ]
 
 patch_wan_rms_norm()

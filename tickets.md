@@ -93,11 +93,11 @@
 - [x] 示例在启动模型前校验 prompt、图片、camera 文件、尺寸、帧数、flow shift 和输出路径，默认请求可直接运行 one-block generation。
 - [x] 支持文档准确记录 14B causal-fast、9–117 frame V1 契约、TP 待真实验证状态、unsupported capabilities 和 checkpoint non-commercial license。
 - [x] Focused camera、pipeline、transformer、registry、example 和 gated E2E tests 全部通过，且测试断言外部契约而不是私有 helper 结构。
-- [ ] 最接近的现有 Wan image-to-video smoke test 通过，证明局部接入没有回归已有模型。
+- [x] 最接近的现有 Wan image-to-video smoke test 通过，证明局部接入没有回归已有模型。
 - [x] Compile、targeted type check、Ruff/pre-commit 和 diff check 通过；临时学习注释和只服务不可达测试状态的防御逻辑已随对应行为 slice 清理。
 - [x] 生产 diff 仍局限于 LingBot/Wan 模型接入及 registry、测试、示例、文档等必要触点，没有项目级重构。
 
-> 本地 macOS 环境无法导入仅支持 Linux/CUDA 的 `vllm`，因此现有 Wan smoke test 在 collection 阶段阻塞；未将环境缺失记作通过。
+> 工作区 venv 本身不含 `vllm`；通过本机 vLLM source path 与已安装依赖环境运行最近的 Wan I2V smoke test，结果为 3 passed。该结果仅证明 CPU/import 回归，不替代 T8 的 Linux/CUDA 证据。
 
 ## T8 — 完成真实 14B GPU readiness 证据
 
@@ -105,9 +105,9 @@
 
 **Blocked by:** T7 — 交付本地可复现示例、文档与回归证明。
 
-- [ ] TP=1 完成真实 checkpoint load 和 9-frame one-block 生成，记录输出 artifact、运行配置和峰值显存。
+- [ ] TP=1 以默认 compile 路径完成真实 checkpoint load 和 480×832、9-frame one-block 生成，记录输出 artifact、运行配置和峰值显存。
 - [ ] TP>1 完成相同 checkpoint load 与 9-frame one-block 生成，证明真实 RMSNorm、projection、attention 和 weight sharding 路径可运行。
-- [ ] 21-frame multi-block 请求验证 cache reuse、sliding/sink behavior、decode 前 cache release 和无跨请求状态泄漏。
+- [ ] 21-frame multi-block 请求验证 cache reuse、decode 前 cache release 和无跨请求状态泄漏；另用 81-frame 请求跨过 18-latent-frame sliding window，覆盖 sink/history eviction。
 - [ ] 固定 prompt、image、action 和 seed 的重复运行具有可解释的 determinism；改变 camera action 会产生符合方向预期的输出变化。
 - [ ] 输出与官方或独立参考结果完成定性比较，记录差异、可接受边界及任何尚未解释的偏差。
 - [ ] GPU 证据、已运行命令、环境版本和剩余限制回填到 Draft PR；任何必需证据缺失时 PR 继续保持 Draft。

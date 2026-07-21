@@ -69,6 +69,12 @@ class _ComponentSource:
     fall_back_to_pt: bool
 
 
+@dataclass(frozen=True)
+class _CameraTrajectory:
+    poses: torch.Tensor
+    intrinsics: torch.Tensor
+
+
 class _SupportImageInput:
     pass
 
@@ -99,9 +105,10 @@ class _AutoWeightsLoader:
         self.module = module
 
     def load_weights(self, weights):
-        return self.module.transformer.load_weights(
+        loaded = self.module.transformer.load_weights(
             (name.removeprefix("transformer."), value) for name, value in weights if name.startswith("transformer.")
         )
+        return {f"transformer.{name}" for name in loaded}
 
 
 class _FakePretrained:
@@ -111,7 +118,8 @@ class _FakePretrained:
         return cls()
 
     def to(self, *args, **kwargs):
-        del args, kwargs
+        self.to_calls = getattr(self, "to_calls", [])
+        self.to_calls.append((args, kwargs))
         return self
 
 
@@ -276,6 +284,10 @@ class _SamplingParams:
         self.output_type = output_type
         self.max_sequence_length = max_sequence_length
         self.extra_args = {"action_path": "."} if include_action else {}
+        self.extra_args["_lingbot_camera_trajectory"] = _CameraTrajectory(
+            poses=torch.eye(4).repeat(32, 1, 1),
+            intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(32, 1),
+        )
         if extra_args is not None:
             self.extra_args.update(extra_args)
         self.latents = None
@@ -365,7 +377,7 @@ def _load_pipeline_module():
         assert filename == "scheduler/scheduler_config.json"
         return _scheduler_config()
 
-    trajectory = SimpleNamespace(
+    trajectory = _CameraTrajectory(
         poses=torch.eye(4).repeat(32, 1, 1),
         intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(32, 1),
     )
@@ -385,11 +397,6 @@ def _load_pipeline_module():
         frames = value.poses.shape[0]
         data = torch.arange(frames * 6 * height * width, device=device, dtype=torch.float32)
         return data.reshape(frames, 6, height, width).to(dtype=dtype)
-
-    class CameraTrajectory:
-        def __init__(self, poses, intrinsics):
-            self.poses = poses
-            self.intrinsics = intrinsics
 
     @dataclass(frozen=True)
     class TrustedActionDirectory:
@@ -476,6 +483,10 @@ def _load_pipeline_module():
                 "vllm_omni.diffusion.profiler.diffusion_pipeline_profiler",
                 DiffusionPipelineProfilerMixin=_DiffusionPipelineProfilerMixin,
             ),
+            "vllm_omni.diffusion.request": _module(
+                "vllm_omni.diffusion.request",
+                OmniDiffusionRequest=object,
+            ),
             "vllm_omni.diffusion.models.schedulers": _module(
                 "vllm_omni.diffusion.models.schedulers",
                 FlowUniPCMultistepScheduler=_FakeScheduler,
@@ -486,7 +497,7 @@ def _load_pipeline_module():
             ),
             "vllm_omni.diffusion.models.wan2_2.lingbot_world_camera": _module(
                 "vllm_omni.diffusion.models.wan2_2.lingbot_world_camera",
-                CameraTrajectory=CameraTrajectory,
+                CameraTrajectory=_CameraTrajectory,
                 TrustedActionDirectory=TrustedActionDirectory,
                 build_plucker_embedding=build_plucker_embedding,
                 interpolate_camera_trajectory=interpolate_camera_trajectory,
@@ -541,6 +552,8 @@ def _od_config(**overrides):
         "quantization_config": None,
         "enable_diffusion_pipeline_profiler": False,
         "model_config": {"lingbot_action_root": str(_ROOT)},
+        "enable_cpu_offload": False,
+        "enable_layerwise_offload": False,
         "parallel_config": SimpleNamespace(
             pipeline_parallel_size=1,
             sequence_parallel_size=1,
@@ -575,6 +588,15 @@ def _pipeline(module, *, transformer=None, od_config=None):
     return pipeline
 
 
+def _preprocess_request(module, *, prompt=None, sampling=None, od_config=None):
+    request = SimpleNamespace(
+        prompt=_prompt() if prompt is None else prompt,
+        sampling_params=_SamplingParams() if sampling is None else sampling,
+    )
+    preprocess = module.get_lingbot_world_pre_process_func(od_config or _od_config())
+    return preprocess(request)
+
+
 def test_pipeline_registers_lingbot_profiler_targets() -> None:
     module = _load_pipeline_module()
 
@@ -585,6 +607,49 @@ def test_pipeline_registers_lingbot_profiler_targets() -> None:
         ("vae.encode", "vae.decode", "_generate_block", "text_encoder.forward", "tokenizer.forward"),
         True,
     )
+
+
+@pytest.mark.parametrize("offload_field", ["enable_cpu_offload", "enable_layerwise_offload"])
+def test_pipeline_respects_loader_managed_component_placement(offload_field: str) -> None:
+    module = _load_pipeline_module()
+
+    pipeline = _pipeline(module, od_config=_od_config(**{offload_field: True}))
+
+    assert getattr(pipeline.text_encoder, "to_calls", []) == []
+    assert getattr(pipeline.vae, "to_calls", []) == []
+
+
+def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    action_root = tmp_path / "trusted-actions"
+    action_dir = action_root / "forward"
+    action_dir.mkdir(parents=True)
+    image_path = tmp_path / "first-frame.png"
+    Image.new("RGBA", (16, 16), color=(1, 2, 3, 4)).save(image_path)
+    sampling = _SamplingParams(extra_args={"action_path": "forward"})
+    sampling.extra_args.pop("_lingbot_camera_trajectory")
+    request = SimpleNamespace(
+        prompt={"prompt": "move", "multi_modal_data": {"image": str(image_path)}},
+        sampling_params=sampling,
+    )
+    trajectory = _CameraTrajectory(
+        poses=torch.eye(4).repeat(9, 1, 1),
+        intrinsics=torch.ones(9, 4),
+    )
+    load_calls = []
+    module.load_camera_trajectory = lambda action: load_calls.append(action) or trajectory
+
+    preprocess = module.get_lingbot_world_pre_process_func(
+        _od_config(model_config={"lingbot_action_root": str(action_root)})
+    )
+    result = preprocess(request)
+
+    assert result is request
+    assert isinstance(request.prompt["multi_modal_data"]["image"], Image.Image)
+    assert request.prompt["multi_modal_data"]["image"].mode == "RGB"
+    assert sampling.extra_args["action_path"] == "forward"
+    assert sampling.extra_args["_lingbot_camera_trajectory"] is trajectory
+    assert len(load_calls) == 1
 
 
 def _request(*, sampling=None, prompt=None, num_reqs: int = 1):
@@ -687,6 +752,13 @@ def _resolve_pipeline_through_real_registry(pipeline_module):
         resolved = registry_module.DiffusionModelRegistry._try_load_model_cls("LingBotWorldCausalDMDPipeline")
         entry = registry_module._DIFFUSION_MODELS["LingBotWorldCausalDMDPipeline"]
         cache_acceleration_disabled = "LingBotWorldCausalDMDPipeline" in registry_module._NO_CACHE_ACCELERATION
+        preprocess_name = registry_module._DIFFUSION_PRE_PROCESS_FUNCS["LingBotWorldCausalDMDPipeline"]
+        preprocess = registry_module.get_diffusion_pre_process_func(
+            SimpleNamespace(
+                model_class_name="LingBotWorldCausalDMDPipeline",
+                model_config={"lingbot_action_root": str(_ROOT)},
+            )
+        )
     finally:
         sys.modules.pop(spec.name, None)
         for name, old_module in previous.items():
@@ -694,7 +766,7 @@ def _resolve_pipeline_through_real_registry(pipeline_module):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = old_module
-    return resolved, entry, cache_acceleration_disabled
+    return resolved, entry, cache_acceleration_disabled, preprocess_name, preprocess
 
 
 def test_component_discovery_uses_official_checkpoint_contract() -> None:
@@ -781,12 +853,16 @@ def test_official_model_index_discovers_only_declared_components() -> None:
 
     module = _load_pipeline_module()
     model_index = json.loads(_MODEL_INDEX_FIXTURE.read_text())
-    resolved, entry, cache_acceleration_disabled = _resolve_pipeline_through_real_registry(module)
+    resolved, entry, cache_acceleration_disabled, preprocess_name, preprocess = _resolve_pipeline_through_real_registry(
+        module
+    )
 
     assert model_index["_class_name"] == "LingBotWorldCausalDMDPipeline"
     assert resolved is module.LingBotWorldCausalDMDPipeline
     assert entry == ("wan2_2", "pipeline_lingbot_world", "LingBotWorldCausalDMDPipeline")
     assert cache_acceleration_disabled
+    assert preprocess_name == "get_lingbot_world_pre_process_func"
+    assert callable(preprocess)
     assert model_index["tokenizer"] == ["transformers", "T5TokenizerFast"]
     assert model_index["text_encoder"] == ["transformers", "UMT5EncoderModel"]
     assert model_index["vae"] == ["diffusers", "AutoencoderKLWan"]
@@ -797,14 +873,62 @@ def test_official_model_index_discovers_only_declared_components() -> None:
     assert model_index["transformer_2"] == [None, None]
 
 
-def test_postprocess_reads_output_type_from_sampling_params() -> None:
+def test_postprocess_returns_latents_without_video_conversion() -> None:
     module = _load_pipeline_module()
     postprocess = module.get_lingbot_world_post_process_func(_od_config())
     latents = torch.randn(1, 16, 3, 2, 2)
 
-    output = postprocess(latents, sampling_params=SimpleNamespace(output_type="latent"))
+    output = postprocess(latents, output_type="latent")
 
     assert output is latents
+
+
+def test_postprocess_uses_the_standard_diffusion_output_envelope(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    processed_video = object()
+    calls = []
+
+    class VideoProcessor:
+        def __init__(self, *, vae_scale_factor):
+            assert vae_scale_factor == 8
+
+        def postprocess_video(self, video, *, output_type):
+            calls.append((video, output_type))
+            return processed_video
+
+    monkeypatch.setitem(
+        sys.modules,
+        "diffusers.video_processor",
+        _module("diffusers.video_processor", VideoProcessor=VideoProcessor),
+    )
+    postprocess = module.get_lingbot_world_post_process_func(_od_config())
+    video = torch.randn(1, 3, 9, 8, 8)
+
+    output = postprocess(video, output_type="np")
+
+    assert output == {"payload": {"video": processed_video}, "metadata": {}}
+    assert calls == [(video, "np")]
+
+
+def test_forward_propagates_pipeline_profiler_stage_durations() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline.stage_durations = {"_generate_block": 0.25, "vae.decode": 0.5}
+
+    output = pipeline(_request())
+
+    assert output.stage_durations == pipeline.stage_durations
+
+
+def test_pipeline_weight_loader_preserves_component_parameter_prefixes() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    weight = torch.randn(2, 2)
+
+    loaded = pipeline.load_weights([("transformer.blocks.0.weight", weight)])
+
+    assert loaded == {"transformer.blocks.0.weight"}
+    assert pipeline.transformer.loaded_weights == [("blocks.0.weight", weight)]
 
 
 def test_noise_uses_device_safe_diffusers_helper() -> None:
@@ -886,7 +1010,7 @@ def test_path_image_rejects_oversized_source_before_decode_or_convert(monkeypatc
     monkeypatch.setattr(module.PIL.Image.Image, "load", forbidden_load)
 
     with pytest.raises(ValueError, match="source image.*4096.*4096"):
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(images=str(source_path)), _SamplingParams()))
+        _preprocess_request(module, prompt=_prompt(images=str(source_path)))
 
     assert decode_calls == []
 
@@ -896,7 +1020,8 @@ def test_normal_path_image_is_decoded_after_source_size_validation(tmp_path: Pat
     source_path = tmp_path / "normal.png"
     Image.new("RGBA", (32, 24), color=(1, 2, 3, 128)).save(source_path)
 
-    parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(images=str(source_path)), _SamplingParams()))
+    request = _preprocess_request(module, prompt=_prompt(images=str(source_path)))
+    parsed = _pipeline(module)._parse_request(_RequestBatch(request.prompt, request.sampling_params))
 
     assert module._MAX_SOURCE_IMAGE_PIXELS == 4096 * 4096
     assert isinstance(parsed.image, Image.Image)
@@ -961,7 +1086,7 @@ def test_path_image_decode_error_is_sanitized(monkeypatch) -> None:
     )
 
     with pytest.raises(ValueError, match="Unable to load multi_modal_data.image") as exc_info:
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(images=unsafe_path), _SamplingParams()))
+        _preprocess_request(module, prompt=_prompt(images=unsafe_path))
 
     assert unsafe_path not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
@@ -975,13 +1100,14 @@ def test_supplied_pil_image_obeys_documented_source_pixel_ceiling(source_size) -
     source_image.close = lambda: close_calls.append(True)
 
     if source_size[0] * source_size[1] <= 4096 * 4096:
-        parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(images=source_image), _SamplingParams()))
+        request = _preprocess_request(module, prompt=_prompt(images=source_image))
+        parsed = _pipeline(module)._parse_request(_RequestBatch(request.prompt, request.sampling_params))
         assert parsed.image is not source_image
         assert parsed.image.mode == "RGB"
         assert close_calls == []
     else:
         with pytest.raises(ValueError, match="source image.*4096.*4096"):
-            _pipeline(module)._parse_request(_RequestBatch(_prompt(images=source_image), _SamplingParams()))
+            _preprocess_request(module, prompt=_prompt(images=source_image))
         assert close_calls == []
 
 
@@ -994,7 +1120,7 @@ def test_supplied_pil_decode_error_is_sanitized_without_closing_caller(monkeypat
     monkeypatch.setattr(source_image, "close", lambda: close_calls.append(True))
 
     with pytest.raises(ValueError, match="Unable to load multi_modal_data.image") as exc_info:
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(images=source_image), _SamplingParams()))
+        _preprocess_request(module, prompt=_prompt(images=source_image))
 
     assert unsafe_detail not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
@@ -1006,17 +1132,26 @@ def test_action_path_resolves_from_sampling_extra_args(tmp_path: Path) -> None:
     action_root = tmp_path / "trusted-actions"
     contained_action = action_root / "actions"
     contained_action.mkdir(parents=True)
-    pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": str(action_root)}))
     sampling = _SamplingParams(extra_args={"action_path": "actions"})
     prompt = _prompt()
-    original_extra = dict(sampling.extra_args)
     original_prompt = prompt.copy()
+    trajectory = _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
+    resolved_actions = []
+    module.load_camera_trajectory = lambda action: resolved_actions.append(action) or trajectory
 
-    parsed = pipeline._parse_request(_RequestBatch(prompt, sampling))
+    request = _preprocess_request(
+        module,
+        prompt=prompt,
+        sampling=sampling,
+        od_config=_od_config(model_config={"lingbot_action_root": str(action_root)}),
+    )
+    parsed = _pipeline(module)._parse_request(_RequestBatch(request.prompt, request.sampling_params))
 
-    assert parsed.action_path.root == action_root.resolve()
-    assert parsed.action_path.relative == Path("actions")
-    assert sampling.extra_args == original_extra
+    assert resolved_actions[0].root == action_root.resolve()
+    assert resolved_actions[0].relative == Path("actions")
+    assert parsed.camera_trajectory is trajectory
+    assert sampling.extra_args["action_path"] == "actions"
+    assert sampling.extra_args["_lingbot_camera_trajectory"] is trajectory
     assert prompt == original_prompt
 
 
@@ -1029,14 +1164,14 @@ def test_additional_information_action_path_is_not_an_input_source(with_extra: b
     )
 
     with pytest.raises(ValueError, match="additional_information.*action_path.*not supported"):
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(action_path="legacy-actions"), sampling))
+        _preprocess_request(module, prompt=_prompt(action_path="legacy-actions"), sampling=sampling)
 
 
 def test_action_path_is_required_in_sampling_extra_args() -> None:
     module = _load_pipeline_module()
 
     with pytest.raises(ValueError, match="sampling_params.extra_args.action_path"):
-        _pipeline(module)._parse_request(_RequestBatch(_prompt(), _SamplingParams(include_action=False)))
+        _preprocess_request(module, sampling=_SamplingParams(include_action=False))
 
 
 @pytest.mark.parametrize("escape_kind", ["traversal", "absolute", "symlink"])
@@ -1053,10 +1188,12 @@ def test_online_action_path_rejects_escape_from_trusted_root(escape_kind: str, t
     else:
         (root / "escape-link").symlink_to(outside, target_is_directory=True)
         action_path = "escape-link"
-    pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": str(root)}))
-
     with pytest.raises(ValueError, match="trusted.*root|contained"):
-        pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": action_path})))
+        _preprocess_request(
+            module,
+            sampling=_SamplingParams(extra_args={"action_path": action_path}),
+            od_config=_od_config(model_config={"lingbot_action_root": str(root)}),
+        )
 
 
 def test_online_action_path_uses_environment_root_fallback(monkeypatch, tmp_path: Path) -> None:
@@ -1065,22 +1202,33 @@ def test_online_action_path_uses_environment_root_fallback(monkeypatch, tmp_path
     action_dir = root / "forward"
     action_dir.mkdir(parents=True)
     monkeypatch.setenv("VLLM_OMNI_LINGBOT_ACTION_ROOT", str(root))
-    pipeline = _pipeline(module, od_config=_od_config(model_config={}))
+    resolved_actions = []
+    module.load_camera_trajectory = lambda action: (
+        resolved_actions.append(action) or _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
+    )
 
-    parsed = pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": "forward"})))
+    request = _preprocess_request(
+        module,
+        sampling=_SamplingParams(extra_args={"action_path": "forward"}),
+        od_config=_od_config(model_config={}),
+    )
 
-    assert parsed.action_path.root == root.resolve()
-    assert parsed.action_path.relative == Path("forward")
+    assert request.sampling_params.extra_args["_lingbot_camera_trajectory"] is not None
+    assert resolved_actions[0].root == root.resolve()
+    assert resolved_actions[0].relative == Path("forward")
 
 
 def test_online_action_path_error_suppresses_path_bearing_filesystem_cause(tmp_path: Path) -> None:
     module = _load_pipeline_module()
     root = tmp_path / "trusted"
     root.mkdir()
-    pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": str(root)}))
 
     with pytest.raises(ValueError, match="trusted action root") as exc_info:
-        pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": "does-not-exist"})))
+        _preprocess_request(
+            module,
+            sampling=_SamplingParams(extra_args={"action_path": "does-not-exist"}),
+            od_config=_od_config(model_config={"lingbot_action_root": str(root)}),
+        )
 
     assert str(root) not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
@@ -1094,10 +1242,13 @@ def test_online_action_path_unknown_user_is_sanitized(source: str, tmp_path: Pat
     root.mkdir()
     configured_root = unknown_user_path if source == "root" else str(root)
     action_path = "actions" if source == "root" else unknown_user_path
-    pipeline = _pipeline(module, od_config=_od_config(model_config={"lingbot_action_root": configured_root}))
 
     with pytest.raises(ValueError, match="trusted action root") as exc_info:
-        pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams(extra_args={"action_path": action_path})))
+        _preprocess_request(
+            module,
+            sampling=_SamplingParams(extra_args={"action_path": action_path}),
+            od_config=_od_config(model_config={"lingbot_action_root": configured_root}),
+        )
 
     assert "__vllm_omni_user_that_does_not_exist__" not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
@@ -1105,10 +1256,9 @@ def test_online_action_path_unknown_user_is_sanitized(source: str, tmp_path: Pat
 
 def test_action_path_requires_a_trusted_root_for_every_request() -> None:
     module = _load_pipeline_module()
-    pipeline = _pipeline(module, od_config=_od_config(model_config={}))
 
     with pytest.raises(ValueError, match="lingbot_action_root|VLLM_OMNI_LINGBOT_ACTION_ROOT"):
-        pipeline._parse_request(_RequestBatch(_prompt(), _SamplingParams()))
+        _preprocess_request(module, od_config=_od_config(model_config={}))
 
 
 @pytest.mark.parametrize(
@@ -1173,13 +1323,14 @@ def test_resource_limits_reject_oversize_before_any_component_call(sampling, mes
 def test_request_validation_rejects_insufficient_camera_frames() -> None:
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
-    module.load_camera_trajectory = lambda path: SimpleNamespace(
+    short_trajectory = _CameraTrajectory(
         poses=torch.eye(4).repeat(8, 1, 1),
         intrinsics=torch.ones(8, 4),
     )
+    sampling = _SamplingParams(extra_args={"_lingbot_camera_trajectory": short_trajectory})
 
     with pytest.raises(ValueError, match="camera.*frames.*num_frames"):
-        pipeline(_request())
+        pipeline(_request(sampling=sampling))
 
 
 def test_camera_load_error_is_actionable_without_echoing_path_contents() -> None:
@@ -1187,7 +1338,7 @@ def test_camera_load_error_is_actionable_without_echoing_path_contents() -> None
     module.load_camera_trajectory = lambda path: (_ for _ in ()).throw(FileNotFoundError(f"missing {path}/poses.npy"))
 
     with pytest.raises(ValueError, match="camera trajectory.*action_path") as exc_info:
-        _pipeline(module)(_request())
+        _preprocess_request(module)
 
     assert str(_ROOT) not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
@@ -1334,7 +1485,8 @@ def test_request_flow_shift_override_has_precedence_without_mutating_scheduler()
 
     assert default_inputs.flow_shift == 3.0
     assert override_inputs.flow_shift == 2.0
-    assert sampling.extra_args == {"action_path": ".", "flow_shift": 2.0}
+    assert sampling.extra_args["action_path"] == "."
+    assert sampling.extra_args["flow_shift"] == 2.0
     assert pipeline.scheduler.config.shift == 3.0
 
 
@@ -1528,12 +1680,17 @@ def test_117_frame_request_generates_ten_complete_latent_blocks() -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
-    module.load_camera_trajectory = lambda path: SimpleNamespace(
+    trajectory = _CameraTrajectory(
         poses=torch.eye(4).repeat(117, 1, 1),
         intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(117, 1),
     )
+    sampling = _SamplingParams(
+        num_frames=117,
+        output_type="latent",
+        extra_args={"_lingbot_camera_trajectory": trajectory},
+    )
 
-    result = pipeline(_request(sampling=_SamplingParams(num_frames=117, output_type="latent")))
+    result = pipeline(_request(sampling=sampling))
 
     assert result.output.shape == (1, 16, 30, 2, 2)
     assert len(transformer.calls) == 50
@@ -1569,11 +1726,17 @@ def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
 
 def test_registry_and_wan_exports_resolve_official_pipeline_class_name() -> None:
     module = _load_pipeline_module()
-    resolved, entry, cache_acceleration_disabled = _resolve_pipeline_through_real_registry(module)
+    resolved, entry, cache_acceleration_disabled, preprocess_name, preprocess = _resolve_pipeline_through_real_registry(
+        module
+    )
 
     assert entry == ("wan2_2", "pipeline_lingbot_world", "LingBotWorldCausalDMDPipeline")
     assert resolved is module.LingBotWorldCausalDMDPipeline
     assert cache_acceleration_disabled
+    assert preprocess_name == "get_lingbot_world_pre_process_func"
+    request = SimpleNamespace(prompt=_prompt(), sampling_params=_SamplingParams())
+    assert preprocess(request) is request
+    assert isinstance(request.sampling_params.extra_args["_lingbot_camera_trajectory"], _CameraTrajectory)
     assert module.LingBotWorldCausalDMDPipeline.__name__ == "LingBotWorldCausalDMDPipeline"
     wan_init = _WAN_INIT_PATH.read_text()
     assert "from .pipeline_lingbot_world import" in wan_init
