@@ -3,6 +3,7 @@
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
 import contextlib
+import importlib
 import os
 import queue
 import threading
@@ -1022,12 +1023,37 @@ class TestSupportedPipelines:
 
         assert stage_cfg["engine_args"]["step_execution"] is True
 
-    def test_qwen_image_supports_step_execution(self):
+    @pytest.mark.parametrize(
+        ("module_name", "class_name"),
+        [
+            pytest.param(
+                "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image",
+                "QwenImagePipeline",
+                id="qwen-image",
+            ),
+            pytest.param(
+                "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit",
+                "QwenImageEditPipeline",
+                id="qwen-image-edit",
+            ),
+            pytest.param(
+                "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus",
+                "QwenImageEditPlusPipeline",
+                id="qwen-image-edit-plus",
+            ),
+            pytest.param(
+                "vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_layered",
+                "QwenImageLayeredPipeline",
+                id="qwen-image-layered",
+            ),
+        ],
+    )
+    def test_qwen_image_pipelines_support_step_execution(self, module_name, class_name):
         from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
-        from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 
+        pipeline_cls = getattr(importlib.import_module(module_name), class_name)
         # Avoid loading model weights; protocol membership depends on the class contract.
-        pipeline = object.__new__(QwenImagePipeline)
+        pipeline = object.__new__(pipeline_cls)
 
         assert pipeline.supports_step_execution is True
         assert supports_step_execution(pipeline) is True

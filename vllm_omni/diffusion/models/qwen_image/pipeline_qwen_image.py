@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.qwen_image.stepwise_mixin import QwenImageStepwiseMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
@@ -47,7 +48,6 @@ from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -264,7 +264,11 @@ def apply_rotary_emb_qwen(
 
 
 class QwenImagePipeline(
-    nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    QwenImageStepwiseMixin,
+    QwenImageCFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -777,12 +781,15 @@ class QwenImagePipeline(
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
         sampling = state.sampling
         prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            height=sampling.height or self.default_sample_size * self.vae_scale_factor,
-            width=sampling.width or self.default_sample_size * self.vae_scale_factor,
+            height=height,
+            width=width,
             num_inference_steps=sampling.num_inference_steps or 50,
             sigmas=sampling.sigmas,
             guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
@@ -814,184 +821,12 @@ class QwenImagePipeline(
         state.img_shapes = ctx["img_shapes"]
         state.txt_seq_lens = ctx["txt_seq_lens"]
         state.negative_txt_seq_lens = ctx["negative_txt_seq_lens"]
+        state.extra["height"] = height
+        state.extra["width"] = width
         # QwenImage always normalizes CFG output (matching forward())
         state.sampling.cfg_normalize = True
 
         return state
-
-    def _build_denoise_kwargs(
-        self,
-        latents: torch.Tensor,
-        timestep: torch.Tensor,
-        guidance: torch.Tensor | None,
-        prompt_embeds: torch.Tensor,
-        prompt_embeds_mask: torch.Tensor,
-        img_shapes: list,
-        txt_seq_lens: list[int] | None,
-        do_true_cfg: bool,
-        negative_prompt_embeds: torch.Tensor | None,
-        negative_prompt_embeds_mask: torch.Tensor | None,
-        negative_txt_seq_lens: list[int] | None,
-        image_latents: torch.Tensor | None = None,
-        extra_transformer_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
-        """Build positive/negative kwargs and output_slice for one denoise step.
-
-        Returns:
-            (positive_kwargs, negative_kwargs, output_slice)
-        """
-        extra_transformer_kwargs = extra_transformer_kwargs or {}
-
-        # Broadcast timestep to match batch size
-        t_for_model = timestep.expand(latents.shape[0]).to(
-            device=latents.device,
-            dtype=latents.dtype,
-        )
-
-        # Concatenate image latents if available (editing pipelines)
-        latent_model_input = latents
-        if image_latents is not None:
-            latent_model_input = torch.cat([latents, image_latents], dim=1)
-
-        positive_kwargs = {
-            "hidden_states": latent_model_input,
-            "timestep": t_for_model / 1000,
-            "guidance": guidance,
-            "encoder_hidden_states_mask": prompt_embeds_mask,
-            "encoder_hidden_states": prompt_embeds,
-            "img_shapes": img_shapes,
-            "txt_seq_lens": txt_seq_lens,
-            **extra_transformer_kwargs,
-        }
-        if do_true_cfg:
-            negative_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": t_for_model / 1000,
-                "guidance": guidance,
-                "encoder_hidden_states_mask": negative_prompt_embeds_mask,
-                "encoder_hidden_states": negative_prompt_embeds,
-                "img_shapes": img_shapes,
-                "txt_seq_lens": negative_txt_seq_lens,
-                **extra_transformer_kwargs,
-            }
-        else:
-            negative_kwargs = None
-
-        output_slice = latents.size(1) if image_latents is not None else None
-        return positive_kwargs, negative_kwargs, output_slice
-
-    def _decode_latents(
-        self,
-        latents: torch.Tensor,
-        height: int,
-        width: int,
-        output_type: str = "pil",
-    ) -> DiffusionOutput:
-        """Unpack, normalize, and VAE-decode latents into a DiffusionOutput."""
-        if output_type == "latent":
-            return DiffusionOutput(
-                output=latents,
-                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-            )
-
-        latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-        latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents = latents / latents_std + latents_mean
-        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
-        return DiffusionOutput(
-            output=image,
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-        )
-
-    def denoise_step(
-        self,
-        input_batch: "InputBatch",
-        **kwargs: Any,
-    ) -> torch.Tensor | None:
-        """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
-
-        Reuses ``predict_noise_maybe_with_cfg`` so that CFG-parallel,
-        sequential-CFG, and no-CFG paths are handled identically to
-        ``diffuse()``.
-        """
-        del kwargs
-        if self.interrupt:
-            return None
-
-        t = input_batch.timesteps
-        self._current_timestep = t
-        self.transformer.do_true_cfg = input_batch.do_true_cfg
-
-        positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
-            latents=input_batch.latents,
-            timestep=t,
-            guidance=input_batch.guidance,
-            prompt_embeds=input_batch.prompt_embeds,
-            prompt_embeds_mask=input_batch.prompt_embeds_mask,
-            img_shapes=input_batch.img_shapes,
-            txt_seq_lens=input_batch.txt_seq_lens,
-            do_true_cfg=input_batch.do_true_cfg,
-            negative_prompt_embeds=input_batch.negative_prompt_embeds,
-            negative_prompt_embeds_mask=input_batch.negative_prompt_embeds_mask,
-            negative_txt_seq_lens=input_batch.negative_txt_seq_lens,
-            image_latents=input_batch.image_latents,
-            extra_transformer_kwargs={
-                "attention_kwargs": self.attention_kwargs,
-                "return_dict": False,
-            },
-        )
-
-        return self.predict_noise_maybe_with_cfg(
-            input_batch.do_true_cfg,
-            input_batch.true_cfg_scale,
-            positive_kwargs,
-            negative_kwargs,
-            input_batch.cfg_normalize,
-            output_slice,
-        )
-
-    def step_scheduler(
-        self,
-        state: "DiffusionRequestState",
-        noise_pred: torch.Tensor,
-        **kwargs: Any,
-    ) -> None:
-        """One scheduler step: update ``state.latents`` and advance ``step_index``."""
-        if self.interrupt:
-            return
-
-        t = state.current_timestep
-        state.latents = self.scheduler_step_maybe_with_cfg(
-            noise_pred,
-            t,
-            state.latents,
-            state.do_true_cfg,
-            per_request_scheduler=state.scheduler,
-        )
-
-        state.step_index += 1
-
-    def post_decode(
-        self,
-        state: "DiffusionRequestState",
-        **kwargs: Any,
-    ) -> DiffusionOutput:
-        """Decode final latents from *state*."""
-        self._current_timestep = None
-
-        height = state.sampling.height or self.default_sample_size * self.vae_scale_factor
-        width = state.sampling.width or self.default_sample_size * self.vae_scale_factor
-        output_type = kwargs.get("output_type") or state.sampling.output_type or "pil"
-
-        return self._decode_latents(state.latents, height, width, output_type)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list

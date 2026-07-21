@@ -1,0 +1,289 @@
+[
+  {
+    "test_name": "test_qwen_image_step_execution_baseline_serial",
+    "description": "Qwen-Image request-level serial baseline",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Qwen/Qwen-Image",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "256x256_steps20_t2i_serial",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 256,
+        "height": 256,
+        "num-inference-steps": 20,
+        "num-prompts": 24,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "512x512_steps20_t2i_serial",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": 16,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "1024x1024_steps20_t2i_serial",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 20,
+        "num-prompts": 8,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_step_execution_single",
+    "description": "Qwen-Image step execution without batching",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Qwen/Qwen-Image",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true,
+        "step-execution": true,
+        "max-num-seqs": 1
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "256x256_steps20_t2i_step_single",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 256,
+        "height": 256,
+        "num-inference-steps": 20,
+        "num-prompts": 24,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "512x512_steps20_t2i_step_single",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": 16,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "1024x1024_steps20_t2i_step_single",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 20,
+        "num-prompts": 8,
+        "max-concurrency": 1,
+        "enable-negative-prompt": true
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_step_execution_batch2",
+    "description": "Qwen-Image step-wise batching sweep",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Qwen/Qwen-Image",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true,
+        "step-execution": true,
+        "max-num-seqs": 2
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "256x256_steps20_t2i_step_batch2",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 256,
+        "height": 256,
+        "num-inference-steps": 20,
+        "num-prompts": [24, 48],
+        "max-concurrency": [1, 2],
+        "warmup-requests": 4,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 20,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "512x512_steps20_t2i_step_batch2",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": [16, 32],
+        "max-concurrency": [1, 2],
+        "warmup-requests": 4,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 20,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "1024x1024_steps20_t2i_step_batch2",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 20,
+        "num-prompts": [8, 16],
+        "max-concurrency": [1, 2],
+        "warmup-requests": 4,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 20,
+        "enable-negative-prompt": true
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_edit_2511_step_execution_baseline_serial",
+    "description": "Qwen-Image-Edit-2511 request-level serial baseline",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-Edit-2511",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20_i2i_1img_serial",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": 8,
+        "max-concurrency": 1,
+        "num-input-images": 1,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "1024x1024_steps20_i2i_1img_serial",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 20,
+        "num-prompts": 4,
+        "max-concurrency": 1,
+        "num-input-images": 1,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "512x512_steps20_i2i_2img_serial",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": 8,
+        "max-concurrency": 1,
+        "num-input-images": 2,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "1024x1024_steps20_i2i_2img_serial",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 20,
+        "num-prompts": 4,
+        "max-concurrency": 1,
+        "num-input-images": 2,
+        "enable-negative-prompt": true
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_edit_2511_step_execution_batch2",
+    "description": "Qwen-Image-Edit-2511 step-wise batching sweep",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-Edit-2511",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true,
+        "step-execution": true,
+        "max-num-seqs": 2
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20_i2i_1img_step_batch2",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": [8, 16],
+        "max-concurrency": [1, 2],
+        "warmup-requests": 4,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 20,
+        "num-input-images": 1,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "1024x1024_steps20_i2i_1img_step_batch2",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 20,
+        "num-prompts": [4, 8],
+        "max-concurrency": [1, 2],
+        "warmup-requests": 2,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 20,
+        "num-input-images": 1,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "512x512_steps20_i2i_2img_step_batch2",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": [8, 16],
+        "max-concurrency": [1, 2],
+        "warmup-requests": 4,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 20,
+        "num-input-images": 2,
+        "enable-negative-prompt": true
+      },
+      {
+        "name": "1024x1024_steps20_i2i_2img_step_batch2",
+        "dataset": "random",
+        "task": "i2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 20,
+        "num-prompts": [4, 8],
+        "max-concurrency": [1, 2],
+        "warmup-requests": 2,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 20,
+        "num-input-images": 2,
+        "enable-negative-prompt": true
+      }
+    ]
+  }
+]

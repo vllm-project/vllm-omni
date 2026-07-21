@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import inspect
 import json
 import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -36,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.qwen_image.stepwise_mixin import QwenImageStepwiseMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -52,6 +54,9 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
 def get_qwen_image_edit_pre_process_func(
@@ -221,11 +226,18 @@ def retrieve_latents(
 
 
 class QwenImageEditPipeline(
-    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    SupportImageInput,
+    QwenImageStepwiseMixin,
+    QwenImageCFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    supports_step_execution: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -677,6 +689,133 @@ class QwenImageEditPipeline(
     def interrupt(self):
         return self._interrupt
 
+    def _prepare_generation_context(
+        self,
+        *,
+        prompt,
+        negative_prompt,
+        prompt_image,
+        image,
+        calculated_height,
+        calculated_width,
+        height,
+        width,
+        num_inference_steps,
+        sigmas,
+        guidance_scale,
+        num_images_per_prompt,
+        generator,
+        true_cfg_scale,
+        max_sequence_length,
+        prompt_embeds=None,
+        prompt_embeds_mask=None,
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        latents=None,
+        attention_kwargs=None,
+        callback_on_step_end_tensor_inputs=None,
+    ):
+        """Shared request preparation for forward() and step-wise prepare_encode()."""
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            image,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds_mask,
+            callback_on_step_end_tensor_inputs,
+            max_sequence_length,
+        )
+
+        self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
+
+        batch_size = 1
+        has_neg_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+        )
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            prompt=prompt,
+            image=prompt_image,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+
+        if do_true_cfg:
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                prompt=negative_prompt,
+                image=prompt_image,
+                prompt_embeds=negative_prompt_embeds,
+                prompt_embeds_mask=negative_prompt_embeds_mask,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name="negative_prompt",
+            )
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+
+        num_channels_latents = self.transformer.in_channels // 4
+        latents, image_latents = self.prepare_latents(
+            image,
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            self.device,
+            generator,
+            latents,
+        )
+        img_shapes = [
+            [
+                (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
+                (1, calculated_height // self.vae_scale_factor // 2, calculated_width // self.vae_scale_factor // 2),
+            ]
+        ] * batch_size
+
+        timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
+        self._num_timesteps = len(timesteps)
+
+        if self.transformer.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        else:
+            guidance = None
+
+        if self.attention_kwargs is None:
+            self._attention_kwargs = {}
+
+        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
+        negative_txt_seq_lens = (
+            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+        )
+
+        return {
+            "prompt_embeds": prompt_embeds,
+            "prompt_embeds_mask": prompt_embeds_mask,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+            "latents": latents,
+            "image_latents": image_latents,
+            "img_shapes": img_shapes,
+            "timesteps": timesteps,
+            "do_true_cfg": do_true_cfg,
+            "guidance": guidance,
+            "txt_seq_lens": txt_seq_lens,
+            "negative_txt_seq_lens": negative_txt_seq_lens,
+        }
+
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Forward pass for image editing."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
@@ -737,104 +876,45 @@ class QwenImageEditPipeline(
         # 4. diffusion process
         # 5. decode latents
         # 6. post-process outputs
-        self.check_inputs(
-            prompt,
-            height,
-            width,
-            image,
-            negative_prompt,
-            prompt_embeds,
-            negative_prompt_embeds,
-            prompt_embeds_mask,
-            negative_prompt_embeds_mask,
-            callback_on_step_end_tensor_inputs,
-            max_sequence_length,
-        )
-
-        self._guidance_scale = guidance_scale
-        self._attention_kwargs = attention_kwargs
-        self._current_timestep = None
-        self._interrupt = False
-
-        batch_size = 1
-
-        has_neg_prompt = negative_prompt is not None
-
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
-        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
-
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+        ctx = self._prepare_generation_context(
             prompt=prompt,
-            image=prompt_image,  # Use resized image for prompt encoding
+            negative_prompt=negative_prompt,
+            prompt_image=prompt_image,  # Use resized image for prompt encoding
+            image=image,
+            calculated_height=calculated_height,
+            calculated_width=calculated_width,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            true_cfg_scale=true_cfg_scale,
+            max_sequence_length=max_sequence_length,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
-        )
-
-        if do_true_cfg:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-                prompt=negative_prompt,
-                image=prompt_image,  # Use same resized image for negative prompt encoding
-                prompt_embeds=negative_prompt_embeds,
-                prompt_embeds_mask=negative_prompt_embeds_mask,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-                prompt_name="negative_prompt",
-            )
-
-        num_channels_latents = self.transformer.in_channels // 4
-        # random noise latents, and image latents encoded by vae
-        latents, image_latents = self.prepare_latents(
-            image,
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            self.device,
-            generator,
-            latents,
-        )
-        img_shapes = [
-            [
-                (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2),
-                (1, calculated_height // self.vae_scale_factor // 2, calculated_width // self.vae_scale_factor // 2),
-            ]
-        ] * batch_size
-
-        timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
-        self._num_timesteps = len(timesteps)
-
-        # handle guidance
-        if self.transformer.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, dtype=torch.float32)
-            guidance = guidance.expand(latents.shape[0])
-        else:
-            guidance = None
-
-        if self.attention_kwargs is None:
-            self._attention_kwargs = {}
-
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+            latents=latents,
+            attention_kwargs=attention_kwargs,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
         )
 
         latents = self.diffuse(
-            prompt_embeds,
-            prompt_embeds_mask,
-            negative_prompt_embeds,
-            negative_prompt_embeds_mask,
-            latents,
-            img_shapes,
-            txt_seq_lens,
-            negative_txt_seq_lens,
-            timesteps,
-            do_true_cfg,
-            guidance,
+            ctx["prompt_embeds"],
+            ctx["prompt_embeds_mask"],
+            ctx["negative_prompt_embeds"],
+            ctx["negative_prompt_embeds_mask"],
+            ctx["latents"],
+            ctx["img_shapes"],
+            ctx["txt_seq_lens"],
+            ctx["negative_txt_seq_lens"],
+            ctx["timesteps"],
+            ctx["do_true_cfg"],
+            ctx["guidance"],
             true_cfg_scale,
-            image_latents=image_latents,
+            image_latents=ctx["image_latents"],
             cfg_normalize=True,
             additional_transformer_kwargs={
                 "return_dict": False,
@@ -866,3 +946,85 @@ class QwenImageEditPipeline(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def prepare_encode(
+        self,
+        state: "DiffusionRequestState",
+        **kwargs: Any,
+    ) -> "DiffusionRequestState":
+        """Populate per-request state for step-wise single-image editing."""
+        sampling = state.sampling
+        first_prompt = state.prompt
+        if first_prompt is None:
+            raise ValueError("QwenImageEditPipeline.prepare_encode requires a non-null state.prompt.")
+        if isinstance(first_prompt, str):
+            raise ValueError(
+                "QwenImageEditPipeline requires an image-bearing prompt. "
+                "A raw string prompt was passed to step-wise prepare_encode."
+            )
+
+        prompt = first_prompt.get("prompt") or ""
+        negative_prompt = first_prompt.get("negative_prompt")
+        additional_information = first_prompt.get("additional_information") or {}
+        prompt_image = additional_information.get("prompt_image")
+        image = additional_information.get("preprocessed_image")
+        calculated_height = additional_information.get("calculated_height")
+        calculated_width = additional_information.get("calculated_width")
+        if image is None or prompt_image is None:
+            raise ValueError(
+                "QwenImageEditPipeline step-wise prepare_encode expected the "
+                "pre-process function to populate preprocessed_image and "
+                "prompt_image on additional_information."
+            )
+
+        height = sampling.height or calculated_height
+        width = sampling.width or calculated_width
+        if height is None or width is None:
+            raise ValueError(
+                "QwenImageEditPipeline step-wise prepare_encode requires "
+                "height and width from sampling params or preprocessing."
+            )
+
+        ctx = self._prepare_generation_context(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            prompt_image=prompt_image,
+            image=image,
+            calculated_height=calculated_height,
+            calculated_width=calculated_width,
+            height=height,
+            width=width,
+            num_inference_steps=sampling.num_inference_steps or 50,
+            sigmas=sampling.sigmas,
+            guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
+            num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
+            generator=sampling.generator,
+            true_cfg_scale=sampling.true_cfg_scale or 4.0,
+            max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
+            latents=sampling.latents,
+            attention_kwargs=kwargs.get("attention_kwargs") or {},
+            callback_on_step_end_tensor_inputs=["latents"],
+        )
+
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(0)
+
+        state.prompt_embeds = ctx["prompt_embeds"]
+        state.prompt_embeds_mask = ctx["prompt_embeds_mask"]
+        state.negative_prompt_embeds = ctx["negative_prompt_embeds"]
+        state.negative_prompt_embeds_mask = ctx["negative_prompt_embeds_mask"]
+        state.latents = ctx["latents"]
+        state.timesteps = ctx["timesteps"]
+        state.step_index = 0
+        state.scheduler = req_scheduler
+        state.do_true_cfg = ctx["do_true_cfg"]
+        state.guidance = ctx["guidance"]
+        state.img_shapes = ctx["img_shapes"]
+        state.txt_seq_lens = ctx["txt_seq_lens"]
+        state.negative_txt_seq_lens = ctx["negative_txt_seq_lens"]
+        state.extra["height"] = height
+        state.extra["width"] = width
+        state.sampling.cfg_normalize = True
+        state.sampling.image_latent = ctx["image_latents"]
+
+        return state

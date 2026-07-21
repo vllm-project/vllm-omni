@@ -64,6 +64,11 @@ class SamplingParamsKey:
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
 
+    # Conditional-image layout. Step-wise edit pipelines currently gather
+    # image_latents without padding, so requests with different condition image
+    # latent shapes must not share a denoise-step batch.
+    condition_image_signature: tuple | None = None
+
     # LoRA identity. Requests with different adapters or scales must run in
     # separate batches so the worker can activate exactly one adapter per step.
     lora_int_id: int | None = None

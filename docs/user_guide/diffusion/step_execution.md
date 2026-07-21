@@ -44,7 +44,10 @@ batching only becomes relevant when `--max-num-seqs > 1`.
 | Pipeline | Example models | Step execution |
 |----------|----------------|----------------|
 | `QwenImagePipeline` | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes |
-| All other diffusion pipelines | `QwenImageEditPipeline`, `QwenImageEditPlusPipeline`, `QwenImageLayeredPipeline`, GLM-Image, Wan, Flux, etc. | No |
+| `QwenImageEditPipeline` | `Qwen/Qwen-Image-Edit` | Yes |
+| `QwenImageEditPlusPipeline` | `Qwen/Qwen-Image-Edit-2509`, `Qwen/Qwen-Image-Edit-2511` | Yes |
+| `QwenImageLayeredPipeline` | Qwen-Image layered editing models | Yes |
+| All other diffusion pipelines | GLM-Image, Wan, Flux, etc. | No |
 
 !!! warning "Experimental continuous batching"
     When `--step-execution` is enabled and `max_num_seqs > 1` is configured,

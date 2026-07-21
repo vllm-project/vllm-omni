@@ -35,6 +35,28 @@ FEATURE_CASES = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
+            server_args=[
+                "--step-execution",
+            ],
+        ),
+        id="step_execution",
+        marks=SINGLE_CARD_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            server_args=[
+                "--step-execution",
+                "--max-num-seqs",
+                "2",
+            ],
+        ),
+        id="step_execution_batch2",
+        marks=SINGLE_CARD_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
             server_args=["--enable-cpu-offload"],
         ),
         id="cpu_offload",

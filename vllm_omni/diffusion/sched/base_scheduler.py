@@ -25,7 +25,10 @@ logger = init_logger(__name__)
 
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
-_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
+_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {
+    "condition_image_signature",
+    "lora_int_id",
+}
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(RequestBatchSamplingParamsKey)) - {
     "lora_int_id"
 }
@@ -36,6 +39,7 @@ def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey:
     sampling = request.sampling_params
     lora_request = getattr(sampling, "lora_request", None)
     return SamplingParamsKey(
+        condition_image_signature=_get_condition_image_signature(request),
         lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
         **{name: getattr(sampling, name) for name in _SAMPLING_PARAMS_KEY_FIELD_NAMES},
     )
@@ -48,6 +52,73 @@ def get_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Requ
     key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
     return RequestBatchSamplingParamsKey(**key_kwargs)
+
+
+def _shape_signature(value: object) -> tuple[int, ...] | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    return tuple(int(dim) for dim in shape)
+
+
+def _sizes_signature(value: object) -> tuple[tuple[int, ...], ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        return None
+    try:
+        return tuple(tuple(int(dim) for dim in item) for item in value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tensor_sequence_shape_signature(value: object) -> tuple[tuple[int, ...], ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        return None
+    if isinstance(value, (list, tuple)):
+        shapes = [_shape_signature(item) for item in value]
+        if all(shape is not None for shape in shapes):
+            return tuple(shape for shape in shapes if shape is not None)
+        return None
+    shape = _shape_signature(value)
+    if shape is None:
+        return None
+    return (shape,)
+
+
+def _get_additional_information(request: OmniDiffusionRequest) -> dict:
+    prompt = request.prompt
+    if isinstance(prompt, dict):
+        additional_information = prompt.get("additional_information")
+        if isinstance(additional_information, dict):
+            return additional_information
+    return {}
+
+
+def _get_condition_image_signature(request: OmniDiffusionRequest) -> tuple | None:
+    sampling = request.sampling_params
+    image_latent = getattr(sampling, "image_latent", None)
+    image_latent_shape = _shape_signature(image_latent)
+    if image_latent_shape is not None:
+        return ("image_latent", image_latent_shape[1:])
+
+    additional_information = _get_additional_information(request)
+
+    vae_image_sizes = _sizes_signature(additional_information.get("vae_image_sizes"))
+    if vae_image_sizes is not None:
+        return ("vae_image_sizes", vae_image_sizes)
+
+    vae_image_shapes = _tensor_sequence_shape_signature(additional_information.get("vae_images"))
+    if vae_image_shapes is not None:
+        return ("vae_images", vae_image_shapes)
+
+    preprocessed_image_shape = _shape_signature(additional_information.get("preprocessed_image"))
+    if preprocessed_image_shape is not None:
+        return ("preprocessed_image", preprocessed_image_shape)
+
+    return None
 
 
 class _BaseScheduler(SchedulerInterface):

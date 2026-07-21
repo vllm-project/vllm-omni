@@ -65,9 +65,10 @@ def _make_step_request(
     num_inference_steps: int = 4,
     step_index: int | None = None,
     sampling_params: OmniDiffusionSamplingParams | None = None,
+    prompt=None,
 ) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
-        prompt=f"prompt_{req_id}",
+        prompt=prompt if prompt is not None else f"prompt_{req_id}",
         sampling_params=sampling_params
         or OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
@@ -925,6 +926,81 @@ class TestStepScheduler:
         assert _new_ids(second) == [req_b]
         assert second.num_running_reqs == 1
         assert second.num_waiting_reqs == 1
+
+    def test_step_batch_co_schedules_matching_condition_image_signature(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        prompt_a = {
+            "prompt": "prompt_a",
+            "additional_information": {"preprocessed_image": torch.zeros(1, 16, 1, 64, 128)},
+        }
+        prompt_b = {
+            "prompt": "prompt_b",
+            "additional_information": {"preprocessed_image": torch.ones(1, 16, 1, 64, 128)},
+        }
+        sampling_a = OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=4)
+        sampling_b = OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=4)
+
+        req_a = scheduler.add_request(_make_step_request("a", sampling_params=sampling_a, prompt=prompt_a))
+        req_b = scheduler.add_request(_make_step_request("b", sampling_params=sampling_b, prompt=prompt_b))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a, req_b]
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_step_batch_separates_different_condition_image_shapes(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        prompt_wide = {
+            "prompt": "prompt_wide",
+            "additional_information": {"preprocessed_image": torch.zeros(1, 16, 1, 64, 128)},
+        }
+        prompt_tall = {
+            "prompt": "prompt_tall",
+            "additional_information": {"preprocessed_image": torch.zeros(1, 16, 1, 128, 64)},
+        }
+        sampling_wide = OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=4)
+        sampling_tall = OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=4)
+
+        req_wide = scheduler.add_request(_make_step_request("wide", sampling_params=sampling_wide, prompt=prompt_wide))
+        req_tall = scheduler.add_request(_make_step_request("tall", sampling_params=sampling_tall, prompt=prompt_tall))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_wide]
+        assert req_tall not in _new_ids(sched_output)
+        assert sched_output.num_waiting_reqs == 1
+
+    def test_step_batch_separates_different_condition_image_counts(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        prompt_one_image = {
+            "prompt": "prompt_one",
+            "additional_information": {"vae_image_sizes": [(1024, 1024)]},
+        }
+        prompt_two_images = {
+            "prompt": "prompt_two",
+            "additional_information": {"vae_image_sizes": [(1024, 1024), (1024, 1024)]},
+        }
+        sampling_one = OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=4)
+        sampling_two = OmniDiffusionSamplingParams(height=512, width=512, num_inference_steps=4)
+
+        req_one = scheduler.add_request(
+            _make_step_request("one", sampling_params=sampling_one, prompt=prompt_one_image)
+        )
+        req_two = scheduler.add_request(
+            _make_step_request("two", sampling_params=sampling_two, prompt=prompt_two_images)
+        )
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_one]
+        assert req_two not in _new_ids(sched_output)
+        assert sched_output.num_waiting_reqs == 1
 
     def test_step_batch_co_schedules_requests_sharing_lora(self) -> None:
         """Multiple requests with the same LoRA (id + scale) co-batch."""
