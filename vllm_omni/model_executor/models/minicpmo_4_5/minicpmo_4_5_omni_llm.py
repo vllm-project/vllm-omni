@@ -963,6 +963,7 @@ class SiglipVisionEmbeddings(nn.Module):
         flat_patch_attention_mask = patch_attention_mask.reshape(batch_size, -1).to(device="cpu")
 
         if tgt_sizes is None:
+            # As in the legacy path, infer rectangular grid sizes from a (B, H, W) mask.
             target_sizes = torch.stack(
                 (
                     patch_attention_mask[:, :, 0].sum(dim=1),
