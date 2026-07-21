@@ -64,7 +64,7 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
 
 
 def uses_full_payload_input_coordinator(model_config: Any) -> bool:
-    """Returns True iff this stage parks pending requests in
+    """Returns True if this stage parks pending requests in
     WAITING_FOR_INPUT awaiting a full_payload delivery on the worker connector.
 
     Gated by (model_arch, model_stage) — see _FULL_PAYLOAD_INPUT_STAGES for the
@@ -100,9 +100,12 @@ class OmniSchedulingCoordinator:
         self.requests_with_ready_chunks: set[str] = set()
         self._full_payload_input_received: set[str] = set()
 
+        # TODO(yrr): Dead code
         self._waiting_for_chunk_waiting: deque[Any] = deque()
+        # TODO(yrr): Dead code
         self._waiting_for_chunk_running: deque[Any] = deque()
 
+        # TODO(yrr): Dead code
         # Request IDs that were newly registered for chunk recv this cycle.
         # The engine/Model Runner should call register_chunk_recv() for these
         # so the bg thread starts polling.
@@ -125,6 +128,7 @@ class OmniSchedulingCoordinator:
     #  Core scheduling methods
     # ------------------------------------------------------------------ #
 
+    # TODO(yrr): Dead code, only process_pending_chunks in chunk transfer adapter is used
     def process_pending_chunks(
         self,
         waiting_queue: Any,
@@ -245,6 +249,7 @@ class OmniSchedulingCoordinator:
                 # repeated O(N) removes from a list-backed queue.
                 waiting_queue.remove_requests(to_remove)
 
+    # TODO(yrr): Dead code, remove this unused method
     def process_pending_full_payload_inputs_legacy(
         self,
         waiting_queue: Any,
@@ -425,6 +430,7 @@ class OmniSchedulingCoordinator:
                     request._output_token_ids.clear()
                     request.num_computed_tokens = 0
 
+    # TODO(yrr): Dead code, only postprocess_scheduler_output in chunk transfer adapter is used
     def postprocess_scheduler_output(
         self,
         scheduler_output: Any,
@@ -437,6 +443,7 @@ class OmniSchedulingCoordinator:
     #  Internal helpers
     # ------------------------------------------------------------------ #
 
+    # TODO(yrr): Dead code, only process_chunk_queue in chunk transfer adapter is used
     def _process_chunk_queue(
         self,
         queue: Any,
@@ -468,6 +475,7 @@ class OmniSchedulingCoordinator:
             queue.remove(request)
             waiting_for_chunk_list.append(request)
 
+    # TODO(yrr): Dead code, only postprocess_scheduler_output in chunk transfer adapter is used
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
         if scheduler_output.scheduled_new_reqs:
             for req_data in scheduler_output.scheduled_new_reqs:

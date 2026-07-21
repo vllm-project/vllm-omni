@@ -6,6 +6,7 @@ from .omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from .omni_generation_scheduler import OmniGenerationScheduler
 from .output import OmniNewRequestData
 
+# TODO(yrr): why not import all classes from this module?
 __all__ = [
     "OmniARAsyncScheduler",
     "OmniARScheduler",

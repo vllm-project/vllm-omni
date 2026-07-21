@@ -350,6 +350,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
+    # TODO(yrr): AR scheduler & generation scheduler same method, extract to OmniSchedulerMixin
     def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.
 
@@ -395,6 +396,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         try:
             return super()._free_request(request, delay_free_blocks)
         finally:
+            # TODO(yrr): miss chunk transfer adapter free ?
             self._free_input_coordinator_request(request.request_id)
 
     """
@@ -509,6 +511,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
+                # TODO(yrr): useless code, remove it
                 request.stop_reason = request.stop_reason  # or "generation_done"
                 stopped = True
 

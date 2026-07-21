@@ -36,6 +36,8 @@ from vllm_omni.outputs import OmniConnectorOutput
 logger = init_logger(__name__)
 
 
+# TODO(yrr): remove this class, use KVCacheTransferData from
+# vllm_omni.distributed.omni_connectors.kv_transfer_manager instead
 @dataclass
 class KVCacheTransferData:
     request_id: str
@@ -82,6 +84,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omits_kv_transfer_cache: dict[str, bool] = {}
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
+        # TODO(yrr): chunk transfer adapter for async chunk &
+        #  Omni scheduling coordinator for full payload input (non async chunk)
+        #  just keep one?
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         self.input_coordinator: OmniSchedulingCoordinator | None = None
@@ -175,6 +180,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if criteria_type == "prefill_finished":
             if confirmed_computed >= request.num_prompt_tokens:
                 self.transfer_triggered_requests.add(request.request_id)
+
+                # TODO(yrr): this part repeats in another criteria: special_token
                 self._mark_request_for_kv_transfer(request.request_id, confirmed_computed)
                 actually_queued = request.request_id in self.requests_needing_kv_transfer
 
@@ -186,6 +193,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     self.pending_stop_after_extraction.add(request.request_id)
 
                 return False
+                # TODO(yrr): this part repeats in another criteria: special_token
+                # end
 
         elif criteria_type == "special_token":
             target_token_id = self.kv_transfer_criteria.get("token_id")
@@ -218,9 +227,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
+        # TODO(yrr): _consume_pending_connector_output & _process_pending_input_timeouts only use for full payload
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
-
+        # TODO(yrr): chunk transfer adapter for async chunk, unified to one
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
@@ -239,6 +249,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if deferred_waiting:
                     original_waiting.prepend_requests(deferred_waiting)
                 self.waiting = original_waiting
+            # TODO(yrr): chunk transfer adapter & input_coordinator can unified to one
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(
@@ -655,7 +666,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             Tuple of (req_id, client_index) for requests that were aborted. Will not
             include any that were already finished.
         """
-
+        # TODO(yrr): chunk transfer adapter & input_coordinator unified to one
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
@@ -823,6 +834,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finally:
             self._free_input_coordinator_request(request_id)
 
+    # TODO(yrr): remove this method
     def _free_blocks(self, request: Request):
         # Helper to match base class structure if not directly available
         # VLLMScheduler has _free_blocks
