@@ -180,7 +180,7 @@ steps:
       queue: "ascend-a2b3"
       resource_class: "npu-1"
     command: |
-      buildkite-agent pipeline upload .buildkite/npu/test-npu-ready.yml
+      python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/test-npu-ready.yml
 
   # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
   - label: "Upload Nightly Pipeline"
@@ -190,7 +190,7 @@ steps:
     key: upload-nightly-pipeline
     if: __UPLOAD_NIGHTLY_IF__
     commands:
-      - buildkite-agent pipeline upload .buildkite/npu/test-npu-nightly.yml
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/test-npu-nightly.yml
     agents:
       queue: "ascend-a2b3"
       resource_class: "npu-1"

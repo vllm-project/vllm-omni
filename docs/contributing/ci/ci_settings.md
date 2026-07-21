@@ -62,7 +62,7 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
 | Platform | Bootstrap entry | Test job files | Upload mechanism | Job hardware in YAML |
 | -------- | ---------------- | -------------- | ---------------- | -------------------- |
 | **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | `mirror_hardwares: <preset>` (string) |
-| **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `buildkite-agent pipeline upload` | Inline `agents`, `plugins`, `image` on each step |
+| **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
 | **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
 
@@ -115,18 +115,19 @@ python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.
 
 ## NPU configuration style
 
-NPU uses **explicit step YAML**—no `upload_pipeline.py` mirror expansion.
+NPU test pipelines use the same **`mirror_hardwares` preset** mechanism as CUDA. Presets live in `common/ci_mirror_hardwares.yml` (`a2b3_npu_1`, `a2b3_npu_4`, `a3_npu_2`) and expand to `agents`, top-level `image`, and `plugins` at upload time.
 
-- **Bootstrap:** `npu/pipeline-npu.yml` builds NPU CI images, then uploads `test-npu-ready.yml` / `test-npu-nightly.yml` via `buildkite-agent pipeline upload`.
-- **Child steps:** each job sets `agents`, `resource_class`, container `image`, `plugins`, `env`, and `commands` directly.
+- **Bootstrap:** `npu/pipeline-npu.yml` builds NPU CI images, then runs `upload_pipeline.py --upload` for `test-npu-ready.yml` / `test-npu-nightly.yml`.
+- **Child steps:** set `mirror_hardwares` only—do not duplicate `agents` / `image` / `plugins` on the same step.
 - **`depends_on: upload-ready-pipeline`** (or nightly equivalent) ties jobs to bootstrap upload keys.
 
 ### Adding an NPU job
 
 1. Edit `npu/test-npu-ready.yml` (L2) or `npu/test-npu-nightly.yml` (L4).
-2. Copy an existing step in the same group; keep the same `agents` / `image` / `plugins` pattern as sibling jobs unless infra requires a change.
+2. Add a step with `mirror_hardwares` pointing at an existing preset, or add a new preset under `common/ci_mirror_hardwares.yml` first.
 3. Point `commands` at your pytest file and markers.
-4. If you add a **new pipeline file**, register it in `skip_ci.py` under `L2_YAML_FILES` or `L45_YAML_FILES`.
+4. Dry-run: `python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/npu/test-npu-ready.yml`
+5. If you add a **new pipeline file**, register it in `skip_ci.py` under `L2_YAML_FILES` or `L45_YAML_FILES`.
 
 ## AMD configuration style
 

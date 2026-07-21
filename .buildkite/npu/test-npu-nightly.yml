@@ -8,15 +8,7 @@ steps:
       build.pull_request.labels includes "diffusion-x2v-test"
     steps:
       - label: ":full_moon: Diffusion X2V · Function Test"
-        agents:
-          queue: "ascend-a2b3"
-          resource_class: "npu-4"
-        image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}"
-        plugins:
-          - kubernetes:
-              podSpecPatch:
-                imagePullSecrets:
-                  - name: swr-secret
+        mirror_hardwares: a2b3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           HF_TOKEN: "${HF_TOKEN}"
@@ -28,15 +20,7 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "tts-test"
     steps:
       - label: ":full_moon: TTS · Perf Test"
-        agents:
-          queue: "ascend-a3"
-          resource_class: "npu-2"
-        image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
-        plugins:
-          - kubernetes:
-              podSpecPatch:
-                imagePullSecrets:
-                  - name: swr-secret
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"

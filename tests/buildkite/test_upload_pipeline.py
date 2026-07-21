@@ -70,7 +70,28 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins() -> None:
 
 
 def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:
-    with pytest.raises(ValueError, match="agents/plugins"):
+    with pytest.raises(ValueError, match="agents/plugins/image"):
         _expand_mirror_hardwares(
             {"label": "bad", "mirror_hardwares": "l4_1", "agents": {"queue": "gpu_1_queue"}},
         )
+
+
+def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
+    doc = {
+        "steps": [
+            {
+                "label": "NPU X2V Test",
+                "mirror_hardwares": "a2b3_npu_4",
+                "commands": ["pytest -sv tests/example"],
+            },
+        ],
+    }
+    rendered = _render_test_pipeline(doc, changed_files=None)
+    step = rendered["steps"][0]
+    assert "mirror_hardwares" not in step
+    assert step["agents"]["queue"] == "ascend-a2b3"
+    assert step["agents"]["resource_class"] == "npu-4"
+    assert step["image"].endswith("${BUILDKITE_COMMIT}")
+    assert step["plugins"][0]["kubernetes"]["podSpecPatch"]["imagePullSecrets"] == [
+        {"name": "swr-secret"},
+    ]

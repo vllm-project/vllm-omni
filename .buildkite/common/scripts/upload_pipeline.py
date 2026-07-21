@@ -8,7 +8,8 @@ Bootstrap mode (pipeline.yml with __IMAGE_BUILD_IF__ placeholders):
 
 Test pipeline mode (e.g. test-merge.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files.
-  - Expand uploader-only ``mirror_hardwares: l4_1`` into ``agents`` + ``plugins`` (see ci_mirror_hardwares.yml).
+  - Expand uploader-only ``mirror_hardwares: l4_1`` into ``agents`` (+ optional ``image``
+    for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
 
 Usage:
   python3 upload_pipeline.py [--upload] [--all | --e2e] <pipeline.yml>
@@ -180,7 +181,7 @@ def _load_mirror_hardwares() -> dict[str, dict[str, Any]]:
 
 
 def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any]:
-    """Replace uploader-only ``mirror_hardwares`` with ``agents`` + ``plugins`` from ci_mirror_hardwares.yml."""
+    """Replace uploader-only ``mirror_hardwares`` with preset fields from ci_mirror_hardwares.yml."""
     hardware = step.get("mirror_hardwares")
     if hardware is None:
         return step
@@ -197,9 +198,9 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any]:
             f"unknown mirror_hardwares {hardware!r} in step {_get_step_label(step)!r}; known: {known}",
         )
 
-    if step.get("agents") is not None or step.get("plugins") is not None:
+    if step.get("agents") is not None or step.get("plugins") is not None or step.get("image") is not None:
         raise ValueError(
-            f"step {_get_step_label(step)!r} sets mirror_hardwares together with agents/plugins; "
+            f"step {_get_step_label(step)!r} sets mirror_hardwares together with agents/plugins/image; "
             "use mirror_hardwares only",
         )
 
