@@ -2,7 +2,8 @@
 End-to-end diffusion coverage for FLUX.2-dev in online serving mode.
 
 Coverage:
-- CPU offload
+- CPU offload (model-level)
+- Layerwise CPU offload
 - Ulysses sequence parallelism
 - Ring sequence parallelism
 
@@ -41,6 +42,16 @@ def _get_flux_2_dev_feature_cases(model: str):
                 ],
             ),
             id="cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-layerwise-offload",
+                ],
+            ),
+            id="layerwise_offload",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
         pytest.param(
