@@ -26,7 +26,14 @@ T2I_PROMPT = "A high quality detailed living room interior photo."
 T2S_PROMPT = "Please read this sentence naturally: Hello from online serving."
 I2I_PROMPT = "Transform this outdoor nature boardwalk scene into a painting style with vivid colors."
 
-TEST_PARAMS = [OmniServerParams(model=MODEL, stage_config_path=STAGE_CONFIG, stage_init_timeout=600)]
+TEST_PARAMS = [
+    OmniServerParams(
+        model=MODEL,
+        stage_config_path=STAGE_CONFIG,
+        stage_init_timeout=600,
+        server_args=["--trust-remote-code"],
+    )
+]
 _STAGE_COUNT = 3
 _I2I_STAGE_SAMPLING = {"max_tokens": 1, "temperature": 0.0, "top_p": 1.0, "detokenize": False}
 

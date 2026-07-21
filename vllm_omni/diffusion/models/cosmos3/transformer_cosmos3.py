@@ -1123,7 +1123,7 @@ class Cosmos3VFMTransformer(nn.Module):
         )
         self.patch_latent_dim = (self.latent_patch_size**2) * self.latent_channel_size
 
-        self.use_k_norm_und_for_gen = _tf_config_get(model_config, "use_k_norm_und_for_gen", None)
+        self.use_und_k_norm_for_gen = _tf_config_get(model_config, "use_und_k_norm_for_gen", None)
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
