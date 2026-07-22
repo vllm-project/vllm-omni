@@ -326,7 +326,12 @@ def _changed_files_for_diff_range(diff_range: str | None) -> list[str] | None:
         ".cursor/skills/",
     )
     _temp_ignore_files = frozenset({"docs/contributing/ci/.nav.yaml"})
-    files = [path for path in files if path not in _temp_ignore_files and not path.startswith(_temp_ignore_prefixes)]
+    _temp_keep_files = frozenset({".buildkite/cuda/test-ready.yml"})
+    files = [
+        path
+        for path in files
+        if path in _temp_keep_files or (path not in _temp_ignore_files and not path.startswith(_temp_ignore_prefixes))
+    ]
     # <<< TEMP
     _log(f"{len(files)} changed file(s)")
     return files

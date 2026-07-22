@@ -37,7 +37,6 @@ def _audiox_server_cases(model: str):
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@pytest.mark.skip(reason="debug for test")
 @pytest.mark.parametrize("omni_server", _audiox_server_cases(AUDIOX_TEST_MODEL), indirect=True)
 def test_audiox_t2a_online(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     """AudioX text-to-audio: chat completion returns a non-empty WAV in `message.audio.data`.
