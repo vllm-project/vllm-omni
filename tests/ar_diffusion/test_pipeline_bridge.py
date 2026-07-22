@@ -11,6 +11,10 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import (
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
+# Required by the check-test-ci-coverage hook once this file is touched; these
+# tests are CPU-only and cheap, so they belong in the per-PR level.
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 BLOCK = 16
 N_HEADS = 4
 HEAD_DIM = 64
@@ -220,3 +224,58 @@ def test_failed_forward_tears_down_session(monkeypatch):
     assert runner.pipeline._ar_diffusion_kv_state is None
     # close() freed the session's resident blocks.
     assert kv.manager.block_pool.get_num_free_blocks() > free_before_failure
+
+
+def test_session_churn_does_not_exhaust_pool(monkeypatch):
+    """A client reconnecting under a fresh session_id must not strand pool blocks.
+
+    Nothing tells the worker that a session ended, so its blocks are released
+    only by eviction. The count cap alone cannot bound the pool — the pool floor
+    is one session's window, so it holds far fewer sessions than the cap — and
+    session-id churn used to exhaust it permanently.
+    """
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=4)
+    kv = ARDiffusionKVCache(
+        cfg,
+        num_layers=1,
+        num_kv_heads=N_HEADS,
+        head_size=HEAD_DIM,
+        dtype=torch.float32,
+        block_size=BLOCK,
+        max_model_len=4096,
+        available_bytes=1 << 24,
+        device=torch.device("cpu"),
+    )
+
+    runner = object.__new__(ARDiffusionModelRunner)
+    runner.kv_cache = kv
+    runner._ar_diffusion_states = OrderedDict()
+    runner._max_ar_diffusion_states = 64  # the shipped cap
+    runner.pipeline = SimpleNamespace(_states={}, _ar_diffusion_kv_state=None)
+    runner.device = None
+    runner._perf_e2e_times = []
+
+    def fill_window(self, req, kv_prefetch_jobs=None):
+        # A real forward leaves the session holding its resident window blocks.
+        _prepare_and_commit(self.pipeline._ar_diffusion_kv_state, False, 2)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", fill_window)
+
+    n_sessions = 4 * kv.num_blocks  # far more sessions than the pool can hold
+    for i in range(n_sessions):
+        req = SimpleNamespace(
+            request_id=f"r{i}",
+            sampling_params=SimpleNamespace(extra_args={"session_id": f"s{i}"}),
+        )
+        ARDiffusionModelRunner.execute_model(runner, req)
+
+    # The pool bounded the live sessions; the count cap never had to fire.
+    assert len(runner._ar_diffusion_states) < n_sessions
+    assert len(runner._ar_diffusion_states) < runner._max_ar_diffusion_states
