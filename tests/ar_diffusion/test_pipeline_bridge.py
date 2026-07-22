@@ -226,6 +226,35 @@ def test_failed_forward_tears_down_session(monkeypatch):
     assert kv.manager.block_pool.get_num_free_blocks() > free_before_failure
 
 
+def test_end_session_frees_blocks_without_waiting_for_eviction():
+    """The serving layer knows when a session is over; releasing it then returns
+    the blocks immediately instead of leaving them for the next admission to
+    evict under pool pressure."""
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+
+    kv, st = make_state(num_layers=1, window_chunks=4)
+    _prepare_and_commit(st, False, 2)  # session owns pool blocks
+    held = kv.num_free_blocks
+
+    runner = object.__new__(ARDiffusionModelRunner)
+    runner.kv_cache = kv
+    runner._ar_diffusion_states = OrderedDict({"s1": st})
+    runner.pipeline = SimpleNamespace(_states={"s1": object()})
+
+    assert runner.end_session("s1") is True
+    assert "s1" not in runner._ar_diffusion_states
+    assert "s1" not in runner.pipeline._states
+    assert kv.num_free_blocks > held
+
+    # Unknown or already-released sessions are a no-op, so the serving layer can
+    # call this on every teardown path without tracking what is still live.
+    assert runner.end_session("s1") is False
+    assert runner.end_session("never-seen") is False
+
+
 def test_session_churn_does_not_exhaust_pool(monkeypatch):
     """A client reconnecting under a fresh session_id must not strand pool blocks.
 

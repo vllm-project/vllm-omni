@@ -76,6 +76,25 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # by the ar_diffusion_perf_stats worker RPC for the perf-compare summary.
         self._perf_e2e_times: list[float] = []
 
+    def end_session(self, session_id: str) -> bool:
+        """Release a finished session's KV pool blocks.
+
+        Sessions are otherwise dropped only by eviction, which reclaims them once
+        the pool is under pressure rather than when they actually end. The serving
+        layer knows the real end of life — a client disconnecting, switching
+        session id, or sending `reset` — and calls this out of band so the blocks
+        go back immediately. Returns whether a session was live under this id.
+        """
+        state = self._ar_diffusion_states.pop(session_id, None)
+        states = getattr(self.pipeline, "_states", None)
+        if states is not None:
+            states.pop(session_id, None)
+        if state is None:
+            return False
+        state.close()
+        logger.debug("AR-Diffusion ended session=%s; freed pool blocks", session_id)
+        return True
+
     def build_kv_cache(
         self,
         *,
