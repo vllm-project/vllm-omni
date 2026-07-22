@@ -113,6 +113,10 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationResponse,
     ResponseFormat,
 )
+from vllm_omni.entrypoints.openai.protocol.rollout import (
+    CreateSessionRequest,
+    RolloutStepRequest,
+)
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
     SizeStr,
@@ -124,8 +128,13 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.rollout_session import (
+    RolloutSessionClosedError,
+    RolloutSessionNotFoundError,
+)
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -799,6 +808,10 @@ async def omni_init_app_state(
             engine_client=engine_client,
             model_name=model_name,
         )
+        if state.openai_serving_realtime_robot is not None:
+            state.rl_rollout_serving = ServingRLRollout(state.openai_serving_realtime_robot)
+        else:
+            state.rl_rollout_serving = None
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -1124,6 +1137,7 @@ async def omni_init_app_state(
         stage_configs=state.stage_configs,
     )
     state.openai_serving_realtime_robot = None
+    state.rl_rollout_serving = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -1637,6 +1651,62 @@ async def realtime_robot_openpi(websocket: WebSocket):
         return
     connection = RobotRealtimeConnection(websocket, serving)
     await connection.handle_connection()
+
+
+# RL Rollout serving (RFC #3747, P0)
+
+
+def _rl_rollout_serving(request: Request) -> ServingRLRollout:
+    serving = getattr(request.app.state, "rl_rollout_serving", None)
+    if serving is None:
+        raise HTTPException(status_code=501, detail="RL rollout serving not available for this model.")
+    return serving
+
+
+@router.post("/v1/realtime/sessions")
+async def create_rollout_session(body: CreateSessionRequest, request: Request):
+    serving = _rl_rollout_serving(request)
+    return (await serving.create_session(body)).model_dump()
+
+
+@router.post("/v1/realtime/sessions/{session_id}/step")
+async def rollout_step(session_id: str, body: RolloutStepRequest, request: Request):
+    serving = _rl_rollout_serving(request)
+    return (await serving.step(session_id, body)).model_dump()
+
+
+@router.post("/v1/realtime/sessions/{session_id}/reset")
+async def reset_rollout_session(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        return (await serving.reset_session(session_id)).model_dump()
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
+
+
+@router.post("/v1/realtime/sessions/{session_id}/close")
+async def close_rollout_session(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        await serving.close_session(session_id)
+        return {"session_id": session_id, "closed": True}
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
+
+
+@router.get("/v1/realtime/sessions/{session_id}/status")
+async def rollout_session_status(session_id: str, request: Request):
+    serving = _rl_rollout_serving(request)
+    try:
+        return (await serving.get_status(session_id)).model_dump()
+    except RolloutSessionNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found.")
+    except RolloutSessionClosedError:
+        raise HTTPException(status_code=410, detail=f"Session {session_id!r} is closed.")
 
 
 # Health and Model endpoints for diffusion mode
