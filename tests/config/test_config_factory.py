@@ -1233,10 +1233,8 @@ stages:
         assert deploy.connectors is not None
         assert deploy.platforms is not None
 
-    def test_qwen3_omni_thinker_only_example_uses_resolved_pipeline(self):
-        deploy_path = (
-            Path(__file__).parent.parent / "examples" / "online_serving" / "qwen3_omni" / "qwen3_omni_moe_thinking.yaml"
-        )
+    def test_qwen3_omni_thinker_only_deploy_config_uses_resolved_pipeline(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe_thinking.yaml"))
         with patch(
             "vllm_omni.config.config_factory.get_config",
             return_value=Q3_OMNI_THINKER_HF_CONFIG,
