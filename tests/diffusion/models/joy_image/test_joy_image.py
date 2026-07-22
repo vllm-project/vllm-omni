@@ -113,8 +113,7 @@ def _assert_attention_outputs_close(
 ) -> None:
     atol = rtol = 5e-3 if dtype is torch.bfloat16 else 1e-5
     max_abs = max(
-        (actual_item - expected_item).abs().max().item()
-        for actual_item, expected_item in zip(actual, expected)
+        (actual_item - expected_item).abs().max().item() for actual_item, expected_item in zip(actual, expected)
     )
     assert max_abs <= atol
     for actual_item, expected_item in zip(actual, expected):
