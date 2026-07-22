@@ -24,6 +24,8 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import logging
 
+from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
+
 try:
     from transformers import AutoVideoProcessor
 except ImportError:
@@ -479,5 +481,10 @@ class MingFlashOmniProcessor(ProcessorMixin):
         return list(dict.fromkeys(names))
 
 
-AutoFeatureExtractor.register("MingWhisperFeatureExtractor", MingWhisperFeatureExtractor)
-AutoProcessor.register("MingFlashOmniProcessor", MingFlashOmniProcessor)
+# transformers >= 5.x requires the config *class* (not a string) as the first
+# arg to AutoFeatureExtractor/AutoProcessor.register — it does `key.__module__`
+# internally. Passing "MingWhisperFeatureExtractor" raises:
+#   AttributeError: 'str' object has no attribute '__module__'
+# Same API change as minicpmo_4_5_omni_llm.py / processing_gr00t_n1d7.py.
+AutoFeatureExtractor.register(BailingMM2Config, MingWhisperFeatureExtractor, exist_ok=True)
+AutoProcessor.register(BailingMM2Config, MingFlashOmniProcessor, exist_ok=True)

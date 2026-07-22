@@ -455,6 +455,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_modalities = getattr(request, "modalities", engine_output_modalities)
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
+        if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
+            return self.create_error_response("'modalities' must be a list of strings.")
+        allowed_modalities = set(engine_output_modalities)
+        if is_single_stage_diffusion(self.engine_client):
+            allowed_modalities.add("text")
+        unsupported = set(request.modalities) - allowed_modalities
+        if unsupported:
+            return self.create_error_response(
+                f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
+                f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
+            )
+
         if request.modalities and "audio" in request.modalities:
             audio_format_check = self._resolve_audio_format(request)
             if isinstance(audio_format_check, ErrorResponse):
@@ -2539,7 +2551,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        mm_output = final_res.outputs[0].multimodal_output
+        # The attribute is attached dynamically when stage audio arrives; fall
+        # back to the no-audio error response instead of an AttributeError 500
+        # when the pipeline produced no audio for this request.
+        mm_output = getattr(final_res.outputs[0], "multimodal_output", None) or {}
         audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
             if not audio_data:

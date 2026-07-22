@@ -1562,6 +1562,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
             "output_format": "jpeg",
             "num_inference_steps": 20,
             "guidance_scale": 8.0,
+            "guidance_scale_2": 2.0,
             "seed": 1234,
             "negative_prompt": "negative",
             "n": 2,
@@ -1576,6 +1577,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
     assert captured_prompt["negative_prompt"] == "negative"
     assert captured_sampling_params.num_inference_steps == 20
     assert captured_sampling_params.guidance_scale == 8.0
+    assert captured_sampling_params.guidance_scale_2 == 2.0
     assert captured_sampling_params.seed == 1234
     assert captured_sampling_params.num_outputs_per_prompt == 2
     assert captured_sampling_params.width == 16

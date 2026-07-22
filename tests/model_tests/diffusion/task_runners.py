@@ -28,11 +28,29 @@ IMAGE_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
     seed=42,
 )
 
+VIDEO_NUM_FRAMES = 9
+VIDEO_GEN_SAMPLING_PARAMS = OmniDiffusionSamplingParams(
+    num_inference_steps=4,
+    height=HEIGHT,
+    width=WIDTH,
+    num_frames=VIDEO_NUM_FRAMES,
+    seed=42,
+)
+
 # Online extra_body for diffusion requests
 IMAGE_GEN_EXTRA_BODY = {
     "height": HEIGHT,
     "width": WIDTH,
     "num_inference_steps": 4,
+    "seed": 42,
+}
+
+# Online form_data for video generation requests (multipart /v1/videos API)
+VIDEO_GEN_FORM_DATA = {
+    "height": HEIGHT,
+    "width": WIDTH,
+    "num_inference_steps": 4,
+    "num_frames": VIDEO_NUM_FRAMES,
     "seed": 42,
 }
 
@@ -70,8 +88,28 @@ def _get_online_images(responses: list[DiffusionResponse]) -> list[Image.Image]:
     return images
 
 
+def _validate_video(outputs: list[OmniRequestOutput], expected_n: int = 1):
+    """Given a set of outputs, ensure we got video frames with the expected shape."""
+    assert len(outputs) == expected_n
+    for output in outputs:
+        # Video models return numpy arrays via output.images
+        images = output.images
+        assert len(images) > 0
+        for frame_data in images:
+            assert isinstance(frame_data, np.ndarray)
+            # (num_outputs, num_frames, H, W, C) or (num_frames, H, W, C)
+            assert frame_data.ndim in (4, 5), f"Expected 4D or 5D video array, got shape {frame_data.shape}"
+            assert frame_data.shape[-3] == HEIGHT, f"Expected height {HEIGHT}, got {frame_data.shape[-3]}"
+            assert frame_data.shape[-2] == WIDTH, f"Expected width {WIDTH}, got {frame_data.shape[-2]}"
+            assert frame_data.shape[-1] == 3, f"Expected 3 channels (RGB), got {frame_data.shape[-1]}"
+
+
 ### Offline helpers
 def _run_offline_t2i(omni: Omni, params: OmniDiffusionSamplingParams = IMAGE_GEN_SAMPLING_PARAMS):
+    return omni.generate({"prompt": PROMPT}, params)
+
+
+def _run_offline_t2v(omni: Omni, params: OmniDiffusionSamplingParams = VIDEO_GEN_SAMPLING_PARAMS):
     return omni.generate({"prompt": PROMPT}, params)
 
 
@@ -130,6 +168,11 @@ def run_and_validate_image_to_image_request(omni: Omni):
     _validate_images(_get_offline_images(_run_offline_i2i(omni)))
 
 
+def run_and_validate_text_to_video_request(omni: Omni):
+    """Run and validate a text to video request."""
+    _validate_video(_run_offline_t2v(omni))
+
+
 def run_and_validate_text_to_image_determinism(omni: Omni):
     """Checks for determinism; for now we just keep this for TTI."""
     _validate_image_gen_determinism(
@@ -142,6 +185,25 @@ def run_and_validate_text_to_image_multi_output(omni: Omni):
     """Checks for multi-output; for now we just keep this for TTI."""
     params = replace(IMAGE_GEN_SAMPLING_PARAMS, num_outputs_per_prompt=2)
     _validate_images(_get_offline_images(_run_offline_t2i(omni, params)), expected_n=2)
+
+
+def _run_online_t2v(
+    server: OmniServer, client: OpenAIClientHandler, form_data: dict | None = None
+) -> list[DiffusionResponse]:
+    """Run a text to video request through the server's /v1/videos API."""
+    data = dict(form_data or VIDEO_GEN_FORM_DATA)
+    data.setdefault("prompt", PROMPT)
+    data.setdefault("model", server.model)
+    return client.send_video_diffusion_request({"form_data": data})
+
+
+def _get_online_videos(responses: list[DiffusionResponse]) -> list:
+    """Extract the videos from a server response."""
+    assert len(responses) == 1
+    videos = responses[0].videos
+    assert videos is not None
+    assert len(videos) > 0
+    return videos
 
 
 ### Online task runners
@@ -170,3 +232,8 @@ def run_and_validate_online_text_to_image_multi_output(server: OmniServer, clien
         _get_online_images(_run_online_t2i(server, client, extra_body=extra_body)),
         expected_n=2,
     )
+
+
+def run_and_validate_online_text_to_video_request(server: OmniServer, client: OpenAIClientHandler):
+    """Run and validate a text to video request through the server."""
+    _get_online_videos(_run_online_t2v(server, client))

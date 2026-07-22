@@ -73,7 +73,7 @@ class OmniCachedRequestData(CachedRequestData):
 
 @dataclass
 class OmniChunkRecvHandle:
-    """Minimal identifier carried from scheduler to runner for chunk-recv
+    """Minimal identifier carried from scheduler to runner for input-receive
     registration.
 
     The runner's ``register_chunk_recv`` only consumes ``request_id`` and

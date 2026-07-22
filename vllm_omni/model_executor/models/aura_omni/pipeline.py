@@ -24,6 +24,7 @@ _QWEN3_TTS_PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
 
 AURA_OMNI_PIPELINE = PipelineConfig(
     model_type="aura_omni",
+    default_deploy_config_name="aura_omni.yaml",
     model_arch="Qwen3ASRForConditionalGeneration",
     stages=(
         StagePipelineConfig(

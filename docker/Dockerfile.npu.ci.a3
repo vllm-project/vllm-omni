@@ -6,6 +6,8 @@ ARG APP_DIR=/vllm-workspace/vllm-omni
 WORKDIR ${APP_DIR}
 COPY . .
 
+RUN sed -i "s@^\(deb.*\)https\?://[a-z0-9.-]*\.ubuntu\.com@\1http://cache-service.nginx-pypi-cache.svc.cluster.local:8081@g" /etc/apt/sources.list
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ffmpeg \

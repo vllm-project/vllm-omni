@@ -14,10 +14,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedErr
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import (
+    BaseScheduler,
     DiffusionRequestStatus,
     RequestScheduler,
     Scheduler,
-    SchedulerInterface,
     StepScheduler,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
@@ -85,7 +85,7 @@ def _cached_ids(sched_output) -> list[str]:
     return list(sched_output.scheduled_cached_reqs.request_ids)
 
 
-class _StubScheduler(SchedulerInterface):
+class _StubScheduler:
     def __init__(self, request: OmniDiffusionRequest, output) -> None:
         self._request = request
         self._output = output
@@ -154,8 +154,14 @@ class _StubScheduler(SchedulerInterface):
         return None
 
 
-class TestGetSamplingParamsKey:
-    """Pure-function tests for the batch-compatibility key builder."""
+class _ConcreteScheduler(BaseScheduler):
+    def update_from_output(self, sched_output, output) -> set[str]:
+        del sched_output, output
+        return set()
+
+
+class TestGetStepBatchSamplingParamsKey:
+    """Tests for the step-batch compatibility key builder on BaseScheduler."""
 
     @staticmethod
     def _make(lora_int_id: int | None = None, lora_scale: float = 1.0) -> OmniDiffusionRequest:
@@ -176,34 +182,32 @@ class TestGetSamplingParamsKey:
         )
 
     def test_distinguishes_lora_id(self) -> None:
-        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
-
-        assert get_sampling_params_key(self._make(lora_int_id=1)) != get_sampling_params_key(self._make(lora_int_id=2))
+        scheduler = _ConcreteScheduler()
+        assert scheduler._build_sampling_params_key(self._make(lora_int_id=1)) != scheduler._build_sampling_params_key(
+            self._make(lora_int_id=2)
+        )
 
     def test_distinguishes_lora_scale(self) -> None:
-        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
-
-        assert get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5)) != get_sampling_params_key(
-            self._make(lora_int_id=1, lora_scale=1.0)
-        )
+        scheduler = _ConcreteScheduler()
+        assert scheduler._build_sampling_params_key(
+            self._make(lora_int_id=1, lora_scale=0.5)
+        ) != scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=1.0))
 
     def test_treats_no_lora_as_distinct_bucket(self) -> None:
-        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
-
-        assert get_sampling_params_key(self._make(lora_int_id=None)) != get_sampling_params_key(
-            self._make(lora_int_id=1)
-        )
+        scheduler = _ConcreteScheduler()
+        assert scheduler._build_sampling_params_key(
+            self._make(lora_int_id=None)
+        ) != scheduler._build_sampling_params_key(self._make(lora_int_id=1))
 
     def test_equal_for_same_lora_identity(self) -> None:
-        from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
-
-        a = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
-        b = get_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+        b = scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         assert a == b
 
 
 class TestGetRequestBatchSamplingParamsKey:
-    """Pure-function tests for the request-batch compatibility key builder."""
+    """Tests for the request-batch compatibility key builder on RequestScheduler."""
 
     @staticmethod
     def _make(
@@ -220,21 +224,19 @@ class TestGetRequestBatchSamplingParamsKey:
         return OmniDiffusionRequest(prompt="prompt", sampling_params=sp, request_id=f"req-{num_inference_steps}")
 
     def test_distinguishes_num_inference_steps(self) -> None:
-        from vllm_omni.diffusion.sched.base_scheduler import get_request_batch_sampling_params_key
-
-        assert get_request_batch_sampling_params_key(
+        scheduler = RequestScheduler()
+        assert scheduler._build_sampling_params_key(
             self._make(num_inference_steps=2)
-        ) != get_request_batch_sampling_params_key(self._make(num_inference_steps=4))
+        ) != scheduler._build_sampling_params_key(self._make(num_inference_steps=4))
 
     def test_ignores_seed_and_generator(self) -> None:
-        from vllm_omni.diffusion.sched.base_scheduler import get_request_batch_sampling_params_key
-
+        scheduler = RequestScheduler()
         gen_a = torch.Generator(device="cpu").manual_seed(1)
         gen_b = torch.Generator(device="cpu").manual_seed(2)
 
-        assert get_request_batch_sampling_params_key(
+        assert scheduler._build_sampling_params_key(
             self._make(seed=1, generator=gen_a)
-        ) == get_request_batch_sampling_params_key(self._make(seed=2, generator=gen_b))
+        ) == scheduler._build_sampling_params_key(self._make(seed=2, generator=gen_b))
 
 
 class TestRequestScheduler:

@@ -716,10 +716,9 @@ def test_distilled_pipeline_initializes_sde_scheduler(
     stub_real_pipeline_init,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from diffusers import FlowMatchEulerDiscreteScheduler
-
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         Cosmos3OmniDiffusersPipeline,
+        FlowMatchEulerDiscreteScheduler,
     )
 
     t_list = [1.0, 0.9375, 0.8333333333333334, 0.625]

@@ -49,7 +49,7 @@ state object:
 
 The state lives in
 [`vllm_omni/diffusion/worker/utils.py`](gh-file:vllm_omni/diffusion/worker/utils.py)
-as `DiffusionRequestState`. Store request-scoped tensors there, or use
+as `StepRequestState`. Store request-scoped tensors there, or use
 `state.extra` for model-specific fields that do not justify extending the core
 dataclass.
 

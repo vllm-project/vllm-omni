@@ -1,0 +1,64 @@
+# MiniCPM-o 4.5 deploy: 2-GPU layout (thinker on GPU 0, talker on GPU 1).
+#
+# Stage 0 (thinker): GPU 0 — multimodal understanding, ~90% mem (thinker
+#                            gets a dedicated card, so it can take more of
+#                            the GPU than the single-GPU co-located layout).
+# Stage 1 (talker) : GPU 1 — MiniCPMTTS + Token2Wav, ~75% mem
+#                            (covers both the talker LM and the in-process
+#                            Token2Wav vocoder that emits the waveform).
+#
+# Use this when you have two GPUs and want the talker + Token2Wav vocoder
+# on its own card instead of sharing GPU 0 with the thinker (the default
+# single-GPU layout co-locates both and can OOM under load).
+pipeline: minicpmo_4_5
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.9
+    enforce_eager: false
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 16384
+    devices: "0"
+    limit_mm_per_prompt:
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    # Talker only consumes runtime_additional_information[0]; any value > 1
+    # makes concurrent requests share request-0's audio (mm_outputs fallback).
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.75
+    enforce_eager: false
+    max_num_batched_tokens: 8192
+    devices: "1"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
