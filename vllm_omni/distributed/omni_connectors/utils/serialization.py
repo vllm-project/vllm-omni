@@ -151,7 +151,6 @@ class OmniMsgpackEncoder:
             "encoder_prompt": obj.encoder_prompt,
             "encoder_prompt_token_ids": obj.encoder_prompt_token_ids,
             "num_cached_tokens": obj.num_cached_tokens,
-            "multi_modal_placeholders": getattr(obj, "multi_modal_placeholders", None),
             "kv_transfer_params": obj.kv_transfer_params,
         }
         # Handle multimodal_output attribute (MultimodalPayload or dict)
@@ -265,7 +264,6 @@ class OmniMsgpackDecoder:
         # Legacy wire format (pre-inheritance): the stage output was nested
         # under "request_output". Merge its content via the compat setter.
         legacy_inner = data.pop("request_output", None)
-        multi_modal_placeholders = data.pop("multi_modal_placeholders", None)
         field_names = {f.name for f in fields(OmniRequestOutput)}
         known = {k: v for k, v in data.items() if k in field_names}
         try:
@@ -276,8 +274,6 @@ class OmniMsgpackDecoder:
             return obj
         if legacy_inner is not None and not isinstance(legacy_inner, dict):
             out.request_output = legacy_inner
-        if multi_modal_placeholders is not None:
-            setattr(out, "multi_modal_placeholders", multi_modal_placeholders)
         return out
 
     def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
@@ -324,19 +320,16 @@ class OmniMsgpackDecoder:
         We construct it manually using only the known __init__ parameters to
         avoid triggering the "Ignoring extra arguments" warning in vllm.
         Fields that are not part of RequestOutput.__init__ (e.g.
-        multi_modal_placeholders, multimodal_output) are extracted first and
+        multimodal_output) are extracted first and
         then restored as dynamic attributes after construction.
         """
         # Extract dynamically-added / non-init fields before constructing so
         # they are not passed as unknown **kwargs to RequestOutput.__init__.
         mm_output = obj.pop("multimodal_output", None)
-        multi_modal_placeholders = obj.pop("multi_modal_placeholders", None)
 
         ro = RequestOutput(**obj)
 
         # Restore dynamic attributes that are not part of __init__.
-        if multi_modal_placeholders is not None:
-            setattr(ro, "multi_modal_placeholders", multi_modal_placeholders)
         if mm_output is not None:
             setattr(ro, "multimodal_output", mm_output)
         return ro
