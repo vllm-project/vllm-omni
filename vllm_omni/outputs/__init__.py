@@ -243,36 +243,6 @@ class OmniRequestOutput(RequestOutput):
         )
 
     @classmethod
-    def from_pipeline(
-        cls,
-        stage_id: int,
-        final_output_type: str,
-        request_output: RequestOutput,
-        replica_id: int | None = None,
-    ) -> "OmniRequestOutput":
-        """Create output from a pipeline stage.
-
-        The stage output's content is copied into the new object's own
-        (inherited) fields.
-
-        Args:
-            stage_id: Stage identifier
-            final_output_type: Type of output
-            request_output: The stage's output
-
-        Returns:
-            OmniRequestOutput configured for pipeline mode
-        """
-        out = cls(
-            stage_id=stage_id,
-            replica_id=replica_id,
-            final_output_type=final_output_type,
-            request_output=request_output,
-        )
-        out.finished = True
-        return out
-
-    @classmethod
     def from_diffusion(
         cls,
         request_id: str,
