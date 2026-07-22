@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Render and optionally upload Buildkite pipeline YAML with diff-aware logic.
 
-Bootstrap mode (cuda/pipeline.yml, npu/pipeline-npu.yml with ``vllm-omni:placeholder:*`` if sentinels):
+Bootstrap mode (``bootstrap-upload-steps.yml``):
+  - Hook uploads the entry YAML (``pipeline.yml`` / ``pipeline-npu.yml``) with one step that runs
+    ``upload_pipeline.py --upload <platform>/bootstrap-upload-steps.yml``.
+  - Injects ``if`` by step ``key`` from skip-ci and uploads child steps (image build, L2–L5 upload).
   - Detect docs-only, pytest skip-mark-only, or combined skip-ci from git diff.
   - When only CI level YAML changes, enable **L2/L3** upload steps for affected levels only.
 
@@ -44,21 +47,14 @@ from skip_ci import (
 # --- Constants ---
 
 LOG = "upload_pipeline"
-DOC_SEP = "\n---\n"
-# Valid Buildkite ``if`` placeholders (always false on hook upload); replaced by upload_pipeline.py.
-PLACEHOLDER_PREFIX = "vllm-omni:placeholder:"
-PLACEHOLDER_IMAGE_BUILD_IF = f'build.message == "{PLACEHOLDER_PREFIX}image-build"'
-PLACEHOLDER_UPLOAD_READY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-ready"'
-PLACEHOLDER_UPLOAD_MERGE_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-merge"'
-PLACEHOLDER_UPLOAD_NIGHTLY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-nightly"'
-PLACEHOLDER_UPLOAD_WEEKLY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-weekly"'
-BOOTSTRAP_PLACEHOLDERS = (
-    PLACEHOLDER_IMAGE_BUILD_IF,
-    PLACEHOLDER_UPLOAD_READY_IF,
-    PLACEHOLDER_UPLOAD_MERGE_IF,
-    PLACEHOLDER_UPLOAD_NIGHTLY_IF,
-    PLACEHOLDER_UPLOAD_WEEKLY_IF,
-)
+BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
+BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset({"image-build", "image-build-a2", "image-build-a3"})
+BOOTSTRAP_UPLOAD_IF_KEYS = {
+    "upload-ready-pipeline": "ready",
+    "upload-merge-pipeline": "merge",
+    "upload-nightly-pipeline": "nightly",
+    "upload-weekly-pipeline": "weekly",
+}
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
 
@@ -84,7 +80,7 @@ def _log(message: str) -> None:
     print(f"{LOG}: {message}", file=sys.stderr)
 
 
-# --- Bootstrap pipeline (cuda/pipeline.yml, npu/pipeline-npu.yml) ---
+# --- Bootstrap pipeline (bootstrap-upload-steps.yml) ---
 
 
 def _get_bootstrap_platform(path: Path) -> str:
@@ -92,29 +88,24 @@ def _get_bootstrap_platform(path: Path) -> str:
     return "npu" if "npu" in parts else "cuda"
 
 
-def _is_bootstrap_pipeline(text: str) -> bool:
-    return PLACEHOLDER_PREFIX in text
+def _load_bootstrap_steps(path: Path) -> str:
+    if path.name != BOOTSTRAP_STEPS_FILENAME:
+        raise ValueError(f"expected {BOOTSTRAP_STEPS_FILENAME}, got {path.name}")
+    return path.read_text(encoding="utf-8")
 
 
-def _render_bootstrap_pipeline(
-    text: str,
-    *,
-    decision,
-    path: Path,
-) -> str:
-    """Replace bootstrap ``if`` placeholders from skip-ci decision (document 2 after ``---``)."""
-    platform = _get_bootstrap_platform(path)
+def _format_bootstrap_if(expr: str) -> str | bool:
+    if expr == "true":
+        return True
+    if expr == "false":
+        return False
+    return f"({expr})"
 
-    def quoted_if(expr: str) -> str:
-        return f"'({expr})'"
 
-    disabled = "'false'"
-
-    _, continuation = _split_pipeline_documents(text)
-    placeholders = tuple(name for name in BOOTSTRAP_PLACEHOLDERS if name in continuation)
-
-    nightly_only = NPU_NIGHTLY_ONLY if platform == "npu" else CUDA_NIGHTLY_ONLY
+def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
+    disabled = "false"
     nightly_main = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
+    nightly_only = NPU_NIGHTLY_ONLY if platform == "npu" else CUDA_NIGHTLY_ONLY
 
     if platform == "npu":
         ready_pr = (
@@ -123,10 +114,9 @@ def _render_bootstrap_pipeline(
             'build.pull_request.labels includes "ready"'
             ")"
         )
-        merge_main = ""
-        merge_pr = ""
         nightly_label_if = nightly_only
-        weekly_label_if = ""
+        weekly_label_if = disabled
+        merge_base = disabled
     else:
         ready_pr = 'build.branch != "main" && build.pull_request.labels includes "ready"'
         merge_main = 'build.branch == "main" && build.env("NIGHTLY") != "1" && build.env("WEEKLY") != "1"'
@@ -145,24 +135,24 @@ def _render_bootstrap_pipeline(
             '(build.branch == "main" && build.env("WEEKLY") == "1") || '
             '(build.branch != "main" && build.pull_request.labels includes "weekly-test")'
         )
+        merge_base = f"({nightly_main}) || (({merge_main}) || ({merge_pr}))"
 
     ready_base = f"({nightly_main}) || ({ready_pr})"
-    merge_base = f"({nightly_main}) || (({merge_main}) || ({merge_pr}))" if platform == "cuda" else ""
 
     if decision.skip_all:
-        image_if = quoted_if(nightly_only)
-        ready_if = quoted_if(nightly_main)
-        merge_if = quoted_if(nightly_main) if platform == "cuda" else disabled
-        nightly_if = quoted_if(nightly_label_if)
-        weekly_if = disabled
+        image_expr = nightly_only
+        ready_expr = nightly_main
+        merge_expr = nightly_main if platform == "cuda" else disabled
+        nightly_expr = nightly_label_if
+        weekly_expr = disabled
     elif decision.skip_l2_l3:
         l2_enabled = decision.is_run("npu", "l2") if platform == "npu" else decision.is_run("cuda", "l2")
         l3_enabled = platform == "cuda" and decision.is_run("cuda", "l3")
 
-        ready_if = quoted_if(ready_base) if l2_enabled else disabled
-        merge_if = quoted_if(merge_base) if l3_enabled else disabled
-        nightly_if = quoted_if(nightly_label_if)
-        weekly_if = quoted_if(weekly_label_if) if platform == "cuda" else disabled
+        ready_expr = ready_base if l2_enabled else disabled
+        merge_expr = merge_base if l3_enabled else disabled
+        nightly_expr = nightly_label_if
+        weekly_expr = weekly_label_if if platform == "cuda" else disabled
 
         image_parts = [f"({nightly_label_if})"]
         if platform == "cuda":
@@ -171,45 +161,56 @@ def _render_bootstrap_pipeline(
             image_parts.insert(0, f"({ready_base})")
         if l3_enabled:
             image_parts.insert(1 if l2_enabled else 0, f"({merge_base})")
-        image_if = quoted_if(" || ".join(image_parts))
+        image_expr = " || ".join(image_parts)
     else:
-        image_if = "'true'"
-        ready_if = quoted_if(ready_base)
-        merge_if = quoted_if(merge_base) if platform == "cuda" else disabled
-        nightly_if = quoted_if(nightly_label_if)
-        weekly_if = quoted_if(weekly_label_if) if platform == "cuda" else disabled
+        image_expr = "true"
+        ready_expr = ready_base
+        merge_expr = merge_base if platform == "cuda" else disabled
+        nightly_expr = nightly_label_if
+        weekly_expr = weekly_label_if if platform == "cuda" else disabled
 
-    replacement_pairs = (
-        (PLACEHOLDER_IMAGE_BUILD_IF, image_if),
-        (PLACEHOLDER_UPLOAD_READY_IF, ready_if),
-        (PLACEHOLDER_UPLOAD_MERGE_IF, merge_if),
-        (PLACEHOLDER_UPLOAD_NIGHTLY_IF, nightly_if),
-        (PLACEHOLDER_UPLOAD_WEEKLY_IF, weekly_if),
-    )
-    rendered = continuation
-    for name, value in sorted(replacement_pairs, key=lambda item: len(item[0]), reverse=True):
-        if name in rendered:
-            rendered = rendered.replace(name, value)
-    _assert_no_bootstrap_placeholders(rendered, placeholders)
-    return rendered
+    return {
+        "image": _format_bootstrap_if(image_expr),
+        "ready": _format_bootstrap_if(ready_expr),
+        "merge": _format_bootstrap_if(merge_expr),
+        "nightly": _format_bootstrap_if(nightly_expr),
+        "weekly": _format_bootstrap_if(weekly_expr),
+    }
 
 
-def _assert_no_bootstrap_placeholders(content: str, placeholders: tuple[str, ...]) -> None:
-    leftover = [name for name in placeholders if name in content]
-    if leftover:
-        raise ValueError(
-            "unreplaced bootstrap placeholders in rendered pipeline: "
-            f"{', '.join(leftover)}. Ensure bootstrap upload runs "
-            ".buildkite/common/scripts/upload_pipeline.py --upload on the platform pipeline file.",
-        )
+def _apply_bootstrap_if(steps: list[Any], if_exprs: dict[str, str]) -> None:
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        nested = step.get("steps")
+        if isinstance(nested, list):
+            _apply_bootstrap_if(nested, if_exprs)
+            continue
+        key = step.get("key")
+        if key in BOOTSTRAP_IMAGE_BUILD_KEYS:
+            step["if"] = if_exprs["image"]
+        elif key in BOOTSTRAP_UPLOAD_IF_KEYS:
+            step["if"] = if_exprs[BOOTSTRAP_UPLOAD_IF_KEYS[key]]
 
 
-def _split_pipeline_documents(text: str) -> tuple[str, str]:
-    for separator in (DOC_SEP, "\r\n---\r\n", "\n---\r\n", "\r\n---\n"):
-        if separator in text:
-            head, tail = text.split(separator, 1)
-            return head, tail
-    return "", text
+def _render_bootstrap_pipeline(
+    steps_yaml: str,
+    *,
+    decision,
+    path: Path,
+) -> str:
+    """Load bootstrap steps YAML and inject ``if`` expressions from skip-ci decision."""
+    doc = yaml.safe_load(steps_yaml)
+    if not isinstance(doc, dict):
+        raise ValueError(f"invalid bootstrap steps YAML for {path}")
+    steps = doc.get("steps")
+    if not isinstance(steps, list):
+        raise ValueError(f"bootstrap steps YAML must contain steps: list in {path}")
+
+    platform = _get_bootstrap_platform(path)
+    if_exprs = _compute_bootstrap_if_exprs(decision=decision, platform=platform)
+    _apply_bootstrap_if(steps, if_exprs)
+    return yaml.safe_dump(doc, sort_keys=False)
 
 
 # --- Test pipeline (test-ready.yml, test-merge.yml) ---
@@ -351,15 +352,16 @@ def _render_pipeline(
     force_all: bool = False,
     e2e_only: bool = False,
 ) -> str:
-    text = path.read_text(encoding="utf-8")
-    if _is_bootstrap_pipeline(text):
+    if path.name == BOOTSTRAP_STEPS_FILENAME:
         ctx = resolve_ci_context_from_git()
+        continuation = _load_bootstrap_steps(path)
         return _render_bootstrap_pipeline(
-            text,
+            continuation,
             decision=ctx.decision,
             path=path,
         )
 
+    text = path.read_text(encoding="utf-8")
     ctx = resolve_ci_context_from_git()
     if force_all or e2e_only:
         changed_files = None
@@ -391,8 +393,8 @@ def main() -> int:
     parser.add_argument(
         "pipeline",
         nargs="?",
-        default=".buildkite/cuda/pipeline.yml",
-        help="Pipeline YAML path (default: .buildkite/cuda/pipeline.yml)",
+        default=".buildkite/cuda/bootstrap-upload-steps.yml",
+        help="Pipeline YAML path (default: .buildkite/cuda/bootstrap-upload-steps.yml)",
     )
     parser.add_argument(
         "--upload",

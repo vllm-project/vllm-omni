@@ -10,60 +10,61 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "com
 
 from skip_ci import resolve_ci_decision  # noqa: E402
 from upload_pipeline import (  # noqa: E402
-    DOC_SEP,
-    PLACEHOLDER_IMAGE_BUILD_IF,
-    PLACEHOLDER_PREFIX,
-    PLACEHOLDER_UPLOAD_NIGHTLY_IF,
-    PLACEHOLDER_UPLOAD_READY_IF,
-    PLACEHOLDER_UPLOAD_WEEKLY_IF,
     _expand_mirror_hardwares,
+    _load_bootstrap_steps,
     _render_bootstrap_pipeline,
     _render_test_pipeline,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-CUDA_PIPELINE = Path(".buildkite/cuda/pipeline.yml")
-BOOTSTRAP_TEMPLATE = f"""steps: []
-{DOC_SEP}steps:
-  - if: {PLACEHOLDER_IMAGE_BUILD_IF}
-  - if: {PLACEHOLDER_UPLOAD_READY_IF}
-  - if: {PLACEHOLDER_UPLOAD_NIGHTLY_IF}
-  - if: {PLACEHOLDER_UPLOAD_WEEKLY_IF}
+CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+BOOTSTRAP_STEPS_TEMPLATE = """steps:
+  - key: image-build
+  - key: upload-ready-pipeline
+  - key: upload-nightly-pipeline
+  - key: upload-weekly-pipeline
 """
 
 
 def _render(changed_files: list[str]) -> str:
     decision = resolve_ci_decision(changed_files)
     return _render_bootstrap_pipeline(
-        BOOTSTRAP_TEMPLATE,
+        BOOTSTRAP_STEPS_TEMPLATE,
         decision=decision,
-        path=CUDA_PIPELINE,
+        path=CUDA_BOOTSTRAP_STEPS,
     )
 
 
-def test_bootstrap_placeholders_replaced() -> None:
+def test_bootstrap_if_injected_by_step_key() -> None:
     rendered = _render_bootstrap_pipeline(
-        BOOTSTRAP_TEMPLATE,
+        BOOTSTRAP_STEPS_TEMPLATE,
         decision=resolve_ci_decision([]),
-        path=Path(".buildkite/npu/pipeline-npu.yml"),
+        path=Path(".buildkite/npu/bootstrap-upload-steps.yml"),
     )
-    assert PLACEHOLDER_PREFIX not in rendered
-    assert "if: 'true'" in rendered
+    assert "if: true" in rendered
+    assert "key: image-build" in rendered
+
+
+def test_bootstrap_steps_loaded_from_file() -> None:
+    steps = _load_bootstrap_steps(CUDA_BOOTSTRAP_STEPS)
+    assert "key: image-build" in steps
+    assert "key: upload-ready-pipeline" in steps
+    assert "placeholder:" not in steps
 
 
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
     rendered = _render([".buildkite/cuda/test-nightly.yml"])
-    assert "if: 'true'" not in rendered
+    assert "if: true" not in rendered
     assert 'build.pull_request.labels includes "nightly-test"' in rendered
     assert 'build.pull_request.labels includes "weekly-test"' in rendered
-    assert "if: 'false'" in rendered
+    assert "if: false" in rendered
 
 
 def test_yaml_gated_l2_still_enables_image_via_ready_base() -> None:
     rendered = _render([".buildkite/cuda/test-ready.yml"])
     assert 'build.pull_request.labels includes "ready"' in rendered
-    assert "if: 'true'" not in rendered
+    assert "if: true" not in rendered
 
 
 def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins() -> None:
