@@ -263,6 +263,15 @@ def _cosmos3_stage_configs():
     ]
 
 
+def _lingbot_stage_configs():
+    return [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args=SimpleNamespace(model_class_name="LingBotVideoPipeline"),
+        )
+    ]
+
+
 def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
     deadline = time.time() + timeout_s
     last_payload = None
@@ -439,6 +448,34 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     input_image = prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (96, 64)
+
+
+def test_lingbot_i2v_preserves_input_image_geometry(test_client, mocker: MockerFixture):
+    image_bytes = _make_test_image_bytes((48, 48))
+    test_client.app.state.openai_serving_video._stage_configs = _lingbot_stage_configs()
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A bear playing with yarn.",
+            "width": "96",
+            "height": "64",
+        },
+        files={"input_reference": ("input.png", image_bytes, "image/png")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (48, 48)
 
 
 @pytest.mark.parametrize(
