@@ -169,8 +169,10 @@ DeepSeek Janus requires Janus-specific dependencies and an explicit deploy
 config:
 
 ```bash
-pip install "addict>=2.4.0" "timm>=0.9.16"
+pip install 'vllm-omni[janus-image]'
 ```
+
+If installing from source, use `pip install -e '.[janus-image]'`.
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \

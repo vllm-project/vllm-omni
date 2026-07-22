@@ -18,7 +18,7 @@ Optimisation stack (enforce_eager=False):
   - StaticCache (pre-allocated KV cache, in-place index_copy_)
   - flash_attn (HF flash_attention_2 backend, auto-detected)
   - CUDA graph capture via vLLM CUDAGraphWrapper around the decode forward
-  - Chunked prefill for long prompts (>512 tokens)
+  - Chunked prefill for long prompts (configurable chunk size)
 """
 
 from __future__ import annotations
@@ -187,12 +187,23 @@ def _resolve_janus_geometry(sp: Any, prompt_extra: dict[str, Any]) -> tuple[int,
 
 
 def _resolve_prefill_chunk_size(od_config: OmniDiffusionConfig) -> int:
-    extras = getattr(od_config, "extras", None) or {}
+    extras = getattr(od_config, "extras", None)
+    if extras is None:
+        extras = {}
     if not isinstance(extras, Mapping):
         raise TypeError(f"Janus extras must be a mapping, got {type(extras)!r}")
     extras = dict(extras)
 
-    chunk_size = int(extras.get("max_prefill_chunk_size", 2048))
+    raw_chunk_size = extras.get("max_prefill_chunk_size", 2048)
+    if isinstance(raw_chunk_size, bool):
+        raise ValueError("Janus extras['max_prefill_chunk_size'] must be a positive integer")
+    if isinstance(raw_chunk_size, float) and not raw_chunk_size.is_integer():
+        raise ValueError("Janus extras['max_prefill_chunk_size'] must be a positive integer")
+
+    try:
+        chunk_size = int(raw_chunk_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Janus extras['max_prefill_chunk_size'] must be a positive integer") from exc
     if chunk_size <= 0:
         raise ValueError("Janus extras['max_prefill_chunk_size'] must be a positive integer")
     return chunk_size
@@ -507,8 +518,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             # ---- Prefill (step 0): process full prompt ----
             # Use chunked prefill for long prompts
             if input_len > self._prefill_chunk_size and not self.od_config.enforce_eager:
-                self._chunked_prefill(inputs_embeds, past_kv, input_len)
-                hidden = self._get_last_hidden(inputs_embeds, past_kv, input_len)
+                hidden = self._chunked_prefill(inputs_embeds, past_kv, input_len)
             else:
                 lm_out = self.transformer(
                     inputs_embeds=inputs_embeds,
@@ -583,7 +593,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         inputs_embeds: torch.Tensor,
         past_kv: StaticCache,
         input_len: int,
-    ) -> None:
+    ) -> torch.Tensor:
         """Process long prompts in chunks to avoid OOM and improve throughput.
 
         Each chunk processes a portion of the prompt, updating the KV cache
@@ -594,51 +604,23 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         logger.info(
             "Janus: chunked prefill with %d chunks (prompt_len=%d, chunk_size=%d)", num_chunks, input_len, chunk_size
         )
-        cache_position = None
+        last_hidden: torch.Tensor | None = None
         for chunk_idx in range(num_chunks):
             start = chunk_idx * chunk_size
             end = min(start + chunk_size, input_len)
             chunk_embeds = inputs_embeds[:, start:end, :]
-            if cache_position is None:
-                _ = self.transformer(
-                    inputs_embeds=chunk_embeds,
-                    use_cache=True,
-                    past_key_values=past_kv,
-                    return_dict=True,
-                )
-            else:
-                cache_position = torch.arange(start, end, device=inputs_embeds.device)
-                _ = self.transformer(
-                    inputs_embeds=chunk_embeds,
-                    use_cache=True,
-                    past_key_values=past_kv,
-                    cache_position=cache_position,
-                    return_dict=True,
-                )
-            if chunk_idx == 0:
-                cache_position = torch.arange(0, end, device=inputs_embeds.device)
+            cache_position = torch.arange(start, end, device=inputs_embeds.device)
+            lm_out = self.transformer(
+                inputs_embeds=chunk_embeds,
+                use_cache=True,
+                past_key_values=past_kv,
+                cache_position=cache_position,
+                return_dict=True,
+            )
+            last_hidden = lm_out.last_hidden_state[:, -1, :]
 
-    def _get_last_hidden(
-        self,
-        inputs_embeds: torch.Tensor,
-        past_kv: StaticCache,
-        input_len: int,
-    ) -> torch.Tensor:
-        """Get the last hidden state after prefill, supporting chunked prefill."""
-        # The last hidden state is obtained from the last token position.
-        # For chunked prefill, we need to run one final small forward to get it.
-        # Actually, the chunked prefill already produced the last hidden state;
-        # we store it during chunked prefill.
-        last_pos = torch.tensor([input_len - 1], device=inputs_embeds.device)
-        last_embeds = inputs_embeds[:, -1:, :]
-        lm_out = self.transformer(
-            inputs_embeds=last_embeds,
-            use_cache=True,
-            past_key_values=past_kv,
-            cache_position=last_pos,
-            return_dict=True,
-        )
-        return lm_out.last_hidden_state[:, -1, :]
+        assert last_hidden is not None
+        return last_hidden
 
     def _decode_with_cudagraph(
         self,

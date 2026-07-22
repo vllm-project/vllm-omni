@@ -44,8 +44,10 @@ those configurations are validated.
 Install Janus-specific dependencies:
 
 ```bash
-pip install "addict>=2.4.0" "timm>=0.9.16"
+pip install 'vllm-omni[janus-image]'
 ```
+
+If installing from source, use `pip install -e '.[janus-image]'`.
 
 ```bash
 vllm serve deepseek-ai/Janus-Pro-7B --omni \

@@ -114,6 +114,63 @@ def _payload_images(output) -> list:
     return output.output["payload"]["image"]
 
 
+def test_janus_prefill_chunk_size_defaults_to_2048() -> None:
+    assert pipeline_janus._resolve_prefill_chunk_size(SimpleNamespace()) == 2048
+
+
+def test_janus_prefill_chunk_size_uses_extras() -> None:
+    od_config = SimpleNamespace(extras={"max_prefill_chunk_size": 512})
+
+    assert pipeline_janus._resolve_prefill_chunk_size(od_config) == 512
+
+
+@pytest.mark.parametrize(
+    "extras",
+    [
+        {"max_prefill_chunk_size": 0},
+        {"max_prefill_chunk_size": "invalid"},
+        {"max_prefill_chunk_size": True},
+        {"max_prefill_chunk_size": 1.5},
+    ],
+)
+def test_janus_prefill_chunk_size_rejects_invalid_value(extras) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        pipeline_janus._resolve_prefill_chunk_size(SimpleNamespace(extras=extras))
+
+
+def test_janus_prefill_chunk_size_rejects_non_mapping_extras() -> None:
+    with pytest.raises(TypeError, match="extras must be a mapping"):
+        pipeline_janus._resolve_prefill_chunk_size(SimpleNamespace(extras=[("max_prefill_chunk_size", 512)]))
+
+
+def test_janus_chunked_prefill_returns_last_chunk_hidden() -> None:
+    pipe, _ = _build_pipeline()
+    pipe._prefill_chunk_size = 2
+    calls: list[tuple[int, list[int]]] = []
+
+    class _RecordingTransformer:
+        def __call__(self, *, inputs_embeds, use_cache, past_key_values, cache_position, return_dict):
+            del use_cache, past_key_values, return_dict
+            calls.append((inputs_embeds.shape[1], cache_position.tolist()))
+            hidden = torch.full(
+                (inputs_embeds.shape[0], inputs_embeds.shape[1], inputs_embeds.shape[-1]),
+                float(len(calls)),
+                dtype=inputs_embeds.dtype,
+            )
+            return SimpleNamespace(last_hidden_state=hidden)
+
+    pipe.transformer = _RecordingTransformer()
+
+    hidden = pipe._chunked_prefill(
+        inputs_embeds=torch.zeros((2, 5, 4), dtype=torch.float32),
+        past_kv=object(),
+        input_len=5,
+    )
+
+    assert calls == [(2, [0, 1]), (2, [2, 3]), (1, [4])]
+    assert torch.equal(hidden, torch.full((2, 4), 3.0))
+
+
 def test_janus_pipeline_rejects_prompt_extra_image_geometry_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pipeline_janus, "StaticCache", lambda **kwargs: object())
     pipe, gen_vision_model = _build_pipeline()

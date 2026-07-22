@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Online serving smoke test for DeepSeek Janus text-to-image generation."""
 
-import importlib.util
 import os
 import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError, version
 
 import pytest
+from packaging.version import InvalidVersion, Version
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import (
@@ -25,16 +26,23 @@ MODEL = "deepseek-ai/Janus-1.3B"
 PROMPT = "A scenic mountain lake at sunset"
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
 JANUS_DEPENDENCIES = {
-    "addict": "addict>=2.4.0",
-    "timm": "timm>=0.9.16",
+    "addict": ("addict>=2.4.0", Version("2.4.0")),
+    "timm": ("timm>=0.9.16", Version("0.9.16")),
 }
+
+
+def _dependency_satisfied(package_name: str, min_version: Version) -> bool:
+    try:
+        return Version(version(package_name)) >= min_version
+    except (InvalidVersion, PackageNotFoundError):
+        return False
 
 
 def _ensure_janus_dependencies() -> None:
     missing_packages = [
         package_spec
-        for module_name, package_spec in JANUS_DEPENDENCIES.items()
-        if importlib.util.find_spec(module_name) is None
+        for package_name, (package_spec, min_version) in JANUS_DEPENDENCIES.items()
+        if not _dependency_satisfied(package_name, min_version)
     ]
     if not missing_packages:
         return
