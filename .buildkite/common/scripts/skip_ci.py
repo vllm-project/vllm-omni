@@ -487,6 +487,30 @@ def _finish(decision: CiDecision, message: str) -> CiDecision:
     return finished
 
 
+def _format_yaml_gated_message(buckets: DiffBuckets, decision: CiDecision) -> str:
+    """Human-readable summary of which CI YAML changed and which L2/L3 targets run."""
+    changed_parts: list[str] = []
+    for level_name, by_platform in (("L2", buckets.l2), ("L3", buckets.l3), ("L4/L5", buckets.l45)):
+        files = [path for platform in PLATFORMS for path in by_platform[platform]]
+        if files:
+            changed_parts.append(f"{level_name}=[{', '.join(files)}]")
+
+    run_targets = [
+        f"{platform}/{level}" for platform in PLATFORMS for level in ("l2", "l3") if decision.is_run(platform, level)
+    ]
+    skip_targets = [
+        f"{platform}/{level}"
+        for platform in PLATFORMS
+        for level in ("l2", "l3")
+        if not decision.is_run(platform, level)
+    ]
+
+    changed = "; ".join(changed_parts) if changed_parts else "none"
+    run = ", ".join(run_targets) if run_targets else "none"
+    skip = ", ".join(skip_targets) if skip_targets else "none"
+    return f"ci-yaml-only change — changed: {changed}; run: {run}; skip: {skip}"
+
+
 def resolve_ci_decision(
     changed_files: list[str] | None = None,
     *,
@@ -527,7 +551,7 @@ def resolve_ci_decision(
         SkipL3Basis.from_buckets(buckets),
         SkipL2Basis.from_buckets(buckets),
     )
-    return _finish(decision, "ci-yaml-only change; yaml-gated L2/L3 targeting")
+    return _finish(decision, _format_yaml_gated_message(buckets, decision))
 
 
 def main() -> int:

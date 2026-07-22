@@ -12,6 +12,6 @@ upload_pipeline() {
 }
 
 is_skip_all_ci
-maybe_exit_l23_if_disabled intel l2
+is_skip_l23_ci intel l2
 
 upload_pipeline

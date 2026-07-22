@@ -153,9 +153,9 @@ fi
 # Early exit: unified skip-ci (docs / skip marks) and CI-yaml-only level targeting.
 is_skip_all_ci
 if [[ $BUILDKITE_BRANCH == "main" ]]; then
-    maybe_exit_l23_if_disabled amd l3
+    is_skip_l23_ci amd l3
 else
-    maybe_exit_l23_if_disabled amd l2
+    is_skip_l23_ci amd l2
 fi
 
 patterns=(

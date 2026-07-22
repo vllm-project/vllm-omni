@@ -220,3 +220,11 @@ def test_decision_serializes_to_dict() -> None:
     payload = asdict(decision)
     assert payload["skip_l2_l3"] is True
     assert payload["device"]["skip_cuda"] is False
+
+
+def test_yaml_gated_message_lists_changed_and_targets() -> None:
+    decision = _decision([".buildkite/cuda/test-ready.yml"])
+    assert "changed: L2=[.buildkite/cuda/test-ready.yml]" in decision.message
+    assert "run: cuda/l2" in decision.message
+    assert "skip: cuda/l3" in decision.message
+    assert "amd/l2" in decision.message
