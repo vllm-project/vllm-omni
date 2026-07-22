@@ -1765,6 +1765,7 @@ class TestTTSMethods:
             "_extract_ming_speaker_embeddings_from_ref_audio",
             return_value=[fake_embedding],
         )
+        mock_to_thread = mocker.spy(asyncio, "to_thread")
         mocker.patch.object(
             speech_server,
             "_build_ming_dense_prompt",
@@ -1778,6 +1779,7 @@ class TestTTSMethods:
         second_prepared = asyncio.run(adapter.build(second_req, [], False))
 
         mock_extract.assert_called_once_with([ref_audio_data])
+        mock_to_thread.assert_called_once_with(mock_extract, [ref_audio_data])
         assert first_req.speaker_embedding == pytest.approx(fake_embedding)
         assert second_req.speaker_embedding == pytest.approx(fake_embedding)
         assert first_req.ref_text == "Reference transcript."

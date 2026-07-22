@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ming-TTS (dense) serving adapter."""
 
+import asyncio
 from typing import TYPE_CHECKING
 
 import torch
@@ -69,12 +70,19 @@ class MingTTSAdapter(ARTTSAdapter):
         if isinstance(ref_audio_source, list):
             ref_audio_data = await server._resolve_ref_audio_many(ref_audio_source)
             if request.speaker_embedding is None:
-                request.speaker_embedding = server._extract_ming_speaker_embeddings_from_ref_audio(ref_audio_data)
+                request.speaker_embedding = await asyncio.to_thread(
+                    server._extract_ming_speaker_embeddings_from_ref_audio,
+                    ref_audio_data,
+                )
         elif ref_audio_source is not None and isinstance(ref_audio_source, str):
             wav_list, sr = await server._resolve_ref_audio(ref_audio_source)
             ref_audio_data = (wav_list, sr)
             if request.speaker_embedding is None:
-                request.speaker_embedding = server._extract_ming_speaker_embeddings_from_ref_audio([ref_audio_data])[0]
+                embeddings = await asyncio.to_thread(
+                    server._extract_ming_speaker_embeddings_from_ref_audio,
+                    [ref_audio_data],
+                )
+                request.speaker_embedding = embeddings[0]
         if speaker_cache_key is not None and request.speaker_embedding is not None:
             embedding = torch.as_tensor(request.speaker_embedding, dtype=torch.float32).detach().reshape(-1).cpu()
             server._speaker_cache.put(
