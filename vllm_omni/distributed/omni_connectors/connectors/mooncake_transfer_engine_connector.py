@@ -15,6 +15,7 @@ import msgspec
 import torch
 import zmq
 
+from ..utils.exceptions import MooncakeUnavailableError
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
@@ -99,7 +100,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
     def __init__(self, config: dict[str, Any]):
         if TransferEngine is None:
-            raise ImportError("Mooncake not available")
+            raise MooncakeUnavailableError("Mooncake TransferEngine is not available")
 
         self._closed = False
         self._bind_error: Exception | None = None  # fatal ZMQ bind error from listener thread
@@ -176,12 +177,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.engine_id = str(uuid.uuid4())
 
         # --- Mooncake Engine Init ---
-        self.engine = TransferEngine()
+        try:
+            self.engine = TransferEngine()
+        except Exception as e:
+            raise MooncakeUnavailableError(f"Failed to create Mooncake TransferEngine: {e}") from e
         # Note: For P2P handshake mode, local_hostname should be just the IP address.
         # Mooncake will auto-assign an RPC port, retrievable via get_rpc_port().
         ret = self.engine.initialize(self.host, "P2PHANDSHAKE", self.protocol, self.device_name)
         if ret != 0:
-            raise RuntimeError(f"Mooncake Engine initialization failed with code {ret}")
+            raise MooncakeUnavailableError(f"Mooncake Engine initialization failed with code {ret}")
 
         self.rpc_port = self.engine.get_rpc_port()
         logger.info(f"MooncakeTransferEngineConnector initialized at {self.host}:{self.rpc_port}")
@@ -199,11 +203,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Register the entire pool
             ret = self.engine.register_memory(self.base_ptr, self.pool_size)
             if ret != 0:
-                raise RuntimeError("Failed to register memory pool with Mooncake Engine")
+                raise MooncakeUnavailableError("Failed to register memory pool with Mooncake Engine")
 
         except Exception as e:
             logger.error(f"Failed to allocate/register memory pool: {e}")
-            raise
+            if isinstance(e, MooncakeUnavailableError):
+                raise
+            raise MooncakeUnavailableError(f"Failed to allocate/register Mooncake memory pool: {e}") from e
 
         self.allocator = BufferAllocator(self.pool_size, alignment=4096)  # 4KB alignment for safety
 

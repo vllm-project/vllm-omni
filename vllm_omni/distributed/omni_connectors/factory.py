@@ -10,6 +10,7 @@ from .utils.logging import get_connector_logger
 try:
     from .connectors.base import OmniConnectorBase
     from .utils.config import ConnectorSpec
+    from .utils.exceptions import ConnectorUnavailableError, MooncakeUnavailableError
 except ImportError:
     # Fallback for direct execution
     import sys
@@ -17,6 +18,7 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from omni_connectors.connectors.base import OmniConnectorBase
     from omni_connectors.utils.config import ConnectorSpec
+    from omni_connectors.utils.exceptions import ConnectorUnavailableError, MooncakeUnavailableError
 
 logger = get_connector_logger(__name__)
 
@@ -45,6 +47,8 @@ class OmniConnectorFactory:
             connector = constructor(spec.extra)
             logger.info(f"Created connector: {spec.name}")
             return connector
+        except ConnectorUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Failed to create connector {spec.name}: {e}")
             raise ValueError(f"Failed to create connector {spec.name}: {e}")
@@ -106,11 +110,16 @@ def _create_yuanrong_transfer_engine_connector(config: dict[str, Any]) -> OmniCo
 def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
         from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
-    except ImportError:
+    except ImportError as first_exc:
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
+        try:
+            from omni_connectors.connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
+        except ImportError as exc:
+            raise MooncakeUnavailableError(
+                f"MooncakeTransferEngineConnector dependencies are unavailable: {first_exc}"
+            ) from exc
     return MooncakeTransferEngineConnector(config)
 
 

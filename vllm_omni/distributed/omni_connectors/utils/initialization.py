@@ -4,7 +4,8 @@
 """Utilities for OmniConnector configuration and validation."""
 
 import json
-import sys
+import os
+import socket
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from ..factory import OmniConnectorFactory
 from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
 from .env import expand_env_int
+from .exceptions import MooncakeUnavailableError
 from .local_rank import get_connector_local_rank
 from .logging import get_connector_logger
 
@@ -39,6 +41,70 @@ KV_RANK_PORT_STRIDE = 16
 # comfortably sized block per replica for TP-rank and stage offsets.
 KV_REPLICA_PORT_STRIDE = 1024
 
+_LOCAL_HOST_VALUES = {"", "auto", "localhost", "127.0.0.1", "::1", "0.0.0.0", "::", "*"}
+_TRANSFER_ENGINE_ONLY_EXTRA_KEYS = {
+    "device_name",
+    "from_stage",
+    "host",
+    "memory_pool_device",
+    "memory_pool_size",
+    "protocol",
+    "role",
+    "sender_host",
+    "sender_zmq_port",
+    "to_stage",
+    "zmq_port",
+}
+
+
+def _local_host_values() -> set[str]:
+    values = set(_LOCAL_HOST_VALUES)
+    for name in {socket.gethostname(), socket.getfqdn()}:
+        if name:
+            values.add(name.lower())
+            try:
+                values.update(addr[4][0].lower() for addr in socket.getaddrinfo(name, None))
+            except OSError:
+                pass
+    return values
+
+
+def _is_local_host(value: Any) -> bool:
+    if value is None:
+        return True
+    host = os.path.expandvars(str(value)).strip().lower()
+    if host in _local_host_values():
+        return True
+    try:
+        return all(addr[4][0].lower() in _local_host_values() for addr in socket.getaddrinfo(host, None))
+    except OSError:
+        return False
+
+
+def _can_fallback_to_shm(extra: dict[str, Any]) -> tuple[bool, str | None]:
+    for key in ("host", "sender_host"):
+        value = extra.get(key)
+        if value is not None and not _is_local_host(value):
+            return False, f"{key}={value!r} is not a local host"
+    return True, None
+
+
+def _make_shm_fallback_spec(
+    original: ConnectorSpec,
+    reason: Exception,
+    default_shm_threshold: int,
+) -> ConnectorSpec:
+    original_extra = dict(original.extra) if original.extra else {}
+    extra = {
+        key: value
+        for key, value in original_extra.items()
+        if key not in _TRANSFER_ENGINE_ONLY_EXTRA_KEYS and key in {"device", "shm_threshold_bytes", "stage_id"}
+    }
+    extra.setdefault("shm_threshold_bytes", default_shm_threshold)
+    extra["fallback_from"] = original.name
+    extra["fallback_reason"] = str(reason)
+    return ConnectorSpec(name="SharedMemoryConnector", extra=extra)
+
 
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,
@@ -65,6 +131,7 @@ def initialize_connectors_from_config(
         purpose=purpose,
         caller_stage_id=caller_stage_id,
         is_sender=is_sender,
+        default_shm_threshold=default_shm_threshold,
     )
     return transfer_config, connectors
 
@@ -74,6 +141,7 @@ def create_connectors_from_config(
     purpose: str = "request_forwarding",
     caller_stage_id: int | str | None = None,
     is_sender: bool | None = None,
+    default_shm_threshold: int = 65536,
 ) -> dict[tuple[str, str], OmniConnectorBase]:
     """
     Create connectors from config.
@@ -138,6 +206,27 @@ def create_connectors_from_config(
                 from_stage,
                 to_stage,
                 type(connector).__name__,
+            )
+        except MooncakeUnavailableError as e:
+            if connector_spec.name != "MooncakeTransferEngineConnector":
+                raise RuntimeError(f"Failed to initialize connector for edge {edge_key}: {e}") from e
+            allowed, reject_reason = _can_fallback_to_shm(connector_spec.extra or {})
+            if not allowed:
+                raise RuntimeError(
+                    f"MooncakeTransferEngineConnector unavailable for edge {from_stage}->{to_stage}: {e}. "
+                    f"SharedMemoryConnector fallback is unsafe: {reject_reason}."
+                ) from e
+
+            fallback_spec = _make_shm_fallback_spec(connector_spec, e, default_shm_threshold)
+            connectors_config[edge_key] = fallback_spec
+            connector = OmniConnectorFactory.create_connector(fallback_spec)
+            connectors[edge_key] = connector
+            logger.warning(
+                "MooncakeTransferEngineConnector unavailable for edge %s -> %s; "
+                "falling back to SharedMemoryConnector: %s",
+                from_stage,
+                to_stage,
+                e,
             )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize connector for edge {edge_key}: {e}") from e
@@ -378,10 +467,7 @@ def initialize_orchestrator_connectors(
     Returns:
         A tuple containing the OmniTransferConfig and a dictionary of connectors.
     """
-    if worker_backend == "ray":
-        default_shm_threshold = sys.maxsize
-    else:
-        default_shm_threshold = max(0, shm_threshold_bytes)
+    default_shm_threshold = max(0, shm_threshold_bytes)
     transfer_config, connectors = initialize_connectors_from_config(
         config_path,
         default_shm_threshold=default_shm_threshold,

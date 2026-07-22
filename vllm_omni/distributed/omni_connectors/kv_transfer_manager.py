@@ -20,7 +20,8 @@ from vllm_omni.platforms import current_omni_platform
 from .factory import OmniConnectorFactory
 from .utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec
 from .utils.env import expand_env_int
-from .utils.initialization import KV_RANK_PORT_STRIDE
+from .utils.exceptions import MooncakeUnavailableError
+from .utils.initialization import KV_RANK_PORT_STRIDE, _can_fallback_to_shm, _make_shm_fallback_spec
 from .utils.kv_utils import (
     KVTPTopology,
     build_rank_aware_recv_keys,
@@ -557,6 +558,34 @@ class OmniKVTransferManager:
                         c_extra.get("role", "N/A"),
                     )
                     self._connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=c_type, extra=c_extra))
+                except MooncakeUnavailableError as e:
+                    if c_type != "MooncakeTransferEngineConnector":
+                        logger.exception("Failed to initialize OmniConnector")
+                        self._connector = False
+                        return None
+
+                    allowed, reject_reason = _can_fallback_to_shm(c_extra)
+                    if not allowed:
+                        logger.exception(
+                            "MooncakeTransferEngineConnector unavailable, but SharedMemoryConnector fallback is "
+                            "unsafe: %s",
+                            reject_reason,
+                        )
+                        self._connector = False
+                        return None
+
+                    fallback_spec = _make_shm_fallback_spec(
+                        ConnectorSpec(name=c_type, extra=c_extra),
+                        e,
+                        default_shm_threshold=65536,
+                    )
+                    self.config.connector_config = {"type": fallback_spec.name, **fallback_spec.extra}
+                    logger.warning(
+                        "MooncakeTransferEngineConnector unavailable in KV transfer manager; "
+                        "falling back to SharedMemoryConnector: %s",
+                        e,
+                    )
+                    self._connector = OmniConnectorFactory.create_connector(fallback_spec)
                 except Exception:
                     logger.exception("Failed to initialize OmniConnector")
                     self._connector = False
