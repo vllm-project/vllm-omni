@@ -10,8 +10,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "com
 
 from skip_ci import resolve_ci_decision  # noqa: E402
 from upload_pipeline import (  # noqa: E402
-    BOOTSTRAP_MARKER,
     DOC_SEP,
+    PLACEHOLDER_IMAGE_BUILD_IF,
+    PLACEHOLDER_PREFIX,
+    PLACEHOLDER_UPLOAD_NIGHTLY_IF,
+    PLACEHOLDER_UPLOAD_READY_IF,
+    PLACEHOLDER_UPLOAD_WEEKLY_IF,
     _expand_mirror_hardwares,
     _render_bootstrap_pipeline,
     _render_test_pipeline,
@@ -22,10 +26,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 CUDA_PIPELINE = Path(".buildkite/cuda/pipeline.yml")
 BOOTSTRAP_TEMPLATE = f"""steps: []
 {DOC_SEP}steps:
-  - if: {BOOTSTRAP_MARKER}
-  - if: __UPLOAD_READY_IF__
-  - if: __UPLOAD_NIGHTLY_IF__
-  - if: __UPLOAD_WEEKLY_IF__
+  - if: {PLACEHOLDER_IMAGE_BUILD_IF}
+  - if: {PLACEHOLDER_UPLOAD_READY_IF}
+  - if: {PLACEHOLDER_UPLOAD_NIGHTLY_IF}
+  - if: {PLACEHOLDER_UPLOAD_WEEKLY_IF}
 """
 
 
@@ -36,6 +40,16 @@ def _render(changed_files: list[str]) -> str:
         decision=decision,
         path=CUDA_PIPELINE,
     )
+
+
+def test_bootstrap_placeholders_replaced() -> None:
+    rendered = _render_bootstrap_pipeline(
+        BOOTSTRAP_TEMPLATE,
+        decision=resolve_ci_decision([]),
+        path=Path(".buildkite/npu/pipeline-npu.yml"),
+    )
+    assert PLACEHOLDER_PREFIX not in rendered
+    assert "if: 'true'" in rendered
 
 
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:

@@ -4,7 +4,9 @@
 # label or main NIGHTLY=1); otherwise upload-nightly can be skipped together with test-ready/test-merge.
 # Weekly uploads also depend on image-build.
 
-# Document 2: appended after `---`; same file, read by upload_pipeline.py (not evaluated as a second pipeline by Buildkite). Child uploads include test-ready.yml, test-merge.yml, test-nightly.yml, and test-weekly.yml.
+# Document 2: appended after `---`; ``if`` uses ``vllm-omni:placeholder:*`` sentinels (valid on
+# hook upload, always false until upload_pipeline.py --upload replaces them). Child uploads include
+# test-ready.yml, test-merge.yml, test-nightly.yml, and test-weekly.yml.
 steps:
   - label: ":github: Resolve skip-ci (docs / skip marks) & upload pipeline"
     key: upload-ci-pipeline
@@ -17,7 +19,7 @@ steps:
 steps:
   - label: ":docker: Build image"
     key: image-build
-    if: __IMAGE_BUILD_IF__
+    if: build.message == "vllm-omni:placeholder:image-build"
     commands:
       - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
       - "docker build --progress=plain --file docker/Dockerfile.ci -t vllm-omni-ci ."
@@ -30,7 +32,7 @@ steps:
   - label: "Upload Ready Pipeline"
     depends_on: image-build
     key: upload-ready-pipeline
-    if: __UPLOAD_READY_IF__
+    if: build.message == "vllm-omni:placeholder:upload-ready"
     commands:
       - |
         EXTRA=""
@@ -45,7 +47,7 @@ steps:
   - label: "Upload Merge Pipeline"
     depends_on: image-build
     key: upload-merge-pipeline
-    if: __UPLOAD_MERGE_IF__
+    if: build.message == "vllm-omni:placeholder:upload-merge"
     commands:
       - |
         EXTRA=""
@@ -60,7 +62,7 @@ steps:
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
-    if: __UPLOAD_NIGHTLY_IF__
+    if: build.message == "vllm-omni:placeholder:upload-nightly"
     commands:
       - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-nightly.yml
     agents:
@@ -70,7 +72,7 @@ steps:
   - label: "Upload Weekly Pipeline"
     depends_on: image-build
     key: upload-weekly-pipeline
-    if: __UPLOAD_WEEKLY_IF__
+    if: build.message == "vllm-omni:placeholder:upload-weekly"
     commands:
       - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-weekly.yml
     agents:

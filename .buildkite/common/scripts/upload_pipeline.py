@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Render and optionally upload Buildkite pipeline YAML with diff-aware logic.
 
-Bootstrap mode (pipeline.yml with __IMAGE_BUILD_IF__ placeholders):
+Bootstrap mode (cuda/pipeline.yml, npu/pipeline-npu.yml with ``vllm-omni:placeholder:*`` if sentinels):
   - Detect docs-only, pytest skip-mark-only, or combined skip-ci from git diff.
   - When only CI level YAML changes, enable **L2/L3** upload steps for affected levels only.
 
@@ -38,13 +38,20 @@ from skip_ci import (
 
 LOG = "upload_pipeline"
 DOC_SEP = "\n---\n"
-BOOTSTRAP_MARKER = "__IMAGE_BUILD_IF__"
+# Valid Buildkite ``if`` placeholders (always false on hook upload); replaced by upload_pipeline.py.
+PLACEHOLDER_PREFIX = "vllm-omni:placeholder:"
+PLACEHOLDER_IMAGE_BUILD_IF = f'build.message == "{PLACEHOLDER_PREFIX}image-build"'
+PLACEHOLDER_UPLOAD_READY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-ready"'
+PLACEHOLDER_UPLOAD_MERGE_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-merge"'
+PLACEHOLDER_UPLOAD_NIGHTLY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-nightly"'
+PLACEHOLDER_UPLOAD_WEEKLY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-weekly"'
+BOOTSTRAP_MARKER = PLACEHOLDER_IMAGE_BUILD_IF
 BOOTSTRAP_PLACEHOLDERS = (
-    "__IMAGE_BUILD_IF__",
-    "__UPLOAD_READY_IF__",
-    "__UPLOAD_MERGE_IF__",
-    "__UPLOAD_NIGHTLY_IF__",
-    "__UPLOAD_WEEKLY_IF__",
+    PLACEHOLDER_IMAGE_BUILD_IF,
+    PLACEHOLDER_UPLOAD_READY_IF,
+    PLACEHOLDER_UPLOAD_MERGE_IF,
+    PLACEHOLDER_UPLOAD_NIGHTLY_IF,
+    PLACEHOLDER_UPLOAD_WEEKLY_IF,
 )
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
@@ -74,9 +81,13 @@ def _log(message: str) -> None:
 # --- Bootstrap pipeline (cuda/pipeline.yml, npu/pipeline-npu.yml) ---
 
 
-def _bootstrap_platform(path: Path) -> str:
+def _get_bootstrap_platform(path: Path) -> str:
     parts = path.as_posix().split("/")
     return "npu" if "npu" in parts else "cuda"
+
+
+def _is_bootstrap_pipeline(text: str) -> bool:
+    return PLACEHOLDER_PREFIX in text
 
 
 def _render_bootstrap_pipeline(
@@ -85,8 +96,8 @@ def _render_bootstrap_pipeline(
     decision,
     path: Path,
 ) -> str:
-    """Replace ``__*__IF__`` placeholders from skip-ci decision (document 2 after ``---``)."""
-    platform = _bootstrap_platform(path)
+    """Replace bootstrap ``if`` placeholders from skip-ci decision (document 2 after ``---``)."""
+    platform = _get_bootstrap_platform(path)
 
     def quoted_if(expr: str) -> str:
         return f"'({expr})'"
@@ -162,15 +173,15 @@ def _render_bootstrap_pipeline(
         nightly_if = quoted_if(nightly_label_if)
         weekly_if = quoted_if(weekly_label_if) if platform == "cuda" else disabled
 
-    replacements = {
-        "__IMAGE_BUILD_IF__": image_if,
-        "__UPLOAD_READY_IF__": ready_if,
-        "__UPLOAD_MERGE_IF__": merge_if,
-        "__UPLOAD_NIGHTLY_IF__": nightly_if,
-        "__UPLOAD_WEEKLY_IF__": weekly_if,
-    }
+    replacement_pairs = (
+        (PLACEHOLDER_IMAGE_BUILD_IF, image_if),
+        (PLACEHOLDER_UPLOAD_READY_IF, ready_if),
+        (PLACEHOLDER_UPLOAD_MERGE_IF, merge_if),
+        (PLACEHOLDER_UPLOAD_NIGHTLY_IF, nightly_if),
+        (PLACEHOLDER_UPLOAD_WEEKLY_IF, weekly_if),
+    )
     rendered = continuation
-    for name, value in replacements.items():
+    for name, value in sorted(replacement_pairs, key=lambda item: len(item[0]), reverse=True):
         if name in rendered:
             rendered = rendered.replace(name, value)
     _assert_no_bootstrap_placeholders(rendered, placeholders)
@@ -337,12 +348,12 @@ def _render_pipeline(
     text = path.read_text(encoding="utf-8")
     ctx = resolve_ci_context_from_git()
     decision = ctx.decision
-    if BOOTSTRAP_MARKER in text or force_all or e2e_only:
+    if _is_bootstrap_pipeline(text) or force_all or e2e_only:
         changed_files = None
     else:
         changed_files = ctx.changed_files
 
-    if BOOTSTRAP_MARKER in text:
+    if _is_bootstrap_pipeline(text):
         return _render_bootstrap_pipeline(
             text,
             decision=decision,
