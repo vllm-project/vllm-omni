@@ -45,6 +45,7 @@ EXCLUDED_MODELS = [
     "WanI2VDMD2Pipeline",
     "LongCatImagePipeline",
     "BagelPipeline",
+    "BooguImagePipeline",
     "LancePipeline",
     "MingImagePipeline",
     "InternVLAA1Pipeline",

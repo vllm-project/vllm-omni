@@ -141,6 +141,11 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "BooguImagePipeline": (
+        "boogu_image",
+        "pipeline_boogu_image",
+        "BooguImagePipeline",
+    ),
     "LancePipeline": (
         "lance",
         "pipeline_lance",
@@ -503,6 +508,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
+    "BooguImagePipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
@@ -566,6 +572,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "GlmImagePipeline": "get_glm_image_pre_process_func",
+    "BooguImagePipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
