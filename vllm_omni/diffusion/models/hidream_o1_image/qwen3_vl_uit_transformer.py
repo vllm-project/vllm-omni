@@ -70,7 +70,7 @@ def _load_qwen3_vl_classes() -> dict[str, type]:
     ``_load_qwen3_vl_cls()`` pattern.
     """
     try:
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (  # noqa: PLC0415
             Qwen3VLForConditionalGeneration,
             Qwen3VLModel,
             Qwen3VLPreTrainedModel,
@@ -532,7 +532,7 @@ class HiDreamO1UiTModel(nn.Module):
         model_path = od_config.model if od_config is not None else None
         if model_path is None:
             raise ValueError("HiDreamO1UiTModel requires od_config.model (a HF config/checkpoint path).")
-        from transformers import AutoConfig
+        from transformers import AutoConfig  # noqa: PLC0415
 
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
         self.config = config

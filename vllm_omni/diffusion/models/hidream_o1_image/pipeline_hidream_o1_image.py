@@ -145,7 +145,7 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Supp
             raise ValueError("HiDreamO1ImagePipeline requires od_config.model.")
         local_files_only = os.path.exists(model_path)
 
-        from transformers import AutoProcessor
+        from transformers import AutoProcessor  # noqa: PLC0415
 
         self.processor = AutoProcessor.from_pretrained(model_path, local_files_only=local_files_only)
         self.tokenizer = self.processor.tokenizer if hasattr(self.processor, "tokenizer") else self.processor
