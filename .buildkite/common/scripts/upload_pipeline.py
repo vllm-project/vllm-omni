@@ -13,6 +13,8 @@ Test pipeline mode (e.g. test-merge.yml):
 
 Usage:
   python3 upload_pipeline.py [--upload] [--all | --e2e] <pipeline.yml>
+
+Requires PyYAML (``pip install pyyaml``); installs it automatically when missing.
 """
 
 from __future__ import annotations
@@ -25,7 +27,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "pyyaml"],
+        check=True,
+    )
+    import yaml
+
 from skip_ci import (
     ROOT,
     resolve_ci_context_from_git,
