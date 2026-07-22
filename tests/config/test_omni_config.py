@@ -302,7 +302,6 @@ def test_from_pipeline_config_maps_orchestrator_cli_overrides():
             "omni_dp_size_local": 2,
             "omni_lb_policy": "round_robin",
             "omni_heartbeat_timeout": 9.5,
-            "shm_threshold_bytes": 4096,
             "batch_timeout": 3,
         },
     )
@@ -317,7 +316,6 @@ def test_from_pipeline_config_maps_orchestrator_cli_overrides():
     assert orchestrator_config.omni_dp_size_local == 2
     assert orchestrator_config.omni_lb_policy == "round_robin"
     assert orchestrator_config.omni_heartbeat_timeout == 9.5
-    assert orchestrator_config.shm_threshold_bytes == 4096
     assert orchestrator_config.batch_timeout == 3
 
 

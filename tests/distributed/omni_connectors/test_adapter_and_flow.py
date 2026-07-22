@@ -142,11 +142,10 @@ def test_recv_no_connector():
 def test_shm_connector_flow(mocker: MockerFixture):
     """
     Verify the full flow: Send -> Adapter -> Connector -> Adapter -> Recv.
-    Using real SharedMemoryConnector (inline mode for simplicity).
+    Using real SharedMemoryConnector and key-addressed SHM metadata.
     """
     # 1. Setup Connector
-    config = {"shm_threshold_bytes": 1024, "inline_small_payloads": True}
-    connector = SharedMemoryConnector(config)
+    connector = SharedMemoryConnector({})
     connectors_map = {("0", "1"): connector}
 
     # 2. Setup Data
