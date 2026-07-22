@@ -28,6 +28,9 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 NEGATIVE_PROMPT = "blurry, low quality"
 
+VAE_PP_MEAN_THRESHOLD = 5e-3
+VAE_PP_P99_THRESHOLD = 1e-1
+
 
 def _get_flux2_dev_model() -> str:
     return os.environ.get("VLLM_TEST_FLUX2_DEV_MODEL", "black-forest-labs/FLUX.2-dev")
@@ -144,17 +147,15 @@ def test_flux2_vae_patch_parallel_decode_tp2(tmp_path: Path):
     assert pp2_img.width == width and pp2_img.height == height
 
     mean_abs_diff, p99_abs_diff = _diff_metrics(baseline_img, pp2_img)
-    mean_threshold = 5e-3
-    p99_threshold = 1e-1
     print(
         "FLUX.2-dev VAE patch parallel decode diff (TP=2, pp=1 vs pp=2): "
         f"mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e}; "
-        f"thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e}; "
+        f"thresholds: mean<={VAE_PP_MEAN_THRESHOLD:.6e}, p99<={VAE_PP_P99_THRESHOLD:.6e}; "
         f"pp1_img={baseline_path}, pp2_img={pp2_path}"
     )
-    assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
+    assert mean_abs_diff <= VAE_PP_MEAN_THRESHOLD and p99_abs_diff <= VAE_PP_P99_THRESHOLD, (
         f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e} "
-        f"(thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e})"
+        f"(thresholds: mean<={VAE_PP_MEAN_THRESHOLD:.6e}, p99<={VAE_PP_P99_THRESHOLD:.6e})"
     )
 
 
@@ -197,15 +198,13 @@ def test_flux2_vae_patch_parallel_i2i_tp2(tmp_path: Path):
     pp2_img.save(pp2_path)
 
     mean_abs_diff, p99_abs_diff = _diff_metrics(baseline_img, pp2_img)
-    mean_threshold = 5e-3
-    p99_threshold = 1e-1
     print(
         "FLUX.2-dev VAE patch parallel I2I diff (TP=2, pp=1 vs pp=2): "
         f"mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e}; "
-        f"thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e}; "
+        f"thresholds: mean<={VAE_PP_MEAN_THRESHOLD:.6e}, p99<={VAE_PP_P99_THRESHOLD:.6e}; "
         f"pp1_img={baseline_path}, pp2_img={pp2_path}"
     )
-    assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
+    assert mean_abs_diff <= VAE_PP_MEAN_THRESHOLD and p99_abs_diff <= VAE_PP_P99_THRESHOLD, (
         f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, p99_abs_diff={p99_abs_diff:.6e} "
-        f"(thresholds: mean<={mean_threshold:.6e}, p99<={p99_threshold:.6e})"
+        f"(thresholds: mean<={VAE_PP_MEAN_THRESHOLD:.6e}, p99<={VAE_PP_P99_THRESHOLD:.6e})"
     )
