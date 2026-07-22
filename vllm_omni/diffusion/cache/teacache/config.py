@@ -46,9 +46,6 @@ _MODEL_COEFFICIENTS = {
         7.61309272e-01,
     ],
     # OmniGen2 transformer coefficients
-    # Estimated with the coefficient_estimator recipe: 72 parti-prompts
-    # (strided across all categories) x 50 steps at 1024x1024, CFG disabled,
-    # 3528 rel-L1 pairs, corr(x, y)=0.94, np.polyfit order 4
     "OmniGen2Transformer2DModel": [
         -1.13169970e01,
         1.28097796e01,
