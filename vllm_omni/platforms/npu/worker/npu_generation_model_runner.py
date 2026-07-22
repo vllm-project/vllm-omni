@@ -159,7 +159,8 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                             make_empty_encoder_model_runner_output(scheduler_output)
                         )
 
-                if not num_scheduled_tokens:
+                # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+                if num_scheduled_tokens <= 0:
                     if (
                         self.parallel_config.distributed_executor_backend == "external_launcher"
                         and self.parallel_config.data_parallel_size > 1
