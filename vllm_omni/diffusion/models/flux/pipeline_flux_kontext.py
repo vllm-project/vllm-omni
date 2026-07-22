@@ -645,6 +645,7 @@ class FluxKontextPipeline(
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt > 0
             else num_images_per_prompt
+        )
         true_cfg_scale = (
             req.sampling_params.true_cfg_scale if req.sampling_params.true_cfg_scale is not None else true_cfg_scale
         )
