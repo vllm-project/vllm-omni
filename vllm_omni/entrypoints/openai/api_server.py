@@ -1955,6 +1955,7 @@ async def edit_images(
     negative_prompt: str | None = Form(None),
     num_inference_steps: int | None = Form(None),
     guidance_scale: float | None = Form(None),
+    guidance_scale_2: float | None = Form(None),
     strength: float | None = Form(None),
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
@@ -2120,6 +2121,7 @@ async def edit_images(
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", guidance_scale)
+        _update_if_not_none(gen_params, "guidance_scale_2", guidance_scale_2)
         _update_if_not_none(gen_params, "strength", strength)
         _update_if_not_none(gen_params, "true_cfg_scale", true_cfg_scale)
         # If seed is not provided, generate a random one to ensure
@@ -2185,6 +2187,8 @@ async def edit_images(
                 extra_body["num_inference_steps"] = num_inference_steps
             if guidance_scale is not None:
                 extra_body["guidance_scale"] = guidance_scale
+            if guidance_scale_2 is not None:
+                extra_body["guidance_scale_2"] = guidance_scale_2
             if strength is not None:
                 extra_body["strength"] = strength
             if true_cfg_scale is not None:

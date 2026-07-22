@@ -66,8 +66,6 @@ runtime:
   connectors:
     connector_of_shared_memory:
       name: SharedMemoryConnector
-      extra:
-        shm_threshold_bytes: 65536
 ```
 
 Wire stages to connectors:

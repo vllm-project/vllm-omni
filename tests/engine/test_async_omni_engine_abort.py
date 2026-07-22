@@ -1,6 +1,5 @@
 import asyncio
 import os
-import sys
 from contextlib import ExitStack
 
 import pytest
@@ -67,11 +66,9 @@ async def generate(
 @pytest.mark.asyncio
 async def test_abort():
     with ExitStack() as after:
-        # Avoid SHM IPC in tests to prevent /dev/shm exhaustion and SIGBUS.
         engine = AsyncOmni(
             model=model,
             stage_configs_path=stage_config,
-            shm_threshold_bytes=sys.maxsize,
         )
         after.callback(engine.shutdown)
 

@@ -649,6 +649,10 @@ steps:
             tests/e2e/online_serving/test_qwen_image_expansion.py
             tests/e2e/online_serving/test_qwen_image_edit_expansion.py
             tests/e2e/online_serving/test_qwen_image_layered_expansion.py
+            tests/e2e/online_serving/test_boogu_image.py
+            tests/e2e/online_serving/test_boogu_image_edit.py
+            tests/e2e/online_serving/test_boogu_image_expansion.py
+            tests/e2e/online_serving/test_boogu_image_edit_expansion.py
             tests/e2e/online_serving/test_bagel_expansion.py
             tests/e2e/online_serving/test_krea2_expansion.py
             tests/e2e/offline_inference/test_krea2_expansion.py
@@ -1298,6 +1302,44 @@ steps:
                     resources:
                       limits:
                         nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      - label: ":full_moon: Diffusion X2V · LingBot Video MoE Function Test"
+        timeout_in_minutes: 90
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_lingbot_video_moe.py -m "full_model and cuda" --run-level "full_model"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
                     volumeMounts:
                       - name: devshm
                         mountPath: /dev/shm
