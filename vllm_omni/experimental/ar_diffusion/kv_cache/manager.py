@@ -447,6 +447,21 @@ class ARDiffusionKVCache:
         base = self.managed_num_blocks + branch_offset + start
         return list(range(base, base + count))
 
+    @property
+    def num_free_blocks(self) -> int:
+        """Managed blocks currently free in the pool."""
+        return self.manager.block_pool.get_num_free_blocks()
+
+    @property
+    def blocks_per_session(self) -> int:
+        """Managed blocks one session's rollout can hold on this rank.
+
+        Mirrors the pool floor in ``__init__`` (resident window + in-flight chunk
+        per local branch), so callers can tell whether admitting another session
+        can be served rather than discovering it mid-forward.
+        """
+        return self.local_branches * (self.config.window_chunks + self.num_frame_per_block)
+
     def key_cache(self, layer_idx: int) -> torch.Tensor:
         return self._kv_pools[layer_idx][0]
 

@@ -76,6 +76,25 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # by the ar_diffusion_perf_stats worker RPC for the perf-compare summary.
         self._perf_e2e_times: list[float] = []
 
+    def end_session(self, session_id: str) -> bool:
+        """Release a finished session's KV pool blocks.
+
+        Sessions are otherwise dropped only by eviction, which reclaims them once
+        the pool is under pressure rather than when they actually end. The serving
+        layer knows the real end of life — a client disconnecting, switching
+        session id, or sending `reset` — and calls this out of band so the blocks
+        go back immediately. Returns whether a session was live under this id.
+        """
+        state = self._ar_diffusion_states.pop(session_id, None)
+        states = getattr(self.pipeline, "_states", None)
+        if states is not None:
+            states.pop(session_id, None)
+        if state is None:
+            return False
+        state.close()
+        logger.debug("AR-Diffusion ended session=%s; freed pool blocks", session_id)
+        return True
+
     def build_kv_cache(
         self,
         *,
@@ -247,6 +266,24 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         session_id = str(extra_args.get("session_id") or "default")
         state = self._ar_diffusion_states.get(session_id)
         if state is None:
+            # Make room before admitting the session. Sessions are only dropped by
+            # the count cap below, but a session's blocks are released solely by
+            # eviction: the OpenPI connection has no way to tell the worker that a
+            # client disconnected, so an ended session keeps its blocks until it is
+            # evicted. The pool holds far fewer than `_max_ar_diffusion_states`
+            # sessions (its floor is one session's window), so the count cap is
+            # unreachable and session-id churn exhausts the pool — permanently,
+            # since every later request then fails to allocate. Evict by capacity
+            # too, so the bound the count cap was meant to provide actually holds.
+            while self._ar_diffusion_states and kv.num_free_blocks < kv.blocks_per_session:
+                old_id, old_state = self._ar_diffusion_states.popitem(last=False)
+                old_state.close()
+                logger.debug(
+                    "AR-Diffusion evicted session=%s (pool capacity); free=%d needs=%d",
+                    old_id,
+                    kv.num_free_blocks,
+                    kv.blocks_per_session,
+                )
             pos = kv.begin_request(f"bde__{session_id}")
             neg = kv.begin_request(f"bde__{session_id}__neg")
             state = ARDiffusionKVState(kv, pos, neg, num_layers=kv.num_layers)

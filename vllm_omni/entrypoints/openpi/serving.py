@@ -119,6 +119,19 @@ class ServingRealtimeRobotOpenPI:
     def reset(self, obs: dict) -> None:
         """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
 
+    async def end_session(self, session_id: str) -> None:
+        """Release the engine-side state a finished session still owns.
+
+        Best effort: cleanup runs on paths that are already ending (disconnect,
+        session switch, `reset`), so a failure here must not surface to the client
+        or break the connection loop. Engines that keep no session state answer
+        False and the call is a no-op.
+        """
+        try:
+            await self.engine_client.collective_rpc("ar_diffusion_end_session", args=(session_id,))
+        except Exception:
+            logger.debug("Failed to release robot session %s", session_id, exc_info=True)
+
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
         # Build request, run inference through AsyncOmni

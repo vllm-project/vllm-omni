@@ -391,6 +391,17 @@ class DiffusionWorker:
         """Generate output for the given requests."""
         return self.execute_model(request, self.od_config)
 
+    def ar_diffusion_end_session(self, session_id: str) -> bool:
+        """Release a finished robot session's session-scoped KV state (worker RPC).
+
+        A no-op for runners that keep no per-session state, so the serving layer can
+        call it unconditionally without knowing which pipeline is loaded.
+        """
+        end_session = getattr(self.model_runner, "end_session", None)
+        if not callable(end_session):
+            return False
+        return bool(end_session(session_id))
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling for this GPU worker.
 

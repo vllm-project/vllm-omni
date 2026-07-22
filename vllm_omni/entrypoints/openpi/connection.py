@@ -220,8 +220,11 @@ class RobotRealtimeConnection:
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
+                        ended = self._current_session_id
                         self.reset()
                         self.serving.reset(obs)
+                        if ended is not None:
+                            await self.serving.end_session(ended)
                         await self.websocket.send_bytes(_pack({"status": "reset successful"}))
                     else:
                         session_id = str(obs.get("session_id") or self._current_session_id or "default")
@@ -232,6 +235,11 @@ class RobotRealtimeConnection:
                                     self._current_session_id,
                                     session_id,
                                 )
+                                # A client that rolls its session id without
+                                # reconnecting (the DROID eval loop does this per
+                                # episode) would otherwise strand the old
+                                # session's state for the life of the connection.
+                                await self.serving.end_session(self._current_session_id)
                             self._current_session_id = session_id
                             self._call_count = 0
 
@@ -253,3 +261,10 @@ class RobotRealtimeConnection:
             pass
         except Exception:
             logger.exception("Connection error")
+        finally:
+            # Last resort: the connection is gone, so whatever session it left
+            # behind has no owner. Eviction would reclaim it eventually, but only
+            # once the pool is already under pressure.
+            if self._current_session_id is not None:
+                ended, self._current_session_id = self._current_session_id, None
+                await self.serving.end_session(ended)
