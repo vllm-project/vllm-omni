@@ -1,0 +1,40 @@
+# LongCat-Next deploy: thinker only (multimodal understanding + text
+# generation), 4x GPU with tensor parallelism.
+#
+# Requires 4x40GB-class GPUs minimum. bf16 weights are ~148 GB total; fp8
+# quantization drops the MoE experts (the dominant weight mass) to ~34 GB,
+# which is what makes TP=4 fit on 40 GB GPUs. On 80GB-class GPUs, quantization
+# can be dropped for full bf16 precision.
+pipeline: longcat_next_thinker_only
+async_chunk: false
+
+trust_remote_code: true
+distributed_executor_backend: mp
+enable_prefix_caching: false
+quantization: fp8
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    tensor_parallel_size: 4
+    devices: "0,1,2,3"
+    trust_remote_code: true
+    enforce_eager: true
+    # Tuned for 40 GB GPUs: gpu_memory_utilization must leave enough headroom
+    # above the ~33 GB of resident weights + encoders for activations and KV
+    # cache; max_num_batched_tokens caps the multimodal profiling batch size
+    # (must stay >= one image's token budget, 4096); max_model_len caps KV
+    # cache reservation (default 131072 requires far more KV memory than fits
+    # here). Raise gpu_memory_utilization/max_model_len on 80GB-class GPUs.
+    gpu_memory_utilization: 0.92
+    max_num_batched_tokens: 4608
+    max_model_len: 16384
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      max_tokens: 2048
+      repetition_penalty: 1.05
+      detokenize: true
+      ignore_eos: false
+
+platforms: {}

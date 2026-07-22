@@ -365,6 +365,22 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    # LongCat-Next
+    "LongcatNextForCausalLM": (
+        "longcat_next",
+        "modeling_longcat_next",
+        "LongcatNextForCausalLM",
+    ),
+    "LongcatNextImageDecoder": (
+        "longcat_next",
+        "modeling_longcat_next_image_decoder",
+        "LongcatNextImageDecoder",
+    ),
+    "LongcatNextAudioDecoder": (
+        "longcat_next",
+        "modeling_longcat_next_audio_decoder",
+        "LongcatNextAudioDecoder",
+    ),
 }
 
 
