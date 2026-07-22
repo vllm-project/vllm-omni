@@ -529,7 +529,8 @@ class ARDiffusionKVCache:
             raise RuntimeError(
                 "AR-Diffusion paged attention scratch blocks exhausted: "
                 f"need [{start}, {start + count}) of {self.scratch_blocks_per_kv_branch}. "
-                "Increase AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH."
+                "Declare max_scratch_tokens_per_branch in the pipeline capability "
+                "or increase AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH."
             )
         kv_branch_offset = self.scratch_blocks_per_kv_branch * self._kv_branch_index(kv_branch)
         base = self.managed_num_blocks + kv_branch_offset + start
