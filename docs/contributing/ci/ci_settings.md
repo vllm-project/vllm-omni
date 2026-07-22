@@ -197,7 +197,7 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 
 #### Bootstrap skip {#bootstrap-skip}
 
-- **Docs / skip-mark only** → skip the entire default CI upload (`skip_ci.py check-skip-all`).
+- **Docs / skip-mark only** → suppress default CI (`skip_all`). PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. Exception: on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4 plus L2/L3 (with `--e2e`); `WEEKLY=1` still builds the image and uploads L5.
 - **CI-YAML only** → skip uploading L2 or L3 for platforms whose whitelisted files were not touched. Register paths in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES`. Bootstrap `bootstrap-upload-steps.yml` steps get label/diff-aware `if` expressions injected by `upload_pipeline.py --upload` (by step `key`: `image-build`, `upload-ready-pipeline`, etc.).
 
 #### Step filtering {#step-filtering}

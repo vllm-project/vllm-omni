@@ -102,7 +102,7 @@ def _format_bootstrap_if(expr: str) -> str | bool:
     return f"({expr})"
 
 
-def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
+def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str | bool]:
     disabled = "false"
     nightly_main = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
     nightly_only = NPU_NIGHTLY_ONLY if platform == "npu" else CUDA_NIGHTLY_ONLY
@@ -138,13 +138,16 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         merge_base = f"({nightly_main}) || (({merge_main}) || ({merge_pr}))"
 
     ready_base = f"({nightly_main}) || ({ready_pr})"
+    weekly_main = 'build.branch == "main" && build.env("WEEKLY") == "1"'
 
     if decision.skip_all:
-        image_expr = nightly_only
+        # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
+        # NIGHTLY=1 still runs L4 + L2/L3 (--e2e); WEEKLY=1 still runs L5.
+        image_expr = f"({nightly_main}) || ({weekly_main})" if platform == "cuda" else nightly_main
         ready_expr = nightly_main
         merge_expr = nightly_main if platform == "cuda" else disabled
-        nightly_expr = nightly_label_if
-        weekly_expr = disabled
+        nightly_expr = nightly_main
+        weekly_expr = weekly_main if platform == "cuda" else disabled
     elif decision.skip_l2_l3:
         l2_enabled = decision.is_run("npu", "l2") if platform == "npu" else decision.is_run("cuda", "l2")
         l3_enabled = platform == "cuda" and decision.is_run("cuda", "l3")
@@ -178,19 +181,29 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     }
 
 
-def _apply_bootstrap_if(steps: list[Any], if_exprs: dict[str, str]) -> None:
+def _apply_bootstrap_if(steps: list[Any], if_exprs: dict[str, str | bool]) -> list[Any]:
+    """Inject ``if`` by step key; drop steps that are unconditionally disabled (``if: false``)."""
+    kept: list[Any] = []
     for step in steps:
         if not isinstance(step, dict):
+            kept.append(step)
             continue
         nested = step.get("steps")
         if isinstance(nested, list):
-            _apply_bootstrap_if(nested, if_exprs)
+            nested_kept = _apply_bootstrap_if(nested, if_exprs)
+            if nested_kept:
+                kept.append({**step, "steps": nested_kept})
             continue
         key = step.get("key")
         if key in BOOTSTRAP_IMAGE_BUILD_KEYS:
             step["if"] = if_exprs["image"]
         elif key in BOOTSTRAP_UPLOAD_IF_KEYS:
             step["if"] = if_exprs[BOOTSTRAP_UPLOAD_IF_KEYS[key]]
+        if step.get("if") is False:
+            _log(f"omit disabled bootstrap step {key!r}")
+            continue
+        kept.append(step)
+    return kept
 
 
 def _render_bootstrap_pipeline(
@@ -209,7 +222,7 @@ def _render_bootstrap_pipeline(
 
     platform = _get_bootstrap_platform(path)
     if_exprs = _compute_bootstrap_if_exprs(decision=decision, platform=platform)
-    _apply_bootstrap_if(steps, if_exprs)
+    doc["steps"] = _apply_bootstrap_if(steps, if_exprs)
     return yaml.safe_dump(doc, sort_keys=False)
 
 

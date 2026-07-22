@@ -22,6 +22,7 @@ CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
   - key: upload-ready-pipeline
+  - key: upload-merge-pipeline
   - key: upload-nightly-pipeline
   - key: upload-weekly-pipeline
 """
@@ -53,12 +54,33 @@ def test_bootstrap_steps_loaded_from_file() -> None:
     assert "placeholder:" not in steps
 
 
+def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
+    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 still gates scheduled CI."""
+    rendered = _render(["docs/foo.md"])
+    assert "key: image-build" in rendered
+    assert "key: upload-nightly-pipeline" in rendered
+    assert "key: upload-weekly-pipeline" in rendered
+    # Scheduled nightly also uploads L2/L3 with --e2e
+    assert "key: upload-ready-pipeline" in rendered
+    assert "key: upload-merge-pipeline" in rendered
+    assert 'build.env("NIGHTLY") == "1"' in rendered
+    assert 'build.env("WEEKLY") == "1"' in rendered
+    assert "nightly-test" not in rendered
+    assert "weekly-test" not in rendered
+    assert "merge-test" not in rendered
+    assert 'labels includes "ready"' not in rendered
+    assert "if: false" not in rendered
+
+
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
     rendered = _render([".buildkite/cuda/test-nightly.yml"])
     assert "if: true" not in rendered
     assert 'build.pull_request.labels includes "nightly-test"' in rendered
     assert 'build.pull_request.labels includes "weekly-test"' in rendered
-    assert "if: false" in rendered
+    # L2/L3 upload steps are unconditionally disabled → omitted from pipeline
+    assert "key: upload-ready-pipeline" not in rendered
+    assert "key: upload-merge-pipeline" not in rendered
+    assert "key: upload-weekly-pipeline" in rendered
 
 
 def test_yaml_gated_l2_still_enables_image_via_ready_base() -> None:
