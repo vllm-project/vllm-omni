@@ -1,4 +1,4 @@
-﻿# FP8 Quantization
+# FP8 Quantization
 
 ## Overview
 
@@ -84,6 +84,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 
 | Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` | Text-Encoder quantization |
 |-------|-----------|:-------:|:------:|----------------|------------------|------------------|
+| Stable Diffusion 3.5 | `stabilityai/stable-diffusion-3.5-medium` | Yes | Not validated | Transformer-focused online FP8; validate image quality against BF16 before expanding to larger checkpoints | None | |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | All layers | None | ✅︎ |
