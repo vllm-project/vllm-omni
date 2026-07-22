@@ -28,7 +28,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 NEGATIVE_PROMPT = "blurry, low quality"
 
-VAE_PP_MEAN_THRESHOLD = 5e-3
+VAE_PP_MEAN_THRESHOLD = 2e-3
 VAE_PP_P99_THRESHOLD = 1e-1
 
 
