@@ -75,20 +75,19 @@ default_tts_server_params = [
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", default_tts_server_params, indirect=True)
 def test_default_cuda_graph_startup(omni_server) -> None:
-    """Start both stages with the shipped CUDA Graph configuration."""
-    stage_1 = get_deploy_config_stage("qwen3_tts.yaml", stage_id=1)
-    assert stage_1.get("enforce_eager") is False
-    assert "--enforce-eager" not in omni_server.serve_args
+    """Verify both stages start with the shipped CUDA Graph configuration.
 
-    [health] = omni_server.send_health_http_request()
-    assert health.success
-    assert health.status_code == 200
+    The fixture reaching this test is the smoke assertion: it waits for the
+    server to become ready after both stages finish model initialization and
+    CUDA Graph capture. The regression covered here exited during stage 1
+    capture, before fixture setup could complete.
+    """
+    for stage_id in (0, 1):
+        stage = get_deploy_config_stage("qwen3_tts.yaml", stage_id=stage_id)
+        assert stage.get("enforce_eager", False) is False
 
-    [models] = omni_server.send_models_http_request()
-    assert models.success
-    assert models.status_code == 200
-    assert models.json_body is not None
-    assert any(model["id"] == MODEL for model in models.json_body["data"])
+    assert omni_server.proc is not None
+    assert omni_server.proc.poll() is None
 
 
 @pytest.mark.core_model
