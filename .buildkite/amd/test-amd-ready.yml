@@ -16,6 +16,7 @@ steps:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
+        # debug for test
         - "timeout 40m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
 
     - label: "Simple · Other Test"
