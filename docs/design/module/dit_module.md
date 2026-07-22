@@ -267,7 +267,7 @@ class WorkerProc:
             self.result_mq = MessageQueue(n_reader=1, ...)
 
         # Initialize GPU worker
-        self.worker = GPUWorker(local_rank=gpu_id, rank=gpu_id, od_config=od_config)
+        self.worker = self._create_worker(gpu_id, od_config, ...)
 ```
 
 **Initialization Steps**:
@@ -289,13 +289,18 @@ class WorkerProc:
 #### 3.2 GPU Worker
 
 ```python
-class GPUWorker:
-    def init_device_and_model(self):
+class DiffusionWorker:
+    def init_device(self):
         # Set distributed environment variables
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Initialize PyTorch distributed
+        # Select the device and initialize distributed execution
+        self.device = current_omni_platform.get_torch_device(rank)
+        current_omni_platform.set_device(self.device)
+        self.vllm_config = _create_diffusion_worker_vllm_config(
+            self.device, self.od_config
+        )
         init_distributed_environment(world_size, rank)
         parallel_config = self.od_config.parallel_config
         initialize_model_parallel(
@@ -306,16 +311,18 @@ class GPUWorker:
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
         )
 
-        # Load model
-        model_loader = DiffusersPipelineLoader(load_config, self.od_config)
-        self.pipeline = model_loader.load_model(load_device=f"cuda:{rank}")
+    def load_model(self, load_format="default", custom_pipeline_name=None):
+        self.model_runner.load_model(
+            load_format=load_format,
+            custom_pipeline_name=custom_pipeline_name,
+        )
 
-        # Setup cache backend
-        from vllm_omni.diffusion.cache.selector import get_cache_backend
-        self.cache_backend = get_cache_backend(od_config.cache_backend, od_config.cache_config)
-
-        if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
+    def init_lora_manager(self):
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.model_runner.pipeline,
+            device=self.device,
+            dtype=self.od_config.dtype,
+        )
 ```
 
 **Key Features**:
@@ -329,17 +336,17 @@ class GPUWorker:
 #### 3.3 Worker Busy Loop
 
 ```python
-def worker_busy_loop(self):
+def _worker_busy_loop(self):
     while self._running:
         # 1. Receive unified message (generation request, RPC request, or shutdown)
-        msg = self.recv_message()
+        msg = self.mq.dequeue(timeout=1.0)
 
         # 2. Route message based on type
         if isinstance(msg, dict) and msg.get("type") == "rpc":
             # Handle RPC request
-            result, should_reply = self.execute_rpc(msg)
+            result, should_reply = self._execute_rpc(msg)
             if should_reply:
-                self.return_result(result)
+                self._return_result(result)
 
         elif isinstance(msg, dict) and msg.get("type") == "shutdown":
             # Handle shutdown message
@@ -348,7 +355,7 @@ def worker_busy_loop(self):
         else:
             # Handle generation request (OmniDiffusionRequest list)
             output = self.worker.execute_model(msg, self.od_config)
-            self.return_result(output)
+            self._return_result(output)
 ```
 
 **Execution Flow**:
@@ -920,8 +927,8 @@ def initialize_model_parallel(
            └─> DiffusionEngine submits scheduled request to executor.add_req(req)
 
 4. Worker Execution
-   └─> WorkerProc.worker_busy_loop()
-       └─> GPUWorker.execute_model(reqs)
+   └─> WorkerProc._worker_busy_loop()
+       └─> DiffusionWorker.execute_model(req)
            └─> Pipeline.forward(req)
                ├─> encode_prompt()
                ├─> prepare_latents()
