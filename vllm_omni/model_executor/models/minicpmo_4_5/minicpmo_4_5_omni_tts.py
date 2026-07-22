@@ -91,6 +91,29 @@ def _install_torchaudio_soundfile_shim() -> None:
 _install_torchaudio_soundfile_shim()
 
 
+def _resolve_model_path(model_path: str) -> str:
+    """Resolve a Hugging Face model ID to a local cache path.
+
+    If ``model_path`` is already a local directory, return it as-is.
+    Otherwise, use huggingface_hub to resolve the model ID to the cached
+    snapshot directory. This is necessary because downstream code treats
+    ``model_path`` as a filesystem path (e.g. joining with ``assets/...``).
+    """
+    if os.path.isdir(model_path):
+        return model_path
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(model_path, local_files_only=True)
+    except Exception:
+        logger.warning(
+            "Could not resolve model path %s to local HF cache; "
+            "using as-is (sub-assets may fail to load).",
+            model_path,
+        )
+        return model_path
+
+
 class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """MiniCPM-o 4.5 Talker: MiniCPMTTS + Token2wav in a single forward pass."""
 
@@ -121,7 +144,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if self._assets_loaded or self._tts_config is None:
             return
         try:
-            model_path = self.vllm_config.model_config.model
+            model_path = _resolve_model_path(self.vllm_config.model_config.model)
+
 
             if model_path not in sys.path:
                 sys.path.insert(0, model_path)
@@ -279,7 +303,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         import torchaudio
 
-        model_path = self.vllm_config.model_config.model
+        model_path = _resolve_model_path(self.vllm_config.model_config.model)
         default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
         prompt_wav_path = default_ref if os.path.exists(default_ref) else None
 
