@@ -89,13 +89,10 @@ class OmniSchedulingCoordinator:
     transitions accordingly.
     """
 
-    def __init__(self, scheduler_max_num_seqs: int, stage_id: int = 0, async_chunk: bool = False):
+    def __init__(self, stage_id: int = 0):
         self._stage_id = stage_id
-        self._scheduler_max_num_seqs = scheduler_max_num_seqs
-        self._async_chunk = async_chunk
 
         self.finished_requests: set[str] = set()
-        self.requests_with_ready_chunks: set[str] = set()
         self._full_payload_input_received: set[str] = set()
 
         # Requests waiting for full_payload stage input (WAITING_FOR_INPUT).
@@ -118,12 +115,11 @@ class OmniSchedulingCoordinator:
     def process_pending_full_payload_inputs(
         self,
         waiting_queue: Any,
-        running_queue: list[Request],
         stage_recv_req_ids: set[str],
     ) -> None:
         """Manage WAITING_FOR_INPUT lifecycle for full_payload_mode.
 
-        For non-Stage-0 stages in full_payload_mode (``async_chunk=False``):
+        For non-Stage-0 stages in full_payload mode:
         1. Fresh WAITING requests are transitioned to WAITING_FOR_INPUT
            and registered for bg-thread polling.
         2. WAITING_FOR_INPUT requests whose data has arrived (in
@@ -133,7 +129,7 @@ class OmniSchedulingCoordinator:
             return
 
         self._full_payload_input_received.update(stage_recv_req_ids)
-        if not self._async_chunk and stage_recv_req_ids:
+        if stage_recv_req_ids:
             self.finished_requests.update(stage_recv_req_ids)
             logger.debug(
                 "[Coordinator stage-%s] full_payload recv -> finished_requests: %s",
@@ -152,19 +148,29 @@ class OmniSchedulingCoordinator:
                 remaining.append(request)
         self._waiting_for_input = remaining
 
-        if not self._async_chunk:
-            to_remove: list[Any] = []
-            queue_snapshot = list(waiting_queue)
-            for request in queue_snapshot:
-                if request.status == RequestStatus.WAITING:
-                    if request.request_id in self._full_payload_input_received:
-                        continue
-                    if request.request_id in self.requests_with_ready_chunks:
-                        continue
-                    if request.request_id in self.finished_requests:
-                        continue
-                    request.status = RequestStatus.WAITING_FOR_INPUT
-                    self._waiting_since.setdefault(request.request_id, time.monotonic())
+        to_remove: list[Any] = []
+        queue_snapshot = list(waiting_queue)
+        for request in queue_snapshot:
+            if request.status == RequestStatus.WAITING:
+                if request.request_id in self._full_payload_input_received:
+                    continue
+                if request.request_id in self.finished_requests:
+                    continue
+                request.status = RequestStatus.WAITING_FOR_INPUT
+                self._waiting_since.setdefault(request.request_id, time.monotonic())
+                to_remove.append(request)
+                self._waiting_for_input.append(request)
+                self.pending_input_registrations.append(
+                    OmniChunkRecvHandle(
+                        request_id=request.request_id,
+                        external_req_id=getattr(request, "external_req_id", None),
+                    )
+                )
+            elif request.status == RequestStatus.WAITING_FOR_INPUT:
+                if request.request_id in stage_recv_req_ids:
+                    request.status = RequestStatus.WAITING
+                    self._waiting_since.pop(request.request_id, None)
+                else:
                     to_remove.append(request)
                     self._waiting_for_input.append(request)
                     self.pending_input_registrations.append(
@@ -173,29 +179,15 @@ class OmniSchedulingCoordinator:
                             external_req_id=getattr(request, "external_req_id", None),
                         )
                     )
-                elif request.status == RequestStatus.WAITING_FOR_INPUT:
-                    if request.request_id in stage_recv_req_ids:
-                        request.status = RequestStatus.WAITING
-                        self._waiting_since.pop(request.request_id, None)
-                    else:
-                        to_remove.append(request)
-                        self._waiting_for_input.append(request)
-                        self.pending_input_registrations.append(
-                            OmniChunkRecvHandle(
-                                request_id=request.request_id,
-                                external_req_id=getattr(request, "external_req_id", None),
-                            )
-                        )
-            if to_remove:
-                # Use the bulk-remove helper: one O(N) sweep instead of N
-                # repeated O(N) removes from a list-backed queue.
-                waiting_queue.remove_requests(to_remove)
+        if to_remove:
+            # Use the bulk-remove helper: one O(N) sweep instead of N
+            # repeated O(N) removes from a list-backed queue.
+            waiting_queue.remove_requests(to_remove)
 
     def free_finished_request(self, request_id: str) -> None:
         """Prune internal tracking sets for a freed request to prevent unbounded growth."""
         self._full_payload_input_received.discard(request_id)
         self.finished_requests.discard(request_id)
-        self.requests_with_ready_chunks.discard(request_id)
         self._waiting_since.pop(request_id, None)
 
     def collect_timed_out_request_ids(
@@ -236,7 +228,7 @@ class OmniSchedulingCoordinator:
         for req_id in timed_out_ids:
             self._waiting_since.pop(req_id, None)
             logger.warning(
-                "[Coordinator stage-%s] Request %s timed out waiting for chunk/input (waited > %.0fs)",
+                "[Coordinator stage-%s] Request %s timed out waiting for input (waited > %.0fs)",
                 self._stage_id,
                 req_id,
                 timeout_s,
@@ -247,14 +239,8 @@ class OmniSchedulingCoordinator:
     def restore_queues(
         self,
         waiting_queue: Any,
-        running_queue: list[Request],
     ) -> None:
-        """Return waiting-for-input requests to the waiting queue.
-
-        ``running_queue`` is unused: chunk waiting restore lives on
-        OmniChunkTransferAdapter.
-        """
-        _ = running_queue
+        """Return waiting-for-input requests to the waiting queue."""
         for request in self._waiting_for_input:
             waiting_queue.add_request(request)
         self._waiting_for_input = deque()
@@ -339,12 +325,6 @@ class OmniSchedulingCoordinator:
 
             if model_mode != "ar":
                 new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
-                runtime_seed = None
-                if "left_context_size" in metadata:
-                    runtime_seed = {
-                        "meta": {"left_context_size": metadata["left_context_size"]},
-                    }
-                request._omni_initial_model_buffer = runtime_seed
                 if new_ids:
                     request.prompt_token_ids = new_ids
                     request.num_prompt_tokens = len(new_ids)

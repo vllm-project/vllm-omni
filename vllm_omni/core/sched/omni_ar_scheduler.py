@@ -75,9 +75,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.input_coordinator: OmniSchedulingCoordinator | None = None
         if uses_full_payload_input_coordinator(model_config):
             self.input_coordinator = OmniSchedulingCoordinator(
-                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
-                async_chunk=False,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
@@ -235,7 +233,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     scheduler_requests=self.requests,
                 )
             if self.input_coordinator:
-                self.input_coordinator.restore_queues(self.waiting, self.running)
+                self.input_coordinator.restore_queues(self.waiting)
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData

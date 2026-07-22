@@ -190,12 +190,12 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
             )
 
 
-class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
+class TestCoordinatorUpdateRequestMetadata(unittest.TestCase):
     """Test update_request_metadata applies scheduling metadata to requests."""
 
     def test_ar_mode_no_longer_sets_additional_information(self):
         """AR mode only processes scheduling metadata, not full payloads."""
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1")
         requests = {"r1": req}
@@ -212,7 +212,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertIsNone(getattr(req, "additional_information", None))
 
     def test_generation_mode(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1")
         req.prompt_token_ids = [0, 0, 0]
@@ -225,7 +225,6 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         request_metadata = {
             "r1": {
                 "code_predictor_codes": [10, 20, 30],
-                "left_context_size": 25,
             }
         }
 
@@ -237,10 +236,9 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req._all_token_ids, [10, 20, 30])
         self.assertEqual(req._output_token_ids, [])
         self.assertIsNone(req.additional_information)
-        self.assertEqual(req._omni_initial_model_buffer, {"meta": {"left_context_size": 25}})
 
     def test_generation_mode_flattens_tensor_code_predictor_codes(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1")
         req.prompt_token_ids = [9]
@@ -261,7 +259,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req._output_token_ids, [])
 
     def test_generation_mode_flattens_nested_code_predictor_codes(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1")
         req.prompt_token_ids = [9]
@@ -286,30 +284,26 @@ class TestWaitingForInputTransition(unittest.TestCase):
     """Test process_pending_full_payload_inputs transitions WAITING_FOR_INPUT."""
 
     def test_transition_on_recv(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
         waiting = MockQueue([req])
-        running: list = []
 
         coord.process_pending_full_payload_inputs(
             waiting,
-            running,
             stage_recv_req_ids={"r1"},
         )
 
         self.assertEqual(req.status, RequestStatus.WAITING)
 
     def test_stays_waiting_for_input_if_not_received(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
         waiting = MockQueue([req])
-        running: list = []
 
         coord.process_pending_full_payload_inputs(
             waiting,
-            running,
             stage_recv_req_ids=set(),
         )
 
@@ -317,49 +311,39 @@ class TestWaitingForInputTransition(unittest.TestCase):
         self.assertEqual(len(coord._waiting_for_input), 1)
 
     def test_stage_0_is_noop(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=0)
+        coord = OmniSchedulingCoordinator(stage_id=0)
 
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
         waiting = MockQueue([req])
-        running: list = []
 
         coord.process_pending_full_payload_inputs(
             waiting,
-            running,
             stage_recv_req_ids={"r1"},
         )
         self.assertEqual(req.status, RequestStatus.WAITING_FOR_INPUT)
 
     def test_restore_queues_includes_waiting_for_input(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         r1 = _make_request("r1")
         coord._waiting_for_input.append(r1)
 
         waiting = MockQueue()
-        running: list = []
 
-        coord.restore_queues(waiting, running)
+        coord.restore_queues(waiting)
 
         self.assertIn(r1, waiting)
         self.assertEqual(len(coord._waiting_for_input), 0)
 
     def test_full_payload_mode_auto_transitions_waiting_to_waiting_for_input(self):
-        """In full_payload_mode (async_chunk=False), fresh WAITING requests on
-        non-Stage-0 should be transitioned to WAITING_FOR_INPUT."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-            async_chunk=False,
-        )
+        """Fresh downstream WAITING requests enter WAITING_FOR_INPUT."""
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1", status=RequestStatus.WAITING)
         waiting = MockQueue([req])
-        running: list = []
 
         coord.process_pending_full_payload_inputs(
             waiting,
-            running,
             stage_recv_req_ids=set(),
         )
 
@@ -367,37 +351,14 @@ class TestWaitingForInputTransition(unittest.TestCase):
         self.assertEqual(len(coord._waiting_for_input), 1)
         self.assertEqual(len(coord.pending_input_registrations), 1)
 
-    def test_async_chunk_mode_does_not_auto_transition(self):
-        """In async_chunk mode, fresh WAITING requests should NOT be
-        transitioned to WAITING_FOR_INPUT."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-            async_chunk=True,
-        )
-
-        req = _make_request("r1", status=RequestStatus.WAITING)
-        waiting = MockQueue([req])
-        running: list = []
-
-        coord.process_pending_full_payload_inputs(
-            waiting,
-            running,
-            stage_recv_req_ids=set(),
-        )
-
-        self.assertEqual(req.status, RequestStatus.WAITING)
-
     def test_pending_input_registrations(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
         waiting = MockQueue([req])
-        running: list = []
 
         coord.process_pending_full_payload_inputs(
             waiting,
-            running,
             stage_recv_req_ids=set(),
         )
 
@@ -405,18 +366,13 @@ class TestWaitingForInputTransition(unittest.TestCase):
         self.assertEqual(coord.pending_input_registrations[0].request_id, "r1")
 
     def test_idle_cycles_retain_received_marker_before_request_appears(self):
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-            async_chunk=False,
-        )
+        coord = OmniSchedulingCoordinator(stage_id=1)
         coord._full_payload_input_received.add("late")
         coord.finished_requests.add("late")
 
         waiting = MockQueue()
-        running: list = []
 
-        coord.process_pending_full_payload_inputs(waiting, running, stage_recv_req_ids=set())
+        coord.process_pending_full_payload_inputs(waiting, stage_recv_req_ids=set())
 
         self.assertIn("late", coord._full_payload_input_received)
         self.assertIn("late", coord.finished_requests)
@@ -424,7 +380,7 @@ class TestWaitingForInputTransition(unittest.TestCase):
         late_req = _make_request("late", status=RequestStatus.WAITING)
         waiting.add_request(late_req)
 
-        coord.process_pending_full_payload_inputs(waiting, running, stage_recv_req_ids=set())
+        coord.process_pending_full_payload_inputs(waiting, stage_recv_req_ids=set())
 
         self.assertEqual(late_req.status, RequestStatus.WAITING)
         self.assertEqual(coord.pending_input_registrations, [])
@@ -441,17 +397,12 @@ class TestTimeoutDetection(unittest.TestCase):
 
     def test_waiting_since_recorded_on_input_wait(self):
         """_waiting_since is set when a request enters WAITING_FOR_INPUT."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-            async_chunk=False,
-        )
+        coord = OmniSchedulingCoordinator(stage_id=1)
         req = _make_request("r1", status=RequestStatus.WAITING)
         waiting = MockQueue([req])
 
         coord.process_pending_full_payload_inputs(
             waiting,
-            [],
             stage_recv_req_ids=set(),
         )
 
@@ -459,11 +410,7 @@ class TestTimeoutDetection(unittest.TestCase):
 
     def test_waiting_since_cleared_on_input_arrival(self):
         """_waiting_since is cleared when input data arrives."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-            async_chunk=False,
-        )
+        coord = OmniSchedulingCoordinator(stage_id=1)
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
         coord._waiting_for_input.append(req)
         coord._waiting_since["r1"] = 0.0
@@ -471,7 +418,6 @@ class TestTimeoutDetection(unittest.TestCase):
         waiting = MockQueue()
         coord.process_pending_full_payload_inputs(
             waiting,
-            [],
             stage_recv_req_ids={"r1"},
         )
 
@@ -480,10 +426,7 @@ class TestTimeoutDetection(unittest.TestCase):
 
     def test_collect_timed_out_request_ids_no_timeout(self):
         """No IDs returned when nothing has timed out."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-        )
+        coord = OmniSchedulingCoordinator(stage_id=1)
         import time
 
         coord._waiting_since["r1"] = time.monotonic()
@@ -493,10 +436,7 @@ class TestTimeoutDetection(unittest.TestCase):
 
     def test_collect_timed_out_request_ids_expired(self):
         """Timed-out IDs are returned and _waiting_since is cleared."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-        )
+        coord = OmniSchedulingCoordinator(stage_id=1)
         coord._waiting_since["r1"] = 0.0  # epoch → definitely expired
         coord._waiting_since["r2"] = 0.0
 
@@ -513,10 +453,7 @@ class TestTimeoutDetection(unittest.TestCase):
 
     def test_collect_removes_from_coordinator_queues(self):
         """Timed-out requests are defensively removed from internal queues."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-        )
+        coord = OmniSchedulingCoordinator(stage_id=1)
         r1 = _make_request("r1")
         coord._waiting_for_input.append(r1)
         coord._waiting_since["r1"] = 0.0
@@ -528,10 +465,7 @@ class TestTimeoutDetection(unittest.TestCase):
 
     def test_free_finished_request_clears_waiting_since(self):
         """free_finished_request clears coordinator lifecycle markers."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-        )
+        coord = OmniSchedulingCoordinator(stage_id=1)
         coord._waiting_since["r1"] = 0.0
         coord._full_payload_input_received.add("r1")
         coord.finished_requests.add("r1")
