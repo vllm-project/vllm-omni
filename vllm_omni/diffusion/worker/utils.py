@@ -33,7 +33,7 @@ def consume_pipeline_stage_durations(pipeline: Any) -> dict[str, float]:
 
 
 def merge_stage_durations(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     stage_durations: dict[str, float],
 ) -> None:
     if not stage_durations:
@@ -43,7 +43,7 @@ def merge_stage_durations(
 
 
 def attach_stage_durations(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     output: DiffusionOutput,
 ) -> None:
     if state.stage_durations:
@@ -51,7 +51,7 @@ def attach_stage_durations(
 
 
 @dataclass
-class DiffusionRequestState:
+class StepRequestState:
     """Per-request mutable state across all pipeline stages.
 
     Owned by Runner and passed through all step-execution stages:

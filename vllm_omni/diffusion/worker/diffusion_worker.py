@@ -46,7 +46,7 @@ from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusio
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -416,7 +416,7 @@ class DiffusionWorker:
         self,
         req: OmniDiffusionRequest,
         od_config: OmniDiffusionConfig,
-        kv_prefetch_jobs: dict | None = None,
+        kv_prefetch_job: KVPrefetchJob | None = None,
     ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -430,7 +430,7 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+            output = self.model_runner.execute_model(req, kv_prefetch_job=kv_prefetch_job)
         if profiler:
             profiler.step()
         return output
@@ -440,7 +440,7 @@ class DiffusionWorker:
     ) -> BatchRunnerOutput:
         """Batch forward: LoRA activate once, delegate to model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        # LoRA: same adapter/scale within batch guaranteed by SamplingParamsKey
+        # LoRA: same adapter/scale within batch guaranteed by RequestBatchSamplingParamsKey.
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
             try:
@@ -475,7 +475,7 @@ class DiffusionWorker:
         Newly scheduled requests register their (lora_request, lora_scale)
         in ``_step_lora_state`` so cached requests can resolve to the same
         adapter on later ticks. Finished requests are evicted. Batch
-        homogeneity is enforced by the scheduler via ``SamplingParamsKey``,
+        homogeneity is enforced by the scheduler via ``StepBatchSamplingParamsKey``,
         so any scheduled request id resolves to the active LoRA identity.
         """
         for request_id in scheduler_output.finished_req_ids:
@@ -1155,7 +1155,7 @@ class WorkerWrapperBase:
         self,
         reqs: list[OmniDiffusionRequest],
         od_config: OmniDiffusionConfig,
-        kv_prefetch_jobs: dict | None = None,
+        kv_prefetch_job: KVPrefetchJob | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass.
@@ -1163,12 +1163,12 @@ class WorkerWrapperBase:
         Args:
             reqs: List of diffusion requests
             od_config: OmniDiffusionConfig configuration
-            kv_prefetch_jobs: Optional next-request KV prefetch descriptor.
+            kv_prefetch_job: Optional next-request KV prefetch descriptor.
 
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(reqs, od_config, kv_prefetch_jobs=kv_prefetch_jobs)
+        return self.worker.execute_model(reqs, od_config, kv_prefetch_job=kv_prefetch_job)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""

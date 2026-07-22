@@ -135,28 +135,7 @@ The scheduler is a **request-state scheduler**. It owns request lifecycle manage
 
 ### Key Components
 
-#### 2.1 Scheduler Interface
-
-```python
-class SchedulerInterface(ABC):
-    def add_request(self, request: OmniDiffusionRequest) -> str: ...
-    def schedule(self) -> DiffusionSchedulerOutput: ...
-    def update_from_output(
-        self,
-        sched_output: DiffusionSchedulerOutput,
-        output: DiffusionOutput,
-    ) -> set[str]: ...
-```
-
-**Responsibilities**:
-
-- **Lifecycle contract**: Defines how the engine adds requests, triggers one scheduling cycle, and feeds executor results back.
-
-- **Stable boundary**: `DiffusionSchedulerOutput` is the only scheduling result consumed by `DiffusionEngine`.
-
-- **Pluggability**: Different scheduler policies can reuse the same engine integration path.
-
-#### 2.2 Request State Model
+#### 2.1 Request State Model
 
 ```python
 class DiffusionRequestStatus(enum.IntEnum):
@@ -168,10 +147,12 @@ class DiffusionRequestStatus(enum.IntEnum):
     FINISHED_ERROR = ...
 
 @dataclass
-class DiffusionRequestState:
+class SchedulerRequestState:
     request_id: str
     req: OmniDiffusionRequest
+    sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
+    error: str | None = None
 ```
 
 **Design Features**:
@@ -180,17 +161,33 @@ class DiffusionRequestState:
 
 - **Centralized error handling**: Completion, abort, and error states are all normalized in the scheduler layer.
 
-#### 2.3 Shared Bookkeeping in `_BaseScheduler`
+#### 2.2 Shared Bookkeeping in `BaseScheduler`
 
 ```python
-class _BaseScheduler(SchedulerInterface):
+class BaseScheduler:
     def __init__(self) -> None:
         self._request_states = {}
         self._waiting = deque()
         self._running = []
         self._finished_req_ids = set()
         self.max_num_running_reqs = 1
+
+    def add_request(self, request: OmniDiffusionRequest) -> str: ...
+    def schedule(self) -> DiffusionSchedulerOutput: ...
+    def update_from_output(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        output: BaseRunnerOutput,
+    ) -> set[str]: ...
 ```
+
+**Responsibilities**:
+
+- **Lifecycle contract**: Defines how the engine adds requests, triggers one scheduling cycle, and feeds executor results back.
+
+- **Stable boundary**: `DiffusionSchedulerOutput` is the only scheduling result consumed by `DiffusionEngine`.
+
+- **Pluggability**: Different scheduler policies can reuse the same engine integration path.
 
 **Design Features**:
 
@@ -199,12 +196,12 @@ class _BaseScheduler(SchedulerInterface):
 - **Shared cleanup logic**: Duplicate-request checks, finish handling, and state removal are centralized instead of
   duplicated in each policy.
 
-- **Current constraint boundary**: `_BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`. Request-mode diffusion can use that capacity for compatible independent requests when the configured pipeline declares `supports_request_batch = True`; step-wise diffusion uses the same scheduler capacity for compatible step batches.
+- **Current constraint boundary**: `BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`. Request-mode diffusion can use that capacity for compatible independent requests when the configured pipeline declares `supports_request_batch = True`; step-wise diffusion uses the same scheduler capacity for compatible step batches.
 
-#### 2.4 Current `RequestScheduler` Policy
+#### 2.3 Current `RequestScheduler` Policy
 
 ```python
-class RequestScheduler(_BaseScheduler):
+class RequestScheduler(BaseScheduler):
     def schedule(self) -> DiffusionSchedulerOutput:
         # 1. keep existing RUNNING requests in the scheduling result
         # 2. pull WAITING requests while capacity remains
@@ -215,11 +212,11 @@ class RequestScheduler(_BaseScheduler):
 
 - **FIFO request scheduling**: Waiting requests are promoted in queue order.
 
-- **Compatible request admission**: `RequestScheduler` admits waiting requests while capacity remains and the request's `SamplingParamsKey` is compatible with the active batch. Request-mode execution keeps each logical request independent, while batch-capable pipelines receive the scheduled requests as a runner-side `DiffusionRequestBatch`.
+- **Compatible request admission**: `RequestScheduler` admits waiting requests while capacity remains and the request's `RequestBatchSamplingParamsKey` is compatible with the active batch. Request-mode execution keeps each logical request independent, while batch-capable pipelines receive the scheduled requests as a runner-side `DiffusionRequestBatch`.
 
 - **Executor result feedback**: `update_from_output()` converts executor output into `FINISHED_COMPLETED` or `FINISHED_ERROR` and returns finished request ids.
 
-#### 2.5 Engine-Driven Execution Loop
+#### 2.4 Engine-Driven Execution Loop
 
 ```python
 request_id = scheduler.add_request(request)
