@@ -474,6 +474,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
         return self.get_multimodal_embeddings(**kwargs)
 
+    @staticmethod
+    def _capture_safe_tensor(
+        values: list[int],
+        *,
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        """Host→device tensor alloc that is legal during CUDA graph capture.
+
+        ``torch.tensor(..., device="cuda")`` does an unpinned H2D copy and raises
+        under capture. Pin the CPU buffer first when the target is CUDA.
+        """
+        device = torch.device(device)
+        if device.type == "cuda":
+            return torch.tensor(values, dtype=dtype, pin_memory=True).to(device=device, non_blocking=True)
+        return torch.tensor(values, dtype=dtype, device=device)
+
     def _run_tts_request(
         self,
         *,
@@ -518,33 +535,39 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return None, chunk_is_last, turn_ended
 
         mel_spec, waveform = talker_result
+        # Dummy / missing-handoff path returns (None, None). During vLLM CUDA
+        # graph capture this still reaches here, and building CUDA meta tensors
+        # from host Python values triggers an illegal unpinned H2D copy.
+        if mel_spec is None and waveform is None:
+            return None, chunk_is_last, turn_ended
+
         mm_out: dict[str, Any] = {}
         duplex_info = talker_info.get("duplex") if isinstance(talker_info.get("duplex"), dict) else {}
         if talker_info.get("native_duplex") is True:
             turn_id = duplex_info.get("turn_id")
             if isinstance(turn_id, int):
-                mm_out["meta.duplex_turn_id"] = torch.tensor([turn_id], dtype=torch.int32, device=device)
+                mm_out["meta.duplex_turn_id"] = self._capture_safe_tensor([turn_id], dtype=torch.int32, device=device)
             epoch = duplex_info.get("epoch")
             if isinstance(epoch, int):
-                mm_out["meta.duplex_epoch"] = torch.tensor([epoch], dtype=torch.int32, device=device)
-        mm_out["meta.tts_is_last_chunk"] = torch.tensor(
+                mm_out["meta.duplex_epoch"] = self._capture_safe_tensor([epoch], dtype=torch.int32, device=device)
+        mm_out["meta.tts_is_last_chunk"] = self._capture_safe_tensor(
             [int(chunk_is_last)],
             dtype=torch.int32,
             device=device,
         )
         if talker_info.get("native_duplex") is True:
-            mm_out["meta.turn_end"] = torch.tensor(
+            mm_out["meta.turn_end"] = self._capture_safe_tensor(
                 [int(turn_ended)],
                 dtype=torch.int32,
                 device=device,
             )
         if tts_text or talker_info.get("native_duplex") is True:
-            mm_out["meta.llm_output_text_utf8"] = torch.tensor(
+            mm_out["meta.llm_output_text_utf8"] = self._capture_safe_tensor(
                 list(tts_text.encode("utf-8")),
                 dtype=torch.uint8,
                 device=device,
             )
-            mm_out["meta.audio_text_total_chars"] = torch.tensor(
+            mm_out["meta.audio_text_total_chars"] = self._capture_safe_tensor(
                 [len(tts_text)],
                 dtype=torch.int32,
                 device=device,
@@ -1196,12 +1219,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return []
         if prompt_token_ids.ndim == 1:
             prompt_token_ids = prompt_token_ids.unsqueeze(0)
-        rows: list[int] = []
-        for row_idx in range(min(batch_size, int(prompt_token_ids.shape[0]))):
-            row = prompt_token_ids[row_idx]
-            if torch.count_nonzero(row == unit_id).item() >= 2:
-                rows.append(row_idx)
-        return rows
+        # Count ``unit_id`` occurrences per row in a single fused reduction and
+        # move the result to the host once. The previous per-row
+        # ``.item()`` did one GPU→CPU sync per row (80 syncs ≈ 446ms of
+        # ``aten::item`` in stage0 duplex profiles).
+        n_rows = min(batch_size, int(prompt_token_ids.shape[0]))
+        counts = (prompt_token_ids[:n_rows] == unit_id).sum(dim=-1).tolist()
+        return [row_idx for row_idx, count in enumerate(counts) if count >= 2]
 
     def _minicpmo45_native_forbidden_token_ids(self, token_ids: dict[str, int]) -> list[int]:
         tokenizer = self._minicpmo45_tokenizer()

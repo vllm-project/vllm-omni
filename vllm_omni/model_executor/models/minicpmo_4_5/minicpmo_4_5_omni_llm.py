@@ -1730,12 +1730,24 @@ class Resampler(nn.Module):
         pos_embed = torch.from_numpy(get_2d_sincos_pos_embed(self.embed_dim, max_size)).float().to(device)
         self.register_buffer("pos_embed", pos_embed, persistent=False)
 
-    def _adjust_pos_cache(self, tgt_sizes, device):
-        max_h = torch.max(tgt_sizes[:, 0])
-        max_w = torch.max(tgt_sizes[:, 1])
+    def _adjust_pos_cache(self, max_h: int, max_w: int, device):
+        """Grow the 2D sincos cache from host ints.
+
+        Comparing GPU scalars in ``if tensor > int`` forces ``aten::item`` /
+        ``cudaStreamSynchronize`` and stalls behind the preceding SigLIP
+        encoder. Pass Python ints instead.
+        """
         if max_h > self.max_size[0] or max_w > self.max_size[1]:
             self.max_size = [max(max_h, self.max_size[0]), max(max_w, self.max_size[1])]
             self._set_2d_pos_cache(self.max_size, device)
+
+    @staticmethod
+    def _tgt_size_lists(tgt_sizes: torch.Tensor) -> tuple[list[int], list[int], list[int]]:
+        sizes = tgt_sizes.detach().tolist() if tgt_sizes.device.type == "cpu" else tgt_sizes.detach().cpu().tolist()
+        hs = [int(h) for h, _ in sizes]
+        ws = [int(w) for _, w in sizes]
+        patch_lens = [h * w for h, w in zip(hs, ws)]
+        return hs, ws, patch_lens
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -1753,21 +1765,20 @@ class Resampler(nn.Module):
         device = x.device
         dtype = x.dtype
 
-        patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
-
-        self._adjust_pos_cache(tgt_sizes, device=device)
+        hs, ws, patch_lens = self._tgt_size_lists(tgt_sizes)
+        self._adjust_pos_cache(max(hs), max(ws), device=device)
 
         if self.pos_embed.device != device:
             self.pos_embed = self.pos_embed.to(device)
 
-        max_patch_len = torch.max(patch_len)
+        max_patch_len = max(patch_lens) if patch_lens else 0
         key_padding_mask = torch.zeros((bs, max_patch_len), dtype=torch.bool, device=device)
 
         pos_embed = []
         for i in range(bs):
-            tgt_h, tgt_w = tgt_sizes[i]
+            tgt_h, tgt_w = hs[i], ws[i]
             pos_embed.append(self.pos_embed[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, -1)).to(dtype))  # patches * D
-            key_padding_mask[i, patch_len[i] :] = True
+            key_padding_mask[i, patch_lens[i] :] = True
 
         pos_embed = torch.nn.utils.rnn.pad_sequence(pos_embed, batch_first=True, padding_value=0.0).permute(
             1, 0, 2
@@ -4175,9 +4186,15 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             L_item = pixel_values_item.shape[-1]
             all_pixel_values[i, ..., :L_item] = pixel_values_item
 
-        num_patches = tgt_sizes.prod(-1)
-        max_patches = num_patches.max().item()
-        assert isinstance(max_patches, int)
+        # Host-side patch geometry before launching SigLIP, so resampler cache
+        # growth never inserts a mid-pipeline cudaStreamSynchronize.
+        tgt_sizes_cpu = tgt_sizes.detach().to(device="cpu")
+        hs, ws, num_patches = self.resampler._tgt_size_lists(tgt_sizes_cpu)
+        max_patches = max(num_patches) if num_patches else 0
+
+        self.resampler._adjust_pos_cache(max(hs) if hs else 0, max(ws) if ws else 0, device=device)
+        if self.resampler.pos_embed.device != device:
+            self.resampler.pos_embed = self.resampler.pos_embed.to(device)
 
         patch_attn_mask = torch.zeros((B, max_patches), dtype=torch.bool, device=device)
         for i, num_patches_item in enumerate(num_patches):
@@ -4186,13 +4203,13 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         vision_embedding = self.vpm(
             all_pixel_values,
             patch_attention_mask=patch_attn_mask.unsqueeze(1),
-            tgt_sizes=tgt_sizes,
+            tgt_sizes=tgt_sizes_cpu,
         )
 
         if not isinstance(vision_embedding, torch.Tensor):
             vision_embedding = vision_embedding.last_hidden_state
 
-        return self.resampler(vision_embedding, tgt_sizes)
+        return self.resampler(vision_embedding, tgt_sizes_cpu)
 
     def _process_vision_input(
         self,

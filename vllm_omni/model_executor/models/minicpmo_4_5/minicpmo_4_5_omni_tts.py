@@ -1527,7 +1527,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                             boundaries.append((i, end))
                             i = end
 
-                        logger.info(
+                        logger.debug(
                             "generate_speech: streaming vocoder, %d tokens -> %d chunks (chunk=%d)",
                             num_tokens,
                             len(boundaries),
