@@ -58,24 +58,20 @@ python image_to_video.py \
 ```bash
 python image_to_video.py \
   --model diffusers/LTX-2.3-Diffusers \
-  --model-class-name LTX23ImageToVideoPipeline \
   --image cherry_blossom.jpg \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
   --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 384 \
-  --width 512 \
-  --num-frames 25 \
-  --guidance-scale 4.0 \
-  --num-inference-steps 20 \
+  --height 512 \
+  --width 768 \
+  --num-frames 121 \
+  --num-inference-steps 30 \
   --frame-rate 24 \
   --fps 24 \
   --output ltx23_i2v_output.mp4
 ```
 
-Use the Diffusers-format checkpoint `diffusers/LTX-2.3-Diffusers`; the
-upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
-this pipeline. Pass `--model-class-name LTX23ImageToVideoPipeline` to select
-the LTX-2.3 image-to-video pipeline.
+The checkpoint selects the unified `LTX2Pipeline`; adding `--image` selects
+I2V. See the [LTX family recipe](../../../../recipes/LTX/LTX-2.md).
 
 Key arguments:
 

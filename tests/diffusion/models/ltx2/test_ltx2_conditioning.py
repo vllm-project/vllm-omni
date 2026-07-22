@@ -21,12 +21,12 @@ def _make_ltx23_request_pipe(cls):
 
 class TestLTXImageToVideoForwardStages:
     def test_forward_resolves_request_image_and_delegates_to_shared_forward_impl(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        pipe = _make_ltx23_request_pipe(LTX23ImageToVideoPipeline)
+        pipe = _make_ltx23_request_pipe(LTX2Pipeline)
         image = torch.zeros(3, 8, 8)
         req = DiffusionRequestBatch(
             [
@@ -65,10 +65,28 @@ class TestLTXImageToVideoForwardStages:
         assert seen["kwargs"]["image"] is image
         assert seen["kwargs"]["noise_scale"] == 0.0
 
-    def test_denoise_timestep_kwargs_masks_video_only(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
+    def test_unified_entry_selects_t2v_without_images_and_rejects_mixed_batches(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        pipe = object.__new__(LTX2Pipeline)
+        request_inputs = SimpleNamespace(latents=None)
+        t2v_req = SimpleNamespace(prompts=["text only", {"prompt": "also text only"}])
+
+        assert pipe._resolve_request_image(t2v_req, None, request_inputs) is None
+
+        mixed_req = SimpleNamespace(
+            prompts=[
+                "text only",
+                {"prompt": "image conditioned", "multi_modal_data": {"image": torch.zeros(3, 8, 8)}},
+            ]
+        )
+        with pytest.raises(ValueError, match="cannot mix text-to-video and image-to-video"):
+            pipe._resolve_request_image(mixed_req, None, request_inputs)
+
+    def test_denoise_timestep_kwargs_masks_video_only(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        pipe = object.__new__(LTX2Pipeline)
         ts = torch.tensor([2.0, 4.0])
         denoise_ctx = SimpleNamespace(
             conditioning_mask=torch.tensor([[1.0, 0.0]]),
@@ -90,21 +108,21 @@ class TestLTXImageToVideoForwardStages:
 
 class TestLTXImageToVideoConditioning:
     def test_ltx23_i2v_supports_image_input(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        assert LTX23ImageToVideoPipeline.support_image_input is True
+        assert LTX2Pipeline.support_image_input is True
 
     def test_ltx23_i2v_rejects_multi_image_prompt_list(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         image = object()
 
-        assert LTX23ImageToVideoPipeline._resolve_single_prompt_image([image]) is image
+        assert LTX2Pipeline._resolve_single_prompt_image([image]) is image
         with pytest.raises(ValueError, match="exactly one image per prompt"):
-            LTX23ImageToVideoPipeline._resolve_single_prompt_image([object(), object()])
+            LTX2Pipeline._resolve_single_prompt_image([object(), object()])
 
     def test_ltx23_i2v_additional_image_resolution_is_tensor_safe(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         image = torch.zeros(1, 3, 4, 4)
         additional = {
@@ -113,14 +131,14 @@ class TestLTXImageToVideoConditioning:
             "image": torch.ones_like(image),
         }
 
-        assert LTX23ImageToVideoPipeline._resolve_additional_image(additional) is image
+        assert LTX2Pipeline._resolve_additional_image(additional) is image
 
     def test_ltx23_i2v_packed_latents_are_not_noised(self, monkeypatch):
         import vllm_omni.diffusion.models.ltx2.ltx2_conditioning as ltx2_conditioning
         import vllm_omni.diffusion.models.ltx2.ltx2_latents as ltx2_latents
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        pipe = object.__new__(LTX2Pipeline)
         torch.nn.Module.__init__(pipe)
         pipe.vae_spatial_compression_ratio = 1
         pipe.vae_temporal_compression_ratio = 1
@@ -136,7 +154,7 @@ class TestLTXImageToVideoConditioning:
         latents = torch.tensor([[[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]])
 
         out, conditioning_mask = pipe.prepare_latents(
-            image=None,
+            image=torch.zeros(1, 3, 1, 1),
             batch_size=1,
             num_channels_latents=2,
             height=1,
@@ -154,9 +172,9 @@ class TestLTXImageToVideoConditioning:
     def test_ltx23_i2v_5d_latents_noise_preserves_conditioning_frame(self, monkeypatch):
         import vllm_omni.diffusion.models.ltx2.ltx2_conditioning as ltx2_conditioning
         import vllm_omni.diffusion.models.ltx2.ltx2_latents as ltx2_latents
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        pipe = object.__new__(LTX2Pipeline)
         torch.nn.Module.__init__(pipe)
         pipe.vae_spatial_compression_ratio = 1
         pipe.vae_temporal_compression_ratio = 1
@@ -177,7 +195,7 @@ class TestLTXImageToVideoConditioning:
         latents = torch.tensor([[[[[10.0]], [[20.0]], [[30.0]]], [[[11.0]], [[21.0]], [[31.0]]]]])
 
         out, conditioning_mask = pipe.prepare_latents(
-            image=None,
+            image=torch.zeros(1, 3, 1, 1),
             batch_size=1,
             num_channels_latents=2,
             height=1,
@@ -193,9 +211,9 @@ class TestLTXImageToVideoConditioning:
         torch.testing.assert_close(out, torch.tensor([[[10.0, 11.0], [1.0, 1.0], [1.0, 1.0]]]))
 
     def test_ltx23_i2v_video_step_preserves_conditioning_frame(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23ImageToVideoPipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        pipe = object.__new__(LTX2Pipeline)
         torch.nn.Module.__init__(pipe)
         pipe.transformer_spatial_patch_size = 1
         pipe.transformer_temporal_patch_size = 1

@@ -12,21 +12,62 @@
 
 ## Model And Pipeline Selection
 
-Select the pipeline explicitly. T2V and I2V use the same checkpoint but
-different public pipeline classes.
+`LTX2Pipeline` is the unified one-stage entry. Checkpoint metadata selects the
+LTX-2 or LTX-2.3 component profile and recipe; omitting an image selects T2V,
+while providing one initial image selects I2V.
 
 | Model | Checkpoint | Task | `--model-class-name` | Request batching |
 |---|---|---|---|---|
-| LTX-2 | `Lightricks/LTX-2` | One-stage T2V | `LTX2Pipeline` | Yes |
-| LTX-2 | `Lightricks/LTX-2` | One-stage I2V | `LTX2ImageToVideoPipeline` | Yes |
+| LTX-2 | `Lightricks/LTX-2` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
 | LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage T2V | `LTX2TwoStagesPipeline` | No |
 | LTX-2 distilled | `rootonchair/LTX-2-19b-distilled` | Two-stage I2V | `LTX2ImageToVideoTwoStagesPipeline` | No |
-| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | One-stage T2V | `LTX23Pipeline` | Yes |
-| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | One-stage I2V | `LTX23ImageToVideoPipeline` | Yes |
+| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` | One-stage T2V/I2V | `LTX2Pipeline` | Yes |
+
+Both supported one-stage checkpoint repositories declare `LTX2Pipeline` in
+`model_index.json`, so `--model-class-name` is optional. Version selection does
+not depend on the repository or directory name: `model_version` is used when
+present, otherwise the LTX-2.3 BWE vocoder declaration is the discriminator.
+Unknown conversions use the LTX-2 defaults, matching the official fallback.
 
 LTX-2.3 requires a Diffusers-format checkpoint. The upstream
 `Lightricks/LTX-2.3` repository contains raw safetensors and is not directly
 loadable by these pipeline classes.
+
+## Breaking API Migration
+
+`LTX2Pipeline` is the only supported one-stage class. Its direct Python
+API accepts only `req` positionally; every optional `forward` argument is
+keyword-only. Positional calls must be migrated as follows:
+
+```python
+# No longer supported
+pipe(req, prompt)
+pipe(req, image, prompt)
+
+# Supported
+pipe(req, prompt=prompt)
+pipe(req, image=image, prompt=prompt)
+```
+
+Passing a second positional argument now raises `TypeError` immediately. This
+is an intentional compatibility break for direct pipeline callers; the offline
+scripts and serving API are unaffected because they already use named fields.
+
+The consolidation also removes three old registry names. There are no aliases;
+configs and commands that still select one of these names fail registry
+resolution and must migrate to `LTX2Pipeline`:
+
+| Removed name | Replacement |
+|---|---|
+| `LTX23Pipeline` | `LTX2Pipeline`; the checkpoint selects LTX-2.3 and no image selects T2V |
+| `LTX2ImageToVideoPipeline` | `LTX2Pipeline` with `image=` |
+| `LTX23ImageToVideoPipeline` | `LTX2Pipeline` with `image=`; the checkpoint selects LTX-2.3 |
+
+These are two intentional breaking changes: optional direct-call arguments are
+now keyword-only, and the three version/task-specific registry names are no
+longer accepted. The shared offline and serving entrypoints already use named
+fields and checkpoint metadata, so only direct Python callers and explicit
+`--model-class-name` overrides require migration.
 
 ## One-Stage Recipe Defaults
 
@@ -63,14 +104,13 @@ to `4.0/4.0`.
 
 ## Serving
 
-### Start A T2V Server
+### Start A Server
 
 LTX-2:
 
 ```bash
 vllm serve Lightricks/LTX-2 \
   --omni \
-  --model-class-name LTX2Pipeline \
   --stage-init-timeout 600
 ```
 
@@ -79,23 +119,11 @@ LTX-2.3:
 ```bash
 vllm serve diffusers/LTX-2.3-Diffusers \
   --omni \
-  --model-class-name LTX23Pipeline \
   --stage-init-timeout 600
 ```
 
-### Start An I2V Server
-
-Use the corresponding image-to-video pipeline class:
-
-```bash
-vllm serve diffusers/LTX-2.3-Diffusers \
-  --omni \
-  --model-class-name LTX23ImageToVideoPipeline \
-  --stage-init-timeout 600
-```
-
-Replace the model with `Lightricks/LTX-2` and the class with
-`LTX2ImageToVideoPipeline` for LTX-2.
+The same server accepts T2V and I2V requests. An I2V request is selected by its
+initial image rather than by a different pipeline class.
 
 ### T2V Request
 
@@ -181,7 +209,6 @@ curl -X POST http://localhost:8000/v1/videos/sync \
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
   --model diffusers/LTX-2.3-Diffusers \
-  --model-class-name LTX23Pipeline \
   --prompt "Floating crystal islands in a cosmic starry sky, slow camera rotation." \
   --negative-prompt "low quality, blurry, noise, watermark, text" \
   --width 768 --height 512 \
@@ -191,13 +218,18 @@ python examples/offline_inference/text_to_video/text_to_video.py \
   --output ltx23_custom_guidance.mp4
 ```
 
-For I2V, use `examples/offline_inference/image_to_video/image_to_video.py`,
-select the corresponding I2V pipeline class, add `--image`, and pass the same
-`--extra-body` JSON.
+For I2V, use `examples/offline_inference/image_to_video/image_to_video.py`, add
+`--image`, and pass the same `--extra-body` JSON.
 
 ### Python API
 
+Build a `DiffusionRequestBatch`, pass it as the only positional argument, and
+put normal per-request values in `OmniDiffusionSamplingParams`. The same call
+selects T2V or I2V from the presence of an image.
+
 ```python
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 sampling_params = OmniDiffusionSamplingParams(
@@ -220,13 +252,70 @@ sampling_params = OmniDiffusionSamplingParams(
         "audio_stg_blocks": [28],
     },
 )
+
+req = DiffusionRequestBatch(
+    [
+        OmniDiffusionRequest(
+            prompt={"prompt": "Cherry blossoms moving in a light breeze"},
+            sampling_params=sampling_params,
+            request_id="ltx-example",
+        )
+    ]
+)
+
+t2v_output = pipe(req)
+i2v_output = pipe(req, image=image)
 ```
+
+Direct keyword arguments are fallbacks for low-level callers. For example,
+`pipe(req, prompt=prompt, width=768)` is valid, but request-batch prompt and
+sampling fields take precedence where the table below says “request first.”
+
+#### Complete `forward` Surface
+
+| Argument | Type and default | Meaning, precedence, and constraints |
+|---|---|---|
+| `req` | `DiffusionRequestBatch`, required | The only positional argument. Holds prompts and one `OmniDiffusionSamplingParams` per request. |
+| `image` | image or batch, `None` | Initial frame. A direct image takes precedence over images embedded in `req`; no image selects T2V. Each I2V prompt accepts exactly one image, and a fused batch cannot mix T2V and I2V. |
+| `prompt` | `str \| list[str]`, `None` | Positive-text fallback. Nonempty `req.prompts` take precedence. Mutually exclusive with `prompt_embeds`. |
+| `negative_prompt` | `str \| list[str]`, `None` | Negative-text fallback. Per-request negative prompts win, then this value, then the model recipe default. Mutually exclusive with `negative_prompt_embeds`. |
+| `height` | `int`, `None` | Output height. Request sampling value wins, then this fallback, then the recipe default. Must be divisible by 32. |
+| `width` | `int`, `None` | Output width with the same precedence as `height`; must be divisible by 32. |
+| `num_frames` | `int`, `None` | Number of output video frames. Request value wins, then this fallback, then the recipe default. It also determines audio duration with `frame_rate`. |
+| `frame_rate` | `float`, `None` | Model frame rate. Request `frame_rate` wins over request `fps`, then this fallback, then the recipe default. |
+| `num_inference_steps` | `int`, `None` | Denoise-step fallback. Request value wins, then this value, then the recipe default; values are clamped to at least 2. A custom `sigmas` schedule determines the actual executed steps. |
+| `sigmas` | `list[float]`, `None` | Final scheduler boundaries. Request `sigmas` win over this fallback. All requests in a fused batch must use the same list. See [Custom Sigma Schedules](#custom-sigma-schedules). |
+| `timesteps` | `list[int]`, `None` | Generic compatibility slot. LTX accepts only `None`; use `sigmas` instead. |
+| `guidance_scale` | `float`, `None` | Common CFG fallback that sets both video and audio CFG. An explicitly provided request `guidance_scale` wins; omit both when using independent modality CFG values. |
+| `guidance_rescale` | `float`, `None` | Generic compatibility slot. Only `None` or `0.0` is accepted; use `video_rescale_scale` and `audio_rescale_scale`. |
+| `noise_scale` | `float`, `0.0` | Initial-noise compatibility slot. LTX accepts only `0.0`. |
+| `num_videos_per_prompt` | `int`, `1` | Direct output-count fallback. Positive request `num_outputs_per_prompt` takes precedence. |
+| `generator` | generator or list, `None` | Explicit RNG source. When omitted, request generators or seeds are collated. A list must match the effective output batch. |
+| `latents` | `torch.Tensor`, `None` | Initial video latents. Request tensors take precedence and are collated. Packed `[B, S, C]` and validated unpacked video layouts are accepted by one-stage pipelines. |
+| `audio_latents` | `torch.Tensor`, `None` | Initial audio latents. Request `audio_latents` take precedence and are collated. |
+| `prompt_embeds` | `torch.Tensor`, `None` | Precomputed positive conditioning that bypasses text encoding. Request prompt payload wins; requires `prompt_attention_mask` and cannot be combined with `prompt`. |
+| `negative_prompt_embeds` | `torch.Tensor`, `None` | Precomputed negative conditioning. Request payload wins; requires `negative_prompt_attention_mask` and cannot be combined with `negative_prompt`. |
+| `prompt_attention_mask` | `torch.Tensor`, `None` | Mask paired with `prompt_embeds`; request `prompt_attention_mask` or `attention_mask` wins. |
+| `negative_prompt_attention_mask` | `torch.Tensor`, `None` | Mask paired with `negative_prompt_embeds`; request `negative_prompt_attention_mask` or `negative_attention_mask` wins. |
+| `decode_timestep` | float or list, `0.0` | Timestep-conditioned video-VAE decode value. Request value wins. A list may have length 1, prompt batch size, or effective output batch size. |
+| `decode_noise_scale` | float or list, `None` | Decode-noise amount with the same list rules. Request value wins. When omitted, it follows `decode_timestep`; the defaults therefore add no noise. |
+| `output_type` | `str`, `"np"` | Request value wins. `"np"` decodes video and audio; `"latent"` returns video/audio latents without VAE or vocoder decode. |
+| `return_dict` | `bool`, `True` | Generic compatibility slot. LTX accepts only `True` and returns the standard `DiffusionOutput`. |
+| `attention_kwargs` | `dict`, `None` | Generic compatibility slot. Public per-call attention kwargs are unsupported; configure the attention backend at engine startup. |
+| `max_sequence_length` | `int`, `None` | Maximum prompt-token length. Request value wins, then this fallback, then the loaded tokenizer limit. |
+
+For ordinary engine use, put values in `req` rather than duplicating them as
+direct fallbacks. Prompt/sampling fields, custom sigmas, latents, embeddings,
+decode controls, and output type are resolved per request; recipe defaults are
+used only after both request and direct fallback values are absent.
 
 ### Custom Sigma Schedules
 
 One-stage LTX requests can override the recipe's default sigma schedule through
-the Python API. Set `sigmas` directly on `OmniDiffusionSamplingParams`; its
-length must match `num_inference_steps`.
+the Python API. Set final scheduler boundary values directly on
+`OmniDiffusionSamplingParams.sigmas`. Each non-terminal value produces one
+denoise step; a terminal `0.0` is appended when omitted. The custom schedule,
+not `num_inference_steps`, determines the executed step count.
 
 ```python
 sampling_params = OmniDiffusionSamplingParams(
@@ -240,17 +329,31 @@ requests in one fused batch must use identical `sigmas`. The `/v1/videos` form
 API and bundled offline CLI do not currently expose this field; use the Python
 request API when supplying a custom schedule.
 
-### Python Request Parameters
+### Request-Object Field Mapping
 
-| Parameter | Supported entrypoint | Behavior |
-|---|---|---|
-| `max_sequence_length` | `OmniDiffusionSamplingParams` | Maximum prompt-token length; defaults to the loaded tokenizer/model limit, normally 1024. |
-| `decode_timestep`, `decode_noise_scale` | `OmniDiffusionSamplingParams` | Optional timestep-conditioned VAE decode controls; defaults `0.0`/`None` add no decode noise. Scalar or per-output lists are accepted. |
-| `num_outputs_per_prompt` | `OmniDiffusionSamplingParams` | Generates multiple outputs for one prompt; this is separate from batching independent requests. |
-| `generator` | `OmniDiffusionSamplingParams` | Supplies a `torch.Generator` or one generator per effective output; otherwise use `seed`. |
-| `latents`, `audio_latents` | `OmniDiffusionSamplingParams` | Supply initial video/audio latents using the pipeline's packed or unpacked tensor layouts. |
-| `prompt_embeds`, `negative_prompt_embeds`, and masks | Python prompt payload | Bypass text encoding with precomputed conditioning tensors. Embeddings require their matching attention masks. |
-| `output_type` | `OmniDiffusionSamplingParams` | `"np"` decodes video/audio; `"latent"` returns latent outputs without VAE/vocoder decode. |
+Most `forward` names are identical on `OmniDiffusionSamplingParams`. The
+exceptions and prompt-payload fields are:
+
+| `forward` concept | Request-object field |
+|---|---|
+| `num_videos_per_prompt` | `num_outputs_per_prompt` |
+| `frame_rate` | `frame_rate`, falling back to `fps` |
+| RNG | `generator`, otherwise `seed` |
+| `image` | Prompt `multi_modal_data.image` or `additional_information.image` |
+| `prompt`, `negative_prompt` | Prompt dictionary fields |
+| Embeddings and masks | Prompt fields or `additional_information` |
+| LTX modality guidance | Sampling `extra_args` entries listed under [Custom Guidance](#custom-guidance) |
+
+These generic diffusion controls remain in the shared request surface for
+API consistency but are intentionally rejected by LTX when non-default:
+
+| Rejected control | Use instead |
+|---|---|
+| `timesteps` or `flow_shift` | Provide the final `sigmas` schedule |
+| Common `guidance_rescale` | `video_rescale_scale` and `audio_rescale_scale` |
+| Nonzero `noise_scale` | LTX one-stage always starts from its standard noise state |
+| Public `attention_kwargs` | Configure the attention backend at engine startup |
+| `return_dict=False` | Consume the standard `DiffusionOutput` |
 
 !!! warning "Request batching requires identical LTX guidance"
 
@@ -307,7 +410,8 @@ request API when supplying a custom schedule.
   components; it is not a per-request guidance parameter.
 - Two-stage LTX-2 support is currently limited to the distilled checkpoint.
   Its second denoise stage uses a fixed positive-only three-step schedule and
-  does not support request-level batching.
+  does not support request-level batching. Official LTX two-stage/HQ execution
+  is outside the scope of this implementation.
 
 ## References
 

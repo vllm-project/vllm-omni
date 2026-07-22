@@ -205,9 +205,8 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
         }
     )
 
-    for pipeline_name in ("LTX2Pipeline", "LTX2ImageToVideoPipeline", "LTX23Pipeline"):
-        assert get_extra_body_params(pipeline_name) == expected
-        assert get_extra_output_params(pipeline_name) == frozenset()
+    assert get_extra_body_params("LTX2Pipeline") == expected
+    assert get_extra_output_params("LTX2Pipeline") == frozenset()
 
 
 @pytest.mark.core_model

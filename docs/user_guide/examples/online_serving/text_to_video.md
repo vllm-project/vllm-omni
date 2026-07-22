@@ -377,11 +377,10 @@ curl -sS -X POST http://localhost:8098/v1/videos \
 
 ## LTX-2.3
 
-LTX-2.3 uses a Diffusers-format checkpoint and a dedicated pipeline class:
+LTX-2.3 uses the same metadata-selected `LTX2Pipeline` as LTX-2:
 
 ```bash
-vllm serve diffusers/LTX-2.3-Diffusers --omni --port 8098 \
-    --model-class-name LTX23Pipeline
+vllm serve diffusers/LTX-2.3-Diffusers --omni --port 8098
 ```
 
 Send requests through the same `/v1/videos` API shown in the LTX-2 example.

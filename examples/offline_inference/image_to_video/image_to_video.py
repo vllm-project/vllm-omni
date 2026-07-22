@@ -23,16 +23,14 @@ Usage:
 
     # LTX2 image-to-video
     python image_to_video.py --model /path/to/LTX-2 \
-        --model-class-name LTX2ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
         --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 
     # LTX-2.3 image-to-video
     python image_to_video.py --model diffusers/LTX-2.3-Diffusers \
-        --model-class-name LTX23ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --height 384 --width 512 --num-frames 25 --num-inference-steps 20 \
+        --height 512 --width 768 --num-frames 121 --num-inference-steps 30 \
         --frame-rate 24 --fps 24 --output ltx23_i2v.mp4
 
     # HunyuanVideo-1.5 I2V (480p)
@@ -100,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2ImageToVideoPipeline or LTX23ImageToVideoPipeline).",
+        help="Override model class name (LTX checkpoints default to LTX2Pipeline).",
     )
     parser.add_argument(
         "--deploy-config",

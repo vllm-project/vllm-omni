@@ -99,7 +99,7 @@ def _prepare_decode_timestep_conditioning(
     )
 
 
-class LTXPipelineRuntime(
+class LTXRuntime(
     LTXRequestMixin,
     LTXTextConditioningMixin,
     nn.Module,
@@ -382,16 +382,16 @@ class LTXPipelineRuntime(
         image: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         latents = self.prepare_latents(
-            prompt_context.batch_size * request_inputs.num_videos_per_prompt,
-            self.transformer.config.in_channels,
-            request_inputs.height,
-            request_inputs.width,
-            request_inputs.num_frames,
-            noise_scale,
-            prompt_context.positive_connector_prompt_embeds.dtype,
-            device,
-            request_inputs.generator,
-            request_inputs.latents,
+            batch_size=prompt_context.batch_size * request_inputs.num_videos_per_prompt,
+            num_channels_latents=self.transformer.config.in_channels,
+            height=request_inputs.height,
+            width=request_inputs.width,
+            num_frames=request_inputs.num_frames,
+            noise_scale=noise_scale,
+            dtype=prompt_context.positive_connector_prompt_embeds.dtype,
+            device=device,
+            generator=request_inputs.generator,
+            latents=request_inputs.latents,
         )
         return latents, None
 
@@ -466,7 +466,10 @@ class LTXPipelineRuntime(
         latent_num_frames: int,
         latent_height: int,
         latent_width: int,
+        *,
+        image_conditioned: bool = False,
     ) -> Any:
+        del latent_num_frames, latent_height, latent_width, image_conditioned
         return VideoAudioScheduler(self.scheduler, audio_scheduler)
 
     def _prepare_denoise_context_for_cfg(

@@ -15,9 +15,9 @@ class TestCFGParallelHelpers:
     """Test LTX-2.3 CFG helper math without loading model weights."""
 
     def test_combine_cfg_noise_matches_x0_space_formula(self):
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        pipe = object.__new__(LTX23Pipeline)
+        pipe = object.__new__(LTX2Pipeline)
         video_sample = torch.tensor([[[1.0, -2.0]]])
         audio_sample = torch.tensor([[[0.5, 3.0]]])
         video_pos = torch.tensor([[[0.2, -0.3]]])
@@ -65,10 +65,10 @@ class TestCFGParallelHelpers:
     def test_cfg_parallel_dummy_warms_supported_cfg_only_plan(self, monkeypatch):
         from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_runtime
         from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX23_ONE_STAGE_RECIPE
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX23Pipeline
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         monkeypatch.setattr(ltx2_pipeline_runtime, "get_classifier_free_guidance_world_size", lambda: 2)
-        pipe = object.__new__(LTX23Pipeline)
+        pipe = object.__new__(LTX2Pipeline)
         req = SimpleNamespace(is_dummy_run=lambda: True)
         request_inputs = SimpleNamespace(guidance=LTX23_ONE_STAGE_RECIPE.guidance)
 
@@ -83,16 +83,14 @@ class TestCFGParallelHelpers:
 class TestCFGParallelForwardPath:
     """Test the LTX-2.3 CFG-parallel denoising path without loading model weights."""
 
-    @pytest.mark.parametrize("pipeline_cls_name", ["LTX2Pipeline", "LTX23Pipeline"])
-    def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch, pipeline_cls_name):
+    def test_forward_collates_request_prompt_embeds_and_mask_aliases(self, monkeypatch):
         from vllm_omni.diffusion.models.ltx2 import ltx2_pipeline_runtime
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2 as ltx23
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        pipeline_cls = getattr(ltx23, pipeline_cls_name)
-        pipe = object.__new__(pipeline_cls)
+        pipe = object.__new__(ltx23.LTX2Pipeline)
         torch.nn.Module.__init__(pipe)
         pipe.device = torch.device("cpu")
         pipe.tokenizer_max_length = 4
@@ -199,7 +197,7 @@ class TestCFGParallelForwardPath:
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        pipe = object.__new__(ltx23.LTX23Pipeline)
+        pipe = object.__new__(ltx23.LTX2Pipeline)
         torch.nn.Module.__init__(pipe)
         pipe.device = torch.device("cpu")
         pipe.tokenizer_max_length = 1

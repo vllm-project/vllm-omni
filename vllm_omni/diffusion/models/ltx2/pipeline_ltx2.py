@@ -16,29 +16,46 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from .ltx2_components import (
     LTX2_COMPONENT_PROFILE,
     LTX23_COMPONENT_PROFILE,
-    LTXComponentProfile,
+    detect_ltx_model_version,
 )
 from .ltx2_components import (
     get_ltx2_post_process_func as get_ltx2_post_process_func,  # noqa: F401
 )
 from .ltx2_conditioning import LTXI2VConditioningMixin
-from .ltx2_pipeline_runtime import LTXPipelineRuntime
+from .ltx2_pipeline_runtime import LTXRuntime
 from .ltx2_recipes import (
     LTX2_ONE_STAGE_RECIPE,
     LTX23_ONE_STAGE_RECIPE,
     LTX_POSITIVE_ONLY_RECIPE,
-    LTXOneStageRecipe,
 )
 from .ltx2_request import LTXRequestInputs
 
 
-class LTXOneStagePipeline(LTXPipelineRuntime):
-    """Single execution path configured by model-version and task entries."""
+class LTX2Pipeline(LTXI2VConditioningMixin, LTXRuntime):
+    """LTX-2 family one-stage entry, configured from checkpoint metadata."""
 
-    component_profile: ClassVar[LTXComponentProfile]
-    one_stage_recipe: ClassVar[LTXOneStageRecipe]
-
+    unified_text_image_entry = True
+    component_profile = LTX2_COMPONENT_PROFILE
+    one_stage_recipe = LTX2_ONE_STAGE_RECIPE
+    _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
+    _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
+    _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
+    _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
     supports_request_batch = True
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        self.model_version = detect_ltx_model_version(od_config.model)
+        if self.model_version == "2.3":
+            self.component_profile = LTX23_COMPONENT_PROFILE
+            if self.one_stage_recipe is LTX2_ONE_STAGE_RECIPE:
+                self.one_stage_recipe = LTX23_ONE_STAGE_RECIPE
+            self.preserve_sp_padded_audio_duration = True
+            self.reports_stage_durations = True
+        self._dit_modules = list(self.component_profile.dit_modules)
+        self._encoder_modules = list(self.component_profile.encoder_modules)
+        self._vae_modules = list(self.component_profile.vae_modules)
+        self._resident_modules = list(self.component_profile.resident_modules)
+        super().__init__(od_config=od_config, prefix=prefix)
 
     def _forward_impl(
         self,
@@ -129,41 +146,10 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
         )
 
 
-class LTX2Pipeline(LTXOneStagePipeline):
-    """LTX2 one-stage text-to-video entry."""
-
-    component_profile = LTX2_COMPONENT_PROFILE
-    one_stage_recipe = LTX2_ONE_STAGE_RECIPE
-    _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
-    _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
-    _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
-    _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
-
-
-class LTX23Pipeline(LTXOneStagePipeline):
-    """LTX2.3 one-stage text-to-video entry."""
-
-    preserve_sp_padded_audio_duration = True
-    reports_stage_durations = True
-    component_profile = LTX23_COMPONENT_PROFILE
-    one_stage_recipe = LTX23_ONE_STAGE_RECIPE
-    _dit_modules: ClassVar[list[str]] = list(component_profile.dit_modules)
-    _encoder_modules: ClassVar[list[str]] = list(component_profile.encoder_modules)
-    _vae_modules: ClassVar[list[str]] = list(component_profile.vae_modules)
-    _resident_modules: ClassVar[list[str]] = list(component_profile.resident_modules)
-
-
-class LTX2ImageToVideoPipeline(LTXI2VConditioningMixin, LTX2Pipeline):
-    """LTX2 one-stage image-to-video entry."""
-
-
-class LTX23ImageToVideoPipeline(LTXI2VConditioningMixin, LTX23Pipeline):
-    """LTX2.3 one-stage image-to-video entry."""
-
-
 class LTX2T2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
     """LTX2 T2V entry for FastGen DMD2-distilled models."""
 
+    support_image_input = False
     one_stage_recipe = LTX_POSITIVE_ONLY_RECIPE
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
@@ -171,9 +157,10 @@ class LTX2T2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
         self.__init_dmd2__()
 
 
-class LTX2I2VDMD2Pipeline(DMD2PipelineMixin, LTX2ImageToVideoPipeline):
+class LTX2I2VDMD2Pipeline(DMD2PipelineMixin, LTX2Pipeline):
     """LTX2 I2V entry for FastGen DMD2-distilled models."""
 
+    unified_text_image_entry = False
     one_stage_recipe = LTX_POSITIVE_ONLY_RECIPE
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):

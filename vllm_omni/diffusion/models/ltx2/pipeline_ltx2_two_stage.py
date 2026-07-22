@@ -23,13 +23,13 @@ from .ltx2_components import (
 )
 from .ltx2_conditioning import LTXI2VConditioningMixin
 from .ltx2_guidance import LTXGuidanceSpec
-from .ltx2_pipeline_runtime import LTXPipelineRuntime
+from .ltx2_pipeline_runtime import LTXRuntime
 from .ltx2_recipes import LTX2_ONE_STAGE_RECIPE
 from .ltx2_request import LTXRequestInputs
 from .pipeline_ltx2_latent_upsample import LTX2LatentUpsamplePipeline
 
 
-class LTX2TwoStagesPipeline(LTXPipelineRuntime):
+class LTX2TwoStagesPipeline(LTXRuntime):
     """Legacy distilled-only LTX2 two-stage compatibility entry."""
 
     component_profile = LTX2_COMPONENT_PROFILE

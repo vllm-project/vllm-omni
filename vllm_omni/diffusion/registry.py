@@ -71,11 +71,6 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2Pipeline",
     ),
-    "LTX2ImageToVideoPipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX2ImageToVideoPipeline",
-    ),
     "LTX2TwoStagesPipeline": (
         "ltx2",
         "pipeline_ltx2_two_stage",
@@ -95,16 +90,6 @@ _DIFFUSION_MODELS = {
         "ltx2",
         "pipeline_ltx2",
         "LTX2I2VDMD2Pipeline",
-    ),
-    "LTX23Pipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX23Pipeline",
-    ),
-    "LTX23ImageToVideoPipeline": (
-        "ltx2",
-        "pipeline_ltx2",
-        "LTX23ImageToVideoPipeline",
     ),
     "StableAudioPipeline": (
         "stable_audio",
@@ -520,12 +505,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
-    "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
-    "LTX23Pipeline": "get_ltx2_post_process_func",
-    "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",

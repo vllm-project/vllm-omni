@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -52,6 +53,7 @@ _LTX_COMPONENT_SUBFOLDERS = (
     "vocoder",
     "scheduler",
 )
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,56 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
     vocoder_cls=LTX2VocoderWithBWE or LTX2Vocoder,
     vocoder_fallback_cls=LTX2Vocoder,
 )
+
+
+def _load_ltx_metadata_json(model: str, filename: str) -> dict[str, Any]:
+    """Load small checkpoint metadata without relying on repository names."""
+    if os.path.isdir(model):
+        path = os.path.join(model, filename)
+        if not os.path.isfile(path):
+            return {}
+    else:
+        try:
+            path = hf_hub_download(repo_id=model, filename=filename)
+        except Exception:
+            return {}
+    try:
+        with open(path) as config_file:
+            value = json.load(config_file)
+    except (OSError, TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def detect_ltx_model_version(model: str) -> str:
+    """Detect LTX-2 versus LTX-2.3 from checkpoint component metadata.
+
+    Official checkpoints use ``model_version`` metadata. Diffusers repositories
+    expose the equivalent distinction through the BWE vocoder introduced by
+    LTX-2.3. Unknown conversions retain the official LTX-2 fallback.
+    """
+    model_index = _load_ltx_metadata_json(model, "model_index.json")
+    if str(model_index.get("model_version", "")).startswith("2.3"):
+        return "2.3"
+
+    vocoder_entry = model_index.get("vocoder")
+    if isinstance(vocoder_entry, (list, tuple)) and vocoder_entry:
+        vocoder_class = str(vocoder_entry[-1])
+    elif isinstance(vocoder_entry, dict):
+        vocoder_class = str(vocoder_entry.get("_class_name", ""))
+    else:
+        vocoder_class = ""
+    if vocoder_class == "LTX2VocoderWithBWE":
+        return "2.3"
+
+    vocoder_config = _load_ltx_metadata_json(model, "vocoder/config.json")
+    if str(vocoder_config.get("model_version", "")).startswith("2.3"):
+        return "2.3"
+    if vocoder_config.get("_class_name") == "LTX2VocoderWithBWE":
+        return "2.3"
+
+    logger.info("Using LTX-2 defaults for checkpoint %s", model)
+    return "2"
 
 
 class _LTXConnectorAttnProcessor:

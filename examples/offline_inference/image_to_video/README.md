@@ -26,7 +26,8 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 480 x 832 | 81 | 50 | 5.0 | Around 60 GiB BF16 for basic single-card usage |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
-| LTX2 (local path + `--model-class-name LTX2ImageToVideoPipeline`) | 512 x 768 | 121 | 40 | 4.0 | Memory use depends on frame count and tensor parallelism |
+| `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | video 3.0 / audio 7.0 | Memory use depends on frame count and tensor parallelism |
+| `diffusers/LTX-2.3-Diffusers` | 512 x 768 | 121 | 30 | video 3.0 / audio 7.0 | 96GB-class GPU |
 
 !!! info
     Peak VRAM: based on basic single-card usage, batch size = 1, without any acceleration/optimization features. Some model weights cannot fit into one card with 80 GiB VRAM, which may need to use CPU offloading.
@@ -105,7 +106,7 @@ python image_to_video.py \
 | Argument | Type | Default | Description |
 | -------- | ---- | ------- | ----------- |
 | `--model` | str | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Diffusers I2V model ID or local path |
-| `--model-class-name` | str | `None` | Override model class name (e.g., `LTX2ImageToVideoPipeline`) |
+| `--model-class-name` | str | `None` | Optional pipeline override; LTX checkpoints default to `LTX2Pipeline` |
 | `--image` | str | (required) | Path to input image |
 | `--prompt` | str | `""` | Text description of desired motion/animation |
 | `--negative-prompt` | str | `""` | Optional list of artifacts to suppress |
@@ -200,7 +201,6 @@ python image_to_video.py \
 ```bash
 python image_to_video.py \
   --model /path/to/LTX-2 \
-  --model-class-name LTX2ImageToVideoPipeline \
   --image cherry_blossom.jpg \
   --prompt "A cinematic dolly shot of cherry blossoms" \
   --height 512 \
@@ -238,24 +238,20 @@ python image_to_video.py \
 ```bash
 python image_to_video.py \
   --model diffusers/LTX-2.3-Diffusers \
-  --model-class-name LTX23ImageToVideoPipeline \
   --image cherry_blossom.jpg \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
   --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 384 \
-  --width 512 \
-  --num-frames 25 \
-  --guidance-scale 4.0 \
-  --num-inference-steps 20 \
+  --height 512 \
+  --width 768 \
+  --num-frames 121 \
+  --num-inference-steps 30 \
   --frame-rate 24 \
   --fps 24 \
   --output ltx23_i2v_output.mp4
 ```
 
-Use the Diffusers-format checkpoint `diffusers/LTX-2.3-Diffusers`; the
-upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
-this pipeline. Pass `--model-class-name LTX23ImageToVideoPipeline` to select
-the LTX-2.3 image-to-video pipeline.
+Both LTX checkpoints select the unified `LTX2Pipeline`; the supplied image
+selects I2V. See the [LTX family recipe](../../../recipes/LTX/LTX-2.md).
 
 ### Cosmos3
 

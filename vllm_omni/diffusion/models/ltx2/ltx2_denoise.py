@@ -225,6 +225,7 @@ def prepare_scheduler_stage(
     latent_num_frames: int,
     latent_height: int,
     latent_width: int,
+    image_conditioned: bool = False,
 ) -> tuple[Any, Any, torch.Tensor]:
     if sigmas is not None and timesteps is not None:
         raise ValueError("Only one of `sigmas` or `timesteps` may be provided.")
@@ -235,6 +236,7 @@ def prepare_scheduler_stage(
         latent_num_frames,
         latent_height,
         latent_width,
+        image_conditioned=image_conditioned,
     )
     if sigmas is not None:
         scheduler_sigmas = torch.as_tensor(sigmas, dtype=torch.float32, device=device)
@@ -437,6 +439,7 @@ class LTXPhaseExecutor:
             latent_num_frames=latent_num_frames,
             latent_height=latent_height,
             latent_width=latent_width,
+            image_conditioned=conditioning_mask is not None,
         )
         forward_ctx = LTXForwardContext(
             req=req,

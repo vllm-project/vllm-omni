@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2TwoStagesVideoPipeline).",
+        help="Override model class name (e.g., LTX2Pipeline).",
     )
     parser.add_argument(
         "--deploy-config",

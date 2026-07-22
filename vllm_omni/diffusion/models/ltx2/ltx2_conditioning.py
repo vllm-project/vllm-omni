@@ -286,9 +286,10 @@ class LTXTextConditioningMixin:
 
 
 class LTXI2VConditioningMixin:
-    """First-frame conditioning behavior common to LTX2 and LTX2.3."""
+    """First-frame conditioning with optional unified T2V/I2V dispatch."""
 
     support_image_input = True
+    unified_text_image_entry = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -322,11 +323,12 @@ class LTXI2VConditioningMixin:
         image: Any | None,
         request_inputs: LTXRequestInputs,
     ) -> Any | None:
-        if image is not None or not req.prompts:
+        prompts = getattr(req, "prompts", None)
+        if image is not None or not prompts:
             return image
 
         raw_images = []
-        for prompt_item in req.prompts:
+        for prompt_item in prompts:
             if isinstance(prompt_item, str):
                 raw_image = None
             else:
@@ -339,8 +341,12 @@ class LTXI2VConditioningMixin:
                 raw_image = PIL.Image.open(raw_image).convert("RGB")
             raw_images.append(raw_image)
 
+        if all(raw_image is None for raw_image in raw_images) and self.unified_text_image_entry:
+            return None
         if any(raw_image is None for raw_image in raw_images) and request_inputs.latents is None:
-            raise ValueError("Image is required for LTX I2V generation.")
+            if not self.unified_text_image_entry:
+                raise ValueError("Image is required for LTX I2V generation.")
+            raise ValueError("LTX request batches cannot mix text-to-video and image-to-video prompts.")
         if len(raw_images) == 1:
             return raw_images[0]
         return raw_images or image
@@ -350,7 +356,7 @@ class LTXI2VConditioningMixin:
         request_inputs: LTXRequestInputs,
         image: Any | None = None,
     ) -> None:
-        if image is None and request_inputs.latents is None:
+        if not self.unified_text_image_entry and image is None and request_inputs.latents is None:
             raise ValueError("Provide either `image` or `latents`. Cannot leave both undefined.")
         super()._check_forward_inputs(request_inputs, image=image)
 
@@ -367,7 +373,21 @@ class LTXI2VConditioningMixin:
         device: torch.device | None = None,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if image is None and self.unified_text_image_entry:
+            return super().prepare_latents(
+                batch_size=batch_size,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                noise_scale=noise_scale,
+                dtype=dtype,
+                device=device,
+                generator=generator,
+                latents=latents,
+            )
+
         num_frames, height, width = latent_ops.resolve_video_latent_shape(
             height,
             width,
@@ -530,6 +550,15 @@ class LTXI2VConditioningMixin:
         noise_scale: float,
         image: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if image is None and self.unified_text_image_entry:
+            return super()._prepare_video_latents_stage(
+                request_inputs,
+                prompt_context,
+                device=device,
+                noise_scale=noise_scale,
+                image=None,
+            )
+
         if request_inputs.latents is None:
             if isinstance(image, torch.Tensor):
                 if image.ndim == 3:
@@ -548,17 +577,17 @@ class LTXI2VConditioningMixin:
             )
 
         return self.prepare_latents(
-            image,
-            prompt_context.batch_size * request_inputs.num_videos_per_prompt,
-            self.transformer.config.in_channels,
-            request_inputs.height,
-            request_inputs.width,
-            request_inputs.num_frames,
-            noise_scale,
-            prompt_context.positive_connector_prompt_embeds.dtype,
-            device,
-            request_inputs.generator,
-            request_inputs.latents,
+            image=image,
+            batch_size=prompt_context.batch_size * request_inputs.num_videos_per_prompt,
+            num_channels_latents=self.transformer.config.in_channels,
+            height=request_inputs.height,
+            width=request_inputs.width,
+            num_frames=request_inputs.num_frames,
+            noise_scale=noise_scale,
+            dtype=prompt_context.positive_connector_prompt_embeds.dtype,
+            device=device,
+            generator=request_inputs.generator,
+            latents=request_inputs.latents,
         )
 
     def _make_video_audio_scheduler(
@@ -567,7 +596,17 @@ class LTXI2VConditioningMixin:
         latent_num_frames: int,
         latent_height: int,
         latent_width: int,
+        *,
+        image_conditioned: bool = False,
     ) -> Any:
+        if not image_conditioned and self.unified_text_image_entry:
+            return super()._make_video_audio_scheduler(
+                audio_scheduler,
+                latent_num_frames,
+                latent_height,
+                latent_width,
+                image_conditioned=False,
+            )
         return I2VVideoAudioScheduler(
             self,
             audio_scheduler,
@@ -583,6 +622,8 @@ class LTXI2VConditioningMixin:
     ) -> LTXDenoiseContext:
         denoise_ctx = super()._prepare_denoise_context_for_cfg(forward_ctx, denoise_ctx)
         if denoise_ctx.conditioning_mask is None:
+            if self.unified_text_image_entry:
+                return denoise_ctx
             raise ValueError("LTX I2V denoising requires a conditioning mask.")
 
         mask_batch = denoise_ctx.conditioning_mask.shape[0]
@@ -608,6 +649,14 @@ class LTXI2VConditioningMixin:
         audio_token_count: int,
     ) -> dict[str, torch.Tensor]:
         if denoise_ctx.conditioning_mask is None:
+            if self.unified_text_image_entry:
+                return super()._denoise_timestep_kwargs(
+                    ts,
+                    forward_ctx,
+                    denoise_ctx,
+                    video_token_count=video_token_count,
+                    audio_token_count=audio_token_count,
+                )
             raise ValueError("LTX I2V denoising requires a conditioning mask.")
         kwargs = super()._denoise_timestep_kwargs(
             ts,

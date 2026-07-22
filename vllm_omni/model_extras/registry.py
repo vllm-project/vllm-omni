@@ -231,11 +231,8 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         }
         for model_class_name in (
             "LTX2Pipeline",
-            "LTX2ImageToVideoPipeline",
             "LTX2TwoStagesPipeline",
             "LTX2ImageToVideoTwoStagesPipeline",
-            "LTX23Pipeline",
-            "LTX23ImageToVideoPipeline",
         )
     },
     "WanVACEPipeline": {

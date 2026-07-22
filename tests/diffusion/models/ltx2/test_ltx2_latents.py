@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.models.ltx2 import ltx2_latents as latent_ops
-from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline, LTX23Pipeline
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -23,9 +23,8 @@ def _make_pipeline(pipeline_cls, sequence_parallel_size: int = 1):
     return pipeline
 
 
-@pytest.mark.parametrize("pipeline_cls", [LTX2Pipeline, LTX23Pipeline])
-def test_prepare_video_latents_samples_directly_in_packed_token_space(pipeline_cls):
-    pipeline = _make_pipeline(pipeline_cls)
+def test_prepare_video_latents_samples_directly_in_packed_token_space():
+    pipeline = _make_pipeline(LTX2Pipeline)
     pipeline.vae_spatial_compression_ratio = 8
     pipeline.vae_temporal_compression_ratio = 8
     pipeline.transformer_spatial_patch_size = 2
@@ -47,9 +46,8 @@ def test_prepare_video_latents_samples_directly_in_packed_token_space(pipeline_c
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("pipeline_cls", [LTX2Pipeline, LTX23Pipeline])
-def test_prepare_audio_latents_samples_directly_in_packed_token_space(pipeline_cls):
-    pipeline = _make_pipeline(pipeline_cls)
+def test_prepare_audio_latents_samples_directly_in_packed_token_space():
+    pipeline = _make_pipeline(LTX2Pipeline)
 
     expected_generator = torch.Generator().manual_seed(42)
     expected = torch.randn((1, 3, 32), generator=expected_generator)
@@ -69,7 +67,7 @@ def test_prepare_audio_latents_samples_directly_in_packed_token_space(pipeline_c
 
 
 def test_prepare_audio_latents_pads_generated_dummy_length_for_sp():
-    pipeline = _make_pipeline(LTX23Pipeline, sequence_parallel_size=2)
+    pipeline = _make_pipeline(LTX2Pipeline, sequence_parallel_size=2)
 
     latents, original_num_frames, padded_num_frames = pipeline.prepare_audio_latents(
         batch_size=1,
@@ -120,7 +118,8 @@ def test_unpad_audio_latents_restores_original_frames_before_unpack():
 
 
 def test_prepare_audio_latents_accepts_already_padded_4d_latents_for_sp():
-    pipeline = _make_pipeline(LTX23Pipeline, sequence_parallel_size=4)
+    pipeline = _make_pipeline(LTX2Pipeline, sequence_parallel_size=4)
+    pipeline.preserve_sp_padded_audio_duration = True
     latents = torch.arange(96, dtype=torch.float32).view(1, 2, 12, 4)
 
     audio_latent_length = pipeline._resolve_audio_latent_length(10, latents)
@@ -142,7 +141,7 @@ def test_prepare_audio_latents_accepts_already_padded_4d_latents_for_sp():
 
 
 def test_resolve_audio_latent_length_preserves_legacy_4d_shape_inference():
-    pipeline = _make_pipeline(LTX23Pipeline, sequence_parallel_size=4)
+    pipeline = _make_pipeline(LTX2Pipeline, sequence_parallel_size=4)
     latents = torch.zeros(1, 2, 13, 4)
 
     audio_latent_length = pipeline._resolve_audio_latent_length(10, latents)
@@ -151,7 +150,7 @@ def test_resolve_audio_latent_length_preserves_legacy_4d_shape_inference():
 
 
 def test_prepare_audio_latents_rejects_incompatible_provided_length():
-    pipeline = _make_pipeline(LTX23Pipeline, sequence_parallel_size=4)
+    pipeline = _make_pipeline(LTX2Pipeline, sequence_parallel_size=4)
     latents = torch.zeros(1, 11, 4)
 
     with pytest.raises(ValueError, match="incompatible audio frame count"):
