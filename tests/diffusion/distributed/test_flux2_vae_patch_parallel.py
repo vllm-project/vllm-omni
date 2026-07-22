@@ -75,7 +75,7 @@ def _run_flux2_generate(
 ) -> Image.Image:
     current_omni_platform.empty_cache()
 
-    request: dict = {"prompt": PROMPT}
+    request: dict = {"prompt": PROMPT, "negative_prompt": NEGATIVE_PROMPT}
     if conditioning_image is not None:
         request["multi_modal_data"] = {"image": conditioning_image}
 
@@ -96,7 +96,6 @@ def _run_flux2_generate(
                     width=width,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=4.0,
-                    negative_prompt=NEGATIVE_PROMPT,
                     seed=seed,
                     num_outputs_per_prompt=1,
                 ),
