@@ -11,7 +11,6 @@ upload_pipeline() {
     buildkite-agent pipeline upload .buildkite/intel/pipeline-intel.yml
 }
 
-is_skip_all_ci
-is_skip_l23_ci intel l2
+gate_bootstrap_ci intel l2
 
 upload_pipeline

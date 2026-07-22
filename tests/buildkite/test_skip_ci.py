@@ -224,6 +224,7 @@ def test_decision_serializes_to_dict() -> None:
 
 def test_yaml_gated_message_lists_changed_and_targets() -> None:
     decision = _decision([".buildkite/cuda/test-ready.yml"])
+    assert decision.message.startswith("only CI config YAML changed")
     assert "changed: L2=[.buildkite/cuda/test-ready.yml]" in decision.message
     assert "run: cuda/l2" in decision.message
     assert "skip: cuda/l3" in decision.message

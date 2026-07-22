@@ -151,11 +151,10 @@ if [[ $BUILDKITE_BRANCH == "main" ]]; then
 fi
 
 # Early exit: unified skip-ci (docs / skip marks) and CI-yaml-only level targeting.
-is_skip_all_ci
 if [[ $BUILDKITE_BRANCH == "main" ]]; then
-    is_skip_l23_ci amd l3
+    gate_bootstrap_ci amd l3
 else
-    is_skip_l23_ci amd l2
+    gate_bootstrap_ci amd l2
 fi
 
 patterns=(

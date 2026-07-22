@@ -7,10 +7,13 @@
 for Buildkite bootstrap / upload scripts.
 
 CLI (for bootstrap scripts; exit code is the signal):
+  python3 skip_ci.py gate <platform> <level>
+      Exit 0 when bootstrap should stop (skip-all, or that L2/L3 target is off).
+      Prints ``skip-all`` or ``skip-l23`` on stdout; logs the decision once.
   python3 skip_ci.py check-skip-all
       Exit 0 when only docs/skip-mark changes → bootstrap skips entire CI upload.
   python3 skip_ci.py check-skip-l2-l3 <platform> <level>
-      Exit 0 when that L2/L3 pipeline should be skipped (ci-yaml-only diffs).
+      Exit 0 when that L2/L3 pipeline should be skipped (CI config YAML-only diffs).
   python3 skip_ci.py print-annotate
       Print decision message for Buildkite annotation.
 """
@@ -25,7 +28,7 @@ import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-LOG = "skip_ci"
+LOG = "[skip-ci]"
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 PLATFORMS = ("cuda", "amd", "intel", "npu")
@@ -508,7 +511,7 @@ def _format_yaml_gated_message(buckets: DiffBuckets, decision: CiDecision) -> st
     changed = "; ".join(changed_parts) if changed_parts else "none"
     run = ", ".join(run_targets) if run_targets else "none"
     skip = ", ".join(skip_targets) if skip_targets else "none"
-    return f"ci-yaml-only change — changed: {changed}; run: {run}; skip: {skip}"
+    return f"only CI config YAML changed — changed: {changed}; run: {run}; skip: {skip}"
 
 
 def resolve_ci_decision(
@@ -532,7 +535,7 @@ def resolve_ci_decision(
     if (buckets.has_l23_yaml_changes or buckets.has_l45_yaml_changes) and (
         buckets.has_doc_changes or buckets.has_skip_test_changes
     ):
-        return _finish(CiDecision(), "mixed doc/skip-mark and ci-yaml changes; run normal CI")
+        return _finish(CiDecision(), "mixed doc/skip-mark and CI config YAML changes; run normal CI")
 
     if not buckets.has_l23_yaml_changes and not buckets.has_l45_yaml_changes:
         if buckets.has_skip_test_changes and diff_range is None:
@@ -561,6 +564,13 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    gate_parser = subparsers.add_parser(
+        "gate",
+        help="exit 0 when bootstrap should stop (skip-all or PLATFORM/LEVEL disabled); logs once",
+    )
+    gate_parser.add_argument("platform", help="cuda, amd, intel, or npu")
+    gate_parser.add_argument("level", choices=("l2", "l3"), help="test level")
+
     subparsers.add_parser(
         "check-skip-all",
         help="exit 0 when docs/skip-mark-only diff should skip entire CI upload",
@@ -568,7 +578,7 @@ def main() -> int:
 
     skip_parser = subparsers.add_parser(
         "check-skip-l2-l3",
-        help="exit 0 when PLATFORM l2/l3 pipeline should be skipped (ci-yaml-only diffs)",
+        help="exit 0 when PLATFORM l2/l3 pipeline should be skipped (CI config YAML-only diffs)",
     )
     skip_parser.add_argument("platform", help="cuda, amd, intel, or npu")
     skip_parser.add_argument("level", choices=("l2", "l3"), help="test level")
@@ -580,6 +590,15 @@ def main() -> int:
 
     args = parser.parse_args()
     decision = resolve_ci_context_from_git().decision
+
+    if args.command == "gate":
+        if decision.skip_all:
+            print("skip-all")
+            return 0
+        if not decision.is_run(args.platform, args.level):
+            print("skip-l23")
+            return 0
+        return 1
 
     if args.command == "check-skip-all":
         return 0 if decision.skip_all else 1

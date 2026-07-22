@@ -12,7 +12,7 @@ Canonical layout (prefer these paths for new changes):
 .buildkite/
 ├── common/                          # Shared across platforms
 │   ├── scripts/
-│   │   ├── skip_ci.py               # Docs/skip-mark / CI-YAML-only level logic
+│   │   ├── skip_ci.py               # skip-ci decision (docs / skip-mark / CI YAML paths)
 │   │   ├── upload_pipeline.py       # Bootstrap + test-pipeline uploader (CUDA/NPU)
 │   │   └── resolve_skip_ci.sh       # Shell helpers for AMD/Intel bootstrap
 │   └── ci_mirror_hardwares.yml      # CUDA uploader presets (referenced by name only)
@@ -55,7 +55,7 @@ Canonical layout (prefer these paths for new changes):
 | Platform code under platform dir | New CUDA jobs go in `.buildkite/cuda/`; do not add new top-level `.buildkite/test-*.yml` files. |
 | Shared logic in `common/` | Skip-ci and CUDA upload rendering stay in `.buildkite/common/scripts/`. |
 | Bootstrap vs test YAML | **Bootstrap** (`pipeline*.yml`) builds images and uploads **child** test pipelines. **Test** YAML (`test-*.yml`) lists pytest steps only. |
-| Register CI-YAML in `skip_ci.py` | If you add a new whitelisted test pipeline file, update `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES` in `.buildkite/common/scripts/skip_ci.py` so docs-only / CI-YAML-only PRs behave correctly. |
+| Register CI YAML in `skip_ci.py` | If you add a new whitelisted test pipeline file, update `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES` in `.buildkite/common/scripts/skip_ci.py` so skip-ci paths stay correct. |
 
 There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` prefix). Treat `.buildkite/cuda/*` as source of truth.
 
@@ -197,8 +197,8 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 
 #### Bootstrap skip {#bootstrap-skip}
 
-- **Docs / skip-mark only** → suppress default CI (`skip_all`). PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. Exception: on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4 plus L2/L3 (with `--e2e`); `WEEKLY=1` still builds the image and uploads L5.
-- **CI-YAML only** → skip uploading L2 or L3 for platforms whose whitelisted files were not touched. Register paths in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES`. Bootstrap `bootstrap-upload-steps.yml` steps get label/diff-aware `if` expressions injected by `upload_pipeline.py --upload` (by step `key`: `image-build`, `upload-ready-pipeline`, etc.).
+- **Docs / skip-mark only** → skip-ci path `skip_all`: suppress default CI. PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. Exception: on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4 plus L2/L3 (with `--e2e`); `WEEKLY=1` still builds the image and uploads L5.
+- **Only whitelisted CI YAML changed** → skip-ci path that enables L2/L3 only for touched platforms/levels. Register paths in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES`. Bootstrap `bootstrap-upload-steps.yml` steps get label/diff-aware `if` expressions injected by `upload_pipeline.py --upload` (by step `key`: `image-build`, `upload-ready-pipeline`, etc.).
 
 #### Step filtering {#step-filtering}
 
