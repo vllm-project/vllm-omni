@@ -4,7 +4,6 @@
 """Utilities for OmniConnector configuration and validation."""
 
 import json
-import sys
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,7 +41,6 @@ KV_REPLICA_PORT_STRIDE = 1024
 
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,
-    default_shm_threshold: int = 65536,
     purpose: str = "request_forwarding",
     caller_stage_id: int | str | None = None,
     is_sender: bool | None = None,
@@ -53,7 +51,7 @@ def initialize_connectors_from_config(
     Returns:
         tuple: (OmniTransferConfig, dict of {(from, to): connector_instance})
     """
-    transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=default_shm_threshold)
+    transfer_config = load_omni_transfer_config(config_path)
 
     if not transfer_config:
         logger.info("No OmniTransferConfig provided")
@@ -190,7 +188,6 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
 def load_omni_transfer_config(
     config_path: str | Path | None = None,
     config_dict: dict[str, Any] | None = None,
-    default_shm_threshold: int = 65536,
 ) -> OmniTransferConfig | None:
     """Load OmniTransferConfig from file or dict."""
     if config_path is None and config_dict is None:
@@ -325,10 +322,7 @@ def load_omni_transfer_config(
                     expected_edges.add(edge_key)
                     if edge_key not in connectors:
                         logger.info(f"Auto-configuring SharedMemoryConnector for edge {edge_key}")
-                        connectors[edge_key] = ConnectorSpec(
-                            name="SharedMemoryConnector",
-                            extra={"shm_threshold_bytes": default_shm_threshold},
-                        )
+                        connectors[edge_key] = ConnectorSpec(name="SharedMemoryConnector")
 
             # Fallback: infer edges from engine_input_source for each stage
             for stage_config in stage_args:
@@ -343,9 +337,7 @@ def load_omni_transfer_config(
 
                     if edge_key not in connectors:
                         logger.info(f"Auto-configuring SharedMemoryConnector for edge {edge_key}")
-                        connectors[edge_key] = ConnectorSpec(
-                            name="SharedMemoryConnector", extra={"shm_threshold_bytes": default_shm_threshold}
-                        )
+                        connectors[edge_key] = ConnectorSpec(name="SharedMemoryConnector")
 
         except Exception as e:
             logger.warning(f"Failed to auto-configure SHM connectors: {e}")
@@ -369,22 +361,16 @@ def load_omni_transfer_config(
 
 
 def initialize_orchestrator_connectors(
-    config_path: str | None, worker_backend: str | None = "multi_process", shm_threshold_bytes: int = 65536
+    config_path: str | None,
 ) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """Initialize connectors shared at orchestrator level.
     Args:
         config_path: The path to the configuration file.
-        worker_backend: The backend to use for the worker.
     Returns:
         A tuple containing the OmniTransferConfig and a dictionary of connectors.
     """
-    if worker_backend == "ray":
-        default_shm_threshold = sys.maxsize
-    else:
-        default_shm_threshold = max(0, shm_threshold_bytes)
     transfer_config, connectors = initialize_connectors_from_config(
         config_path,
-        default_shm_threshold=default_shm_threshold,
         purpose="request_forwarding",
         caller_stage_id="orchestrator",
         is_sender=True,
