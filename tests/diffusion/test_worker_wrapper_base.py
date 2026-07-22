@@ -184,7 +184,7 @@ class TestWorkerWrapperBaseDelegation:
         mock_reqs = [mocker.Mock()]
         result = wrapper.execute_model(mock_reqs, mock_od_config)
 
-        wrapper.worker.execute_model.assert_called_once_with(mock_reqs, mock_od_config, kv_prefetch_jobs=None)
+        wrapper.worker.execute_model.assert_called_once_with(mock_reqs, mock_od_config, kv_prefetch_job=None)
         assert result == mock_output
 
     def test_load_weights_delegation(self, mocker: MockerFixture, mock_od_config):

@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = logging.getLogger(__name__)
 
@@ -279,9 +279,9 @@ class HeliosPipeline(
 
     def prepare_encode(
         self,
-        state: DiffusionRequestState,
+        state: StepRequestState,
         **kwargs: Any,
-    ) -> DiffusionRequestState:
+    ) -> StepRequestState:
         """Initialize Helios request state for chunk-wise step execution."""
         del kwargs
         # Wrap the single request in a DiffusionRequestBatch so the batch
@@ -530,7 +530,7 @@ class HeliosPipeline(
         self._prepare_next_chunk(state)
         return state
 
-    def _prepare_next_chunk(self, state: DiffusionRequestState) -> None:
+    def _prepare_next_chunk(self, state: StepRequestState) -> None:
         extra = state.extra
         k = state.chunk_index
         is_first_chunk = k == 0
@@ -604,7 +604,7 @@ class HeliosPipeline(
         state.step_index = 0
         self._num_timesteps = state.chunk_num_steps
 
-    def _prepare_stage2_chunk(self, state: DiffusionRequestState) -> None:
+    def _prepare_stage2_chunk(self, state: StepRequestState) -> None:
         extra = state.extra
         batch_size, num_channel, num_frames_lat, height, width = state.latents.shape
         latents_flat = state.latents.permute(0, 2, 1, 3, 4).reshape(
@@ -634,7 +634,7 @@ class HeliosPipeline(
             return num_steps * 2
         return num_steps
 
-    def _set_stage2_timesteps(self, state: DiffusionRequestState) -> None:
+    def _set_stage2_timesteps(self, state: StepRequestState) -> None:
         extra = state.extra
         patch_size = self.transformer.config.patch_size
         image_seq_len = (state.latents.shape[-1] * state.latents.shape[-2] * state.latents.shape[-3]) // (
@@ -655,7 +655,7 @@ class HeliosPipeline(
     def denoise_step(
         self,
         input_batch: InputBatch,
-        states: Sequence[DiffusionRequestState],
+        states: Sequence[StepRequestState],
         **kwargs: Any,
     ) -> torch.Tensor | None:
         del kwargs
@@ -668,7 +668,7 @@ class HeliosPipeline(
 
     def _denoise_stage1_step(
         self,
-        state: DiffusionRequestState,
+        state: StepRequestState,
         latents: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
@@ -727,7 +727,7 @@ class HeliosPipeline(
             cfg_normalize=False,
         )
 
-    def _denoise_stage2_step(self, state: DiffusionRequestState) -> torch.Tensor:
+    def _denoise_stage2_step(self, state: StepRequestState) -> torch.Tensor:
         extra = state.extra
         latents = state.latents
         assert latents is not None
@@ -773,7 +773,7 @@ class HeliosPipeline(
 
     def step_scheduler(
         self,
-        state: DiffusionRequestState,
+        state: StepRequestState,
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
@@ -800,7 +800,7 @@ class HeliosPipeline(
             state.step_in_chunk += 1
             state.step_index = state.step_in_chunk
 
-    def _step_scheduler_stage2(self, state: DiffusionRequestState, noise_pred: torch.Tensor) -> None:
+    def _step_scheduler_stage2(self, state: StepRequestState, noise_pred: torch.Tensor) -> None:
         extra = state.extra
         t = state.current_timestep
         assert t is not None and state.latents is not None
@@ -866,7 +866,7 @@ class HeliosPipeline(
 
     def post_decode(
         self,
-        state: DiffusionRequestState,
+        state: StepRequestState,
         **kwargs: Any,
     ) -> DiffusionOutput:
         del kwargs

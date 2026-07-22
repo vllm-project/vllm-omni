@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 
 def _normalize_prompt_embeds(x: torch.Tensor) -> torch.Tensor:
@@ -59,9 +59,9 @@ def _pad_mask(x: torch.Tensor, target_seq_len: int) -> torch.Tensor:
 
 
 def _select_states(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     idx_mapping: torch.Tensor | None,
-) -> tuple[list[DiffusionRequestState], torch.Tensor, np.ndarray]:
+) -> tuple[list[StepRequestState], torch.Tensor, np.ndarray]:
     if not states:
         raise ValueError("Cannot build InputBatch from empty states.")
 
@@ -73,7 +73,7 @@ def _select_states(
             raise ValueError("idx_mapping must be a 1D tensor.")
         idx_mapping = idx_mapping.to(dtype=torch.int32)
 
-    selected_states: list[DiffusionRequestState] = []
+    selected_states: list[StepRequestState] = []
     for batch_idx, state_idx in enumerate(idx_mapping.tolist()):
         if state_idx < 0 or state_idx >= len(states):
             raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
@@ -81,12 +81,12 @@ def _select_states(
     return selected_states, idx_mapping, idx_mapping.detach().cpu().numpy()
 
 
-def _prepare_request_ids(states: Sequence[DiffusionRequestState]) -> list[str]:
+def _prepare_request_ids(states: Sequence[StepRequestState]) -> list[str]:
     return [state.request_id for state in states]
 
 
 def _prepare_prompt_field_on_state(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     *,
     embeds_attr: str,
     mask_attr: str,
@@ -180,7 +180,7 @@ def _get_seq_lens_from_mask(mask: torch.Tensor) -> list[int]:
 
 
 def _get_request_prompt_seq_lens(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     *,
     embeds_attr: str,
     mask_attr: str,
@@ -209,7 +209,7 @@ def _get_request_prompt_seq_lens(
 
 
 def _prepare_request_prompt_field(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     *,
     embeds_attr: str,
     mask_attr: str,
@@ -266,7 +266,7 @@ def _prepare_request_prompt_field(
 
 
 def _prepare_padded_prompt_fields(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     embeds_attr: str,
     mask_attr: str,
@@ -337,7 +337,7 @@ def _prepare_padded_prompt_fields(
 
 
 def _prepare_latents(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -352,7 +352,7 @@ def _prepare_latents(
 
 
 def _require_state_latents(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     *,
     for_field: str,
 ) -> torch.Tensor:
@@ -382,7 +382,7 @@ def _expand_scalar_or_vector(
 
 
 def _prepare_timesteps(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -410,9 +410,9 @@ def _prepare_timesteps(
 
 
 def _prepare_cfg_scalars(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
 ) -> tuple[bool, float, bool]:
-    def _cfg_scalars(state: DiffusionRequestState) -> tuple[bool, float, bool]:
+    def _cfg_scalars(state: StepRequestState) -> tuple[bool, float, bool]:
         true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
         cfg_normalize = bool(getattr(state.sampling, "cfg_normalize", False))
         return state.do_true_cfg, true_cfg_scale, cfg_normalize
@@ -425,7 +425,7 @@ def _prepare_cfg_scalars(
 
 
 def _prepare_guidance(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
@@ -461,7 +461,7 @@ def _prepare_guidance(
 
 
 def _prepare_image_latents(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
@@ -478,7 +478,7 @@ def _prepare_image_latents(
 
 
 def _prepare_seq_lens(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     attr_name: str,
 ) -> list[int] | None:
     values = [getattr(state, attr_name) for state in states]
@@ -489,7 +489,7 @@ def _prepare_seq_lens(
     return [int(value[0]) for value in values if value is not None]
 
 
-def _prepare_img_shapes(states: Sequence[DiffusionRequestState]) -> list | None:
+def _prepare_img_shapes(states: Sequence[StepRequestState]) -> list | None:
     values = [state.img_shapes for state in states]
     if all(value is None for value in values):
         return None
@@ -499,7 +499,7 @@ def _prepare_img_shapes(states: Sequence[DiffusionRequestState]) -> list | None:
 
 
 def _prepare_prompt_embeds(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     embeds_out: torch.Tensor | None = None,
     mask_out: torch.Tensor | None = None,
@@ -516,7 +516,7 @@ def _prepare_prompt_embeds(
 
 
 def _prepare_negative_prompt_embeds(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     *,
     embeds_out: torch.Tensor | None = None,
     mask_out: torch.Tensor | None = None,
@@ -544,7 +544,7 @@ def _same_composition(
 
 
 def _scatter_batch_tensor_by_mapping(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     idx_mapping_np: np.ndarray,
     *,
     attr_name: str,
@@ -582,7 +582,7 @@ class InputBatch:
     """Ephemeral step-level batch view.
 
     Static request-local tensors are normalized and padded onto
-    ``DiffusionRequestState`` itself, making the request state the persistent
+    ``StepRequestState`` itself, making the request state the persistent
     source of truth. ``InputBatch`` only assembles a contiguous view for the
     current step and refreshes dynamic fields in-place when composition is
     unchanged.
@@ -613,7 +613,7 @@ class InputBatch:
     img_shapes: list | None = None
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None
-    states: Sequence[DiffusionRequestState] = field(default_factory=tuple)
+    states: Sequence[StepRequestState] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if len(self.request_ids) != int(self.idx_mapping.numel()):
@@ -625,14 +625,14 @@ class InputBatch:
 
     def _refresh_dynamic_fields(
         self,
-        selected_states: Sequence[DiffusionRequestState],
+        selected_states: Sequence[StepRequestState],
     ) -> None:
         self.latents = _prepare_latents(selected_states, out=self.latents)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
 
     def _refresh_static_fields(
         self,
-        states: Sequence[DiffusionRequestState],
+        states: Sequence[StepRequestState],
     ) -> None:
         self.do_true_cfg, self.true_cfg_scale, self.cfg_normalize = _prepare_cfg_scalars(states)
         self.guidance = _prepare_guidance(states, out=self.guidance)
@@ -656,7 +656,7 @@ class InputBatch:
 
     def _repack_dynamic_fields(
         self,
-        selected_states: Sequence[DiffusionRequestState],
+        selected_states: Sequence[StepRequestState],
     ) -> None:
         # Same-composition cache hits reuse static prompt fields; request ids
         # must keep the same encoded prompt metadata for the batch lifetime.
@@ -665,7 +665,7 @@ class InputBatch:
 
     def _rebuild(
         self,
-        selected_states: Sequence[DiffusionRequestState],
+        selected_states: Sequence[StepRequestState],
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
         request_ids: list[str],
@@ -685,7 +685,7 @@ class InputBatch:
     @classmethod
     def make_batch(
         cls,
-        states: Sequence[DiffusionRequestState],
+        states: Sequence[StepRequestState],
         idx_mapping: torch.Tensor | None = None,
         cached_batch: InputBatch | None = None,
     ) -> InputBatch:
@@ -737,7 +737,7 @@ class InputBatch:
 
 
 def scatter_latents(
-    states: Sequence[DiffusionRequestState],
+    states: Sequence[StepRequestState],
     input_batch: InputBatch,
 ) -> None:
     """Scatter the step-updated latents back into persistent request states.

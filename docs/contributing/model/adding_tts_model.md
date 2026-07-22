@@ -175,15 +175,16 @@ vllm_omni/model_executor/models/
   your_model_name/
     __init__.py
     your_model.py                    # Unified class (stage dispatch)
+    pipeline.py                      # Pipeline topology registry entry
     your_model_ar_stage.py           # Stage 0: AR stage
     your_model_decoder.py            # Stage 1: audio decoder
 
 vllm_omni/model_executor/stage_input_processors/
   your_model_name.py                 # Stage 0 -> Stage 1 transition
 
-vllm_omni/model_executor/stage_configs/
-  your_model_name.yaml               # Batch mode config
-  your_model_name_async_chunk.yaml   # Streaming mode config
+vllm_omni/deploy/
+  your_model_name.yaml               # Batch/deploy config
+  your_model_name_async_chunk.yaml   # Streaming/deploy config
 ```
 
 ### Example placement
@@ -444,6 +445,13 @@ Key configuration fields:
 | `custom_process_next_stage_input_func` | Async chunk processor function path (streaming only) |
 | `final_output` | Whether this stage produces the final user-facing output |
 | `final_output_type` | Type of final output (`audio`, `text`, etc.) |
+
+!!! note
+    New in-tree models should define frozen topology in `models/<model>/pipeline.py`,
+    register it in `vllm_omni/config/pipeline_registry.py`, and put deployment
+    knobs in `vllm_omni/deploy/<model>.yaml`. Legacy `stage_args` YAMLs are still
+    accepted for custom configs via `--stage-configs-path`, but should not be used
+    for new bundled defaults.
 
 ### Batch mode
 
@@ -771,8 +779,9 @@ directly from the model's own generator.
 vllm_omni/model_executor/models/your_model_name/
     __init__.py
     modeling_your_model_name.py    # unified class: load_weights + forward + streaming
+    pipeline.py                    # single-stage pipeline topology
 
-vllm_omni/model_executor/stage_configs/your_model_name.yaml
+vllm_omni/deploy/your_model_name.yaml
 ```
 
 No stage input processor is needed.

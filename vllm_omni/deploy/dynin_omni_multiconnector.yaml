@@ -31,8 +31,6 @@ connectors:
   # Alternative SHM connector with an explicit threshold.
   shared_memory_connector:
     name: SharedMemoryConnector
-    extra:
-      shm_threshold_bytes: 65536    # 64KB threshold
 
 stages:
   - stage_id: 0

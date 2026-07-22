@@ -1,0 +1,35 @@
+[
+    {
+        "test_name": "test_boogu_image_edit_single_device",
+        "description": "Single-device baseline (no parallelism), concurrency sweep 1/2/4 at 512x512, 28 steps. Text-only edit path (2 predictions/step); a double-guidance (guidance_scale_2) case is a follow-up since the random dataset cannot inject extra_body params. Baselines recorded on 1x A40 46GB (measured c1/c2/c4: qps 0.0337/0.0336/0.0336, latency_mean 29.64/56.50/101.48 s, peak mem 36754 MB) with ~10% margin.",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Boogu/Boogu-Image-0.1-Edit",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps28_i2i",
+                "dataset": "random",
+                "task": "i2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 28,
+                "num-prompts": 10,
+                "max-concurrency": [1, 2, 4],
+                "warmup-requests": 4,
+                "warmup-concurrency": 4,
+                "warmup-num-inference-steps": 28,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": {"1": 0.0303, "2": 0.0302, "4": 0.0302},
+                    "latency_mean": {"1": 32.6, "2": 62.2, "4": 111.7},
+                    "peak_memory_mb_max": 40500,
+                    "peak_memory_mb_mean": 40500
+                }
+            }
+        ]
+    }
+]
