@@ -7,8 +7,7 @@ steps:
     commands:
       - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/pipeline-npu.yml"
     agents:
-      queue: "ascend-a2b3"
-      resource_class: "npu-1"
+      queue: "cpu_queue_premerge"
 
 ---
 steps:
