@@ -38,9 +38,8 @@ class InterRequestCacheBackend(CacheBackend):
       partial-resume capability)
 
     A :class:`StepLatentsRecorder` is always attached to the pipeline to capture
-    intermediate latents during denoising.  These are stored in the in-memory
-    cache alongside the final latent.  When ``record_step_latents`` is enabled,
-    the step latents are additionally saved to disk.
+    intermediate latents during denoising.  These are stored in the cache
+    alongside the final latent.
 
     Usage:
         omni = Omni(
@@ -48,9 +47,7 @@ class InterRequestCacheBackend(CacheBackend):
             cache_backend="inter_request",
             cache_config={
                 "inter_request_max_entries": 100,
-                "inter_request_max_memory_gb": 4.0,
-                "inter_request_record_step_latents": True,
-                "inter_request_step_latents_dir": "./step_latents",
+                "inter_request_max_memory_gb": 0.0,
             }
         )
     """
@@ -58,7 +55,7 @@ class InterRequestCacheBackend(CacheBackend):
     def __init__(self, config: DiffusionCacheConfig):
         super().__init__(config)
         max_entries = getattr(config, "inter_request_max_entries", 100)
-        max_memory_gb = getattr(config, "inter_request_max_memory_gb", 4.0)
+        max_memory_gb = getattr(config, "inter_request_max_memory_gb", 0.0)
 
         # Initialize LMCache ECCacheEngine for CPU→Disk tiered storage.
         # ECCacheEngine stores arbitrary tensors by string key with built-in
@@ -74,7 +71,7 @@ class InterRequestCacheBackend(CacheBackend):
                 local_cpu=True,
                 max_local_cpu_size=getattr(config, "inter_request_lmcache_max_cpu_gb", 5.0),
                 local_disk=lmcache_disk_dir,
-                max_local_disk_size=getattr(config, "inter_request_lmcache_max_disk_gb", 0.0),
+                max_local_disk_size=getattr(config, "inter_request_lmcache_max_disk_gb", 100.0),
                 save_decode_cache=True,
             )
             lc_metadata = LMCacheMetadata(
@@ -106,8 +103,6 @@ class InterRequestCacheBackend(CacheBackend):
         )
         self._pipeline = None
 
-        self._record_step_latents = getattr(config, "inter_request_record_step_latents", False)
-        self._step_latents_dir = getattr(config, "inter_request_step_latents_dir", "./step_latents")
         self._persistent_cache_dir = getattr(config, "inter_request_persistent_cache_dir", None)
 
         self._clip_model_path = getattr(config, "inter_request_clip_model_path", None)
@@ -130,12 +125,11 @@ class InterRequestCacheBackend(CacheBackend):
 
         logger.info(
             "InterRequestCacheBackend initialized: "
-            "max_entries=%d, max_memory_gb=%.1f, record_step_latents=%s, "
+            "max_entries=%d, max_memory_gb=%.1f, "
             "persistent_cache_dir=%s, clip_model_path=%s, "
             "clip_threshold=%.2f, clip_min_skip=%d, clip_max_skip_ratio=%.2f",
             max_entries,
             max_memory_gb,
-            self._record_step_latents,
             self._persistent_cache_dir,
             self._clip_model_path,
             self._clip_threshold,
@@ -167,9 +161,8 @@ class InterRequestCacheBackend(CacheBackend):
                 )
 
         logger.info(
-            "InterRequestCacheBackend enabled on pipeline %s (save_step_latents_to_disk=%s)",
+            "InterRequestCacheBackend enabled on pipeline %s",
             pipeline.__class__.__name__,
-            self._record_step_latents,
         )
 
     def _init_clip_encoder(self) -> None:
@@ -254,49 +247,6 @@ class InterRequestCacheBackend(CacheBackend):
             logger.warning("CLIP encoding failed: %s", e)
             return None
 
-    def encode_image(self, image_tensor: torch.Tensor) -> torch.Tensor | None:
-        # Video tensors are 5D [B, C, T, H, W] — skip image embedding for video
-        if image_tensor.dim() == 5:
-            return None
-        if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:
-            return None
-        if self._clip_image_processor is None:
-            return None
-        try:
-            from PIL import Image
-
-            img = image_tensor.float().cpu()
-            if img.dim() == 4:
-                img = img[0]  # [C, H, W]
-            # Only process 3-channel RGB images (CLIP expects 3 channels).
-            # Latents have 16+ channels and cannot be directly CLIP-encoded.
-            if img.shape[0] != 3:
-                logger.debug("encode_image: skipping non-RGB tensor (channels=%d)", img.shape[0])
-                return None
-            # Normalize from [-1, 1] or arbitrary range to [0, 255] uint8
-            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-            img = (img * 255).clamp(0, 255).to(torch.uint8)
-            # Convert to HWC for PIL
-            img_hwc = img.permute(1, 2, 0).numpy()
-            pil_image = Image.fromarray(img_hwc)
-            inputs = self._clip_image_processor(images=[pil_image], return_tensors="pt").to(self._clip_device)
-            with torch.no_grad():
-                image_features = self._full_clip_model.get_image_features(**inputs)
-            # Handle both raw tensor (older transformers) and HF model output.
-            if hasattr(image_features, "pooler_output"):
-                feat = image_features.pooler_output.squeeze(0)
-            elif hasattr(image_features, "image_embeds"):
-                feat = image_features.image_embeds.squeeze(0)
-            elif torch.is_tensor(image_features):
-                feat = image_features.squeeze(0)
-            else:
-                feat = image_features.last_hidden_state.mean(dim=1).squeeze(0)
-            feat = feat / feat.norm(dim=-1, keepdim=True)
-            return feat
-        except Exception as e:
-            logger.warning("CLIP image encoding failed: %s", e)
-            return None
-
     def _encode_image_cpu(self, image_tensor: torch.Tensor) -> torch.Tensor | None:
         """Encode image on CPU to avoid NPU async issues."""
         if image_tensor.dim() != 4 or image_tensor.shape[1] != 3:
@@ -318,11 +268,10 @@ class InterRequestCacheBackend(CacheBackend):
                 feat = feats.last_hidden_state.mean(dim=1).squeeze(0)
             return feat / feat.norm(dim=-1, keepdim=True)
         except Exception as e:
-            logger.info("UPDATE_IMG: encode_image_cpu failed: %s", e)
+            logger.debug("encode_image_cpu failed: %s", e)
             return None
 
     def update_image_embedding(self, cache_key_hash: str | None, image_tensor: torch.Tensor) -> None:
-        logger.info("UPDATE_IMG: hash=%s, clip_model_None=%s", cache_key_hash, self._full_clip_model is None)
         if cache_key_hash is None:
             return
         if getattr(self, "_use_fgclip", False) or self._full_clip_model is None:

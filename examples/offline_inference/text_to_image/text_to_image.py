@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
         help="LMCache disk directory for CPU→Disk tiering.",
     )
     parser.add_argument("--lmcache-max-cpu-gb", type=float, default=5.0)
-    parser.add_argument("--lmcache-max-disk-gb", type=float, default=0.0)
+    parser.add_argument("--lmcache-max-disk-gb", type=float, default=100.0)
     parser.add_argument(
         "--max-entries",
         type=int,

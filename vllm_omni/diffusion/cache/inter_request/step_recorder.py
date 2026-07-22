@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -20,12 +18,12 @@ class StepLatentRecord:
 
 class StepLatentsRecorder:
     """
-    Records latent tensors at each denoising step during the first request.
+    Records latent tensors at each denoising step during a request.
 
     When attached to a pipeline as ``pipeline._step_latents_recorder``, the
     diffuse loop will call ``record()`` after every scheduler step.  After the
-    forward pass completes, call ``save()`` to persist all step latents to disk
-    or ``clear()`` to discard them.
+    forward pass completes, the runner reads ``records`` and passes them to
+    DiTCacheStore for inter-request caching.
     """
 
     def __init__(self) -> None:
@@ -50,26 +48,6 @@ class StepLatentsRecorder:
     @property
     def num_steps(self) -> int:
         return len(self._records)
-
-    def save(self, save_dir: str | Path, prefix: str = "step") -> list[str]:
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        saved_paths: list[str] = []
-        for rec in self._records:
-            filename = f"{prefix}_step{rec.step_index:04d}_t{rec.timestep:.1f}.pt"
-            filepath = save_dir / filename
-            torch.save(
-                {"step_index": rec.step_index, "timestep": rec.timestep, "latent": rec.latent},
-                filepath,
-            )
-            saved_paths.append(str(filepath))
-        logger.info(
-            "Saved %d step latents to %s (%.2f MB total)",
-            len(saved_paths),
-            save_dir,
-            sum(os.path.getsize(p) for p in saved_paths) / 1024**2,
-        )
-        return saved_paths
 
     def clear(self) -> None:
         self._records.clear()

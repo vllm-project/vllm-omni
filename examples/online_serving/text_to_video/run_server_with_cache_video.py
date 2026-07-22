@@ -206,7 +206,7 @@ def main():
              "tensors are stored via LMCache ECCacheEngine with built-in LRU.",
     )
     parser.add_argument("--lmcache-max-cpu-gb", type=float, default=5.0)
-    parser.add_argument("--lmcache-max-disk-gb", type=float, default=0.0)
+    parser.add_argument("--lmcache-max-disk-gb", type=float, default=100.0)
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument("--max-entries", type=int, default=1000)
     parser.add_argument("--max-memory-gb", type=float, default=200.0)

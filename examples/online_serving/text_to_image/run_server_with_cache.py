@@ -175,7 +175,7 @@ def main():
         help="LMCache disk directory for CPU→Disk tiering.",
     )
     parser.add_argument("--lmcache-max-cpu-gb", type=float, default=5.0)
-    parser.add_argument("--lmcache-max-disk-gb", type=float, default=0.0)
+    parser.add_argument("--lmcache-max-disk-gb", type=float, default=100.0)
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--max-entries", type=int, default=8000)
     parser.add_argument("--max-memory-gb", type=float, default=800.0)
