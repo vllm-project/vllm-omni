@@ -96,6 +96,7 @@ class LTXOneStagePipeline(LTXPipelineRuntime):
         image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
         del return_dict
+        sigmas = self._resolve_request_sigmas(req, sigmas)
         request_inputs = self._resolve_request_inputs(
             req,
             prompt=prompt,
