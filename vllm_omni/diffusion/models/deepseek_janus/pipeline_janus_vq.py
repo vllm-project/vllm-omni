@@ -74,7 +74,7 @@ def _resolve_janus_vq_geometry(extra: dict[str, Any], prompt_extra: dict[str, An
 
 
 class JanusVQDecodePipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
-    """VQ-decode-only component for Janus image token IDs.
+    """VQ-decode-only pipeline for Janus two-stage deployment.
 
     This pipeline loads the VQ decoder and converts token IDs to image pixels.
 

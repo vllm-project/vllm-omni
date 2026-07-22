@@ -17,8 +17,10 @@ YAML through `--stage-configs-path`.
 `requirements/common.txt` by default:
 
 ```bash
-pip install "addict>=2.4.0" "timm>=0.9.16"
+pip install 'vllm-omni[janus-image]'
 ```
+
+If installing from source, use `pip install -e '.[janus-image]'`.
 
 ## Offline Inference
 

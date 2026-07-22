@@ -27,7 +27,7 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `stepfun-ai/NextStep-1.1` | 512 x 512 | 71.8 | 28.1 |
 | `meituan-longcat/LongCat-Image` | 1024 x 1024 | 71.2 | 27.3 |
 | `AIDC-AI/Ovis-Image-7B` | 1024 x 1024 | 71.8 | 17.1 |
-| `deepseek-ai/Janus-1.3B` | 384 x 384 | 14.8 | 2.6 |
+| `deepseek-ai/Janus-1.3B` | 384 x 384 | 4.5 | 2.6 |
 | `deepseek-ai/Janus-Pro-7B` | 384 x 384 | 14.8 | 14.0 |
 | `OmniGen2/OmniGen2` |  1024 x 1024 | 20.1 | 14.7 |
 | `stabilityai/stable-diffusion-3.5-medium` | 1024 x 1024 | 20.1 | 15.6 |

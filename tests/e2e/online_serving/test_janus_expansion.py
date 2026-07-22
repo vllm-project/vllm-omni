@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Online serving smoke test for DeepSeek Janus text-to-image generation."""
 
+import importlib.util
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -16,10 +19,42 @@ from tests.helpers.runtime import (
 from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL = "deepseek-ai/Janus-1.3B"
 PROMPT = "A scenic mountain lake at sunset"
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
+JANUS_DEPENDENCIES = {
+    "addict": "addict>=2.4.0",
+    "timm": "timm>=0.9.16",
+}
+
+
+def _ensure_janus_dependencies() -> None:
+    missing_packages = [
+        package_spec
+        for module_name, package_spec in JANUS_DEPENDENCIES.items()
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if not missing_packages:
+        return
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            *missing_packages,
+        ],
+        check=True,
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _janus_dependencies() -> None:
+    _ensure_janus_dependencies()
 
 
 def _get_janus_cases():
@@ -35,8 +70,6 @@ def _get_janus_cases():
     ]
 
 
-@pytest.mark.diffusion
-@pytest.mark.full_model
 @pytest.mark.parametrize("omni_server", _get_janus_cases(), indirect=True)
 def test_janus_single_stage(
     omni_server: OmniServer,

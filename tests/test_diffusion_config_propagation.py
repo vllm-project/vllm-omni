@@ -135,3 +135,11 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
+
+
+def test_extras_default_and_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").extras == {}
+
+    extras = {"max_prefill_chunk_size": 512}
+    od = _roundtrip_diffusion_config(model="x", extras=extras)
+    assert od.extras == extras

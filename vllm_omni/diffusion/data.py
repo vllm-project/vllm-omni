@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import diffusers
 import torch
 from PIL import Image
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -832,7 +832,7 @@ class OmniDiffusionConfig:
     request_batch_max_wait_ms: float = 0.0
 
     # Supplementary model specific parameters
-    extras: dict[str, Any] = Field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_moe(self) -> bool:

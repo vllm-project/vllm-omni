@@ -24,7 +24,7 @@ Optimisation stack (enforce_eager=False):
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -186,6 +186,18 @@ def _resolve_janus_geometry(sp: Any, prompt_extra: dict[str, Any]) -> tuple[int,
     return image_token_num, img_size, patch_size
 
 
+def _resolve_prefill_chunk_size(od_config: OmniDiffusionConfig) -> int:
+    extras = getattr(od_config, "extras", None) or {}
+    if not isinstance(extras, Mapping):
+        raise TypeError(f"Janus extras must be a mapping, got {type(extras)!r}")
+    extras = dict(extras)
+
+    chunk_size = int(extras.get("max_prefill_chunk_size", 2048))
+    if chunk_size <= 0:
+        raise ValueError("Janus extras['max_prefill_chunk_size'] must be a positive integer")
+    return chunk_size
+
+
 def get_janus_post_process_func(od_config: OmniDiffusionConfig):
     """Janus returns PIL images directly from ``forward()``."""
 
@@ -334,7 +346,7 @@ class JanusPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
 
         # Chunked prefill: max tokens per prefill chunk
-        self._prefill_chunk_size = getattr(od_config, "max_prefill_chunk_size", 2048)
+        self._prefill_chunk_size = _resolve_prefill_chunk_size(od_config)
 
     def _build_minimal_vllm_config(self) -> VllmConfig:
         """Build a minimal VllmConfig for CUDAGraphWrapper initialization.
