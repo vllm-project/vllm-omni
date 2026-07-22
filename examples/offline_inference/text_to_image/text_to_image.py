@@ -164,6 +164,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cache-config",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON object of cache configuration values that override the example defaults. "
+            "Example: '{\"rel_l1_thresh\": 0.1}'."
+        ),
+    )
+    parser.add_argument(
         "--enable-cache-dit-summary",
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
@@ -427,6 +436,11 @@ def main():
             # Note: coefficients will use model-specific defaults based on model_type
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
+
+    if args.cache_config is not None:
+        if not isinstance(args.cache_config, dict):
+            raise ValueError("--cache-config must be a JSON object.")
+        cache_config = {**(cache_config or {}), **args.cache_config}
 
     profiler_enabled = args.profiler_config is not None
 

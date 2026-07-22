@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -6,6 +7,8 @@ from torch import nn
 
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit as mammoth_pipeline_module
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import MammothModa2DiTPipeline
+from vllm_omni.model_executor.models.mammoth_moda2 import mammoth_moda2 as mammoth_model_module
+from vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2 import MammothModa2ForConditionalGeneration
 
 pytestmark = [pytest.mark.cpu]
 
@@ -49,6 +52,7 @@ def _build_pipeline(monkeypatch):
     pipe.gen_image_condition_refiner = None
     pipe.gen_freqs_cis = []
     pipe._llm_hidden_size = 8
+    pipe.cache_backend = None
     return pipe
 
 
@@ -119,3 +123,46 @@ def test_mammoth_moda2_cfg_range_only_uses_negative_inside_range(monkeypatch):
         "positive",
         "negative",
     ]
+
+
+def test_mammoth_moda2_dit_stage_enables_cache_backend(monkeypatch):
+    pipe = _build_pipeline(monkeypatch)
+    fake_backend = SimpleNamespace(
+        enable=Mock(),
+        is_enabled=Mock(return_value=True),
+        refresh=Mock(),
+    )
+    monkeypatch.setattr(
+        mammoth_model_module,
+        "get_cache_backend",
+        lambda *_args, **_kwargs: fake_backend,
+    )
+    wrapper = object.__new__(MammothModa2ForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "dit"
+    wrapper.dit = pipe
+    wrapper.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            cache_backend="tea_cache",
+            cache_config={"rel_l1_thresh": 0.1},
+        )
+    )
+
+    wrapper._maybe_enable_dit_cache_backend()
+
+    fake_backend.enable.assert_called_once_with(pipe)
+    assert wrapper._dit_cache_backend is fake_backend
+    assert pipe.cache_backend is fake_backend
+
+
+def test_mammoth_moda2_dit_stage_refreshes_cache_from_sampling_steps(monkeypatch):
+    pipe = _build_pipeline(monkeypatch)
+    fake_backend = SimpleNamespace(
+        is_enabled=Mock(return_value=True),
+        refresh=Mock(),
+    )
+    pipe.cache_backend = fake_backend
+
+    _run_pipeline(pipe, text_guidance_scale=1.0, cfg_range=[0.0, 1.0], num_inference_steps=3)
+
+    fake_backend.refresh.assert_called_once_with(pipe, 3, verbose=False)

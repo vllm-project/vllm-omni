@@ -151,6 +151,15 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         )
 
         self._llm_hidden_size = llm_hidden_size
+        self.cache_backend = None
+
+    def set_cache_backend(self, cache_backend: Any) -> None:
+        self.cache_backend = cache_backend
+
+    def _refresh_cache(self, num_inference_steps: int) -> None:
+        if self.cache_backend is None or not self.cache_backend.is_enabled():
+            return
+        self.cache_backend.refresh(self, num_inference_steps, verbose=False)
 
     def _reinit_caption_embedder(self, in_features: int) -> None:
         # Align with upstream Mammothmoda2Model's `reinit_caption_embedder`:
@@ -306,6 +315,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         request = self._parse_request(req)
+        self._refresh_cache(request.num_inference_steps)
         text_cond, image_cond = self._split_ar_conditions(
             full_hidden_states=request.full_hidden_states,
             full_token_ids=request.full_token_ids,

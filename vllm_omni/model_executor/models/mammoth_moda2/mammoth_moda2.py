@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterable, Mapping
 from itertools import islice
 from typing import Any
@@ -10,6 +11,7 @@ from transformers import Qwen2Config, Qwen3VLProcessor
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -53,9 +55,12 @@ from vllm.transformers_utils.config import (
     set_default_rope_theta,
 )
 
+from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, is_interleaved
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
+
+logger = init_logger(__name__)
 
 
 def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:
@@ -927,8 +932,42 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
+        self._dit_cache_backend = None
+        self._maybe_enable_dit_cache_backend()
+
         # Expose intermediate tensor factory for PP if provided by the submodule.
         self.make_empty_intermediate_tensors = getattr(self.model, "make_empty_intermediate_tensors", lambda: None)
+
+    def _maybe_enable_dit_cache_backend(self) -> None:
+        if self.model_stage != "dit" or self.dit is None:
+            return
+
+        model_config = self.vllm_config.model_config
+        cache_backend_name = getattr(model_config, "cache_backend", None)
+        if cache_backend_name in (None, "", "none"):
+            return
+
+        cache_config = getattr(model_config, "cache_config", None)
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid MammothModa2 DiT cache_config JSON, using defaults.")
+                cache_config = {}
+        elif cache_config is None:
+            cache_config = {}
+
+        cache_backend = get_cache_backend(cache_backend_name, cache_config)
+        if cache_backend is None:
+            return
+
+        cache_backend.enable(self.dit)
+        if hasattr(self.dit, "set_cache_backend"):
+            self.dit.set_cache_backend(cache_backend)
+        else:
+            self.dit.cache_backend = cache_backend
+        self._dit_cache_backend = cache_backend
+        logger.info("MammothModa2 DiT cache backend enabled: backend=%s", cache_backend_name)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int):  # noqa: ARG003
