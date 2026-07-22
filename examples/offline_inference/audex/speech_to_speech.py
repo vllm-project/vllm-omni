@@ -26,15 +26,20 @@ import copy
 import re
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
 import torch
+from common import (
+    SAMPLE_RATE,
+    default_deploy_config,
+    guided_stage_params,
+    load_audex_tokenizer,
+    load_audio_file,
+    write_wav,
+)
 from vllm.assets.audio import AudioAsset
 
 from vllm_omni import Omni
-from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt, build_null_prompt
+from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
 
-SAMPLE_RATE = 16_000
 ASR_QUESTION = "Transcribe the input speech."
 SYSTEM_PROMPT = "You are a helpful and harmless assistant.\n\nYou are not allowed to use any tools."
 # The official chat-pass recipe below (SYSTEM_PROMPT + TEXT_INSTRUCTION
@@ -59,9 +64,6 @@ TEXT_INSTRUCTION = (
     "* Standard numbers, abbreviations, and symbols are acceptable. "
     "* [CRITICAL] You must press enter after every single sentence, placing each sentence on its own separate line."
 )
-# The model root's default deploy yaml is the TTS-only pipeline; the cascade
-# needs the audio-capable 2-stage full pipeline, so default to it.
-_DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "audex_s2s.yaml")
 
 
 def is_30b(model: str) -> bool:
@@ -86,7 +88,9 @@ def parse_args():
     parser.add_argument(
         "--deploy-config",
         type=str,
-        default=_DEFAULT_DEPLOY_CONFIG,
+        # The model root's default deploy yaml is the TTS-only pipeline; the
+        # cascade needs the audio-capable 2-stage full pipeline.
+        default=default_deploy_config("audex_s2s.yaml"),
         help="Deploy yaml (defaults to the audex_s2s pipeline).",
     )
     parser.add_argument(
@@ -181,40 +185,16 @@ def _chat_once(engine: Omni, prompt: str, seed: int) -> tuple[str, bool]:
     return text, truncated
 
 
-def _tts_params(engine: Omni, cfg_scale: float, cond_prompt: str, tokenizer):
-    params = copy.deepcopy(engine.resolve_sampling_params_list(None))
-    stage0 = params[0]
-    if cfg_scale > 1.0:
-        if stage0.extra_args is None:
-            stage0.extra_args = {}
-        stage0.extra_args.update(
-            {
-                "cfg_scale": float(cfg_scale),
-                "cfg_role": "cond",
-                "cfg_pair_id": "s2s-tts-pass",
-                "cfg_null_prompt": build_null_prompt(cond_prompt, tokenizer),
-            }
-        )
-    return params
-
-
 def main():
     args = parse_args()
     engine = Omni(model=args.model, deploy_config=args.deploy_config, trust_remote_code=True)
 
     tokenizer = None
     if args.cfg_scale > 1.0:
-        from transformers import AutoTokenizer
-
-        from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
-
-        root = ensure_audex_snapshot(args.model, profile="full")
-        tokenizer = AutoTokenizer.from_pretrained(str(Path(root) / "checkpoint_folder_full"))
+        tokenizer = load_audex_tokenizer(args.model, profile="full", folder="checkpoint_folder_full")
 
     if args.audio_file:
-        audio, sr = sf.read(args.audio_file, dtype="float32")
-        if audio.ndim == 2:
-            audio = audio.mean(axis=1)
+        audio, sr = load_audio_file(args.audio_file)
     else:
         audio, sr = AudioAsset("mary_had_lamb").audio_and_sample_rate
 
@@ -270,7 +250,7 @@ def main():
     tts_prompt = build_cond_prompt(re.sub(r"\s+", " ", answer).strip())
     outputs = engine.generate(
         [{"prompt": tts_prompt, "modalities": ["audio"]}],
-        _tts_params(engine, args.cfg_scale, tts_prompt, tokenizer),
+        guided_stage_params(engine, tts_prompt, tokenizer, args.cfg_scale, "s2s-tts-pass"),
     )
     chunks: list[torch.Tensor] = []
     for req_output in outputs:
@@ -289,9 +269,7 @@ def main():
         raise SystemExit("TTS pass produced empty audio")
 
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    arr = (np.clip(pcm.numpy(), -1.0, 1.0) * 32767.0).astype(np.int16)
-    sf.write(str(out_path), arr, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    write_wav(out_path, pcm)
     print(f"[3/3] speech     : {pcm.numel() / SAMPLE_RATE:.2f}s -> {out_path}")
 
 

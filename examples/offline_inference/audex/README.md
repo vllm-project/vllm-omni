@@ -13,6 +13,13 @@ resolve automatically.
 | `audio_qa.py` | `audex_thinker_only` | ✅ | ✅ | ❌ | ❌ |
 | `speech_to_speech.py` | `audex_s2s` | ✅ | ✅ | ✅ | ❌ |
 
+Shared plumbing (corpus/WAV IO, tokenizer loading, the CFG cond/uncond
+pair contract) lives in `common.py`; each task script keeps only its own
+prompt recipe and flow. Note `text_to_audio.py` here drives the Audex
+two-stage AR pipeline — for diffusion text-to-audio models (Stable Audio
+Open, AudioX) use the generic
+`examples/offline_inference/text_to_audio/text_to_audio.py` instead.
+
 ## text_to_speech.py — text → speech
 
 Thinker generates `<speechcodec_N>` tokens; the streaming causal decoder

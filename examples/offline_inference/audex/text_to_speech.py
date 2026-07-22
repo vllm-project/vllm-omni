@@ -25,18 +25,23 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import re
 import time
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
-import torch
+from common import (
+    GUIDED_TEMPERATURE,
+    SAMPLE_RATE,
+    extract_pcm,
+    guided_stage_params,
+    load_audex_tokenizer,
+    load_corpus,
+    request_index,
+    write_wav,
+)
 
 from vllm_omni import Omni
 from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
 
-SAMPLE_RATE = 16_000
 DEFAULT_TEXTS = (
     "Hello world.",
     "The quick brown fox jumps over the lazy dog.",
@@ -86,102 +91,19 @@ def parse_args():
     return parser.parse_args()
 
 
-def _slugify(text: str) -> str:
-    slug = re.sub(r"\s+", "_", text.strip().lower())
-    slug = re.sub(r"[^a-z0-9_]+", "", slug)
-    return slug[:48] or "prompt"
-
-
-def _load_corpus(args) -> list[tuple[str, str]]:
-    if args.texts_file:
-        corpus = []
-        for line in Path(args.texts_file).read_text().splitlines():
-            if not line.strip():
-                continue
-            utt, text = line.split("\t", 1)
-            corpus.append((utt, text.strip()))
-        return corpus
-    texts = args.texts if args.texts else list(DEFAULT_TEXTS)
-    return [(_slugify(t), t) for t in texts]
-
-
-def _extract_pcm(multimodal_output: dict) -> torch.Tensor:
-    audio = multimodal_output.get("model_outputs")
-    if audio is None:
-        audio = multimodal_output.get("audio")
-    if audio is None:
-        raise ValueError(f"no audio key in multimodal_output: {list(multimodal_output.keys())}")
-    if isinstance(audio, list):
-        valid = [torch.as_tensor(a).float().cpu().reshape(-1) for a in audio if a is not None]
-        if not valid:
-            raise ValueError("audio list is empty")
-        return torch.cat(valid, dim=0) if len(valid) > 1 else valid[0]
-    return torch.as_tensor(audio).float().cpu().reshape(-1)
-
-
-def _pcm_to_int16(pcm: torch.Tensor) -> np.ndarray:
-    arr = np.clip(pcm.numpy(), -1.0, 1.0)
-    return (arr * 32767.0).astype(np.int16)
-
-
-def _load_audex_tokenizer(model: str):
-    from transformers import AutoTokenizer
-
-    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
-
-    root = ensure_audex_snapshot(model)
-    return AutoTokenizer.from_pretrained(str(Path(root) / "checkpoint_folder_audiogen"))
-
-
-# Guided decoding sharpens the distribution, so the unguided temperature
-# (0.1) adds excess sampling noise under CFG. Measured on the en-24 gate
-# corpus at cfg 1.5: temp 0.1 -> CER 7.31%, temp 0.05 -> CER 6.87% (vs the
-# unguided baseline 7.24%).
-GUIDED_TEMPERATURE = 0.05
-
-
-def _cfg_sampling_params(engine: Omni, cfg_scale: float, pair_id: str, cond_prompt: str, tokenizer):
-    """Stage sampling params carrying the CFG pair contract for one request."""
-    import copy
-
-    from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
-
-    params = copy.deepcopy(engine.resolve_sampling_params_list(None))
-    stage0 = params[0]
-    stage0.temperature = GUIDED_TEMPERATURE
-    if stage0.extra_args is None:
-        stage0.extra_args = {}
-    stage0.extra_args.update(
-        {
-            "cfg_scale": float(cfg_scale),
-            "cfg_role": "cond",
-            "cfg_pair_id": pair_id,
-            "cfg_null_prompt": build_null_prompt(cond_prompt, tokenizer),
-        }
-    )
-    return params
-
-
 def _write_outputs(outputs, batch: list[tuple[str, str]], output_dir: Path) -> float:
-    # Omni.generate may return outputs out of submission order; align by the
-    # numeric request-id suffix, which follows submission order.
-    def _req_index(req_output) -> int:
-        match = re.search(r"(\d+)", str(req_output.request_id))
-        return int(match.group(1)) if match else 0
-
-    ordered = sorted(outputs, key=_req_index)
+    ordered = sorted(outputs, key=request_index)
     if len(ordered) != len(batch):
         raise RuntimeError(f"expected {len(batch)} outputs, got {len(ordered)}")
 
     total_dur = 0.0
     for (utt, _text), req_output in zip(batch, ordered):
-        mm = req_output.outputs[0].multimodal_output
-        pcm = _extract_pcm(mm)
+        pcm = extract_pcm(req_output.outputs[0].multimodal_output)
         dur = pcm.numel() / SAMPLE_RATE
         if dur <= 0:
             raise RuntimeError(f"empty audio for {utt}")
         out_path = output_dir / f"{utt}.wav"
-        sf.write(str(out_path), _pcm_to_int16(pcm), SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        write_wav(out_path, pcm)
         total_dur += dur
         print(f"  {utt:<40} dur={dur:6.2f}s  -> {out_path}")
     return total_dur
@@ -191,12 +113,12 @@ def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    corpus = _load_corpus(args)
+    corpus = load_corpus(args.texts_file, args.texts, DEFAULT_TEXTS)
 
     engine = Omni(model=args.model, deploy_config=args.deploy_config, trust_remote_code=True)
 
     cfg_enabled = args.cfg_scale > 1.0
-    tokenizer = _load_audex_tokenizer(args.model) if cfg_enabled else None
+    tokenizer = load_audex_tokenizer(args.model) if cfg_enabled else None
 
     print(f"Model       : {args.model}")
     print(f"Prompts     : {len(corpus)}")
@@ -213,8 +135,13 @@ def main():
         prompts = [build_cond_prompt(text) for _utt, text in batch]
         sampling_params_list = None
         if cfg_enabled:
-            sampling_params_list = _cfg_sampling_params(
-                engine, args.cfg_scale, f"cfg-{batch[0][0]}", prompts[0], tokenizer
+            sampling_params_list = guided_stage_params(
+                engine,
+                prompts[0],
+                tokenizer,
+                args.cfg_scale,
+                f"cfg-{batch[0][0]}",
+                temperature=GUIDED_TEMPERATURE,
             )
         if args.temperature is not None:
             import copy

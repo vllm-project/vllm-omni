@@ -28,16 +28,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
+from common import default_deploy_config, load_audio_file, request_index
 from vllm.assets.audio import AudioAsset
 
 from vllm_omni import Omni
 
 ASR_QUESTION = "Transcribe the input speech."
-# The model root's default deploy yaml is the TTS pipeline; audio
-# understanding needs the single-stage thinker-only pipeline, so default to it.
-_DEFAULT_DEPLOY_CONFIG = str(Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "audex_thinker_only.yaml")
 
 
 def build_prompt(question: str) -> str:
@@ -58,19 +54,12 @@ def parse_args():
     parser.add_argument(
         "--deploy-config",
         type=str,
-        default=_DEFAULT_DEPLOY_CONFIG,
+        # The model root's default deploy yaml is the TTS pipeline; audio
+        # understanding needs the single-stage thinker-only pipeline.
+        default=default_deploy_config("audex_thinker_only.yaml"),
         help="Deploy yaml (defaults to the audex_thinker_only pipeline).",
     )
     return parser.parse_args()
-
-
-def _load_audio(path: str) -> tuple[np.ndarray, int]:
-    audio, sr = sf.read(path, dtype="float32")
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-    # Native sample rate is passed through; the processor resamples via its
-    # data parser.
-    return audio, sr
 
 
 def main():
@@ -79,7 +68,7 @@ def main():
 
     prompt_text = build_prompt(args.question)
     if args.audio_files:
-        clips = [_load_audio(path) for path in args.audio_files]
+        clips = [load_audio_file(path) for path in args.audio_files]
     else:
         clips = [AudioAsset("mary_had_lamb").audio_and_sample_rate]
     prompts = []
@@ -93,16 +82,7 @@ def main():
 
     outputs = engine.generate(prompts)
 
-    # Outputs may return out of submission order; the numeric request-id
-    # prefix follows submission order (lexicographic sort would misplace
-    # "10_..." before "2_...").
-    def _req_index(req_output) -> int:
-        import re as _re
-
-        match = _re.search(r"(\d+)", str(req_output.request_id))
-        return int(match.group(1)) if match else 0
-
-    ordered = sorted(outputs, key=_req_index)
+    ordered = sorted(outputs, key=request_index)
     names = [Path(p).name for p in args.audio_files] if args.audio_files else ["mary_had_lamb"]
     for name, req_output in zip(names, ordered):
         text = req_output.outputs[0].text if req_output.outputs else ""
