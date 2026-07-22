@@ -11,24 +11,56 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-class TestLTX23OutputRank:
-    def test_single_process_rank_is_output_rank(self, monkeypatch):
-        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23
+class TestLTXOutputRank:
+    @pytest.mark.parametrize(
+        ("distributed_vae_state", "expected_decode_calls"),
+        [(False, 0), (True, 1), (RuntimeError("unavailable"), 0)],
+    )
+    def test_non_output_rank_only_enters_collective_vae_decode(
+        self,
+        monkeypatch,
+        distributed_vae_state,
+        expected_decode_calls,
+    ):
+        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2 as ltx
 
-        monkeypatch.setattr(ltx23.torch.distributed, "is_initialized", lambda: False)
+        class FakeVae:
+            dtype = torch.float32
+            config = SimpleNamespace(timestep_conditioning=False)
 
-        assert ltx23._is_output_rank() is True
-        assert ltx23._should_decode_video_on_rank(SimpleNamespace(is_distributed_enabled=lambda: False)) is True
+            def __init__(self):
+                self.decode_calls = 0
 
-    def test_non_output_rank_skips_decode_unless_vae_decode_is_distributed(self, monkeypatch):
-        import vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 as ltx23
+            def is_distributed_enabled(self):
+                if isinstance(distributed_vae_state, Exception):
+                    raise distributed_vae_state
+                return distributed_vae_state
 
-        monkeypatch.setattr(ltx23.torch.distributed, "is_initialized", lambda: True)
-        monkeypatch.setattr(ltx23.torch.distributed, "get_rank", lambda: 1)
+            def decode(self, *_args, **_kwargs):
+                self.decode_calls += 1
+                return (torch.ones(1, 1),)
 
-        assert ltx23._is_output_rank() is False
-        assert ltx23._should_decode_video_on_rank(SimpleNamespace(is_distributed_enabled=lambda: False)) is False
-        assert ltx23._should_decode_video_on_rank(SimpleNamespace(is_distributed_enabled=lambda: True)) is True
+        monkeypatch.setattr(ltx.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(ltx.torch.distributed, "get_rank", lambda: 1)
+        pipe = object.__new__(ltx.LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae = FakeVae()
+
+        output = pipe._decode_output(
+            latents=torch.ones(1, 1),
+            audio_latents=torch.ones(1, 1),
+            output_type="np",
+            connector_prompt_embeds=torch.ones(1, 1),
+            generator=None,
+            device=torch.device("cpu"),
+            decode_timestep=0.0,
+            decode_noise_scale=None,
+            prompt_batch_size=1,
+        )
+
+        assert pipe.vae.decode_calls == expected_decode_calls
+        assert output.output[0].numel() == 0
+        assert output.output[1].numel() == 0
 
 
 class TestLTX23VaeDistributedDecode:

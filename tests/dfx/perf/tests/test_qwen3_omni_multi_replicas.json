@@ -35,10 +35,10 @@
         "ignore_eos": true,
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-            "mean_ttft_ms": [203, 283, 470, 869],
-            "mean_tpot_ms": [28, 36, 41, 45],
-            "mean_audio_ttfp_ms": [861, 1200, 1528, 2100],
-            "mean_audio_rtf": [0.24, 0.30, 0.35, 0.39]
+            "mean_ttft_ms": [130.5751, 278.6469, 324.7249, 911.6085],
+            "mean_tpot_ms": [7.9854, 11.1209, 16.1507, 20.7485],
+            "mean_audio_ttfp_ms": [486.486, 954.1791, 1289.6514, 2196.8275],
+            "mean_audio_rtf": [0.1896, 0.3962, 0.4098, 0.7322]
         }
       },
       {
@@ -61,9 +61,9 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-            "mean_ttft_ms": [377],
-            "mean_audio_ttfp_ms": [684],
-            "mean_audio_rtf": [0.14]
+            "mean_ttft_ms": [340.5122],
+            "mean_audio_ttfp_ms": [463.0752],
+            "mean_audio_rtf": [0.1153]
         }
       },
       {
@@ -88,9 +88,9 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-            "mean_ttft_ms": [228],
-            "mean_audio_ttfp_ms": [686],
-            "mean_audio_rtf": [0.16]
+            "mean_ttft_ms": [236.926],
+            "mean_audio_ttfp_ms": [395.2182],
+            "mean_audio_rtf": [0.1259]
         }
       },
       {
@@ -117,9 +117,9 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-            "mean_ttft_ms": [522],
-            "mean_audio_ttfp_ms": [1119],
-            "mean_audio_rtf": [0.21]
+            "mean_ttft_ms": [470.6126],
+            "mean_audio_ttfp_ms": [665.5474],
+            "mean_audio_rtf": [0.166]
         }
       }
     ]

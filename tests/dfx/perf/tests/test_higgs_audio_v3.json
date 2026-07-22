@@ -47,10 +47,10 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            3000
+            223.3584
           ],
           "median_audio_rtf": [
-            0.5
+            0.4393
           ]
         }
       },
@@ -71,13 +71,13 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            5000
+            276.575
           ],
           "median_audio_rtf": [
-            1.2
+            0.5073
           ],
           "audio_throughput": [
-            30
+            27.3728
           ]
         }
       }

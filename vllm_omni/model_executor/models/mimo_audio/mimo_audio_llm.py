@@ -897,20 +897,28 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         input_ids: torch.Tensor,
         *,
         request_ids: list[str],
-        query_start_loc: torch.Tensor,
+        query_start_loc_list: list[int],
         kwargs: dict,
     ) -> tuple[dict[str, any], dict]:
         has_merge_mm_embedding = False
         merge_mm_embedding_info: dict[str, any] = {}
         seq_len = input_ids.shape[1] if input_ids.ndim == 2 else input_ids.shape[0]
 
-        for req_idx, req_id in enumerate(request_ids):
-            query_start_loc_by_req = int(query_start_loc[req_idx].item())
-            query_end_loc_by_req = int(query_start_loc[req_idx + 1].item())
-            input_ids_by_req = input_ids[query_start_loc_by_req:query_end_loc_by_req]
-            seq_len_by_req = input_ids_by_req.shape[1] if input_ids_by_req.ndim == 2 else input_ids_by_req.shape[0]
+        # Only each request's start token is ever read below, and only for
+        # single-token requests. Gather just those start offsets (num_reqs elements)
+        # to host instead of copying the whole flattened sequence every forward.
+        # query_start_loc entries are flat token offsets, so we index the flattened
+        # ids by the same offsets and derive per-request length from the boundaries.
+        flat_input_ids = input_ids.reshape(-1)
+        start_positions = query_start_loc_list[:-1]
+        start_is_empty_cpu = (flat_input_ids[start_positions] == self.empty_token_id).cpu().tolist()
 
-            if seq_len_by_req == 1 and bool(input_ids_by_req == self.empty_token_id):
+        for req_idx, req_id in enumerate(request_ids):
+            query_start_loc_by_req = query_start_loc_list[req_idx]
+            query_end_loc_by_req = query_start_loc_list[req_idx + 1]
+            seq_len_by_req = query_end_loc_by_req - query_start_loc_by_req
+
+            if seq_len_by_req == 1 and start_is_empty_cpu[req_idx]:
                 merge_mm_embedding_info[req_id] = {
                     "query_start_loc": query_start_loc_by_req,
                     "query_end_loc": query_end_loc_by_req,
@@ -1035,13 +1043,19 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        # Materialize the request boundaries on the host once instead of one
+        # `.item()` sync per boundary in the loops below.
         _forward_context = get_forward_context()
-        _default_query_start_loc = torch.tensor([0, input_ids.shape[-1]], device=input_ids.device)
-        query_start_loc = (
-            next(iter(_forward_context.attn_metadata.values())).query_start_loc
-            if _forward_context.attn_metadata is not None
-            else _default_query_start_loc
-        )
+        if _forward_context.attn_metadata is not None:
+            query_start_loc = next(iter(_forward_context.attn_metadata.values())).query_start_loc
+            query_start_loc_list = query_start_loc.tolist()
+        else:
+            # Single implicit request over all tokens. Build the host boundaries
+            # directly (no .tolist() D2H); the small device tensor is still needed
+            # for logits_indices below.
+            n_tokens = int(input_ids.shape[-1])
+            query_start_loc_list = [0, n_tokens]
+            query_start_loc = torch.tensor([0, n_tokens], device=input_ids.device)
 
         runtime_additional_information = kwargs.get("runtime_additional_information", [])
         if runtime_additional_information:
@@ -1054,7 +1068,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         merge_mm_embedding_info, has_merge_mm_embedding, kwargs = self._collect_merge_mm_embedding_info(
             input_ids,
             request_ids=request_ids,
-            query_start_loc=query_start_loc,
+            query_start_loc_list=query_start_loc_list,
             kwargs=kwargs,
         )
 
@@ -1077,15 +1091,18 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         batch_next_speech_tokens: torch.Tensor | None = None
 
         if not is_capturing and next_ids is not None and num_reqs > 0:
-            if (next_ids == self.empty_token_id).any():
+            # Copy the empty-token mask to host once; the `.any()` gate and the
+            # per-request checks below then avoid a GPU sync each.
+            next_is_empty_cpu = (next_ids == self.empty_token_id).cpu()
+            if bool(next_is_empty_cpu.any()):
                 batch_hs_list = []
                 valid_mask = []
 
                 for req_idx in range(num_reqs):
-                    start = int(query_start_loc[req_idx].item())
-                    end = int(query_start_loc[req_idx + 1].item())
+                    start = query_start_loc_list[req_idx]
+                    end = query_start_loc_list[req_idx + 1]
                     hs_req = hidden_states[start:end][-1:, :]
-                    is_empty = bool(next_ids[req_idx] == self.empty_token_id)
+                    is_empty = bool(next_is_empty_cpu[req_idx])
                     valid_mask.append(is_empty)
 
                     if not is_empty:

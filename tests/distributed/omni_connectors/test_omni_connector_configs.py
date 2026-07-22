@@ -48,7 +48,6 @@ def test_load_qwen_yaml_configs(yaml_file):
     print(f"Testing config load: {yaml_file.name}")
     try:
         # Attempt to load the config
-        # default_shm_threshold doesn't matter much for loading correctness, using default
         config = load_omni_transfer_config(yaml_file)
 
         assert config is not None, "Config should not be None"
