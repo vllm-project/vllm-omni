@@ -209,7 +209,7 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
     assert kv is not None
     free_total = kv.manager.block_pool.get_num_free_blocks()
 
-    def boom(self, req, kv_prefetch_jobs=None):
+    def boom(self, req, kv_prefetch_job=None):
         state = pipeline.bound_state
         ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
         ctx.ensure_video_slots(torch.device("cpu"))

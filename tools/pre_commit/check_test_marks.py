@@ -4,8 +4,9 @@
 """Run a pre-commit hook that fails if test files are modified or added
 that (probably) never run in the CI. For now, this means that every tests file
 needs to have a CI level marker (e.g., core_model, advanced_model, full_model,
-etc) and hardware mark / helper so that we ensure mutated tests will actually
-be selected as long as there are pytest commands pointing at the right paths.
+local_model, slow, etc) and hardware mark / helper so that we ensure mutated
+tests will actually be selected as long as there are pytest commands pointing
+at the right paths.
 """
 
 import os
@@ -13,7 +14,7 @@ import re
 import sys
 
 # CI level markers
-LEVEL_MARKERS = ("core_model", "advanced_model", "full_model", "slow")
+LEVEL_MARKERS = ("core_model", "advanced_model", "full_model", "local_model", "slow")
 
 # Hardware markers. These are platforms and resources that CI filters on.
 # NOTE: If new hardware marks are added to pyproject.toml etc, we need

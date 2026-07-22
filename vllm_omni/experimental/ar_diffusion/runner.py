@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
@@ -221,10 +222,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def execute_model(
         self,
         req: OmniDiffusionRequest,
-        kv_prefetch_jobs: dict | None = None,
+        kv_prefetch_job: KVPrefetchJob | None = None,
     ) -> DiffusionOutput:
         if self.kv_cache is None:
-            return super().execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+            return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
         capability = self._ar_diffusion_capability
         if capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
@@ -236,7 +237,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         started = time.perf_counter()
         try:
             with capability.bind_ar_diffusion_state(session_id, state):
-                output = super().execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+                output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
         except Exception:
             self._release_session(
                 session_id,
