@@ -18,11 +18,17 @@ Specify the port:
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
 ```
 
-If you have custom stage configs file, launch the server with command below
+For a migrated model, load a custom deploy configuration with `--deploy-config`:
+
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --deploy-config /path/to/deploy_config.yaml
 ```
 
+The deprecated `--stage-configs-path` flag is retained for models that still use the legacy `stage_args` schema:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --stage-configs-path /path/to/legacy_stage_config.yaml
+```
 
 ## bench
 

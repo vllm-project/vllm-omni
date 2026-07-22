@@ -22,6 +22,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.moss_tts"
 
 MOSS_TTS_PIPELINE = PipelineConfig(
     model_type="moss_tts",
+    default_deploy_config_name="moss_tts.yaml",
     model_arch="MossTTSDelayModel",  # HF architectures string
     stages=(
         StagePipelineConfig(
@@ -53,6 +54,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
 
 MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
     model_type="moss_tts_realtime",
+    default_deploy_config_name="moss_tts_realtime.yaml",
     model_arch="MossTTSRealtime",  # different talker class from the delay variant
     stages=(
         StagePipelineConfig(
@@ -82,6 +84,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
 
 MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
     model_type="moss_tts_local",
+    default_deploy_config_name="moss_tts_local.yaml",
     model_arch="MossTTSLocalModel",  # different talker class: GPT2-style local depth transformer
     stages=(
         StagePipelineConfig(

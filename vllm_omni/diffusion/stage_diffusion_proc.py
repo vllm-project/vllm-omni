@@ -40,6 +40,7 @@ from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 
 logger = init_logger(__name__)
 
@@ -92,20 +93,19 @@ class StageDiffusionProc:
     def _is_executor_dead(self) -> bool:
         """True iff the multiproc executor has been closed or marked failed.
 
-        Detects the "workers died but the diffusion proc is still pulling
-        requests" case: ``MultiprocDiffusionExecutor`` sets ``_closed = True``
-        and ``is_failed = True`` from its worker-monitor thread the moment any
-        worker process exits; every subsequent ``execute_request`` /
-        ``collective_rpc`` then raises ``RuntimeError("DiffusionExecutor is
-        closed.")`` inside the engine. Callers in ``run_loop`` use this to
-        decide whether a per-request failure is recoverable or fatal.
+        requests" case: ``MultiprocDiffusionExecutor`` sets ``is_dead`` from its
+        worker-monitor thread the moment any worker process exits; every
+        subsequent ``execute_request`` / ``collective_rpc`` then raises
+        ``RuntimeError("DiffusionExecutor is closed.")`` inside the engine.
+        Callers in ``run_loop`` use this to decide whether a per-request
+        failure is recoverable or fatal.
         """
         if self._engine is None:
             return False
-        executor = getattr(self._engine, "executor", None)
+        executor: DiffusionExecutor | None = getattr(self._engine, "executor", None)
         if executor is None:
             return False
-        return bool(getattr(executor, "_closed", False) or getattr(executor, "is_failed", False))
+        return executor.is_dead
 
     def _signal_fatal_engine_failure(self, reason: str) -> None:
         """Idempotently signal ``run_loop`` to tear down on a fatal engine error."""

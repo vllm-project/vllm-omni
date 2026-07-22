@@ -278,12 +278,17 @@ def main():
     )
 
     for req_output in outputs:
-        custom = getattr(req_output, "_custom_output", {}) or {}
-        if args.print_think and custom.get("think_text"):
-            print(f"[Think]\n{custom['think_text']}\n")
+        multimodal_output = getattr(req_output, "multimodal_output", {}) or {}
+        metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
+        text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
+        think_text = text_metadata.get("think_text") if isinstance(text_metadata, dict) else None
+        if args.print_think and think_text:
+            print(f"[Think]\n{think_text}\n")
 
         if is_text_output:
-            text = custom.get("text_output", "")
+            text = multimodal_output.get("text", "") if isinstance(multimodal_output, dict) else ""
+            if not text:
+                text = text_metadata.get("text_output", "") if isinstance(text_metadata, dict) else ""
             if not text:
                 text = getattr(req_output, "text", "") or ""
             print(f"[Response]\n{text}")

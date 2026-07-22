@@ -19,7 +19,7 @@ AUDIOX_EXTRA_BODY_PARAMS = frozenset(
         "audio_path",  # optional reference-audio conditioning
     }
 )
-# Echoed back in ``DiffusionOutput.custom_output`` (pipeline_audiox.py).
+# Echoed back in diffusion output metadata (pipeline_audiox.py).
 AUDIOX_EXTRA_OUTPUT_PARAMS = frozenset(
     {
         "audiox_task",

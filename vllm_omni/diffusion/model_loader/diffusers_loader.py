@@ -12,7 +12,6 @@ from typing import cast
 
 import torch
 from torch import nn
-from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -81,7 +80,6 @@ def _natural_sort_key(filepath: str) -> list:
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", os.path.basename(filepath))]
 
 
-MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
@@ -326,15 +324,6 @@ class DiffusersPipelineLoader:
             return all_parameter_names
         return {name for name in all_parameter_names if name.startswith(source_prefixes)}
 
-    def download_model(self, model_config: ModelConfig) -> None:
-        self._prepare_weights(
-            model_name_or_path=model_config.model,
-            subfolder=None,
-            revision=model_config.revision,
-            fall_back_to_pt=True,
-            allow_patterns_overrides=None,
-        )
-
     def load_model(
         self,
         load_device: str,
@@ -381,10 +370,9 @@ class DiffusersPipelineLoader:
                     cast(DiffusersAdapterPipeline, model).load_weights()
                 else:
                     self.load_weights(model)
-
-            # Process weights after loading for quantization (e.g., FP8 online quantization)
-            # This is needed for vLLM's quantization methods that need to transform weights
-            self._process_weights_after_loading(model, target_device)
+                # HSDP processes quantized weights before wrapping parameters as
+                # DTensors. The non-HSDP path can process them here as usual.
+                self._process_weights_after_loading(model, target_device)
 
             if offload_after_quant:
                 model.to("cpu")
@@ -629,12 +617,25 @@ class DiffusersPipelineLoader:
         model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
         self.load_weights(model)
 
+        # Quantization methods must finish while parameters are ordinary local
+        # tensors. Some post-load transforms use operations (for example,
+        # torch.unique in ModelOpt NVFP4) that do not support DTensor inputs.
+        self._process_weights_after_loading(model, target_device)
+
         # Discover pipeline components (DiT, encoders, VAEs) via
         # ModuleDiscovery, which consults SupportsComponentDiscovery
         # when available and falls back to well-known attribute names.
         # This supports nested pipelines (e.g. LTX2TwoStagesPipeline
         # where the transformer lives at "pipe.transformer").
         discovered_modules = ModuleDiscovery.discover(model)
+
+        # Shard only the outermost DiTs. A pipeline may list a DiT and one of its
+        # submodules as separate DiTs (e.g. Cosmos3's transformer and the nested
+        # transformer.language_model) for offload's independent rings; for HSDP an
+        # inner DiT is already covered by its ancestor's _hsdp_shard_conditions, so
+        # sharding it again would double-wrap blocks and require the inner stack to
+        # declare its own conditions.
+        outer_dit_names, outer_dits = discovered_modules.outermost_dits()
 
         # Online FP8 quantization (Fp8OnlineLinearMethod) leaves layer weights
         # as non-contiguous transpose views (qweight.t()) so the Cutlass kernel
@@ -647,14 +648,14 @@ class DiffusersPipelineLoader:
                 prepare_fp8_layers_for_fsdp,
             )
 
-            for trans in discovered_modules.dits:
+            for trans in outer_dits:
                 prepare_fp8_layers_for_fsdp(trans)
 
-        if not discovered_modules.dits:
+        if not outer_dits:
             raise ValueError("No DiT modules discovered for HSDP sharding")
 
-        # Apply HSDP sharding to all discovered DiT transformers
-        for name, trans in zip(discovered_modules.dit_names, discovered_modules.dits):
+        # Apply HSDP sharding to each outermost DiT transformer
+        for name, trans in zip(outer_dit_names, outer_dits):
             logger.debug("Applying HSDP to %s", name)
             apply_hsdp_to_model(trans, hsdp_config, target_device=target_device)
 

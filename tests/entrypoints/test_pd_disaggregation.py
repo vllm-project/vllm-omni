@@ -121,9 +121,7 @@ class _FakeStage:
         self._in_q = in_q
         self._out_q = out_q
 
-    def init_stage_worker(
-        self, model: str, *, is_async=False, shm_threshold_bytes=65536, ctx=None, batch_timeout=10, **kwargs
-    ):
+    def init_stage_worker(self, model: str, *, is_async=False, ctx=None, batch_timeout=10, **kwargs):
         self._proc = _ns(
             start=lambda: None,
             join=lambda timeout=None: None,

@@ -257,7 +257,7 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
 | :------- | :--- | :------ | :---------- |
 | `--deploy-config` | string | `None` | Path to deploy YAML (auto-detected if omitted) |
 | `--stage-configs-path` | string | `None` | [Deprecated] Legacy path to `stage_args` YAML; prefer `--deploy-config` |
-| `--worker-backend` | choice | `process` | `process` or `ray` |
+| `--worker-backend` | choice | `multi_process` | `multi_process` or `ray` |
 | `--ray-address` | string | `None` | Ray cluster address |
 | `--quantization` | string | `None` | Quantization method (e.g. `fp8`) |
 | `--log-stats` | flag | `False` | Enable statistics logging |

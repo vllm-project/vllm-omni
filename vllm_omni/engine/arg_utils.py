@@ -9,7 +9,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.engine.output_modality import OutputModality
+from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
 
@@ -423,7 +423,6 @@ class OrchestratorArgs:
     init_timeout: int = 600
 
     # === Cross-stage Communication ===
-    shm_threshold_bytes: int = 65536
     batch_timeout: int = 10
 
     # === Cluster / Backend ===

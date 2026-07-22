@@ -739,8 +739,10 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         text_output = text_output.split("<|im_start|>")[-1]
 
             return DiffusionOutput(
-                output=text_output,
-                custom_output={"text_output": text_output},
+                output={
+                    "payload": {"text": text_output},
+                    "metadata": {"text": {"text_output": text_output}},
+                },
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
@@ -847,22 +849,28 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         if trajectory_log_probs:
             trajectory_log_probs_stacked = torch.stack(trajectory_log_probs)
 
-        custom = {}
+        payload = {"image": img}
+        metadata = {}
         if think_text is not None:
-            custom["think_text"] = think_text
-        # Mirror the PIL image into ``custom_output`` so callers reading via
-        # the orchestrator IPC boundary (which strips the bare ``output``
-        # field) can still recover the result.  ``video_frames`` already
-        # uses this pattern.
-        custom["image"] = img
+            metadata["text"] = {"think_text": think_text}
+        trajectory_payload = {}
+        if trajectory_latents_stacked is not None:
+            trajectory_payload["latents"] = trajectory_latents_stacked
+        if trajectory_timesteps_stacked is not None:
+            trajectory_payload["timesteps"] = trajectory_timesteps_stacked
+        if trajectory_log_probs_stacked is not None:
+            trajectory_payload["log_probs"] = trajectory_log_probs_stacked
+        if trajectory_decoded is not None:
+            trajectory_payload["decoded"] = trajectory_decoded
+        if trajectory_payload:
+            payload["trajectory"] = trajectory_payload
+            metadata["trajectory"] = {"type": "denoising"}
 
         return DiffusionOutput(
-            output=img,
-            trajectory_latents=trajectory_latents_stacked,
-            trajectory_timesteps=trajectory_timesteps_stacked,
-            trajectory_log_probs=trajectory_log_probs_stacked,
-            trajectory_decoded=trajectory_decoded,
-            custom_output=custom,
+            output={
+                "payload": payload,
+                "metadata": metadata,
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 

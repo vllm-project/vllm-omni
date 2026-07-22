@@ -1016,6 +1016,7 @@ CUSTOM_DIT_ENABLERS.update(
         "Wan22VACEPipeline": enable_cache_for_wan22,
         "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
         "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
+        "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
         "Krea2Pipeline": enable_cache_for_krea2,
     }
 )

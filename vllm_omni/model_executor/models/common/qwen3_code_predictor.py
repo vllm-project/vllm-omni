@@ -3,7 +3,7 @@
 Shared by Qwen3-Omni and Qwen3-TTS talker models.
 
 * SDPA attention (F.scaled_dot_product_attention) with native GQA support
-* HF-compatible numerics (float32 RMSNorm, float32 RoPE, separate linear layers)
+* HF-compatible CPU/CUDA numerics with NPU-only fused norm/RoPE fast paths
 * Per-call embedding buffer to avoid cross-request aliasing
 * Pre-allocated position_ids (read-only, safe to persist)
 * torch.compile (epilogue_fusion=False) on inner transformer by default
@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -31,33 +32,48 @@ logger = init_logger(__name__)
 _GeneratorLike = torch.Generator | Sequence[torch.Generator | None] | None
 _UNIFORM_EPS = 1e-20
 
+if current_omni_platform.is_npu():
+    import torch_npu
+
 
 # ===================================================================
-# HF-numerics-compatible layers for code predictor
+# Portable layers for code predictor
 # ===================================================================
 #
 # These use plain PyTorch ops (nn.Linear, manual RMSNorm in float32,
 # rotate_half RoPE) to produce outputs numerically identical to the
-# HuggingFace reference. vLLM's fused kernels (RMSNorm, QKVParallel,
-# get_rope) introduce small precision differences that compound across
-# the autoregressive steps of the code predictor, causing severe
-# audio quality degradation.
+# HuggingFace reference on CPU/CUDA. vLLM's fused kernels (RMSNorm,
+# QKVParallel, get_rope) introduce small precision differences that compound
+# across the autoregressive steps of the code predictor, causing severe audio
+# quality degradation. The Ascend fused norm/RoPE kernels below are dispatched
+# by the current device platform.
 #
 # See: https://github.com/vllm-project/vllm-omni/issues/2274
 
 
-class _RMSNorm(nn.Module):
-    """RMSNorm matching HuggingFace's implementation exactly.
-
-    Computes variance in float32 to avoid bfloat16 precision loss.
-    """
+class _RMSNorm(CustomOp):
+    """RMSNorm with HuggingFace-compatible CPU/CUDA math and an NPU fast path."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, _ = torch_npu.npu_rms_norm(
+            hidden_states,
+            self.weight,
+            self.variance_epsilon,
+        )
+        return hidden_states
+
+    def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(hidden_states)
+
+    def forward_xpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(hidden_states)
+
+    def forward_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -72,11 +88,8 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-class _RotaryEmbedding(nn.Module):
-    """RoPE matching HuggingFace's implementation exactly.
-
-    Forces float32 computation for cos/sin, matching HF's torch.autocast(enabled=False).
-    """
+class _RotaryEmbedding(CustomOp):
+    """RoPE with HuggingFace-compatible CPU/CUDA math and cached NPU tables."""
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -88,8 +101,24 @@ class _RotaryEmbedding(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000.0)
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        if current_omni_platform.is_npu():
+            max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
+            positions = torch.arange(max_seq, dtype=torch.float32)
+            freqs = torch.outer(positions, inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self.register_buffer("cos_cached", emb.cos(), persistent=False)
+            self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_npu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cos_cached[position_ids].to(dtype=x.dtype), self.sin_cached[position_ids].to(dtype=x.dtype)
+
+    def forward_cuda(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(x, position_ids)
+
+    def forward_xpu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(x, position_ids)
+
+    def forward_native(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # position_ids: [batch, seq_len]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -145,7 +174,6 @@ class CodePredictorAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
         if current_omni_platform.is_npu():
             if self.max_seq > 2048:
                 raise ValueError(
@@ -168,8 +196,6 @@ class CodePredictorAttention(nn.Module):
         bsz: int,
         seq_len: int,
     ) -> torch.Tensor:
-        import torch_npu
-
         q_f, k_f, v_f = q, k, v
         if self.is_gqa:
             k_f = (
@@ -230,10 +256,13 @@ class CodePredictorAttention(nn.Module):
         # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
         cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
         sin = sin.unsqueeze(1)
-        q = (q * cos) + (_rotate_half(q) * sin)
-        k = (k * cos) + (_rotate_half(k) * sin)
-
-        if not current_omni_platform.is_npu():
+        if current_omni_platform.is_npu():
+            q = torch_npu.npu_rotary_mul(q, cos, sin)
+            k = torch_npu.npu_rotary_mul(k, cos, sin)
+            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+        else:
+            q = (q * cos) + (_rotate_half(q) * sin)
+            k = (k * cos) + (_rotate_half(k) * sin)
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -242,8 +271,6 @@ class CodePredictorAttention(nn.Module):
                 is_causal=True,
                 enable_gqa=self.is_gqa,
             )
-        else:
-            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -290,10 +317,17 @@ class CodePredictorDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if current_omni_platform.is_npu():
+            hidden_states, _, residual = torch_npu.npu_add_rms_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
@@ -875,7 +909,6 @@ class CodePredictorWrapper(nn.Module):
             # Use captured device graph if available, otherwise call compiled fn.
             device_graph_entry = self._device_graphs.get(graph_key)
 
-            # Run transformer (device graph replay or compiled forward)
             if device_graph_entry is not None:
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
@@ -939,6 +972,18 @@ class CodePredictorWrapper(nn.Module):
     #  Weight loading
     # ------------------------------------------------------------------
 
+    def _prepare_npu_weights(self) -> None:
+        from vllm_ascend.utils import maybe_trans_nz
+
+        linear_count = 0
+        with torch.no_grad():
+            # Pack linear weights once for NPU matmul.
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    module.weight.data = maybe_trans_nz(module.weight.data)
+                    linear_count += 1
+        logger.info("Prepared NPU code predictor weights: linear=%d", linear_count)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights directly (no fused projection remapping needed)."""
         loaded: set[str] = set()
@@ -964,5 +1009,8 @@ class CodePredictorWrapper(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, w)
             loaded.add(name)
+
+        if current_omni_platform.is_npu():
+            self._prepare_npu_weights()
 
         return loaded

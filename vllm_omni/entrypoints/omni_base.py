@@ -144,7 +144,7 @@ class OmniBase(PDDisaggregationMixin):
         log_stats = kwargs.pop("log_stats", False)
         self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
-        # before it reaches ``StageConfigFactory._create_from_registry``, so
+        # before it reaches ``StageConfigFactory._create_legacy_from_registry``, so
         # ``--no-async-chunk`` (``async_chunk=False``) silently fails to
         # override the deploy YAML's ``async_chunk: true`` default.
         async_chunk = kwargs.get("async_chunk")

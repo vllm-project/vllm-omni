@@ -40,7 +40,7 @@ from tests.helpers.runtime import OmniServer
 _DIFFUSERS_VERSION = tuple(int(x) for x in diffusers.__version__.split(".")[:2] if x.isdigit())
 _DIFFUSERS_038 = _DIFFUSERS_VERSION >= (0, 38)
 
-MODEL_ID = "dg845/LTX-2.3-Diffusers"
+MODEL_ID = "diffusers/LTX-2.3-Diffusers"
 MODEL_ENV_VAR = "VLLM_TEST_LTX23_MODEL"
 PROMPT = "A lighthouse on a rocky cliff at sunset, waves crashing below, golden hour lighting"
 NEGATIVE_PROMPT = "blurry, low quality, distorted, watermark"
@@ -216,7 +216,10 @@ def _run_with_custom_transformer(model: str, output_dir: Path) -> list[Image.Ima
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
 
-    from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import create_transformer_from_config, load_transformer_config
+    from vllm_omni.diffusion.models.ltx2 import (
+        create_transformer_from_config,
+        load_transformer_config,
+    )
 
     vllm_config = VllmConfig()
     ctx = set_current_vllm_config(vllm_config)

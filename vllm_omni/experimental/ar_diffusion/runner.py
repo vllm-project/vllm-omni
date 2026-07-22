@@ -234,10 +234,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             num_frame_per_block=num_frame_per_block,
         )
 
-    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         # KV disabled -> base behavior, unchanged.
         if self.kv_cache is None:
-            return super().execute_model(req)
+            return super().execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
 
         kv = self.kv_cache
         # DreamZero KV is session-scoped (the model state persists across a
@@ -273,7 +273,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # sync below makes the stop reflect completed GPU work, not just dispatch.
         _e2e_t0 = time.perf_counter()
         try:
-            out = super().execute_model(req)
+            out = super().execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
         except Exception:
             # Transactional containment: a forward that died partway may have
             # written some layers' K/V into allocated-but-uncommitted blocks

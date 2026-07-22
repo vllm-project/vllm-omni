@@ -1,4 +1,4 @@
-# SenseNova-U1-8B-MoT
+# SenseNova-U1: Offline inference
 
 ## Architecture
 

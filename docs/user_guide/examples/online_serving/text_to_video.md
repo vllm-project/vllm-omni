@@ -13,6 +13,7 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
+| LTX-2.3 | `diffusers/LTX-2.3-Diffusers` |
 
 ## Wan2.2 T2V
 
@@ -373,6 +374,17 @@ curl -sS -X POST http://localhost:8098/v1/videos \
   -F "guidance_scale=3.0" \
   -F "seed=42"
 ```
+
+## LTX-2.3
+
+LTX-2.3 uses a Diffusers-format checkpoint and a dedicated pipeline class:
+
+```bash
+vllm serve diffusers/LTX-2.3-Diffusers --omni --port 8098 \
+    --model-class-name LTX23Pipeline
+```
+
+Send requests through the same `/v1/videos` API shown in the LTX-2 example.
 
 ## Example materials
 

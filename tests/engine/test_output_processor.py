@@ -11,8 +11,8 @@ from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
 
-from vllm_omni.engine.output_modality import OutputModalityNames
-from vllm_omni.engine.output_processor import OmniRequestState
+from vllm_omni.outputs.output_modality import OutputModalityNames
+from vllm_omni.outputs.output_processor import OmniRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
