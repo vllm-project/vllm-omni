@@ -194,7 +194,13 @@ QUALITY_CONFIGS = [
     QualityTestConfig(
         id="fp8_sd35",
         model="stabilityai/stable-diffusion-3.5-medium",
-        quantization="fp8",
+        quantization={
+            "method": "fp8",
+            "ignored_layers": [
+                "proj_out",
+                "context_embedder",
+            ],
+        },
         task="t2i",
         prompt="a cozy reading corner with a chair, lamp, and books",
         max_lpips=0.20,
