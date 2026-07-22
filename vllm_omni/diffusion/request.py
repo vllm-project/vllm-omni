@@ -56,6 +56,13 @@ class OmniDiffusionRequest:
         ):
             self.sampling_params.do_classifier_free_guidance = True
 
+        # Detect whether the caller explicitly provided guidance_scale_2
+        # BEFORE auto-filling it. Pipelines with a model-specific second
+        # guidance default (e.g. Boogu image_guidance_scale=1.0) must be able
+        # to tell an explicit value apart from the guidance_scale fallback.
+        if self.sampling_params.guidance_scale_2 is not None:
+            self.sampling_params.guidance_scale_2_provided = True
+
         # Auto-fill guidance_scale_2 from the (now-resolved) guidance_scale
         # so downstream code always has a valid value.
         if self.sampling_params.guidance_scale_2 is None:

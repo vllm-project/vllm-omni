@@ -6,8 +6,8 @@
 ``from stepaudio2 import Token2wav`` entry point (``stepaudio2-minicpmo``).
 That package hard-codes ``.cuda()`` and duplicates the flow/HiFT stack that
 vLLM-Omni already vendors for Step-Audio2 (which also carries the Ascend/NPU
-fixes: CPU HiFT, DiT mask expand, MATH SDPA, compile disable, PE buffer
-extension).
+fixes: HiFT linear downsample, DiT mask expand, MATH SDPA, compile disable,
+PE buffer extension).
 
 This module exposes the same call surface MiniCPM expects
 (``__call__`` / ``set_stream_cache`` / ``stream``) while delegating the

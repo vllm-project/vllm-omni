@@ -514,7 +514,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # memory on the NPU sdpa path. Detach the Token2wav vocoder first
                 # so the cast does not drag it onto the accelerator or downcast
                 # its float32 flow/HiFT weights: it manages its own device
-                # placement (e.g. CPU HiFT on NPU) and may not be an nn.Module.
+                # placement and may not be an nn.Module.
                 device = current_omni_platform.get_torch_device()
                 audio_tok = getattr(self.tts_obj, "audio_tokenizer", None)
                 if audio_tok is not None:
