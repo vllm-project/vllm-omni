@@ -124,10 +124,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if self._assets_loaded or self._tts_config is None:
             return
         try:
-            model_path = download_weights_from_hf_specific(
-                self.vllm_config.model_config.model, None, ["*"]
-            )
-
+            model_path = download_weights_from_hf_specific(self.vllm_config.model_config.model, None, ["*"])
 
             if model_path not in sys.path:
                 sys.path.insert(0, model_path)
@@ -285,9 +282,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         import torchaudio
 
-        model_path = download_weights_from_hf_specific(
-            self.vllm_config.model_config.model, None, ["*"]
-        )
+        model_path = download_weights_from_hf_specific(self.vllm_config.model_config.model, None, ["*"])
         default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
         prompt_wav_path = default_ref if os.path.exists(default_ref) else None
 
