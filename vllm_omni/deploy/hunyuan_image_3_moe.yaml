@@ -27,8 +27,6 @@ connectors:
       memory_pool_device: "npu"
   shared_memory_connector:
     name: SharedMemoryConnector
-    extra:
-      shm_threshold_bytes: 65536
 
 stages:
   - stage_id: 0

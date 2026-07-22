@@ -12,7 +12,6 @@ from typing import cast
 
 import torch
 from torch import nn
-from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -81,7 +80,6 @@ def _natural_sort_key(filepath: str) -> list:
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", os.path.basename(filepath))]
 
 
-MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
@@ -325,15 +323,6 @@ class DiffusersPipelineLoader:
         if not source_prefixes:
             return all_parameter_names
         return {name for name in all_parameter_names if name.startswith(source_prefixes)}
-
-    def download_model(self, model_config: ModelConfig) -> None:
-        self._prepare_weights(
-            model_name_or_path=model_config.model,
-            subfolder=None,
-            revision=model_config.revision,
-            fall_back_to_pt=True,
-            allow_patterns_overrides=None,
-        )
 
     def load_model(
         self,

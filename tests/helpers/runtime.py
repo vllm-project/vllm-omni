@@ -2333,7 +2333,6 @@ class OmniRunner:
         # production default in AsyncOmniEngine remains 600s; this only
         # affects the test runner wrapper.
         init_timeout: int = 1800,
-        shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
         stage_configs_path: str | None = None,
         **kwargs,
@@ -2353,7 +2352,6 @@ class OmniRunner:
             stage_init_timeout=stage_init_timeout,
             batch_timeout=batch_timeout,
             init_timeout=init_timeout,
-            shm_threshold_bytes=shm_threshold_bytes,
             stage_configs_path=stage_configs_path,
             **kwargs,
         )
