@@ -1,9 +1,9 @@
-# MiniCPM-o 4.5 default deploy: 2-GPU layout.
+# MiniCPM-o 4.5 default deploy: single-GPU layout.
 #
-# Stage 0 (thinker): GPU 0 — multimodal understanding, ~70% mem.
-# Stage 1 (talker) : GPU 1 — MiniCPMTTS + Token2Wav, ~75% mem
-#                            (covers both the talker LM and the in-process
-#                            Token2Wav vocoder that emits the waveform).
+# Both stages are co-located on GPU 0:
+#   Stage 0 (thinker): multimodal understanding, ~80% mem.
+#   Stage 1 (talker) : MiniCPMTTS + in-process Token2Wav vocoder, ~10% mem
+#                      (talker LM plus the vocoder that emits the waveform).
 #
 # Other GPU layouts: minicpmo_4_5_3gpu.yaml, minicpmo_4_5_8x4090.yaml.
 async_chunk: false
@@ -13,9 +13,9 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
-    max_num_seqs: 1
-    gpu_memory_utilization: 0.7
-    enforce_eager: true
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.8
+    enforce_eager: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -34,10 +34,10 @@ stages:
     # Talker only consumes runtime_additional_information[0]; any value > 1
     # makes concurrent requests share request-0's audio (mm_outputs fallback).
     max_num_seqs: 1
-    gpu_memory_utilization: 0.75
-    enforce_eager: true
+    gpu_memory_utilization: 0.1
+    enforce_eager: false
     max_num_batched_tokens: 8192
-    devices: "1"
+    devices: "0"
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -46,6 +46,14 @@ stages:
       seed: 42
       detokenize: false
 
-# MiniCPM-o 4.5 has only been verified on CUDA devices.  Add per-platform
-# overrides here when other backends (ROCm/XPU/NPU) are verified end-to-end.
-platforms: {}
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE

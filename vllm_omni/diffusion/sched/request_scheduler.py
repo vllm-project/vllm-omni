@@ -3,30 +3,38 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler, get_request_batch_sampling_params_key
+from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    RequestBatchSamplingParamsKey,
 )
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import RunnerOutput
 
+# LoRA identity is derived from `sampling.lora_request`, not a same-named field
+# on sampling params, so it must be resolved separately from the bulk lookup.
+_REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
+    field.name for field in fields(RequestBatchSamplingParamsKey)
+) - {"lora_int_id"}
 
-class RequestScheduler(_BaseScheduler):
+
+class RequestScheduler(BaseScheduler):
     """Diffusion scheduler with vLLM-style waiting/running queues."""
 
-    def _build_sampling_params_key(self, request: OmniDiffusionRequest):
-        return get_request_batch_sampling_params_key(request)
-
-    def add_request(self, request: OmniDiffusionRequest) -> str:
-        return super().add_request(request)
-
-    def schedule(self) -> DiffusionSchedulerOutput:
-        return super().schedule()
+    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+        """Build a request-batch compatibility key from sampling parameters."""
+        sampling = request.sampling_params
+        # LoRA identity is optional on sampling params (and on test stubs).
+        lora_request = getattr(sampling, "lora_request", None)
+        key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+        key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+        return RequestBatchSamplingParamsKey(**key_kwargs)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

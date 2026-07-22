@@ -15,6 +15,7 @@ Pipeline:
 import io
 import logging
 import os
+import sys
 from collections.abc import Iterable
 
 import numpy as np
@@ -27,13 +28,33 @@ from vllm.model_executor.models.interfaces import SupportsPP
 
 from vllm_omni.platforms import current_omni_platform
 
-try:
-    from stepaudio2 import Token2wav as _Token2wav
+# Preserve the established external vocoder on CUDA. Ascend uses the in-tree
+# adapter because ``stepaudio2-minicpmo`` hard-codes CUDA device placement.
+if current_omni_platform.is_npu():
+    try:
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+            MiniCPMO45Token2wav as _Token2wav,
+        )
 
-    _stepaudio2_available = True
-except ImportError:
-    _Token2wav = None
-    _stepaudio2_available = False
+        _token2wav_backend = "step_audio2_core"
+    except ImportError:
+        try:
+            from stepaudio2 import Token2wav as _Token2wav
+
+            _token2wav_backend = "stepaudio2_pkg"
+        except ImportError:
+            _Token2wav = None
+            _token2wav_backend = None
+else:
+    try:
+        from stepaudio2 import Token2wav as _Token2wav
+
+        _token2wav_backend = "stepaudio2_pkg"
+    except ImportError:
+        _Token2wav = None
+        _token2wav_backend = None
+
+_stepaudio2_available = _Token2wav is not None
 
 logger = logging.getLogger(__name__)
 
@@ -101,14 +122,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return
         try:
             model_path = self.vllm_config.model_config.model
-            import os
-            import sys
 
             if model_path not in sys.path:
                 sys.path.insert(0, model_path)
+            from transformers import AutoImageProcessor
             from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-            MiniCPMTTS = get_class_from_dynamic_module("modeling_minicpmo.MiniCPMTTS", model_path)
+            # openbmb/MiniCPM-o-4_5/processing_minicpmo.py registers via a
+            # string: AutoImageProcessor.register("MiniCPMVImageProcessor", ...),
+            # which crashes on transformers>=5 (register reads key.__module__).
+            # Loading MiniCPMTTS imports that module, so no-op the string form
+            # (unused by the standalone talker) while it runs, then restore.
+            original_register = AutoImageProcessor.register
+            AutoImageProcessor.register = (  # type: ignore[method-assign]
+                lambda key, *a, **k: None if isinstance(key, str) else original_register(key, *a, **k)
+            )
+            try:
+                MiniCPMTTS = get_class_from_dynamic_module("modeling_minicpmo.MiniCPMTTS", model_path)
+            finally:
+                AutoImageProcessor.register = original_register  # type: ignore[method-assign]
 
             # MiniCPMTTS.__init__ reads `config.top_p / top_k / repetition_penalty`
             # directly (modeling_minicpmo.py L4112-4114), but the model repo's
@@ -120,6 +152,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             for _attr, _default in (("top_p", 0.8), ("top_k", 100), ("repetition_penalty", 1.02)):
                 if not hasattr(self._tts_config, _attr):
                     setattr(self._tts_config, _attr, _default)
+
+            # The copied Hugging Face flash_attention_2 setting is not valid
+            # for this standalone MiniCPMTTS path. Use PyTorch SDPA on every
+            # backend until a dedicated flash-attention implementation exists.
+            self._tts_config.attn_implementation = "sdpa"
 
             prev_dtype = torch.get_default_dtype()
             torch.set_default_dtype(torch.float32)
@@ -159,7 +196,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 finally:
                     torch.set_default_dtype(prev_dtype2)
                 self.tts_obj.audio_tokenizer = self.audio_tokenizer
-                logger.info("Loaded Token2wav from %s", token2wav_dir)
+                logger.info(
+                    "Loaded Token2wav from %s (backend=%s)",
+                    token2wav_dir,
+                    _token2wav_backend,
+                )
             # Only mark init as complete after every step succeeds, so a
             # partial failure leaves the next call free to retry the full
             # init instead of short-circuiting back to a silent empty path.
@@ -189,19 +230,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         tts = self.tts_obj
         device = tts.emb_text.weight.device
-        dtype = tts.emb_text.weight.dtype
+        # MiniCPMTTS AR backbone uses FlashAttention (fp16/bf16 only). The
+        # submodule is constructed under float32 default dtype during lazy init,
+        # so pin the condition embeddings to bfloat16 explicitly rather than
+        # inheriting the (float32) parameter dtype — a float32 condition breaks
+        # the CUDA FA2 path and wastes memory on the NPU sdpa path.
+        ar_dtype = torch.bfloat16
 
         llm_embeds = tts.emb_text(tts_token_ids.to(device))
-        hidden_embeds = tts.projector_semantic(tts_hidden_states.to(device=device, dtype=dtype))
+        hidden_embeds = tts.projector_semantic(tts_hidden_states.to(device=device, dtype=ar_dtype))
         if getattr(tts.config, "normalize_projected_hidden", False):
             hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
-        tts_embeds = llm_embeds + hidden_embeds
+        tts_embeds = (llm_embeds + hidden_embeds).to(dtype=ar_dtype)
 
         text_eos = tts.emb_text(torch.tensor([tts.config.text_eos_token_id], device=device, dtype=torch.long))
         audio_bos = tts.emb_text(torch.tensor([tts.audio_bos_token_id], device=device, dtype=torch.long))
-        spk_embeds = torch.zeros(0, tts.config.hidden_size, device=device, dtype=tts_embeds.dtype)
+        spk_embeds = torch.zeros(0, tts.config.hidden_size, device=device, dtype=ar_dtype)
 
         inputs_embeds = torch.cat([spk_embeds, tts_embeds, text_eos, audio_bos], dim=0).unsqueeze(0)
+        inputs_embeds = inputs_embeds.to(dtype=ar_dtype)
         logger.info("generate_speech: inputs_embeds shape=%s", list(inputs_embeds.shape))
 
         # Scale max_new_token with input text length to avoid mid-stream truncation on long
@@ -249,7 +296,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         prev_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.float32)
         try:
-            with torch.amp.autocast("cuda", enabled=False):
+            # Vocoder path is float32; use the platform abstraction because
+            # torch.amp.autocast validates unsupported device types even when
+            # autocast is disabled.
+            autocast_device = device.type if isinstance(device, torch.device) else str(device)
+            with current_omni_platform.create_autocast_context(
+                device_type=autocast_device,
+                dtype=torch.float32,
+                enabled=False,
+            ):
                 token_list = generated_tokens.squeeze(0).tolist()
                 num_tokens = len(token_list)
 
@@ -418,7 +473,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return None, None
 
     def compute_logits(self, hidden_states, *args, **kwargs):
-        return torch.zeros(1, 2, device=hidden_states.device if isinstance(hidden_states, torch.Tensor) else "cuda")
+        # Placeholder logits: one row per sampled request (the scheduler
+        # indexes sampled_token_ids by req_index). Hardcoding a single row
+        # breaks batched/concurrent decoding with IndexError. The values are
+        # discarded — real output is the waveform via multimodal_outputs.
+        if isinstance(hidden_states, torch.Tensor):
+            device = hidden_states.device
+            num_reqs = hidden_states.shape[0] if hidden_states.ndim >= 1 else 1
+        else:
+            device = current_omni_platform.get_torch_device()
+            num_reqs = 1
+        return torch.zeros(num_reqs, 2, device=device)
 
     def sample(self, logits, sampling_metadata):
         return None
@@ -442,10 +507,31 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     logger.warning("TTS missing keys (%d): %s", len(missing), missing[:5])
                 if unexpected:
                     logger.warning("TTS unexpected keys (%d): %s", len(unexpected), unexpected[:5])
-                self.tts_obj = self.tts_obj.to("cuda")
+                # Move the AR backbone to the active device (cuda / npu / …) and
+                # cast to bfloat16: MiniCPMTTS AR uses FlashAttention (fp16/bf16
+                # only) and is built under a float32 default dtype during lazy
+                # init, so an uncast float32 backbone breaks CUDA FA2 and wastes
+                # memory on the NPU sdpa path. Detach the Token2wav vocoder first
+                # so the cast does not drag it onto the accelerator or downcast
+                # its float32 flow/HiFT weights: it manages its own device
+                # placement and may not be an nn.Module.
+                device = current_omni_platform.get_torch_device()
+                audio_tok = getattr(self.tts_obj, "audio_tokenizer", None)
+                if audio_tok is not None:
+                    self.tts_obj.audio_tokenizer = None
+                try:
+                    self.tts_obj = self.tts_obj.to(device=device, dtype=torch.bfloat16)
+                finally:
+                    if audio_tok is not None:
+                        self.tts_obj.audio_tokenizer = audio_tok
+                        self.audio_tokenizer = audio_tok
                 self.emb_text = self.tts_obj.emb_text
                 self.projector_semantic = self.tts_obj.projector_semantic
-                logger.info("Loaded %d TTS weights, moved to cuda", len(tts_weights))
+                logger.info(
+                    "Loaded %d TTS weights, moved to %s (bfloat16)",
+                    len(tts_weights),
+                    device,
+                )
 
         return loaded
 

@@ -107,6 +107,8 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
         "diffusion_engine_total_time_ms": 60.0,
         "image_num": 1,
         "resolution": 512,
+        "width": None,
+        "height": None,
         "postprocess_time_ms": 30.0,
     }
 
@@ -239,6 +241,41 @@ def test_formatter_preserves_text_envelope_metadata(monkeypatch: pytest.MonkeyPa
         "metadata": {"text": {"text_output": "caption"}},
         "text": "caption",
     }
+
+
+@pytest.mark.parametrize(
+    "text_metadata",
+    [
+        pytest.param({"think_text": "reasoning"}, id="sensenova-bagel-thinking"),
+        pytest.param({"ar_generated_text": "reasoning"}, id="hunyuan-image3-cot"),
+    ],
+)
+def test_formatter_preserves_image_with_reasoning_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    text_metadata: dict[str, str],
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    metadata = {"text": text_metadata}
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "payload": {"image": "image-0"},
+            "metadata": metadata,
+        }
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("generate an image"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data=None,
+        postprocess_output=postprocess_output,
+        timings=_timings(),
+    )
+
+    assert postprocess_output.primary_key == "image"
+    assert result.images == ["image-0"]
+    assert result.final_output_type == "image"
+    assert result.multimodal_output == {"metadata": metadata}
 
 
 def test_formatter_preserves_audio_output_with_model_sample_rate_fallback(

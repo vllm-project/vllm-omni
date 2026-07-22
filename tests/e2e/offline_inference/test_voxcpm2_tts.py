@@ -14,8 +14,8 @@ VOXCPM2_MODEL = "openbmb/VoxCPM2"
 DEPLOY_CONFIG = get_deploy_config_path("voxcpm2.yaml")
 SAMPLE_RATE = 48000
 
-# (model, stage_config_path) — see ``omni_runner`` in tests.helpers.fixtures.runtime
-_OMNI_RUNNER_PARAM = (VOXCPM2_MODEL, DEPLOY_CONFIG)
+# VoxCPM2 ships a custom tokenizer, so remote code must be explicitly enabled.
+_OMNI_RUNNER_PARAM = (VOXCPM2_MODEL, DEPLOY_CONFIG, {"trust_remote_code": True})
 
 pytestmark = pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
 

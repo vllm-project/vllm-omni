@@ -37,8 +37,15 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_component_quant_config(quant_config, component: str):
+    if hasattr(quant_config, "resolve"):
+        return quant_config.resolve(component)
+    return quant_config
 
 
 class Flux2ImageProcessor(VaeImageProcessor):
@@ -393,10 +400,14 @@ class Flux2Pipeline(
         text_encoder_config = AutoConfig.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
+        te_quant_config = _resolve_component_quant_config(od_config.quantization_config, "text_encoder")
         self.text_encoder = MistralEncoderModel(
             text_encoder_config,
             prefix="text_encoder",
-        ).to(self._execution_device)
+            quant_config=te_quant_config,
+        )
+        if not any(param.is_meta for param in self.text_encoder.parameters()):
+            self.text_encoder.to(self._execution_device)
         self.tokenizer = PixtralProcessor.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
         )
@@ -409,8 +420,9 @@ class Flux2Pipeline(
             self._execution_device
         )
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
+        transformer_quant_config = _resolve_component_quant_config(od_config.quantization_config, "transformer")
         self.transformer = Flux2Transformer2DModel(
-            quant_config=od_config.quantization_config, od_config=od_config, **transformer_kwargs
+            quant_config=transformer_quant_config, od_config=od_config, **transformer_kwargs
         )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
@@ -1148,5 +1160,26 @@ class Flux2Pipeline(
         return DiffusionOutput(output=image)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        text_encoder_quant_config = _resolve_component_quant_config(self.od_config.quantization_config, "text_encoder")
+        transformer_quant_config = _resolve_component_quant_config(self.od_config.quantization_config, "transformer")
+        if (
+            self.od_config.enable_cpu_offload
+            and text_encoder_quant_config is not None
+            and transformer_quant_config is None
+        ):
+            weights = self._offload_transformer_before_text_encoder(weights)
+
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def _offload_transformer_before_text_encoder(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        transformer_offloaded = False
+        for name, weight in weights:
+            if not transformer_offloaded and name.startswith("text_encoder."):
+                self.transformer.to("cpu")
+                current_omni_platform.empty_cache()
+                transformer_offloaded = True
+                logger.info("Offloaded the unquantized transformer before text encoder quantization")
+            yield name, weight

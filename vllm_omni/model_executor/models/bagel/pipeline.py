@@ -27,6 +27,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.bagel"
 
 BAGEL_PIPELINE = PipelineConfig(
     model_type="bagel",
+    default_deploy_config_name="bagel.yaml",
     model_arch="OmniBagelForConditionalGeneration",
     hf_architectures=("BagelForConditionalGeneration",),
     stages=(
@@ -63,6 +64,7 @@ BAGEL_PIPELINE = PipelineConfig(
 
 BAGEL_THINK_PIPELINE = PipelineConfig(
     model_type="bagel_think",
+    default_deploy_config_name="bagel_think.yaml",
     model_arch="OmniBagelForConditionalGeneration",
     hf_architectures=(),
     stages=(
@@ -96,6 +98,7 @@ BAGEL_THINK_PIPELINE = PipelineConfig(
 
 BAGEL_SINGLE_STAGE_PIPELINE = PipelineConfig(
     model_type="bagel_single_stage",
+    default_deploy_config_name="bagel_single_stage.yaml",
     model_arch="BagelForConditionalGeneration",
     hf_architectures=(),
     stages=(

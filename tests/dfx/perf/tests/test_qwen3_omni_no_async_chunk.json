@@ -44,25 +44,25 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "mean_ttft_ms": [
-            109.1218,
-            247.4411,
-            354.9384,
-            447.7885,
-            694.7487
+            115.8348,
+            173.1823,
+            446.672,
+            464.5985,
+            3420.0634
           ],
           "mean_e2el_ms": [
-            22413.667,
-            30808.9715,
-            35677.844,
-            46345.8978,
-            68350.4853
+            25070.9523,
+            31992.0646,
+            37619.7669,
+            50393.8257,
+            136619.2743
           ],
           "mean_audio_rtf": [
-            0.1695,
-            0.2033,
-            0.2467,
-            0.3234,
-            0.4438
+            0.169,
+            0.2111,
+            0.2475,
+            0.3551,
+            0.9266
           ]
         }
       },
@@ -91,13 +91,13 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "mean_ttft_ms": [
-            323.3573
+            343.1377
           ],
           "mean_e2el_ms": [
-            4623.4173
+            4811.1123
           ],
           "mean_audio_rtf": [
-            0.1406
+            0.1463
           ]
         }
       },
@@ -128,13 +128,13 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "mean_ttft_ms": [
-            215.4502
+            245.5446
           ],
           "mean_e2el_ms": [
-            4924.149
+            5019.1256
           ],
           "mean_audio_rtf": [
-            0.1637
+            0.1713
           ]
         }
       },
@@ -167,13 +167,13 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "mean_ttft_ms": [
-            442.5815
+            506.1407
           ],
           "mean_e2el_ms": [
-            6441.0986
+            6814.9656
           ],
           "mean_audio_rtf": [
-            0.2091
+            0.2213
           ]
         }
       }
