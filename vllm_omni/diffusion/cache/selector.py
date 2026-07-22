@@ -16,10 +16,14 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     - tea_cache: Uses TeaCacheBackend with enable()/refresh() interface
     - mag_cache: Uses MagCacheBackend with enable()/refresh() interface
     - step_cache: Uses StepCacheBackend for DreamZero velocity step skip
+    - inter_request: Uses InterRequestCacheBackend for cross-request DiT state reuse
+    - inter_request+cache_dit: CompositeCacheBackend combining both
 
     Args:
-        cache_backend: Cache backend name ("cache_dit", "tea_cache",
-            "mag_cache", "step_cache", or None).
+        cache_backend: Cache backend name. Supported values:
+            "cache_dit", "tea_cache", "mag_cache", "step_cache",
+            "inter_request", "inter_request+cache_dit"
+            (or "cache_dit+inter_request"), or None.
         cache_config: Cache configuration (dict or DiffusionCacheConfig instance).
 
     Returns:
@@ -42,8 +46,17 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         return MagCacheBackend(cache_config)
     elif cache_backend in ("step_cache", "stepcache", "step_cache_dit"):
         return StepCacheBackend(cache_config)
+    elif cache_backend == "inter_request":
+        from vllm_omni.diffusion.cache.inter_request.backend import InterRequestCacheBackend
+
+        return InterRequestCacheBackend(cache_config)
+    elif cache_backend in ("inter_request+cache_dit", "cache_dit+inter_request"):
+        from vllm_omni.diffusion.cache.composite_backend import CompositeCacheBackend
+
+        return CompositeCacheBackend(cache_config)
     else:
         raise ValueError(
             f"Unsupported cache backend: {cache_backend}. "
-            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'step_cache'"
+            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'step_cache', "
+            "'inter_request', 'inter_request+cache_dit'"
         )

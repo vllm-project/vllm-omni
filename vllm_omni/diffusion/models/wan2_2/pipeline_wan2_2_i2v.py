@@ -340,12 +340,27 @@ class Wan22I2VPipeline(
         attention_kwargs: dict[str, Any],
         condition: torch.Tensor,
         first_frame_mask: torch.Tensor,
+        resume_from_step: int = 0,
+        resume_latents: torch.Tensor | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+
+        # Inter-request cache: resume support
+        step_latents_recorder = getattr(self, "_step_latents_recorder", None)
+        if resume_from_step > 0 and resume_latents is not None:
+            latents = resume_latents.to(device=latents.device, dtype=latents.dtype)
+            self.scheduler._step_index = resume_from_step
+            self.scheduler.set_begin_index(resume_from_step)
+
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
+
+                # Inter-request cache: skip already-computed steps
+                if step_idx < resume_from_step:
+                    pbar.update()
+                    continue
 
                 # Select model and guidance scale based on timestep
                 current_model = self.transformer
@@ -405,6 +420,8 @@ class Wan22I2VPipeline(
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if step_latents_recorder is not None:
+                    step_latents_recorder.record(step_idx, t.item(), latents)
                 pbar.update()
 
         return latents
@@ -648,6 +665,8 @@ class Wan22I2VPipeline(
             attention_kwargs=attention_kwargs,
             condition=condition,
             first_frame_mask=first_frame_mask,
+            resume_from_step=getattr(req.sampling_params, "resume_from_step", 0) or 0,
+            resume_latents=getattr(req.sampling_params, "resume_latents", None),
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos

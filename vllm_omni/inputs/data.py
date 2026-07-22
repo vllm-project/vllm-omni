@@ -304,6 +304,9 @@ class OmniDiffusionSamplingParams:
 
     # VSA parameters
     VSA_sparsity: float = 0.0
+    # Inter-request cache: resume from a cached denoising step
+    resume_from_step: int = 0
+    resume_latents: torch.Tensor | None = None
     # perf_logger: PerformanceLogger | None = None
 
     # stage logging

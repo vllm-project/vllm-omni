@@ -123,10 +123,13 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit", "tea_cache"],
+        choices=["cache_dit", "tea_cache", "mag_cache", "step_cache", "inter_request", "inter_request+cache_dit"],
         help=(
             "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), "
+            "'tea_cache' (Timestep Embedding Aware Cache), "
+            "'inter_request' (cross-request DiT cache reuse), "
+            "'inter_request+cache_dit' (cross-request + intra-request cache_dit). "
             "Default: None (no cache acceleration)."
         ),
     )
@@ -134,6 +137,62 @@ def parse_args() -> argparse.Namespace:
         "--enable-cache-dit-summary",
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
+    # Inter-request cache parameters [inter_request only]
+    parser.add_argument(
+        "--persistent-cache-dir",
+        type=str,
+        default="./persistent_cache",
+        help="Directory for persistent cross-request cache storage.",
+    )
+    parser.add_argument(
+        "--lmcache-disk-dir",
+        type=str,
+        default=None,
+        help="LMCache disk directory for CPU→Disk tiering.",
+    )
+    parser.add_argument("--lmcache-max-cpu-gb", type=float, default=5.0)
+    parser.add_argument("--lmcache-max-disk-gb", type=float, default=100.0)
+    parser.add_argument(
+        "--max-entries",
+        type=int,
+        default=8000,
+        help="Maximum number of cached entries in the inter-request cache.",
+    )
+    parser.add_argument(
+        "--max-memory-gb",
+        type=float,
+        default=800.0,
+        help="Maximum GPU/CPU memory (GB) for the inter-request cache.",
+    )
+    parser.add_argument(
+        "--clip-model-path",
+        type=str,
+        default=None,
+        help="Path to CLIP model for semantic prompt matching.",
+    )
+    parser.add_argument(
+        "--clip-threshold",
+        type=float,
+        default=0.75,
+        help="CLIP text similarity threshold for semantic cache hit.",
+    )
+    parser.add_argument(
+        "--clip-min-skip",
+        type=int,
+        default=5,
+        help="Minimum denoising steps to skip on a semantic hit.",
+    )
+    parser.add_argument(
+        "--clip-max-skip-ratio",
+        type=float,
+        default=0.5,
+        help="Maximum skip ratio of total steps when similarity is 1.0.",
+    )
+    parser.add_argument(
+        "--no-t2i-penalty",
+        action="store_true",
+        help="Disable t2i sigmoid penalty (use text-only similarity).",
     )
     parser.add_argument(
         "--ulysses-degree",
@@ -384,6 +443,34 @@ def main():
             # Note: coefficients will use model-specific defaults based on model_type
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
+    elif cache_backend and "inter_request" in cache_backend:
+        # Inter-request DiT cache reuse configuration
+        cache_config = {
+            "inter_request_max_entries": args.max_entries,
+            "inter_request_max_memory_gb": args.max_memory_gb,
+            "inter_request_persistent_cache_dir": args.persistent_cache_dir,
+        }
+        if args.lmcache_disk_dir:
+            cache_config["inter_request_lmcache_disk_dir"] = args.lmcache_disk_dir
+            cache_config["inter_request_lmcache_max_cpu_gb"] = args.lmcache_max_cpu_gb
+            cache_config["inter_request_lmcache_max_disk_gb"] = args.lmcache_max_disk_gb
+        if args.clip_model_path:
+            cache_config["inter_request_clip_model_path"] = args.clip_model_path
+            cache_config["inter_request_clip_threshold"] = args.clip_threshold
+            cache_config["inter_request_clip_min_skip"] = args.clip_min_skip
+            cache_config["inter_request_clip_max_skip_ratio"] = args.clip_max_skip_ratio
+        cache_config["inter_request_use_t2i_penalty"] = not args.no_t2i_penalty
+        # When combined with cache_dit, also add cache_dit parameters
+        if "cache_dit" in cache_backend:
+            cache_config["Fn_compute_blocks"] = 1
+            cache_config["Bn_compute_blocks"] = 0
+            cache_config["max_warmup_steps"] = 4
+            cache_config["residual_diff_threshold"] = 0.24
+            cache_config["max_continuous_cached_steps"] = 3
+            cache_config["enable_taylorseer"] = False
+            cache_config["taylorseer_order"] = 1
+            cache_config["scm_steps_mask_policy"] = None
+            cache_config["scm_steps_policy"] = "dynamic"
 
     profiler_enabled = args.profiler_config is not None
 

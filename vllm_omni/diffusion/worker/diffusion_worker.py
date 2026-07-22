@@ -720,6 +720,10 @@ class DiffusionWorker:
             mgr = getattr(self.model_runner, "kv_transfer_manager", None)
             if mgr is not None:
                 mgr.shutdown_prefetch()
+            # Allow model runner to flush persistent caches etc.
+            runner_shutdown = getattr(self.model_runner, "shutdown", None)
+            if runner_shutdown is not None:
+                runner_shutdown()
         destroy_distributed_env()
 
 
