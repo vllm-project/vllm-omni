@@ -25,14 +25,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import yaml
 from skip_ci import (
     ROOT,
-    CiDecision,
-    resolve_changed_files,
-    resolve_ci_decision,
+    resolve_ci_context_from_git,
 )
 
 # --- Constants ---
@@ -40,6 +39,13 @@ from skip_ci import (
 LOG = "upload_pipeline"
 DOC_SEP = "\n---\n"
 BOOTSTRAP_MARKER = "__IMAGE_BUILD_IF__"
+BOOTSTRAP_PLACEHOLDERS = (
+    "__IMAGE_BUILD_IF__",
+    "__UPLOAD_READY_IF__",
+    "__UPLOAD_MERGE_IF__",
+    "__UPLOAD_NIGHTLY_IF__",
+    "__UPLOAD_WEEKLY_IF__",
+)
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
 
@@ -68,24 +74,27 @@ def _log(message: str) -> None:
 # --- Bootstrap pipeline (cuda/pipeline.yml, npu/pipeline-npu.yml) ---
 
 
+def _bootstrap_platform(path: Path) -> str:
+    parts = path.as_posix().split("/")
+    return "npu" if "npu" in parts else "cuda"
+
+
 def _render_bootstrap_pipeline(
     text: str,
     *,
-    decision: CiDecision,
+    decision,
     path: Path,
 ) -> str:
     """Replace ``__*__IF__`` placeholders from skip-ci decision (document 2 after ``---``)."""
-    platform = "npu" if "/npu/" in path.as_posix() else "cuda"
+    platform = _bootstrap_platform(path)
 
     def quoted_if(expr: str) -> str:
         return f"'({expr})'"
 
     disabled = "'false'"
 
-    if DOC_SEP in text:
-        _, continuation = text.split(DOC_SEP, 1)
-    else:
-        continuation = text
+    _, continuation = _split_pipeline_documents(text)
+    placeholders = tuple(name for name in BOOTSTRAP_PLACEHOLDERS if name in continuation)
 
     nightly_only = NPU_NIGHTLY_ONLY if platform == "npu" else CUDA_NIGHTLY_ONLY
     nightly_main = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
@@ -153,15 +162,37 @@ def _render_bootstrap_pipeline(
         nightly_if = quoted_if(nightly_label_if)
         weekly_if = quoted_if(weekly_label_if) if platform == "cuda" else disabled
 
-    rendered = (
-        continuation.replace("__IMAGE_BUILD_IF__", image_if)
-        .replace("__UPLOAD_READY_IF__", ready_if)
-        .replace("__UPLOAD_MERGE_IF__", merge_if)
-        .replace("__UPLOAD_NIGHTLY_IF__", nightly_if)
-    )
-    if platform == "cuda":
-        rendered = rendered.replace("__UPLOAD_WEEKLY_IF__", weekly_if)
+    replacements = {
+        "__IMAGE_BUILD_IF__": image_if,
+        "__UPLOAD_READY_IF__": ready_if,
+        "__UPLOAD_MERGE_IF__": merge_if,
+        "__UPLOAD_NIGHTLY_IF__": nightly_if,
+        "__UPLOAD_WEEKLY_IF__": weekly_if,
+    }
+    rendered = continuation
+    for name, value in replacements.items():
+        if name in rendered:
+            rendered = rendered.replace(name, value)
+    _assert_no_bootstrap_placeholders(rendered, placeholders)
     return rendered
+
+
+def _assert_no_bootstrap_placeholders(content: str, placeholders: tuple[str, ...]) -> None:
+    leftover = [name for name in placeholders if name in content]
+    if leftover:
+        raise ValueError(
+            "unreplaced bootstrap placeholders in rendered pipeline: "
+            f"{', '.join(leftover)}. Ensure bootstrap upload runs "
+            ".buildkite/common/scripts/upload_pipeline.py --upload on the platform pipeline file.",
+        )
+
+
+def _split_pipeline_documents(text: str) -> tuple[str, str]:
+    for separator in (DOC_SEP, "\r\n---\r\n", "\n---\r\n", "\r\n---\n"):
+        if separator in text:
+            head, tail = text.split(separator, 1)
+            return head, tail
+    return "", text
 
 
 # --- Test pipeline (test-ready.yml, test-merge.yml) ---
@@ -304,11 +335,12 @@ def _render_pipeline(
     e2e_only: bool = False,
 ) -> str:
     text = path.read_text(encoding="utf-8")
-    decision = resolve_ci_decision(from_git=True)
-    changed_files = resolve_changed_files()
-
-    if force_all or e2e_only:
+    ctx = resolve_ci_context_from_git()
+    decision = ctx.decision
+    if BOOTSTRAP_MARKER in text or force_all or e2e_only:
         changed_files = None
+    else:
+        changed_files = ctx.changed_files
 
     if BOOTSTRAP_MARKER in text:
         return _render_bootstrap_pipeline(

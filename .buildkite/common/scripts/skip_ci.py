@@ -2,15 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared Buildkite skip-ci and CI-YAML level targeting logic.
 
-``resolve_ci_decision()`` buckets changed files once, then combines:
-
-  - ``docs`` / ``skip_tests`` only → ``skip_all`` (suppress entire default CI)
-  - ``l45`` yaml → skip both L2 and L3 (L4/L5 labels unchanged; ``l2``/``l3`` buckets rescue)
-  - ``l2`` yaml → skip L3; keep L2 on touched platforms
-  - ``l3`` yaml → skip L2; keep L3 on touched platforms
-
-Buildkite entry point: ``resolve_ci_decision(from_git=True)``; helpers live on
-``CiDecision`` (``is_run``, ``message``).
+``resolve_ci_decision(changed_files, ...)`` buckets explicit file lists (tests, dry-run).
+``resolve_ci_context_from_git()`` resolves git diff once and returns decision + changed files
+for Buildkite bootstrap / upload scripts.
 
 CLI (for bootstrap scripts; exit code is the signal):
   python3 skip_ci.py check-skip-all
@@ -260,6 +254,15 @@ class CiDecision:
         return True
 
 
+@dataclass(frozen=True)
+class CiContext:
+    """Skip-ci decision plus git diff inputs used to compute it."""
+
+    decision: CiDecision
+    changed_files: list[str] | None
+    diff_range: str | None
+
+
 def _log(message: str) -> None:
     print(f"{LOG}: {message}", file=sys.stderr)
 
@@ -307,9 +310,8 @@ def _resolve_diff_range() -> str | None:
     return None
 
 
-def resolve_changed_files() -> list[str] | None:
-    """Return changed file paths, or None when diff cannot be resolved."""
-    diff_range = _resolve_diff_range()
+def _changed_files_for_diff_range(diff_range: str | None) -> list[str] | None:
+    """Return changed file paths for *diff_range*, or None when unavailable."""
     if diff_range is None:
         return None
 
@@ -326,6 +328,14 @@ def resolve_changed_files() -> list[str] | None:
     # <<< TEMP
     _log(f"{len(files)} changed file(s)")
     return files
+
+
+def resolve_ci_context_from_git() -> CiContext:
+    """Resolve git diff once and return skip-ci decision plus changed files."""
+    diff_range = _resolve_diff_range()
+    changed_files = _changed_files_for_diff_range(diff_range)
+    decision = resolve_ci_decision(changed_files, diff_range=diff_range)
+    return CiContext(decision=decision, changed_files=changed_files, diff_range=diff_range)
 
 
 # --- Doc / skip-mark helpers ---
@@ -474,12 +484,7 @@ def resolve_ci_decision(
     changed_files: list[str] | None = None,
     *,
     diff_range: str | None = None,
-    from_git: bool = False,
 ) -> CiDecision:
-    if from_git:
-        diff_range = _resolve_diff_range()
-        changed_files = resolve_changed_files()
-
     if changed_files is None:
         return _finish(CiDecision(), "could not resolve changed files; run normal CI")
 
@@ -543,7 +548,7 @@ def main() -> int:
     )
 
     args = parser.parse_args()
-    decision = resolve_ci_decision(from_git=True)
+    decision = resolve_ci_context_from_git().decision
 
     if args.command == "check-skip-all":
         return 0 if decision.skip_all else 1
