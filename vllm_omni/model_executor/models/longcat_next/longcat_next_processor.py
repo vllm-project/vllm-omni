@@ -37,7 +37,7 @@ from vllm.multimodal.processing import (
     PromptUpdate,
 )
 
-from vllm.transformers_utils.processors.longcat_next import (
+from vllm_omni.transformers_utils.processors.longcat_next import (
     LongcatNextAudioProcessor,
     LongcatNextProcessor,
 )
