@@ -1002,24 +1002,19 @@ class TestTTSMethods:
 
         assert speech_server.uploaded_speakers["bad_emb_voice"] == existing
 
-    def test_upload_ming_audio_voice_caches_speaker_embedding(self, speech_server, mocker: MockerFixture, tmp_path):
-        """Ming stereo uploads downmix before persisting the derived embedding."""
+    def test_upload_ming_audio_voice_defers_speaker_extraction(self, speech_server, mocker: MockerFixture, tmp_path):
+        """Ming audio uploads stay model-agnostic and defer extraction to use."""
         speech_server._tts_model_type = "ming_tts"
         speech_server.uploaded_speakers_dir = tmp_path
         speech_server.uploaded_speakers = {}
         speech_server.supported_speakers = set()
+        speech_server._speaker_cache.clear()
 
         left = np.full(32000, 0.5, dtype=np.float32)
         right = np.full(32000, -0.25, dtype=np.float32)
         samples = np.stack((left, right), axis=-1)
-        expected_mono = np.mean(samples, axis=-1)
-        fake_embedding = [0.2] * SPEAKER_EMBEDDING_DIM
         mocker.patch("soundfile.read", return_value=(samples, 16000))
-        mock_extract = mocker.patch.object(
-            speech_server,
-            "_extract_ming_speaker_embeddings_from_ref_audio",
-            return_value=[fake_embedding],
-        )
+        mock_extract = mocker.patch.object(speech_server, "_extract_ming_speaker_embeddings_from_ref_audio")
         saved: dict[str, object] = {}
 
         def fake_save_file(tensors, path, metadata=None):
@@ -1043,16 +1038,22 @@ class TestTTSMethods:
             )
         )
 
-        mock_extract.assert_called_once_with([(expected_mono.tolist(), 16000)])
+        mock_extract.assert_not_called()
         tensors = saved["tensors"]
         metadata = saved["metadata"]
         assert isinstance(tensors, dict)
         assert isinstance(metadata, dict)
-        assert set(tensors) == {"audio", "speaker_embedding"}
+        assert set(tensors) == {"audio"}
         assert tensors["audio"].shape == (32000, 2)
-        assert tensors["speaker_embedding"].shape == (SPEAKER_EMBEDDING_DIM,)
         assert metadata["embedding_source"] == "audio"
-        assert metadata["embedding_dim"] == str(SPEAKER_EMBEDDING_DIM)
+        assert "embedding_dim" not in metadata
+        speaker_info = speech_server.uploaded_speakers["ming_audio_voice"]
+        cache_key = speech_server._speaker_cache.make_cache_key(
+            "ming_audio_voice",
+            model_type="ming_tts",
+            created_at=speaker_info["created_at"],
+        )
+        assert speech_server._speaker_cache.get(cache_key) is None
 
     def test_base_task_requires_ref_audio_or_speaker_embedding(self, speech_server):
         """Base task without ref_audio or speaker_embedding is rejected."""
@@ -1677,25 +1678,30 @@ class TestTTSMethods:
 
     def test_ming_adapter_uploaded_audio_uses_cached_embedding(self, speech_server, mocker: MockerFixture):
         """Cached Ming audio voices skip repeated speaker extraction."""
+        speech_server._speaker_cache.clear()
         speech_server.uploaded_speakers = {
             "audio_voice": {
                 "name": "audio_voice",
                 "file_path": "/tmp/voice_samples/audio_voice.safetensors",
+                "created_at": 123,
                 "mime_type": "audio/wav",
                 "embedding_source": "audio",
-                "embedding_dim": SPEAKER_EMBEDDING_DIM,
                 "ref_text": "Reference transcript.",
             }
         }
         ref_audio_source = "data:audio/wav;base64,ZmFrZWF1ZGlv"
         ref_audio_data = ([0.0, 0.1], 16000)
         fake_embedding = [0.2] * SPEAKER_EMBEDDING_DIM
-        mocker.patch.object(speech_server, "_get_uploaded_audio_data", return_value=ref_audio_source)
-        mock_get_emb = mocker.patch.object(
-            speech_server,
-            "_get_uploaded_speaker_embedding",
-            return_value=fake_embedding,
+        cache_key = speech_server._speaker_cache.make_cache_key(
+            "audio_voice",
+            model_type="ming_tts",
+            created_at=123,
         )
+        speech_server._speaker_cache.put(
+            cache_key,
+            {"speaker_embedding": torch.tensor(fake_embedding)},
+        )
+        mocker.patch.object(speech_server, "_get_uploaded_audio_data", return_value=ref_audio_source)
         mocker.patch.object(
             speech_server,
             "_resolve_ref_audio",
@@ -1715,16 +1721,77 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", voice="audio_voice")
         prepared = asyncio.run(adapter.build(req, [], False))
 
-        mock_get_emb.assert_called_once_with(
-            "audio_voice",
-            expected_source="audio",
-            expected_dim=SPEAKER_EMBEDDING_DIM,
-        )
         mock_extract.assert_not_called()
         mock_prompt.assert_called_once_with(req, ref_audio_data=ref_audio_data)
         assert req.ref_text == "Reference transcript."
-        assert req.speaker_embedding == fake_embedding
+        assert req.speaker_embedding == pytest.approx(fake_embedding)
         assert prepared.model_type == "ming_tts"
+
+    def test_ming_adapter_legacy_audio_only_voice_falls_back_and_caches(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+        tmp_path,
+    ):
+        """Legacy audio-only profiles extract once instead of failing after upgrade."""
+        from safetensors.torch import save_file
+
+        speech_server._tts_model_type = "ming_tts"
+        speech_server.uploaded_speakers_dir = tmp_path
+        speech_server._speaker_cache.clear()
+        file_path = tmp_path / "legacy_audio_voice.safetensors"
+        save_file({"audio": torch.zeros(32000, dtype=torch.float32)}, str(file_path))
+        speech_server.uploaded_speakers = {
+            "legacy_audio_voice": {
+                "name": "legacy_audio_voice",
+                "file_path": str(file_path),
+                "created_at": 456,
+                "mime_type": "audio/wav",
+                "embedding_source": "audio",
+                "ref_text": "Reference transcript.",
+            }
+        }
+        ref_audio_source = "data:audio/wav;base64,ZmFrZWF1ZGlv"
+        ref_audio_data = ([0.0, 0.1], 16000)
+        fake_embedding = [0.4] * SPEAKER_EMBEDDING_DIM
+        mocker.patch.object(speech_server, "_get_uploaded_audio_data", return_value=ref_audio_source)
+        mocker.patch.object(
+            speech_server,
+            "_resolve_ref_audio",
+            new=mocker.AsyncMock(return_value=ref_audio_data),
+        )
+        mock_extract = mocker.patch.object(
+            speech_server,
+            "_extract_ming_speaker_embeddings_from_ref_audio",
+            return_value=[fake_embedding],
+        )
+        mocker.patch.object(
+            speech_server,
+            "_build_ming_dense_prompt",
+            return_value={"additional_information": {"speaker_count": 1}},
+        )
+
+        adapter = MingTTSAdapter(SpeechServingContext(server=speech_server))
+        first_req = OpenAICreateSpeechRequest(input="Hello", voice="legacy_audio_voice")
+        first_prepared = asyncio.run(adapter.build(first_req, [], False))
+        second_req = OpenAICreateSpeechRequest(input="Hello again", voice="legacy_audio_voice")
+        second_prepared = asyncio.run(adapter.build(second_req, [], False))
+
+        mock_extract.assert_called_once_with([ref_audio_data])
+        assert first_req.speaker_embedding == pytest.approx(fake_embedding)
+        assert second_req.speaker_embedding == pytest.approx(fake_embedding)
+        assert first_req.ref_text == "Reference transcript."
+        assert second_req.ref_text == "Reference transcript."
+        assert first_prepared.model_type == "ming_tts"
+        assert second_prepared.model_type == "ming_tts"
+        cache_key = speech_server._speaker_cache.make_cache_key(
+            "legacy_audio_voice",
+            model_type="ming_tts",
+            created_at=456,
+        )
+        cached = speech_server._speaker_cache.get(cache_key)
+        assert cached is not None
+        torch.testing.assert_close(cached["speaker_embedding"], torch.tensor(fake_embedding))
 
     # ── regression: full flow from issue #1603 ──
 

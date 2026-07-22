@@ -1102,17 +1102,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._ref_audio_data_url_cache[voice_name_lower] = data_url
         return data_url
 
-    def _get_uploaded_speaker_embedding(
-        self,
-        voice_name: str,
-        *,
-        expected_source: str = "direct",
-        expected_dim: int | None = None,
-    ) -> list[float] | None:
-        """Load a speaker embedding from an uploaded voice's safetensors."""
+    def _get_uploaded_speaker_embedding(self, voice_name: str) -> list[float] | None:
+        """Load a pre-computed speaker embedding from an uploaded voice's safetensors.
+
+        Returns ``None`` if the voice has audio (not a direct embedding)."""
         voice_name_lower = voice_name.lower()
         info = self.uploaded_speakers.get(voice_name_lower)
-        if info is None or info.get("embedding_source") != expected_source:
+        if info is None or info.get("embedding_source") != "direct":
             return None
         file_path = Path(info["file_path"])
         if not file_path.exists():
@@ -1122,26 +1118,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error("File path traversal detected for voice %s: %s", voice_name, file_path)
             return None
         try:
-            from safetensors import safe_open
+            from safetensors.torch import load_file
         except ImportError:
             logger.error("The 'safetensors' package is required to load speaker embeddings")
             return None
         try:
-            with safe_open(str(file_path), framework="pt") as f:
-                if "speaker_embedding" not in f.keys():
-                    if expected_source == "direct":
-                        logger.warning("Key 'speaker_embedding' missing in %s", file_path)
-                    return None
-                embedding = f.get_tensor("speaker_embedding").detach().reshape(-1).to(torch.float32).cpu()
-            if expected_dim is not None and int(embedding.numel()) != expected_dim:
-                logger.warning(
-                    "Speaker embedding for voice %s has %d dims; expected %d",
-                    voice_name,
-                    int(embedding.numel()),
-                    expected_dim,
-                )
+            tensors = load_file(str(file_path))
+            if "speaker_embedding" not in tensors:
+                logger.warning("Key 'speaker_embedding' missing in %s", file_path)
                 return None
-            return embedding.tolist()
+            return tensors["speaker_embedding"].squeeze().tolist()
         except Exception as e:
             logger.error("Could not load embedding for voice %s: %s", voice_name, e)
             return None
@@ -1347,19 +1333,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("safetensors is required for voice upload") from exc
             try:
                 audio_tensor = torch.from_numpy(np.asarray(wav_np, dtype=np.float32)).contiguous()
-                tensors = {"audio": audio_tensor}
-                if self._tts_model_type == "ming_tts":
-                    embedding_audio = np.asarray(wav_np, dtype=np.float32)
-                    if embedding_audio.ndim > 1:
-                        embedding_audio = np.mean(embedding_audio, axis=-1)
-                    embedding = self._extract_ming_speaker_embeddings_from_ref_audio(
-                        [(embedding_audio.tolist(), int(sr))]
-                    )[0]
-                    embedding_tensor = torch.tensor(embedding, dtype=torch.float32).reshape(-1).contiguous()
-                    tensors["speaker_embedding"] = embedding_tensor
-                    speaker_data["embedding_dim"] = int(embedding_tensor.numel())
                 save_file(
-                    tensors,
+                    {"audio": audio_tensor},
                     str(file_path),
                     metadata=self._speaker_metadata_to_header(speaker_data),
                 )
