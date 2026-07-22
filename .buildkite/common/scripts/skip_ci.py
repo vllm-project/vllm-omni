@@ -329,12 +329,7 @@ def _changed_files_for_diff_range(diff_range: str | None) -> list[str] | None:
         ".cursor/skills/",
     )
     _temp_ignore_files = frozenset({"docs/contributing/ci/.nav.yaml"})
-    _temp_keep_files = frozenset(
-        {
-            ".buildkite/cuda/test-ready.yml",
-            ".buildkite/amd/test-amd-ready.yml",
-        }
-    )
+    _temp_keep_files = frozenset({".buildkite/npu/test-npu-ready.yml"})
     files = [
         path
         for path in files
