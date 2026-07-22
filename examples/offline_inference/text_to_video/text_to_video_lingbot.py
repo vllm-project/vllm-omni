@@ -58,9 +58,12 @@ def _to_frame_array(video: Any) -> np.ndarray:
     if isinstance(video, torch.Tensor):
         tensor = video.detach().cpu()
         if tensor.dim() == 5:
-            tensor = tensor[0] if tensor.shape[1] not in (3, 4) else tensor[0].permute(1, 2, 3, 0)
-        elif tensor.dim() == 4 and tensor.shape[0] in (3, 4):
-            tensor = tensor.permute(1, 2, 3, 0)
+            tensor = tensor[0]
+        if tensor.dim() == 4 and tensor.shape[-1] not in (3, 4):
+            if tensor.shape[0] in (3, 4):
+                tensor = tensor.permute(1, 2, 3, 0)
+            elif tensor.shape[1] in (3, 4):
+                tensor = tensor.permute(0, 2, 3, 1)
         if tensor.is_floating_point():
             if float(tensor.min()) < 0.0:
                 tensor = tensor.clamp(-1, 1) * 0.5 + 0.5

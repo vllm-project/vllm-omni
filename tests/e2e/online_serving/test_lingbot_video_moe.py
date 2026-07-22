@@ -7,6 +7,7 @@ import os
 
 import pytest
 
+from tests.helpers.assertions import assert_video_first_frame_matches
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
@@ -89,4 +90,10 @@ def test_video_generation_modes_moe(omni_server: OmniServer, openai_client: Open
     synthetic_image = generate_synthetic_image(320, 192, force_regenerate=True, seed=42)
     request_config["form_data"]["prompt"] = "the red block moves slowly while the camera remains fixed"
     request_config["image_reference"] = f"data:image/jpeg;base64,{synthetic_image['base64']}"
-    openai_client.send_video_diffusion_request(request_config)
+    responses = openai_client.send_video_diffusion_request(request_config)
+    assert responses[0].videos
+    assert_video_first_frame_matches(
+        responses[0].videos[0],
+        synthetic_image["np_array"],
+        max_mean_absolute_error=0.25,
+    )

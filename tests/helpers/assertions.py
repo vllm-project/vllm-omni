@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from tests.helpers.runtime import DiffusionResponse
 
+import av
 import numpy as np
 import soundfile as sf
 from PIL import Image
@@ -156,6 +157,29 @@ def assert_video_diffusion_response(
             height=expected_height,
             fps=expected_fps,
         )
+
+
+def assert_video_first_frame_matches(
+    video: Path | bytes | BytesIO,
+    expected: np.ndarray,
+    *,
+    max_mean_absolute_error: float,
+) -> None:
+    """Assert that an encoded video's first frame matches a reference image."""
+    if isinstance(video, Path):
+        source: str | BytesIO = str(video)
+    else:
+        video_bytes = video if isinstance(video, bytes) else video.getvalue()
+        source = BytesIO(video_bytes)
+
+    with av.open(source) as container:
+        first_frame = next(container.decode(video=0)).to_ndarray(format="rgb24")
+
+    assert first_frame.shape == expected.shape
+    mean_absolute_error = float(np.abs(first_frame.astype(np.float32) - expected).mean() / 255.0)
+    assert mean_absolute_error < max_mean_absolute_error, (
+        f"Expected first-frame MAE < {max_mean_absolute_error}, got {mean_absolute_error:.6f}."
+    )
 
 
 def assert_audio_diffusion_response(

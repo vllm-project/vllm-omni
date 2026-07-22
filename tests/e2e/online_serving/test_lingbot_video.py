@@ -3,13 +3,11 @@
 
 """Online serving smoke coverage for the dense LingBot-Video checkpoint."""
 
-import io
 import os
 
-import av
-import numpy as np
 import pytest
 
+from tests.helpers.assertions import assert_video_first_frame_matches
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
@@ -71,14 +69,6 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
     assert payload["data"][0]["b64_json"]
 
 
-def _assert_first_frame_conditioned(video_bytes: bytes, expected: np.ndarray) -> None:
-    with av.open(io.BytesIO(video_bytes)) as container:
-        first_frame = next(container.decode(video=0)).to_ndarray(format="rgb24")
-    assert first_frame.shape == expected.shape
-    mean_absolute_error = float(np.abs(first_frame.astype(np.float32) - expected).mean() / 255.0)
-    assert mean_absolute_error < 0.25
-
-
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -107,4 +97,8 @@ def test_video_generation_modes_001(omni_server: OmniServer, openai_client: Open
     request_config["image_reference"] = f"data:image/jpeg;base64,{synthetic_image['base64']}"
     responses = openai_client.send_video_diffusion_request(request_config)
     assert responses[0].videos
-    _assert_first_frame_conditioned(responses[0].videos[0], synthetic_image["np_array"])
+    assert_video_first_frame_matches(
+        responses[0].videos[0],
+        synthetic_image["np_array"],
+        max_mean_absolute_error=0.25,
+    )

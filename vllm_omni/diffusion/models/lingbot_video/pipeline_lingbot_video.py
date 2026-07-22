@@ -277,19 +277,26 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
 
     def post_process_func(frames: torch.Tensor | dict[str, torch.Tensor], sampling_params=None):
-        mode = None
+        output_key = None
         if isinstance(frames, dict):
             output_keys = [key for key in ("image", "video") if key in frames]
             if len(output_keys) != 1:
                 raise ValueError(
                     f"LingBot output must contain exactly one of 'image' or 'video', got {sorted(frames)!r}."
                 )
-            mode = output_keys[0]
-            frames = frames[mode]
+            output_key = output_keys[0]
+            frames = frames[output_key]
         output_type = getattr(sampling_params, "output_type", None) or "pt"
-        if isinstance(frames, torch.Tensor) and output_type != "latent" and (output_type == "np" or mode == "image"):
-            return frames.float().cpu().numpy()
-        return frames
+        # The image serving path currently accepts PIL images or NumPy arrays,
+        # while LingBot decodes T2I outputs to tensors. Keep that compatibility
+        # conversion without discarding the model's image/video payload key.
+        if (
+            isinstance(frames, torch.Tensor)
+            and output_type != "latent"
+            and (output_type == "np" or output_key == "image")
+        ):
+            frames = frames.float().cpu().numpy()
+        return {output_key: frames} if output_key is not None else frames
 
     return post_process_func
 

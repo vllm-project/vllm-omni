@@ -144,14 +144,61 @@ def test_postprocess_keeps_torch_by_default_and_converts_np_when_requested():
     array = post(frames, SimpleNamespace(output_type="np"))
     assert isinstance(array, np.ndarray)
     assert array.shape == (2, 4, 4, 3)
+    video = post({"video": frames}, SimpleNamespace(output_type="pt"))
+    assert set(video) == {"video"}
+    assert video["video"] is frames
     image = post(
         {"image": torch.ones(4, 4, 3)},
         SimpleNamespace(output_type="pt"),
     )
-    assert isinstance(image, np.ndarray)
-    assert image.shape == (4, 4, 3)
+    assert set(image) == {"image"}
+    assert isinstance(image["image"], np.ndarray)
+    assert image["image"].shape == (4, 4, 3)
     latent = torch.ones(1, 4, 1, 2, 2)
-    assert post({"image": latent}, SimpleNamespace(output_type="latent")) is latent
+    latent_output = post({"image": latent}, SimpleNamespace(output_type="latent"))
+    assert set(latent_output) == {"image"}
+    assert latent_output["image"] is latent
+
+
+def test_postprocess_preserves_image_contract_for_serving():
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.models.lingbot_video import get_lingbot_video_post_process_func
+    from vllm_omni.diffusion.output_formatter import (
+        DiffusionStepTimings,
+        format_diffusion_outputs,
+        normalize_diffusion_postprocess_output,
+    )
+    from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
+
+    sampling = OmniDiffusionSamplingParams(
+        num_inference_steps=1,
+        output_type="pt",
+        resolution=64,
+    )
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "a robot", "modalities": ["image"]},
+        sampling_params=sampling,
+        request_id="lingbot-image-contract-test",
+    )
+    raw_output = {"image": torch.ones(8, 12, 3)}
+    processed = get_lingbot_video_post_process_func(SimpleNamespace())(raw_output, sampling)
+    normalized = normalize_diffusion_postprocess_output(processed)
+
+    assert normalized.primary_key == "image"
+    [result] = format_diffusion_outputs(
+        request=request,
+        od_config=SimpleNamespace(model_class_name="LingBotVideoPipeline"),
+        diffusion_output=DiffusionOutput(output=raw_output),
+        output_data=raw_output,
+        postprocess_output=normalized,
+        timings=DiffusionStepTimings(0.0, 0.0, 0.0, 0.0),
+    )
+
+    assert len(result.images) == 1
+    assert isinstance(result.images[0], np.ndarray)
+    endpoint_images = _extract_images_from_result(result)
+    assert len(endpoint_images) == 1
+    assert endpoint_images[0].size == (12, 8)
 
 
 def test_forward_resolves_t2v_sampling_and_flow_shift_alias():

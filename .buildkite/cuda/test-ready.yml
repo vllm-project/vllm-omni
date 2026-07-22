@@ -312,6 +312,7 @@ steps:
       - label: "Diffusion · LingBot Video Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_lingbot_video.py
+          - tests/helpers/assertions.py
           - vllm_omni/diffusion/models/lingbot_video/
           - vllm_omni/entrypoints/openai/serving_video.py
           - vllm_omni/model_extras/lingbot_video.py
