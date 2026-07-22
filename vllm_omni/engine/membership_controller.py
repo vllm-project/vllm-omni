@@ -15,6 +15,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import janus
 from vllm.logger import init_logger
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -51,7 +52,7 @@ class MembershipController:
         self._membership_tasks: set[asyncio.Task[None]] = set()
         self._shutdown_event = asyncio.Event()
         self._watcher_task: asyncio.Task[None] | None = None
-        self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
+        self._output_queue: janus.SyncQueue[EngineQueueMessage] | None = None
         self._cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None
 
         self._hub = OmniCoordClientForHub(coordinator_pub_address)
@@ -76,7 +77,7 @@ class MembershipController:
         self,
         stage_id: int,
         input_addr: str,
-        output_queue: asyncio.Queue[EngineQueueMessage] | None = None,
+        output_queue: janus.SyncQueue[EngineQueueMessage] | None = None,
         cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None,
     ) -> None:
         """Handle an unregister_remote_replica message."""
@@ -90,8 +91,11 @@ class MembershipController:
         if affected and effective_cleanup_callback is not None:
             await effective_cleanup_callback(affected)
         if affected and effective_output_queue is not None:
+            # Orchestrator now produces output via the queue's sync side, so push
+            # non-blocking with put_nowait (the queue is unbounded). See
+            # Orchestrator.output_sync_queue / try_get_output_async.
             for req_id in affected:
-                await effective_output_queue.put(
+                effective_output_queue.put_nowait(
                     ErrorMessage(error="stage replica disappeared", request_id=req_id, stage_id=stage_id)
                 )
 
@@ -181,7 +185,7 @@ class MembershipController:
     def install_unregister_handlers(
         self,
         *,
-        output_queue: asyncio.Queue[EngineQueueMessage],
+        output_queue: janus.SyncQueue[EngineQueueMessage],
         cleanup_callback: Callable[[list[str]], Awaitable[None]],
     ) -> None:
         """Install shared cleanup sinks for watcher-driven unregister events."""

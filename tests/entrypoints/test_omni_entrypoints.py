@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -146,8 +147,17 @@ class FakeAsyncOmniEngine:
         except queue.Empty:
             return None
 
-    async def try_get_output_async(self) -> Any | None:
-        return self.try_get_output()
+    async def try_get_output_async(self) -> Any:
+        # Mirror the real AsyncOmniEngine: park until a message is available
+        # instead of returning None on empty. The AsyncOmni output loop no
+        # longer polls (it relies on this awaitable suspending when the queue
+        # is empty), so a synchronous None return would hot-spin the loop
+        # without ever yielding and starve the event loop.
+        while True:
+            msg = self.try_get_output()
+            if msg is not None:
+                return msg
+            await asyncio.sleep(0.001)
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         return self.stage_metadata[stage_id]

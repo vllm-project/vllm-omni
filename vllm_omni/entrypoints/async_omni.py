@@ -47,7 +47,6 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniPromptType
 
 logger = init_logger(__name__)
-_FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
 
 
 class AsyncEventResolver:
@@ -673,9 +672,6 @@ class AsyncOmni(EngineClient, OmniBase):
             try:
                 while True:
                     msg = await engine.try_get_output_async()
-                    if msg is None:
-                        await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
-                        continue
 
                     if isinstance(msg, dict) and msg.get("type") == "ack":
                         ack_data = msg.get("ack")

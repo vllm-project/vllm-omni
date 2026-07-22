@@ -303,7 +303,7 @@ def _build_harness(
             rpc_queue = janus.Queue()
             orchestrator = Orchestrator(
                 request_async_queue=request_queue.async_q,
-                output_async_queue=output_queue.async_q,
+                output_sync_queue=output_queue.sync_q,
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
                 async_chunk=async_chunk,

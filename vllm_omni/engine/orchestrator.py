@@ -212,7 +212,7 @@ class Orchestrator:
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[dict[str, Any]],
+        output_sync_queue: janus.SyncQueue[dict[str, Any]],
         rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
         stage_pools: list[StagePool],
         *,
@@ -225,7 +225,7 @@ class Orchestrator:
         enable_orch_monitor: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
-        self.output_async_queue = output_async_queue
+        self.output_sync_queue = output_sync_queue
         self.rpc_async_queue = rpc_async_queue
 
         self.async_chunk = bool(async_chunk)
@@ -341,7 +341,7 @@ class Orchestrator:
         membership_watcher: asyncio.Task[None] | None = None
         if self._membership is not None:
             self._membership.install_unregister_handlers(
-                output_queue=self.output_async_queue,
+                output_queue=self.output_sync_queue,
                 cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
             )
             membership_watcher = self._membership.start()
@@ -732,7 +732,7 @@ class Orchestrator:
                             self._fatal_error_stage_id = stage_id
                             for req_id, req_state in list(self.request_states.items()):
                                 if stage_id in req_state.stage_submit_ts:
-                                    await self.output_async_queue.put(
+                                    self.output_sync_queue.put_nowait(
                                         ErrorMessage(
                                             error=str(e),
                                             fatal=True,
@@ -799,7 +799,7 @@ class Orchestrator:
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
         else:
             parent_id = output.request_id
-        await self.output_async_queue.put(
+        self.output_sync_queue.put_nowait(
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
@@ -900,7 +900,7 @@ class Orchestrator:
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
         if self.stage_pools[stage_id].final_output:
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -912,7 +912,7 @@ class Orchestrator:
                 )
             )
         elif stage_metrics is not None:
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 StageMetricsMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -1248,7 +1248,7 @@ class Orchestrator:
                         src_stage_id,
                         next_logical,
                     )
-                    await self.output_async_queue.put(
+                    self.output_sync_queue.put_nowait(
                         OutputMessage(
                             request_id=req_id,
                             stage_id=next_logical,
@@ -1274,7 +1274,7 @@ class Orchestrator:
                             src_stage_id,
                             next_logical,
                         )
-                        await self.output_async_queue.put(
+                        self.output_sync_queue.put_nowait(
                             OutputMessage(
                                 request_id=req_id,
                                 stage_id=next_logical,
@@ -1416,7 +1416,7 @@ class Orchestrator:
                 final_output_type or "text",
                 final_stage_id,
             )
-            await self.output_async_queue.put(
+            self.output_sync_queue.put_nowait(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,
@@ -1603,7 +1603,7 @@ class Orchestrator:
                 break
             if msg.type == "add_request":
                 req_id = msg.request_id
-                await self.output_async_queue.put(
+                self.output_sync_queue.put_nowait(
                     ErrorMessage(
                         error=self._fatal_error,
                         fatal=True,
@@ -1618,7 +1618,7 @@ class Orchestrator:
         #    missed it because it wasn't submitted to the dead stage yet).
         for req_id in list(self.request_states):
             if req_id not in notified:
-                await self.output_async_queue.put(
+                self.output_sync_queue.put_nowait(
                     ErrorMessage(
                         error=self._fatal_error,
                         fatal=True,

@@ -395,11 +395,16 @@ class TestPipelineStreamingOutputToEntrypoint:
                 )
             )
 
-        async def try_get_output_async(self) -> Any | None:
-            try:
-                return self._fixture.output_sync_q.get_nowait()
-            except queue.Empty:
-                return None
+        async def try_get_output_async(self) -> Any:
+            # Mirror the real AsyncOmniEngine: park until a message is available
+            # instead of returning None on empty. The AsyncOmni output loop no
+            # longer polls, so a synchronous None return would hot-spin the loop
+            # without yielding and starve the event loop.
+            while True:
+                try:
+                    return self._fixture.output_sync_q.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.001)
 
         def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
             return self.stage_metadata[stage_id]
