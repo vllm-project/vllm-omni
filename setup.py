@@ -116,6 +116,10 @@ def detect_target_device() -> str:
         return "cpu"
 
     except ImportError:
+        if sys.platform == "darwin":
+            print("PyTorch not found on macOS, defaulting to CPU installation")
+            return "cpu"
+
         print("PyTorch not found, defaulting to CUDA installation")
         return "cuda"
 
