@@ -68,7 +68,6 @@ class OmniSchedulerMixin:
             )
         input_coordinator.process_pending_full_payload_inputs(
             self.waiting,
-            self.running,
             connector_output.stage_recv_req_ids if connector_output else set(),
         )
 
