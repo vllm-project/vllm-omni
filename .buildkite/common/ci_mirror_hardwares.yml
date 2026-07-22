@@ -16,6 +16,7 @@ x-npu-k8s-plugins: &npu_k8s_plugins
         imagePullSecrets:
           - name: swr-secret
 
+
 mirror_hardwares:
   l4_1:
     agents:
@@ -229,7 +230,7 @@ mirror_hardwares:
       resource_class: "npu-8"
     image: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/vllm-omni-ci-npu:${BUILDKITE_COMMIT}-a3"
     plugins: *npu_k8s_plugins
- 
+
   a3_npu_16:
     agents:
       queue: "ascend-a3"
