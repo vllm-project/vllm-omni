@@ -299,6 +299,25 @@ class PipelineConfig:
                     errors.append(f"Stage {stage.stage_id} references itself")
         if not any(not s.input_sources for s in self.stages):
             errors.append("No entry point (stage with empty input_sources)")
+
+        # RFC #4590: apply the disaggregated-diffusion topology rules when any
+        # stage declares a disaggregated role (encode/denoise/decode). This
+        # catches denoise-without-encode-source, decode-without-denoise-source,
+        # bad final-output placement, and unmergeable multi-source consumers.
+        #
+        # validate_linear_diffusion_topology re-checks duplicate ids and source
+        # references that the generic block above already covers. That overlap is
+        # intentional, not redundant: the diffusion validator is duck-typed and
+        # lives in the torch-free stage_roles leaf so it can validate lightweight
+        # test doubles standalone, so it cannot assume this method ran first. The
+        # duplicate messages are harmless (callers surface the error list as-is).
+        from vllm_omni.diffusion.stage_roles import (
+            DISAGGREGATED_ROLES,
+            validate_linear_diffusion_topology,
+        )
+
+        if any(s.model_stage in DISAGGREGATED_ROLES for s in self.stages):
+            errors.extend(validate_linear_diffusion_topology(self.stages))
         return errors
 
 
@@ -754,6 +773,9 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "active_stream_window",
     "custom_voice_dir",
 )
+# Public alias for the same tuple: internal call sites use the underscored name,
+# while other packages (config.__init__ __all__, omni_config) import this public
+# one. Same object — kept as an alias only to preserve the public import path.
 PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
 
 
@@ -771,6 +793,12 @@ def _build_engine_args(
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
+    # The asymmetry here is deliberate: model_arch falls back to the pipeline
+    # value, but model_class_name is derived only from a stage-level model_arch.
+    # A diffusion stage that omits its own model_arch (relying on the pipeline
+    # fallback) intentionally does NOT auto-set model_class_name, leaving the
+    # loader to resolve the class by other means. Do not add the pipeline
+    # fallback to this branch without checking the diffusion loader.
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:

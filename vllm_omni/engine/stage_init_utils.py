@@ -1093,6 +1093,17 @@ def build_diffusion_config(
     od_config.num_gpus = num_devices_per_stage
     if metadata.cfg_kv_collect_func is not None:
         od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
+
+    # Wire the stage role through to the worker/runner (RFC #4590). engine_args
+    # may already carry it (StageConfig.to_omegaconf writes model_stage), but the
+    # authoritative source is the stage metadata; set it explicitly so the runner
+    # can select encode/denoise/decode and the loader can gate components. This is
+    # the narrowest wiring point — model_stage previously reached only the
+    # head-side client, never the worker's od_config.
+    # ``model_stage`` is a required StageMetadata field (None only for the
+    # monolithic/legacy case), so read it directly rather than defensively.
+    if metadata.model_stage is not None:
+        od_config.model_stage = metadata.model_stage
     return od_config
 
 

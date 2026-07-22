@@ -287,8 +287,10 @@ class DiffusionEngine:
         logger.debug("Generation completed successfully.")
 
         if output.output is None:
-            logger.warning("Output is None, returning empty OmniRequestOutput")
-            return format_empty_diffusion_outputs(request, finished=output.finished)
+            logger.debug(
+                "Output is None, returning empty OmniRequestOutput (custom_output=%s)", bool(output.custom_output)
+            )
+            return format_empty_diffusion_outputs(request, finished=output.finished, custom_output=output.custom_output)
 
         # When CPU offload is enabled, move output to CPU before
         # post-processing to avoid device OOM — model weights may still

@@ -48,7 +48,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, spli
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -770,9 +770,9 @@ class QwenImagePipeline(
 
     def prepare_encode(
         self,
-        state: "StepRequestState",
+        state: "DiffusionRequestState",
         **kwargs: Any,
-    ) -> "StepRequestState":
+    ) -> "DiffusionRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
         sampling = state.sampling
         prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
@@ -959,7 +959,7 @@ class QwenImagePipeline(
 
     def step_scheduler(
         self,
-        state: "StepRequestState",
+        state: "DiffusionRequestState",
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
@@ -980,7 +980,7 @@ class QwenImagePipeline(
 
     def post_decode(
         self,
-        state: "StepRequestState",
+        state: "DiffusionRequestState",
         **kwargs: Any,
     ) -> DiffusionOutput:
         """Decode final latents from *state*."""

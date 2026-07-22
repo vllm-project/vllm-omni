@@ -362,6 +362,40 @@ def _prepare_diffusion_quant_config(
     configure_quant_config(quant_config, model_class)
 
 
+def _log_stage_component_plan(od_config: OmniDiffusionConfig, model_class: type) -> None:
+    """Validate + log the component plan for a disaggregated diffusion stage.
+
+    Model-agnostic: it consults the pipeline class's declared
+    ``required_components_for_stage`` (part of the disaggregated protocol) and
+    logs which components this stage role intends to build. Raises early if a
+    disaggregated role is requested but the class does not declare the
+    capability. A no-op for the monolithic role / non-disaggregated pipelines.
+    """
+    from vllm_omni.diffusion.stage_roles import is_disaggregated_role, normalize_stage_role
+
+    role = normalize_stage_role(getattr(od_config, "model_stage", None))
+    if not is_disaggregated_role(role):
+        return
+
+    spec_fn = getattr(model_class, "required_components_for_stage", None)
+    if not callable(spec_fn) or not getattr(model_class, "supports_disaggregated_execution", False):
+        raise ValueError(
+            f"Stage role {role!r} requested for {od_config.model_class_name}, but that "
+            "pipeline does not declare disaggregated execution support "
+            "(missing supports_disaggregated_execution / required_components_for_stage)."
+        )
+    try:
+        spec = spec_fn(role)
+        logger.info(
+            "Diffusion stage loader: model=%s role=%s will construct components: %s",
+            od_config.model_class_name,
+            role,
+            spec.describe(),
+        )
+    except Exception as exc:  # pragma: no cover - logging must not block load
+        logger.warning("Failed to resolve component spec for role %s: %s", role, exc)
+
+
 def initialize_model(
     od_config: OmniDiffusionConfig,
 ) -> nn.Module:
@@ -385,6 +419,14 @@ def initialize_model(
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
+        # Stage-specific partial construction (RFC #4590 §8). For a disaggregated
+        # stage, query the pipeline class's component spec *before* construction
+        # and log which components this role will build. The actual skip happens
+        # inside the pipeline __init__ (it reads od_config.model_stage), because
+        # the constructor is the only place components are built; this generic
+        # hook validates + records intent and stays model-agnostic (no hard-coded
+        # pipeline class names). Monolithic stages are unaffected.
+        _log_stage_component_plan(od_config, model_class)
         with set_current_diffusion_config(od_config):
             model = model_class(od_config=od_config)
 

@@ -578,6 +578,14 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Disaggregated-diffusion stage role (RFC #4590). One of
+    # ``encode`` / ``denoise`` / ``decode`` for a disaggregated stage, or
+    # ``diffusion`` / ``None`` for the monolithic single-worker fallback. This
+    # is the single per-worker copy of ``StagePipelineConfig.model_stage``;
+    # ``build_diffusion_config`` sets it from the stage metadata so the runner
+    # can pick its execution path and the loader can gate component construction.
+    model_stage: str | None = None
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)
@@ -1231,6 +1239,13 @@ class DiffusionOutput:
     # memory usage info
     peak_memory_mb: float = 0.0
 
+    # Opaque per-request extras passed through to OmniRequestOutput.custom_output.
+    # Used by disaggregated diffusion (RFC #4590) to carry the typed StagePayload
+    # from one stage's output into the next stage's request (under
+    # STAGE_PAYLOAD_OUTPUT_KEY); see ``_intermediate_output`` in
+    # diffusion_model_runner.py and the generic stage-transition processor.
+    custom_output: dict[str, Any] = field(default_factory=dict)
+
     # When True, move tensor fields to CPU at construction time. Useful when
     # the output is shipped across process boundaries (e.g. step-execution
     # mode) and the receiving side must not initialise a stray CUDA context.
@@ -1255,6 +1270,8 @@ class DiffusionOutput:
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        if self.custom_output:
+            self.custom_output = {k: _maybe_to_cpu(v) for k, v in self.custom_output.items()}
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":

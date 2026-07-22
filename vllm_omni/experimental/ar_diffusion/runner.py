@@ -23,13 +23,15 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import MAX_DREAMZERO_SESSIONS
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import KVPrefetchJob
+from vllm_omni.diffusion.stage_payload import STAGE_PAYLOAD_PROMPT_KEY
+from vllm_omni.diffusion.stage_roles import DECODE, DENOISE, ENCODE
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -62,14 +64,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # Built after the model is loaded (dimensions known); stays None while KV
         # management is disabled.
         self.kv_cache: ARDiffusionKVCache | None = None
-        # DreamZero KV is session-scoped (persists across a session's forwards),
-        # so AR-Diffusion KV state is keyed by session_id and reused, not created per request.
-        # Bounded by the same LRU cap as DreamZeroPipeline._states: an evicted
-        # session's ARDiffusionKVState owns pool blocks (two CFG adapters), so without a
-        # bound, session-id churn in a long-running server would leak pool ownership
-        # until the KV pool is exhausted. Evicting frees those blocks (state.close()).
+        # AR-Diffusion KV is session-scoped (persists across a session's forwards),
+        # so KV state is keyed by session_id and reused, not created per request.
+        # Bounded by an LRU cap: an evicted session's ARDiffusionKVState owns pool
+        # blocks (two CFG adapters), so without a bound, session-id churn in a
+        # long-running server would leak pool ownership until the KV pool is
+        # exhausted. Evicting frees those blocks (state.close()). The cap comes
+        # from the generic KV config (ARDiffusionKVConfig.max_sessions) rather than
+        # a model-specific constant so the engine layer stays decoupled from any
+        # one model; a model whose pipeline caps its own session map can set the
+        # same value in ar_diffusion_kv_config to keep the two maps in step.
         self._ar_diffusion_states: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
-        self._max_ar_diffusion_states = MAX_DREAMZERO_SESSIONS
+        self._max_ar_diffusion_states = self.ar_diffusion_kv_config.max_sessions
         # Per-request server-side forward E2E times (seconds), recorded in
         # execute_model. This is the worker-side compute time — the analog of the
         # upstream server's per-request E2E — and excludes the engine<->worker IPC
@@ -140,9 +146,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
     def _infer_frame_seqlen(self) -> int:
         """frame_seqlen = (H//8)*(W//8)//4 from the configured image_resolution."""
-        mc = getattr(self.od_config, "model_config", None) or {}
-        psc = (mc.get("policy_server_config") if isinstance(mc, dict) else None) or {}
-        res = psc.get("image_resolution", [180, 320])
+        res = self._image_resolution()
         h, w = int(res[0]), int(res[1])
         return (h // 8) * (w // 8) // 4
 
@@ -168,8 +172,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # The loaded transformer is the source of truth for frame_seqlen (it derives
         # max_attention_size from it). The deploy-config inference is only a
         # cross-check — warn on drift rather than silently sizing chunks wrong.
-        frame_seqlen = int(getattr(t, "frame_seqlen", 0)) or self._infer_frame_seqlen()
         inferred = self._infer_frame_seqlen()
+        frame_seqlen = int(getattr(t, "frame_seqlen", 0)) or inferred
         if frame_seqlen != inferred:
             logger.warning(
                 "AR-Diffusion frame_seqlen mismatch: transformer=%d deploy-config=%d; using transformer",
@@ -197,7 +201,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = dataclasses.replace(
             self.ar_diffusion_kv_config, chunk_size=chunk_size, window_chunks=window_chunks
         )
-        free_bytes = torch.cuda.mem_get_info(self.device)[0]
+        free_bytes = current_omni_platform.get_free_memory(self.device)
         # Under CFG-parallel each rank executes exactly ONE branch (rank0 pos,
         # rank1 neg; the other branch's lazy contexts never allocate on this
         # rank), so its pool only needs one branch's capacity. A single-process
@@ -235,6 +239,29 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             num_frame_per_block=num_frame_per_block,
         )
 
+    def _resolve_session_id(self, req: OmniDiffusionRequest) -> str:
+        """Resolve the AR-Diffusion session id for this request.
+
+        Monolithic path: ``sampling_params.extra_args["session_id"]``. Denoise
+        stage: the transition processor mirrors the encode payload's public
+        ``scalar_fields["session_id"]`` into both ``extra_args["session_id"]`` and
+        the prompt, so reading extra_args covers both. Falls back to the payload's
+        public ``scalar_fields`` directly if extra_args did not carry it (handling
+        both a live ``StagePayload`` and a msgpack-flattened plain dict).
+        """
+        extra_args = req.sampling_params.extra_args or {}
+        session_id = extra_args.get("session_id")
+        if session_id is None and self.model_stage == DENOISE:
+            prompt = req.prompt
+            extra = prompt.get("extra") if isinstance(prompt, dict) else getattr(prompt, "extra", None)
+            payload = extra.get(STAGE_PAYLOAD_PROMPT_KEY) if isinstance(extra, dict) else None
+            if payload is not None:
+                scalar_fields = (
+                    payload.get("scalar_fields") if isinstance(payload, dict) else getattr(payload, "scalar_fields", {})
+                )
+                session_id = (scalar_fields or {}).get("session_id")
+        return str(session_id or "default")
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
@@ -244,12 +271,23 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if self.kv_cache is None:
             return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
 
+        # Disaggregated encode/decode stages own NO AR-Diffusion KV: they run
+        # conditions encode / VAE decode only. Route them straight to the base
+        # runner's role dispatch without touching the session pool (RFC #4590
+        # §9.1: KV/session state lives exclusively on the denoise stage). The
+        # denoise stage (and the monolithic path) keep the session attach below.
+        role = self.model_stage
+        if role in (ENCODE, DECODE):
+            return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+
         kv = self.kv_cache
         # DreamZero KV is session-scoped (the model state persists across a
         # session's forwards), so the AR-Diffusion KV state is keyed by session_id and
         # reused — matching how pipeline.forward resolves the model-local state.
-        extra_args = req.sampling_params.extra_args or {}
-        session_id = str(extra_args.get("session_id") or "default")
+        # For the denoise stage the session id arrives in the payload metadata
+        # (mirrored to extra_args by the transition processor); for the
+        # monolithic path it is the request's own extra_args["session_id"].
+        session_id = self._resolve_session_id(req)
         state = self._ar_diffusion_states.get(session_id)
         if state is None:
             pos = kv.begin_request(f"bde__{session_id}")
@@ -292,6 +330,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             states = getattr(self.pipeline, "_states", None)
             if states is not None:
                 states.pop(session_id, None)
+            # RFC #4590 Part A: also drop the committed session-progress record so
+            # the torn-down session cannot leave the ordering authority mid-stream.
+            # After teardown the next chunk must arrive as an explicit reset (fresh
+            # epoch), which re-syncs both stages; a bare continuation is then
+            # rejected instead of silently resuming a session whose KV/model state
+            # was wiped. Guarded so non-session pipelines are unaffected.
+            progress = getattr(self.pipeline, "_session_progress", None)
+            if progress is not None and hasattr(progress, "drop"):
+                progress.drop(session_id)
             logger.warning(
                 "AR-Diffusion execute_model failed for session=%s; session state torn down "
                 "(pool blocks freed) — the next request starts a fresh session",
@@ -368,7 +415,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 n_frames = 1 if i == 0 else 4  # client convention: 1-frame prefill, 4-frame chunks
                 obs = self._synth_robot_obs(h, w, n_frames)
                 sp = OmniDiffusionSamplingParams(extra_args={"reset": i == 0, "session_id": sid, "robot_obs": obs})
-                req = OmniDiffusionRequest(prompts=["warmup"], sampling_params=sp, request_id=f"ardiffusion-warmup-{i}")
+                req = OmniDiffusionRequest(prompt="warmup", sampling_params=sp, request_id=f"ardiffusion-warmup-{i}")
                 self.execute_model(req)
                 # Stop once the resident window is full — the remaining shapes are
                 # already captured (the window caps/resets through the same set).

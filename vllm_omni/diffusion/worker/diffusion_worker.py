@@ -240,6 +240,23 @@ class DiffusionWorker:
         else:
             model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
         model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        # PR #4948: step/streaming pipelines migrated to the DiffusionV2Atoms
+        # contract run through DiffusionModelRunnerV2 (the runner owns the state
+        # cache, batching, step loop, scatter/gather, and local stage execution).
+        # We swap ONLY when (a) step or streaming execution is requested, (b) the
+        # platform/base runner class was selected (engine-selected runners like
+        # ARDiffusionModelRunner keep their own execute path), and (c) the target
+        # pipeline actually implements the new atoms (``init_state``). Pipelines
+        # still on the legacy SupportsStepExecution contract (helios /
+        # hunyuan_image3 / qwen_image / diffusers_adapter) keep the base runner's
+        # execute_stepwise path.
+        needs_step_runner = bool(
+            getattr(self.od_config, "step_execution", False) or getattr(self.od_config, "streaming_output", False)
+        )
+        if needs_step_runner and model_runner_cls is DiffusionModelRunner and self._pipeline_uses_v2_atoms():
+            from vllm_omni.diffusion.worker.diffusion_model_runner_v2 import DiffusionModelRunnerV2
+
+            model_runner_cls = DiffusionModelRunnerV2
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
@@ -250,6 +267,30 @@ class DiffusionWorker:
             self.load_model(load_format=self.od_config.diffusion_load_format)
             self.init_lora_manager()
         logger.info(f"Worker {self.rank}: Initialization complete.")
+
+    def _pipeline_uses_v2_atoms(self) -> bool:
+        """Return whether the configured pipeline implements the #4948 atoms.
+
+        Resolved from the model class BEFORE the model is loaded, so the runner
+        class can be chosen up front. A pipeline is on the DiffusionV2Atoms
+        contract if it exposes the ``init_state`` atom (the entry hook of the new
+        surface); legacy step pipelines only expose ``prepare_encode`` and must
+        keep the base runner. Any resolution failure is treated as "legacy" so a
+        model we cannot introspect never gets silently misrouted to the v2 runner.
+        """
+        try:
+            from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+            model_class = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
+            return model_class is not None and hasattr(model_class, "init_state")
+        except Exception:
+            logger.warning(
+                "Worker %s: could not resolve model class %r for runner selection; "
+                "using base DiffusionModelRunner.",
+                self.rank,
+                getattr(self.od_config, "model_class_name", None),
+            )
+            return False
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""

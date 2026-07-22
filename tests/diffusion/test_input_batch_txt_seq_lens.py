@@ -2,14 +2,14 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.worker.input_batch import _prepare_request_prompt_field
-from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def test_prepare_request_prompt_field_refreshes_txt_seq_lens_after_padding():
-    state = StepRequestState(
+    state = DiffusionRequestState(
         request_id="req-0",
         sampling=OmniDiffusionSamplingParams(),
         prompt_embeds=torch.randn(1, 10, 4),
