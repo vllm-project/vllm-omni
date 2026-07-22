@@ -4,7 +4,6 @@
 import torch
 
 from .pipeline_janus import JanusPipeline, get_janus_post_process_func
-from .pipeline_janus_vq import JanusVQDecodePipeline
 
 
 def _register_janus_hf_classes() -> None:
@@ -45,7 +44,6 @@ def _load_param(module: torch.nn.Module, name: str, tensor: torch.Tensor) -> Non
 
 __all__ = [
     "JanusPipeline",
-    "JanusVQDecodePipeline",
     "get_janus_post_process_func",
     "_load_param",
     "_register_janus_hf_classes",

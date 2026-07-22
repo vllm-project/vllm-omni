@@ -36,10 +36,10 @@ from vllm_omni.diffusion.sched.interface import RequestBatchSamplingParamsKey
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 # Default values for every batch-key field, so SimpleNamespace-based
-# sampling_params satisfy ``get_sampling_params_key``'s attribute lookups.
+# sampling_params satisfy ``RequestScheduler._build_sampling_params_key``'s attribute lookups.
 _SAMPLING_KEY_DEFAULTS = {f.name: f.default for f in _dc_fields(RequestBatchSamplingParamsKey)}
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
 
 # ───────────────────────────────────────── helpers ─────────────────────────

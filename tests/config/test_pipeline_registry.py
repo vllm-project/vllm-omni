@@ -73,8 +73,8 @@ def test_deepseek_janus_pipeline_registered():
     assert "deepseek_janus_single_stage" in OMNI_PIPELINES
 
 
-def test_deepseek_janus_pipeline_requires_explicit_config():
-    """Avoid routing every MultiModalityCausalLM checkpoint to Janus."""
+def test_deepseek_janus_pipeline_does_not_match_generic_hf_architecture():
+    """Avoid routing every MultiModalityCausalLM checkpoint to Janus by architecture."""
     pipeline = OMNI_PIPELINES["deepseek_janus_single_stage"]
 
     assert not callable(pipeline)

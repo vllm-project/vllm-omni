@@ -43,7 +43,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
+from vllm_omni.diffusion.worker.utils import RunnerOutput, StepRequestState
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -369,8 +369,8 @@ def _make_batch_scheduler_output(reqs, *, step_id=0, finished_req_ids=None):
     )
 
 
-def _make_input_batch_state(request_id: str, latent_value: float) -> DiffusionRequestState:
-    state = DiffusionRequestState(
+def _make_input_batch_state(request_id: str, latent_value: float) -> StepRequestState:
+    state = StepRequestState(
         request_id=request_id,
         sampling=SimpleNamespace(),
         prompt=None,

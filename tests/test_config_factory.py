@@ -573,6 +573,16 @@ class TestPipelineDiscovery:
             return
         assert Path(get_deploy_config_path(pipeline.default_deploy_config_name)).is_file()
 
+    @pytest.mark.parametrize(
+        "deploy_path",
+        sorted(_DEPLOY_DIR.glob("*.yaml")),
+        ids=lambda deploy_path: deploy_path.name,
+    )
+    def test_explicit_deploy_pipeline_is_registered(self, deploy_path):
+        deploy = load_deploy_config(deploy_path)
+        if deploy.pipeline is not None:
+            assert deploy.pipeline in OMNI_PIPELINES
+
     def test_registry_returns_none_for_unknown(self):
         """Unknown model_types aren't found and resolve to `None`."""
         assert "definitely_not_a_real_model" not in OMNI_PIPELINES
@@ -1164,6 +1174,7 @@ stages:
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
             ("step_audio_2_asr.yaml", "step_audio_2_asr", 1, "text", "step_audio_2_asr"),
             ("step_audio_2_async_chunk.yaml", "step_audio_2", 2, "audio", None),
+            ("step_audio2_ci.yaml", "step_audio_2_asr", 1, "text", "step_audio_2_asr"),
             ("hunyuan_video_15.yaml", "hunyuan_video_15", 1, "video", None),
             ("wan2_2_ti2v.yaml", "wan2_2_ti2v", 1, "video", None),
         ],
@@ -1230,6 +1241,33 @@ stages:
         assert deploy.stages[0].devices == "0,1"
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[1].devices == "1"
+
+    def test_step_audio2_online_ci_deploy_is_single_thinker(self):
+        deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))
+
+        assert deploy.pipeline == "step_audio_2_asr"
+        assert deploy.async_chunk is False
+        assert deploy.trust_remote_code is True
+        assert deploy.enable_prefix_caching is False
+        assert len(deploy.stages) == 1
+
+        stage = deploy.stages[0]
+        assert stage.devices == "0"
+        assert stage.tensor_parallel_size == 1
+        assert stage.max_model_len == 1024
+        assert stage.max_num_batched_tokens == 1024
+        assert stage.max_num_seqs == 1
+        assert stage.gpu_memory_utilization == 0.7
+        assert stage.skip_mm_profiling is True
+        assert stage.enforce_eager is True
+        assert stage.async_scheduling is False
+        assert stage.engine_extras["hf_overrides"]["architectures"] == ["StepAudio2ThinkerForConditionalGeneration"]
+
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+        assert len(stages) == 1
+        assert stages[0].final_output is True
+        assert stages[0].final_output_type == "text"
+        assert stages[0].yaml_engine_args["engine_output_type"] == "text"
 
     def test_step_audio2_dispatches_sync_and_async_chunk_processors(self):
         pipeline = resolve_pipeline_config("step_audio_2")

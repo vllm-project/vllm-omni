@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import pytest
 
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
+from vllm_omni.entrypoints.utils import resolve_model_config_path
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -75,3 +77,43 @@ def test_enrich_config_routes_janus_checkpoint_to_janus_pipeline(monkeypatch: py
     config.enrich_config()
 
     assert config.model_class_name == "JanusPipeline"
+
+
+def test_resolve_model_config_path_routes_janus_to_single_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.utils.get_config",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("unknown model_type")),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.utils.file_or_path_exists",
+        lambda model, path, revision=None: path == "config.json",
+    )
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.utils.get_hf_file_to_dict",
+        lambda path, model, revision=None: _janus_config() if path == "config.json" else None,
+    )
+
+    path = resolve_model_config_path("deepseek-ai/Janus-1.3B")
+
+    assert path.endswith("vllm_omni/deploy/deepseek_janus_single_stage.yaml")
+
+
+def test_stage_config_factory_routes_janus_to_single_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    StageConfigFactory.try_infer_model_type.cache_clear()
+
+    monkeypatch.setattr(
+        StageConfigFactory,
+        "get_hf_config",
+        classmethod(lambda cls, model, trust_remote_code: None),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.config.config_factory.get_hf_file_to_dict",
+        lambda path, model, revision=None: _janus_config() if path == "config.json" else None,
+    )
+
+    try:
+        model_type = StageConfigFactory.try_infer_model_type("deepseek-ai/Janus-Pro-7B", True)
+    finally:
+        StageConfigFactory.try_infer_model_type.cache_clear()
+
+    assert model_type == "deepseek_janus_single_stage"

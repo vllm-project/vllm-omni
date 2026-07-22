@@ -57,7 +57,7 @@ python image_to_video.py \
 
 ```bash
 python image_to_video.py \
-  --model dg845/LTX-2.3-Diffusers \
+  --model diffusers/LTX-2.3-Diffusers \
   --model-class-name LTX23ImageToVideoPipeline \
   --image cherry_blossom.jpg \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
@@ -72,7 +72,7 @@ python image_to_video.py \
   --output ltx23_i2v_output.mp4
 ```
 
-Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers`; the
+Use the Diffusers-format checkpoint `diffusers/LTX-2.3-Diffusers`; the
 upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
 this pipeline. Pass `--model-class-name LTX23ImageToVideoPipeline` to select
 the LTX-2.3 image-to-video pipeline.
