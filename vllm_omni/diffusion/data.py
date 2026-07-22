@@ -1171,6 +1171,9 @@ class OmniDiffusionConfig:
                         self.update_multimodal_support()
                     else:
                         raise
+                elif self.model_class_name == "LingbotWorldFastPipeline":
+                    self.tf_config_dict = get_hf_file_to_dict("config.json", self.model)
+                    self.tf_model_config = TransformerConfig.from_dict(self.tf_config_dict)
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry

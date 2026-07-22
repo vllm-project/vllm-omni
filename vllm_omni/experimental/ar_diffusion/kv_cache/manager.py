@@ -275,7 +275,7 @@ class ARDiffusionKVCache:
         # fewer-blocks — so guarantee the minimum the rollout cannot run without,
         # otherwise allocate_chunk hits an exhausted pool mid-forward.
         min_blocks = self.local_branches * (config.window_chunks + self.num_frame_per_block) + 2
-        if num_blocks < min_blocks:
+        if config.enforce_min and num_blocks < min_blocks:
             _log.warning(
                 "AR-Diffusion KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
                 "floor (%d local CFG branch(es) x (window_chunks=%d + num_frame_per_block=%d) + 2 headroom)",

@@ -40,6 +40,13 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def supports_camera_pos_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_camera_pos_input", False))
+
+
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
     """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
 

@@ -38,6 +38,11 @@ class SupportAudioInput(Protocol):
 
 
 @runtime_checkable
+class SupportCameraPosInput(Protocol):
+    support_camera_pos_input: ClassVar[bool] = True
+
+
+@runtime_checkable
 class SupportAudioOutput(Protocol):
     support_audio_output: ClassVar[bool] = True
 
