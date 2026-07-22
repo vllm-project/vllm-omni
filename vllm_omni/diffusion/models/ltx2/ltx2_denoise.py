@@ -177,6 +177,17 @@ class I2VVideoAudioScheduler:
         return ((video_out, audio_out),)
 
 
+def _set_scheduler_sigmas(scheduler: Any, sigmas: torch.Tensor) -> torch.Tensor:
+    sigmas = sigmas.to(torch.float32)
+    timesteps = sigmas[:-1] * scheduler.config.get("num_train_timesteps", 1000)
+    scheduler.sigmas = sigmas
+    scheduler.timesteps = timesteps
+    scheduler.num_inference_steps = len(timesteps)
+    scheduler._step_index = None
+    scheduler._begin_index = None
+    return timesteps
+
+
 def prepare_scheduler_stage(
     pipeline: Any,
     request_inputs: LTXRequestInputs,
@@ -188,24 +199,36 @@ def prepare_scheduler_stage(
     latent_height: int,
     latent_width: int,
 ) -> tuple[Any, Any, torch.Tensor]:
-    sigmas = (
-        np.linspace(1.0, 1 / request_inputs.num_inference_steps, request_inputs.num_inference_steps)
-        if sigmas is None
-        else sigmas
-    )
-    mu = calculate_shift(
-        pipeline.scheduler.config.get("max_image_seq_len", 4096),
-        pipeline.scheduler.config.get("base_image_seq_len", 1024),
-        pipeline.scheduler.config.get("max_image_seq_len", 4096),
-        pipeline.scheduler.config.get("base_shift", 0.95),
-        pipeline.scheduler.config.get("max_shift", 2.05),
-    )
+    if sigmas is not None and timesteps is not None:
+        raise ValueError("Only one of `sigmas` or `timesteps` may be provided.")
+
     audio_scheduler = copy.deepcopy(pipeline.scheduler)
     video_audio_scheduler = pipeline._make_video_audio_scheduler(
         audio_scheduler,
         latent_num_frames,
         latent_height,
         latent_width,
+    )
+    if sigmas is not None:
+        scheduler_sigmas = torch.as_tensor(sigmas, dtype=torch.float32, device=device)
+        if scheduler_sigmas.ndim != 1 or scheduler_sigmas.numel() < 2:
+            raise ValueError("An LTX custom sigma schedule must contain at least two boundary values.")
+        if scheduler_sigmas[-1] != 0:
+            scheduler_sigmas = torch.cat([scheduler_sigmas, scheduler_sigmas.new_zeros(1)])
+        timesteps_tensor = _set_scheduler_sigmas(pipeline.scheduler, scheduler_sigmas)
+        _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
+        return audio_scheduler, video_audio_scheduler, timesteps_tensor
+
+    sigmas = np.linspace(1.0, 1 / request_inputs.num_inference_steps, request_inputs.num_inference_steps)
+    # Official LTX2 one-stage omits the latent, so mu stays at max_shift across resolutions.
+    # Mu varies with latent token count only when the scheduler receives a latent, as in official HQ two-stage;
+    # explicit sigma schedules bypass mu entirely.
+    mu = calculate_shift(
+        pipeline.scheduler.config.get("max_image_seq_len", 4096),
+        pipeline.scheduler.config.get("base_image_seq_len", 1024),
+        pipeline.scheduler.config.get("max_image_seq_len", 4096),
+        pipeline.scheduler.config.get("base_shift", 0.95),
+        pipeline.scheduler.config.get("max_shift", 2.05),
     )
     retrieve_timesteps(
         audio_scheduler,

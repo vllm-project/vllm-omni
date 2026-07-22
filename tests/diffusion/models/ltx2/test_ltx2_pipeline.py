@@ -17,7 +17,11 @@ from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX23_COMPONENT_PROFILE,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_conditioning import LTXI2VConditioningMixin
-from vllm_omni.diffusion.models.ltx2.ltx2_denoise import LTXDenoiseExecutor, LTXPhaseResult
+from vllm_omni.diffusion.models.ltx2.ltx2_denoise import (
+    LTXDenoiseExecutor,
+    LTXPhaseResult,
+    prepare_scheduler_stage,
+)
 from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
     LTX_LEGACY_VELOCITY_GUIDANCE,
     LTX_OFFICIAL_X0_GUIDANCE,
@@ -324,6 +328,38 @@ def test_ltx2_two_stage_reuses_prompt_context_between_phases():
     torch.testing.assert_close(output.output[1], torch.tensor([4.0]))
 
 
+def test_ltx_custom_sigmas_bypass_scheduler_shifting():
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    scheduler = FlowMatchEulerDiscreteScheduler(
+        use_dynamic_shifting=True,
+        base_shift=0.95,
+        max_shift=2.05,
+        shift_terminal=0.1,
+    )
+    pipeline = SimpleNamespace(
+        scheduler=scheduler,
+        _make_video_audio_scheduler=lambda *args, **kwargs: object(),
+    )
+    sigmas = [1.0, 0.75, 0.25, 0.0]
+
+    audio_scheduler, _, timesteps = prepare_scheduler_stage(
+        pipeline,
+        SimpleNamespace(num_inference_steps=3),
+        device=torch.device("cpu"),
+        sigmas=sigmas,
+        timesteps=None,
+        latent_num_frames=1,
+        latent_height=1,
+        latent_width=1,
+    )
+
+    expected = torch.tensor(sigmas, dtype=torch.float32)
+    torch.testing.assert_close(pipeline.scheduler.sigmas, expected)
+    torch.testing.assert_close(audio_scheduler.sigmas, expected)
+    torch.testing.assert_close(timesteps, expected[:-1] * scheduler.config.num_train_timesteps)
+
+
 class TestLTXRequestParsing:
     @pytest.mark.parametrize(
         ("t2v_cls", "i2v_cls"),
@@ -513,6 +549,7 @@ class TestLTX23ForwardStages:
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         pipe = _make_ltx_request_pipe(LTX23Pipeline)
+        request_sigmas = [1.0, 0.4]
         req = DiffusionRequestBatch(
             [
                 OmniDiffusionRequest(
@@ -525,12 +562,13 @@ class TestLTX23ForwardStages:
                         num_inference_steps=3,
                         guidance_scale=4.5,
                         output_type="latent",
+                        sigmas=request_sigmas,
                     ),
                     request_id="ltx23-t2v-forward-stage-delegation",
                 )
             ]
         )
-        sigmas = [1.0, 0.5]
+        fallback_sigmas = [1.0, 0.5]
         timesteps = [1000, 500]
         attention_kwargs = {"scale": 1.0}
         seen = {}
@@ -545,7 +583,7 @@ class TestLTX23ForwardStages:
 
         output = pipe.forward(
             req,
-            sigmas=sigmas,
+            sigmas=fallback_sigmas,
             timesteps=timesteps,
             noise_scale=0.25,
             attention_kwargs=attention_kwargs,
@@ -561,7 +599,7 @@ class TestLTX23ForwardStages:
         assert seen["request_inputs"].output_type == "latent"
         assert seen["kwargs"] == {
             "noise_scale": 0.25,
-            "sigmas": sigmas,
+            "sigmas": request_sigmas,
             "timesteps": timesteps,
             "attention_kwargs": attention_kwargs,
         }

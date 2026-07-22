@@ -141,7 +141,6 @@ _DEPLOY_CONFIG = {
     "connectors": {
         "shared_memory_connector": {
             "name": "SharedMemoryConnector",
-            "extra": {"shm_threshold_bytes": 65536},
         },
     },
     "stages": [

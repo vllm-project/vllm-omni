@@ -15,7 +15,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       # Stream PCM bytes back to the client as Stage 1 emits each chunk.
       codec_streaming: true
       # Streaming chunk shape for talker2code2wav_async_chunk:
