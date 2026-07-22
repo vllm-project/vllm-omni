@@ -26,9 +26,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 from skip_ci import (
     ROOT,
     resolve_ci_context_from_git,
@@ -45,7 +42,6 @@ PLACEHOLDER_UPLOAD_READY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-rea
 PLACEHOLDER_UPLOAD_MERGE_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-merge"'
 PLACEHOLDER_UPLOAD_NIGHTLY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-nightly"'
 PLACEHOLDER_UPLOAD_WEEKLY_IF = f'build.message == "{PLACEHOLDER_PREFIX}upload-weekly"'
-BOOTSTRAP_MARKER = PLACEHOLDER_IMAGE_BUILD_IF
 BOOTSTRAP_PLACEHOLDERS = (
     PLACEHOLDER_IMAGE_BUILD_IF,
     PLACEHOLDER_UPLOAD_READY_IF,
@@ -346,19 +342,19 @@ def _render_pipeline(
     e2e_only: bool = False,
 ) -> str:
     text = path.read_text(encoding="utf-8")
+    if _is_bootstrap_pipeline(text):
+        ctx = resolve_ci_context_from_git()
+        return _render_bootstrap_pipeline(
+            text,
+            decision=ctx.decision,
+            path=path,
+        )
+
     ctx = resolve_ci_context_from_git()
-    decision = ctx.decision
-    if _is_bootstrap_pipeline(text) or force_all or e2e_only:
+    if force_all or e2e_only:
         changed_files = None
     else:
         changed_files = ctx.changed_files
-
-    if _is_bootstrap_pipeline(text):
-        return _render_bootstrap_pipeline(
-            text,
-            decision=decision,
-            path=path,
-        )
 
     doc = yaml.safe_load(text)
     if not isinstance(doc, dict):

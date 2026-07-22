@@ -13,7 +13,7 @@ Canonical layout (prefer these paths for new changes):
 ├── common/                          # Shared across platforms
 │   ├── scripts/
 │   │   ├── skip_ci.py               # Docs/skip-mark / CI-YAML-only level logic
-│   │   ├── upload_pipeline.py       # CUDA bootstrap + test-pipeline uploader
+│   │   ├── upload_pipeline.py       # Bootstrap + test-pipeline uploader (CUDA/NPU)
 │   │   └── resolve_skip_ci.sh       # Shell helpers for AMD/Intel bootstrap
 │   └── ci_mirror_hardwares.yml      # CUDA uploader presets (referenced by name only)
 ├── cuda/                            # Primary NVIDIA CUDA CI
@@ -70,7 +70,7 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
 
 === "CUDA"
 
-    **Bootstrap:** two-document [`cuda/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/pipeline.yml)—document 1 runs `upload_pipeline.py --upload`; document 2 builds the CI image and uploads L2–L5 child pipelines. Placeholders such as `__UPLOAD_READY_IF__` are resolved by [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) (see [Diff-aware CI — Bootstrap skip](#bootstrap-skip)).
+    **Bootstrap:** two-document [`cuda/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/pipeline.yml)—hook command `buildkite-agent pipeline upload .buildkite/cuda/pipeline.yml`; document 1 runs [`upload_pipeline.py --upload`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py); document 2 builds the CI image and uploads L2–L5 child pipelines. Document 2 `if` lines use **placeholder** expressions such as `build.message == "vllm-omni:placeholder:upload-ready"` (valid on hook upload, always false until replaced). [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) calls [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) for the git diff decision and substitutes real `if` expressions before upload (see [Diff-aware CI — Bootstrap skip](#bootstrap-skip)).
 
     **Test YAML:** `cuda/test-ready.yml` (L2), `test-merge.yml` (L3), `test-nightly.yml` (L4), `test-weekly.yml` (L5). Each file starts with shared `env:` then `steps:`.
 
@@ -106,7 +106,7 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
 
 === "NPU"
 
-    **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) builds NPU CI images (A2/B3 and A3 tags), then runs `upload_pipeline.py --upload` for child pipelines.
+    **Bootstrap:** two-document [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml)—same hook + placeholder pattern as CUDA—builds NPU CI images (A2/B3 and A3 tags), then runs `upload_pipeline.py --upload` for child pipelines.
 
     **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
 
@@ -180,7 +180,7 @@ PR diffs drive **two independent skip layers**. Both read changed files from git
 
 | Layer | Script | When | What is skipped | Where you configure |
 | ----- | ------ | ---- | --------------- | ------------------- |
-| **Bootstrap** | [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) | Before child test pipelines upload (`cuda/pipeline.yml`, AMD/Intel/NPU bootstraps) | Entire default CI, or whole L2/L3 upload for a platform | Whitelists in `skip_ci.py`; `__UPLOAD_READY_IF__` placeholders in bootstrap YAML |
+| **Bootstrap** | [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) + [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | Before child test pipelines upload (`cuda/pipeline.yml`, `npu/pipeline-npu.yml`, AMD/Intel bootstraps) | Entire default CI, or whole L2/L3 upload for a platform | Whitelists in `skip_ci.py`; `vllm-omni:placeholder:*` `if` sentinels in bootstrap YAML (replaced by `upload_pipeline.py`) |
 | **Step filter** | [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | While uploading CUDA L2/L3 YAML | Individual Buildkite steps inside `test-ready.yml` / `test-merge.yml` | `source_file_dependencies` on each step or group |
 
 **Changed files** (both layers):
@@ -195,8 +195,8 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 
 #### Bootstrap skip {#bootstrap-skip}
 
-- **Docs / skip-mark only** → skip the entire default CI upload (`check-skip-all`; `__UPLOAD_READY_IF__` in `cuda/pipeline.yml`).
-- **CI-YAML only** → skip uploading L2 or L3 for platforms whose whitelisted files were not touched. Register paths in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES`.
+- **Docs / skip-mark only** → skip the entire default CI upload (`skip_ci.py check-skip-all`).
+- **CI-YAML only** → skip uploading L2 or L3 for platforms whose whitelisted files were not touched. Register paths in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES`. Bootstrap document 2 `if` placeholders (`vllm-omni:placeholder:image-build`, `upload-ready`, `upload-merge`, `upload-nightly`, `upload-weekly`) are replaced with label/diff-aware expressions by `upload_pipeline.py --upload`.
 
 #### Step filtering {#step-filtering}
 

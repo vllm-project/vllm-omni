@@ -49,11 +49,6 @@ L45_YAML_FILES: dict[str, str] = {
     ".buildkite/npu/test-npu-nightly.yml": "npu",
 }
 
-SKIP_L2_FILES = frozenset(L2_YAML_FILES) | frozenset(L45_YAML_FILES)
-SKIP_L3_FILES = frozenset(L3_YAML_FILES) | frozenset(L45_YAML_FILES)
-SKIP_L2_L3_FILES = frozenset(L45_YAML_FILES)
-CI_YAML_TARGET_FILES = SKIP_L2_FILES | SKIP_L3_FILES
-
 
 def _empty_platform_buckets() -> dict[str, list[str]]:
     return {platform: [] for platform in PLATFORMS}
