@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -52,7 +52,6 @@ class ARDiffusionKVState:
         self.num_layers = num_layers
         self._committed: dict[str, int] = dict.fromkeys(expected, 0)
         self._paged_pending: dict[str, ARDiffusionPagedForwardContext | None] = dict.fromkeys(expected)
-        self._cross_populated: dict[str, set[str]] = {kv_branch: set() for kv_branch in expected}
         self._closed = False
 
     @property
@@ -61,6 +60,8 @@ class ARDiffusionKVState:
 
     def adapter(self, kv_branch: str) -> ARDiffusionRequestAdapter:
         """Return the request adapter for one logical KV branch."""
+        if self._closed:
+            raise RuntimeError(f"AR-Diffusion session {self.session_id!r} is closed")
         try:
             return self.adapters[kv_branch]
         except KeyError as exc:
@@ -87,8 +88,6 @@ class ARDiffusionKVState:
         Allocation is lazy so distributed workers allocate only for KV branches
         they actually execute.
         """
-        if self._closed:
-            raise RuntimeError(f"AR-Diffusion session {self.session_id!r} is closed")
         cs = self.kv_cache.spec.chunk_size
         if int(seq_len) % cs != 0:
             raise AssertionError(
@@ -146,27 +145,21 @@ class ARDiffusionKVState:
 
     def is_cross_attention_populated(self, kv_branch: str, cache_name: str) -> bool:
         self.adapter(kv_branch)
-        return cache_name in self._cross_populated[kv_branch]
+        return self.kv_cache.is_cross_attention_populated(self.session_id, cache_name, kv_branch)
 
-    def mark_cross_attention_populated(self, kv_branch: str, cache_name: str) -> None:
-        self.adapter(kv_branch)
-        if cache_name not in self.kv_cache.cross_attention_lengths:
-            raise KeyError(
-                f"Unknown AR-Diffusion cross-attention cache {cache_name!r}; "
-                f"expected {tuple(self.kv_cache.cross_attention_lengths)}"
-            )
-        self._cross_populated[kv_branch].add(cache_name)
-
-    def write_cross_attention_kv(
+    def populate_cross_attention(
         self,
-        cache_name: str,
-        layer_idx: int,
         kv_branch: str,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
+        cache_name: str,
+        layer_kv: Iterable[tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
+        """Publish one named logical-branch cache after all layers are written.
+
+        The iterable is consumed once in layer order. If projection, validation,
+        or copying fails, the previous complete cache (if any) remains visible.
+        """
         self.adapter(kv_branch)
-        self.kv_cache.write_cross_attention_kv(self.session_id, cache_name, layer_idx, kv_branch, k, v)
+        self.kv_cache.populate_cross_attention(self.session_id, cache_name, kv_branch, layer_kv)
 
     def get_cross_attention_kv(self, kv_branch: str, cache_name: str) -> list[dict[str, torch.Tensor | bool]]:
         """Return all layers for one populated named cross-attention cache."""
@@ -201,13 +194,10 @@ class ARDiffusionKVState:
         if unknown:
             raise KeyError(f"Unknown AR-Diffusion cross-attention caches to keep: {sorted(unknown)}")
         request_ids = {kv_branch: adapter.request_id for kv_branch, adapter in self.adapters.items()}
-        populated_to_keep = {
-            kv_branch: self._cross_populated[kv_branch].intersection(keep_cross_attention)
-            for kv_branch in self.adapters
-        }
         if keep_cross_attention:
             for adapter in self.adapters.values():
                 self.kv_cache.end_request(adapter)
+            self.kv_cache.retain_cross_attention(self.session_id, keep_cross_attention)
         else:
             self.close()
         self.adapters = {
@@ -215,7 +205,6 @@ class ARDiffusionKVState:
         }
         self._committed = dict.fromkeys(self.adapters, 0)
         self._paged_pending = dict.fromkeys(self.adapters)
-        self._cross_populated = populated_to_keep
         self._closed = False
         _log.info(
             "AR-Diffusion RESET session=%s KV branches=%s kept_cross=%s",

@@ -18,7 +18,19 @@ pipeline may use it during that context but must not retain it. The session
 survives subsequent requests with the same `session_id`. Request reset, explicit
 close, LRU eviction, and forward exceptions all release runner-owned KV and call
 the pipeline's reset/close lifecycle hook. Cross-attention KV is allocated lazily
-per session and is released on the same path.
+per session and logical KV branch, and is released on the same path. A pipeline
+publishes one named cache transactionally by yielding exactly one `(k, v)` pair
+per layer:
+
+```python
+state.populate_cross_attention("main", "text", project_text_kv_by_layer())
+```
+
+The cache becomes readable only after the iterable completes successfully.
+Logical branches remain independent even when they share a worker-local
+`local_index`; that index only maps lazily executed self-attention and scratch
+work to worker-local capacity slots. It does not define cross-attention cache
+ownership.
 
 Requests select the session with `extra_args["session_id"]`; setting `reset=True`
 replaces it before the forward, while `close_session=True` releases it after a
@@ -50,6 +62,22 @@ mechanically: replace `local_branches` with explicit `kv_branches`,
 `num_frame_per_block` with `frames_per_block`, and the fixed text/image length
 arguments with a named `cross_attention_lengths` mapping plus
 `session_capacity`. Normal engine users do not construct this object directly.
+
+Cross-attention writers migrate from incremental publication:
+
+```python
+# Before
+for layer_index, (key, value) in enumerate(project_text_kv_by_layer()):
+    state.write_cross_attention_kv("text", layer_index, branch, key, value)
+state.mark_cross_attention_populated(branch, "text")
+
+# After
+state.populate_cross_attention(branch, "text", project_text_kv_by_layer())
+```
+
+The iterable is consumed once and must yield exactly `num_layers` pairs. Failed
+or incomplete projection leaves the previous complete cache unchanged, or
+leaves the cache absent on its first population.
 
 ## Single-KV-branch pipeline sketch
 

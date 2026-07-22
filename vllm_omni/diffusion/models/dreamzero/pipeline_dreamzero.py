@@ -110,6 +110,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     _POSITIVE_BRANCH = "positive"
     _NEGATIVE_BRANCH = "negative"
     _ar_diffusion_kv_state = None
+    state: DreamZeroState | None
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
         """Describe DreamZero's local KV geometry to the generic runner."""
@@ -153,11 +154,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
         """Reset DreamZero-owned state after the runner releases session KV."""
-        self._states.pop(session_id, None)
+        self._drop_ar_diffusion_session_state(session_id)
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         """Drop DreamZero-owned state after close, eviction, or failed forward."""
-        self._states.pop(session_id, None)
+        self._drop_ar_diffusion_session_state(session_id)
+
+    def _drop_ar_diffusion_session_state(self, session_id: str) -> None:
+        """Remove model state and clear the compatibility alias when it points there."""
+        removed = self._states.pop(str(session_id or "default"), None)
+        if removed is not None and getattr(self, "state", None) is removed:
+            self.state = None
 
     @staticmethod
     def _ar_warmup_robot_obs(height: int, width: int, n_frames: int, session_id: str) -> dict:
@@ -262,25 +269,30 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             return
         projected = self.transformer.text_embedding(context) if need_text else None
         img_ctx = self.transformer.img_emb(clip_feature) if need_img else None
-        for i, block in enumerate(self.transformer.blocks):
-            ca = block.cross_attn
-            n, d = ca.tp_num_heads, ca.head_dim
-            k = v = None
-            if projected is not None:
-                k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
-                v = ca.v(projected).unflatten(2, (n, d))
-            k_img = v_img = None
-            if img_ctx is not None:
-                k_img = ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d))
-                v_img = ca.v_img(img_ctx).unflatten(2, (n, d))
-            if k is not None:
-                s.write_cross_attention_kv("text", i, kv_branch, k, v)
-            if k_img is not None:
-                s.write_cross_attention_kv("image", i, kv_branch, k_img, v_img)
-        if need_text:
-            s.mark_cross_attention_populated(kv_branch, "text")
-        if need_img:
-            s.mark_cross_attention_populated(kv_branch, "image")
+        if projected is not None:
+
+            def text_layer_kv():
+                for block in self.transformer.blocks:
+                    ca = block.cross_attn
+                    n, d = ca.tp_num_heads, ca.head_dim
+                    yield (
+                        ca.norm_k(ca.k(projected)).unflatten(2, (n, d)),
+                        ca.v(projected).unflatten(2, (n, d)),
+                    )
+
+            s.populate_cross_attention(kv_branch, "text", text_layer_kv())
+        if img_ctx is not None:
+
+            def image_layer_kv():
+                for block in self.transformer.blocks:
+                    ca = block.cross_attn
+                    n, d = ca.tp_num_heads, ca.head_dim
+                    yield (
+                        ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d)),
+                        ca.v_img(img_ctx).unflatten(2, (n, d)),
+                    )
+
+            s.populate_cross_attention(kv_branch, "image", image_layer_kv())
         logger.info(
             "AR-Diffusion CROSS POPULATE [%s]: %d layers, text=%s img=%s",
             "neg" if is_negative else "pos",
@@ -655,6 +667,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if not torch.cuda.is_available():
             return
 
+        state = self.state
+        if state is None:
+            state = self._get_or_create_state("default")
+            self.state = state
         device = next(self.text_encoder.parameters()).device
         with torch.inference_mode():
             try:
@@ -666,18 +682,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
             try:
                 image = torch.zeros(1, 1, 3, 180, 320, dtype=torch.bfloat16, device=device)
-                self._encode_image(image, self.num_frames, 180, 320, state=self.state)
+                self._encode_image(image, self.num_frames, 180, 320, state=state)
             except Exception as exc:
                 logger.warning("DreamZero compile warmup (image_encoder) skipped: %s", exc)
 
             try:
-                self.state.reset_vae_encoder_stream()
+                state.reset_vae_encoder_stream()
                 dummy_video = torch.zeros(1, 3, 1, 180, 320, dtype=torch.bfloat16, device=device)
-                self._vae_stream_seed(self.state, dummy_video[:, :, :1])
+                self._vae_stream_seed(state, dummy_video[:, :, :1])
                 for _ in range(4):
-                    self._vae_stream_append_frame(self.state, dummy_video[:, :, :1])
+                    self._vae_stream_append_frame(state, dummy_video[:, :, :1])
                 self._vae_stream_get_observation_latents(
-                    self.state,
+                    state,
                     self.num_frame_per_block,
                     dtype=torch.bfloat16,
                 )

@@ -37,13 +37,27 @@ def test_dreamzero_pipeline_state_follows_runner_lifecycle_notifications() -> No
 
     session_a = pipeline._get_or_create_state("session-a")
     session_b = pipeline._get_or_create_state("session-b")
+    pipeline.state = session_b
 
     pipeline.close_ar_diffusion_session("session-a")
+    assert pipeline.state is session_b
     pipeline.reset_ar_diffusion_session("session-b")
 
     assert not pipeline._states
+    assert pipeline.state is None
     assert pipeline._get_or_create_state("session-a") is not session_a
     assert pipeline._get_or_create_state("session-b") is not session_b
+
+
+def test_close_session_clears_active_state_alias() -> None:
+    pipeline = _empty_pipeline()
+    session_a = pipeline._get_or_create_state("session-a")
+    pipeline.state = session_a
+
+    pipeline.close_ar_diffusion_session("session-a")
+
+    assert not pipeline._states
+    assert pipeline.state is None
 
 
 def test_dreamzero_warmup_provider_builds_session_scoped_requests() -> None:

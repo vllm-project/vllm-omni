@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import inspect
 import os
-from collections.abc import Sequence
+from collections.abc import Collection, Iterable, Sequence
 
 import torch
 from vllm.logger import init_logger
@@ -215,11 +215,11 @@ class ARDiffusionKVCache:
         # paged self-attention pool so the two stores share one memory budget.
         self._cross_sessions: dict[
             str,
-            dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]],
+            dict[str, dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]]],
         ] = {}
 
         def _cross_pool_bytes(length: int) -> int:
-            return int(2 * self.num_local_kv_branches * length * num_kv_heads * head_size * dtype.itemsize * num_layers)
+            return int(2 * len(self.kv_branches) * length * num_kv_heads * head_size * dtype.itemsize * num_layers)
 
         cross_bytes_per_session = sum(_cross_pool_bytes(length) for length in self.cross_attention_lengths.values())
         cross_total_bytes = cross_bytes_per_session * session_capacity
@@ -320,9 +320,54 @@ class ARDiffusionKVCache:
         self,
         session_id: str,
         cache_name: str,
-        *,
-        create: bool,
+        kv_branch: str,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        if cache_name not in self.cross_attention_lengths:
+            raise KeyError(
+                f"Unknown AR-Diffusion cross-attention cache {cache_name!r}; "
+                f"expected {tuple(self.cross_attention_lengths)}"
+            )
+        self._kv_branch_index(kv_branch)
+        session = self._cross_sessions.get(session_id)
+        if session is None:
+            raise RuntimeError(
+                f"AR-Diffusion cross-attention cache {cache_name!r} for session {session_id!r} "
+                "was read before it was populated"
+            )
+        pool = session.get(cache_name, {}).get(kv_branch)
+        if pool is None:
+            raise RuntimeError(
+                f"AR-Diffusion cross-attention cache {cache_name!r} for session {session_id!r} "
+                f"and KV branch {kv_branch!r} was read before it was populated"
+            )
+        return pool
+
+    def is_cross_attention_populated(self, session_id: str, cache_name: str, kv_branch: str) -> bool:
+        """Whether a complete logical-branch cache has been published."""
+        if cache_name not in self.cross_attention_lengths:
+            raise KeyError(
+                f"Unknown AR-Diffusion cross-attention cache {cache_name!r}; "
+                f"expected {tuple(self.cross_attention_lengths)}"
+            )
+        self._kv_branch_index(kv_branch)
+        session = self._cross_sessions.get(session_id)
+        return session is not None and kv_branch in session.get(cache_name, {})
+
+    def populate_cross_attention(
+        self,
+        session_id: str,
+        cache_name: str,
+        kv_branch: str,
+        layer_kv: Iterable[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Atomically populate one logical branch of a named cross-attention cache.
+
+        ``layer_kv`` must yield exactly one ``(k, v)`` pair per model layer.
+        Inputs have shape ``(B, length, local_kv_heads, head_size)``; batch zero
+        is copied because AR-Diffusion currently supports one sequence per
+        forward. The new cache is published only after every layer is copied,
+        so failed projection/copy work cannot expose partially initialized KV.
+        """
         try:
             length = self.cross_attention_lengths[cache_name]
         except KeyError as exc:
@@ -330,61 +375,50 @@ class ARDiffusionKVCache:
                 f"Unknown AR-Diffusion cross-attention cache {cache_name!r}; "
                 f"expected {tuple(self.cross_attention_lengths)}"
             ) from exc
+        self._kv_branch_index(kv_branch)
         session = self._cross_sessions.get(session_id)
+        if session is None and len(self._cross_sessions) >= self.session_capacity:
+            raise RuntimeError(
+                "AR-Diffusion cross-attention session capacity exhausted; "
+                "the runner must evict a session before allocating another"
+            )
+        if not self._allocate_tensors:
+            raise RuntimeError("AR-Diffusion cross-attention tensors require a configured pool device")
+
+        shape = (length, self.num_kv_heads, self.head_size)
+        expected_input_shape = (1, *shape)
+        k_pool = [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)]
+        v_pool = [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)]
+        populated_layers = 0
+        for layer_idx, (k, v) in enumerate(layer_kv):
+            if layer_idx >= self.num_layers:
+                raise ValueError(
+                    f"AR-Diffusion cross-attention cache {cache_name!r} expected {self.num_layers} layers, "
+                    f"got more than {self.num_layers}"
+                )
+            if not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
+                raise ValueError(
+                    f"AR-Diffusion cross-attention cache {cache_name!r} layer {layer_idx} "
+                    f"must yield torch.Tensor k/v, got {type(k).__name__} and {type(v).__name__}"
+                )
+            if tuple(k.shape) != expected_input_shape or tuple(v.shape) != expected_input_shape:
+                raise ValueError(
+                    f"AR-Diffusion cross-attention cache {cache_name!r} layer {layer_idx} expected "
+                    f"k/v shape {expected_input_shape}, got {tuple(k.shape)} and {tuple(v.shape)}"
+                )
+            k_pool[layer_idx].copy_(k[0])
+            v_pool[layer_idx].copy_(v[0])
+            populated_layers += 1
+        if populated_layers != self.num_layers:
+            raise ValueError(
+                f"AR-Diffusion cross-attention cache {cache_name!r} expected {self.num_layers} layers, "
+                f"got {populated_layers}"
+            )
+
         if session is None:
-            if not create:
-                raise RuntimeError(
-                    f"AR-Diffusion cross-attention cache {cache_name!r} for session {session_id!r} "
-                    "was read before it was populated"
-                )
-            if len(self._cross_sessions) >= self.session_capacity:
-                raise RuntimeError(
-                    "AR-Diffusion cross-attention session capacity exhausted; "
-                    "the runner must evict a session before allocating another"
-                )
             session = {}
             self._cross_sessions[session_id] = session
-        pool = session.get(cache_name)
-        if pool is None:
-            if not create:
-                raise RuntimeError(
-                    f"AR-Diffusion cross-attention cache {cache_name!r} for session {session_id!r} "
-                    "was read before it was populated"
-                )
-            if not self._allocate_tensors:
-                raise RuntimeError("AR-Diffusion cross-attention tensors require a configured pool device")
-            shape = (self.num_local_kv_branches, length, self.num_kv_heads, self.head_size)
-            pool = (
-                [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)],
-                [torch.empty(shape, dtype=self.dtype, device=self.device) for _ in range(self.num_layers)],
-            )
-            session[cache_name] = pool
-        return pool
-
-    def write_cross_attention_kv(
-        self,
-        session_id: str,
-        cache_name: str,
-        layer_idx: int,
-        kv_branch: str,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
-    ) -> None:
-        """Write one layer of a named cross-attention K/V allocation.
-
-        Inputs have shape ``(B, length, local_kv_heads, head_size)``. Batch zero
-        is copied because AR-Diffusion currently supports one sequence per
-        forward. Passing both values as ``None`` is a no-op.
-        """
-        if (k is None) != (v is None):
-            raise ValueError("Cross-attention k and v must either both be tensors or both be None")
-        if k is None:
-            return
-        assert v is not None
-        k_pool, v_pool = self._cross_attention_pool(session_id, cache_name, create=True)
-        kv_branch_idx = self._kv_branch_index(kv_branch)
-        k_pool[layer_idx][kv_branch_idx].copy_(k[0])
-        v_pool[layer_idx][kv_branch_idx].copy_(v[0])
+        session.setdefault(cache_name, {})[kv_branch] = (k_pool, v_pool)
 
     def read_cross_attention_kv(
         self,
@@ -394,13 +428,24 @@ class ARDiffusionKVCache:
         kv_branch: str,
     ) -> dict[str, torch.Tensor | bool]:
         """Return a model-facing K/V dict for one named cross-attention pool."""
-        k_pool, v_pool = self._cross_attention_pool(session_id, cache_name, create=False)
-        kv_branch_idx = self._kv_branch_index(kv_branch)
+        k_pool, v_pool = self._cross_attention_pool(session_id, cache_name, kv_branch)
         return {
             "is_init": True,
-            "k": k_pool[layer_idx][kv_branch_idx].unsqueeze(0),
-            "v": v_pool[layer_idx][kv_branch_idx].unsqueeze(0),
+            "k": k_pool[layer_idx].unsqueeze(0),
+            "v": v_pool[layer_idx].unsqueeze(0),
         }
+
+    def retain_cross_attention(self, session_id: str, cache_names: Collection[str]) -> None:
+        """Release named cross-attention caches not retained by an internal reset."""
+        session = self._cross_sessions.get(session_id)
+        if session is None:
+            return
+        keep = set(cache_names)
+        for cache_name in tuple(session):
+            if cache_name not in keep:
+                del session[cache_name]
+        if not session:
+            self._cross_sessions.pop(session_id, None)
 
     def release_cross_attention(self, session_id: str) -> None:
         """Release every named cross-attention allocation for one session."""

@@ -195,7 +195,7 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
         block_size=BLOCK,
         max_model_len=4096,
         available_bytes=avail,
-        kv_branches=(ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 1)),
+        kv_branches=(ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 0)),
         session_capacity=1,
         cross_attention_lengths={"text": L},
         device=torch.device("cpu"),
@@ -203,7 +203,7 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
     cross_bytes = 2 * 2 * L * 4 * 64 * torch.float16.itemsize * 2  # K+V, pos+neg, layers
     expected = compute_num_blocks(avail - cross_bytes, 0.5, kv.spec.page_size_bytes * 2)
     assert kv.num_blocks == expected
-    assert expected > 2 * (2 + 1) + 2  # above the min-blocks floor, so the deduction is what's tested
+    assert expected > 1 * (2 + 1) + 2  # above the local-slot floor, so the cross deduction is what's tested
 
 
 def _make_kv(*, local_branches, num_frame_per_block=2, window_chunks=9):

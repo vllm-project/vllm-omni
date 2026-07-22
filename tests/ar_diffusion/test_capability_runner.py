@@ -141,12 +141,10 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     assert runner._get_or_create_session("s1") is first
     k = torch.randn(1, 8, 4, 64)
     v = torch.randn(1, 8, 4, 64)
-    first.write_cross_attention_kv("text", 0, "main", k, v)
-    first.mark_cross_attention_populated("main", "text")
+    first.populate_cross_attention("main", "text", [(k, v)] * first.num_layers)
     assert first.get_cross_attention_kv("main", "text")[0]["k"].shape == k.shape
     other = runner._get_or_create_session("s2")
-    other.write_cross_attention_kv("text", 0, "main", k + 1, v + 1)
-    other.mark_cross_attention_populated("main", "text")
+    other.populate_cross_attention("main", "text", [(k + 1, v + 1)] * other.num_layers)
     assert torch.equal(first.get_cross_attention_kv("main", "text")[0]["k"], k)
 
     runner.reset_session("s1")
