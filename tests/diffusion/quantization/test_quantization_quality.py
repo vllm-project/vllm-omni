@@ -82,6 +82,7 @@ class QualityTestConfig:
     gpu: str = "H100"  # minimum GPU requirement
     negative_prompt: str = ""
     guidance_scale: float | None = None
+    sigmas: list[float] | None = None
     enable_cpu_offload: bool = False
 
     def baseline_ref(self) -> str:
@@ -215,6 +216,19 @@ QUALITY_CONFIGS = [
         width=256,
         num_frames=25,
         num_inference_steps=8,
+        # Preserve the final scheduler trajectory used when this FP8 quality
+        # gate was established. Explicit LTX sigmas bypass dynamic shifting.
+        sigmas=[
+            1.0,
+            0.92185378074646,
+            0.8327768445014954,
+            0.7303033471107483,
+            0.6111654043197632,
+            0.4709382653236389,
+            0.30347853899002075,
+            0.10000002384185791,
+            0.0,
+        ],
     ),
 ]
 
@@ -322,6 +336,7 @@ def _generate_video(omni, config: QualityTestConfig):
             num_inference_steps=config.num_inference_steps,
             num_frames=config.num_frames,
             guidance_scale=config.guidance_scale,
+            sigmas=config.sigmas,
         ),
     )
 
@@ -444,6 +459,33 @@ def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch
 
     assert output is image
     assert peak_mem == 0.0
+
+
+def test_generate_video_forwards_sigmas(monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None, raising=False)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 0, raising=False)
+    captured = SimpleNamespace(sampling=None)
+
+    class DummyOmni:
+        def generate(self, _prompt, sampling):
+            captured.sampling = sampling
+            return [SimpleNamespace(images=[np.zeros((1, 2, 2, 3), dtype=np.float32)])]
+
+    config = QualityTestConfig(
+        id="ltx-sigmas",
+        model="unused",
+        quantization="fp8",
+        task="t2v",
+        prompt="test",
+        max_lpips=0.1,
+        sigmas=[1.0, 0.5],
+    )
+    _generate_video(DummyOmni(), config)
+
+    assert captured.sampling.sigmas == [1.0, 0.5]
 
 
 _marks = hardware_marks(res={"cuda": "H100"})
