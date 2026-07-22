@@ -317,7 +317,14 @@ def _changed_files_for_diff_range(diff_range: str | None) -> list[str] | None:
 
     files = [line for line in result.stdout.splitlines() if line.strip()]
     # >>> TEMP: delete this block before merge (PR skip-ci debugging)
-    _temp_ignore_prefixes = (".buildkite/", "tests/buildkite/")
+    _temp_ignore_prefixes = (
+        ".buildkite/",
+        "tests/buildkite/",
+        "docs/",
+        "skills/",
+        ".claude/skills/",
+        ".cursor/skills/",
+    )
     _temp_ignore_files = frozenset({"docs/contributing/ci/.nav.yaml"})
     files = [path for path in files if path not in _temp_ignore_files and not path.startswith(_temp_ignore_prefixes)]
     # <<< TEMP
