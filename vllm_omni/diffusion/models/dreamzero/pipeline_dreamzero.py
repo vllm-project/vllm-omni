@@ -137,6 +137,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             ),
             session_capacity=MAX_DREAMZERO_SESSIONS,
             cross_attention=tuple(cross_attention),
+            max_scratch_tokens_per_branch=int(transformer.num_action_per_block + transformer.num_state_per_block),
         )
 
     @contextmanager

@@ -94,9 +94,23 @@ class WarmupPipeline(CapablePipeline):
         return iter(self.requests)
 
 
-def make_runner(pipeline: object, *, available_bytes: int = 1 << 28) -> ARDiffusionModelRunner:
+class BatchCapablePipeline(CapablePipeline):
+    supports_request_batch = True
+
+
+def make_runner(
+    pipeline: object,
+    *,
+    available_bytes: int = 1 << 28,
+    step_execution: bool = False,
+) -> ARDiffusionModelRunner:
     runner = object.__new__(ARDiffusionModelRunner)
-    runner.od_config = SimpleNamespace(max_num_seqs=1, dtype=torch.float32, enforce_eager=True)
+    runner.od_config = SimpleNamespace(
+        max_num_seqs=1,
+        dtype=torch.float32,
+        enforce_eager=True,
+        step_execution=step_execution,
+    )
     runner.device = torch.device("cpu")
     runner.pipeline = pipeline
     runner.ar_diffusion_kv_config = ARDiffusionKVConfig(enable=True)
@@ -143,9 +157,6 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     v = torch.randn(1, 8, 4, 64)
     first.populate_cross_attention("main", "text", [(k, v)] * first.num_layers)
     assert first.get_cross_attention_kv("main", "text")[0]["k"].shape == k.shape
-    other = runner._get_or_create_session("s2")
-    other.populate_cross_attention("main", "text", [(k + 1, v + 1)] * other.num_layers)
-    assert torch.equal(first.get_cross_attention_kv("main", "text")[0]["k"], k)
 
     runner.reset_session("s1")
     assert "s1" not in runner._sessions
@@ -187,18 +198,23 @@ def test_dreamzero_like_two_branches_are_independent():
 
 
 def test_lru_eviction_releases_blocks_and_notifies_pipeline():
-    pipeline = CapablePipeline(lingbot_like_spec(capacity=1))
+    pipeline = CapablePipeline(lingbot_like_spec(capacity=8))
     runner = make_runner(pipeline)
     kv = runner.kv_cache
     assert kv is not None
+    assert runner._session_capacity == 1
+    assert kv.session_capacity == 1
     free_total = kv.manager.block_pool.get_num_free_blocks()
-    commit_one_frame(runner, "old", "main")
+    old = commit_one_frame(runner, "old", "main")
+    k = torch.randn(1, 8, 4, 64)
+    old.populate_cross_attention("main", "text", [(k, k)] * old.num_layers)
     assert kv.manager.block_pool.get_num_free_blocks() < free_total
 
     runner._get_or_create_session("new")
 
     assert tuple(runner._sessions) == ("new",)
     assert pipeline.closes == ["old"]
+    assert "old" not in kv._cross_sessions
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
 
 
@@ -226,6 +242,53 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
     assert not runner._sessions
     assert not kv._adapters
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
+    pipeline = CapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline)
+    kv = runner.kv_cache
+    assert kv is not None
+    free_total = kv.manager.block_pool.get_num_free_blocks()
+
+    def return_after_allocation(self, req, kv_prefetch_job=None):
+        state = pipeline.bound_state
+        ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
+        ctx.ensure_video_slots(torch.device("cpu"))
+        return object()
+
+    def synchronize_boom(device):
+        raise RuntimeError("asynchronous kernel failed")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", return_after_allocation)
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize_boom)
+    runner.device = torch.device("cuda")
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}))
+
+    with pytest.raises(RuntimeError, match="asynchronous kernel failed"):
+        runner.execute_model(request)
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["broken"]
+    assert not runner._sessions
+    assert not kv._adapters
+    assert not runner._perf_e2e_times
+    assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+def test_ar_runner_rejects_step_and_request_batch_modes():
+    with pytest.raises(ValueError, match="step_execution=True"):
+        make_runner(CapablePipeline(lingbot_like_spec()), step_execution=True)
+    with pytest.raises(ValueError, match="request-batch execution"):
+        make_runner(BatchCapablePipeline(lingbot_like_spec()))
+
+
+def test_ar_runner_defensively_rejects_inherited_batch_and_step_entrypoints():
+    runner = object.__new__(ARDiffusionModelRunner)
+    with pytest.raises(RuntimeError, match="request-batch execution"):
+        runner.execute_model_batch(None, None)
+    with pytest.raises(RuntimeError, match="step execution"):
+        runner.execute_stepwise(None)
 
 
 def test_model_specific_warmup_provider_is_consumed(monkeypatch):

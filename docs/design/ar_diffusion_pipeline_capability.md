@@ -1,5 +1,10 @@
 # AR-Diffusion pipeline capability
 
+> **Status:** experimental and non-normative. This note documents the current
+> `experimental/ar_diffusion` contract. It follows the ownership and lifecycle
+> direction in [#5137](https://github.com/vllm-project/vllm-omni/issues/5137),
+> but it is not yet part of the stable module-design hierarchy.
+
 `ARDiffusionEngine` is an opt-in diffusion backend for pipelines that keep
 autoregressive attention KV across requests. The engine only selects
 `ARDiffusionModelRunner`; the runner owns paged KV pools, session lookup, LRU
@@ -11,7 +16,8 @@ A pipeline opts in by implementing `SupportsARDiffusionPipeline`. Its immutable
 - self-attention layers, TP-local KV heads, head size, and tokens per latent frame;
 - latent frames committed by one model block, sliding window, and attention sink;
 - logical KV branches mapped to worker-local storage slots;
-- named fixed-length cross-attention KV and maximum retained sessions.
+- named fixed-length cross-attention KV, model-specific scratch geometry, and
+  the pipeline's requested session-capacity upper bound.
 
 The runner binds an `ARDiffusionKVState` only around one `forward()` call. The
 pipeline may use it during that context but must not retain it. The session
@@ -36,6 +42,29 @@ Requests select the session with `extra_args["session_id"]`; setting `reset=True
 replaces it before the forward, while `close_session=True` releases it after a
 successful forward. The runner also exposes `reset_session()` and
 `close_session()` for an owning serving layer.
+
+## Current execution limits
+
+The experimental runner supports request-mode execution with
+`max_num_seqs=1`. It rejects step execution and request-batch execution at load
+time, and its inherited batch/step entry points also fail explicitly. Supporting
+those paths requires a batch-aware state-binding contract rather than silently
+bypassing `bind_ar_diffusion_state()`.
+
+The current implementation retains one session per model instance. A request
+for a different `session_id` closes the resident session through the same LRU
+lifecycle used by explicit close and failure cleanup before allocating the new
+one. Self-attention and cross-attention memory are therefore sized for one
+resident session even if the pipeline declares a larger `session_capacity`.
+This prioritizes rollout throughput and prevents block-pool exhaustion before a
+count-based eviction can run. Multi-session residency can be added later with a
+memory-backed capacity calculation or allocation-pressure eviction.
+
+Scratch storage is also capability-driven. `frames_per_block` reserves space for
+an uncommitted current video block, while `max_scratch_tokens_per_branch`
+declares the maximum model-specific tokens, such as action/state registers, that
+must coexist with it. `AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH` may increase
+that derived minimum for deployment experiments but cannot reduce it.
 
 ## DreamZero adapter
 
@@ -97,7 +126,8 @@ class WorldPipeline:
             sink_frames=self.transformer.sink_frames,
             kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
             cross_attention=(ARDiffusionCrossAttentionKVSpec("text", self.text_length),),
-            session_capacity=16,
+            max_scratch_tokens_per_branch=self.transformer.max_register_tokens,
+            session_capacity=1,
         )
 
     @contextmanager
@@ -118,3 +148,18 @@ class WorldPipeline:
 The model writes/reads named cross-attention KV through the bound state and uses
 the `"main"` KV branch for paged self-attention. Pipelines without a warmup
 provider are loaded normally and skip AR rollout warmup.
+
+## Relationship to the multi-stage KV manager RFC
+
+[#5244](https://github.com/vllm-project/vllm-omni/issues/5244) describes a
+future multi-stage KV transfer manager, connector integration, and cache-aware
+scheduling. This capability has a narrower scope: it owns model-local paged KV
+and session lifecycle inside one AR-Diffusion runner. It does not define
+cross-stage transfer, connector behavior, or scheduler-visible cache affinity.
+
+When the experimental runtime migrates toward #5244, the implementation should
+reconcile its current full `KVCacheManager` use with the RFC's proposed
+`BlockPool`-oriented DiT manager. The pipeline capability should remain the
+model-facing geometry and state-binding boundary where possible, while the
+experimental `ARDiffusionKVCache` class itself should not be treated as a stable
+public API.

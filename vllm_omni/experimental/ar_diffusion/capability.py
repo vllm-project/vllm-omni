@@ -56,6 +56,11 @@ class ARDiffusionKVCacheSpec:
     recent sliding tail and ``sink_frames`` is the separately retained prefix;
     both are expressed in the same frame/block unit.
 
+    ``max_scratch_tokens_per_branch`` is the maximum non-video KV (for example,
+    action/state registers) that must coexist with an uncommitted video block.
+    ``session_capacity`` is the pipeline's upper bound; a runner may retain
+    fewer sessions when its current memory and execution policy is stricter.
+
     The runner owns all pool allocations and session lifetime. The pipeline
     owns its non-KV model state and receives reset/close notifications through
     :class:`SupportsARDiffusionPipeline`.
@@ -73,6 +78,7 @@ class ARDiffusionKVCacheSpec:
     reset_at_boundary: bool = False
     cross_attention: tuple[ARDiffusionCrossAttentionKVSpec, ...] = ()
     max_model_len: int = 1 << 20
+    max_scratch_tokens_per_branch: int = 0
 
     def __post_init__(self) -> None:
         positive_fields = {
@@ -90,6 +96,11 @@ class ARDiffusionKVCacheSpec:
                 raise ValueError(f"AR-Diffusion {name} must be positive, got {value}")
         if self.sink_frames < 0:
             raise ValueError(f"AR-Diffusion sink_frames must be non-negative, got {self.sink_frames}")
+        if self.max_scratch_tokens_per_branch < 0:
+            raise ValueError(
+                "AR-Diffusion max_scratch_tokens_per_branch must be non-negative, "
+                f"got {self.max_scratch_tokens_per_branch}"
+            )
         if not self.kv_branches:
             raise ValueError("AR-Diffusion requires at least one KV branch")
         kv_branch_names = [kv_branch.name for kv_branch in self.kv_branches]

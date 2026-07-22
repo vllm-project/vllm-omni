@@ -10,8 +10,9 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.interface import KVPrefetchJob
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
     SupportsARDiffusionPipeline,
@@ -50,6 +51,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     """
 
     _WARMUP_SID = "__ardiffusion_warmup__"
+    _MAX_RESIDENT_SESSIONS = 1
 
     def __init__(self, vllm_config: object, od_config: OmniDiffusionConfig, device: torch.device) -> None:
         super().__init__(vllm_config, od_config, device)
@@ -88,6 +90,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
+        if bool(getattr(self.od_config, "step_execution", False)):
+            raise ValueError(
+                "ARDiffusionModelRunner currently supports request-mode execution only; "
+                "step_execution=True would bypass per-request AR session binding."
+            )
         max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
         if max_num_seqs > 1:
             raise ValueError(
@@ -95,6 +102,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 f"rollouts); got max_num_seqs={max_num_seqs}."
             )
         capability = self._require_capability(self.pipeline)
+        if bool(getattr(self.pipeline, "supports_request_batch", False)):
+            raise ValueError(
+                "ARDiffusionModelRunner currently supports one request at a time; "
+                "request-batch execution would bypass per-request AR session binding."
+            )
         spec = capability.ar_diffusion_kv_cache_spec()
         if not isinstance(spec, ARDiffusionKVCacheSpec):
             raise TypeError(
@@ -111,7 +123,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = config
         self._ar_diffusion_capability = capability
         self._ar_diffusion_kv_cache_spec = spec
-        self._session_capacity = spec.session_capacity
+        self._session_capacity = min(spec.session_capacity, self._MAX_RESIDENT_SESSIONS)
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,
@@ -122,14 +134,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             max_model_len=spec.max_model_len,
             available_bytes=self._available_memory_bytes() if available_bytes is None else available_bytes,
             kv_branches=spec.kv_branches,
-            session_capacity=spec.session_capacity,
+            session_capacity=self._session_capacity,
             cross_attention_lengths=spec.cross_attention_lengths,
             frames_per_block=spec.frames_per_block,
+            max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
             device=self.device,
         )
         logger.info(
             "AR-Diffusion KV cache: blocks=%d layers=%d local_kv_heads=%d head_size=%d "
-            "tokens/frame=%d frames/block=%d window=%d sink=%d kv_branches=%s cross=%s capacity=%d",
+            "tokens/frame=%d frames/block=%d window=%d sink=%d kv_branches=%s cross=%s "
+            "resident_capacity=%d requested_capacity=%d",
             self.kv_cache.num_blocks,
             spec.num_layers,
             spec.num_kv_heads,
@@ -140,6 +154,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             config.sink_chunks,
             [(kv_branch.name, kv_branch.local_index) for kv_branch in spec.kv_branches],
             spec.cross_attention_lengths,
+            self._session_capacity,
             spec.session_capacity,
         )
 
@@ -238,6 +253,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         try:
             with capability.bind_ar_diffusion_state(session_id, state):
                 output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            if self.device is not None and torch.device(self.device).type == "cuda":
+                torch.accelerator.synchronize(self.device)
         except Exception:
             self._release_session(
                 session_id,
@@ -250,12 +267,26 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 session_id,
             )
             raise
-        if self.device is not None and torch.cuda.is_available():
-            torch.accelerator.synchronize(self.device)
         self._perf_e2e_times.append(time.perf_counter() - started)
         if extra_args.get("close_session", False):
             self.close_session(session_id)
         return output
+
+    def execute_model_batch(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        od_config: OmniDiffusionConfig,
+    ) -> BatchRunnerOutput:
+        """Reject request batching until batch-aware AR state binding exists."""
+        raise RuntimeError(
+            "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
+        )
+
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Reject step execution until step-aware AR state binding exists."""
+        raise RuntimeError(
+            "ARDiffusionModelRunner does not support step execution; use request mode with step_execution=False."
+        )
 
     def _warmup_ar_rollout(self) -> None:
         """Run model-provided warmup requests, or safely skip when absent."""

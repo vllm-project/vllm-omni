@@ -206,7 +206,13 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
     assert expected > 1 * (2 + 1) + 2  # above the local-slot floor, so the cross deduction is what's tested
 
 
-def _make_kv(*, local_branches, num_frame_per_block=2, window_chunks=9):
+def _make_kv(
+    *,
+    local_branches,
+    num_frame_per_block=2,
+    window_chunks=9,
+    max_scratch_tokens_per_branch=0,
+):
     kv_branches = (
         (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 0))
         if local_branches == 1
@@ -225,6 +231,7 @@ def _make_kv(*, local_branches, num_frame_per_block=2, window_chunks=9):
         kv_branches=kv_branches,
         session_capacity=1,
         frames_per_block=num_frame_per_block,
+        max_scratch_tokens_per_branch=max_scratch_tokens_per_branch,
     )
 
 
@@ -238,7 +245,28 @@ def test_pool_floor_is_branch_aware():
     assert two.managed_num_blocks == 2 * (9 + 2) + 2  # 24
     assert one.scratch_num_blocks == one.scratch_blocks_per_kv_branch
     assert two.scratch_num_blocks == 2 * two.scratch_blocks_per_kv_branch
+    assert one.scratch_blocks_per_kv_branch == 2
     assert one.num_blocks_total == 13 + one.scratch_blocks_per_kv_branch
+
+
+def test_scratch_capacity_is_derived_from_declared_geometry(monkeypatch):
+    monkeypatch.delenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", raising=False)
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=6,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+    )
+    assert kv.scratch_blocks_per_kv_branch == 8  # six video blocks + two auxiliary blocks
+
+
+def test_scratch_env_override_cannot_reduce_declared_minimum(monkeypatch):
+    monkeypatch.setenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "1")
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=6,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+    )
+    assert kv.scratch_blocks_per_kv_branch == 8
 
 
 def test_scratch_maps_to_slot_zero_with_one_local_branch():

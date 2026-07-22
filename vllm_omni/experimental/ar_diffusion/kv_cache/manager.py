@@ -168,6 +168,7 @@ class ARDiffusionKVCache:
         cross_attention_lengths: dict[str, int] | None = None,
         device: torch.device | None = None,
         frames_per_block: int = 1,
+        max_scratch_tokens_per_branch: int = 0,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -196,6 +197,8 @@ class ARDiffusionKVCache:
         self.num_local_kv_branches = max(local_indices) + 1
         if frames_per_block <= 0:
             raise ValueError(f"frames_per_block must be positive, got {frames_per_block}")
+        if max_scratch_tokens_per_branch < 0:
+            raise ValueError(f"max_scratch_tokens_per_branch must be non-negative, got {max_scratch_tokens_per_branch}")
         self.frames_per_block = int(frames_per_block)
         self.block_size = block_size
         self.num_layers = num_layers
@@ -277,14 +280,16 @@ class ARDiffusionKVCache:
         self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
         self.managed_num_blocks = num_blocks
         self.num_blocks = num_blocks
-        # Scratch blocks are outside KVCacheManager ownership. They hold current
-        # denoise-step video KV when update_kv_cache=False and action/state KV in
-        # both modes; they are reused every forward and never committed.
-        # Default 4 covers the current model high-water: several current video
-        # blocks plus optional model-specific scratch tokens.
-        scratch_per_kv_branch = int(os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "4"))
-        if scratch_per_kv_branch <= 0:
-            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be positive")
+        # Scratch blocks are outside KVCacheManager ownership. A non-committing
+        # forward needs one block per current frame plus space for any
+        # model-declared action/state tokens that coexist with video KV.
+        declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
+        minimum_scratch_blocks = self.frames_per_block + declared_scratch_blocks
+        override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
+        override_blocks = int(override) if override is not None else 0
+        if override_blocks < 0:
+            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
+        scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
         self.scratch_blocks_per_kv_branch = scratch_per_kv_branch
         self.scratch_num_blocks = self.num_local_kv_branches * scratch_per_kv_branch
         self.num_blocks_total = self.managed_num_blocks + self.scratch_num_blocks
