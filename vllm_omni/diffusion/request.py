@@ -4,6 +4,7 @@
 
 import random
 from dataclasses import dataclass
+from typing import Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
@@ -28,7 +29,7 @@ class OmniDiffusionRequest:
     prompt: OmniPromptType
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
-    kv_sender_info: dict | None = None
+    kv_sender_info: dict[str, Any] | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

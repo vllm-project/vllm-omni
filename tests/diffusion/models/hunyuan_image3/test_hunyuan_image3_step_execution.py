@@ -20,7 +20,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -38,8 +38,8 @@ def _pipeline():
     return pipeline
 
 
-def _state(request_id: str, step_index: int) -> DiffusionRequestState:
-    state = DiffusionRequestState(
+def _state(request_id: str, step_index: int) -> StepRequestState:
+    state = StepRequestState(
         request_id=request_id,
         sampling=SimpleNamespace(),
         prompt="prompt",
@@ -133,7 +133,7 @@ def test_prepare_encode_preserves_normal_hunyuan_bot_task_semantics(
 
     monkeypatch.setattr(hy3_module, "get_system_prompt", fake_get_system_prompt)
     pipeline.prepare_model_inputs = fake_prepare_model_inputs
-    state = DiffusionRequestState(
+    state = StepRequestState(
         request_id="req-bot-task",
         sampling=sampling,
         prompt=prompt_item,

@@ -71,6 +71,17 @@ class LTXRequestMixin:
     supports_request_batch = False
     supports_guidance_rescale = False
 
+    @staticmethod
+    def _resolve_request_sigmas(
+        req: DiffusionRequestBatch,
+        fallback: list[float] | None,
+    ) -> list[float] | None:
+        request_sigmas = [sampling.sigmas for sampling in req.sampling_params_list]
+        first = request_sigmas[0] if request_sigmas else None
+        if any(item != first for item in request_sigmas[1:]):
+            raise ValueError("Batched LTX requests must use identical custom sigmas.")
+        return first if first is not None else fallback
+
     def check_inputs(
         self,
         prompt: str | list[str] | None,
