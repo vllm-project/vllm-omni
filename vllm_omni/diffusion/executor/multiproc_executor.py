@@ -329,7 +329,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             try:
                 result = self.collective_rpc(
                     "execute_model",
-                    args=(req, self.od_config, scheduler_output.kv_prefetch_jobs),
+                    args=(req, self.od_config, scheduler_output.kv_prefetch_job),
                     unique_reply_rank=0,
                     exec_all_ranks=True,
                 )

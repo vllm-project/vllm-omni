@@ -3,10 +3,22 @@
 # be updated on every rebase to match the new upstream vllm commit/tag.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
 ARG VLLM_BASE_TAG=v0.25.0
-FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
+
+# We use registry-based layer caching for the dependencies,
+# where the tag is determined based on the hash of the contents
+# of files like pyproject.toml, etc. The deps stage should have
+# everything except the actual project dir, since that should not
+# change much across branches.
+FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
-COPY . .
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Create a vllm_omni dir so that we can install the python package
+# without failing to write the version files; we'll copy over it
+# after installing
+RUN mkdir -p vllm_omni
 
 # Install system dependencies
 RUN apt-get update && \
@@ -14,9 +26,33 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Copy dependency related things first and install deps/
+# We set the version str to 0.0.0 since it doesn't matter
+# for CI
+COPY pyproject.toml setup.py ./
+COPY requirements/ requirements/
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
 RUN uv pip install --system ".[dev]"
 
+# The final stage just copies the working dir on top of the
+# dependencies image. This uses --link so that we can skip
+# the image pull in Buildkite when we have a cache hit.
+#
+# IMPORTANT: Do not make any modifications that depend on the
+# file system after the --link copy, otherwise we'd need to pull
+# the heavy base image to build it. This is the reason we copy
+# link & update the pythonpath to point at the copied code instead
+# of running a new pip install on it.
+FROM deps
+ARG APP_DIR=/workspace/vllm-omni
+# Add APP_DIR to the pythonpath, since the entrypoint stub
+# that was installed in the earlier step must point at the copied code.
+#
+# NOTE: this will probably warn about undefined vars, but is expected.
+# See: https://github.com/docker/buildx/issues/2751
+ENV PYTHONPATH=${APP_DIR}${PYTHONPATH:+:${PYTHONPATH}}
+WORKDIR ${APP_DIR}
 
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+COPY --link . .
 
 ENTRYPOINT []

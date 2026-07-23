@@ -46,6 +46,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 
@@ -100,7 +101,7 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
     multimodal_outputs: Any # Omni-Specific
 
-class NPUARModelRunner(OmniNPUModelRunner):
+class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
 
     def __init__(self, *args, **kwargs):
@@ -112,6 +113,22 @@ class NPUARModelRunner(OmniNPUModelRunner):
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
+        _OMNI_CONNECTOR_INIT_ARCHS = {
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+            "CovoAudioForConditionalGeneration",
+            "MiMoAudioModel",
+            "Qwen3TTSTalkerForConditionalGeneration",
+            "Qwen3TTSCode2Wav",
+            "CosyVoice3Model",
+            "DyninOmniForConditionalGeneration",
+            "IndexTTS2TalkerForConditionalGeneration",
+        }
+        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+            self.init_omni_connectors(
+                model_config=self.model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
+            )
         self._downstream_payload_cache: dict[str, bool] = {}
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -380,6 +397,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
             request_id_resolver=self._resolve_global_request_id,
         )
         #  -------------------------------------- Omni-new -------------------------------------------------
+        if hasattr(self, "_omni_connector"):
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.
@@ -435,9 +461,10 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         if kv_ids:
                             output = copy(output)
                             output.kv_extracted_req_ids = kv_ids
-                        return output
+                        return self.attach_omni_connector_output(output)
 
-                if not num_scheduled_tokens:
+                # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+                if num_scheduled_tokens <= 0:
                     if (
                         self.parallel_config.distributed_executor_backend == "external_launcher"
                         and self.parallel_config.data_parallel_size > 1
@@ -462,7 +489,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         output = copy(output)
                         output.kv_extracted_req_ids = kv_ids
 
-                    return output
+                    return self.attach_omni_connector_output(output)
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
                         "--kv-sharing-fast-prefill produces incorrect "
@@ -879,11 +906,11 @@ class NPUARModelRunner(OmniNPUModelRunner):
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
-            return output
+            return self.attach_omni_connector_output(output)
 
         # Unpack ephemeral state.
         (
@@ -1166,6 +1193,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
             # inter_stage_outputs (the NPU runner has no separate full-payload
             # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
             pooler_inter, pooler_client = pooler_output, pooler_output
+
+        # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
+        if pooler_inter and self._should_accumulate_full_payload_output():
+            with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
+                for i, rid in enumerate(req_ids_output_copy):
+                    req_state = self.requests.get(rid)
+                    if req_state is not None and pooler_inter[i]:
+                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
+
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
         multimodal_outputs = self._build_multimodal_outputs(pooler_client)
         model_runner_output = OmniModelRunnerOutput(
@@ -1183,6 +1219,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
         model_runner_output.routed_experts = routed_experts_lists
+        with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
+            model_runner_output.omni_connector_output = self.get_omni_connector_output()
         #  -------------------------------------- Omni-new -------------------------------------------------
 
         if self.ascend_config.profiling_chunk_config.enabled and hasattr(self, "_execution_start_time"):
