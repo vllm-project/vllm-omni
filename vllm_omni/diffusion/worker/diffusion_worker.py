@@ -417,6 +417,25 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
+    def _run_ar_diffusion_session_lifecycle(self, method: str, session_id: str) -> bool:
+        """Delegate an optional AR session lifecycle call to the model runner."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string.")
+        assert self.model_runner is not None, "Model runner not initialized"
+        lifecycle_method = getattr(self.model_runner, method, None)
+        if not callable(lifecycle_method):
+            return False
+        lifecycle_method(session_id)
+        return True
+
+    def reset_ar_diffusion_session(self, session_id: str) -> bool:
+        """Reset runner-owned AR state through the collective RPC boundary."""
+        return self._run_ar_diffusion_session_lifecycle("reset_session", session_id)
+
+    def close_ar_diffusion_session(self, session_id: str) -> bool:
+        """Close runner-owned AR state through the collective RPC boundary."""
+        return self._run_ar_diffusion_session_lifecycle("close_session", session_id)
+
     def execute_model(
         self,
         req: OmniDiffusionRequest | list[OmniDiffusionRequest],
