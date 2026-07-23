@@ -18,7 +18,6 @@ steps:
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
         # CPU tests on ROCm gpu machines are very slow, so we give them more time.
-        # debug for test
         - "timeout 60m pytest -sv tests/diffusion -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
 
     - label: "Simple · Diffusion & Model Executor Test (2/2)"
