@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from functools import lru_cache
 from math import prod
@@ -45,7 +46,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rotary_emb_torch
 
 logger = init_logger(__name__)
 
@@ -712,6 +713,127 @@ class QwenImageCrossAttention(nn.Module):
 
         return img_attn_output, txt_attn_output
 
+    def forward_mixfusion(
+        self,
+        image_chunks: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_freq_chunks: torch.Tensor,
+        text_freqs: torch.Tensor,
+        chunk_to_request: torch.Tensor,
+        request_chunk_ranges: list[tuple[int, int]],
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run Qwen joint attention with chunked image tokens and request-level text.
+
+        Text/prompt tokens are projected once per request. Image tokens stay in
+        MixFusion chunks for token-wise projections, then each request is
+        recovered to ``text + full image`` immediately before attention so the
+        attention semantics match independent dense execution.
+        """
+        if int(chunk_to_request.numel()) != int(image_chunks.shape[0]):
+            raise ValueError("chunk_to_request must have one entry per image chunk.")
+
+        img_qkv, _ = self.to_qkv(image_chunks)
+        q_size = self.query_num_heads * self.head_dim
+        kv_size = self.kv_num_heads * self.head_dim
+        img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
+        add_q_size = self.add_query_num_heads * self.head_dim
+        add_kv_size = self.add_kv_num_heads * self.head_dim
+        txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
+
+        img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
+        img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
+        img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
+
+        txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
+        txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+        txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+
+        img_query = self.norm_q(img_query)
+        img_key = self.norm_k(img_key)
+        txt_query = self.norm_added_q(txt_query)
+        txt_key = self.norm_added_k(txt_key)
+
+        img_cos = image_freq_chunks.real.to(img_query.dtype)
+        img_sin = image_freq_chunks.imag.to(img_query.dtype)
+        txt_cos = text_freqs.real.to(txt_query.dtype)
+        txt_sin = text_freqs.imag.to(txt_query.dtype)
+
+        # The fused RotaryEmbedding path drops 3D cos/sin to the first batch
+        # item. MixFusion needs per-chunk/per-request positions, so use the
+        # native implementation that preserves the leading dimension.
+        img_query = apply_rotary_emb_torch(img_query, img_cos, img_sin, interleaved=self.rope.interleaved)
+        img_key = apply_rotary_emb_torch(img_key, img_cos, img_sin, interleaved=self.rope.interleaved)
+        txt_query = apply_rotary_emb_torch(txt_query, txt_cos, txt_sin, interleaved=self.rope.interleaved)
+        txt_key = apply_rotary_emb_torch(txt_key, txt_cos, txt_sin, interleaved=self.rope.interleaved)
+
+        seq_len_txt = encoder_hidden_states.shape[1]
+        chunk_size = image_chunks.shape[1]
+        text_outputs: list[torch.Tensor | None] = [None] * encoder_hidden_states.shape[0]
+        image_outputs: list[torch.Tensor | None] = [None] * image_chunks.shape[0]
+
+        buckets: dict[int, list[int]] = {}
+        for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
+            image_seq_len = (chunk_end - chunk_start) * chunk_size
+            buckets.setdefault(seq_len_txt + image_seq_len, []).append(req_idx)
+
+        for req_indices in buckets.values():
+            bucket_queries: list[torch.Tensor] = []
+            bucket_keys: list[torch.Tensor] = []
+            bucket_values: list[torch.Tensor] = []
+            bucket_masks: list[torch.Tensor] = []
+            for req_idx in req_indices:
+                chunk_start, chunk_end = request_chunk_ranges[req_idx]
+                req_img_query = img_query[chunk_start:chunk_end].reshape(1, -1, self.query_num_heads, self.head_dim)
+                req_img_key = img_key[chunk_start:chunk_end].reshape(1, -1, self.kv_num_heads, self.head_dim)
+                req_img_value = img_value[chunk_start:chunk_end].reshape(1, -1, self.kv_num_heads, self.head_dim)
+                bucket_queries.append(torch.cat([txt_query[req_idx : req_idx + 1], req_img_query], dim=1))
+                bucket_keys.append(torch.cat([txt_key[req_idx : req_idx + 1], req_img_key], dim=1))
+                bucket_values.append(torch.cat([txt_value[req_idx : req_idx + 1], req_img_value], dim=1))
+                if encoder_hidden_states_mask is not None:
+                    image_mask = torch.ones(
+                        (1, req_img_query.shape[1]),
+                        dtype=torch.bool,
+                        device=encoder_hidden_states_mask.device,
+                    )
+                    bucket_masks.append(
+                        torch.cat([encoder_hidden_states_mask[req_idx : req_idx + 1], image_mask], dim=1)
+                    )
+
+            joint_query = torch.cat(bucket_queries, dim=0)
+            joint_key = torch.cat(bucket_keys, dim=0)
+            joint_value = torch.cat(bucket_values, dim=0)
+            attn_metadata = None
+            if bucket_masks:
+                attn_metadata = AttentionMetadata(attn_mask=torch.cat(bucket_masks, dim=0))
+            joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
+
+            for bucket_row, req_idx in enumerate(req_indices):
+                chunk_start, chunk_end = request_chunk_ranges[req_idx]
+                text_outputs[req_idx] = joint_hidden_states[bucket_row : bucket_row + 1, :seq_len_txt]
+                image_output = joint_hidden_states[bucket_row : bucket_row + 1, seq_len_txt:]
+                image_output = image_output.reshape(
+                    chunk_end - chunk_start,
+                    chunk_size,
+                    self.query_num_heads,
+                    self.head_dim,
+                )
+                for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
+                    image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
+
+        txt_attn_output = torch.cat([out for out in text_outputs if out is not None], dim=0)
+        img_attn_output = torch.cat([out for out in image_outputs if out is not None], dim=0)
+
+        txt_attn_output = txt_attn_output.flatten(2, 3).to(txt_query.dtype)
+        img_attn_output = img_attn_output.flatten(2, 3).to(img_query.dtype)
+
+        img_attn_output = self.to_out(img_attn_output)
+        txt_attn_output = self.to_add_out(txt_attn_output)
+
+        return img_attn_output, txt_attn_output
+
 
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
@@ -899,6 +1021,58 @@ class QwenImageTransformerBlock(nn.Module):
 
         return encoder_hidden_states, hidden_states
 
+    def forward_mixfusion(
+        self,
+        image_chunks: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_freq_chunks: torch.Tensor,
+        text_freqs: torch.Tensor,
+        chunk_to_request: torch.Tensor,
+        request_chunk_ranges: list[tuple[int, int]],
+        encoder_hidden_states_mask: torch.Tensor | None,
+        temb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        img_mod_params = self.img_mod(temb)
+        txt_mod_params = self.txt_mod(temb)
+
+        img_mod_params = img_mod_params.index_select(0, chunk_to_request.to(img_mod_params.device))
+        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
+        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
+
+        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1)
+        img_modulated = self.img_norm1(image_chunks, img_scale1, img_shift1)
+
+        txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
+        txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
+
+        img_attn_output, txt_attn_output = self.attn.forward_mixfusion(
+            image_chunks=img_modulated,
+            encoder_hidden_states=txt_modulated,
+            image_freq_chunks=image_freq_chunks,
+            text_freqs=text_freqs,
+            chunk_to_request=chunk_to_request,
+            request_chunk_ranges=request_chunk_ranges,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+        )
+
+        image_chunks = image_chunks + img_gate1 * img_attn_output
+        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+
+        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2)
+        img_modulated2 = self.img_norm2(image_chunks, img_scale2, img_shift2)
+        image_chunks = image_chunks + img_gate2 * self.img_mlp(img_modulated2)
+
+        txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2)
+        txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
+
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+        if image_chunks.dtype == torch.float16:
+            image_chunks = image_chunks.clip(-65504, 65504)
+
+        return encoder_hidden_states, image_chunks
+
 
 # Note: inheriting from CachedTransformer only when we support caching
 class QwenImageTransformer2DModel(CachedTransformer):
@@ -1074,9 +1248,101 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
 
+    @staticmethod
+    def _mixfusion_chunk_size(hidden_states: list[torch.Tensor]) -> int:
+        chunk_size = int(hidden_states[0].shape[1])
+        for sample in hidden_states[1:]:
+            chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
+        return chunk_size
+
+    def _forward_mixfusion(
+        self,
+        hidden_states: list[torch.Tensor],
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None,
+        timestep: torch.LongTensor,
+        img_shapes: list[tuple[int, int, int]] | None,
+        txt_seq_lens: list[int] | None,
+        guidance: torch.Tensor | None,
+        additional_t_cond=None,
+    ) -> list[torch.Tensor]:
+        if self.zero_cond_t:
+            raise ValueError("Qwen MixFusion does not support zero_cond_t/editing path yet.")
+        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
+            raise ValueError("Qwen MixFusion requires sequence parallel disabled.")
+        if not hidden_states:
+            raise ValueError("Qwen MixFusion requires at least one hidden-state tensor.")
+        if img_shapes is None or txt_seq_lens is None:
+            raise ValueError("Qwen MixFusion requires img_shapes and txt_seq_lens.")
+
+        chunk_size = self._mixfusion_chunk_size(hidden_states)
+        image_chunks: list[torch.Tensor] = []
+        image_freq_chunks: list[torch.Tensor] = []
+        chunk_to_request: list[int] = []
+        request_chunk_ranges: list[tuple[int, int]] = []
+        seq_len_txt = int(encoder_hidden_states.shape[1])
+        text_freqs: list[torch.Tensor] = []
+
+        for req_idx, sample in enumerate(hidden_states):
+            seq_len = int(sample.shape[1])
+            if seq_len % chunk_size != 0:
+                raise ValueError(f"Qwen MixFusion seq_len={seq_len} is not divisible by chunk_size={chunk_size}.")
+            chunk_start = len(image_chunks)
+            image_chunks.extend(sample.split(chunk_size, dim=1))
+            chunk_end = len(image_chunks)
+            request_chunk_ranges.append((chunk_start, chunk_end))
+            chunk_to_request.extend([req_idx] * (chunk_end - chunk_start))
+
+            req_vid_freqs, req_txt_freqs = self.pos_embed(img_shapes[req_idx], [seq_len_txt], device=sample.device)
+            image_freq_chunks.extend(req_vid_freqs.split(chunk_size, dim=0))
+            text_freqs.append(req_txt_freqs[:seq_len_txt])
+
+        image_chunks_tensor = torch.cat(image_chunks, dim=0)
+        image_chunks_tensor = self.img_in(image_chunks_tensor)
+        image_freq_chunks_tensor = torch.stack(image_freq_chunks, dim=0)
+        text_freqs_tensor = torch.stack(text_freqs, dim=0)
+        chunk_to_request_tensor = torch.tensor(chunk_to_request, dtype=torch.long, device=image_chunks_tensor.device)
+
+        timestep = timestep.to(device=image_chunks_tensor.device, dtype=image_chunks_tensor.dtype)
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        if guidance is not None:
+            guidance = guidance.to(image_chunks_tensor.dtype) * 1000
+
+        temb = (
+            self.time_text_embed(timestep, image_chunks_tensor, additional_t_cond)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, image_chunks_tensor, additional_t_cond)
+        )
+
+        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
+            encoder_hidden_states_mask = None
+
+        for block in self.transformer_blocks:
+            encoder_hidden_states, image_chunks_tensor = block.forward_mixfusion(
+                image_chunks=image_chunks_tensor,
+                encoder_hidden_states=encoder_hidden_states,
+                image_freq_chunks=image_freq_chunks_tensor,
+                text_freqs=text_freqs_tensor,
+                chunk_to_request=chunk_to_request_tensor,
+                request_chunk_ranges=request_chunk_ranges,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                temb=temb,
+            )
+
+        chunk_temb = temb.index_select(0, chunk_to_request_tensor)
+        image_chunks_tensor = self.norm_out(image_chunks_tensor, chunk_temb)
+        image_chunks_tensor = self.proj_out(image_chunks_tensor)
+
+        outputs: list[torch.Tensor] = []
+        for chunk_start, chunk_end in request_chunk_ranges:
+            outputs.append(image_chunks_tensor[chunk_start:chunk_end].reshape(1, -1, image_chunks_tensor.shape[-1]))
+        return outputs
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | list[torch.Tensor],
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         timestep: torch.LongTensor = None,
@@ -1086,7 +1352,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_kwargs: dict[str, Any] | None = None,
         additional_t_cond=None,
         return_dict: bool = True,
-    ) -> torch.Tensor | Transformer2DModelOutput:
+    ) -> torch.Tensor | Transformer2DModelOutput | list[torch.Tensor]:
         """
         The [`QwenTransformer2DModel`] forward method.
 
@@ -1111,6 +1377,18 @@ class QwenImageTransformer2DModel(CachedTransformer):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
+        if isinstance(hidden_states, list):
+            return self._forward_mixfusion(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                timestep=timestep,
+                img_shapes=img_shapes,
+                txt_seq_lens=txt_seq_lens,
+                guidance=guidance,
+                additional_t_cond=additional_t_cond,
+            )
+
         # if attention_kwargs is not None:
         #     attention_kwargs = attention_kwargs.copy()
         #     lora_scale = attention_kwargs.pop("scale", 1.0)

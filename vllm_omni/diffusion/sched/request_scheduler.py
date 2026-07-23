@@ -7,7 +7,7 @@ from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
+from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler, _apply_mixfusion_shape_relaxation
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -27,12 +27,15 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
 class RequestScheduler(BaseScheduler):
     """Diffusion scheduler with vLLM-style waiting/running queues."""
 
-    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey | None:
         """Build a request-batch compatibility key from sampling parameters."""
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
         key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+        key_kwargs = _apply_mixfusion_shape_relaxation(request, key_kwargs)
+        if key_kwargs is None:
+            return None
         key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
         return RequestBatchSamplingParamsKey(**key_kwargs)
 
