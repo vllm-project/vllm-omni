@@ -94,15 +94,14 @@ def _load_bootstrap_steps(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _format_bootstrap_if(expr: str) -> str | bool:
-    if expr == "true":
-        return True
-    if expr == "false":
-        return False
+def _format_bootstrap_if(expr: str) -> str:
+    """Return a Buildkite ``if`` string. Buildkite rejects YAML bool ``if`` values."""
+    if expr in ("true", "false"):
+        return expr
     return f"({expr})"
 
 
-def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str | bool]:
+def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     disabled = "false"
     nightly_main = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
     nightly_only = NPU_NIGHTLY_ONLY if platform == "npu" else CUDA_NIGHTLY_ONLY
@@ -181,8 +180,8 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str | b
     }
 
 
-def _apply_bootstrap_if(steps: list[Any], if_exprs: dict[str, str | bool]) -> list[Any]:
-    """Inject ``if`` by step key; drop steps that are unconditionally disabled (``if: false``)."""
+def _apply_bootstrap_if(steps: list[Any], if_exprs: dict[str, str]) -> list[Any]:
+    """Inject ``if`` by step key; drop steps that are unconditionally disabled."""
     kept: list[Any] = []
     for step in steps:
         if not isinstance(step, dict):
@@ -199,9 +198,13 @@ def _apply_bootstrap_if(steps: list[Any], if_exprs: dict[str, str | bool]) -> li
             step["if"] = if_exprs["image"]
         elif key in BOOTSTRAP_UPLOAD_IF_KEYS:
             step["if"] = if_exprs[BOOTSTRAP_UPLOAD_IF_KEYS[key]]
-        if step.get("if") is False:
+        if_expr = step.get("if")
+        if if_expr == "false":
             _log(f"omit disabled bootstrap step {key!r}")
             continue
+        if if_expr == "true":
+            # Unconditional step: omit ``if`` (Buildkite requires string ``if``, not YAML bool).
+            step.pop("if", None)
         kept.append(step)
     return kept
 

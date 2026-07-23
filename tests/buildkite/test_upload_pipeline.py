@@ -38,13 +38,20 @@ def _render(changed_files: list[str]) -> str:
 
 
 def test_bootstrap_if_injected_by_step_key() -> None:
+    import yaml
+
     rendered = _render_bootstrap_pipeline(
         BOOTSTRAP_STEPS_TEMPLATE,
         decision=resolve_ci_decision([]),
         path=Path(".buildkite/npu/bootstrap-upload-steps.yml"),
     )
-    assert "if: true" in rendered
-    assert "key: image-build" in rendered
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "image-build" in by_key
+    # Unconditional image has no ``if`` (Buildkite rejects YAML bool if: true).
+    assert "if" not in by_key["image-build"]
+    assert isinstance(by_key["upload-ready-pipeline"]["if"], str)
+    assert isinstance(by_key["upload-nightly-pipeline"]["if"], str)
 
 
 def test_bootstrap_steps_loaded_from_file() -> None:
