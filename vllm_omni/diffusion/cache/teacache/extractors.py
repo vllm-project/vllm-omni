@@ -697,11 +697,11 @@ def extract_omnigen2_context(
     # DEFINE TRANSFORMER EXECUTION (OmniGen2-specific)
     # ============================================================================
     def run_transformer_blocks():
-        """Execute all OmniGen2 main transformer blocks."""
-        h = joint_hidden_states
+        """Run the main transformer blocks between the SP boundaries, mirroring the original forward."""
+        h, emb = module.sp_input_boundary(joint_hidden_states, rotary_emb)
         for layer in module.layers:
-            h = layer(h, attention_mask, rotary_emb, temb)
-        return (h,)
+            h = layer(h, attention_mask, emb, temb)
+        return (module.sp_output_boundary(h),)
 
     # ============================================================================
     # DEFINE POSTPROCESSING (OmniGen2-specific)
