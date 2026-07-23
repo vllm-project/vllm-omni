@@ -349,7 +349,7 @@ class StageMetadata:
 def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     """Pure data extraction from a stage_config object."""
     stage_id: int = stage_config.stage_id
-    stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
+    stage_type: Literal["llm", "diffusion"] = _get_attr_or_item(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
 
     if current_omni_platform.is_rocm():
@@ -365,34 +365,34 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             # when the selected_backend is not specified.
             engine_args["attention_backend"] = "TRITON_ATTN"
 
-    runtime_cfg = getattr(stage_config, "runtime", {})
-    engine_input_source: list[int] = getattr(stage_config, "engine_input_source", [])
-    final_output: bool = getattr(stage_config, "final_output", False)
-    final_output_type: str | None = getattr(stage_config, "final_output_type", None)
+    runtime_cfg = stage_config.runtime
+    engine_input_source: list[int] = stage_config.engine_input_source
+    final_output: bool = stage_config.final_output
+    final_output_type: str | None = stage_config.final_output_type
 
-    default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
+    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
     SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
     default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
 
     custom_process_input_func: Callable | None = None
-    _cpif_path = getattr(stage_config, "custom_process_input_func", None)
+    _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
     if _cpif_path:
         mod_path, fn_name = _cpif_path.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
 
     prompt_expand_func: Callable | None = None
-    _pef_path = getattr(stage_config, "prompt_expand_func", None)
+    _pef_path = _get_attr_or_item(stage_config, "prompt_expand_func")
     if _pef_path:
         _mod, _fn = _pef_path.rsplit(".", 1)
         prompt_expand_func = getattr(importlib.import_module(_mod), _fn)
 
     cfg_kv_collect_func: Callable | None = None
-    _ckf_path = getattr(stage_config, "cfg_kv_collect_func", None)
+    _ckf_path = _get_attr_or_item(stage_config, "cfg_kv_collect_func")
     if _ckf_path:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
-    model_stage = getattr(engine_args, "model_stage", None)
+    model_stage = engine_args.get("model_stage")
 
     if stage_type == "diffusion":
         return StageMetadata(
@@ -411,8 +411,8 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
-    engine_output_type = getattr(engine_args, "engine_output_type", None)
-    is_comprehension = getattr(stage_config, "is_comprehension", False)
+    engine_output_type = engine_args.get("engine_output_type")
+    is_comprehension = stage_config.is_comprehension
     requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
 
     return StageMetadata(
@@ -695,7 +695,7 @@ def build_engine_args_dict(
     if "tensor_parallel_size" in engine_args and engine_args["tensor_parallel_size"] is None:
         del engine_args["tensor_parallel_size"]
 
-    stage_type = getattr(stage_config, "stage_type", "llm")
+    stage_type = _get_attr_or_item(stage_config, "stage_type", "llm")
     stage_id = stage_config.stage_id
 
     engine_args_dict = _to_dict(engine_args)
@@ -735,7 +735,7 @@ def build_engine_args_dict(
         engine_args_dict.setdefault("enable_prefix_caching", False)
 
     # Check whether the stage's default_sampling_params defines extra_args.
-    default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
+    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
     engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
 
     # TODO: Remove this after the performance regression is fixed
