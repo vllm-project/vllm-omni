@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer i
     create_quantized_avatar_dit,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -499,12 +500,12 @@ def get_longcat_video_avatar_post_process_func(od_config: OmniDiffusionConfig):
 
 def get_longcat_video_avatar_pre_process_func(od_config: OmniDiffusionConfig):
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        for idx, prompt in enumerate(request.prompts):
-            if isinstance(prompt, str):
-                request.prompts[idx] = {"prompt": prompt, "multi_modal_data": {}, "additional_information": {}}
-                continue
-            prompt.setdefault("multi_modal_data", {})
-            prompt.setdefault("additional_information", {})
+        prompt = request.prompt
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        prompt.setdefault("multi_modal_data", {})
+        prompt.setdefault("additional_information", {})
+        request.prompt = prompt
         return request
 
     return pre_process_func
@@ -643,7 +644,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         # .to() is overloaded (device / dtype / tensor); only treat args[0] as
         # a device when it actually is one, otherwise keep self.device.
         candidate = kwargs.get("device", args[0] if args else None)
-        device = torch.device(candidate) if isinstance(candidate, (str, torch.device, int)) else self.device
+        device = torch.device(candidate) if isinstance(candidate, str | torch.device | int) else self.device
         self.device = device
         for name in ("text_encoder", "vae", "transformer", "audio_encoder"):
             module = getattr(self, name, None)
@@ -1754,7 +1755,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             height = req.sampling_params.height or 512
             width = req.sampling_params.width or 512
             frame = torch.zeros((1, height, width, 3), dtype=torch.uint8)
-            return DiffusionOutput(output=frame, custom_output={"fps": self.save_fps})
+            return DiffusionOutput(output=frame)
 
         started = time.perf_counter()
         inputs = self._resolve_request_inputs(req)
@@ -1924,18 +1925,5 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             frames = (np.clip(output[0], 0.0, 1.0) * 255).round().astype("uint8")
         return DiffusionOutput(
             output=torch.from_numpy(frames),
-            custom_output={
-                "fps": save_fps,
-                "audio_path": inputs["audio_path"],
-                "audio_paths": inputs["audio_paths"],
-                "multi_speaker": inputs["is_multi_speaker"],
-                "audio_type": inputs["audio_type"],
-                "stage": stage,
-                "resolution": resolution,
-                "height": height,
-                "width": width,
-                "num_segments": num_segments,
-                "num_cond_frames": num_cond_frames,
-            },
             stage_durations={"avatar_generate_s": time.perf_counter() - started},
         )
