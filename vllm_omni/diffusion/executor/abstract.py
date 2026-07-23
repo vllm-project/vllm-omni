@@ -81,7 +81,7 @@ class DiffusionExecutor(ABC):
 
     @abstractmethod
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Execute request-mode work as a single batched RPC."""
+        """Execute request-mode work through the request-batch path."""
         pass
 
     @abstractmethod

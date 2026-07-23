@@ -139,7 +139,8 @@ compatibility gating and runner-side `StepInputBatch` packing.
 
 ## Current Limitations
 
-- Experimental feature; use `max_num_seqs=1` for the older conservative path.
+- Experimental feature; use `max_num_seqs=1` for the conservative single-request
+  step path.
 - Only native pipelines that already support `step_execution=True`.
 - Only homogeneous batches keyed by `StepBatchSamplingParamsKey` are supported.
 - `cache_backend`, KV transfer, and other request-mode extras are not wired

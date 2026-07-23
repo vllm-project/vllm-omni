@@ -3,7 +3,7 @@
 
 """DreamZero pipeline for vllm-omni.
 
-Entry point for DiffusionEngine.step() -> pipeline.forward(req)
+Entry point for DiffusionEngine.step_streaming() -> pipeline.forward(req)
 """
 
 from __future__ import annotations
@@ -1163,7 +1163,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
-        """Full inference step. Called by DiffusionEngine.step()."""
+        """Full inference step. Called by DiffusionEngine.step_streaming()."""
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")
         if robot_obs is None:
