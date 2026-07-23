@@ -60,6 +60,36 @@ diff --git a/tests/foo/test_bar.py b/tests/foo/test_bar.py
     assert _diff_only_contains_skip_mark_changes(diff)
 
 
+def test_skip_mark_removal_does_not_qualify() -> None:
+    """Removing a skip decorator re-enables the test; must not suppress CI."""
+    diff = """\
+diff --git a/tests/foo/test_bar.py b/tests/foo/test_bar.py
+--- a/tests/foo/test_bar.py
++++ b/tests/foo/test_bar.py
+@@ -1,5 +1,4 @@
+ import pytest
+-
+-@pytest.mark.skip(reason="temp")
+ def test_x():
+     assert True
+"""
+    assert not _diff_only_contains_skip_mark_changes(diff)
+
+
+def test_skip_mark_reason_edit_still_qualifies() -> None:
+    diff = """\
+diff --git a/tests/foo/test_bar.py b/tests/foo/test_bar.py
+--- a/tests/foo/test_bar.py
++++ b/tests/foo/test_bar.py
+@@ -1,4 +1,4 @@
+ import pytest
+-@pytest.mark.skip(reason="old")
++@pytest.mark.skip(reason="new")
+ def test_x():
+"""
+    assert _diff_only_contains_skip_mark_changes(diff)
+
+
 def test_skip_mark_diff_rejects_assertion_change() -> None:
     diff = """\
 diff --git a/tests/foo/test_bar.py b/tests/foo/test_bar.py
@@ -101,12 +131,16 @@ def test_weekly_only_skips_all_l23() -> None:
     decision = _decision([".buildkite/cuda/test-weekly.yml"])
     assert _is_yaml_gated(decision)
     assert _all_l23_skipped(decision)
+    assert not decision.is_run("cuda", "l2")
+    assert not decision.is_run("cuda", "l3")
 
 
 def test_npu_nightly_only_skips_all_l23() -> None:
     decision = _decision([".buildkite/npu/test-npu-nightly.yml"])
     assert _is_yaml_gated(decision)
     assert _all_l23_skipped(decision)
+    assert not decision.is_run("npu", "l2")
+    assert not decision.is_run("npu", "l3")
 
 
 def test_nightly_and_weekly_skips_all_l23() -> None:
@@ -118,6 +152,8 @@ def test_nightly_and_weekly_skips_all_l23() -> None:
     )
     assert _is_yaml_gated(decision)
     assert _all_l23_skipped(decision)
+    assert not decision.is_run("cuda", "l2")
+    assert not decision.is_run("cuda", "l3")
 
 
 def test_l2_and_l4_skips_l3() -> None:
@@ -154,6 +190,27 @@ def test_ready_and_merge_runs_cuda_l2_l3() -> None:
     assert decision.is_run("cuda", "l3")
 
 
+def test_cross_platform_cuda_l2_and_amd_l3_preserves_both() -> None:
+    """CUDA ready + AMD merge must keep cuda/l2 and amd/l3 (not wipe L2 outside L3 platforms)."""
+    decision = _decision(
+        [
+            ".buildkite/cuda/test-ready.yml",
+            ".buildkite/amd/test-amd-merge.yml",
+        ],
+    )
+    assert _is_yaml_gated(decision)
+    assert decision.is_run("cuda", "l2")
+    assert not decision.is_run("cuda", "l3")
+    assert not decision.is_run("amd", "l2")
+    assert decision.is_run("amd", "l3")
+    assert not decision.is_run("intel", "l2")
+    assert not decision.is_run("npu", "l2")
+    assert not decision.device.skip_cuda_l2
+    assert decision.device.skip_cuda_l3
+    assert decision.device.skip_amd_l2
+    assert not decision.device.skip_amd_l3
+
+
 def test_amd_ready_only_runs_amd_l2() -> None:
     decision = _decision([".buildkite/amd/test-amd-ready.yml"])
     assert _is_yaml_gated(decision)
@@ -161,11 +218,73 @@ def test_amd_ready_only_runs_amd_l2() -> None:
     assert not decision.is_run("cuda", "l2")
 
 
+def test_npu_ready_only_runs_npu_l2() -> None:
+    decision = _decision([".buildkite/npu/test-npu-ready.yml"])
+    assert _is_yaml_gated(decision)
+    assert decision.is_run("npu", "l2")
+    assert not decision.is_run("cuda", "l2")
+    assert not decision.is_run("npu", "l3")
+
+
+def test_amd_merge_only_runs_amd_l3() -> None:
+    decision = _decision([".buildkite/amd/test-amd-merge.yml"])
+    assert _is_yaml_gated(decision)
+    assert decision.is_run("amd", "l3")
+    assert not decision.is_run("amd", "l2")
+    assert not decision.is_run("cuda", "l3")
+
+
 def test_intel_pipeline_runs_intel_l2() -> None:
     decision = _decision([".buildkite/intel/pipeline-intel.yml"])
     assert _is_yaml_gated(decision)
     assert decision.is_run("intel", "l2")
     assert not decision.is_run("cuda", "l2")
+
+
+def test_cuda_and_amd_ready_runs_both_l2() -> None:
+    decision = _decision(
+        [
+            ".buildkite/cuda/test-ready.yml",
+            ".buildkite/amd/test-amd-ready.yml",
+        ],
+    )
+    assert _is_yaml_gated(decision)
+    assert decision.is_run("cuda", "l2")
+    assert decision.is_run("amd", "l2")
+    assert not decision.is_run("cuda", "l3")
+    assert not decision.is_run("amd", "l3")
+    assert not decision.is_run("intel", "l2")
+    assert not decision.is_run("npu", "l2")
+
+
+def test_cuda_and_amd_merge_runs_both_l3() -> None:
+    decision = _decision(
+        [
+            ".buildkite/cuda/test-merge.yml",
+            ".buildkite/amd/test-amd-merge.yml",
+        ],
+    )
+    assert _is_yaml_gated(decision)
+    assert decision.is_run("cuda", "l3")
+    assert decision.is_run("amd", "l3")
+    assert not decision.is_run("cuda", "l2")
+    assert not decision.is_run("amd", "l2")
+
+
+def test_ready_merge_and_nightly_runs_cuda_l2_l3() -> None:
+    """G7: L2+L3+L45 → same matrix as ready+merge (L45 rescued by L2/L3 YAML)."""
+    decision = _decision(
+        [
+            ".buildkite/cuda/test-ready.yml",
+            ".buildkite/cuda/test-merge.yml",
+            ".buildkite/cuda/test-nightly.yml",
+        ],
+    )
+    assert _is_yaml_gated(decision)
+    assert decision.is_run("cuda", "l2")
+    assert decision.is_run("cuda", "l3")
+    assert not decision.is_run("amd", "l2")
+    assert not decision.is_run("amd", "l3")
 
 
 def test_non_whitelist_buildkite_runs_normal_ci() -> None:
@@ -188,6 +307,25 @@ def test_mixed_product_code_disables_targeting() -> None:
     assert not _is_yaml_gated(
         _decision([".buildkite/cuda/test-ready.yml", "vllm_omni/x.py"]),
     )
+
+
+def test_docs_mixed_with_ci_yaml_follows_yaml_gating() -> None:
+    decision = _decision(["docs/a.md", ".buildkite/cuda/test-ready.yml"])
+    assert _is_yaml_gated(decision)
+    assert not decision.skip_all
+    assert decision.is_run("cuda", "l2")
+    assert not decision.is_run("cuda", "l3")
+    assert not decision.is_run("amd", "l2")
+    assert "follow CI YAML gating" in decision.message
+
+
+def test_docs_mixed_with_l45_yaml_skips_all_l23() -> None:
+    decision = _decision(["docs/a.md", ".buildkite/cuda/test-nightly.yml"])
+    assert _is_yaml_gated(decision)
+    assert not decision.skip_all
+    assert not decision.is_run("cuda", "l2")
+    assert not decision.is_run("cuda", "l3")
+    assert not decision.is_run("amd", "l2")
 
 
 def test_non_whitelist_path_disables_targeting() -> None:
@@ -219,7 +357,8 @@ def test_decision_serializes_to_dict() -> None:
     assert _is_yaml_gated(decision)
     payload = asdict(decision)
     assert payload["skip_l2_l3"] is True
-    assert payload["device"]["skip_cuda"] is False
+    assert payload["device"]["skip_cuda_l2"] is False
+    assert payload["device"]["skip_cuda_l3"] is True
 
 
 def test_yaml_gated_message_lists_changed_and_targets() -> None:

@@ -197,8 +197,82 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 
 #### Bootstrap skip {#bootstrap-skip}
 
-- **Docs / skip-mark only** → skip-ci path `skip_all`: suppress default CI. PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. Exception: on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4 plus L2/L3 (with `--e2e`); `WEEKLY=1` still builds the image and uploads L5.
-- **Only whitelisted CI YAML changed** → skip-ci path that enables L2/L3 only for touched platforms/levels. Register paths in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES`. Bootstrap `bootstrap-upload-steps.yml` steps get label/diff-aware `if` expressions injected by `upload_pipeline.py --upload` (by step `key`: `image-build`, `upload-ready-pipeline`, etc.).
+[`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) classifies the git diff into buckets (docs / qualifying skip-mark / whitelisted L2·L3·L4/L5 YAML / other), then picks one decision path. CUDA/NPU apply that decision by injecting Buildkite `if` on `bootstrap-upload-steps.yml` step keys; AMD/Intel call `gate_bootstrap_ci <platform> <l2|l3>`.
+
+##### Decision overview
+
+| Diff shape | Path | Default L2/L3 |
+| --- | --- | --- |
+| Product code / non-whitelisted paths | normal CI | all on |
+| Docs and/or qualifying skip-mark only | `skip_all` | all off (scheduled `main` NIGHTLY/WEEKLY exceptions below) |
+| Whitelisted CI YAML only | yaml-gated (`skip_l2_l3`) | per platform/level matrix |
+| Docs/skip-mark **+** whitelisted CI YAML | yaml-gated (`skip_l2_l3`) | same as CI-YAML-only (does **not** widen to normal CI) |
+| Non-qualifying skip-mark and no CI YAML | normal CI | all on |
+| Diff unavailable | normal CI | all on |
+
+**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4 plus L2/L3 (with `--e2e`); `WEEKLY=1` still builds the image and uploads L5 (CUDA).
+
+**Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
+
+##### Whitelisted CI YAML → platform
+
+Register new files in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES` in `skip_ci.py`.
+
+| Level | File | Platform |
+| --- | --- | --- |
+| L2 | `.buildkite/cuda/test-ready.yml` | cuda |
+| L2 | `.buildkite/npu/test-npu-ready.yml` | npu |
+| L2 | `.buildkite/amd/test-amd-ready.yml` | amd |
+| L2 | `.buildkite/intel/pipeline-intel.yml` | intel |
+| L3 | `.buildkite/cuda/test-merge.yml` | cuda |
+| L3 | `.buildkite/amd/test-amd-merge.yml` | amd |
+| L4/L5 | `.buildkite/cuda/test-nightly.yml`, `test-weekly.yml` | cuda |
+| L4/L5 | `.buildkite/npu/test-npu-nightly.yml` | npu |
+
+##### Yaml-gated category branches
+
+`L2?` / `L3?` / `L45?` = whether any file in that whitelist changed. Untouched platforms/levels end up off.
+
+| ID | L2? | L3? | L45? | Enabled L2/L3 |
+| --- | --- | --- | --- | --- |
+| G1 | | | ✓ | none (all L2/L3 off) |
+| G2 | ✓ | | | L2 only on platforms whose L2 YAML changed |
+| G3 | | ✓ | | L3 only on platforms whose L3 YAML changed |
+| G4 | ✓ | ✓ | | union of G2 and G3 (same platform ready+merge → both on) |
+| G5 | ✓ | | ✓ | same as G2 (L45 rescued by L2 YAML) |
+| G6 | | ✓ | ✓ | same as G3 (L45 rescued by L3 YAML) |
+| G7 | ✓ | ✓ | ✓ | same as G4 |
+
+##### Yaml-gated examples (platform-level)
+
+Docs/skip-mark mixed with any row below follows the same matrix.
+
+| Diff (whitelist) | Branch | Enabled L2/L3 |
+| --- | --- | --- |
+| Only `cuda/test-ready.yml` | G2 | `cuda/l2` |
+| Only `amd/test-amd-ready.yml` | G2 | `amd/l2` |
+| Only `npu/test-npu-ready.yml` | G2 | `npu/l2` |
+| Only `intel/pipeline-intel.yml` | G2 | `intel/l2` |
+| Only `cuda/test-merge.yml` | G3 | `cuda/l3` |
+| Only `amd/test-amd-merge.yml` | G3 | `amd/l3` |
+| CUDA ready + CUDA merge | G4 | `cuda/l2` + `cuda/l3` |
+| CUDA ready + AMD merge | G4 | `cuda/l2` + `amd/l3` |
+| CUDA ready + AMD ready | G2 | `cuda/l2` + `amd/l2` |
+| CUDA merge + AMD merge | G3 | `cuda/l3` + `amd/l3` |
+| Only nightly / weekly / npu-nightly YAML | G1 | (none) |
+| CUDA ready + nightly | G5 | `cuda/l2` |
+| CUDA merge + nightly | G6 | `cuda/l3` |
+| CUDA ready + merge + nightly | G7 | `cuda/l2` + `cuda/l3` |
+
+##### How platforms consume the decision
+
+| Platform | Mechanism |
+| --- | --- |
+| **CUDA** | `upload_pipeline.py` injects `if` by step `key` (`image-build`, `upload-ready-pipeline`, `upload-merge-pipeline`, …) from `is_run(cuda, l2/l3)` |
+| **NPU** | Same injection; no merge upload step (L3 always off in bootstrap) |
+| **AMD / Intel** | `gate_bootstrap_ci <platform> <l2\|l3>` exits 0 when `skip_all` or that target is off |
+
+Unit coverage: `tests/buildkite/test_skip_ci.py`.
 
 #### Step filtering {#step-filtering}
 

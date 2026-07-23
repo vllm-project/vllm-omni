@@ -59,12 +59,19 @@ def _empty_platform_buckets() -> dict[str, list[str]]:
 
 @dataclass(frozen=True)
 class CiDevice:
-    """Per-platform skip flags for yaml-gated bootstrap."""
+    """Per-platform / per-level skip flags for yaml-gated bootstrap (``skip_l2_l3``)."""
 
-    skip_cuda: bool = False
-    skip_amd: bool = False
-    skip_intel: bool = False
-    skip_npu: bool = False
+    skip_cuda_l2: bool = False
+    skip_cuda_l3: bool = False
+    skip_amd_l2: bool = False
+    skip_amd_l3: bool = False
+    skip_intel_l2: bool = False
+    skip_intel_l3: bool = False
+    skip_npu_l2: bool = False
+    skip_npu_l3: bool = False
+
+    def is_skip(self, platform: str, level: str) -> bool:
+        return bool(getattr(self, f"skip_{platform}_{level}", True))
 
 
 @dataclass
@@ -122,10 +129,12 @@ class SkipL2L3Basis:
 
     @classmethod
     def from_buckets(cls, buckets: DiffBuckets) -> SkipL2L3Basis | None:
-        """L4/L5 yaml → skip both L2 and L3 (L2/L3 buckets may rescue)."""
+        """L4/L5 yaml → skip both L2 and L3 (L2/L3 buckets may rescue).
+
+        Docs / skip-mark changes do not block this path; they are ignored for
+        L2/L3 targeting when CI YAML is also present.
+        """
         if buckets.has_other_changes:
-            return None
-        if buckets.has_doc_changes or buckets.has_skip_test_changes:
             return None
         if not buckets.has_l45_yaml_changes:
             return None
@@ -167,8 +176,6 @@ class CiDecision:
 
     skip_all: bool = False
     skip_l2_l3: bool = False
-    skip_l2: bool = False
-    skip_l3: bool = False
     device: CiDevice = field(default_factory=CiDevice)
     message: str = ""
 
@@ -194,7 +201,13 @@ class CiDecision:
         l3_basis: SkipL3Basis | None,
         l2_basis: SkipL2Basis | None,
     ) -> CiDecision:
-        """Build a yaml-gated decision by merging L2/L3 skip bases."""
+        """Build a yaml-gated decision by merging L2/L3 skip bases.
+
+        Bases are applied as a union of enables: L2 yaml keeps L2 on touched
+        platforms, L3 yaml keeps L3 on touched platforms. Cross-platform mixes
+        (e.g. CUDA ready + AMD merge) must preserve both enables. The resulting
+        per-platform / per-level matrix is stored on ``device`` as ``skip_*``.
+        """
         run = {platform: {"l2": True, "l3": True} for platform in PLATFORMS}
 
         if l2_l3_basis is not None:
@@ -216,24 +229,21 @@ class CiDecision:
                     run[platform]["l3"] = True
                     if l3_basis is None or platform not in l3_basis.enable_l2_platforms:
                         run[platform]["l2"] = False
-                else:
+                elif l3_basis is None:
+                    # L3-yaml-only: disable platforms that did not change L3.
                     run[platform]["l2"] = False
                     run[platform]["l3"] = False
+                # else: leave L2 enables from SkipL3Basis; keep this platform's L3 off.
 
         return cls(
             skip_l2_l3=True,
-            skip_l2=not any(run[platform]["l2"] for platform in PLATFORMS),
-            skip_l3=not any(run[platform]["l3"] for platform in PLATFORMS),
             device=cls._device_from_run(run),
         )
 
     @staticmethod
     def _device_from_run(run: dict[str, dict[str, bool]]) -> CiDevice:
         return CiDevice(
-            skip_cuda=not (run["cuda"]["l2"] or run["cuda"]["l3"]),
-            skip_amd=not (run["amd"]["l2"] or run["amd"]["l3"]),
-            skip_intel=not run["intel"]["l2"],
-            skip_npu=not run["npu"]["l2"],
+            **{f"skip_{platform}_{level}": not run[platform][level] for platform in PLATFORMS for level in ("l2", "l3")}
         )
 
     def is_run(self, platform: str, level: str) -> bool:
@@ -243,13 +253,7 @@ class CiDecision:
             return True
         if level not in L23_LEVELS:
             return True
-        if getattr(self.device, f"skip_{platform}", True):
-            return False
-        if level == "l2" and self.skip_l2:
-            return False
-        if level == "l3" and self.skip_l3:
-            return False
-        return True
+        return not self.device.is_skip(platform, level)
 
 
 @dataclass(frozen=True)
@@ -340,16 +344,22 @@ _PYTEST_MARK_ONLY_RE = re.compile(r"pytest\.mark\.\w+")
 
 
 def _diff_only_contains_skip_mark_changes(diff_text: str) -> bool:
-    """Return True when a unified diff only edits pytest skip marks."""
+    """Return True when a unified diff only *adds* pytest skip marks.
+
+    Deleting a skip mark re-enables the test and must not suppress CI. Editing an
+    existing skip (``-`` old / ``+`` new) still qualifies when at least one skip
+    mark is added.
+    """
 
     def paren_balance(line: str) -> int:
         return line.count("(") - line.count(")")
 
-    def is_skip_mark_line(line: str) -> bool:
+    def is_blank_or_comment(line: str) -> bool:
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            return True
-        return _SKIP_MARK_RE.search(stripped) is not None
+        return not stripped or stripped.startswith("#")
+
+    def is_skip_mark_line(line: str) -> bool:
+        return _SKIP_MARK_RE.search(line.strip()) is not None
 
     def is_pytestmark_adjacent_line(line: str) -> bool:
         stripped = line.strip().rstrip(",")
@@ -361,7 +371,7 @@ def _diff_only_contains_skip_mark_changes(diff_text: str) -> bool:
 
     pending_depth = 0
     saw_change = False
-    has_skip_mark_edit = False
+    has_added_skip_mark = False
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("@@"):
             pending_depth = 0
@@ -372,6 +382,7 @@ def _diff_only_contains_skip_mark_changes(diff_text: str) -> bool:
             continue
 
         saw_change = True
+        is_add = raw_line.startswith("+")
         content = raw_line[1:]
 
         if pending_depth > 0:
@@ -380,8 +391,12 @@ def _diff_only_contains_skip_mark_changes(diff_text: str) -> bool:
                 pending_depth = 0
             continue
 
+        if is_blank_or_comment(content):
+            continue
+
         if is_skip_mark_line(content):
-            has_skip_mark_edit = True
+            if is_add:
+                has_added_skip_mark = True
             pending_depth = max(0, paren_balance(content))
             continue
 
@@ -390,7 +405,7 @@ def _diff_only_contains_skip_mark_changes(diff_text: str) -> bool:
 
         return False
 
-    return saw_change and has_skip_mark_edit
+    return saw_change and has_added_skip_mark
 
 
 def _is_skip_testcase_change(file_path: str, *, diff_range: str) -> bool:
@@ -494,6 +509,11 @@ def _format_yaml_gated_message(buckets: DiffBuckets, decision: CiDecision) -> st
     changed = "; ".join(changed_parts) if changed_parts else "none"
     run = ", ".join(run_targets) if run_targets else "none"
     skip = ", ".join(skip_targets) if skip_targets else "none"
+    if buckets.has_doc_changes or buckets.has_skip_test_changes:
+        return (
+            "CI config YAML + docs/skip-mark changed — follow CI YAML gating; "
+            f"changed: {changed}; run: {run}; skip: {skip}"
+        )
     return f"only CI config YAML changed — changed: {changed}; run: {run}; skip: {skip}"
 
 
@@ -515,11 +535,8 @@ def resolve_ci_decision(
             "CI skipped — docs or pytest skip-mark changes only",
         )
 
-    if (buckets.has_l23_yaml_changes or buckets.has_l45_yaml_changes) and (
-        buckets.has_doc_changes or buckets.has_skip_test_changes
-    ):
-        return _finish(CiDecision(), "mixed doc/skip-mark and CI config YAML changes; run normal CI")
-
+    # Docs / skip-mark mixed with whitelisted CI YAML → same yaml-gated path
+    # as CI-YAML-only (docs/skip-mark do not widen to normal CI).
     if not buckets.has_l23_yaml_changes and not buckets.has_l45_yaml_changes:
         if buckets.has_skip_test_changes and diff_range is None:
             message = (

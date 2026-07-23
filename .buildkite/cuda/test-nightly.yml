@@ -281,6 +281,7 @@ steps:
       - label: ":full_moon: Diffusion X2I(&A&T) · Accuracy Test"
         timeout_in_minutes: 180
         commands:
+          - export VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
           - pytest -s -v tests/e2e/accuracy/test_qwen_image*.py --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2i_matches_diffusers' -m full_model --run-level full_model
         mirror_hardwares: h100_1
