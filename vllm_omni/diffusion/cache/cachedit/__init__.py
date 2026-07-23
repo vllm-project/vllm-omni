@@ -17,6 +17,11 @@ from vllm_omni.diffusion.cache.cachedit.model_specific import (
     BagelCachedAdapter,
     SensenovaCachedAdapter,
 )
+from vllm_omni.diffusion.cache.cachedit.model_specific import (
+    register_custom_dit_enablers as _register_custom_dit_enablers,
+)
+
+_register_custom_dit_enablers()
 
 __all__ = [
     "BagelCachedAdapter",

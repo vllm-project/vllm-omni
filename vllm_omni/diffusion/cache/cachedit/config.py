@@ -92,4 +92,5 @@ class CacheDiTConfig:
         logger.info("TaylorSeer enabled with order=%s", self.taylorseer_order)
         return TaylorSeerCalibratorConfig(taylorseer_order=self.taylorseer_order)
 
+
 __all__ = ["CacheDiTAdapterConfig", "CacheDiTConfig"]

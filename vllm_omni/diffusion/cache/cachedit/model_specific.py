@@ -836,19 +836,25 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
-# Register custom cache-dit enablers after function definitions
-CUSTOM_DIT_ENABLERS.update(
-    {
-        "Wan22Pipeline": enable_cache_for_wan22,
-        "Wan22I2VPipeline": enable_cache_for_wan22,
-        "Wan22TI2VPipeline": enable_cache_for_wan22,
-        "Wan22VACEPipeline": enable_cache_for_wan22,
-        "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
-        "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
-        "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
-        "Krea2Pipeline": enable_cache_for_krea2,
-    }
-)
+def register_custom_dit_enablers() -> None:
+    """Register model-specific Cache-DiT enablers.
+
+    This is called explicitly by the package initializer so registration does
+    not depend on unrelated model-specific symbols being imported for their
+    side effects.
+    """
+    CUSTOM_DIT_ENABLERS.update(
+        {
+            "Wan22Pipeline": enable_cache_for_wan22,
+            "Wan22I2VPipeline": enable_cache_for_wan22,
+            "Wan22TI2VPipeline": enable_cache_for_wan22,
+            "Wan22VACEPipeline": enable_cache_for_wan22,
+            "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
+            "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
+            "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
+            "Krea2Pipeline": enable_cache_for_krea2,
+        }
+    )
 
 
 __all__ = [

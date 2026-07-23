@@ -89,6 +89,57 @@ class TestCacheDiTBackend:
         assert backend._refresh_func is not None
         mock_cache_dit.enable_cache.assert_called_once()
 
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.logger")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_enable_without_model_adapter_uses_cache_dit_registry(self, mock_cache_dit, mock_logger):
+        """A missing model-declared adapter falls back to Cache-DiT's registry."""
+
+        class BuiltinTransformer:
+            pass
+
+        class BuiltinPipeline:
+            transformer = BuiltinTransformer()
+
+        pipeline = BuiltinPipeline()
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+
+        backend.enable(pipeline)
+
+        assert backend.enabled is True
+        assert backend._refresh_func is not None
+        assert mock_cache_dit.enable_cache.call_args.args[0] is pipeline.transformer
+        mock_logger.info.assert_any_call(
+            "Transformer %s does not declare _cache_dit_adapter_config; "
+            "falling back to Cache-DiT's built-in adapter registry.",
+            "BuiltinTransformer",
+        )
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_enable_without_compatible_adapter_has_contextual_error(self, mock_cache_dit):
+        """An unsupported fallback reports both pipeline and transformer names."""
+
+        class UnsupportedTransformer:
+            pass
+
+        class UnsupportedPipeline:
+            transformer = UnsupportedTransformer()
+
+        pipeline = UnsupportedPipeline()
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+        mock_cache_dit.enable_cache.side_effect = ValueError("unsupported")
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "Failed to enable Cache-DiT for pipeline UnsupportedPipeline with transformer UnsupportedTransformer"
+            ),
+        ) as exc_info:
+            backend.enable(pipeline)
+
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert backend.enabled is False
+        assert backend._refresh_func is None
+
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
     def test_refresh(self, mock_cache_dit, mock_block_adapter):

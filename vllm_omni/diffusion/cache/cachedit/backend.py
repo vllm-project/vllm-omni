@@ -106,6 +106,21 @@ def enable_cache_for_dit(
             cache_config=db_cache_config,
             calibrator_config=calibrator_config,
         )
+    elif block_adapter is None:
+        try:
+            cache_dit.enable_cache(
+                cache_target,
+                cache_config=db_cache_config,
+                calibrator_config=calibrator_config,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Failed to enable Cache-DiT for pipeline "
+                f"{type(pipeline).__name__} with transformer "
+                f"{type(transformer).__name__}: no model-declared "
+                "_cache_dit_adapter_config or compatible Cache-DiT built-in "
+                "adapter was found."
+            ) from exc
     else:
         cache_dit.enable_cache(
             cache_target,
@@ -122,6 +137,11 @@ def _maybe_build_block_adapter(pipeline: Any) -> BlockAdapter | None:
     transformer = _default_get_pipeline_transformer(pipeline)
     adapter_config: CacheDiTAdapterConfig | None = getattr(transformer, "_cache_dit_adapter_config", None)
     if adapter_config is None:
+        logger.info(
+            "Transformer %s does not declare _cache_dit_adapter_config; "
+            "falling back to Cache-DiT's built-in adapter registry.",
+            type(transformer).__name__,
+        )
         return None
 
     block_attributes, forward_patterns = zip(*adapter_config.block_forward_patterns.items())

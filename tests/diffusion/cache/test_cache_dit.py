@@ -45,8 +45,33 @@ SEPARATE_CFG_TRANSFORMERS = [
 SAMPLE_CACHE_CONFIG = DiffusionCacheConfig()
 
 
+def test_custom_cache_dit_enablers_are_registered_explicitly():
+    expected_enablers = {
+        "Wan22Pipeline": cd_model_specific.enable_cache_for_wan22,
+        "Wan22I2VPipeline": cd_model_specific.enable_cache_for_wan22,
+        "Wan22TI2VPipeline": cd_model_specific.enable_cache_for_wan22,
+        "Wan22VACEPipeline": cd_model_specific.enable_cache_for_wan22,
+        "Wan22S2VPipeline": cd_model_specific.enable_cache_for_wan22_s2v,
+        "Cosmos3OmniDiffusersPipeline": cd_model_specific.enable_cache_for_cosmos3,
+        "Cosmos3OmniPipeline": cd_model_specific.enable_cache_for_cosmos3,
+        "Krea2Pipeline": cd_model_specific.enable_cache_for_krea2,
+    }
+
+    with patch.dict(cd_backend.CUSTOM_DIT_ENABLERS, {}, clear=True):
+        cd_model_specific.register_custom_dit_enablers()
+        assert cd_backend.CUSTOM_DIT_ENABLERS == expected_enablers
+
+
 def test_wan22_vace_uses_wan22_custom_cache_dit_enabler():
     assert cd_backend.CUSTOM_DIT_ENABLERS["Wan22VACEPipeline"] is cd_model_specific.enable_cache_for_wan22
+
+
+@pytest.mark.parametrize(
+    "pipeline_name",
+    ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"],
+)
+def test_cosmos3_aliases_use_cosmos3_custom_cache_dit_enabler(pipeline_name: str):
+    assert cd_backend.CUSTOM_DIT_ENABLERS[pipeline_name] is cd_model_specific.enable_cache_for_cosmos3
 
 
 def test_cachedit_public_api_is_explicit():
@@ -137,8 +162,8 @@ def test_wan22_custom_enabler_passes_taylorseer_calibrator(
         assert modifier._context_kwargs["calibrator_config"] is calibrator_config
 
 
-@patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
-@patch("vllm_omni.diffusion.cache.cachedit.model_specific.cache_dit")
+@patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
 def test_cosmos3_cache_dit_wraps_gen_layers(mock_cache_dit, mock_block_adapter):
     """Cosmos3 should cache only the repeated GEN pathway blocks."""
     mock_pipeline = Mock()
@@ -146,7 +171,7 @@ def test_cosmos3_cache_dit_wraps_gen_layers(mock_cache_dit, mock_block_adapter):
     mock_pipeline.transformer.gen_layers = gen_layers
     mock_pipeline.transformer._cache_dit_adapter_config = Cosmos3VFMTransformer._cache_dit_adapter_config
 
-    cd_backend.enable_cache_for_cosmos3(mock_pipeline, SAMPLE_CACHE_CONFIG)
+    cd_model_specific.enable_cache_for_cosmos3(mock_pipeline, SAMPLE_CACHE_CONFIG)
 
     mock_cache_dit.enable_cache.assert_called_once()
     adapter_kwargs = mock_block_adapter.call_args.kwargs
