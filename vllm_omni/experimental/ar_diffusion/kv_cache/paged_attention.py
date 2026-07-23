@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged self-attention helpers for AR-Diffusion DreamZero KV reuse."""
+"""Paged self-attention helpers for AR-Diffusion KV reuse."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 
-# Set by ARDiffusionPagedForwardContext.prepare() before each branch forward and
+# Set by ARDiffusionPagedForwardContext.prepare() before each KV branch forward and
 # read by the fused write+attend custom op below. The pools are process-lifetime
 # allocations owned by one ARDiffusionKVCache per worker process (CFG-parallel /
 # TP ranks are separate processes), mirroring vLLM's forward-context pattern for
@@ -39,7 +39,7 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
 
     A NamedTuple of plain tensors + ints so ``torch.compile`` treats every field
     as a pytree graph input (no object-attribute guards, no recompiles when only
-    tensor *values* change). All layers of one branch forward share the same
+    tensor *values* change). All layers of one KV branch forward share the same
     metadata tensor objects, built once by ``prepare()``.
 
     ``layer_idx`` is a 0-dim CPU tensor, NOT a python int: all 40 DiT blocks
@@ -62,11 +62,11 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
 
 @dataclass
 class ARDiffusionPagedForwardContext:
-    """Mutable branch-level state shared by all layer contexts in one forward."""
+    """Mutable KV-branch state shared by all layer contexts in one forward."""
 
     kv_cache: Any
     adapter: Any
-    is_negative: bool
+    kv_branch: str
     history_block_ids: list[int]
     seq_len: int
     commit_current: bool
@@ -80,7 +80,7 @@ class ARDiffusionPagedForwardContext:
     _allocated_video: bool = False
     _committed: bool = False
     _action_len: int = 0
-    # Set once by prepare(); shared by all layers of the branch forward.
+    # Set once by prepare(); shared by all layers of the KV branch forward.
     block_table: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
@@ -102,7 +102,7 @@ class ARDiffusionPagedForwardContext:
         return self.seq_len // self.block_size
 
     def ensure_video_slots(self, device: torch.device) -> None:
-        """Allocate/write targets for the current video tokens, once per branch."""
+        """Allocate/write targets for the current video tokens, once per KV branch."""
         if self._allocated_video:
             return
 
@@ -116,7 +116,7 @@ class ARDiffusionPagedForwardContext:
             positions = torch.arange(start, start + self.seq_len, dtype=torch.long)
             self.current_video_slot_mapping = compute_slot_mapping(table, positions, self.block_size).to(device=device)
         else:
-            self.current_video_block_ids = self.kv_cache.scratch_block_ids(self.is_negative, 0, n_blocks)
+            self.current_video_block_ids = self.kv_cache.scratch_block_ids(self.kv_branch, 0, n_blocks)
             positions = torch.arange(self.seq_len, dtype=torch.long)
             self.current_video_slot_mapping = compute_slot_mapping(
                 self.current_video_block_ids,
@@ -140,7 +140,7 @@ class ARDiffusionPagedForwardContext:
         action_blocks = (action_len + self.block_size - 1) // self.block_size
         scratch_offset = 0 if self.commit_current else len(self.current_video_block_ids)
         self.action_scratch_block_ids = self.kv_cache.scratch_block_ids(
-            self.is_negative,
+            self.kv_branch,
             scratch_offset,
             action_blocks,
         )
@@ -161,8 +161,15 @@ class ARDiffusionPagedForwardContext:
             )
         all_video_blocks = self.history_block_ids + self.current_video_block_ids
         max_video_blocks = self.max_video_tokens // self.block_size
-        visible_video_blocks = all_video_blocks[-max_video_blocks:] if max_video_blocks else []
-        video_len = min(len(all_video_blocks) * self.block_size, self.max_video_tokens)
+        sink_blocks = int(self.kv_cache.spec.sink_chunks)
+        if len(all_video_blocks) <= max_video_blocks:
+            visible_video_blocks = all_video_blocks
+        else:
+            tail_blocks = max_video_blocks - sink_blocks
+            visible_video_blocks = all_video_blocks[:sink_blocks]
+            if tail_blocks:
+                visible_video_blocks += all_video_blocks[-tail_blocks:]
+        video_len = len(visible_video_blocks) * self.block_size
         return visible_video_blocks, video_len
 
     def build_block_table(
@@ -201,9 +208,9 @@ class ARDiffusionPagedForwardContext:
         return block_table, query_start_loc, seq_lens, self.query_len, max_seq_len
 
     def prepare(self, device: torch.device, action_len: int, query_len: int) -> None:
-        """Host-side, once-per-branch-forward setup (called OUTSIDE torch.compile).
+        """Host-side, once-per-KV-branch setup (called OUTSIDE torch.compile).
 
-        Allocates the current video/action slots (still lazy: only the branch a
+        Allocates the current video/action slots (still lazy: only the KV branch a
         CFG-parallel rank actually runs reaches its ``_forward_blocks``), builds
         the padded block-table metadata ONCE for all layers, and publishes the
         pool registry for the fused custom op. The compiled per-layer code then
@@ -245,7 +252,7 @@ class ARDiffusionPagedForwardContext:
 
 @dataclass
 class ARDiffusionPagedLayerContext:
-    """Layer-specific handle passed through DreamZero's existing ``kv_cache`` slot."""
+    """Layer-specific handle passed through a model's ``kv_cache`` slot."""
 
     is_ar_diffusion_paged_context: ClassVar[bool] = True
     layer_idx: int
@@ -260,8 +267,8 @@ class ARDiffusionPagedLayerContext:
         return self.forward_ctx.adapter
 
     @property
-    def is_negative(self) -> bool:
-        return self.forward_ctx.is_negative
+    def kv_branch(self) -> str:
+        return self.forward_ctx.kv_branch
 
     @property
     def history_block_ids(self) -> list[int]:

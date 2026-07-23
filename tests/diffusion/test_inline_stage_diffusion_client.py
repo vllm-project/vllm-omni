@@ -54,9 +54,12 @@ def client(mock_engine):
 
 @pytest.mark.asyncio
 async def test_inline_dispatch_request_success(client, mock_engine):
-    # Setup mock engine step to return a successful result
     mock_result = OmniRequestOutput.from_diffusion(request_id="req-1", images=[MagicMock()])
-    mock_engine.step.return_value = [mock_result]
+
+    async def _step_streaming(_request):
+        yield [mock_result]
+
+    mock_engine.step_streaming = _step_streaming
 
     sampling_params = OmniDiffusionSamplingParams()
     await client.add_request_async("req-1", "A test prompt", sampling_params)
@@ -70,7 +73,6 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
     assert output is not None
     assert output.request_id == "req-1"
-    mock_engine.step.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -104,8 +106,11 @@ async def test_inline_dispatch_request_streaming_success(client, mock_engine):
 
 @pytest.mark.asyncio
 async def test_inline_dispatch_request_error(client, mock_engine):
-    # Setup mock engine step to raise an exception
-    mock_engine.step.side_effect = RuntimeError("Engine failure")
+    async def _step_streaming(_request):
+        raise RuntimeError("Engine failure")
+        yield  # pragma: no cover
+
+    mock_engine.step_streaming = _step_streaming
 
     sampling_params = OmniDiffusionSamplingParams()
     await client.add_request_async("req-err", "A test prompt", sampling_params)

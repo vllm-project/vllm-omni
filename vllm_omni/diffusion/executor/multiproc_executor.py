@@ -356,14 +356,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         return BatchRunnerOutput.from_list(runner_outputs)
 
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        """Execute request-mode work through a single batched worker RPC.
+        """Execute request-mode work through the unified request-batch path.
 
-        The worker builds DiffusionRequestBatch from scheduler output and returns
-        BatchRunnerOutput with one RunnerOutput per scheduled request.
+        A scheduler wave with one request is the conservative serial case and
+        uses the single-request worker RPC. Waves with multiple requests use the
+        fused request-batch RPC and require pipeline request-batch support.
         """
         from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 
         self._ensure_open()
+        if len(scheduler_output.scheduled_new_reqs) <= 1:
+            return self.execute_request(scheduler_output)
+
         result = self.collective_rpc(
             "execute_model_batch",
             args=(scheduler_output, self.od_config),

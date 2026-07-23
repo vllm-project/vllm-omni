@@ -714,7 +714,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                             )
                             if self.od_config.streaming_output:
-                                should_decode = req.chunk_denoise_completed
+                                should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:
                                 should_decode = req.denoise_completed
 

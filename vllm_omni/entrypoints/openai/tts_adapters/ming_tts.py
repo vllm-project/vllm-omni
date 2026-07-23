@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ming-TTS (dense) serving adapter."""
 
+import asyncio
 from typing import TYPE_CHECKING
+
+import torch
+from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-
-from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -33,6 +36,7 @@ class MingTTSAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         server = self.ctx.server
         ref_audio_source = request.ref_audio
+        speaker_cache_key: tuple[str, str, int] | None = None
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
         if ref_audio_source is None and voice_lower in server.uploaded_speakers:
             speaker_info = server.uploaded_speakers[voice_lower]
@@ -42,6 +46,21 @@ class MingTTSAdapter(ARTTSAdapter):
                 if request.speaker_embedding is None:
                     raise ValueError(f"Speaker embedding for uploaded voice '{request.voice}' is missing")
             else:
+                if request.speaker_embedding is None:
+                    speaker_cache_key = server._speaker_cache.make_cache_key(
+                        voice_lower,
+                        model_type=self.name,
+                        created_at=int(speaker_info.get("created_at") or 0),
+                    )
+                    cached = server._speaker_cache.get(speaker_cache_key)
+                    if cached is not None:
+                        cached_embedding = cached.get("speaker_embedding")
+                        if isinstance(cached_embedding, torch.Tensor):
+                            flat = cached_embedding.detach().reshape(-1).to(torch.float32).cpu()
+                            if int(flat.numel()) == SPEAKER_EMBEDDING_DIM:
+                                request.speaker_embedding = flat.tolist()
+                                speaker_cache_key = None
+                                logger.debug("Speaker cache HIT for Ming-TTS speaker '%s'", voice_lower)
                 ref_audio_source = server._get_uploaded_audio_data(request.voice)
                 if not ref_audio_source:
                     raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing")
@@ -51,12 +70,26 @@ class MingTTSAdapter(ARTTSAdapter):
         if isinstance(ref_audio_source, list):
             ref_audio_data = await server._resolve_ref_audio_many(ref_audio_source)
             if request.speaker_embedding is None:
-                request.speaker_embedding = server._extract_ming_speaker_embeddings_from_ref_audio(ref_audio_data)
+                request.speaker_embedding = await asyncio.to_thread(
+                    server._extract_ming_speaker_embeddings_from_ref_audio,
+                    ref_audio_data,
+                )
         elif ref_audio_source is not None and isinstance(ref_audio_source, str):
             wav_list, sr = await server._resolve_ref_audio(ref_audio_source)
             ref_audio_data = (wav_list, sr)
             if request.speaker_embedding is None:
-                request.speaker_embedding = server._extract_ming_speaker_embeddings_from_ref_audio([ref_audio_data])[0]
+                embeddings = await asyncio.to_thread(
+                    server._extract_ming_speaker_embeddings_from_ref_audio,
+                    [ref_audio_data],
+                )
+                request.speaker_embedding = embeddings[0]
+        if speaker_cache_key is not None and request.speaker_embedding is not None:
+            embedding = torch.as_tensor(request.speaker_embedding, dtype=torch.float32).detach().reshape(-1).cpu()
+            server._speaker_cache.put(
+                speaker_cache_key,
+                {"speaker_embedding": embedding},
+            )
+            logger.debug("Speaker cache STORE for Ming-TTS speaker '%s'", voice_lower)
         prompt = server._build_ming_dense_prompt(request, ref_audio_data=ref_audio_data)
         tts_params = prompt.get("additional_information", {})
         # Ming stop-token / max_tokens sampling stays in the orchestrator tail.
@@ -73,11 +106,12 @@ class MingTTSAdapter(ARTTSAdapter):
             if not request.speaker_embedding:
                 return "'speaker_embedding' must be a non-empty list of floats"
             emb_len = len(request.speaker_embedding)
-            if emb_len != 192:
+            if emb_len != SPEAKER_EMBEDDING_DIM:
                 logger.warning(
-                    "speaker_embedding has %d dimensions; Ming dense expects 192. "
+                    "speaker_embedding has %d dimensions; Ming dense expects %d. "
                     "Wrong dimensions will likely fail or degrade output.",
                     emb_len,
+                    SPEAKER_EMBEDDING_DIM,
                 )
 
         voice_lower = request.voice.lower() if isinstance(request.voice, str) else None
@@ -127,8 +161,10 @@ class MingTTSAdapter(ARTTSAdapter):
                 )
             if embeddings and isinstance(embeddings[0], list):
                 for item in embeddings:
-                    if len(item) != 192:
-                        return "Podcast-style Ming speaker embeddings must each have 192 dimensions"
+                    if len(item) != SPEAKER_EMBEDDING_DIM:
+                        return (
+                            f"Podcast-style Ming speaker embeddings must each have {SPEAKER_EMBEDDING_DIM} dimensions"
+                        )
 
         if request.instructions and len(request.instructions) > server._max_instructions_length:
             return f"Instructions too long (max {server._max_instructions_length} characters)"
