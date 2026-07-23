@@ -50,7 +50,7 @@ def build_image_to_video_prompt(
     width: int | None = None,
     num_frames: int | None = None,
 ) -> dict[str, Any]:
-    del height, width, num_frames
+    del height, width
     if set(media_inputs) != {"image"} or not isinstance(media_inputs["image"], Image.Image):
         raise ValueError("LingBot text-image-to-video requires exactly one PIL image input.")
 
@@ -59,6 +59,8 @@ def build_image_to_video_prompt(
         "modalities": ["video"],
         "multi_modal_data": {"image": media_inputs["image"]},
     }
+    if num_frames is not None:
+        result["num_frames"] = num_frames
     if negative_prompt is not None:
         result["negative_prompt"] = negative_prompt
     return result

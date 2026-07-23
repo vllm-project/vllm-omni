@@ -90,7 +90,11 @@ def main() -> None:
         parallel_config=DiffusionParallelConfig(),
     )
 
-    prompt: dict[str, Any] = {"prompt": args.prompt, "modalities": ["video"]}
+    prompt: dict[str, Any] = {
+        "prompt": args.prompt,
+        "modalities": ["video"],
+        "num_frames": args.num_frames,
+    }
     if args.negative_prompt is not None:
         prompt["negative_prompt"] = args.negative_prompt
 

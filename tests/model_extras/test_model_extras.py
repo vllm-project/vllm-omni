@@ -168,6 +168,7 @@ def test_lingbot_image_to_video_prompt_builder() -> None:
         "prompt": "the fox looks toward the camera",
         "modalities": ["video"],
         "multi_modal_data": {"image": image},
+        "num_frames": 9,
     }
 
 

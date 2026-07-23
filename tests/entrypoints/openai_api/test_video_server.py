@@ -28,6 +28,7 @@ from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationStatus,
+    VideoParams,
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
@@ -466,6 +467,44 @@ def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, 
     sampling_params = engine.captured_sampling_params_list[0]
     assert sampling_params.extra_args["width"] == 96
     assert sampling_params.extra_args["height"] == 64
+
+
+@pytest.mark.parametrize(
+    ("generation_request", "expected"),
+    [
+        (
+            VideoGenerationRequest(
+                prompt="top-level frames",
+                seconds="5",
+                num_frames=9,
+                extra_params={"_vllm_request_context": {"user_value": True}},
+            ),
+            {"seconds": "5", "num_frames_explicit": True},
+        ),
+        (
+            VideoGenerationRequest(
+                prompt="nested frames",
+                video_params=VideoParams(num_frames=9),
+            ),
+            {"seconds": None, "num_frames_explicit": True},
+        ),
+        (
+            VideoGenerationRequest(prompt="duration only", seconds="5"),
+            {"seconds": "5", "num_frames_explicit": False},
+        ),
+    ],
+)
+def test_video_generation_preserves_frame_count_provenance(generation_request, expected):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    )
+
+    asyncio.run(handler._run_and_extract(generation_request, "frame-count-provenance"))
+
+    context = engine.captured_sampling_params_list[0].extra_args["_vllm_request_context"]
+    assert context == expected
 
 
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):

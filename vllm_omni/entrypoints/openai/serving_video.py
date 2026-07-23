@@ -250,6 +250,15 @@ class OmniOpenAIServingVideo:
                 loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
 
+        # Keep only the request provenance that cannot be recovered from the
+        # resolved sampling params. Model-specific normalizers may use this to
+        # distinguish an explicit frame count from one derived from seconds or
+        # inherited from a generic serving default.
+        gen_params.extra_args["_vllm_request_context"] = {
+            "seconds": request.seconds,
+            "num_frames_explicit": self._request_num_frames_provided(request),
+        }
+
         self._apply_lora(request.lora, gen_params)
 
         logger.info(
@@ -396,6 +405,15 @@ class OmniOpenAIServingVideo:
         if video_params is None or "video_params" not in request.model_fields_set:
             return False
         return "fps" in video_params.model_fields_set and video_params.fps is not None
+
+    @staticmethod
+    def _request_num_frames_provided(request: VideoGenerationRequest) -> bool:
+        if "num_frames" in request.model_fields_set and request.num_frames is not None:
+            return True
+        video_params = request.video_params
+        if video_params is None or "video_params" not in request.model_fields_set:
+            return False
+        return "num_frames" in video_params.model_fields_set and video_params.num_frames is not None
 
     def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
         default_sampling_params_list = getattr(self._engine_client, "default_sampling_params_list", None)

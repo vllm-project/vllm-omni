@@ -211,6 +211,52 @@ def test_normalize_lingbot_request_rounds_all_video_frame_counts():
     assert config.num_frames == 121
 
 
+def test_normalize_lingbot_request_prefers_explicit_frames_over_duration():
+    online = _normalize(
+        {"prompt": "motion", "modalities": ["video"]},
+        width=320,
+        height=192,
+        num_frames=9,
+        fps=24,
+        extra_args={
+            "duration": 5,
+            "_vllm_request_context": {
+                "seconds": None,
+                "num_frames_explicit": True,
+            },
+        },
+    )
+    assert online.num_frames == 9
+
+    offline = _normalize(
+        {
+            "prompt": {"caption": "motion", "duration": 5, "num_frames": 9},
+            "modalities": ["video"],
+        },
+        width=320,
+        height=192,
+        fps=24,
+    )
+    assert offline.num_frames == 9
+
+
+def test_normalize_lingbot_request_uses_duration_then_model_default():
+    duration = _normalize(
+        {"prompt": {"caption": "motion", "duration": 5}, "modalities": ["video"]},
+        width=320,
+        height=192,
+        fps=24,
+    )
+    assert duration.num_frames == 121
+
+    default = _normalize(
+        {"prompt": "motion", "modalities": ["video"]},
+        width=320,
+        height=192,
+    )
+    assert default.num_frames == 81
+
+
 def test_normalize_lingbot_request_rejects_contract_conflicts():
     with pytest.raises(ValueError, match="text-to-image.*duration"):
         _normalize(
