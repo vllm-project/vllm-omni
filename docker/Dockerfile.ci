@@ -15,10 +15,10 @@ WORKDIR ${APP_DIR}
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# Create a vllm_omni dir so that we can install the python package
-# without failing to write the version files; we'll copy over it
-# after installing
-RUN mkdir -p vllm_omni
+# Placeholder package tree so editable install can register APP_DIR.
+# The final stage COPY --link fills this directory with the real sources;
+# the editable .pth / egg-link keeps resolving imports there — no PYTHONPATH.
+RUN mkdir -p vllm_omni && touch vllm_omni/__init__.py
 
 # Install system dependencies
 RUN apt-get update && \
@@ -32,7 +32,11 @@ RUN apt-get update && \
 COPY pyproject.toml setup.py ./
 COPY requirements/ requirements/
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
-RUN uv pip install --system ".[dev]"
+# Editable install: deps + project metadata are cached in this layer, while
+# the package itself is linked to APP_DIR (populated later by COPY --link).
+# Do NOT use a non-editable install here — that copies an empty stub into
+# site-packages and breaks ``import vllm_omni.entrypoints``.
+RUN uv pip install --system -e ".[dev]"
 
 # The final stage just copies the working dir on top of the
 # dependencies image. This uses --link so that we can skip
@@ -40,17 +44,10 @@ RUN uv pip install --system ".[dev]"
 #
 # IMPORTANT: Do not make any modifications that depend on the
 # file system after the --link copy, otherwise we'd need to pull
-# the heavy base image to build it. This is the reason we copy
-# link & update the pythonpath to point at the copied code instead
-# of running a new pip install on it.
+# the heavy base image to build it. Editable install above already
+# registered APP_DIR, so we must not re-pip-install after COPY.
 FROM deps
 ARG APP_DIR=/workspace/vllm-omni
-# Add APP_DIR to the pythonpath, since the entrypoint stub
-# that was installed in the earlier step must point at the copied code.
-#
-# NOTE: this will probably warn about undefined vars, but is expected.
-# See: https://github.com/docker/buildx/issues/2751
-ENV PYTHONPATH=${APP_DIR}${PYTHONPATH:+:${PYTHONPATH}}
 WORKDIR ${APP_DIR}
 
 COPY --link . .
