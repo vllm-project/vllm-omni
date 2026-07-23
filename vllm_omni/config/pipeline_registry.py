@@ -68,6 +68,9 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS2_PIPELINE,
     INDEXTTS25_PIPELINE,
 )
+from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_PIPELINE,
+)
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
@@ -122,6 +125,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
+    "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,

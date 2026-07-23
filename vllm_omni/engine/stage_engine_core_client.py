@@ -403,6 +403,13 @@ class StageEngineCoreClientBase(StageClientBase):
                 # stage's model config (e.g. a talker whose engine positions
                 # must cover a speaker-prompt prefill).
                 extra_kwargs["next_stage_hf_config"] = self._stage_hf_config
+            target_model_config = signature.parameters.get("target_model_config")
+            if target_model_config is not None:
+                # The JoyAI bridge needs the Talker tokenizer and model config
+                # to calculate the exact prompt length.
+                if target_model_config.kind is not inspect.Parameter.KEYWORD_ONLY:
+                    raise TypeError("target_model_config must be a keyword-only parameter")
+                extra_kwargs["target_model_config"] = self.vllm_config.model_config
             # Match the context parameter by name, including the
             # underscore-prefixed spelling some processors use (e.g.
             # MiniCPM-o's ``llm2tts(..., _streaming_context)``), so bridge
