@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 import torch.nn.functional as F
@@ -16,50 +15,10 @@ from torch import nn
 from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 
 logger = init_logger(__name__)
-
-# CosyVoice3 flow-decoder streaming controls. The model was trained
-# chunked-causal (static_chunk_size / num_decoding_left_chunks) but the base
-# forward path ran full bidirectional attention. These flags restore the
-# chunked-causal pattern and enable an incremental streaming decode with a
-# per-layer attention KV cache for the finalized prefix, so each streaming
-# chunk only denoises its own new frames instead of the whole cumulative
-# sequence. Default on; export COSYVOICE3_CHUNK_CAUSAL=0 / COSYVOICE3_DIT_KV_CACHE=0
-# for the byte-identical full-sequence path.
-CHUNK_CAUSAL = os.environ.get("COSYVOICE3_CHUNK_CAUSAL", "1") == "1"
-KV_CACHE = os.environ.get("COSYVOICE3_DIT_KV_CACHE", "1") == "1"
-# Mirrors cfm.FLOW_BF16: under the bf16 flow the dtype-routed diffusion backend
-# would pick FlashAttention (2D-mask only); keep the SDPA math for the 4D
-# chunk-causal mask instead.
-FLOW_BF16 = os.environ.get("COSYVOICE3_FLOW_BF16", "0") == "1"
-
-
-def build_chunk_causal_mask(
-    q_len: int,
-    kv_len: int,
-    chunk_size: int,
-    device: torch.device,
-    q_offset: int = 0,
-) -> torch.Tensor:
-    """Boolean chunked-causal attention mask, True == may attend.
-
-    Query row ``i`` (absolute position ``q_offset + i``) may attend to key
-    column ``j`` (absolute position ``j``) iff ``j`` lies in the same static
-    chunk as the query or any earlier chunk, i.e.
-    ``j < ((q_offset + i) // chunk_size + 1) * chunk_size``. All left chunks are
-    visible (``num_decoding_left_chunks = -1``). Returns shape
-    ``(1, 1, q_len, kv_len)`` so SDPA broadcasts it over batch and heads.
-    """
-    q_pos = torch.arange(q_len, device=device) + q_offset
-    k_pos = torch.arange(kv_len, device=device)
-    ending = ((q_pos // chunk_size) + 1) * chunk_size
-    mask = k_pos.unsqueeze(0) < ending.unsqueeze(1)
-    return mask.view(1, 1, q_len, kv_len)
-
 
 """
 in notation:
@@ -152,22 +111,7 @@ class DiTAttention(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         rope=None,
-        attn_mask: torch.Tensor | None = None,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ):
-        """Self-attention with optional chunked-causal mask and prefix KV cache.
-
-        ``x`` holds only the query frames (the new streaming chunk when a cache
-        is supplied, otherwise the full sequence). ``rope`` must already be
-        sliced to the query frames' absolute positions. When ``kv_cache`` is
-        given, the cached prefix K/V (finalized, at t=1) are concatenated before
-        the freshly projected new-frame K/V. ``attn_mask`` is a boolean SDPA
-        mask (True == attend) of shape ``(1, 1, q_len, kv_len)``.
-
-        Returns ``(out, new_key, new_value)`` where ``new_key``/``new_value`` are
-        the query frames' K/V (post-RoPE, pre-concat) so the caller can append
-        them to the cache when the chunk is finalized.
-        """
+    ) -> torch.Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
 
         # Project to Q, K, V
@@ -181,49 +125,24 @@ class DiTAttention(nn.Module):
             q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
             query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
             key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
-            # RoPE freqs are kept fp32 for position precision; realign q/k to v's
-            # dtype so attention and the KV cache stay uniform (no-op in fp32).
-            query = query.to(value.dtype)
-            key = key.to(value.dtype)
 
         # Reshape for attention: (batch, seq, heads, head_dim)
         query = query.view(batch_size, seq_len, self.heads, self.dim_head)
         key = key.view(batch_size, seq_len, self.heads, self.dim_head)
         value = value.view(batch_size, seq_len, self.heads, self.dim_head)
 
-        new_key, new_value = key, value
-        if kv_cache is not None:
-            cached_key, cached_value = kv_cache
-            if cached_key is not None and cached_key.shape[1] > 0:
-                key = torch.cat([cached_key, key], dim=1)
-                value = torch.cat([cached_value, value], dim=1)
+        # Use diffusion attention backend
+        # The diffusion Attention layer expects (batch, seq, heads, head_dim)
+        out = self.attn(query, key, value, attn_metadata=None)
 
-        # On the fp32 flow the diffusion backend routes to SDPA, which consumes
-        # the 4D attn_mask directly. Under bf16 the dtype-routed backend would
-        # pick FlashAttention (2D-mask only), so call SDPA directly to keep the
-        # same masked-attention math. q/k/v are (batch, seq, heads, head_dim);
-        # SDPA wants (batch, heads, seq, head_dim).
-        if FLOW_BF16:
-            q = query.permute(0, 2, 1, 3)
-            k = key.permute(0, 2, 1, 3)
-            v = value.permute(0, 2, 1, 3)
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False, scale=self.scale
-            )
-            out = out.permute(0, 2, 1, 3)
-        else:
-            attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
-            out = self.attn(query, key, value, attn_metadata=attn_metadata)
-
-        # Reshape back: (batch, seq, dim). reshape, not view: an attention
-        # backend may return a non-contiguous layout, which view rejects.
+        # Some attention backends return a non-contiguous layout.
         out = out.reshape(batch_size, seq_len, self.inner_dim)
         out = out.to(query.dtype)
 
         # Output projection
         out = self.to_out(out)
 
-        # Apply padding mask if provided (no-op for the unpadded batch here).
+        # Apply mask if provided
         if mask is not None:
             if mask.dim() == 2:
                 mask = mask.unsqueeze(-1)
@@ -232,7 +151,7 @@ class DiTAttention(nn.Module):
                 mask = mask[:, 0, -1].unsqueeze(-1)
             out = out.masked_fill(~mask.bool(), 0.0)
 
-        return out, new_key, new_value
+        return out
 
 
 class DiTBlock(nn.Module):
@@ -252,14 +171,12 @@ class DiTBlock(nn.Module):
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
-    def forward(self, x, t, mask=None, rope=None, attn_mask=None, kv_cache=None):
+    def forward(self, x, t, mask=None, rope=None):
         # pre-norm & modulation for attention input
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
-        # attention (only the query frames of `x` are updated)
-        attn_output, new_key, new_value = self.attn(
-            x=norm, mask=mask, rope=rope, attn_mask=attn_mask, kv_cache=kv_cache
-        )
+        # attention
+        attn_output = self.attn(x=norm, mask=mask, rope=rope)
 
         # process attention output for input x
         x = x + gate_msa.unsqueeze(1) * attn_output
@@ -268,7 +185,7 @@ class DiTBlock(nn.Module):
         ff_output = self.ff(ff_norm)
         x = x + gate_mlp.unsqueeze(1) * ff_output
 
-        return x, new_key, new_value
+        return x
 
 
 class CausalConvPositionEmbedding(nn.Module):
@@ -287,50 +204,22 @@ class CausalConvPositionEmbedding(nn.Module):
             nn.Mish(),
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        cnn_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ):
-        """Causal conv position embedding with an optional left-context cache.
-
-        Each of the two causal convs left-pads by ``kernel_size - 1`` frames. In
-        streaming, those frames must be the tail of the previous chunk's conv
-        input, not zeros, or the chunk boundary corrupts. ``cnn_cache`` supplies
-        that tail per conv; the updated tails are returned for the next chunk.
-        Passing ``cnn_cache=None`` reproduces the zero-padded (non-streaming)
-        path exactly. Returns ``(out, new_cnn_cache)``.
-        """
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
         if mask is not None:
             mask = mask[..., None]
             x = x.masked_fill(~mask, 0.0)
 
-        pad = self.kernel_size - 1
         x = x.permute(0, 2, 1)
-
-        if cnn_cache is not None:
-            left1, left2 = cnn_cache
-        else:
-            left1 = x.new_zeros(x.shape[0], x.shape[1], pad)
-            left2 = None  # filled below with zeros of conv1's output shape
-
-        x1_in = torch.cat([left1, x], dim=-1)
-        new_left1 = x1_in[..., -pad:]
-        x = self.conv1(x1_in)
-
-        if left2 is None:
-            left2 = x.new_zeros(x.shape[0], x.shape[1], pad)
-        x2_in = torch.cat([left2, x], dim=-1)
-        new_left2 = x2_in[..., -pad:]
-        x = self.conv2(x2_in)
-
+        x = F.pad(x, (self.kernel_size - 1, 0, 0, 0))
+        x = self.conv1(x)
+        x = F.pad(x, (self.kernel_size - 1, 0, 0, 0))
+        x = self.conv2(x)
         out = x.permute(0, 2, 1)
 
         if mask is not None:
             out = out.masked_fill(~mask, 0.0)
 
-        return out, (new_left1, new_left2)
+        return out
 
 
 class AdaLayerNormZero_Final(nn.Module):
@@ -437,16 +326,15 @@ class InputEmbedding(nn.Module):
         self.proj = nn.Linear(mel_dim * 2 + text_dim + spk_dim, out_dim)
         self.conv_pos_embed = CausalConvPositionEmbedding(dim=out_dim)
 
-    def forward(self, x, cond, text_embed, spks, cnn_cache=None):
+    def forward(self, x, cond, text_embed, spks):
         to_cat = [x, cond, text_embed]
         if self.spk_dim > 0:
             spks = repeat(spks, "b c -> b t c", t=x.shape[1])
             to_cat.append(spks)
 
         x = self.proj(torch.cat(to_cat, dim=-1))
-        conv_out, new_cnn_cache = self.conv_pos_embed(x, cnn_cache=cnn_cache)
-        x = conv_out + x
-        return x, new_cnn_cache
+        x = self.conv_pos_embed(x) + x
+        return x
 
 
 class DiT(nn.Module):
@@ -507,26 +395,17 @@ class DiT(nn.Module):
 
         # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
         t = self.time_embed(t)
-        x, _ = self.input_embed(x, cond, mu, spks.squeeze(1))
+        x = self.input_embed(x, cond, mu, spks.squeeze(1))
 
         rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
         if self.long_skip_connection is not None:
             residual = x
 
-        pad_mask = mask.bool().repeat(1, x.size(1), 1).unsqueeze(dim=1)
-
-        # Chunked-causal attention: the model was trained with a static chunk
-        # size and all left context visible; the base path ran full bidirectional
-        # attention. Restoring the chunked-causal pattern also makes a finalized
-        # prefix's K/V stable (it never attends to future chunks), which is what
-        # the incremental streaming cache relies on.
-        chunk_mask = None
-        if CHUNK_CAUSAL or KV_CACHE:
-            chunk_mask = build_chunk_causal_mask(seq_len, seq_len, self.static_chunk_size, x.device)
+        attn_mask = mask.bool().repeat(1, x.size(1), 1).unsqueeze(dim=1)
 
         for block in self.transformer_blocks:
-            x, _, _ = block(x, t, mask=pad_mask.bool(), rope=rope, attn_mask=chunk_mask)
+            x = block(x, t, mask=attn_mask.bool(), rope=rope)
 
         if self.long_skip_connection is not None:
             x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
@@ -534,64 +413,3 @@ class DiT(nn.Module):
         x = self.norm_out(x, t)
         output = self.proj_out(x).transpose(1, 2)
         return output
-
-    def forward_chunk(
-        self,
-        x,
-        mu,
-        t,
-        spks,
-        cond,
-        att_step,
-        cnn_step,
-        offset,
-    ):
-        """Incremental streaming forward over only the new chunk's frames.
-
-        ``x``/``mu``/``cond`` are ``(B, mel_dim, N_new)`` for the new frames at
-        one Euler step. ``offset`` is the number of finalized prefix frames.
-        ``att_step`` is the per-layer prefix K/V captured at this *same* Euler
-        step (a list of ``(K, V)`` or None on the first chunk); ``cnn_step`` is
-        the prefix causal-conv tail at this step. The new frames attend, under a
-        chunked-causal mask, to the whole prefix (at the matching denoising t)
-        plus themselves.
-
-        Returns ``(output, new_kv, new_cnn)`` — ``output`` is
-        ``(B, mel_dim, N_new)`` and ``new_kv``/``new_cnn`` are this step's new
-        frames' per-layer K/V and conv tail, to be stored at this step's cache
-        slot.
-        """
-        if self.long_skip_connection is not None:
-            raise NotImplementedError("long_skip_connection is unsupported on the streaming chunk path")
-
-        x = x.transpose(1, 2)
-        mu = mu.transpose(1, 2)
-        cond = cond.transpose(1, 2)
-        spks = spks.unsqueeze(dim=1)
-        batch, n_new = x.shape[0], x.shape[1]
-        if t.ndim == 0:
-            t = t.repeat(batch)
-
-        t = self.time_embed(t)
-        x, new_cnn = self.input_embed(x, cond, mu, spks.squeeze(1), cnn_cache=cnn_step)
-
-        total_len = offset + n_new
-        freqs, xpos_scale = self.rotary_embed.forward_from_seq_len(total_len)
-        # Slice RoPE to the new frames' absolute positions [offset, total_len).
-        # freqs is (1, total_len, rot_dim): slice the sequence dim, not dim 0.
-        freqs = freqs[:, offset:total_len, :]
-        if torch.is_tensor(xpos_scale):
-            xpos_scale = xpos_scale[:, offset:total_len, :]
-        rope = (freqs, xpos_scale)
-
-        chunk_mask = build_chunk_causal_mask(n_new, total_len, self.static_chunk_size, x.device, q_offset=offset)
-
-        new_kv = []
-        for i, block in enumerate(self.transformer_blocks):
-            layer_cache = att_step[i] if att_step is not None else None
-            x, new_key, new_value = block(x, t, mask=None, rope=rope, attn_mask=chunk_mask, kv_cache=layer_cache)
-            new_kv.append((new_key, new_value))
-
-        x = self.norm_out(x, t)
-        output = self.proj_out(x).transpose(1, 2)
-        return output, new_kv, new_cnn

@@ -19,10 +19,8 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiT
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
-    KV_CACHE,
     CausalConditionalCFM,
     CausalMaskedDiffWithDiT,
-    DiTStreamCache,
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalConvRNNF0Predictor,
@@ -161,7 +159,6 @@ class CosyVoice3Code2Wav(nn.Module):
         token_offset_tokens: int = 0,
         streaming: bool = True,
         finalize: bool = False,
-        stream_cache=None,
     ) -> torch.Tensor:
         """Generate mel features via the upstream flow-model inference path."""
         flow_weight = next(self.flow_model.parameters())
@@ -187,16 +184,11 @@ class CosyVoice3Code2Wav(nn.Module):
             streaming=streaming,
             finalize=finalize,
             n_timesteps=n_timesteps,
-            stream_cache=stream_cache,
         )
 
-        # The incremental cache path already returns only the new chunk's frames;
-        # the cumulative path returns all generated frames and must drop the
-        # already-emitted prefix here.
-        if stream_cache is None:
-            trim_mel = max(0, int(token_offset_tokens)) * int(self.token_mel_ratio)
-            if trim_mel > 0:
-                feat = feat[:, :, trim_mel:]
+        trim_mel = max(0, int(token_offset_tokens)) * int(self.token_mel_ratio)
+        if trim_mel > 0:
+            feat = feat[:, :, trim_mel:]
 
         return feat
 
@@ -221,14 +213,6 @@ class CosyVoice3Code2Wav(nn.Module):
         suffix. That preserves causal look-right handling without double
         trimming or duplicated overlap at chunk boundaries.
         """
-        # Incremental DiT flow: carry a per-request KV/conv cache across chunks
-        # alongside the mel cache, so the flow denoises only the new frames.
-        dit_cache = None
-        if KV_CACHE:
-            dit_cache = cache_state.get("dit") if cache_state else None
-            if dit_cache is None:
-                dit_cache = DiTStreamCache()
-
         feat = self._forward_mel(
             token=token,
             prompt_token=prompt_token,
@@ -238,7 +222,6 @@ class CosyVoice3Code2Wav(nn.Module):
             token_offset_tokens=token_offset_tokens,
             streaming=True,
             finalize=finalize,
-            stream_cache=dit_cache,
         )
         hift_weight = self.hift.m_source.l_linear.weight
         chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
@@ -272,8 +255,6 @@ class CosyVoice3Code2Wav(nn.Module):
             "mel": tts_mel.detach().cpu().contiguous(),
             "speech_offset": int(tts_speech.shape[-1]),
         }
-        if dit_cache is not None:
-            new_state["dit"] = dit_cache
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
     @torch.inference_mode()
