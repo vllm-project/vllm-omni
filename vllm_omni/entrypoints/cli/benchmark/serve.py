@@ -120,7 +120,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         "--backend openai-audio-speech or openai-chat-omni). Scoring follows "
         "zhaochenyang20/seed-tts-eval (Whisper-large-v3 / Paraformer-zh + jiwer). "
         "Sets SEED_TTS_WER_EVAL=1. Install: pip install 'vllm-omni[dev]'. "
-        "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL.",
+        "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL, SEED_TTS_PARAFORMER_MODEL.",
     )
     g.add_argument(
         "--seed-tts-wer-save-items",

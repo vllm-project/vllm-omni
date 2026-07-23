@@ -36,7 +36,8 @@ Enable with ``SEED_TTS_WER_EVAL=1`` or ``--seed-tts-wer-eval``. Install optional
     pip install 'vllm-omni[dev]'
 
 Env: ``SEED_TTS_EVAL_DEVICE`` (e.g. ``cuda:0``, ``cpu``); ``SEED_TTS_HF_WHISPER_MODEL``
-defaults to ``openai/whisper-large-v3`` (override for debugging only). Set
+defaults to ``openai/whisper-large-v3`` (override for debugging only);
+``SEED_TTS_PARAFORMER_MODEL`` defaults to ``paraformer-zh``. Set
 ``SEED_TTS_WER_SAVE_AUDIO_DIR`` to save the captured 24 kHz mono WAV used by
 WER evaluation for each synthesized utterance.
 Streaming PCM is decoded using ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
@@ -425,15 +426,16 @@ def _ensure_zh_asr() -> None:
         from funasr import AutoModel
 
         _device = _get_eval_device()
+        mid = os.environ.get("SEED_TTS_PARAFORMER_MODEL", PARAFORMER_MODEL_ID).strip() or PARAFORMER_MODEL_ID
         logger.warning(
             "Loading Seed-TTS eval Paraformer %r on %s (one-time, seed-tts-eval protocol)...",
             PARAFORMER_MODEL_ID,
             _device,
         )
         try:
-            _zh_paraformer = AutoModel(model=PARAFORMER_MODEL_ID, device=_device)
+            _zh_paraformer = AutoModel(model=mid, device=_device)
         except TypeError:
-            _zh_paraformer = AutoModel(model=PARAFORMER_MODEL_ID)
+            _zh_paraformer = AutoModel(model=mid)
 
 
 def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:
