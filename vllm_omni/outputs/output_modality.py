@@ -14,7 +14,7 @@ from enum import Enum, Flag, auto
 if sys.version_info >= (3, 11):
     from enum import StrEnum
 else:
-
+    # TODO: Remove this Python 3.10 compatibility shim when Python 3.10 support is dropped.
     class StrEnum(str, Enum):
         """``enum.StrEnum`` for Python 3.10, which predates it.
 
