@@ -71,6 +71,12 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
 
+# The pipeline's per-session state is a bespoke ``DreamZeroState`` by default, or
+# a ``DreamZeroStateAdapter`` view when the opt-in session manager is enabled.
+# The adapter mirrors ``DreamZeroState``'s surface, so every helper that reads or
+# writes session state accepts either.
+DreamZeroSessionState = DreamZeroState | DreamZeroStateAdapter
+
 
 class VideoActionScheduler:
     """Wraps video + action schedulers into single .step() interface."""
@@ -115,7 +121,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     _POSITIVE_BRANCH = "positive"
     _NEGATIVE_BRANCH = "negative"
     _ar_diffusion_kv_state = None
-    state: DreamZeroState | None
+    state: DreamZeroSessionState | None
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
         """Describe DreamZero's local KV geometry to the generic runner."""
@@ -168,7 +174,21 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def _drop_ar_diffusion_session_state(self, session_id: str) -> None:
         """Remove model state and clear the compatibility alias when it points there."""
-        removed = self._states.pop(str(session_id or "default"), None)
+        key = str(session_id or "default")
+        # Local binding narrows the Optional and guards lightweight test fixtures
+        # that build the pipeline via __new__ without setting _memory_manager.
+        manager = getattr(self, "_memory_manager", None)
+        if manager is not None:
+            # Manager-backed path: the session lives in the manager, not in
+            # ``_states``. The runner's explicit close/reset is the session's
+            # end-of-life signal, so release it there (freeing its buffers) and
+            # drop the alias if it still views this session.
+            manager.drop_session(key)
+            current = getattr(self, "state", None)
+            if isinstance(current, DreamZeroStateAdapter) and str(current.session_id or "default") == key:
+                self.state = None
+            return
+        removed = self._states.pop(key, None)
         if removed is not None and getattr(self, "state", None) is removed:
             self.state = None
 
@@ -837,7 +857,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         height: int,
         width: int,
         *,
-        state: DreamZeroState | None = None,
+        state: DreamZeroSessionState | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode first frame via CLIP + VAE.
         Returns: (clip_feas, ys, image_latent)
@@ -928,7 +948,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         inv_std = self.vae_latents_inv_std.to(device=mu.device, dtype=mu.dtype)
         return (mu - mean) * inv_std
 
-    def _vae_stream_seed(self, state: DreamZeroState, first_frame: torch.Tensor) -> None:
+    def _vae_stream_seed(self, state: DreamZeroSessionState, first_frame: torch.Tensor) -> None:
         """Seed incremental VAE encode with the first observation frame."""
         state.reset_vae_encoder_stream()
         feat_map = self._vae_init_enc_feat_map()
@@ -940,7 +960,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         state.vae_pending_body_frames = None
         state.vae_stream_initialized = True
 
-    def _vae_stream_append_frame(self, state: DreamZeroState, new_frame: torch.Tensor) -> None:
+    def _vae_stream_append_frame(self, state: DreamZeroSessionState, new_frame: torch.Tensor) -> None:
         """Append one pixel frame and encode a 4-frame body chunk when ready."""
         if not state.vae_stream_initialized or state.vae_enc_feat_map is None or state.vae_encoder_out is None:
             raise RuntimeError("VAE encoder stream is not initialized.")
@@ -964,7 +984,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def _vae_stream_get_observation_latents(
         self,
-        state: DreamZeroState,
+        state: DreamZeroSessionState,
         num_latent_frames: int,
         *,
         dtype: torch.dtype,
@@ -1000,7 +1020,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def _encode_observation_latents(
         self,
-        state: DreamZeroState,
+        state: DreamZeroSessionState,
         videos: torch.Tensor,
         *,
         latent_dtype: torch.dtype,
@@ -1067,7 +1087,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         frame_seqlen: int,
         seq_len: int,
         do_true_cfg: bool,
-        state: DreamZeroState,
+        state: DreamZeroSessionState,
     ) -> None:
         """Prefill KV cache with first frame and/or current observation.
 
@@ -1193,7 +1213,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         negative_prompt_embeds: torch.Tensor | None,
         video_action_scheduler: VideoActionScheduler,
         do_true_cfg: bool,
-        state: DreamZeroState,
+        state: DreamZeroSessionState,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Denoising loop with CFG parallel support.
@@ -1249,10 +1269,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
 
             csf = state.current_start_frame
-            if csf + self.num_frame_per_block <= state.ys.shape[2]:
-                y = state.ys[:, :, csf : csf + self.num_frame_per_block]
+            ys = state.ys
+            if ys is None:
+                raise RuntimeError("diffuse() requires state.ys, populated by the forward pass before denoising")
+            if csf + self.num_frame_per_block <= ys.shape[2]:
+                y = ys[:, :, csf : csf + self.num_frame_per_block]
             else:
-                y = state.ys[:, :, -self.num_frame_per_block :]
+                y = ys[:, :, -self.num_frame_per_block :]
 
             run_dit = _step_cache is None or _step_cache.should_run_step(_prev_predictions)
             if run_dit:

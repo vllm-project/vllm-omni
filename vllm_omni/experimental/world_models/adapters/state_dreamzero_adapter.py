@@ -103,6 +103,15 @@ class DreamZeroStateAdapter:
         self._session = manager.get_or_create_session(session_id)
         self._ensure_frame_buffer()
 
+    @property
+    def session_id(self) -> str | None:
+        """The session this adapter views, as passed at construction.
+
+        Lets the pipeline match the alias against a runner-supplied session id
+        when the engine signals that session's close/reset.
+        """
+        return self._session_id
+
     # -- session / metadata plumbing ------------------------------------
 
     @staticmethod

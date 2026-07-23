@@ -158,6 +158,24 @@ class SessionStateManager:
                 self._sessions.move_to_end(key)
             return session
 
+    def drop_session(self, session_id: str | None) -> bool:
+        """Release one session explicitly and free its buffers.
+
+        This is the end-of-session signal a model's engine raises on close,
+        eviction, or reset -- distinct from the count-based LRU in
+        ``get_or_create_session``, which only drops the *table* entry and lets an
+        adapter still holding the session keep it alive. Here the session is
+        finished, so its ``StateObject`` buffers and carried attributes are reset
+        to release their memory. Returns whether a session was present.
+        """
+        key = self._key(session_id)
+        with self._lock:
+            session = self._sessions.pop(key, None)
+            if session is None:
+                return False
+            session.reset()
+            return True
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._sessions)
