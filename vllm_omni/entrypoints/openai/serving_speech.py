@@ -79,6 +79,8 @@ logger = init_logger(__name__)
 _SPEECH_USAGE_INPUT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TOKENS"
 _SPEECH_USAGE_OUTPUT_TOKENS_HEADER = "X-VLLM-OMNI-OUTPUT-TOKENS"
 _SPEECH_USAGE_TOTAL_TOKENS_HEADER = "X-VLLM-OMNI-TOTAL-TOKENS"
+_SPEECH_USAGE_INPUT_TEXT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TEXT-TOKENS"
+_SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-AUDIO-TOKENS"
 
 # TTS Configuration
 _MING_TTS_MODEL_ARCHS = {"MingTTSForConditionalGeneration"}
@@ -983,6 +985,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             _SPEECH_USAGE_INPUT_TOKENS_HEADER: str(usage.input_tokens),
             _SPEECH_USAGE_OUTPUT_TOKENS_HEADER: str(usage.output_tokens),
             _SPEECH_USAGE_TOTAL_TOKENS_HEADER: str(usage.total_tokens),
+            _SPEECH_USAGE_INPUT_TEXT_TOKENS_HEADER: str(usage.input_token_details.text_tokens),
+            _SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER: str(usage.input_token_details.audio_tokens),
         }
 
     def _estimate_fish_ref_code_len(self, ref_audio: object) -> int | None:

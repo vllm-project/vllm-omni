@@ -379,6 +379,8 @@ class TestSpeechAPI:
         assert response.headers["x-vllm-omni-input-tokens"] == "2"
         assert response.headers["x-vllm-omni-output-tokens"] == "5"
         assert response.headers["x-vllm-omni-total-tokens"] == "7"
+        assert response.headers["x-vllm-omni-input-text-tokens"] == "2"
+        assert response.headers["x-vllm-omni-input-audio-tokens"] == "0"
 
     def test_build_speech_usage_headers_uses_usage_field_names(self):
         usage = SpeechTokenUsage(
@@ -392,6 +394,8 @@ class TestSpeechAPI:
             "X-VLLM-OMNI-INPUT-TOKENS": "7",
             "X-VLLM-OMNI-OUTPUT-TOKENS": "11",
             "X-VLLM-OMNI-TOTAL-TOKENS": "18",
+            "X-VLLM-OMNI-INPUT-TEXT-TOKENS": "3",
+            "X-VLLM-OMNI-INPUT-AUDIO-TOKENS": "4",
         }
 
     def test_create_speech_mp3_format(self, client):
