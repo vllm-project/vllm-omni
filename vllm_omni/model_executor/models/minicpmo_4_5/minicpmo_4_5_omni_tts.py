@@ -26,6 +26,9 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.platforms import current_omni_platform
 
 # Preserve the established external vocoder on CUDA. Ascend uses the in-tree
@@ -105,6 +108,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.tts = None
         self.audio_tokenizer = None
         self._assets_loaded = False
+        self._model_path = None
 
         tts_config = getattr(config, "tts_config", None)
         if tts_config is not None:
@@ -121,7 +125,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if self._assets_loaded or self._tts_config is None:
             return
         try:
-            model_path = self.vllm_config.model_config.model
+            model_path = download_weights_from_hf_specific(self.vllm_config.model_config.model, None, ["*"])
+            self._model_path = model_path
 
             if model_path not in sys.path:
                 sys.path.insert(0, model_path)
@@ -279,7 +284,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         import torchaudio
 
-        model_path = self.vllm_config.model_config.model
+        model_path = self._model_path or download_weights_from_hf_specific(
+            self.vllm_config.model_config.model, None, ["*"]
+        )
         default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
         prompt_wav_path = default_ref if os.path.exists(default_ref) else None
 
