@@ -49,6 +49,9 @@ class MembershipController:
         self._stage_pools = stage_pools
         self._remote_replica_factory = remote_replica_factory
         self._membership_tasks: set[asyncio.Task[None]] = set()
+        self._attaching_remote_replicas: set[tuple[int, int]] = set()
+        self._attached_remote_replicas: set[tuple[int, int]] = set()
+        self._remote_replica_keys_by_input_addr: dict[str, tuple[int, int]] = {}
         self._shutdown_event = asyncio.Event()
         self._watcher_task: asyncio.Task[None] | None = None
         self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
@@ -67,8 +70,33 @@ class MembershipController:
 
     async def handle_register(self, stage_id: int, replica_id: int) -> None:
         """Handle a register_remote_replica message (fire-and-forget)."""
+        if self._shutdown_event.is_set():
+            logger.info(
+                "[MembershipController] ignoring register during shutdown stage=%d replica=%d",
+                stage_id,
+                replica_id,
+            )
+            return
+
+        key = (stage_id, replica_id)
+        if key in self._attached_remote_replicas:
+            logger.info(
+                "[MembershipController] ignoring register for attached replica stage=%d replica=%d",
+                stage_id,
+                replica_id,
+            )
+            return
+        if key in self._attaching_remote_replicas:
+            logger.info(
+                "[MembershipController] ignoring register while attach is in flight stage=%d replica=%d",
+                stage_id,
+                replica_id,
+            )
+            return
+
+        self._attaching_remote_replicas.add(key)
         self._spawn_task(
-            self._do_register(stage_id, replica_id),
+            self._register_once(stage_id, replica_id),
             label=f"register-s{stage_id}-r{replica_id}",
         )
 
@@ -132,7 +160,11 @@ class MembershipController:
             try:
                 snap = self._hub.get_replica_list()
                 current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}
-                for stage_id, addr in last_up - current:
+                attached = {
+                    (stage_id, input_addr)
+                    for input_addr, (stage_id, _replica_id) in self._remote_replica_keys_by_input_addr.items()
+                }
+                for stage_id, addr in (last_up | attached) - current:
                     self._spawn_task(
                         self.handle_unregister(stage_id, addr),
                         label=f"unregister-s{stage_id}",
@@ -148,12 +180,33 @@ class MembershipController:
             except asyncio.CancelledError:
                 raise
 
-    async def _do_register(self, stage_id: int, replica_id: int) -> None:
+    async def _register_once(self, stage_id: int, replica_id: int) -> None:
+        key = (stage_id, replica_id)
+        try:
+            input_addr = await self._do_register(stage_id, replica_id)
+            if input_addr is None:
+                return
+            self._attached_remote_replicas.add(key)
+            self._remote_replica_keys_by_input_addr[input_addr] = key
+        finally:
+            self._attaching_remote_replicas.discard(key)
+
+    async def _do_register(self, stage_id: int, replica_id: int) -> str | None:
         pool = self._pool_for_stage_id(stage_id)
         if pool is None:
             logger.warning("[MembershipController] register: stage_id %d out of range", stage_id)
-            return
+            return None
         client = await asyncio.to_thread(self._remote_replica_factory, stage_id, replica_id)
+        if self._shutdown_event.is_set():
+            try:
+                client.shutdown()
+            except Exception:
+                logger.exception(
+                    "[MembershipController] failed to shutdown late replica client stage=%d replica=%d",
+                    stage_id,
+                    replica_id,
+                )
+            return None
         input_addr = StagePool._client_input_addr(client)
         if input_addr is None:
             raise RuntimeError(f"remote replica factory for stage {stage_id} produced a client without input address")
@@ -164,8 +217,13 @@ class MembershipController:
             replica_id,
             input_addr,
         )
+        return input_addr
 
     def _detach_replica(self, stage_id: int, input_addr: str) -> None:
+        key = self._remote_replica_keys_by_input_addr.pop(input_addr, None)
+        if key is not None:
+            self._attached_remote_replicas.discard(key)
+            self._attaching_remote_replicas.discard(key)
         pool = self._pool_for_stage_id(stage_id)
         if pool is None:
             return

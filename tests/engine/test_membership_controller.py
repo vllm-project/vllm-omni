@@ -188,3 +188,205 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
     assert pool.get_replica_id_by_addr("tcp://new-1") == 1
     assert pool.get_replica_id_by_addr("tcp://old-1") is None
     assert pool.available_replica_ids() == [1]
+
+
+@pytest.mark.asyncio
+async def test_handle_register_deduplicates_inflight_and_attached_replica(monkeypatch):
+    pool = FakePool(stage_id=0)
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+    factory_calls = []
+
+    def _factory(stage_id, replica_id):
+        factory_calls.append((stage_id, replica_id))
+        factory_started.set()
+        assert release_factory.wait(timeout=1)
+        return SimpleNamespace(
+            client_addresses={"input_address": f"tcp://stage-{stage_id}-replica-{replica_id}"},
+            shutdown=lambda: None,
+        )
+
+    controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=_factory)
+
+    await asyncio.gather(
+        controller.handle_register(0, 2),
+        controller.handle_register(0, 2),
+    )
+    assert await asyncio.to_thread(factory_started.wait, 1)
+
+    await controller.handle_register(0, 2)
+    release_factory.set()
+    await controller.drain_tasks(timeout=1)
+
+    await controller.handle_register(0, 2)
+    await controller.drain_tasks(timeout=1)
+
+    assert factory_calls == [(0, 2)]
+    assert len(pool.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_register_allows_retry_after_factory_failure(monkeypatch):
+    pool = FakePool(stage_id=0)
+    factory_calls = 0
+
+    def _factory(stage_id, replica_id):
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 1:
+            raise RuntimeError("injected registration failure")
+        return SimpleNamespace(
+            client_addresses={"input_address": f"tcp://stage-{stage_id}-replica-{replica_id}"},
+            shutdown=lambda: None,
+        )
+
+    controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=_factory)
+
+    await controller.handle_register(0, 3)
+    await controller.drain_tasks(timeout=1)
+    await controller.handle_register(0, 3)
+    await controller.drain_tasks(timeout=1)
+
+    assert factory_calls == 2
+    assert len(pool.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_unregister_allows_same_replica_to_register_again(monkeypatch):
+    pool = FakePool(stage_id=0)
+    factory_calls = 0
+
+    def _factory(stage_id, replica_id):
+        nonlocal factory_calls
+        factory_calls += 1
+        return SimpleNamespace(
+            client_addresses={"input_address": f"tcp://stage-{stage_id}-replica-{replica_id}"},
+            shutdown=lambda: None,
+        )
+
+    controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=_factory)
+
+    await controller.handle_register(0, 4)
+    await controller.drain_tasks(timeout=1)
+    await controller.handle_unregister(0, "tcp://stage-0-replica-4")
+    await controller.handle_register(0, 4)
+    await controller.drain_tasks(timeout=1)
+
+    assert factory_calls == 2
+    assert len(pool.added) == 2
+
+
+@pytest.mark.asyncio
+async def test_handle_register_ignores_registration_after_shutdown(monkeypatch):
+    pool = FakePool(stage_id=0)
+    factory_calls = 0
+
+    def _factory(stage_id, replica_id):
+        nonlocal factory_calls
+        factory_calls += 1
+        return SimpleNamespace(
+            client_addresses={"input_address": f"tcp://stage-{stage_id}-replica-{replica_id}"},
+            shutdown=lambda: None,
+        )
+
+    controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=_factory)
+    controller.shutdown()
+
+    await controller.handle_register(0, 5)
+    await controller.drain_tasks(timeout=1)
+
+    assert factory_calls == 0
+    assert pool.added == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_discards_client_from_inflight_registration(monkeypatch):
+    pool = FakePool(stage_id=0)
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+    client_shutdown = threading.Event()
+
+    def _factory(stage_id, replica_id):
+        factory_started.set()
+        assert release_factory.wait(timeout=1)
+        return SimpleNamespace(
+            client_addresses={"input_address": f"tcp://stage-{stage_id}-replica-{replica_id}"},
+            shutdown=client_shutdown.set,
+        )
+
+    controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=_factory)
+
+    await controller.handle_register(0, 6)
+    assert await asyncio.to_thread(factory_started.wait, 1)
+    controller.shutdown()
+    release_factory.set()
+    await controller.drain_tasks(timeout=1)
+
+    assert client_shutdown.is_set()
+    assert pool.added == []
+
+
+@pytest.mark.asyncio
+async def test_watcher_reconciles_replica_that_disappears_during_registration(monkeypatch):
+    input_addr = "tcp://stage-0-replica-7"
+    pool = StagePool(0, [])
+    hub = FakeHub(
+        snapshots=[
+            _snapshot(_replica(0, input_addr)),
+            _snapshot(),
+        ]
+    )
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+    client_shutdown = threading.Event()
+
+    def _factory(stage_id, replica_id):
+        assert (stage_id, replica_id) == (0, 7)
+        factory_started.set()
+        assert release_factory.wait(timeout=1)
+        return SimpleNamespace(
+            client_addresses={"input_address": input_addr},
+            shutdown=client_shutdown.set,
+        )
+
+    controller = _controller(monkeypatch, pool, hub, remote_replica_factory=_factory)
+    controller.WATCH_INTERVAL_S = 0
+    original_handle_unregister = controller.handle_unregister
+    first_unregister = asyncio.Event()
+    second_unregister = asyncio.Event()
+    unregister_calls = 0
+
+    async def _track_unregister(stage_id, addr, *args, **kwargs):
+        nonlocal unregister_calls
+        await original_handle_unregister(stage_id, addr, *args, **kwargs)
+        unregister_calls += 1
+        if unregister_calls == 1:
+            first_unregister.set()
+        elif unregister_calls == 2:
+            second_unregister.set()
+
+    controller.handle_unregister = _track_unregister  # type: ignore[method-assign]
+
+    await controller.handle_register(0, 7)
+    assert await asyncio.to_thread(factory_started.wait, 1)
+    watcher = controller.start()
+
+    try:
+        await asyncio.wait_for(first_unregister.wait(), timeout=1)
+        assert pool.live_num_replicas == 0
+
+        release_factory.set()
+        await asyncio.wait_for(second_unregister.wait(), timeout=1)
+
+        assert client_shutdown.is_set()
+        assert pool.live_num_replicas == 0
+        assert controller._attached_remote_replicas == set()
+        assert controller._remote_replica_keys_by_input_addr == {}
+    finally:
+        release_factory.set()
+        controller.shutdown()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        await controller.drain_tasks(timeout=1)
