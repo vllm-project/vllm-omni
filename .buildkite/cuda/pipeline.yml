@@ -19,10 +19,7 @@ steps:
     key: image-build
     if: __IMAGE_BUILD_IF__
     commands:
-      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
-      - "docker build --progress=plain --file docker/Dockerfile.ci -t vllm-omni-ci ."
-      - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
-      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+      - "bash .buildkite/cuda/scripts/build-ci-image.sh"
     agents:
       queue: "cpu_queue_premerge"
 
