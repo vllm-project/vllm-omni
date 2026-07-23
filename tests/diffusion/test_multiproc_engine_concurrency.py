@@ -91,7 +91,7 @@ def _make_engine(num_gpus: int = 1):
     engine._loop_started = False
     engine._rpc_queue = queue.Queue()
     engine.abort_queue = queue.Queue()
-    engine.execute_fn = executor.execute_request
+    engine.execute_fn = executor.execute_batch
     return engine, executor, req_q, res_q
 
 

@@ -319,6 +319,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
                     prompt_is_token_ids=nr.prompt_is_token_ids,
                     additional_information=(getattr(request, "additional_information", None) if request else None),
+                    model_intermediate_buffer=(
+                        getattr(request, "model_intermediate_buffer", None) if request else None
+                    ),
                 )
                 new_list.append(omni_nr)
 

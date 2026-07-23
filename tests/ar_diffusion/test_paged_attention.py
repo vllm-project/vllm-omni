@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ARDiffusionKVCache,
     ARDiffusionKVConfig,
@@ -24,6 +25,8 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVStat
 BLOCK = 16
 N_HEADS = 4
 HEAD_DIM = 64
+POS = "positive"
+NEG = "negative"
 
 
 def make_state(*, num_layers=1, window_chunks=2, dtype=torch.float32, device=torch.device("cpu")):
@@ -37,11 +40,15 @@ def make_state(*, num_layers=1, window_chunks=2, dtype=torch.float32, device=tor
         block_size=BLOCK,
         max_model_len=4096,
         available_bytes=1 << 26,
+        kv_branches=(ARDiffusionKVBranchSpec(POS, 0), ARDiffusionKVBranchSpec(NEG, 1)),
+        session_capacity=2,
+        frames_per_block=2,
+        max_scratch_tokens_per_branch=BLOCK,
         device=device,
     )
     pos = kv.begin_request("r-pos")
     neg = kv.begin_request("r-neg")
-    return kv, ARDiffusionKVState(kv, pos, neg, num_layers=num_layers)
+    return kv, ARDiffusionKVState(kv, "s1", {POS: pos, NEG: neg}, num_layers=num_layers)
 
 
 def _dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
@@ -79,51 +86,51 @@ def _commit_video_span(
     kv: ARDiffusionKVCache,
     st: ARDiffusionKVState,
     *,
-    is_negative: bool,
+    kv_branch: str,
     n_chunks: int,
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    ctx = st.get_kv_caches(is_negative, seq_len=n_chunks * BLOCK, commit_current=True)[0].forward_ctx
+    ctx = st.get_kv_caches(kv_branch, seq_len=n_chunks * BLOCK, commit_current=True)[0].forward_ctx
     ctx.ensure_video_slots(device)
     k = torch.randn(1, n_chunks * BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     v = torch.randn(1, n_chunks * BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     kv._k_pools[0][ctx.current_video_slot_mapping] = k[0]
     kv._v_pools[0][ctx.current_video_slot_mapping] = v[0]
-    st.commit_paged_context(is_negative)
+    st.commit_paged_context(kv_branch)
     return k, v
 
 
 def test_paged_context_allocates_lazily_and_commits_after_forward():
     _, st = make_state()
 
-    contexts = st.get_kv_caches(False, seq_len=BLOCK, commit_current=True)
+    contexts = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
     ctx = contexts[0].forward_ctx
     assert isinstance(contexts[0], ARDiffusionPagedLayerContext)
-    assert st.pos.completed_chunks == 0
+    assert st.adapter(POS).completed_chunks == 0
     assert ctx.current_video_slot_mapping is None
 
     ctx.ensure_video_slots(torch.device("cpu"))
-    assert st.pos.completed_chunks == 0
+    assert st.adapter(POS).completed_chunks == 0
     assert len(ctx.current_video_block_ids) == 1
 
-    st.commit_paged_context(False)
-    assert st.pos.completed_chunks == 1
-    assert st._committed[False] == BLOCK
+    st.commit_paged_context(POS)
+    assert st.adapter(POS).completed_chunks == 1
+    assert st._committed[POS] == BLOCK
 
 
 def test_scratch_video_and_action_blocks_do_not_commit():
     kv, st = make_state()
 
-    ctx = st.get_kv_caches(False, seq_len=2 * BLOCK, commit_current=False)[0].forward_ctx
+    ctx = st.get_kv_caches(POS, seq_len=2 * BLOCK, commit_current=False)[0].forward_ctx
     ctx.ensure_video_slots(torch.device("cpu"))
     ctx.ensure_action_slots(3, torch.device("cpu"))
 
-    assert ctx.current_video_block_ids == kv.scratch_block_ids(False, 0, 2)
-    assert ctx.action_scratch_block_ids == kv.scratch_block_ids(False, 2, 1)
-    st.commit_paged_context(False)
-    assert st.pos.completed_chunks == 0
-    assert st._committed[False] == 0
+    assert ctx.current_video_block_ids == kv.scratch_block_ids(POS, 0, 2)
+    assert ctx.action_scratch_block_ids == kv.scratch_block_ids(POS, 2, 1)
+    st.commit_paged_context(POS)
+    assert st.adapter(POS).completed_chunks == 0
+    assert st._committed[POS] == 0
 
 
 def test_pipeline_kv_get_paged_path_has_no_gather_backend():
@@ -155,7 +162,7 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
         k, v = _commit_video_span(
             kv,
             st,
-            is_negative=False,
+            kv_branch=POS,
             n_chunks=history_chunks,
             dtype=dtype,
             device=device,
@@ -163,7 +170,7 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
         history_k_parts.append(k)
         history_v_parts.append(v)
 
-    ctx = st.get_kv_caches(False, seq_len=BLOCK, commit_current=commit_current)[0].forward_ctx
+    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0].forward_ctx
     ctx.ensure_video_slots(device)
     current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
@@ -212,9 +219,9 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
 
     torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
 
-    before = st.pos.completed_chunks
-    st.commit_paged_context(False)
-    assert st.pos.completed_chunks == before + (1 if commit_current else 0)
+    before = st.adapter(POS).completed_chunks
+    st.commit_paged_context(POS)
+    assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
 
 
 @pytest.mark.skipif(not _cuda_flash_attn_usable(), reason="usable CUDA FlashAttention is required")
@@ -231,13 +238,13 @@ def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len,
     history_k, history_v = _commit_video_span(
         kv,
         st,
-        is_negative=False,
+        kv_branch=POS,
         n_chunks=history_chunks,
         dtype=dtype,
         device=device,
     )
 
-    layer_ctx = st.get_kv_caches(False, seq_len=BLOCK, commit_current=commit_current)[0]
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0]
     ctx = layer_ctx.forward_ctx
     current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
@@ -294,13 +301,13 @@ def test_block_table_padded_to_fixed_width():
     device = torch.device("cpu")
     kv, st = make_state(window_chunks=2)
 
-    ctx1 = st.get_kv_caches(False, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+    ctx1 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
     ctx1.prepare(device=device, action_len=0, query_len=BLOCK)
-    st.commit_paged_context(False)
+    st.commit_paged_context(POS)
 
-    ctx2 = st.get_kv_caches(False, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+    ctx2 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
     ctx2.prepare(device=device, action_len=0, query_len=BLOCK)
-    st.commit_paged_context(False)
+    st.commit_paged_context(POS)
 
     # 1-block vs 2-block visible history: same table width, same max_seq_len.
     assert ctx1.block_table.shape == ctx2.block_table.shape
@@ -315,7 +322,7 @@ def test_block_table_padded_to_fixed_width():
 def test_prepare_is_idempotent_and_layers_share_metadata():
     device = torch.device("cpu")
     _, st = make_state(num_layers=2)
-    contexts = st.get_kv_caches(False, seq_len=BLOCK, commit_current=False)
+    contexts = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)
     fctx = contexts[0].forward_ctx
     fctx.prepare(device=device, action_len=0, query_len=BLOCK)
     table = fctx.block_table
@@ -335,7 +342,7 @@ def test_prepare_is_idempotent_and_layers_share_metadata():
 
 def test_layer_inputs_before_prepare_raises():
     _, st = make_state()
-    layer_ctx = st.get_kv_caches(False, seq_len=BLOCK, commit_current=False)[0]
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
     with pytest.raises(RuntimeError, match="before prepare"):
         layer_ctx.to_layer_inputs()
 
@@ -363,7 +370,7 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
     kv, st = make_state(num_layers=2, window_chunks=2)
 
     def run_one_forward(commit):
-        contexts = st.get_kv_caches(False, seq_len=BLOCK, commit_current=commit)
+        contexts = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit)
         fctx = contexts[0].forward_ctx
         fctx.prepare(device=device, action_len=0, query_len=BLOCK)
         q = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
@@ -374,7 +381,7 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
         # block-forward code object in production).
         for layer_ctx in contexts:
             out = compiled(layer_ctx.to_layer_inputs(), q, k, v)
-        st.commit_paged_context(False)
+        st.commit_paged_context(POS)
         return out
 
     torch._dynamo.reset()

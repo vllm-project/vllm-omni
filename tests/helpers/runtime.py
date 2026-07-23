@@ -638,7 +638,10 @@ class OmniServerStageCli(OmniServer):
         proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            # Must be repo root (not tests/): after Docker deps-cache installs an empty
+            # vllm_omni stub into site-packages, cwd on sys.path[0] is what makes
+            # ``python -m vllm_omni.entrypoints...`` resolve the real package.
+            cwd=_omni_subprocess_cwd(),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )

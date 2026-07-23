@@ -1,0 +1,36 @@
+# MiniCPM-o 4.5 native duplex deployment.
+#
+# The registered minicpmo_4_5 pipeline owns the fixed Stage0 -> Stage1
+# topology and llm2tts bridge. This overlay only changes session lifetime and
+# the Stage1 token budget needed to drain streaming audio segments.
+base_config: minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+session_mode: duplex
+active_stream_window: 1
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  # Matches the configured Stage0/Stage1 sequence capacity below.
+  max_sessions: 2
+  completed_append_cache_size: 256
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 2
+    async_scheduling: false
+
+  - stage_id: 1
+    max_num_seqs: 2
+    async_scheduling: false
+    # The streaming talker advances Python-owned per-request generators on
+    # every step, so only fixed-topology model regions are graph-capturable.
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+    default_sampling_params:
+      max_tokens: 4096
+      stop_token_ids: [151645]

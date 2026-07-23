@@ -16,6 +16,7 @@ from .config_ming_tts import (
     VAE_PATCH_SIZE,
     MingTTSConfig,
 )
+from .constants import SPEAKER_EMBEDDING_DIM
 
 
 def pad_prompt_waveform(
@@ -56,7 +57,7 @@ def coerce_prompt_waveform(value: Any) -> torch.Tensor:
 
 def coerce_speaker_embeddings(value: Any, *, use_zero_spk_emb: bool = False) -> list[torch.Tensor] | None:
     if value is None:
-        return [torch.zeros((192,), dtype=torch.float32)] if use_zero_spk_emb else None
+        return [torch.zeros((SPEAKER_EMBEDDING_DIM,), dtype=torch.float32)] if use_zero_spk_emb else None
     if isinstance(value, torch.Tensor):
         tensor = value.detach()
         if tensor.ndim == 1:
@@ -78,10 +79,10 @@ def coerce_speaker_embeddings(value: Any, *, use_zero_spk_emb: bool = False) -> 
     else:
         return coerce_speaker_embeddings(torch.as_tensor(value), use_zero_spk_emb=use_zero_spk_emb)
     if not items:
-        return [torch.zeros((192,), dtype=torch.float32)] if use_zero_spk_emb else None
+        return [torch.zeros((SPEAKER_EMBEDDING_DIM,), dtype=torch.float32)] if use_zero_spk_emb else None
     for item in items:
-        if int(item.numel()) != 192:
-            raise ValueError(f"Ming speaker embedding must have 192 dims, got {int(item.numel())}")
+        if int(item.numel()) != SPEAKER_EMBEDDING_DIM:
+            raise ValueError(f"Ming speaker embedding must have {SPEAKER_EMBEDDING_DIM} dims, got {int(item.numel())}")
     return items
 
 

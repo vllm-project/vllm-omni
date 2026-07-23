@@ -40,15 +40,15 @@ except ValueError:
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
+    # ------------------------------------------------------------------ #
+    #  Shared scheduler/output helpers (lift the AR / generation duplicates)
+    # ------------------------------------------------------------------ #
+
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
-
-    # ------------------------------------------------------------------ #
-    #  Shared scheduler/output helpers (lift the AR / generation duplicates)
-    # ------------------------------------------------------------------ #
 
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.

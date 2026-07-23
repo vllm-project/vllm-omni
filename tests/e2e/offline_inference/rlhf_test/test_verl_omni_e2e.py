@@ -283,7 +283,7 @@ class vLLMOmniHttpServerLocal:
             "worker_extension_cls": WORKER_EXTENSION_CLASS,
             "trust_remote_code": _cfg_get(self.model_config, "trust_remote_code", True),
             "max_model_len": _cfg_get(self.config, "max_model_len", 1058),
-            "max_num_seqs": _cfg_get(self.config, "max_num_seqs", 256),
+            "max_num_seqs": _cfg_get(self.config, "max_num_seqs", 1),
             "enable_chunked_prefill": _cfg_get(self.config, "enable_chunked_prefill", False),
             "max_num_batched_tokens": _cfg_get(self.config, "max_num_batched_tokens", 8192),
             "enable_prefix_caching": _cfg_get(self.config, "enable_prefix_caching", False),
@@ -476,7 +476,8 @@ def init_server():
             "pipeline_model_parallel_size": 1,
             "gpu_memory_utilization": 0.8,
             "max_num_batched_tokens": 8192,
-            "max_num_seqs": 256,
+            # The custom log-prob pipeline only supports serial requests.
+            "max_num_seqs": 1,
             "max_model_len": 1058,
             "dtype": "bfloat16",
             "load_format": "auto",

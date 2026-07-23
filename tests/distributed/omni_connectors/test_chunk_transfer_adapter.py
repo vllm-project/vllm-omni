@@ -677,6 +677,28 @@ def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter
     assert "req-zombie" not in adapter.finished_requests
 
 
+def test_finish_requests_releases_active_stream_slot(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, active_stream_window=1)
+    aborted = _req("req-aborted", RequestStatus.RUNNING)
+    waiting = _req("req-waiting", RequestStatus.WAITING)
+    waiting_queue = DummyWaitingQueue([waiting])
+    running_queue = []
+    adapter._active_streams[aborted.request_id] = aborted
+    adapter._held_non_active.append(aborted)
+
+    adapter.finish_requests(
+        [aborted.request_id],
+        RequestStatus.FINISHED_ABORTED,
+        {aborted.request_id: aborted},
+    )
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert aborted.request_id not in adapter._active_streams
+    assert [request.request_id for request in adapter._held_non_active] == []
+    assert list(adapter._active_streams) == [waiting.request_id]
+    assert waiting.status == RequestStatus.WAITING_FOR_CHUNK
+
+
 def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     zombie = _req("req-zombie", RequestStatus.WAITING_FOR_CHUNK)

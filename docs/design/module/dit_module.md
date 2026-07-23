@@ -52,7 +52,7 @@ The diffusion module follows a **multi-process, distributed architecture** with 
 
 ### Responsibilities
 
-The `DiffusionEngine` is the **orchestrator** of the diffusion inference system. It manages the lifecycle of worker processes and coordinates the execution flow.
+The `DiffusionEngine` is the **orchestrator** of the diffusion inference system. It owns request admission, scheduler/executor coordination, output-stream delivery, cancellation cleanup, and startup warmup.
 
 ### Key Components
 
@@ -60,68 +60,84 @@ The `DiffusionEngine` is the **orchestrator** of the diffusion inference system.
 
 ```python
 class DiffusionEngine:
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(
+        self,
+        od_config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ):
         self.od_config = od_config
-        self.post_process_func = get_diffusion_post_process_func(od_config)
-        self.pre_process_func = get_diffusion_pre_process_func(od_config)
-        self._processes: list[mp.Process] = []
-        self._make_client()
+        self._init_process_hooks(od_config)
+        self.execution_mode = self._resolve_execution_mode(od_config)
+        self._init_executor(od_config)
+        self._init_scheduler(od_config, scheduler)
+        self._init_runtime_state()
+        self._init_execute_fn()
 ```
 
 **Key Features**:
 
 - **Pre/Post Processing**: Registers model-specific pre-processing and post-processing functions via registry pattern
 
-- **Worker Management**: Launches and manages multiple worker processes (one per GPU)
+- **Execution Mode Selection**: Selects one of two execution modes:
+  - `REQUEST_BATCH`: complete requests are scheduled through request-level execution. `max_num_seqs=1` is the serial request path; values above `1` allow compatible requests to use fused `pipeline.forward(batch)` when the pipeline supports it.
+  - `STEP_BATCH`: requests are advanced one denoising step at a time through `prepare_encode()`, `denoise_step()`, `step_scheduler()`, and `post_decode()`. `max_num_seqs` controls the maximum number of compatible active requests in one step wave.
 
-- **Process Isolation**: Uses multiprocessing for true parallelism
+- **Scheduler Selection**: Uses `StepScheduler` for step-batch execution and `RequestScheduler` for request-batch execution. Tests and custom integrations may inject a `SchedulerInterface` instance explicitly.
 
-#### 1.2 Worker Launch Process
+- **Executor Selection**: Builds the configured `DiffusionExecutor`, then routes scheduled work through `execute_batch` or `execute_step` according to the execution mode. `execute_batch` handles the serial `max_num_seqs=1` request path internally.
 
-The engine launches workers using a **spawn** method:
+- **Factory-Owned Warmup**: `DiffusionEngine.make_engine()` constructs the selected engine backend and then runs startup warmup through `run_startup_warmup()`.
+
+#### 1.2 Execution Modes
 
 ```python
-def _launch_workers(self, broadcast_handle):
-    # Creates one process per GPU
-    for i in range(num_gpus):
-        process = mp.Process(
-            target=worker_proc.worker_main,
-            args=(i, od_config, writer, broadcast_handle),
-            name=f"DiffusionWorker-{i}",
-        )
-        process.start()
+class DiffusionExecutionMode(str, Enum):
+    REQUEST_BATCH = "request_batch"
+    STEP_BATCH = "step_batch"
+```
+
+`streaming_output=True` requires step execution. If streaming is enabled without `step_execution=True`, the engine enables step execution so the output stream can receive intermediate chunks or the final step output.
+
+#### 1.3 Output Stream Lifecycle
+
+```python
+request_id = engine.add_request(request)
+async for output in engine.get_output_stream(request_id):
+    yield output
 ```
 
 **Design Decisions**:
 
-- **Spawn Method**: Ensures clean state for each worker (no shared memory issues)
+- **Unified Stream Semantics**: `step_streaming()` is the public async engine path. Streaming callers forward every yielded output. Non-streaming callers consume the same stream to completion and return only the final output.
 
-- **Pipe Communication**: Uses `mp.Pipe` for initialization handshake
+- **Queue Delivery**: Each admitted request gets an `asyncio.Queue[DiffusionOutput]`. The busy loop emits chunks/final outputs into that queue.
 
-- **Device Selection**: Each worker is assigned a specific GPU (`cuda:{rank}`)
+- **Cancellation Cleanup**: If a client disconnects or cancels stream consumption, `get_output_stream()` removes only the queue. Scheduler terminal state is still finalized when the scheduler reports the request as finished, so request IDs do not remain active indefinitely.
 
-#### 1.3 Request Processing Flow
+#### 1.4 Request Processing Flow
 
 ```python
-def step(self, requests: list[OmniDiffusionRequest]):
+async def step_streaming(self, request: OmniDiffusionRequest):
     # 1. Pre-process requests
-    requests = self.pre_process_func(requests)
+    request = self.pre_process_func(request)
 
-    # 2. Send to scheduler and wait for response
-    output = self.add_req_and_wait_for_response(requests)
-
-    # 3. Post-process results
-    result = self.post_process_func(output.output)
-    return result
+    # 2. Add request and consume the unified output stream
+    async for output in self.async_add_req_and_stream_response(request):
+        # 3. Post-process each delivered output
+        yield self.postprocess_output(request, output, ...)
 ```
 
 **Flow**:
 
 1. **Pre-processing**: Applies model-specific transformations
 
-2. **Scheduling**: Delegates to scheduler for distribution
+2. **Scheduling**: Delegates request state transitions to the selected scheduler
 
-3. **Post-processing**: Converts raw outputs to final format (e.g., PIL images)
+3. **Execution**: Calls the selected executor function for request, request-batch, or step execution
+
+4. **Output Delivery**: Emits intermediate chunks and final outputs through the request output stream
+
+5. **Post-processing**: Converts raw outputs to final format (e.g., PIL images)
 
 ---
 
@@ -915,36 +931,49 @@ def initialize_model_parallel(
 1. User Request
    └─> Omni.generate(prompt)
        └─> Prepare OmniDiffusionRequest
-           └─> DiffusionEngine.step(requests)
+           └─> DiffusionEngine.step_streaming(request)
 
 2. Pre-processing
-   └─> pre_process_func(requests)
+   └─> pre_process_func(request)
        └─> Model-specific transformations
 
 3. Scheduling
-   └─> scheduler.add_request(request)
-       └─> scheduler.schedule()
-           └─> DiffusionEngine submits scheduled request to executor.add_req(req)
+       └─> scheduler.add_request(request)
+           └─> scheduler.schedule()
+           └─> DiffusionEngine selects execute_batch / execute_step
 
 4. Worker Execution
    └─> WorkerProc._worker_busy_loop()
        └─> DiffusionWorker.execute_model(req)
-           └─> Pipeline.forward(req)
-               ├─> encode_prompt()
-               ├─> prepare_latents()
-               ├─> diffuse() [loop]
-               │   ├─> transformer.forward() [with cache backend hooks]
-               │   └─> scheduler.step()
-               └─> vae.decode()
+           └─> DiffusionModelRunner selects execution mode
+               ├─> REQUEST_BATCH
+               │   └─> Pipeline.forward(req_or_batch)
+               │       ├─> encode_prompt()
+               │       ├─> prepare_latents()
+               │       ├─> diffuse() [loop]
+               │       │   ├─> transformer.forward() [with cache backend hooks]
+               │       │   └─> scheduler.step()
+               │       └─> vae.decode()
+               └─> STEP
+                   ├─> pipeline.prepare_encode(state) [new requests]
+                   ├─> pipeline.denoise_step(input_batch)
+                   ├─> pipeline.step_scheduler(state, noise_pred)
+                   └─> pipeline.post_decode(state) [chunk boundary or final step]
 
 5. Result Collection
-   └─> Executor returns DiffusionOutput
+   └─> Executor returns RunnerOutput / BatchRunnerOutput
        └─> scheduler.update_from_output(...)
-           └─> DiffusionEngine pops finished request state
+           ├─> DiffusionEngine emits chunk/final output to request queue
+           └─> DiffusionEngine finalizes terminal scheduler state
 
 6. Post-processing
    └─> post_process_func(output)
        └─> Convert to PIL images / final format
+
+7. Stream Completion / Cancellation
+   ├─> Streaming callers receive every yielded output
+   ├─> Non-streaming callers drain the stream and return the final output
+   └─> Cancelled streams drop their output queue but still allow scheduler state cleanup
 ```
 
 ---

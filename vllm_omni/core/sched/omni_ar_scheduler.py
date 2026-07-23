@@ -259,6 +259,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
                     prompt_is_token_ids=nr.prompt_is_token_ids,
                     additional_information=(getattr(request, "additional_information", None) if request else None),
+                    model_intermediate_buffer=(
+                        getattr(request, "model_intermediate_buffer", None) if request else None
+                    ),
                 )
                 new_list.append(omni_nr)
 
@@ -718,6 +721,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
         super()._update_request_as_session(session, update)
+        if hasattr(update, "model_intermediate_buffer"):
+            session.model_intermediate_buffer = update.model_intermediate_buffer
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred

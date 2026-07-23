@@ -1,159 +1,139 @@
 # MiniCPM-o 4.5: Online serving
 
-OpenAI-compatible `/v1/chat/completions` serving for **MiniCPM-o 4.5**, plus a
-Gradio UI and curl / Python clients.
+This directory contains MiniCPM-o 4.5 online serving demos for vLLM-Omni.
+Inputs can include text, image, audio, or video; outputs are text and optional
+24 kHz speech.
 
-Inputs: text / image / audio / video. Outputs: text and optional **24 kHz** speech.
+For the experimental native duplex runtime architecture, lifecycle invariants,
+capability boundary, and validation scope, see
+[`vllm_omni/experimental/fullduplex/DESIGN.md`](../../../vllm_omni/experimental/fullduplex/DESIGN.md).
 
 ## Installation
 
-Please refer to [README.md](../../../README.md). Install the talker extra:
+Install vLLM-Omni with the MiniCPM-o talker dependencies:
 
 ```bash
 pip install 'vllm-omni[minicpmo]'
+
+# From a source checkout:
+pip install -e '.[minicpmo]'
 ```
 
-## Launch the server
+The `minicpmo` extra installs `stepaudio2-minicpmo` and its audio dependencies,
+including `librosa`.
 
-The deploy config auto-loads via `--omni`; the default
-`vllm_omni/deploy/minicpmo_4_5.yaml` targets a single-GPU layout (thinker
-and talker + t2w co-located on GPU 0).  For other hardware layouts pick
-one of the deploy variants below.
+## Start the backend server
 
-| deploy config | GPUs | Notes |
-|---|---|---|
-| `minicpmo_4_5.yaml` (default) | 1 | Thinker and talker+t2w co-located on GPU0. |
-| `minicpmo_4_5_2gpu.yaml` | 2 | Thinker on GPU0, talker+t2w on GPU1. |
-| `minicpmo_4_5_3gpu.yaml` | 3 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
-| `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
+Pick a deploy config that matches your GPU layout:
 
-Default (single-GPU):
+| config | GPUs | TP | Notes |
+|---|---|---|---|
+| `minicpmo_4_5.yaml` | 1 | 1 | Thinker and talker+t2w co-located on GPU0. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | 1 | Thinker on GPU0, talker+t2w on GPU1. |
+| `minicpmo_4_5_3gpu.yaml` | 3 | 2 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
+| `minicpmo_4_5_8x4090.yaml` | 8 | 4 | Thinker 4-way TP on GPU0-3, talker+t2w on GPU4. |
+| `minicpmo_4_5_3gpu_stage1_replicas.yaml` | 3 | 1 | Experimental validation profile: Thinker on GPU0, two talker+Token2wav replicas on GPU1/2. |
+| `minicpmo_4_5_4gpu_stage1_replicas.yaml` | 4 | 1 | Experimental validation profile: Thinker on GPU0, three talker+Token2wav replicas on GPU1/2/3. |
+| `minicpmo_4_5_8x4090_stage1_replicas.yaml` | 8 | 4 | Experimental validation profile: Thinker 4-way TP on GPU0-3, four talker+Token2wav replicas on GPU4-7. |
+| `minicpmo_4_5_duplex.yaml` | 2 | 1 | Experimental native duplex profile. |
 
 ```bash
-vllm serve openbmb/MiniCPM-o-4_5 --omni \
+vllm-omni serve openbmb/MiniCPM-o-4_5 \
+    --omni \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml \
     --trust-remote-code \
     --host 0.0.0.0 --port 8099
 ```
 
-Other layouts:
+For local ModelScope checkpoints, replace `openbmb/MiniCPM-o-4_5` with the
+checkpoint path. To start the experimental native duplex backend, use
+`vllm_omni/deploy/minicpmo_4_5_duplex.yaml`.
 
-```bash
-vllm serve openbmb/MiniCPM-o-4_5 --omni \
-    --deploy-config vllm_omni/deploy/minicpmo_4_5_3gpu.yaml \
-    --trust-remote-code \
-    --host 0.0.0.0 --port 8099
-```
+The `*_stage1_replicas.yaml` files exercise composite Stage1 replica routing
+and failure recovery. They are validation profiles, not recommended production
+entrypoints.
 
-### Stage-based CLI (optional)
+## Send chat requests
 
-Stage 0 (thinker + API) and stage 1 (talker) can run in separate processes:
-
-```bash
-# Stage 0
-CUDA_VISIBLE_DEVICES=0 vllm serve openbmb/MiniCPM-o-4_5 --omni \
-    --trust-remote-code --port 8099 --stage-id 0 \
-    --omni-master-address 127.0.0.1 --omni-master-port 26000
-
-# Stage 1 (headless)
-CUDA_VISIBLE_DEVICES=1 vllm serve openbmb/MiniCPM-o-4_5 --omni \
-    --trust-remote-code --stage-id 1 --headless \
-    --omni-master-address 127.0.0.1 --omni-master-port 26000
-```
-
-### Per-stage overrides
-
-```bash
-vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code --port 8099 \
-    --stage-overrides '{"0": {"gpu_memory_utilization": 0.65}}'
-```
-
-## Send multimodal requests
-
-```bash
-cd examples/online_serving/minicpmo
-```
-
-### curl
+From this directory, run the MiniCPM-specific curl or Python clients:
 
 ```bash
 bash run_curl_multimodal_generation.sh text
 bash run_curl_multimodal_generation.sh use_image
-bash run_curl_multimodal_generation.sh use_audio '["text"]'   # text-only
-```
+bash run_curl_multimodal_generation.sh use_audio '["text"]'
 
-Text + speech smoke test (TTS needs top-level `chat_template_kwargs`):
-
-```bash
-curl http://localhost:8099/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "openbmb/MiniCPM-o-4_5",
-        "messages": [{"role": "user", "content": "Say hello, then introduce vLLM in one sentence."}],
-        "modalities": ["text", "audio"],
-        "chat_template_kwargs": {"use_tts_template": true}
-    }'
-```
-
-### Python client
-
-```bash
 python openai_chat_completion_client_for_multimodal_generation.py \
     --query-type use_image \
-    --port 8099 \
-    --host localhost
-
-# Text-only (faster; no <|tts_bos|>)
-python openai_chat_completion_client_for_multimodal_generation.py \
-    --query-type text \
-    --modalities text \
-    --prompt "Briefly introduce yourself."
-```
-
-Shared helpers also work if you pass MiniCPM defaults yourself:
-
-```bash
-python ../openai_chat_completion_client_for_multimodal_generation.py \
-    --model openbmb/MiniCPM-o-4_5 \
-    --query-type text \
+    --host localhost \
     --port 8099
 ```
 
-(Note: the shared client does **not** set `use_tts_template`; prefer the
-MiniCPM-specific client above for speech.)
+Speech output requires `chat_template_kwargs.use_tts_template=true`. Put that
+field at the request root for curl; the OpenAI Python SDK can merge it from
+`extra_body`.
 
-### Gradio demo
+## Launch the Gradio demo
 
 ```bash
-bash run_gradio_demo.sh
+bash examples/online_serving/minicpmo/run_gradio_demo.sh
 
-# Or:
-python gradio_demo.py \
+# Or run the Python entry point directly:
+python examples/online_serving/minicpmo/gradio_demo.py \
     --minicpmo45-api-base http://localhost:8099/v1 \
     --minicpmo45-model openbmb/MiniCPM-o-4_5 \
     --port 7862
 ```
 
-Open `http://<host>:7862`. Uncheck **"Generate speech output (TTS)"** for
-text-only responses.
+Open `http://<host>:7862` in a browser.
 
-## Modality control
+## Run the Realtime duplex CLI demo
 
-| Modalities | Output |
-|---|---|
-| `["text"]` | Text only (no TTS bos) |
-| `["text", "audio"]` / unset | Text + 24 kHz speech |
+After the duplex backend is running, stream one WAV through the Realtime
+WebSocket endpoint:
 
-Speech requires `chat_template_kwargs.use_tts_template=true` so the chat
-template appends `<|tts_bos|>`. For **curl**, put that field at the request
-root; nested `extra_body` is ignored. The OpenAI Python SDK may use
-`extra_body` because it merges those fields into the root.
+```bash
+python examples/online_serving/minicpmo/realtime_duplex_demo.py \
+    --url ws://localhost:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --input-wav /path/to/input_16k_mono_pcm16.wav \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
+    --output-dir /tmp/minicpmo_realtime_duplex_demo
+```
 
-## Notes
+## Open the experimental browser client
 
-- Stage 1 is capped at `max_num_seqs: 1` in the deploy YAML (talker shares
-  request-0 audio metadata).
-- Output audio is base64 WAV in `message.audio.data` (24 kHz mono).
-- Offline counterpart:
-  [`examples/offline_inference/minicpmo/`](../../offline_inference/minicpmo/)
-- Recipe:
-  [`recipes/OpenBMB/MiniCPM-o-4_5.md`](../../../recipes/OpenBMB/MiniCPM-o-4_5.md)
+The browser UI serves the page and proxies the same-origin Realtime WebSocket to
+the backend:
+
+```bash
+python -m examples.online_serving.minicpmo.realtime_web \
+    --port 7862 \
+    --ws-backend ws://127.0.0.1:8099 \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav
+```
+
+Open `http://<host>:7862/`. When using a reverse proxy, open the URL mapped to
+port `7862`; the browser derives its WebSocket endpoint relative to that URL.
+
+If the page proxy serves HTTP but does not forward WebSocket upgrades, point the
+browser at a separately exposed Realtime endpoint:
+
+```bash
+python -m examples.online_serving.minicpmo.realtime_web \
+    --port 7862 \
+    --ws-backend ws://127.0.0.1:8099 \
+    --public-realtime-url wss://public.example/v1/realtime
+```
+
+## Validate soft-interrupt behavior
+
+The soft-interrupt E2E driver defaults to `--validation-mode model-policy`,
+which checks lifecycle and streaming invariants for arbitrary input audio. The
+stronger `response-required` mode is diagnostic: it requires a purpose-built
+two-response WAV, its `--input-sha256`, and an
+`--expect-second-response-substring` value.
+
+## Related examples
+
+- [Offline MiniCPM-o inference](../../offline_inference/minicpmo/)
+- [MiniCPM-o 4.5 recipe](../../../recipes/OpenBMB/MiniCPM-o-4_5.md)
