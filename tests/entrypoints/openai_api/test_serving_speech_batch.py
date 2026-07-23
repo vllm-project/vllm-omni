@@ -88,7 +88,7 @@ class TestSpeechBatchE2E:
 
     @pytest.mark.advanced_model
     @pytest.mark.tts
-    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_basic_two_items(self, omni_server) -> None:
         """Batch with two items returns two successful base64-encoded results."""

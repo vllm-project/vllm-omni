@@ -975,6 +975,38 @@ def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> RefreshCacheCo
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
+def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
+    """Enable cache-dit for Krea 2.
+
+    Krea 2 is a single-stream MMDiT: each ``Krea2TransformerBlock`` takes and returns only
+    ``hidden_states`` (text is fused into the token stream), so the blocks follow
+    ``ForwardPattern.Pattern_3``.
+
+    ``has_separate_cfg`` is checkpoint-dependent, which is why this needs a custom enabler
+    rather than a static ``_cache_dit_adapter_config``: the distilled Turbo checkpoint runs
+    no-CFG (a single transformer forward per denoise step), while the Raw checkpoint runs CFG
+    as two separate forwards. cache-dit tells cond/uncond apart purely by transformer-forward
+    parity, so the flag must match the actual per-step forward count — ``True`` only for the
+    CFG (Raw) path. The pipeline exposes this via ``is_distilled`` (read from ``model_index.json``).
+
+    Args:
+        pipeline: The Krea2Pipeline instance.
+        cache_config: DiffusionCacheConfig instance with cache configuration.
+
+    Returns:
+        A refresh function that can be called to update cache context with new num_inference_steps.
+    """
+    transformer = default_get_pipeline_transformer(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=not pipeline.is_distilled,
+        check_forward_pattern=False,
+    )
+    return enable_cache_for_dit(pipeline, cache_config, block_adapter)
+
+
 # Register custom cache-dit enablers after function definitions
 CUSTOM_DIT_ENABLERS.update(
     {
@@ -984,6 +1016,8 @@ CUSTOM_DIT_ENABLERS.update(
         "Wan22VACEPipeline": enable_cache_for_wan22,
         "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
         "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
+        "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
+        "Krea2Pipeline": enable_cache_for_krea2,
     }
 )
 

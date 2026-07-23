@@ -1,4 +1,4 @@
-# SenseNova-U1 Online Serving
+# SenseNova-U1: Online serving
 
 ## Launch the Server
 

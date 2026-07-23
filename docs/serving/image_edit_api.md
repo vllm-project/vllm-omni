@@ -252,7 +252,7 @@ Validation errors (missing required fields):
 
 ```bash
 # Check if server is responding
-curl -X http://localhost:8000/v1/images/edit \
+curl http://localhost:8000/v1/images/edits \
   -F "prompt='test'"
 ```
 

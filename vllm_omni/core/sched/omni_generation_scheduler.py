@@ -50,14 +50,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.input_coordinator: OmniSchedulingCoordinator | None = None
         if uses_full_payload_input_coordinator(model_config):
             self.input_coordinator = OmniSchedulingCoordinator(
-                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
-                async_chunk=False,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        """Diffusion fast path:
+        """One-shot generation fast path:
         - Feed all input tokens of the request at once
           (if 0, allocate 1 placeholder token).
         - If the token budget cannot be satisfied at once, fall back to the
@@ -81,7 +79,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         cached_prompt_token_ids: dict[str, list[int]] = {}
         cached_additional_information: dict[str, dict | None] = {}
 
-        # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
+        # Temporary queue: preserve waiting order while requests await input.
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
         self._consume_pending_connector_output(model_mode="generation")
@@ -144,8 +142,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if already_finished_reqs:
             self.running = remove_all(self.running, already_finished_reqs)
 
-        # Fast path selection and scheduling (treat all as diffusion requests,
-        # independent of pooling_params)
+        # Fast path selection and scheduling for one-shot generation requests,
+        # independent of pooling_params.
         while (
             self.waiting
             and token_budget > 0
@@ -171,9 +169,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
-
-            # Uniformly treat as diffusion. A feature flag can be added later
-            # via config or request tag.
 
             # Allocate all input tokens for the request in one shot
             # (allocate 1 placeholder if zero)
@@ -219,7 +214,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             else:
                 res = super().schedule(throttle_prefills)
                 if self.input_coordinator:
-                    self.input_coordinator.restore_queues(self.waiting, self.running)
+                    self.input_coordinator.restore_queues(self.waiting)
                 return self._wrap_omni_scheduler_output(res)
 
         # Compute common prefix blocks (aligned with v1)
@@ -346,7 +341,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     scheduler_requests=self.requests,
                 )
             if self.input_coordinator:
-                self.input_coordinator.restore_queues(self.waiting, self.running)
+                self.input_coordinator.restore_queues(self.waiting)
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
@@ -397,24 +392,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         finally:
             self._free_input_coordinator_request(request.request_id)
 
-    """
-    Scheduler for the diffusion model.
-    This scheduler is modified to stop the request immediately for the diffusion model.
-    This is because the diffusion model can generate the final image/audio in one step.
-    Note: This is just a minimal modification to the original scheduler,
-    and there should be some further efforts to optimize the scheduler.
-    The original scheduler is still used for the AR model.
-    """
-
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: OmniModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        """Update the scheduler state based on the model runner output.
-
-        This method is modified to stop the request immediately for the diffusion model.
-        """
+        """Update scheduler state and finish completed one-shot work."""
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -431,14 +414,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
-        kv_connector_stats: KVConnectorStats | None = (
-            kv_connector_output.kv_connector_stats if kv_connector_output else None
-        )
-        # Merge connector-side stats (align with v0.14.0)
-        if kv_connector_stats and self.connector:
-            kv_stats = self.connector.get_kv_connector_stats()
-            if kv_stats:
-                kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
 
         failed_kv_load_req_ids = None
         if kv_connector_output and getattr(kv_connector_output, "invalid_block_ids", None):
@@ -504,7 +479,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
-            # Diffusion request: completes in one step; mark finished and free resources
+            # One-shot generation request: finish after its current input unit
+            # has been fully processed.
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
@@ -517,7 +493,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
-                request.stop_reason = request.stop_reason  # or "generation_done"
                 stopped = True
 
             if stopped:
@@ -645,6 +620,20 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
+
+        # Worker-side KV connector stats from the model runner output.
+        kv_connector_stats: KVConnectorStats | None = (
+            kv_connector_output.kv_connector_stats if kv_connector_output else None
+        )
+        if self.connector:
+            # Scheduler-side KV connector stats collected after connector update.
+            scheduler_kv_connector_stats = self.connector.get_kv_connector_stats()
+            if scheduler_kv_connector_stats is not None and not scheduler_kv_connector_stats.is_empty():
+                kv_connector_stats = (
+                    kv_connector_stats.aggregate(scheduler_kv_connector_stats)
+                    if kv_connector_stats is not None
+                    else scheduler_kv_connector_stats
+                )
 
         # Collect and publish KV cache events (align with v0.14.0)
         events = self.kv_cache_manager.take_events()

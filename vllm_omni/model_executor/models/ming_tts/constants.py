@@ -43,6 +43,7 @@ LLM_VOCAB_SIZE = 151936
 AGGREGATOR_HIDDEN_SIZE = 1024
 VAE_PATCH_SIZE = 4
 SAMPLE_RATE = 44100
+SPEAKER_EMBEDDING_DIM = 192  # CAMPPlus output width and speaker projection input width
 
 # AudioVAE frame/hop geometry (confirmed)
 AUDIO_FRAME_HOP = 882  # enc input_dim / hop_size / dec output_dim
@@ -58,6 +59,7 @@ DEFAULT_TEMPERATURE = 0.0
 
 # Connector / Stage-2 streaming defaults (runtime tuning)
 LATENT_CHUNK_SIZE = 25
+INITIAL_LATENT_CHUNK_SIZE = 4
 LATENT_LEFT_CONTEXT = 0
 MAX_DECODE_STEPS = 200
 

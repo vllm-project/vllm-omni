@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import copy
 import time
-from collections.abc import Iterable
-from contextlib import nullcontext
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import torch
 from torch.profiler import record_function
-from vllm.config import LoadConfig
+from vllm.config import LoadConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
@@ -36,19 +36,20 @@ from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
     BatchRunnerOutput,
-    DiffusionRequestState,
     RunnerOutput,
+    StepRequestState,
     attach_stage_durations,
     clear_pipeline_stage_durations,
     consume_pipeline_stage_durations,
     merge_stage_durations,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -103,7 +104,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def __init__(
         self,
-        vllm_config,
+        vllm_config: VllmConfig,
         od_config: OmniDiffusionConfig,
         device: torch.device,
     ):
@@ -118,13 +119,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.vllm_config = vllm_config
         self.od_config = od_config
         self.device = device
-        self.pipeline = None
-        self.cache_backend = None
-        self.offload_backend = None
-        self.prompt_embed_cache = None
+        self.pipeline: Any | None = None
+        self.cache_backend: Any | None = None
+        self.offload_backend: Any | None = None
+        self.prompt_embed_cache: Any | None = None
+        self.input_batch: InputBatch | None = None
 
         # Cache for per-request stepwise state.
-        self.state_cache: dict[str, DiffusionRequestState] = {}
+        self.state_cache: dict[str, StepRequestState] = {}
 
         # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -140,7 +142,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
 
     @property
-    def target_device(self) -> torch.device | None:
+    def _target_device(self) -> torch.device | None:
         return getattr(self.pipeline, "device", None)
 
     def _compile_transformer(self, attr_name: str) -> None:
@@ -161,12 +163,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def load_model(
         self,
-        memory_pool_context_fn: callable | None = None,
+        memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
     ) -> None:
         """
-        Load the diffusion model, apply compilation and offloading.
+        Launch the diffusion pipeline, applying compilation, offloading, and caching.
 
         Args:
             memory_pool_context_fn: Optional function that returns a context manager
@@ -186,9 +188,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
         )
 
-        def get_memory_context():
+        def get_memory_context() -> AbstractContextManager[Any]:
             if memory_pool_context_fn is not None:
-                return memory_pool_context_fn(tag="weights")
+                return memory_pool_context_fn("weights")
             return nullcontext()
 
         # Load model within forward context
@@ -217,13 +219,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             self.od_config.step_execution = True
 
-        if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
+        if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
-        if self.od_config.streaming_output and not self.supports_step_mode():
+        if self.od_config.streaming_output and not self._supports_step_mode():
             raise ValueError(
                 "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
@@ -287,17 +289,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         logger.info("Model runner: Initialization complete.")
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights into the pipeline."""
-        return self.pipeline.load_weights(weights)
-
     def clear_prompt_embed_cache(self) -> None:
-        """Evict all cached text-encoder outputs (e.g. between training epochs)."""
+        """Evict all cached text-encoder outputs (e.g. between training epochs).
+
+        Kept primarily for extension purposes.
+        """
         if self.prompt_embed_cache is not None:
             self.prompt_embed_cache.clear()
 
     def get_prompt_embed_cache_stats(self) -> dict | None:
-        """Return hit/miss statistics for the prompt-embedding cache, if enabled."""
+        """Return hit/miss statistics for the prompt-embedding cache, if enabled.
+
+        Kept primarily for extension purposes.
+        """
         if self.prompt_embed_cache is None:
             return None
         return self.prompt_embed_cache.stats()
@@ -336,7 +340,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         req: OmniDiffusionRequest,
         *,
         od_config: OmniDiffusionConfig,
-        kv_prefetch_jobs: dict | None = None,
+        kv_prefetch_job: KVPrefetchJob | None = None,
         use_prefetch: bool = False,
     ) -> None:
         # Receive AR KV. Single-request execution can use the prefetch path:
@@ -346,29 +350,32 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if use_prefetch and self._kv_prefetch_enabled:
             self.kv_transfer_manager.consume_and_distribute_kv_cache(
                 req,
-                target_device=self.target_device,
+                target_device=self._target_device,
             )
         else:
             self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                 req,
                 cfg_kv_collect_func=getattr(od_config, "cfg_kv_collect_func", None),
-                target_device=self.target_device if use_prefetch else getattr(self.pipeline, "device", None),
+                target_device=self._target_device if use_prefetch else getattr(self.pipeline, "device", None),
             )
         kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
         logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
 
         # Kick off the next request's prefetch (+ H2D) to overlap this forward.
-        if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
-            self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
+        if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_job is not None:
+            self.kv_transfer_manager.start_prefetch(kv_prefetch_job, self._target_device)
 
-        if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-            if req.sampling_params.generator_device is not None:
-                gen_device = req.sampling_params.generator_device
+        self._initialize_generator(req.sampling_params)
+
+    def _initialize_generator(self, sampling_params: OmniDiffusionSamplingParams) -> None:
+        if sampling_params.generator is None and sampling_params.seed is not None:
+            if sampling_params.generator_device is not None:
+                gen_device = sampling_params.generator_device
             elif self.device.type == "cpu":
                 gen_device = "cpu"
             else:
                 gen_device = self.device
-            req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+            sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
 
     def _refresh_cache_for_requests(
         self,
@@ -377,15 +384,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         od_config: OmniDiffusionConfig,
     ) -> None:
         first_req = reqs[0]
-        if (
-            getattr(first_req, "skip_cache_refresh", False)
-            or self.cache_backend is None
-            or not self.cache_backend.is_enabled()
-        ):
+        if self.cache_backend is None or not self.cache_backend.is_enabled():
             return
 
         # Refresh cache context if needed. Batch admission groups requests by
-        # SamplingParamsKey, so the first request's num_inference_steps applies
+        # RequestBatchSamplingParamsKey, so the first request's num_inference_steps applies
         # to the whole runner batch.
         num_inference_steps = first_req.sampling_params.num_inference_steps
         if num_inference_steps is None and od_config.cache_backend in (
@@ -432,7 +435,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         od_config: OmniDiffusionConfig,
         allow_single_output: bool,
         require_request_batch_support: bool,
-        kv_prefetch_jobs: dict | None = None,
+        kv_prefetch_job: KVPrefetchJob | None = None,
         record_name: str,
     ) -> BatchRunnerOutput:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
@@ -454,7 +457,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self._prepare_request_for_forward(
                     req,
                     od_config=od_config,
-                    kv_prefetch_jobs=kv_prefetch_jobs,
+                    kv_prefetch_job=kv_prefetch_job,
                     use_prefetch=allow_single_output,
                 )
 
@@ -497,10 +500,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def _attach_stepwise_metrics(
         self,
-        state: DiffusionRequestState,
+        state: StepRequestState,
         output: DiffusionOutput,
-        *,
-        is_primary: bool,
     ) -> None:
         merge_stage_durations(
             state,
@@ -508,7 +509,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         attach_stage_durations(state, output)
 
-    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
+    def execute_model(
+        self,
+        req: OmniDiffusionRequest,
+        kv_prefetch_job: KVPrefetchJob | None = None,
+    ) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
@@ -529,7 +534,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             od_config=self.od_config,
             allow_single_output=True,
             require_request_batch_support=False,
-            kv_prefetch_jobs=kv_prefetch_jobs,
+            kv_prefetch_job=kv_prefetch_job,
             record_name="pipeline_forward",
         )
         output = runner_output.runner_outputs[0].result
@@ -560,18 +565,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     # Step-wise execution
     # ------------------------------------------------------------------
 
-    def supports_step_mode(self) -> bool:
+    def _supports_step_mode(self) -> bool:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
-    def _update_states(
-        self, scheduler_output: DiffusionSchedulerOutput
-    ) -> tuple[list[DiffusionRequestState], list[str]]:
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for request_id in scheduler_output.finished_req_ids:
             self.state_cache.pop(request_id, None)
 
-        resolved: list[DiffusionRequestState] = []
+        resolved: list[StepRequestState] = []
         new_request_ids: list[str] = []
         try:
             # process new requests
@@ -580,7 +583,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 new_request_ids.append(request_id)
                 if request_id in self.state_cache:
                     raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
-                new_state = DiffusionRequestState(
+                new_state = StepRequestState(
                     request_id=request_id,
                     sampling=copy.deepcopy(sched_new_req.req.sampling_params),
                     prompt=sched_new_req.req.prompt,
@@ -591,7 +594,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     state_req,
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self.target_device,
+                    target_device=self._target_device,
                 )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
@@ -609,19 +612,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return resolved, new_request_ids
 
-    def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
+    def _prepare_batch_inputs(self, states: list[StepRequestState], new_request_ids: list[str]) -> InputBatch:
         # process new reqs
         for state in states:
             if state.request_id in new_request_ids:
-                # set generator
-                if state.sampling.generator is None and state.sampling.seed is not None:
-                    if state.sampling.generator_device is not None:
-                        gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
-                    else:
-                        gen_device = self.device
-                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                self._initialize_generator(state.sampling)
                 clear_pipeline_stage_durations(self.pipeline)
                 # encode
                 self.pipeline.prepare_encode(state)
@@ -639,10 +634,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def _update_states_after(
         self,
-        states: list[DiffusionRequestState],
+        states: list[StepRequestState],
         input_batch: InputBatch,
         interrupted: bool = False,
-    ):
+    ) -> None:
         """Step-after update: clear cached state for completed request."""
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
         if (
@@ -661,19 +656,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if interrupted or state.request_denoise_completed:
                 self.state_cache.pop(state.request_id, None)
 
-    def _prepare_attn_metadata(self, input_batch: InputBatch) -> Any:
-        model_state = getattr(self, "model_state", None)
-        if model_state is None:
-            return {}
-        prepare_attn = getattr(model_state, "prepare_attn", None)
-        if not callable(prepare_attn):
-            return {}
-        return prepare_attn(input_batch)
-
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if not self.supports_step_mode():
+        if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.
         # Request-mode extras such as cache backends, editing inputs, and
@@ -690,7 +676,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
                 current_omni_platform.reset_peak_memory_stats()
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
-            attn_metadata = self._prepare_attn_metadata(input_batch)
+            attn_metadata = {}
 
             with set_forward_context(
                 vllm_config=self.vllm_config,
@@ -728,7 +714,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                             )
                             if self.od_config.streaming_output:
-                                should_decode = req.chunk_denoise_completed
+                                should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:
                                 should_decode = req.denoise_completed
 
@@ -739,7 +725,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                     self._attach_stepwise_metrics(
                                         req,
                                         result,
-                                        is_primary=is_primary,
                                     )
                             else:
                                 result = None

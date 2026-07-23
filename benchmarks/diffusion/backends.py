@@ -28,6 +28,7 @@ class RequestFuncInput:
     slo_ms: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
+    video_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
 
@@ -338,6 +339,11 @@ async def async_request_v1_videos(
         form.add_field(k, str(v))
 
     image_file = None
+    if input.image_paths and input.video_paths:
+        output.error = "Only one of image_paths or video_paths can be provided"
+        output.success = False
+        return output
+
     if input.image_paths and len(input.image_paths) > 0:
         image_path = input.image_paths[0]
         image_file = open(image_path, "rb")
@@ -345,7 +351,16 @@ async def async_request_v1_videos(
             "input_reference",
             image_file,
             filename=os.path.basename(image_path),
-            content_type="application/octet-stream",
+            content_type=_guess_mime_type(image_path),
+        )
+    elif input.video_paths and len(input.video_paths) > 0:
+        video_path = input.video_paths[0]
+        image_file = open(video_path, "rb")
+        form.add_field(
+            "input_reference",
+            image_file,
+            filename=os.path.basename(video_path),
+            content_type=_guess_mime_type(video_path),
         )
 
     job_id = None

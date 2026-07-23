@@ -328,7 +328,7 @@ class MiniCPMOConfig(Qwen2Config):
         tts_config=None,
         use_image_id=True,
         vision_batch_size=16,
-        audio_pool_step=2,
+        audio_pool_step=5,
         audio_chunk_length=1.0,
         stream_input=False,
         init_vision=True,
@@ -760,7 +760,12 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         )
 
 
-AutoImageProcessor.register("MiniCPMVImageProcessor", MiniCPMVImageProcessor)
+# transformers >= 5.x requires the config *class* (not a string) as the
+# first arg to AutoImageProcessor.register — it does `key.__module__`
+# internally. Passing "MiniCPMVImageProcessor" raises:
+#   AttributeError: 'str' object has no attribute '__module__'
+# See also processing_gr00t_n1d7.py for the same transformers API change.
+AutoImageProcessor.register(MiniCPMOConfig, MiniCPMVImageProcessor, exist_ok=True)
 
 
 # ============== SigLIP Vision Transformer Classes ==============
@@ -931,46 +936,85 @@ class SiglipVisionEmbeddings(nn.Module):
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
+    def _create_grid_position_ids(
+        self,
+        patch_grid_height: int,
+        patch_grid_width: int,
+        boundaries: torch.Tensor,
+    ) -> torch.Tensor:
+        fractional_coords_h = torch.arange(
+            0,
+            1 - 1e-6,
+            1 / patch_grid_height,
+            device=boundaries.device,
+        )
+        fractional_coords_w = torch.arange(
+            0,
+            1 - 1e-6,
+            1 / patch_grid_width,
+            device=boundaries.device,
+        )
+        bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
+        bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+        return (bucket_coords_h[:, None] * self.num_patches_per_side + bucket_coords_w).flatten()
+
+    def _create_position_ids(
+        self,
+        patch_attention_mask: torch.BoolTensor,
+        tgt_sizes: torch.IntTensor | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        batch_size = patch_attention_mask.size(0)
+        flat_patch_attention_mask = patch_attention_mask.reshape(batch_size, -1).to(device="cpu")
+
+        if tgt_sizes is None:
+            # As in the legacy path, infer rectangular grid sizes from a (B, H, W) mask.
+            target_sizes = torch.stack(
+                (
+                    patch_attention_mask[:, :, 0].sum(dim=1),
+                    patch_attention_mask[:, 0, :].sum(dim=1),
+                ),
+                dim=1,
+            )
+        else:
+            target_sizes = tgt_sizes
+
+        # Group construction on the host preserves the legacy floating-point
+        # mapping and is faster than device-side construction for vision grids.
+        target_sizes_list = target_sizes.detach().to(device="cpu").tolist()
+        position_ids = torch.zeros(flat_patch_attention_mask.shape, dtype=torch.long)
+        boundaries = torch.arange(
+            1 / self.num_patches_per_side,
+            1.0,
+            1 / self.num_patches_per_side,
+        )
+        grid_position_ids: dict[tuple[int, int], torch.Tensor] = {}
+
+        for batch_idx, (patch_grid_height, patch_grid_width) in enumerate(target_sizes_list):
+            grid_shape = (int(patch_grid_height), int(patch_grid_width))
+            grid_ids = grid_position_ids.get(grid_shape)
+            if grid_ids is None:
+                grid_ids = self._create_grid_position_ids(*grid_shape, boundaries)
+                grid_position_ids[grid_shape] = grid_ids
+
+            position_ids[batch_idx, flat_patch_attention_mask[batch_idx]] = grid_ids
+
+        return position_ids.to(device=device)
+
     def forward(
         self,
         pixel_values: torch.FloatTensor,
         patch_attention_mask: torch.BoolTensor,
         tgt_sizes: torch.IntTensor | None = None,
     ) -> torch.Tensor:
-        batch_size = pixel_values.size(0)
-
         patch_embeds = self.patch_embedding(pixel_values)
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
 
-        max_im_h, max_im_w = pixel_values.size(2), pixel_values.size(3)
-        max_nb_patches_h, max_nb_patches_w = max_im_h // self.patch_size, max_im_w // self.patch_size
-        boundaries = torch.arange(1 / self.num_patches_per_side, 1.0, 1 / self.num_patches_per_side)
-        position_ids = torch.full(
-            size=(
-                batch_size,
-                max_nb_patches_h * max_nb_patches_w,
-            ),
-            fill_value=0,
+        position_ids = self._create_position_ids(
+            patch_attention_mask,
+            tgt_sizes,
+            device=self.position_embedding.weight.device,
         )
-
-        for batch_idx, p_attn_mask in enumerate(patch_attention_mask):
-            if tgt_sizes is not None:
-                nb_patches_h = tgt_sizes[batch_idx][0]
-                nb_patches_w = tgt_sizes[batch_idx][1]
-            else:
-                nb_patches_h = p_attn_mask[:, 0].sum()
-                nb_patches_w = p_attn_mask[0].sum()
-
-            fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / nb_patches_h)
-            fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / nb_patches_w)
-
-            bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
-            bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
-
-            pos_ids = (bucket_coords_h[:, None] * self.num_patches_per_side + bucket_coords_w).flatten()
-            position_ids[batch_idx][p_attn_mask.view(-1).cpu()] = pos_ids
-
-        position_ids = position_ids.to(self.position_embedding.weight.device)
 
         embeddings = embeddings + self.position_embedding(position_ids)
         return embeddings
@@ -2834,6 +2878,9 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     ) -> str:
         hf_processor = self.get_hf_processor()
 
+        # Keep prompt placeholders aligned with the encoder's checkpoint config.
+        hf_processor.pool_step = self.get_default_audio_pool_step()
+
         return hf_processor.get_audio_placeholder(
             audio_lens,
             chunk_input=chunk_input,
@@ -2841,7 +2888,7 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         )
 
     def get_default_audio_pool_step(self) -> int:
-        return getattr(self.get_hf_config(), "audio_pool_step", 2)
+        return getattr(self.get_hf_config(), "audio_pool_step", 5)
 
     def get_default_audio_sampling_rate(self) -> int:
         return 16000
@@ -3167,9 +3214,33 @@ class MiniCPMOAudioEmbeddingItems(DictEmbeddingItems):
 
 
 def _minicpmo_field_config(hf_inputs: Mapping[str, torch.Tensor]):
+    audio_features = hf_inputs.get("audio_features")
+    audio_feature_lens = hf_inputs.get("audio_feature_lens")
+    audio_features_cfg = MultiModalFieldConfig.batched("audio")
+
+    if audio_features is not None and audio_feature_lens is not None:
+        num_features = len(audio_features)
+        num_audios = len(audio_feature_lens)
+
+        if num_features > num_audios:
+            chunks_per_audio = [lens.numel() if isinstance(lens, torch.Tensor) else 1 for lens in audio_feature_lens]
+            if sum(chunks_per_audio) != num_features:
+                chunks_per_audio = [
+                    max(int((lens != 0).sum()), 1) if isinstance(lens, torch.Tensor) else 1
+                    for lens in audio_feature_lens
+                ]
+
+            slice_idxs = [0]
+            for num_chunks in chunks_per_audio:
+                slice_idxs.append(slice_idxs[-1] + num_chunks)
+            audio_features_cfg = MultiModalFieldConfig.flat(
+                "audio",
+                [slice(slice_idxs[i], slice_idxs[i + 1]) for i in range(len(chunks_per_audio))],
+            )
+
     return dict(
         **_minicpmv_field_config(hf_inputs),
-        audio_features=MultiModalFieldConfig.batched("audio"),
+        audio_features=audio_features_cfg,
         audio_feature_lens=MultiModalFieldConfig.batched("audio"),
         audio_embeds=MultiModalFieldConfig.batched("audio"),
     )
@@ -3361,11 +3432,17 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 out_keys={"audio_features", "audio_feature_lens"},
             )
 
+            flat_feature_lens: list[int] = []
+            for lens in audio_inputs["audio_feature_lens"]:
+                if isinstance(lens, torch.Tensor):
+                    flat_feature_lens.extend(lens.flatten().tolist())
+                else:
+                    flat_feature_lens.append(int(lens))
             unpadded_audio_features = [
                 feat[:, :feature_len]
                 for feat, feature_len in zip(
                     audio_inputs["audio_features"],
-                    audio_inputs["audio_feature_lens"],
+                    flat_feature_lens,
                 )
             ]
             audio_inputs["audio_features"] = unpadded_audio_features

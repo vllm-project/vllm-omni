@@ -36,6 +36,7 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `black-forest-labs/FLUX.2-dev` | 1024 x 1024 | 65.7 | >80 (CPU offload required) |
 | `HunyuanImage-3.0` | 1024 x 1024 | 80.0 (TP≥3)  | 160 |
 | `HiDream-I1-Full` | 1024 x 1024 | 63.7  | 57.7 |
+| `krea/Krea-2-Raw`, `krea/Krea-2-Turbo` | 1024 (Raw) / 2048 (Turbo) | — | ~30 |
 
 !!! info
 *Peak VRAM:  based on basic single-card usage, batch size =1, without any acceleration/optimization features. FLUX.2-dev requires `--enable-cpu-offload` on a single 80 GiB GPU.
@@ -195,6 +196,37 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --auxiliary-text-encoder meta-llama/Meta-Llama-3.1-8B-Instruct \
   --output /output.png
 ```
+
+### Krea 2
+
+Krea 2 is published as diffusers-format checkpoints: `krea/Krea-2-Turbo` (few-step distilled) and `krea/Krea-2-Raw`.
+The pipeline class (`Krea2Pipeline`) is auto-detected from `model_index.json`. The distilled Turbo checkpoint sets
+`is_distilled=true` and is best run at 2048x2048 with few steps and guidance disabled:
+
+```bash
+# Few-step distilled (Turbo) checkpoint
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model krea/Krea-2-Turbo \
+  --prompt "a fox in the snow" \
+  --num-inference-steps 8 \
+  --guidance-scale 0.0 \
+  --height 2048 --width 2048 \
+  --output krea2.png
+```
+
+For the Raw checkpoint, use more steps with CFG enabled:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model krea/Krea-2-Raw \
+  --prompt "a fox in the snow" \
+  --num-inference-steps 28 \
+  --guidance-scale 4.5 \
+  --output krea2.png
+```
+
+`guidance-scale` follows the Krea 2 convention (`velocity = cond + guidance_scale * (cond - uncond)`); CFG is enabled
+whenever `guidance-scale > 0`.
 
 ### Batch Requests (Multiple Prompts)
 
