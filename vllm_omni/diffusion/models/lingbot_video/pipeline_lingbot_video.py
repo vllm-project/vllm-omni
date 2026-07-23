@@ -225,9 +225,7 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-def _resolve_construction_device(
-    od_config: OmniDiffusionConfig, execution_device: torch.device
-) -> torch.device:
+def _resolve_construction_device(od_config: OmniDiffusionConfig, execution_device: torch.device) -> torch.device:
     """Device on which pipeline components are materialized during ``__init__``.
 
     When CPU or layerwise offload is requested, components are built on the host
@@ -238,9 +236,7 @@ def _resolve_construction_device(
     otherwise: ``execution_device`` is returned unchanged, preserving the
     validated single-device placement path for accelerators that fit the model.
     """
-    if getattr(od_config, "enable_layerwise_offload", False) or getattr(
-        od_config, "enable_cpu_offload", False
-    ):
+    if getattr(od_config, "enable_layerwise_offload", False) or getattr(od_config, "enable_cpu_offload", False):
         return torch.device("cpu")
     return execution_device
 
