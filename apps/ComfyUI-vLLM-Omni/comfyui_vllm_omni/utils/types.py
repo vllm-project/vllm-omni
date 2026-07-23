@@ -3,10 +3,14 @@ from enum import Enum, auto
 from typing import (
     Any,
     Literal,
-    NotRequired,
     TypeAlias,
-    TypedDict,
 )
+
+try:
+    from typing import NotRequired, TypedDict
+except ImportError:
+    # Python < 3.11: use typing_extensions.
+    from typing_extensions import NotRequired, TypedDict
 
 AudioFormat: TypeAlias = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
 

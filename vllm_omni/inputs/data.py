@@ -1,7 +1,7 @@
 import copy
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias, TypedDict
+from typing import Any, TypeAlias
 
 from vllm.inputs import PromptType
 from vllm.sampling_params import SamplingParams
@@ -9,10 +9,10 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 try:
-    from typing import NotRequired
+    from typing import NotRequired, TypedDict
 except ImportError:
     # Python < 3.11: use typing_extensions
-    from typing_extensions import NotRequired
+    from typing_extensions import NotRequired, TypedDict
 
 
 import torch
