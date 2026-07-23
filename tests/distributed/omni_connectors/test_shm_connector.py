@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
+import os
+
 import pytest
+import torch
 
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
     SharedMemoryConnector,
@@ -13,7 +16,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture()
 def connector():
-    c = SharedMemoryConnector({"shm_threshold_bytes": 0})
+    c = SharedMemoryConnector({})
     yield c
     c.close()
 
@@ -36,6 +39,30 @@ class TestKeyBasedReadWrite:
         assert obj == data
         assert rsize == size
         assert "test_key_1" not in connector._pending_keys
+        assert connector._metrics["gets"] == 1
+
+    def test_tensor_payload_removes_lock_file(self, connector):
+        key = "tensor_payload"
+        payload = torch.ones(2, 2)
+        ok, _, metadata = connector.put("s0", "s1", key, payload)
+        assert ok
+
+        result = connector.get("s0", "s1", key, metadata=metadata)
+
+        assert result is not None
+        assert torch.equal(result[0], payload)
+        assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
+
+    def test_falsey_payload_removes_lock_file(self, connector):
+        key = "falsey_payload"
+        ok, _, metadata = connector.put("s0", "s1", key, 0)
+        assert ok
+
+        result = connector.get("s0", "s1", key, metadata=metadata)
+
+        assert result is not None
+        assert result[0] == 0
+        assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
 
     def test_get_nonexistent_key_returns_none(self, connector):
         result = connector.get("s0", "s1", "no_such_key_xyz", metadata=None)

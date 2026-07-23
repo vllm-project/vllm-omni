@@ -148,7 +148,8 @@ class OmniServeCommand(CLISubcommand):
                     "The following CLI args are not supported under --omni: "
                     f"{', '.join(offenders)}. Configure parallelism through the "
                     "per-stage YAML (`--deploy-config` / `--stage-configs-path`) "
-                    "and replica count via `--omni-dp-size-local`."
+                    "and replica count via the per-stage `num_replicas` config field "
+                    "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
 
         # --omni-lb-policy is validated against the LoadBalancingPolicy enum.
@@ -823,6 +824,7 @@ def run_headless(args: TrackingNamespace) -> None:
         model,
         stage_configs_path,
         args_dict,
+        trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
         deploy_config_path=args_dict.get("deploy_config"),
         stage_overrides=stage_overrides,
         strategy_config_path=args_dict.get("strategy_config"),

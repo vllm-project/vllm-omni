@@ -433,10 +433,7 @@ def from_pretrained_with_prefetch(
     ``factory`` is a bound ``SomeModel.from_pretrained`` (or any callable with
     the same ``(model, *, subfolder, local_files_only, **kwargs)`` signature).
 
-    This is a stronger sibling of :func:`retry_on_missing_shard`: that helper
-    only retries the missing-shard ``OSError`` and never re-prefetches, so it
-    cannot recover the second face of the same race. Two shapes of partial
-    -cache failure crash the diffusion server outright:
+    Two shapes of partial-cache failure crash the diffusion server outright:
 
     * ``OSError: <repo> does not appear to have a file named
       text_encoder/model-0000X-of-0000Y.safetensors`` - a shard is still under
@@ -488,31 +485,3 @@ def from_pretrained_with_prefetch(
 
     assert last_exc is not None  # loop only exits via return or a caught exc
     raise last_exc
-
-
-def retry_on_missing_shard(load_fn, *, max_retries: int = 3, base_delay: float = 5.0):
-    """Call *load_fn* with retry on the transformers v5 shard-resolution race.
-
-    When the prefetch lock cannot be acquired (e.g. flock unsupported on
-    the filesystem and dotfile lock times out), ``from_pretrained`` may
-    still hit the ``cached_files`` race. This wrapper retries with
-    exponential backoff when the OSError message matches the specific
-    "does not appear to have a file named" pattern.
-    """
-    for attempt in range(max_retries):
-        try:
-            return load_fn()
-        except OSError as exc:
-            if "does not appear to have a file" not in str(exc):
-                raise
-            if attempt == max_retries - 1:
-                raise
-            delay = base_delay * (attempt + 1)
-            logger.warning(
-                "from_pretrained failed with shard-resolution race (%s); retrying in %.1fs (attempt %d/%d)",
-                exc,
-                delay,
-                attempt + 1,
-                max_retries,
-            )
-            time.sleep(delay)

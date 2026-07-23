@@ -75,7 +75,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/platforms/npu/stage_configs"
+        return "vllm_omni/deploy"
 
     @classmethod
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:

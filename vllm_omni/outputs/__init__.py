@@ -58,6 +58,18 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
 
+    @classmethod
+    def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
+        return cls(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=kv_connector_output,
+        )
+
 
 @dataclass
 class OmniRequestOutput:

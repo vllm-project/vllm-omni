@@ -135,28 +135,7 @@ The scheduler is a **request-state scheduler**. It owns request lifecycle manage
 
 ### Key Components
 
-#### 2.1 Scheduler Interface
-
-```python
-class SchedulerInterface(ABC):
-    def add_request(self, request: OmniDiffusionRequest) -> str: ...
-    def schedule(self) -> DiffusionSchedulerOutput: ...
-    def update_from_output(
-        self,
-        sched_output: DiffusionSchedulerOutput,
-        output: DiffusionOutput,
-    ) -> set[str]: ...
-```
-
-**Responsibilities**:
-
-- **Lifecycle contract**: Defines how the engine adds requests, triggers one scheduling cycle, and feeds executor results back.
-
-- **Stable boundary**: `DiffusionSchedulerOutput` is the only scheduling result consumed by `DiffusionEngine`.
-
-- **Pluggability**: Different scheduler policies can reuse the same engine integration path.
-
-#### 2.2 Request State Model
+#### 2.1 Request State Model
 
 ```python
 class DiffusionRequestStatus(enum.IntEnum):
@@ -168,10 +147,12 @@ class DiffusionRequestStatus(enum.IntEnum):
     FINISHED_ERROR = ...
 
 @dataclass
-class DiffusionRequestState:
+class SchedulerRequestState:
     request_id: str
     req: OmniDiffusionRequest
+    sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
+    error: str | None = None
 ```
 
 **Design Features**:
@@ -180,17 +161,33 @@ class DiffusionRequestState:
 
 - **Centralized error handling**: Completion, abort, and error states are all normalized in the scheduler layer.
 
-#### 2.3 Shared Bookkeeping in `_BaseScheduler`
+#### 2.2 Shared Bookkeeping in `BaseScheduler`
 
 ```python
-class _BaseScheduler(SchedulerInterface):
+class BaseScheduler:
     def __init__(self) -> None:
         self._request_states = {}
         self._waiting = deque()
         self._running = []
         self._finished_req_ids = set()
         self.max_num_running_reqs = 1
+
+    def add_request(self, request: OmniDiffusionRequest) -> str: ...
+    def schedule(self) -> DiffusionSchedulerOutput: ...
+    def update_from_output(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        output: BaseRunnerOutput,
+    ) -> set[str]: ...
 ```
+
+**Responsibilities**:
+
+- **Lifecycle contract**: Defines how the engine adds requests, triggers one scheduling cycle, and feeds executor results back.
+
+- **Stable boundary**: `DiffusionSchedulerOutput` is the only scheduling result consumed by `DiffusionEngine`.
+
+- **Pluggability**: Different scheduler policies can reuse the same engine integration path.
 
 **Design Features**:
 
@@ -199,12 +196,12 @@ class _BaseScheduler(SchedulerInterface):
 - **Shared cleanup logic**: Duplicate-request checks, finish handling, and state removal are centralized instead of
   duplicated in each policy.
 
-- **Current constraint boundary**: `_BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`. Request-mode diffusion can use that capacity for compatible independent requests when the configured pipeline declares `supports_request_batch = True`; step-wise diffusion uses the same scheduler capacity for compatible step batches.
+- **Current constraint boundary**: `BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`. Request-mode diffusion can use that capacity for compatible independent requests when the configured pipeline declares `supports_request_batch = True`; step-wise diffusion uses the same scheduler capacity for compatible step batches.
 
-#### 2.4 Current `RequestScheduler` Policy
+#### 2.3 Current `RequestScheduler` Policy
 
 ```python
-class RequestScheduler(_BaseScheduler):
+class RequestScheduler(BaseScheduler):
     def schedule(self) -> DiffusionSchedulerOutput:
         # 1. keep existing RUNNING requests in the scheduling result
         # 2. pull WAITING requests while capacity remains
@@ -215,11 +212,11 @@ class RequestScheduler(_BaseScheduler):
 
 - **FIFO request scheduling**: Waiting requests are promoted in queue order.
 
-- **Compatible request admission**: `RequestScheduler` admits waiting requests while capacity remains and the request's `SamplingParamsKey` is compatible with the active batch. Request-mode execution keeps each logical request independent, while batch-capable pipelines receive the scheduled requests as a runner-side `DiffusionRequestBatch`.
+- **Compatible request admission**: `RequestScheduler` admits waiting requests while capacity remains and the request's `RequestBatchSamplingParamsKey` is compatible with the active batch. Request-mode execution keeps each logical request independent, while batch-capable pipelines receive the scheduled requests as a runner-side `DiffusionRequestBatch`.
 
 - **Executor result feedback**: `update_from_output()` converts executor output into `FINISHED_COMPLETED` or `FINISHED_ERROR` and returns finished request ids.
 
-#### 2.5 Engine-Driven Execution Loop
+#### 2.4 Engine-Driven Execution Loop
 
 ```python
 request_id = scheduler.add_request(request)
@@ -270,7 +267,7 @@ class WorkerProc:
             self.result_mq = MessageQueue(n_reader=1, ...)
 
         # Initialize GPU worker
-        self.worker = GPUWorker(local_rank=gpu_id, rank=gpu_id, od_config=od_config)
+        self.worker = self._create_worker(gpu_id, od_config, ...)
 ```
 
 **Initialization Steps**:
@@ -292,13 +289,18 @@ class WorkerProc:
 #### 3.2 GPU Worker
 
 ```python
-class GPUWorker:
-    def init_device_and_model(self):
+class DiffusionWorker:
+    def init_device(self):
         # Set distributed environment variables
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Initialize PyTorch distributed
+        # Select the device and initialize distributed execution
+        self.device = current_omni_platform.get_torch_device(rank)
+        current_omni_platform.set_device(self.device)
+        self.vllm_config = _create_diffusion_worker_vllm_config(
+            self.device, self.od_config
+        )
         init_distributed_environment(world_size, rank)
         parallel_config = self.od_config.parallel_config
         initialize_model_parallel(
@@ -309,16 +311,18 @@ class GPUWorker:
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
         )
 
-        # Load model
-        model_loader = DiffusersPipelineLoader(load_config, self.od_config)
-        self.pipeline = model_loader.load_model(load_device=f"cuda:{rank}")
+    def load_model(self, load_format="default", custom_pipeline_name=None):
+        self.model_runner.load_model(
+            load_format=load_format,
+            custom_pipeline_name=custom_pipeline_name,
+        )
 
-        # Setup cache backend
-        from vllm_omni.diffusion.cache.selector import get_cache_backend
-        self.cache_backend = get_cache_backend(od_config.cache_backend, od_config.cache_config)
-
-        if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
+    def init_lora_manager(self):
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.model_runner.pipeline,
+            device=self.device,
+            dtype=self.od_config.dtype,
+        )
 ```
 
 **Key Features**:
@@ -332,17 +336,17 @@ class GPUWorker:
 #### 3.3 Worker Busy Loop
 
 ```python
-def worker_busy_loop(self):
+def _worker_busy_loop(self):
     while self._running:
         # 1. Receive unified message (generation request, RPC request, or shutdown)
-        msg = self.recv_message()
+        msg = self.mq.dequeue(timeout=1.0)
 
         # 2. Route message based on type
         if isinstance(msg, dict) and msg.get("type") == "rpc":
             # Handle RPC request
-            result, should_reply = self.execute_rpc(msg)
+            result, should_reply = self._execute_rpc(msg)
             if should_reply:
-                self.return_result(result)
+                self._return_result(result)
 
         elif isinstance(msg, dict) and msg.get("type") == "shutdown":
             # Handle shutdown message
@@ -351,7 +355,7 @@ def worker_busy_loop(self):
         else:
             # Handle generation request (OmniDiffusionRequest list)
             output = self.worker.execute_model(msg, self.od_config)
-            self.return_result(output)
+            self._return_result(output)
 ```
 
 **Execution Flow**:
@@ -923,8 +927,8 @@ def initialize_model_parallel(
            └─> DiffusionEngine submits scheduled request to executor.add_req(req)
 
 4. Worker Execution
-   └─> WorkerProc.worker_busy_loop()
-       └─> GPUWorker.execute_model(reqs)
+   └─> WorkerProc._worker_busy_loop()
+       └─> DiffusionWorker.execute_model(req)
            └─> Pipeline.forward(req)
                ├─> encode_prompt()
                ├─> prepare_latents()
