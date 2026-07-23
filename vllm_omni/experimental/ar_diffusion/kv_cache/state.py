@@ -173,6 +173,17 @@ class ARDiffusionKVState:
             for i in range(self.num_layers)
         ]
 
+    def clear_cross_attention(self) -> None:
+        """Invalidate all named cross-attention caches without dropping self-KV.
+
+        Prompt changes may preserve the autoregressive world history while
+        requiring fresh text projections. This operation deliberately leaves
+        branch adapters and their resident self-attention blocks untouched.
+        """
+        if self._closed:
+            raise RuntimeError(f"AR-Diffusion session {self.session_id!r} is closed")
+        self.kv_cache.release_cross_attention(self.session_id)
+
     def close(self) -> None:
         """Release all self- and cross-attention storage owned by this session."""
         if self._closed:

@@ -7,7 +7,8 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
@@ -17,6 +18,7 @@ import torch.nn.functional as F
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -36,16 +38,31 @@ from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import (
     load_camera_trajectory,
     resolve_trusted_action_directory,
 )
-from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import CausalLingBotWorldTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import (
+    CausalLingBotWorldTransformer3DModel,
+    LingBotAttentionCache,
+    LingBotTransformerCache,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.experimental.ar_diffusion.capability import (
+    ARDiffusionCrossAttentionKVSpec,
+    ARDiffusionKVBranchSpec,
+    ARDiffusionKVCacheSpec,
+)
+from vllm_omni.experimental.ar_diffusion.tick_protocol import (
+    ARDiffusionChunkMetadata,
+    ARDiffusionTickRequest,
+)
 
 if TYPE_CHECKING:
     from tqdm.std import tqdm as TqdmProgressBar
 
-    from vllm_omni.diffusion.models.wan2_2.lingbot_world_transformer import LingBotTransformerCache
+    from vllm_omni.experimental.ar_diffusion.kv_cache.state import (
+        ARDiffusionKVState,
+    )
 
 LINGBOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _CAMERA_SPATIAL_FOLD = 8
@@ -75,6 +92,16 @@ class _LingBotRequestInputs:
     max_sequence_length: int
     flow_shift: float
     generator: torch.Generator
+
+
+@dataclass
+class _LingBotARSessionState:
+    """Small model-owned state; attention tensors remain runner-owned."""
+
+    next_chunk_index: int = 0
+    prompt: str | None = None
+    generator_state: torch.Tensor | None = None
+    image_condition: torch.Tensor | None = None
 
 
 def _positive_finite_flow_shift(value: Any) -> float:
@@ -222,21 +249,61 @@ def get_lingbot_world_pre_process_func(
         extra_args = getattr(request.sampling_params, "extra_args", None) or {}
         if not isinstance(extra_args, dict):
             raise ValueError("sampling_params.extra_args must be a mapping.")
-        action_path = extra_args.get("action_path")
-        if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
-            raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
-        if not configured_action_root:
-            raise ValueError(
-                "sampling_params.extra_args.action_path requires a trusted action root configured by "
-                f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+        tick = ARDiffusionTickRequest.from_extra_args(
+            extra_args,
+            request_id=getattr(request, "request_id", "legacy-lingbot-request"),
+        )
+        if tick is not None:
+            camera_controls = [
+                control
+                for control in tick.controls
+                if control.track == "camera" and control.schema == "lingbot.camera_trajectory.v1"
+            ]
+            if len(camera_controls) != 1:
+                raise ValueError(
+                    "LingBot realtime ticks require exactly one camera control "
+                    "with schema 'lingbot.camera_trajectory.v1'."
+                )
+            camera_data = camera_controls[0].data
+            try:
+                poses = torch.as_tensor(camera_data["poses"], dtype=torch.float32)
+                intrinsics = torch.as_tensor(
+                    camera_data["intrinsics"],
+                    dtype=torch.float32,
+                )
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("lingbot.camera_trajectory.v1 requires numeric poses and intrinsics fields.") from None
+            if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+                raise ValueError("camera control poses must have shape [frames, 4, 4].")
+            if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
+                raise ValueError("camera control intrinsics must have shape [frames, 4].")
+            if poses.shape[0] != intrinsics.shape[0] or poses.shape[0] == 0:
+                raise ValueError("camera control poses and intrinsics must contain the same positive number of frames.")
+            if not torch.isfinite(poses).all() or not torch.isfinite(intrinsics).all():
+                raise ValueError("camera control values must all be finite.")
+            trajectory = CameraTrajectory(
+                poses=poses,
+                intrinsics=intrinsics,
             )
-        action_directory = resolve_trusted_action_directory(action_path, configured_action_root)
-        try:
-            trajectory = load_camera_trajectory(action_directory)
-        except OSError:
-            raise ValueError(
-                "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
-            ) from None
+        else:
+            action_path = extra_args.get("action_path")
+            if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
+                raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
+            if not configured_action_root:
+                raise ValueError(
+                    "sampling_params.extra_args.action_path requires a trusted action root configured by "
+                    f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+                )
+            action_directory = resolve_trusted_action_directory(
+                action_path,
+                configured_action_root,
+            )
+            try:
+                trajectory = load_camera_trajectory(action_directory)
+            except OSError:
+                raise ValueError(
+                    "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
+                ) from None
 
         updated_prompt = dict(prompt)
         updated_multi_modal_data = dict(multi_modal_data)
@@ -272,6 +339,8 @@ def get_lingbot_world_post_process_func(od_config: OmniDiffusionConfig) -> Calla
         output_type: str = "np",
         sampling_params: Any | None = None,
     ) -> Any:
+        if isinstance(video, dict) and isinstance(video.get("payload"), dict):
+            return video
         if sampling_params is not None:
             output_type = getattr(sampling_params, "output_type", None) or output_type
         if output_type == "latent":
@@ -298,6 +367,8 @@ class LingBotWorldCausalDMDPipeline(
     _vae_modules: ClassVar[list[str]] = ["vae"]
     # Generic warmup cannot synthesize the required camera action directory.
     dummy_run_num_frames: ClassVar[int] = 0
+    _AR_BRANCH = "main"
+    _AR_TEXT_CACHE = "text"
 
     def __init__(
         self,
@@ -394,6 +465,11 @@ class LingBotWorldCausalDMDPipeline(
 
         self.vae_scale_factor_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
+        model_config = getattr(od_config, "model_config", None) or {}
+        self._ar_height = int(model_config.get("ar_diffusion_height", 480))
+        self._ar_width = int(model_config.get("ar_diffusion_width", 832))
+        self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
+        self._ar_sessions: dict[str, _LingBotARSessionState] = {}
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
                 "vae.encode",
@@ -404,6 +480,68 @@ class LingBotWorldCausalDMDPipeline(
             ],
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
+
+    def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
+        """Describe the fixed worker-local cache geometry for realtime ticks."""
+        patch_frames, patch_height, patch_width = self.transformer.config.patch_size
+        if patch_frames != 1:
+            raise ValueError("LingBot AR-Diffusion requires temporal patch size 1.")
+        spatial = self.vae_scale_factor_spatial
+        if self._ar_height % (spatial * patch_height) or self._ar_width % (spatial * patch_width):
+            raise ValueError("ar_diffusion_height/width must align with VAE and DiT patch sizes.")
+        latent_height = self._ar_height // spatial
+        latent_width = self._ar_width // spatial
+        tokens_per_frame = (latent_height // patch_height) * (latent_width // patch_width)
+        tp_size = get_tensor_model_parallel_world_size()
+        num_local_heads = int(self.transformer.config.num_attention_heads) // tp_size
+        total_window_frames = (
+            int(self.transformer.config.local_attn_size)
+            if int(self.transformer.config.local_attn_size) != -1
+            else int(self.transformer.config.sliding_window_num_frames)
+        )
+        sink_frames = int(self.transformer.config.sink_size)
+        recent_window_frames = total_window_frames - sink_frames
+        if recent_window_frames <= 0:
+            raise ValueError("LingBot AR-Diffusion cache needs a positive recent window after reserving sink frames.")
+        return ARDiffusionKVCacheSpec(
+            num_layers=int(self.transformer.config.num_layers),
+            num_kv_heads=num_local_heads,
+            head_size=int(self.transformer.config.attention_head_dim),
+            tokens_per_frame=tokens_per_frame,
+            frames_per_block=int(self.transformer.config.num_frames_per_block),
+            window_frames=recent_window_frames,
+            sink_frames=sink_frames,
+            kv_branches=(ARDiffusionKVBranchSpec(self._AR_BRANCH, 0),),
+            session_capacity=1,
+            cross_attention=(
+                ARDiffusionCrossAttentionKVSpec(
+                    self._AR_TEXT_CACHE,
+                    _MAX_SEQUENCE_LENGTH,
+                ),
+            ),
+        )
+
+    @contextmanager
+    def bind_ar_diffusion_state(
+        self,
+        session_id: str,
+        state: ARDiffusionKVState,
+    ):
+        if self._ar_diffusion_kv_state is not None:
+            raise RuntimeError("LingBot AR-Diffusion state is already bound.")
+        if state.session_id != session_id:
+            raise ValueError(f"LingBot bound session mismatch: {state.session_id!r} != {session_id!r}.")
+        self._ar_diffusion_kv_state = state
+        try:
+            yield
+        finally:
+            self._ar_diffusion_kv_state = None
+
+    def reset_ar_diffusion_session(self, session_id: str) -> None:
+        self._ar_sessions.pop(session_id, None)
+
+    def close_ar_diffusion_session(self, session_id: str) -> None:
+        self._ar_sessions.pop(session_id, None)
 
     def _parse_request(self, req: DiffusionRequestBatch) -> _LingBotRequestInputs:
         if req.num_reqs != 1 or len(req.prompts) != 1:
@@ -664,13 +802,93 @@ class LingBotWorldCausalDMDPipeline(
         )
         return _fold_camera_embedding(camera_embedding)
 
+    def _ar_text_caches(
+        self,
+        prompt_embeds: torch.Tensor,
+        *,
+        invalidate: bool,
+    ) -> list[LingBotAttentionCache]:
+        state = self._ar_diffusion_kv_state
+        if state is None:
+            raise RuntimeError("LingBot AR text cache requested without a bound state.")
+        if invalidate:
+            state.clear_cross_attention()
+        if not state.is_cross_attention_populated(
+            self._AR_BRANCH,
+            self._AR_TEXT_CACHE,
+        ):
+            projected_text = self.transformer.text_embedding(prompt_embeds)
+
+            def layer_kv():
+                for block in self.transformer.blocks:
+                    cross_attention = block.cross_attn
+                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
+                        2,
+                        (
+                            cross_attention.num_local_heads,
+                            cross_attention.head_dim,
+                        ),
+                    )
+                    value = cross_attention.v(projected_text).unflatten(
+                        2,
+                        (
+                            cross_attention.num_local_heads,
+                            cross_attention.head_dim,
+                        ),
+                    )
+                    yield key, value
+
+            state.populate_cross_attention(
+                self._AR_BRANCH,
+                self._AR_TEXT_CACHE,
+                layer_kv(),
+            )
+        return [
+            LingBotAttentionCache(
+                key=layer["k"],
+                value=layer["v"],
+                end=prompt_embeds.shape[1],
+                absolute_end=prompt_embeds.shape[1],
+                last_start=0,
+            )
+            for layer in state.get_cross_attention_kv(
+                self._AR_BRANCH,
+                self._AR_TEXT_CACHE,
+            )
+        ]
+
+    def _ar_transformer_cache(
+        self,
+        *,
+        condition: torch.Tensor,
+        cross_attention: list[LingBotAttentionCache],
+        commit_current: bool,
+    ) -> LingBotTransformerCache:
+        state = self._ar_diffusion_kv_state
+        if state is None:
+            raise RuntimeError("LingBot AR cache requested without a bound state.")
+        patch_frames, patch_height, patch_width = self.transformer.config.patch_size
+        frames = condition.shape[2] // patch_frames
+        height = condition.shape[3] // patch_height
+        width = condition.shape[4] // patch_width
+        seq_len = frames * height * width
+        return LingBotTransformerCache(
+            self_attention=state.get_kv_caches(
+                self._AR_BRANCH,
+                seq_len=seq_len,
+                commit_current=commit_current,
+            ),
+            cross_attention=cross_attention,
+        )
+
     def _generate_block(
         self,
         *,
         condition: torch.Tensor,
         camera: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        cache: LingBotTransformerCache,
+        cache: LingBotTransformerCache | None,
+        ar_cross_attention: list[LingBotAttentionCache] | None,
         start_frame: int,
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
@@ -695,12 +913,24 @@ class LingBotWorldCausalDMDPipeline(
             # Checkpoint channel contract:
             # [noise/x_t(16), temporal_mask(4), image_latent(16)] -> 36.
             model_input = torch.cat((current_latents.to(dtype=condition.dtype), condition), dim=1)
+            current_cache = (
+                self._ar_transformer_cache(
+                    condition=condition,
+                    cross_attention=cast(
+                        list[LingBotAttentionCache],
+                        ar_cross_attention,
+                    ),
+                    commit_current=False,
+                )
+                if ar_cross_attention is not None
+                else cast(LingBotTransformerCache, cache)
+            )
             flow_prediction = self.transformer(
                 hidden_states=model_input,
                 timestep=timestep,
                 encoder_hidden_states=prompt_embeds,
                 camera_hidden_states=camera,
-                cache=cache,
+                cache=current_cache,
                 start_frame=start_frame,
                 update_cache=False,
             )
@@ -729,15 +959,32 @@ class LingBotWorldCausalDMDPipeline(
 
         # Commit K/V only for the final clean block, never for noisy probes.
         cache_input = torch.cat((current_latents.to(dtype=condition.dtype), condition), dim=1)
+        commit_cache = (
+            self._ar_transformer_cache(
+                condition=condition,
+                cross_attention=cast(
+                    list[LingBotAttentionCache],
+                    ar_cross_attention,
+                ),
+                commit_current=True,
+            )
+            if ar_cross_attention is not None
+            else cast(LingBotTransformerCache, cache)
+        )
         self.transformer(
             hidden_states=cache_input,
             timestep=torch.zeros(1, device=self.device, dtype=torch.float32),
             encoder_hidden_states=prompt_embeds,
             camera_hidden_states=camera,
-            cache=cache,
+            cache=commit_cache,
             start_frame=start_frame,
             update_cache=True,
         )
+        if ar_cross_attention is not None:
+            state = self._ar_diffusion_kv_state
+            if state is None:
+                raise RuntimeError("LingBot AR state disappeared before KV commit.")
+            state.commit_paged_context(self._AR_BRANCH)
         return current_latents
 
     def encode_prompt(
@@ -764,6 +1011,39 @@ class LingBotWorldCausalDMDPipeline(
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         inputs = self._parse_request(req)
+        tick = ARDiffusionTickRequest.from_extra_args(
+            req.sampling_params.extra_args,
+            request_id=getattr(req, "request_id", "legacy-lingbot-request"),
+        )
+        if tick is not None and self._ar_diffusion_kv_state is None:
+            raise RuntimeError("LingBot typed ticks require ARDiffusionEngine session binding.")
+        if tick is None and self._ar_diffusion_kv_state is not None:
+            raise ValueError("LingBot ARDiffusionEngine requests must carry ar_diffusion_tick.")
+        session_state: _LingBotARSessionState | None = None
+        if tick is not None:
+            if tick.prompt is not None and " ".join(tick.prompt.split()) != " ".join(inputs.prompt.split()):
+                raise ValueError("ar_diffusion_tick.prompt must match the standard request prompt.")
+            if inputs.num_latent_frames != int(self.transformer.config.num_frames_per_block):
+                raise ValueError("A LingBot AR-Diffusion request must generate exactly one three-latent-frame block.")
+            if (inputs.height, inputs.width) != (
+                self._ar_height,
+                self._ar_width,
+            ):
+                raise ValueError(
+                    "LingBot AR-Diffusion request resolution must match the "
+                    "fixed cache geometry "
+                    f"{self._ar_height}x{self._ar_width}."
+                )
+            session_state = self._ar_sessions.setdefault(
+                tick.session_id,
+                _LingBotARSessionState(),
+            )
+            if tick.chunk_index != session_state.next_chunk_index:
+                raise ValueError(
+                    "LingBot chunk_index must be contiguous within a session: "
+                    f"expected {session_state.next_chunk_index}, got "
+                    f"{tick.chunk_index}."
+                )
         schedule = _build_shifted_flow_schedule(
             flow_shift=inputs.flow_shift,
         )
@@ -774,7 +1054,30 @@ class LingBotWorldCausalDMDPipeline(
             max_sequence_length=inputs.max_sequence_length,
             dtype=dtype,
         )
-        condition = self._prepare_condition(inputs, dtype=dtype)
+        if tick is None:
+            condition = self._prepare_condition(inputs, dtype=dtype)
+        else:
+            assert session_state is not None
+            if session_state.image_condition is None:
+                horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
+                session_state.image_condition = self._prepare_condition(
+                    replace(
+                        inputs,
+                        num_frames=_MAX_RAW_FRAMES,
+                        num_latent_frames=horizon_latent_frames,
+                    ),
+                    dtype=dtype,
+                )
+            block_frames = int(self.transformer.config.num_frames_per_block)
+            condition_start = tick.chunk_index * block_frames
+            condition_stop = condition_start + block_frames
+            if condition_stop > session_state.image_condition.shape[2]:
+                raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
+            condition = session_state.image_condition[
+                :,
+                :,
+                condition_start:condition_stop,
+            ]
         camera = self._prepare_camera(inputs, dtype=dtype)
         if camera.shape[2:] != condition.shape[2:]:
             raise RuntimeError(
@@ -782,30 +1085,48 @@ class LingBotWorldCausalDMDPipeline(
                 f"got camera={tuple(camera.shape)}, condition={tuple(condition.shape)}."
             )
 
-        # Phase 2: allocate state owned by this request. The Pipeline object is
-        # shared, but its causal K/V cache and RNG must never be shared.
         block_frames = int(self.transformer.config.num_frames_per_block)
-        cache = self.transformer.allocate_cache(
-            batch_size=1,
-            latent_height=condition.shape[-2],
-            latent_width=condition.shape[-1],
-            device=self.device,
-            dtype=dtype,
-        )
+        cache: LingBotTransformerCache | None = None
+        ar_cross_attention: list[LingBotAttentionCache] | None = None
+        if tick is None:
+            # Direct/offline oracle keeps request-local contiguous K/V.
+            cache = self.transformer.allocate_cache(
+                batch_size=1,
+                latent_height=condition.shape[-2],
+                latent_width=condition.shape[-1],
+                device=self.device,
+                dtype=dtype,
+            )
+        else:
+            assert session_state is not None
+            prompt_changed = session_state.prompt is not None and session_state.prompt != inputs.prompt
+            if session_state.generator_state is not None:
+                inputs.generator.set_state(session_state.generator_state)
+            ar_cross_attention = self._ar_text_caches(
+                prompt_embeds,
+                invalidate=prompt_changed,
+            )
         generated_blocks: list[torch.Tensor] = []
         total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
+        first_start_frame = tick.chunk_index * block_frames if tick is not None else 0
         with self.progress_bar(total=total_steps) as progress_bar:
             # Phase 3: generate left-to-right in latent-frame blocks. The
             # monotonically increasing ``start_frame`` is also the temporal
             # position and cache offset used by the Transformer.
-            for start_frame in range(0, inputs.num_latent_frames, block_frames):
-                stop_frame = start_frame + block_frames
+            for local_start_frame in range(
+                0,
+                inputs.num_latent_frames,
+                block_frames,
+            ):
+                start_frame = first_start_frame + local_start_frame
+                stop_frame = local_start_frame + block_frames
                 generated_blocks.append(
                     self._generate_block(
-                        condition=condition[:, :, start_frame:stop_frame],
-                        camera=camera[:, :, start_frame:stop_frame],
+                        condition=condition[:, :, local_start_frame:stop_frame],
+                        camera=camera[:, :, local_start_frame:stop_frame],
                         prompt_embeds=prompt_embeds,
                         cache=cache,
+                        ar_cross_attention=ar_cross_attention,
                         start_frame=start_frame,
                         schedule=schedule,
                         generator=inputs.generator,
@@ -813,11 +1134,25 @@ class LingBotWorldCausalDMDPipeline(
                     )
                 )
         generated_latents = torch.cat(generated_blocks, dim=2)
-        del cache
+        if tick is not None:
+            assert session_state is not None
+            session_state.prompt = inputs.prompt
+            session_state.generator_state = inputs.generator.get_state()
+            session_state.next_chunk_index += 1
 
         # Phase 4: either expose model-space latents or invert the checkpoint's
         # latent normalization and decode to pixel-space video.
-        if inputs.output_type == "latent":
+        if tick is not None:
+            if inputs.output_type != "latent":
+                raise ValueError(
+                    "LingBot realtime ticks currently require output_type='latent'; "
+                    "stateful streaming VAE decode is a separate integration step."
+                )
+            output = {
+                "payload": {"latents": generated_latents},
+                "metadata": {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(tick).to_dict()},
+            }
+        elif inputs.output_type == "latent":
             output = generated_latents
         else:
             latent_mean, latent_std = self._vae_latent_stats(generated_latents)

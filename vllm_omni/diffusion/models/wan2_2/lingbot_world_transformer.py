@@ -26,6 +26,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionPagedLayerContext,
+    ARDiffusionPagedLayerInputs,
+    paged_write_attn,
+)
 
 
 @dataclass
@@ -50,7 +55,7 @@ class LingBotAttentionCache:
 class LingBotTransformerCache:
     """One request's per-layer video K/V and reusable text K/V."""
 
-    self_attention: list[LingBotAttentionCache]
+    self_attention: list[LingBotAttentionCache | ARDiffusionPagedLayerContext | ARDiffusionPagedLayerInputs]
     cross_attention: list[LingBotAttentionCache | None]
 
 
@@ -260,7 +265,7 @@ class LingBotSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        cache: LingBotAttentionCache,
+        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
         current_start: int,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         sink_tokens: int,
@@ -281,17 +286,30 @@ class LingBotSelfAttention(nn.Module):
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
 
-        # The attention kernel sees history + current K/V even when the caller
-        # asks not to mutate persistent cache state.
-        visible_key, visible_value = self._update_cache(
-            cache,
-            key,
-            value,
-            current_start,
-            sink_tokens=sink_tokens,
-            update_cache=update_cache,
-        )
-        output = self.attn(query, visible_key, visible_value)
+        if isinstance(cache, ARDiffusionPagedLayerInputs):
+            if query.shape[0] != 1:
+                raise RuntimeError("LingBot AR-Diffusion paged attention requires batch_size=1.")
+            output = paged_write_attn(
+                cache,
+                query[0],
+                key[0],
+                value[0],
+                None,
+                None,
+                self.head_dim**-0.5,
+            ).unsqueeze(0)
+        else:
+            # The direct path sees history + current K/V even when the caller
+            # asks not to mutate persistent cache state.
+            visible_key, visible_value = self._update_cache(
+                cache,
+                key,
+                value,
+                current_start,
+                sink_tokens=sink_tokens,
+                update_cache=update_cache,
+            )
+            output = self.attn(query, visible_key, visible_value)
         return self.o(output.flatten(2, 3))
 
 
@@ -477,7 +495,7 @@ class LingBotAttentionBlock(nn.Module):
         timestep_projection: torch.Tensor,
         camera_hidden_states: torch.Tensor,
         *,
-        self_cache: LingBotAttentionCache,
+        self_cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
         cross_cache: LingBotAttentionCache | None,
         current_start: int,
         sink_tokens: int,
@@ -1066,6 +1084,23 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             if any(value is None for value in cache.cross_attention)
             else None
         )
+        if cache.self_attention and isinstance(cache.self_attention[0], ARDiffusionPagedLayerContext):
+            if batch_size != 1:
+                raise RuntimeError("LingBot AR-Diffusion paged attention requires batch_size=1.")
+            forward_context = cache.self_attention[0].forward_ctx
+            expected_seq_len = patched_frames * tokens_per_frame
+            if forward_context.seq_len != expected_seq_len:
+                raise RuntimeError(
+                    "LingBot AR-Diffusion paged context token count does not "
+                    f"match this block: {forward_context.seq_len} != "
+                    f"{expected_seq_len}."
+                )
+            forward_context.prepare(
+                device=hidden_states.device,
+                action_len=0,
+                query_len=hidden_states.shape[1],
+            )
+            cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
         # Phase 3: each layer receives its own cache entry. Text K/V is passed
         # only when absent; the returned cache is stored for subsequent DMD
         # steps and causal blocks in this request.

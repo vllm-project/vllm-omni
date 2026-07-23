@@ -627,3 +627,44 @@ pytest -q \
   tests/diffusion/models/wan2_2/test_lingbot_world_typing.py \
   tests/diffusion/models/wan2_2/test_lingbot_world_camera.py
 ```
+
+### 2026-07-23：PR C model/runtime tick bridge
+
+已实现：
+
+- LingBot pipeline 实现 `SupportsARDiffusionPipeline` capability；
+- 固定 realtime resolution，并从 VAE/patch geometry 计算
+  `tokens_per_frame`；
+- 单逻辑 branch `main`、3 latent frames/block；
+- direct contiguous self-KV 与 AR paged self-KV 双路径；
+- 四次 DMD probe 使用 scratch pages，clean forward 只 commit 一次；
+- runner-owned named text cross-KV；
+- prompt 更新只清 cross-KV，不清 world self-KV；
+- model session 持有 chunk cursor、RNG state、prompt 和 causal
+  image-condition horizon；
+- typed camera trajectory control 的 LingBot adapter；
+- 一个 typed request 只生成一个 block；
+- 标准 latent payload + `metadata.ar_diffusion` envelope；
+- reset/close/failure cleanup hook。
+
+问题驱动的代码掌握文档：
+
+```text
+docs/design/lingbot_world_v2_pr_c_guide.md
+```
+
+本机实际通过：
+
+```bash
+python3.11 -m pytest \
+  -o addopts='' \
+  --confcutdir=tests/diffusion/models/wan2_2 \
+  -q tests/diffusion/models/wan2_2/test_lingbot_world_attention.py
+# 14 passed
+```
+
+所有 PR C Python 文件通过 `ruff check`、`py_compile` 和
+`git diff --check`。完整 pipeline/runner pytest 仍需要带已构建 vLLM 和
+完整 diffusion dependencies 的 Linux/CUDA 或 CI 环境；本机临时
+Python 3.11 环境在收集阶段缺少 vLLM runtime dependencies，不能把
+“未收集”误报为测试通过。

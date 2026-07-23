@@ -18,6 +18,10 @@ from torch import nn
 import vllm_omni.diffusion.models.wan2_2.pipeline_lingbot_world as lingbot_pipeline
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
 from vllm_omni.diffusion.models.wan2_2.lingbot_world_camera import CameraTrajectory as _CameraTrajectory
+from vllm_omni.experimental.ar_diffusion.tick_protocol import (
+    ARDiffusionControlInput,
+    ARDiffusionTickRequest,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -109,6 +113,7 @@ class _RecordingTransformer(nn.Module):
             num_frames_per_block=3,
             sliding_window_num_frames=6,
             local_attn_size=-1,
+            sink_size=3,
         )
         self.blocks = nn.ModuleList([nn.Identity(), nn.Identity()])
         for block in self.blocks:
@@ -258,6 +263,10 @@ class _RequestBatch:
     def sampling_params(self):
         return self._sampling
 
+    @property
+    def request_id(self):
+        return "legacy-lingbot-request"
+
 
 def _load_pipeline_module():
     return lingbot_pipeline
@@ -353,7 +362,11 @@ def _od_config(**overrides):
         "flow_shift": None,
         "quantization_config": None,
         "enable_diffusion_pipeline_profiler": False,
-        "model_config": {"lingbot_action_root": str(_ROOT)},
+        "model_config": {
+            "lingbot_action_root": str(_ROOT),
+            "ar_diffusion_height": 16,
+            "ar_diffusion_width": 16,
+        },
         "enable_cpu_offload": False,
         "enable_layerwise_offload": False,
         "parallel_config": SimpleNamespace(
@@ -410,6 +423,23 @@ def test_pipeline_respects_loader_managed_component_placement(offload_field: str
     assert getattr(pipeline.vae, "to_calls", []) == []
 
 
+def test_ar_diffusion_capability_uses_fixed_tp_local_lingbot_geometry() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+
+    spec = pipeline.ar_diffusion_kv_cache_spec()
+
+    assert spec.num_layers == 2
+    assert spec.num_kv_heads == 2
+    assert spec.head_size == 4
+    assert spec.tokens_per_frame == 1
+    assert spec.frames_per_block == 3
+    assert spec.window_frames == 3
+    assert spec.sink_frames == 3
+    assert [(branch.name, branch.local_index) for branch in spec.kv_branches] == [("main", 0)]
+    assert spec.cross_attention_lengths == {"text": 512}
+
+
 def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_path: Path) -> None:
     module = _load_pipeline_module()
     action_root = tmp_path / "trusted-actions"
@@ -441,6 +471,40 @@ def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_pat
     assert sampling.extra_args["action_path"] == "forward"
     assert sampling.extra_args["_lingbot_camera_trajectory"] is trajectory
     assert len(load_calls) == 1
+
+
+def test_preprocess_materializes_camera_from_typed_tick_without_action_path() -> None:
+    module = _load_pipeline_module()
+    poses = torch.eye(4).repeat(9, 1, 1)
+    intrinsics = torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(9, 1)
+    tick = ARDiffusionTickRequest(
+        session_id="world-1",
+        request_id="tick-request-0",
+        chunk_index=0,
+        controls=(
+            ARDiffusionControlInput(
+                track="camera",
+                schema="lingbot.camera_trajectory.v1",
+                data={
+                    "poses": poses.tolist(),
+                    "intrinsics": intrinsics.tolist(),
+                },
+            ),
+        ),
+    )
+    sampling = _SamplingParams(include_action=False)
+    sampling.extra_args.update(tick.to_extra_args())
+    request = SimpleNamespace(
+        request_id="tick-request-0",
+        prompt=_prompt(),
+        sampling_params=sampling,
+    )
+
+    result = module.get_lingbot_world_pre_process_func(_od_config())(request)
+
+    trajectory = result.sampling_params.extra_args["_lingbot_camera_trajectory"]
+    torch.testing.assert_close(trajectory.poses, poses)
+    torch.testing.assert_close(trajectory.intrinsics, intrinsics)
 
 
 def _request(*, sampling=None, prompt=None, num_reqs: int = 1):
@@ -1317,6 +1381,104 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
     transformer.calls.clear()
     gc.collect()
     assert cache_ref() is None
+
+
+def _tick_extra_args(*, chunk_index: int, prompt: str = "move through the room"):
+    return ARDiffusionTickRequest(
+        session_id="world-1",
+        request_id="legacy-lingbot-request",
+        chunk_index=chunk_index,
+        applied_event_ids=(chunk_index,),
+        prompt=prompt,
+        controls=(
+            ARDiffusionControlInput(
+                track="camera",
+                schema="lingbot.camera_trajectory.v1",
+                data={"poses": [], "intrinsics": []},
+            ),
+        ),
+    ).to_extra_args()
+
+
+def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    cross_calls = []
+    generated = []
+
+    def ar_text_caches(prompt_embeds, *, invalidate):
+        del prompt_embeds
+        cross_calls.append(invalidate)
+        return [SimpleNamespace()]
+
+    def generate_block(**kwargs):
+        block = torch.randn(
+            (1, 16, 3, 2, 2),
+            generator=kwargs["generator"],
+        )
+        generated.append(
+            {
+                "start_frame": kwargs["start_frame"],
+                "condition": kwargs["condition"].clone(),
+                "block": block.clone(),
+            }
+        )
+        return block
+
+    monkeypatch.setattr(pipeline, "_ar_text_caches", ar_text_caches)
+    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+
+    first_sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=0))
+    first = pipeline(_request(sampling=first_sampling))
+    second_sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=1))
+    second = pipeline(_request(sampling=second_sampling))
+
+    assert generated[0]["start_frame"] == 0
+    assert generated[1]["start_frame"] == 3
+    assert torch.count_nonzero(generated[0]["condition"]) > 0
+    torch.testing.assert_close(
+        generated[1]["condition"][:, :4],
+        torch.zeros_like(generated[1]["condition"][:, :4]),
+    )
+    assert torch.count_nonzero(generated[1]["condition"][:, 4:]) > 0
+    assert cross_calls == [False, False]
+    assert first.output["payload"]["latents"].shape == (1, 16, 3, 2, 2)
+    assert second.output["metadata"]["ar_diffusion"] == {
+        "session_id": "world-1",
+        "request_id": "legacy-lingbot-request",
+        "chunk_index": 1,
+        "applied_event_ids": [1],
+    }
+    assert pipeline._ar_sessions["world-1"].next_chunk_index == 2
+    expected_generator = torch.Generator(device="cpu").manual_seed(17)
+    expected_first = torch.randn((1, 16, 3, 2, 2), generator=expected_generator)
+    expected_second = torch.randn((1, 16, 3, 2, 2), generator=expected_generator)
+    torch.testing.assert_close(generated[0]["block"], expected_first)
+    torch.testing.assert_close(generated[1]["block"], expected_second)
+
+
+def test_typed_tick_rejects_non_contiguous_chunk_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    monkeypatch.setattr(
+        pipeline,
+        "_ar_text_caches",
+        lambda *args, **kwargs: [SimpleNamespace()],
+    )
+
+    sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=2))
+    with pytest.raises(ValueError, match="must be contiguous"):
+        pipeline(_request(sampling=sampling))
 
 
 def test_request_cache_is_released_before_vae_decode() -> None:

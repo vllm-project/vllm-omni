@@ -54,6 +54,10 @@ def _install_macos_vllm_stubs() -> None:
         "vllm_omni.diffusion.layers",
         "vllm_omni.diffusion.layers.norm",
         "vllm_omni.diffusion.layers.rope",
+        "vllm_omni.experimental",
+        "vllm_omni.experimental.ar_diffusion",
+        "vllm_omni.experimental.ar_diffusion.kv_cache",
+        "vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention",
     ):
         ensure_module(name)
 
@@ -185,6 +189,20 @@ def _install_macos_vllm_stubs() -> None:
 
     sys.modules["vllm_omni.diffusion.layers.rope"].RotaryEmbeddingWan = _RotaryEmbeddingWan
 
+    paged_attention = sys.modules["vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention"]
+
+    class _PagedLayerContext:
+        pass
+
+    class _PagedLayerInputs:
+        pass
+
+    paged_attention.ARDiffusionPagedLayerContext = _PagedLayerContext
+    paged_attention.ARDiffusionPagedLayerInputs = _PagedLayerInputs
+    paged_attention.paged_write_attn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("paged path was not expected in this direct-cache test")
+    )
+
 
 def _load_module():
     assert _MODULE_PATH.exists(), "LingBot attention module has not been implemented"
@@ -311,6 +329,33 @@ def test_self_attention_uses_one_fused_qkv_projection() -> None:
     attention(_tokens(1, 2), cache=cache, current_start=0, sink_tokens=0)
 
     assert attention.qkv.calls == 1
+
+
+def test_self_attention_routes_paged_inputs_through_engine_owned_cache() -> None:
+    module = _load_module()
+    attention = module.LingBotSelfAttention(dim=2, num_heads=1)
+    _set_identity_attention(attention)
+    paged_inputs = module.ARDiffusionPagedLayerInputs()
+    calls = []
+
+    def paged_write(inputs, query, key, value, k_act, v_act, scale):
+        calls.append((inputs, query.clone(), key.clone(), value.clone(), k_act, v_act, scale))
+        return query
+
+    module.paged_write_attn = paged_write
+    output = attention(
+        _tokens(1, 2),
+        cache=paged_inputs,
+        current_start=0,
+        sink_tokens=0,
+        update_cache=False,
+    )
+
+    assert output.shape == (1, 2, 2)
+    assert len(calls) == 1
+    assert calls[0][0] is paged_inputs
+    assert calls[0][4:6] == (None, None)
+    assert attention.attn.calls == []
     assert not any(hasattr(attention, name) for name in ("q", "k", "v"))
 
 
