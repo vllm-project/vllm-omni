@@ -217,3 +217,23 @@ def test_load_weights_rejects_external_weight_stream():
     assert pipeline.load_weights([]) == set()
     with pytest.raises(RuntimeError, match="components are loaded directly"):
         pipeline.load_weights([("transformer.weight", torch.zeros(1))])
+
+
+def test_construction_device_respects_offload_flags():
+    """Offload flags select host construction; otherwise keep the execution device."""
+    from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import (
+        _resolve_construction_device,
+    )
+
+    execution_device = torch.device("cuda", 0)
+    no_offload = SimpleNamespace(enable_layerwise_offload=False, enable_cpu_offload=False)
+    layerwise = SimpleNamespace(enable_layerwise_offload=True, enable_cpu_offload=False)
+    cpu_only = SimpleNamespace(enable_layerwise_offload=False, enable_cpu_offload=True)
+    both = SimpleNamespace(enable_layerwise_offload=True, enable_cpu_offload=True)
+
+    # Any offload requested -> materialize on the host so the backend can stream.
+    for cfg in (layerwise, cpu_only, both):
+        assert _resolve_construction_device(cfg, execution_device) == torch.device("cpu")
+
+    # No offload -> unchanged, preserving the validated single-device path.
+    assert _resolve_construction_device(no_offload, execution_device) == execution_device
