@@ -367,7 +367,7 @@ class TestSpeechAPI:
         assert response.headers["content-type"] == "audio/wav"
         assert len(response.content) > 0
 
-    def test_create_speech_includes_token_usage_headers(self, client):
+    def test_create_speech_includes_token_usage_and_detail_headers(self, client):
         payload = {
             "input": "Hello world",
             "model": "tts-model",
@@ -382,7 +382,7 @@ class TestSpeechAPI:
         assert response.headers["x-vllm-omni-input-text-tokens"] == "2"
         assert response.headers["x-vllm-omni-input-audio-tokens"] == "0"
 
-    def test_build_speech_usage_headers_uses_usage_field_names(self):
+    def test_build_speech_usage_headers_uses_usage_and_detail_field_names(self):
         usage = SpeechTokenUsage(
             input_tokens=7,
             output_tokens=11,
