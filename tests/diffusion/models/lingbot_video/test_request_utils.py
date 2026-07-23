@@ -242,6 +242,15 @@ def test_normalize_lingbot_request_model_size_overrides_sampling_dimensions():
         width=480,
         height=480,
         num_frames=81,
+        extra_args={"size": "320x192"},
+    )
+    assert (config.height, config.width) == (192, 320)
+
+    config = _normalize(
+        {"prompt": "motion", "modalities": ["video"]},
+        width=480,
+        height=480,
+        num_frames=81,
         extra_args={"resolution": "192p", "ratio": "9:16"},
     )
     assert (config.height, config.width) == (192, 320)

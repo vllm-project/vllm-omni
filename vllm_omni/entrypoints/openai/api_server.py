@@ -2805,13 +2805,6 @@ def _reference_video_decode_spec(
     return ReferenceVideoDecodeSpec(max_frames=video_params.num_frames, keep="first")
 
 
-def _preserve_reference_image_size(stage_configs: list[Any] | None) -> bool:
-    return any(
-        bool(getattr(model_cls, "preserve_input_image_size", False))
-        for model_cls in _diffusion_model_classes(stage_configs)
-    )
-
-
 def video_response_from_request(model_name: str, req: VideoGenerationRequest) -> VideoResponse:
     resp = VideoResponse(
         model=model_name,
@@ -3273,11 +3266,6 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
-    stage_configs = (
-        handler.stage_configs
-        or app_stage_configs
-        or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
-    )
     supports_mixed_reference_inputs = bool(getattr(handler, "supports_mixed_reference_inputs", False))
     if input_reference is not None:
         input_reference_bytes = await _read_upload_limited(
@@ -3294,6 +3282,11 @@ async def _parse_video_form(
 
     decode_spec = ReferenceVideoDecodeSpec()
     if not input_references and (parsed_video_reference is not None or input_reference_bytes is not None):
+        stage_configs = (
+            handler.stage_configs
+            or app_stage_configs
+            or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
+        )
         decode_spec = _reference_video_decode_spec(request, stage_configs)
     reference_image = None
     reference_video = None
@@ -3306,10 +3299,7 @@ async def _parse_video_form(
         else:
             images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references)
         if images:
-            reference_image = ReferenceImage(
-                data=images if len(images) > 1 else images[0],
-                preserve_input_image_size=_preserve_reference_image_size(stage_configs),
-            )
+            reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])
         if video_paths:
             reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
         if audio_paths:
@@ -3363,10 +3353,7 @@ async def _parse_video_form(
                         video_frames = list(media_data)
 
             if image_data:
-                reference_image = ReferenceImage(
-                    data=image_data if len(image_data) > 1 else image_data[0],
-                    preserve_input_image_size=_preserve_reference_image_size(stage_configs),
-                )
+                reference_image = ReferenceImage(data=image_data if len(image_data) > 1 else image_data[0])
             if video_paths:
                 reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
             elif video_frames is not None:

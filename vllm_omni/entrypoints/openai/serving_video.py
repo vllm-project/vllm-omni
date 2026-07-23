@@ -44,7 +44,6 @@ class ReferenceImage:
     """Reference class for tracking additional metadata if needed"""
 
     data: Image.Image | list[Image.Image]
-    preserve_input_image_size: bool = False
 
 
 @dataclass
@@ -155,12 +154,7 @@ class OmniOpenAIServingVideo:
         provided_fields = request.model_fields_set
         fps_provided = self._request_fps_provided(request)
         vp = request.resolve_video_params()
-        if (
-            input_image is not None
-            and not reference_image.preserve_input_image_size
-            and vp.width is not None
-            and vp.height is not None
-        ):
+        if input_image is not None and vp.width is not None and vp.height is not None:
             target_size = (vp.width, vp.height)
             image_items = input_image if isinstance(input_image, list) else [input_image]
             resized_images = [

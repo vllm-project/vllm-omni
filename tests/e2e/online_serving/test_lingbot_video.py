@@ -3,6 +3,7 @@
 
 """Online serving smoke coverage for the dense LingBot-Video checkpoint."""
 
+import json
 import os
 
 import pytest
@@ -94,6 +95,10 @@ def test_video_generation_modes_001(omni_server: OmniServer, openai_client: Open
 
     synthetic_image = generate_synthetic_image(320, 192, force_regenerate=True, seed=42)
     request_config["form_data"]["prompt"] = "the red block moves slowly while the camera remains fixed"
+    # Keep TI2V dimensions model-scoped until /v1/videos forwards raw reference images.
+    request_config["form_data"].pop("height")
+    request_config["form_data"].pop("width")
+    request_config["form_data"]["extra_params"] = json.dumps({"size": "320x192"}, separators=(",", ":"))
     request_config["image_reference"] = f"data:image/jpeg;base64,{synthetic_image['base64']}"
     responses = openai_client.send_video_diffusion_request(request_config)
     assert responses[0].videos

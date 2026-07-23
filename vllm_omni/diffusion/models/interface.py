@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 class SupportImageInput(Protocol):
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"  # Default color format
-    preserve_input_image_size: ClassVar[bool] = False
 
 
 @dataclass(frozen=True)

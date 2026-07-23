@@ -36,6 +36,13 @@ INPUT_IMAGE=/path/to/input.png bash run_curl_text_image_to_video.sh
 Remove the `input_reference` form field from the create request to select T2V.
 The example uses the lightweight `320x192`, 9-frame, two-step configuration.
 
+Until the shared `/v1/videos` reference-image resizing is removed, TI2V target
+dimensions must be sent through `extra_params`, for example
+`{"size":"320x192"}`. Do not use the top-level `size`, `width`, or `height`
+fields for TI2V because the serving layer currently applies those dimensions
+to the reference image before the model receives it. T2V requests can continue
+to use the top-level dimension fields.
+
 LingBot video frame counts use the causal VAE `4n+1` grid. The pipeline rounds
 any requested frame count upward to the next valid value. An explicit
 `num_frames` takes precedence over `seconds`; otherwise, the server first

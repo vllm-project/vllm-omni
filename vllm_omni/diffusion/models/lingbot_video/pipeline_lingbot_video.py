@@ -316,7 +316,6 @@ class LingBotVideoPipeline(
     """
 
     supports_step_execution: ClassVar[bool] = False
-    preserve_input_image_size: ClassVar[bool] = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
