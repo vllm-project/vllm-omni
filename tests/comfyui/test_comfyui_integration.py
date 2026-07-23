@@ -10,7 +10,7 @@ import multiprocessing
 import time
 import traceback
 from collections.abc import Iterable, Sequence
-from enum import StrEnum, auto
+from enum import auto
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
@@ -35,6 +35,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.enums import StrEnum
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

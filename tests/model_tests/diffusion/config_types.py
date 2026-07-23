@@ -3,13 +3,14 @@ Common definitions for controlling what tests run where.
 """
 
 from collections.abc import Callable
-from enum import StrEnum, auto
+from enum import auto
 from typing import NamedTuple, TypeAlias
 
 from pytest import MarkDecorator
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.enums import StrEnum
 
 # All builder funcs take no params and return a path
 TinyDiffusionBuilder: TypeAlias = Callable[[], str]
