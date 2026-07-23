@@ -765,6 +765,7 @@ class Flux2Transformer2DModel(nn.Module):
     )
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
     _sp_plan = {
         "": {
             "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
