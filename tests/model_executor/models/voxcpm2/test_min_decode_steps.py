@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the VoxCPM2 per-request minimum decode-step stop guard.
 
-The guard mirrors the native VoxCPM ``min_len`` check: below a per-request
-minimum number of decode steps, the learned stop head must not end the
-request — on any of the three stop-decision paths (cached-logits check,
-batched audio-collect precompute, and ``compute_logits``).
+The guard restores the native VoxCPM ``min_len`` policy: below a per-request
+minimum number of decode steps, the learned stop head must not end the request
+on any of the three stop-decision paths (cached-logits check, batched
+audio-collect precompute, and ``compute_logits``).
 """
 
 from __future__ import annotations
@@ -49,6 +49,45 @@ def _make_bare_talker():
 def test_runtime_config_guard_disabled_by_default():
     _, _, RuntimeConfig = _voxcpm2_talker_mod()
     cfg = RuntimeConfig()
+    assert cfg.min_decode_steps_per_text_token == 0.0
+    assert cfg.min_decode_steps_floor == 0
+
+
+@pytest.mark.parametrize(
+    ("text_token_count", "max_decode_steps", "expected"),
+    [
+        (0, 100, 4),  # floor wins
+        (5, 100, 4),  # ceil(5 * 0.6) remains below the floor
+        (10, 100, 6),  # ratio wins
+        (11, 100, 7),  # ratio rounds up
+        (100, 32, 32),  # hard decode cap wins
+        (-1, -1, 0),  # defensive normalization of counts/caps
+    ],
+)
+def test_runtime_config_computes_minimum_decode_steps(text_token_count, max_decode_steps, expected):
+    _, _, RuntimeConfig = _voxcpm2_talker_mod()
+    cfg = RuntimeConfig(
+        min_decode_steps_per_text_token=0.6,
+        min_decode_steps_floor=4,
+    )
+
+    assert (
+        cfg.minimum_decode_steps(
+            text_token_count=text_token_count,
+            max_decode_steps=max_decode_steps,
+        )
+        == expected
+    )
+
+
+def test_runtime_config_normalizes_invalid_minimum_decode_values():
+    _, _, RuntimeConfig = _voxcpm2_talker_mod()
+
+    cfg = RuntimeConfig(
+        min_decode_steps_per_text_token=float("nan"),
+        min_decode_steps_floor=-3,
+    )._normalized()
+
     assert cfg.min_decode_steps_per_text_token == 0.0
     assert cfg.min_decode_steps_floor == 0
 
@@ -127,6 +166,24 @@ def test_compute_logits_passes_stop_logits_at_min_decode_steps():
         min_decode_steps=10,
     )
     state.decode_step_count = 10
+    talker._active_states["req"] = state
+    talker._results_queue = [("req", state.precomputed_stop_logits)]
+
+    logits = talker.compute_logits(torch.zeros(1, 1))
+
+    assert logits[0, 1] > logits[0, 0]
+
+
+def test_forced_stop_takes_precedence_over_minimum_guard():
+    _, RState, _ = _voxcpm2_talker_mod()
+    talker = _make_bare_talker()
+    state = RState(
+        request_id="req",
+        precomputed_stop_logits=torch.tensor(_STOP_LOGITS),
+        min_decode_steps=10,
+        is_stopping=True,
+    )
+    state.decode_step_count = 5
     talker._active_states["req"] = state
     talker._results_queue = [("req", state.precomputed_stop_logits)]
 

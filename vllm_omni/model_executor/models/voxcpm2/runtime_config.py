@@ -34,10 +34,11 @@ class _VoxCPM2RuntimeConfig:
     deterministic_cfm_seed: int = 20260601
     # Prevents the learned stop head from ending a request before it has had
     # a fair chance to render the input text. Native VoxCPM2 (src/voxcpm)
-    # enforces a small `min_len=2` floor before honoring its stop flag; the
-    # vLLM-Omni port dropped that floor entirely, so a near-tied stop-vs-continue
-    # logit (made noisier by per-step CFM sampling noise feeding back into the
-    # next AR step) can end generation after a single decode step.
+    # checks `i > min_len` (default min_len=2), so it cannot stop before four
+    # audio patches have been generated. The vLLM-Omni port dropped that guard,
+    # allowing a near-tied stop-vs-continue logit (made noisier on later steps
+    # by CFM sampling noise feeding back into the AR state) to end generation
+    # on the first few patches.
     min_decode_steps_per_text_token: float = 0.0
     min_decode_steps_floor: int = 0
     audio_emit_every: int = 1
@@ -128,6 +129,16 @@ class _VoxCPM2RuntimeConfig:
 
     def unified_decode_graph_available(self, *, use_cuda_graph: bool) -> bool:
         return bool(use_cuda_graph and self.enable_unified_decode_graph and not self.deterministic_cfm_noise)
+
+    def minimum_decode_steps(self, *, text_token_count: int, max_decode_steps: int) -> int:
+        """Return the guarded decode count, excluding the prefill audio patch."""
+        token_count = max(0, int(text_token_count))
+        decode_cap = max(0, int(max_decode_steps))
+        minimum = max(
+            self.min_decode_steps_floor,
+            math.ceil(token_count * self.min_decode_steps_per_text_token),
+        )
+        return min(decode_cap, minimum)
 
     @staticmethod
     def _coerce_value(key: str, value: Any, default: Any) -> Any:

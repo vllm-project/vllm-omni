@@ -37,11 +37,13 @@ stages:
           # must sit BELOW the natural completed-speech range, or the stop head
           # gets suppressed after the sentence is already finished and the AR
           # model pads the tail with babble bursts ("short meaningless sounds").
-          # Measured on Turkish chunks (160ms audio per decode step): completed
-          # speech lands at 0.73-0.92 steps per input token, so 0.6 only binds
-          # on genuinely premature stops (e.g. the single-step CFM-noise blips
-          # this guard exists for). 0.85 sat inside the natural range and
-          # force-extended 4 of 5 chunks with trailing babble.
+          # Measured on Turkish chunks (160ms audio per generated patch):
+          # completed speech lands at 0.73-0.92 decode steps per input token,
+          # so 0.6 only binds on genuinely premature stops (e.g. the early CFM
+          # noise-driven blips this guard exists for). 0.85 sat inside the
+          # natural range and force-extended 4 of 5 chunks with trailing babble.
+          # This calibration is Turkish-specific; validate the ratio before
+          # treating it as a multilingual or workload-independent default.
           min_decode_steps_per_text_token: 0.6
           min_decode_steps_floor: 4
           audio_emit_every: 1

@@ -3077,12 +3077,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.decode_pad = None
             state.prefill_completed = False
             state.decode_step_count = 0
-            state.min_decode_steps = min(
-                self._max_decode_steps,
-                max(
-                    self._runtime_config.min_decode_steps_floor,
-                    math.ceil(len(token_ids) * self._runtime_config.min_decode_steps_per_text_token),
-                ),
+            # The prefill tail has already generated the first audio patch while
+            # decode_step_count is still zero. A threshold of N therefore allows
+            # the learned stop head after N + 1 generated patches.
+            state.min_decode_steps = self._runtime_config.minimum_decode_steps(
+                text_token_count=len(token_ids),
+                max_decode_steps=self._max_decode_steps,
             )
             state.precomputed_stop_logits = None
             state.precomputed_is_stopping = None
