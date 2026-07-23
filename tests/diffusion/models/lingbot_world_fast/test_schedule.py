@@ -10,10 +10,10 @@ import math
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.lingbot_world_fast.flow_scheduler import LingbotFlowScheduler
 from vllm_omni.diffusion.models.lingbot_world_fast.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.lingbot_world_fast.pipeline_lingbot_world_fast import (
     CONFIG,
-    LingbotWorldFastPipeline,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -21,18 +21,22 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _make_scheduler() -> FlowUniPCMultistepScheduler:
     # Same construction as ``LingbotWorldFastPipeline.__init__``.
-    scheduler = FlowUniPCMultistepScheduler(
+    base_scheduler = FlowUniPCMultistepScheduler(
         num_train_timesteps=CONFIG["num_train_timesteps"],
         shift=1,
         use_dynamic_shifting=False,
     )
-    scheduler.set_timesteps(CONFIG["num_train_timesteps"], shift=CONFIG["sample_shift"])
-    return scheduler
+    base_scheduler.set_timesteps(CONFIG["num_train_timesteps"], shift=CONFIG["sample_shift"])
+
+    timesteps = base_scheduler.timesteps[CONFIG["timesteps_index"]]
+    scheduler = LingbotFlowScheduler(base_scheduler, timesteps)
+
+    return (base_scheduler, scheduler)
 
 
 def test_timesteps_index_selects_exactly_four_steps() -> None:
-    scheduler = _make_scheduler()
-    selected = scheduler.timesteps[CONFIG["timesteps_index"]]
+    base_scheduler, _ = _make_scheduler()
+    selected = base_scheduler.timesteps[CONFIG["timesteps_index"]]
 
     assert selected.shape == (4,)
     # Monotonically decreasing — flow matching schedulers walk t from high to low.
@@ -41,39 +45,31 @@ def test_timesteps_index_selects_exactly_four_steps() -> None:
 
 
 def test_timesteps_full_schedule_length_matches_num_train_timesteps() -> None:
-    scheduler = _make_scheduler()
-    assert scheduler.num_inference_steps == CONFIG["num_train_timesteps"]
-    assert scheduler.timesteps.shape == (CONFIG["num_train_timesteps"],)
-
-
-def _convert(flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor, scheduler) -> torch.Tensor:
-    # Bind ``_convert_flow_pred_to_x0`` as an unbound method to avoid
-    # constructing the full pipeline (which loads T5 / VAE).
-    return LingbotWorldFastPipeline._convert_flow_pred_to_x0(
-        None,  # type: ignore[arg-type]
-        flow_pred=flow_pred,
-        xt=xt,
-        timestep=timestep,
-        scheduler=scheduler,
-    )
+    base_scheduler, _ = _make_scheduler()
+    assert base_scheduler.num_inference_steps == CONFIG["num_train_timesteps"]
+    assert base_scheduler.timesteps.shape == (CONFIG["num_train_timesteps"],)
 
 
 def test_convert_flow_pred_to_x0_passthrough_when_pred_is_zero() -> None:
-    scheduler = _make_scheduler()
+    base_scheduler, scheduler = _make_scheduler()
     xt = torch.randn(1, 4, 1, 4, 4, dtype=torch.float32)
-    timestep = scheduler.timesteps[0]
+    timestep = base_scheduler.timesteps[0]
     flow_pred = torch.zeros_like(xt)
 
-    x0 = _convert(flow_pred, xt, timestep, scheduler)
+    x0 = scheduler._convert_flow_pred_to_x0(
+        flow_pred=flow_pred,
+        xt=xt,
+        timestep=timestep,
+    )
     assert torch.allclose(x0, xt, atol=1e-6)
 
 
 def test_convert_flow_pred_to_x0_recovers_x0_from_synthesized_pair() -> None:
-    scheduler = _make_scheduler()
-    timestep = scheduler.timesteps[CONFIG["timesteps_index"][1]]
+    base_scheduler, scheduler = _make_scheduler()
+    timestep = base_scheduler.timesteps[CONFIG["timesteps_index"][1]]
 
-    sigmas = scheduler.sigmas
-    timesteps = scheduler.timesteps
+    sigmas = base_scheduler.sigmas
+    timesteps = base_scheduler.timesteps
     timestep_id = torch.argmin((timesteps - timestep).abs())
     sigma_t = sigmas[timestep_id].item()
 
@@ -82,7 +78,11 @@ def test_convert_flow_pred_to_x0_recovers_x0_from_synthesized_pair() -> None:
     flow_pred = noise - x0
     xt = (1.0 - sigma_t) * x0 + sigma_t * noise
 
-    recovered = _convert(flow_pred, xt, timestep, scheduler)
+    recovered = scheduler._convert_flow_pred_to_x0(
+        flow_pred=flow_pred,
+        xt=xt,
+        timestep=timestep,
+    )
 
     # The function does the math in float64 internally, casts back to the
     # input dtype. float32 inputs ⇒ ~1e-5 absolute tolerance is plenty.

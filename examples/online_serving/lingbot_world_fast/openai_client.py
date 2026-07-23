@@ -82,6 +82,8 @@ def generate_video(args: Namespace) -> list[np.ndarray]:
             "intrinsics": full_camera["intrinsics"][starting_frame : starting_frame + args.num_frames],
         }
 
+        extra_body.update("extend", i != 0)
+
         request: dict = {"prompt": args.prompt, "camera": camera, "extra_body": extra_body}
         if i == 0:
             request["image"] = image

@@ -109,15 +109,29 @@ class ServingRealtimeWorldCamera:
         self._current_session_id = None
         self._force_reset = True
 
-    async def infer(self, req: dict) -> np.ndarray:
+    async def infer(self, req: dict) -> tuple[bool, np.ndarray | None]:
         """raw req → engine → video."""
         # Session tracking
 
         session_id = req.get("session_id")
-        if session_id is not None and session_id != self._current_session_id:
-            if self._current_session_id is not None:
-                logger.info("Session changed %s → %s", self._current_session_id, session_id)
-                self.reset({})
+        accepted = True
+
+        req.setdefault("extra_body", {})
+        req["extra_body"].setdefault("extend", False)
+
+        extend = req["extra_body"]["extend"]
+        should_reset = not extend
+
+        if extend and session_id != self._current_session_id:
+            accepted = False
+            return (accepted, None)
+
+        if session_id != self._current_session_id:
+            logger.info("Session changed %s → %s", self._current_session_id, session_id)
+            should_reset = True
+
+        if should_reset:
+            self.reset({})
             self._current_session_id = session_id
 
         self._call_count += 1
@@ -125,7 +139,7 @@ class ServingRealtimeWorldCamera:
         # Build request, run inference through AsyncOmni
         request = self._build_request(req)
 
-        # After an inference call we reset the _force_reset argument
+        # After building the request we reset the _force_reset argument
         self._force_reset = False
 
         result = None
@@ -141,7 +155,7 @@ class ServingRealtimeWorldCamera:
         if result is None:
             raise RuntimeError("World Model Camera OpenPI request produced no output.")
 
-        return result
+        return (accepted, result)
 
     def _build_request(self, req: dict) -> Any:
         """Build engine request from raw robot req.

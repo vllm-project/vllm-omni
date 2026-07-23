@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 from collections.abc import Iterable
 from typing import Any
 
@@ -233,6 +234,79 @@ def test_reset_endpoint_clears_session_and_returns_text_ack() -> None:
     assert ws.sent_text == ["reset successful"]
 
 
+def test_extend_current_session() -> None:
+    engine_client = FakeEngineClient()
+    serving = ServingRealtimeWorldCamera(engine_client=engine_client, model_name="lingbot")
+    base = {
+        "prompt": "p",
+        "camera": make_dummy_camera_inputs(num_frames=6),
+        "session_id": "s1",
+        "extra_body": {"num_frames": 6, "height": 16, "width": 16, "fps": 16},
+        "image": np.zeros((16, 16, 3), dtype=np.uint8),
+    }
+
+    r1 = copy.deepcopy(base)
+    r2 = copy.deepcopy(base)
+
+    r2["extra_body"]["extend"] = True
+
+    ws = MockWebSocket(incoming=[_bytes_frame(r1), _bytes_frame(r2)])
+    conn = WorldCameraRealtimeConnection(ws, serving)
+    asyncio.run(conn.handle_connection())
+
+    responses = [msgpack_numpy.unpackb(b) for b in ws.sent_bytes]
+
+    for response in responses:
+        assert type(response) is dict
+        assert response.get("type", "ok") != "error"
+
+
+def test_refuse_extend_first() -> None:
+    engine_client = FakeEngineClient()
+    serving = ServingRealtimeWorldCamera(engine_client=engine_client, model_name="lingbot")
+    request = {
+        "prompt": "p",
+        "camera": make_dummy_camera_inputs(num_frames=6),
+        "session_id": "s1",
+        "extra_body": {"num_frames": 6, "height": 16, "width": 16, "fps": 16, "extend": True},
+        "image": np.zeros((16, 16, 3), dtype=np.uint8),
+    }
+
+    ws = MockWebSocket(incoming=[_bytes_frame(request)])
+    conn = WorldCameraRealtimeConnection(ws, serving)
+    asyncio.run(conn.handle_connection())
+
+    assert len(ws.sent_bytes) == 2
+    error = msgpack_numpy.unpackb(ws.sent_bytes[-1])
+    assert error.get("type", "") == "error"
+
+
+def test_refuse_extension_of_old_session() -> None:
+    engine_client = FakeEngineClient()
+    serving = ServingRealtimeWorldCamera(engine_client=engine_client, model_name="lingbot")
+    base = {
+        "prompt": "p",
+        "camera": make_dummy_camera_inputs(num_frames=6),
+        "session_id": "s1",
+        "extra_body": {"num_frames": 6, "height": 16, "width": 16, "fps": 16},
+        "image": np.zeros((16, 16, 3), dtype=np.uint8),
+    }
+
+    r1 = copy.deepcopy(base)
+    r2 = copy.deepcopy(base)
+    r3 = copy.deepcopy(base)
+
+    r2["session_id"] = "s2"
+    r3["extra_body"]["extend"] = True
+
+    ws = MockWebSocket(incoming=[_bytes_frame(r1), _bytes_frame(r2), _bytes_frame(r3)])
+    conn = WorldCameraRealtimeConnection(ws, serving)
+    asyncio.run(conn.handle_connection())
+
+    error = msgpack_numpy.unpackb(ws.sent_bytes[-1])
+    assert error.get("type", "") == "error"
+
+
 def test_infer_frames_are_chunked() -> None:
     num_frames = DEFAULT_FRAMES_PER_CHUNK * 3 // 2
 
@@ -351,6 +425,7 @@ def test_msgpack_does_not_silently_coerce_camera_dtypes() -> None:
     }
     decoded = msgpack_numpy.unpackb(msgpack_numpy.packb(payload))
     assert decoded["intrinsics"].dtype == np.float64
+    assert decoded["poses"].dtype == np.float32
     assert decoded["poses"].shape == (1, 2, 4, 4)
 
 

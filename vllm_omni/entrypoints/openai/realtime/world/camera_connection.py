@@ -116,7 +116,11 @@ class WorldCameraRealtimeConnection:
                         self.serving.reset(req)
                         await self.websocket.send_text("reset successful")
                     else:
-                        result = await self.serving.infer(req)
+                        accepted, result = await self.serving.infer(req)
+
+                        if not accepted:
+                            await self._send_error("Cannot extend video. Active session has been changed")
+                            continue
 
                         extra_body: dict = req.get("extra_body", {})
 

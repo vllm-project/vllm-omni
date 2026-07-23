@@ -45,10 +45,7 @@ class LingbotWorldFastState:
         self.current_lat_f: int = 0
         self.session_id: str | None = None
 
-        self.batch_size: int | None = None
         self.num_layers: int | None = None
-        self.num_heads: int | None = None
-        self.head_dim: int | None = None
 
         # Shape constants captured on the first call of a session and reused
         # on extension calls, where multi_modal_data["image"] is absent.
