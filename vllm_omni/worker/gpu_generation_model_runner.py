@@ -70,7 +70,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         }
         if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
-                vllm_config=self.vllm_config,
                 model_config=self.model_config,
             )
 
@@ -160,7 +159,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
 
-            if not scheduler_output.total_num_scheduled_tokens:
+            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+            if scheduler_output.total_num_scheduled_tokens <= 0:
                 return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:

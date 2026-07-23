@@ -145,7 +145,11 @@ def format_diffusion_outputs(
         "diffusion_engine_exec_time_ms": timings.exec_time_s * 1000,
         "diffusion_engine_total_time_ms": timings.total_time_ms,
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
-        "resolution": int(request.sampling_params.resolution),
+        "resolution": (
+            int(request.sampling_params.resolution) if request.sampling_params.resolution is not None else None
+        ),
+        "width": request.sampling_params.width,
+        "height": request.sampling_params.height,
         "postprocess_time_ms": timings.postprocess_time_s * 1000,
     }
 

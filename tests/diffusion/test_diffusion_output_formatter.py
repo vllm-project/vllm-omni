@@ -107,6 +107,8 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
         "diffusion_engine_total_time_ms": 60.0,
         "image_num": 1,
         "resolution": 512,
+        "width": None,
+        "height": None,
         "postprocess_time_ms": 30.0,
     }
 

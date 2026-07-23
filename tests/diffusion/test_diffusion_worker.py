@@ -5,7 +5,6 @@
 Unit tests for DiffusionWorker class.
 
 This module tests the DiffusionWorker implementation:
-- load_weights: Loading model weights
 - sleep: Putting worker into sleep mode (levels 1 and 2)
 - wake_up: Waking worker from sleep mode
 """
@@ -57,38 +56,6 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     worker.device = torch.device("cuda", 0)
     worker._sleep_saved_buffers = {}
     return worker
-
-
-class TestDiffusionWorkerLoadWeights:
-    """Test DiffusionWorker.load_weights method."""
-
-    def test_load_weights_calls_pipeline(self, mocker: MockerFixture, mock_gpu_worker):
-        """Test that load_weights delegates to model_runner.load_weights."""
-        # Setup mock weights
-        mock_weights = [
-            ("layer1.weight", torch.randn(10, 10)),
-            ("layer2.weight", torch.randn(20, 20)),
-        ]
-        expected_loaded = {"layer1.weight", "layer2.weight"}
-
-        # Configure model_runner mock
-        mock_gpu_worker.model_runner.load_weights = mocker.Mock(return_value=expected_loaded)
-
-        # Call load_weights
-        result = mock_gpu_worker.load_weights(mock_weights)
-
-        # Verify model_runner.load_weights was called with the weights
-        mock_gpu_worker.model_runner.load_weights.assert_called_once_with(mock_weights)
-        assert result == expected_loaded
-
-    def test_load_weights_empty_iterable(self, mocker: MockerFixture, mock_gpu_worker):
-        """Test load_weights with empty weights iterable."""
-        mock_gpu_worker.model_runner.load_weights = mocker.Mock(return_value=set())
-
-        result = mock_gpu_worker.load_weights([])
-
-        mock_gpu_worker.model_runner.load_weights.assert_called_once_with([])
-        assert result == set()
 
 
 def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods():

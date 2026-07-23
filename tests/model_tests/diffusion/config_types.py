@@ -34,7 +34,8 @@ class DiffusionTasks(StrEnum):
 
     TEXT_TO_IMAGE = auto()
     IMAGE_TO_IMAGE = auto()
-    # Text to video, text to audio, etc should be added here as needed
+    TEXT_TO_VIDEO = auto()
+    # Text to audio, etc should be added here as needed
 
 
 class DiffusionModelTestOpts(NamedTuple):
