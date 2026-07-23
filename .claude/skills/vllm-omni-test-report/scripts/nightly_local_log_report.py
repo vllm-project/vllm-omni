@@ -955,18 +955,6 @@ def _github_issue_submit_script() -> str:
     }}
   }});
 
-  document.querySelectorAll(".btn-view-full-log").forEach(function (btn) {{
-    btn.addEventListener("click", function () {{
-      var id = btn.getAttribute("aria-controls");
-      var panel = id ? document.getElementById(id) : null;
-      if (!panel) return;
-      var nowHidden = !panel.hidden;
-      panel.hidden = nowHidden;
-      btn.setAttribute("aria-expanded", nowHidden ? "false" : "true");
-      btn.textContent = nowHidden ? "View full log" : "Collapse full log";
-    }});
-  }});
-
   var logExcerptModal = document.getElementById("log-excerpt-modal");
   function openLogExcerptModal(btn) {{
     if (!logExcerptModal) return;
@@ -1526,34 +1514,6 @@ def read_job_text(paths: list[Path]) -> str:
 
 def _read_combined_job_logs(paths: list[Path]) -> str:
     return read_combined_job_logs(paths, include_headers=True)
-
-
-def _render_full_log_panel_html(paths: list[Path], panel_id: str) -> str:
-    """Button + hidden panel: full concatenated logs, or oversize / stat error notice."""
-    if not paths:
-        return ""
-    tb = _combined_job_log_disk_bytes(paths)
-    if tb is None:
-        inner = '<p class="note full-log-oversize">Unable to read log file metadata.</p>'
-    elif tb > FULL_LOG_EMBED_MAX_BYTES:
-        mib = tb / (1024 * 1024)
-        cap = FULL_LOG_EMBED_MAX_BYTES / (1024 * 1024)
-        lis = "".join(f"<li><code>{html.escape(str(p.resolve()))}</code></li>" for p in paths)
-        inner = (
-            f'<p class="note full-log-oversize">Merged logs are about <strong>{mib:.2f} MiB</strong>, '
-            f"exceeding the embed cap "
-            f"(<strong>{cap:.1f} MiB</strong>); full text not embedded. Open locally:</p>"
-            f'<ul class="full-log-paths">{lis}</ul>'
-        )
-    else:
-        inner = f'<pre class="log-full">{html.escape(_read_combined_job_logs(paths))}</pre>'
-    return (
-        '<div class="full-log-wrap">'
-        '<button type="button" class="btn-view-full-log" aria-expanded="false" '
-        f'aria-controls="{panel_id}">View full log</button>'
-        f'<div id="{panel_id}" class="full-log-panel" hidden>{inner}</div>'
-        "</div>"
-    )
 
 
 def _summary_row_for_job(job_name: str, paths: list[Path], info: dict[str, Any]) -> list[str]:
@@ -3131,10 +3091,6 @@ def emit_report(
             continue
         lines.append(f"### Local job: `{_md_cell(job_name)}`")
         lines.append("")
-        lines.append(
-            "*Full logs: in the HTML report click **View full log** to expand embedded text, "
-            "or open these files locally.*"
-        )
         rel = ", ".join(f"`{p.name}`" for p in paths)
         lines.append(f"- {rel}")
         lines.append("")
@@ -3684,7 +3640,6 @@ def emit_report_html(
     # (the same CI pipeline the local H200/H800/A100 runs target).
     local_bk_build_url = _buildkite_build_url(cuda_build, CUDA_TARGET)
     if job_rows:
-        full_log_i = 0
         for job_name, paths, info in job_rows:
             if _job_is_clean(info):
                 continue
@@ -3697,7 +3652,6 @@ def emit_report_html(
                     _SVG_ALERT,
                     html.escape(f"Failed local job: {job_name}"),
                 ),
-                _render_full_log_panel_html(paths, f"local-full-log-{full_log_i}"),
                 "</summary>",
                 '<div class="job-fail-details-body">',
                 _heading_html(
@@ -3710,17 +3664,16 @@ def emit_report_html(
                     info,
                     report_context=(f"Local nightly_jobs · job: {job_name} · logs: {log_files}"),
                     buildkite_build_url=local_bk_build_url,
-                    full_log_text=read_job_text(paths),  # NEW: pass complete local job log
+                    full_log_text=read_job_text(paths),
                 ),
                 "</div></details>",
             ]
             fail_local_parts.append("\n".join(bits))
-            full_log_i += 1
     if fail_local_parts:
         fail_inner_loc = (
             '<p class="hint">Click each job title to expand or collapse failed test lists. '
-            "Use <strong>View full log</strong> to open the complete job log in a dialog.</p>\n"
-            + "\n".join(fail_local_parts)
+            "Use the per-row <strong>View full log</strong> in the failure table to open the "
+            "raw job log excerpt.</p>\n" + "\n".join(fail_local_parts)
         )
     else:
         fail_inner_loc = '<p class="note">No failures or errors require itemized analysis.</p>'

@@ -431,58 +431,6 @@ summary.job-fail-details-summary .meta {
     var(--dashboard-panel-bg) 48%
   );
 }
-.full-log-wrap {
-  margin: 0.55rem 0 0;
-  padding-top: 0.4rem;
-  border-top: 1px dashed color-mix(in srgb, var(--dashboard-warning) 42%, transparent);
-}
-.btn-view-full-log {
-  display: inline-flex;
-  align-items: center;
-  padding: 0.42rem 0.88rem;
-  border-radius: 9px;
-  border: 1px solid color-mix(in srgb, var(--dashboard-warning) 45%, var(--dashboard-border));
-  background: linear-gradient(
-    180deg,
-    var(--dashboard-panel-bg) 0%,
-    color-mix(in srgb, var(--dashboard-warning-bg) 55%, var(--dashboard-panel-bg)) 100%
-  );
-  color: var(--danger-strong);
-  font-size: 0.86rem;
-  font-weight: 650;
-  cursor: pointer;
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--dashboard-warning) 12%, transparent);
-}
-.btn-view-full-log:hover {
-  border-color: var(--dashboard-warning);
-  background: var(--dashboard-panel-bg);
-}
-.full-log-panel {
-  margin-top: 0.65rem;
-}
-pre.log-full {
-  margin: 0;
-  padding: 0.85rem 1rem;
-  background: linear-gradient(180deg, var(--code-bg-top) 0%, var(--code-bg-bottom) 100%);
-  color: var(--code-fg);
-  border-radius: var(--radius-sm);
-  border: 1px solid color-mix(in srgb, var(--dashboard-muted) 38%, transparent);
-  font-size: 0.78rem;
-  line-height: 1.48;
-  max-height: min(75vh, 42rem);
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-ul.full-log-paths {
-  margin: 0.35rem 0 0;
-  padding-left: 1.25rem;
-  font-size: 0.88rem;
-  color: var(--text);
-}
-.full-log-oversize {
-  margin: 0;
-}
 summary.job-fail-details-summary-bk {
   background: linear-gradient(
     180deg,
