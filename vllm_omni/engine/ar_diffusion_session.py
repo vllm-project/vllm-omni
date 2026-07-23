@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Generic, Protocol, TypeVar
 
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
@@ -124,10 +124,15 @@ class ARDiffusionEventAcceptance:
     pending_event_count: int
 
 
-class ARDiffusionTickConsumer(Protocol):
+TickOutputT = TypeVar("TickOutputT")
+
+
+class ARDiffusionTickConsumer(Protocol[TickOutputT]):
     """Consumes one immutable chunk-boundary tick."""
 
-    async def execute_tick(self, tick: ARDiffusionTickRequest) -> ARDiffusionChunkMetadata: ...
+    async def execute_tick(self, tick: ARDiffusionTickRequest) -> TickOutputT: ...
+
+    def chunk_metadata(self, output: TickOutputT) -> ARDiffusionChunkMetadata: ...
 
 
 class ARDiffusionSessionLifecycle(Protocol):
@@ -141,7 +146,7 @@ class ARDiffusionSessionLifecycle(Protocol):
 class ARDiffusionCollectiveRPCClient(Protocol):
     """Subset of the engine control RPC surface used by session lifecycle."""
 
-    async def collective_rpc_async(
+    async def collective_rpc(
         self,
         method: str,
         timeout: float | None = None,
@@ -187,7 +192,7 @@ class ARDiffusionWorkerLifecycle:
         self._timeout = timeout
 
     async def _invoke(self, method: str, session_id: str) -> None:
-        results = await self._rpc_client.collective_rpc_async(
+        results = await self._rpc_client.collective_rpc(
             method=method,
             timeout=self._timeout,
             args=(session_id,),
@@ -212,14 +217,14 @@ def _default_request_id(session_id: str, chunk_index: int) -> str:
     return f"ar-{session_id}-{chunk_index}-{uuid.uuid4().hex}"
 
 
-class ARDiffusionSession:
+class ARDiffusionSession(Generic[TickOutputT]):
     """Transactional event queue and chunk snapshot for one realtime world."""
 
     def __init__(
         self,
         session_id: str,
         *,
-        tick_consumer: ARDiffusionTickConsumer,
+        tick_consumer: ARDiffusionTickConsumer[TickOutputT],
         lifecycle: ARDiffusionSessionLifecycle,
         max_pending_events: int,
         request_id_factory: Callable[[str, int], str] | None = None,
@@ -260,6 +265,13 @@ class ARDiffusionSession:
 
     def _require_active(self) -> None:
         if self._status is not ARDiffusionSessionStatus.ACTIVE:
+            raise ARDiffusionSessionStateError(f"AR-Diffusion session {self.session_id!r} is {self._status.value}.")
+
+    def _require_resettable(self) -> None:
+        if self._status not in {
+            ARDiffusionSessionStatus.ACTIVE,
+            ARDiffusionSessionStatus.FAILED,
+        }:
             raise ARDiffusionSessionStateError(f"AR-Diffusion session {self.session_id!r} is {self._status.value}.")
 
     async def accept_event(self, event: ARDiffusionSessionEvent) -> ARDiffusionEventAcceptance:
@@ -358,7 +370,7 @@ class ARDiffusionSession:
             self._chunk_index += 1
             self._inflight_event_floor = None
 
-    async def next_chunk(self) -> ARDiffusionChunkMetadata:
+    async def next_chunk(self) -> TickOutputT:
         """Execute and atomically commit one chunk-boundary snapshot."""
         async with self._tick_lock:
             async with self._state_lock:
@@ -367,14 +379,28 @@ class ARDiffusionSession:
 
             expected_metadata = ARDiffusionChunkMetadata.from_tick(tick)
             try:
-                metadata = await self._tick_consumer.execute_tick(tick)
+                output = await self._tick_consumer.execute_tick(tick)
+                metadata = self._tick_consumer.chunk_metadata(output)
                 if not isinstance(metadata, ARDiffusionChunkMetadata) or metadata != expected_metadata:
                     raise ARDiffusionChunkMetadataError(
                         "Tick consumer metadata does not match the submitted AR-Diffusion tick."
                     )
-            except BaseException:
+            except BaseException as tick_error:
                 async with self._state_lock:
                     self._inflight_event_floor = None
+                    self._status = ARDiffusionSessionStatus.FAILED
+                try:
+                    # A model forward may already have released its state. This
+                    # idempotent close also covers successful-but-mismatched
+                    # output metadata, where worker state has advanced but the
+                    # control-plane snapshot must not commit.
+                    await self._lifecycle.close_session(self.session_id)
+                except Exception as cleanup_error:
+                    raise ARDiffusionSessionError(
+                        "AR-Diffusion tick failed "
+                        f"({type(tick_error).__name__}: {tick_error}) and worker "
+                        f"session cleanup also failed: {cleanup_error}"
+                    ) from tick_error
                 raise
 
             commit_task = asyncio.create_task(self._commit_tick(tick, prompt, controls))
@@ -385,13 +411,13 @@ class ARDiffusionSession:
                 # must commit even if the transport task is being cancelled.
                 await commit_task
                 raise
-            return metadata
+            return output
 
     async def reset(self) -> None:
         """Reset worker state and discard queued/current transport state."""
         async with self._tick_lock:
             async with self._state_lock:
-                self._require_active()
+                self._require_resettable()
                 self._status = ARDiffusionSessionStatus.RESETTING
             try:
                 await self._lifecycle.reset_session(self.session_id)
@@ -406,6 +432,7 @@ class ARDiffusionSession:
                 self._prompt = None
                 self._controls.clear()
                 self._inflight_event_floor = None
+                self._chunk_index = 0
                 self._status = ARDiffusionSessionStatus.ACTIVE
 
     async def close(self) -> None:
@@ -432,13 +459,13 @@ class ARDiffusionSession:
         await self.close()
 
 
-class ARDiffusionSessionManager:
+class ARDiffusionSessionManager(Generic[TickOutputT]):
     """Creates and owns transport sessions sharing one tick/lifecycle backend."""
 
     def __init__(
         self,
         *,
-        tick_consumer: ARDiffusionTickConsumer,
+        tick_consumer: ARDiffusionTickConsumer[TickOutputT],
         lifecycle: ARDiffusionSessionLifecycle,
         max_pending_events: int,
         request_id_factory: Callable[[str, int], str] | None = None,
@@ -449,10 +476,10 @@ class ARDiffusionSessionManager:
         self._max_pending_events = max_pending_events
         self._request_id_factory = request_id_factory
         self._session_id_factory = session_id_factory or (lambda: uuid.uuid4().hex)
-        self._sessions: dict[str, ARDiffusionSession] = {}
+        self._sessions: dict[str, ARDiffusionSession[TickOutputT]] = {}
         self._lock = asyncio.Lock()
 
-    async def create_session(self, session_id: str | None = None) -> ARDiffusionSession:
+    async def create_session(self, session_id: str | None = None) -> ARDiffusionSession[TickOutputT]:
         resolved_session_id = session_id or self._session_id_factory()
         async with self._lock:
             if resolved_session_id in self._sessions:
@@ -467,7 +494,7 @@ class ARDiffusionSessionManager:
             self._sessions[resolved_session_id] = session
             return session
 
-    async def get_session(self, session_id: str) -> ARDiffusionSession:
+    async def get_session(self, session_id: str) -> ARDiffusionSession[TickOutputT]:
         async with self._lock:
             try:
                 return self._sessions[session_id]

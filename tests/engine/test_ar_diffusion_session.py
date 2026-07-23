@@ -48,6 +48,9 @@ class FakeTickConsumer:
             raise RuntimeError("fake tick failed")
         return self.metadata_override or ARDiffusionChunkMetadata.from_tick(tick)
 
+    def chunk_metadata(self, output: ARDiffusionChunkMetadata) -> ARDiffusionChunkMetadata:
+        return output
+
 
 class FakeLifecycle:
     def __init__(self) -> None:
@@ -193,21 +196,32 @@ def test_event_rejects_duplicate_tracks_and_non_transport_payloads() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_tick_keeps_events_pending_for_same_chunk_retry() -> None:
+async def test_failed_tick_closes_worker_and_requires_reset() -> None:
     consumer = FakeTickConsumer()
     consumer.failures_remaining = 1
-    session, _, _ = make_session(consumer=consumer)
+    lifecycle = FakeLifecycle()
+    session, _, _ = make_session(consumer=consumer, lifecycle=lifecycle)
     await session.accept_event(ARDiffusionSessionEvent(event_id=3, prompt="retry me"))
 
     with pytest.raises(RuntimeError, match="fake tick failed"):
         await session.next_chunk()
 
+    assert session.status is ARDiffusionSessionStatus.FAILED
     assert session.chunk_index == 0
     assert session.pending_event_count == 1
+    assert lifecycle.closes == ["world-1"]
+    with pytest.raises(ARDiffusionSessionStateError, match="failed"):
+        await session.next_chunk()
+
+    await session.reset()
+    assert session.status is ARDiffusionSessionStatus.ACTIVE
+    assert session.pending_event_count == 0
+    assert lifecycle.resets == ["world-1"]
+    await session.accept_event(ARDiffusionSessionEvent(event_id=4, prompt="after reset"))
     metadata = await session.next_chunk()
     assert metadata.chunk_index == 0
-    assert metadata.applied_event_ids == (3,)
-    assert [tick.applied_event_ids for tick in consumer.ticks] == [(3,), (3,)]
+    assert metadata.applied_event_ids == (4,)
+    assert [tick.applied_event_ids for tick in consumer.ticks] == [(3,), (4,)]
 
 
 @pytest.mark.asyncio
@@ -244,7 +258,8 @@ async def test_metadata_mismatch_does_not_commit_snapshot() -> None:
         request_id="wrong",
         chunk_index=0,
     )
-    session, _, _ = make_session(consumer=consumer)
+    lifecycle = FakeLifecycle()
+    session, _, _ = make_session(consumer=consumer, lifecycle=lifecycle)
     await session.accept_event(ARDiffusionSessionEvent(event_id=1, prompt="pending"))
 
     with pytest.raises(ARDiffusionChunkMetadataError, match="does not match"):
@@ -252,6 +267,8 @@ async def test_metadata_mismatch_does_not_commit_snapshot() -> None:
 
     assert session.chunk_index == 0
     assert session.pending_event_count == 1
+    assert session.status is ARDiffusionSessionStatus.FAILED
+    assert lifecycle.closes == ["world-1"]
 
 
 @pytest.mark.asyncio
@@ -271,12 +288,12 @@ async def test_reset_close_and_disconnect_reach_lifecycle_boundary() -> None:
 
     assert lifecycle.resets == ["world-reset"]
     assert session.status is ARDiffusionSessionStatus.ACTIVE
-    assert session.chunk_index == 1
+    assert session.chunk_index == 0
     duplicate = await session.accept_event(ARDiffusionSessionEvent(event_id=4, prompt="duplicate"))
     assert duplicate.status is ARDiffusionEventAcceptanceStatus.DUPLICATE
 
     reset_tick = await session.next_chunk()
-    assert reset_tick.chunk_index == 1
+    assert reset_tick.chunk_index == 0
     assert consumer.ticks[-1].prompt is None
     assert consumer.ticks[-1].controls == ()
 
@@ -297,7 +314,7 @@ class FakeRPCClient:
         self.result = result
         self.calls: list[dict[str, Any]] = []
 
-    async def collective_rpc_async(self, **kwargs: Any) -> list[Any]:
+    async def collective_rpc(self, **kwargs: Any) -> list[Any]:
         self.calls.append(kwargs)
         return self.result
 

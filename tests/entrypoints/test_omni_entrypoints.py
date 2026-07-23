@@ -545,6 +545,38 @@ async def test_async_omni_diffusion_only_yields_single_image_output(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_async_omni_internal_request_id_reaches_engine_exactly(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=DIFFUSION_ONLY_META,
+        on_add_request=_enqueue_async_diffusion_only_output,
+    )
+    _patch_engine(monkeypatch, engine)
+    monkeypatch.setattr(
+        AsyncOmni,
+        "_get_unique_request_id",
+        staticmethod(lambda _: pytest.fail("internal request IDs must not be rewritten")),
+    )
+
+    app = AsyncOmni("dummy-model")
+    try:
+        outputs = [
+            output
+            async for output in app.generate(
+                prompt="hello",
+                request_id="tick-request-7",
+                _internal_request_id="tick-request-7",
+            )
+        ]
+    finally:
+        app.shutdown()
+
+    assert engine.submitted[0]["request_id"] == "tick-request-7"
+    assert outputs[0].request_id == "tick-request-7"
+    assert outputs[0].images == ["tick-request-7-image"]
+    assert outputs[0].request_output.payload == "tick-request-7-diffusion-final"
+
+
+@pytest.mark.asyncio
 async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatch: pytest.MonkeyPatch):
     engine = FakeAsyncOmniEngine(
         stage_metadata=LLM_DIFFUSION_META,

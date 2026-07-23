@@ -468,6 +468,7 @@ class AsyncOmni(EngineClient, OmniBase):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        _internal_request_id: str | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -491,6 +492,9 @@ class AsyncOmni(EngineClient, OmniBase):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            _internal_request_id: Internal-only exact engine-facing identifier.
+                Realtime typed protocols use this when their embedded request
+                identity must remain unchanged.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -499,11 +503,18 @@ class AsyncOmni(EngineClient, OmniBase):
             ValueError: If sampling_params_list has incorrect length, or
                 if a list prompt is submitted to a diffusion stage.
         """
-        # Append a random UUID suffix to the request_id to ensure it is unique
-        # and non-empty, similar to vLLM's input processor. The suffix is used
-        # only for internal tracking throughout the request's life.
         external_request_id = request_id
-        request_id = self._get_unique_request_id(external_request_id)
+        if _internal_request_id is None:
+            # Append a random UUID suffix to ensure the engine-facing ID is
+            # unique and non-empty, similar to vLLM's input processor.
+            request_id = self._get_unique_request_id(external_request_id)
+        else:
+            if not isinstance(_internal_request_id, str) or not _internal_request_id.strip():
+                raise ValueError("_internal_request_id must be a non-empty string.")
+            if external_request_id and external_request_id != _internal_request_id:
+                raise ValueError("request_id must match _internal_request_id when both are provided.")
+            request_id = _internal_request_id
+            external_request_id = external_request_id or _internal_request_id
 
         # Wait until generation is resumed if the engine is paused
         async with self._pause_cond:
