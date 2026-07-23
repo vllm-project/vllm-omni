@@ -30,6 +30,7 @@ from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
     image_color_format,
     supports_audio_output,
+    supports_camera_pos_input,
     supports_multimodal_input,
 )
 from vllm_omni.diffusion.output_formatter import (
@@ -777,6 +778,15 @@ class DiffusionEngine:
             audio_sr = 16000
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
+
+        if supports_camera_pos_input(self.od_config.model_class_name):
+            camera_pos_len = 64
+            # Shape [N x 4]
+            intrinsics = np.random.rand(camera_pos_len, 4)
+            # Shape [N x 4 x 4]
+            poses = np.array([np.identity(4) for _ in range(camera_pos_len)])
+            dummy_camera_pos = {"intrinsics": intrinsics, "poses": poses}
+            prompt.setdefault("multi_modal_data", {})["camera"] = dummy_camera_pos
 
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
         if num_frames <= 0:

@@ -32,6 +32,8 @@ class ARDiffusionKVConfig:
     warmup_cudagraph: bool = True
     # Also capture the post-window-boundary (reset-cycle) forward during warm-up.
     warmup_capture_reset: bool = False
+    # Set this to False to use only gpu_memory_fraction and not window_chunks to decide the number of blocks to allocate
+    enforce_min: bool = True
 
     @property
     def sliding_window(self) -> int | None:

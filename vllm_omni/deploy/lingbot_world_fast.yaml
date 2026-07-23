@@ -1,0 +1,22 @@
+# Stage config for Lingbot World Fast online serving.
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    model_class_name: LingbotWorldFastPipeline
+    runtime:
+      process: true
+    final_output: true
+    final_output_type: image
+    engine_args:
+      engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+      model_class_name: LingbotWorldFastPipeline
+      dtype: bfloat16
+      model_config:
+        patch_size: [1, 2, 2]
+        vae_stride: [4, 8, 8]
+        latent_frames_per_chunk: 3
+        max_area: 399360  # 480 * 832
+        ar_diffusion_kv_config:
+          gpu_memory_fraction: 0.6
+          enforce_min: False

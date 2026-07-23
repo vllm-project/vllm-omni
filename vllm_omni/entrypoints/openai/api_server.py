@@ -123,6 +123,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.realtime.world.camera_serving import ServingRealtimeWorldCamera
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -481,6 +482,11 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
+    if args.ws_max_size is not None:
+        uvicorn_kwargs["ws_max_size"] = args.ws_max_size
+    if args.ws is not None:
+        uvicorn_kwargs["ws"] = args.ws
+
     async with build_async_omni(
         args,
         client_config=client_config,
@@ -798,6 +804,10 @@ async def omni_init_app_state(
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
             engine_client=engine_client,
             model_name=model_name,
+        )
+
+        state.openai_serving_world_camera = ServingRealtimeWorldCamera.create_policy_server(
+            engine_client=engine_client, model_name=model_name
         )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
@@ -1124,6 +1134,10 @@ async def omni_init_app_state(
         stage_configs=state.stage_configs,
     )
     state.openai_serving_realtime_robot = None
+
+    state.openai_serving_world_camera = ServingRealtimeWorldCamera.create_policy_server(
+        engine_client=engine_client, model_name=model_name
+    )
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -1619,6 +1633,21 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close()
         return
     connection = RealtimeConnection(websocket, serving)
+    await connection.handle_connection()
+
+
+@router.websocket("/v1/realtime/world/camera")
+async def realtime_world_camera_openpi(websocket: WebSocket):
+    from vllm_omni.entrypoints.openai.realtime.world.camera_connection import WorldCameraRealtimeConnection
+
+    serving = getattr(websocket.app.state, "openai_serving_world_camera", None)
+
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "World Model policy not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = WorldCameraRealtimeConnection(websocket, serving)
     await connection.handle_connection()
 
 

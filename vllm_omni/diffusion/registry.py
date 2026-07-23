@@ -326,6 +326,11 @@ _DIFFUSION_MODELS = {
         "pipeline_krea2",
         "Krea2Pipeline",
     ),
+    "LingbotWorldFastPipeline": (
+        "lingbot_world_fast",
+        "pipeline_lingbot_world_fast",
+        "LingbotWorldFastPipeline",
+    ),
 }
 
 
@@ -557,6 +562,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
+    "LingbotWorldFastPipeline": "get_lingbot_world_fast_post_process_func",
 }
 
 _DIFFUSION_IR_OP_PRIORITY_FUNCS = {

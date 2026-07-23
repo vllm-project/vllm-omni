@@ -194,6 +194,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         chunk_size = frame_seqlen
         window_chunks = self.ar_diffusion_kv_config.window_chunks or (max_attention_size // frame_seqlen)
 
+        local_branches = getattr(t, "local_branches", None)
+
         self.ar_diffusion_kv_config = dataclasses.replace(
             self.ar_diffusion_kv_config, chunk_size=chunk_size, window_chunks=window_chunks
         )
@@ -210,7 +212,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             cfg_world = int(get_classifier_free_guidance_world_size())
         except Exception:
             cfg_world = 1
-        local_branches = 1 if cfg_world >= 2 else 2
+        if local_branches is None:
+            local_branches = 1 if cfg_world >= 2 else 2
         logger.info(
             "AR-Diffusion preallocating (paged): frame_seqlen=%d num_frame_per_block=%d "
             "local_attn_size=%d -> chunk_size=%d window_chunks=%d (window=%d tokens)",
