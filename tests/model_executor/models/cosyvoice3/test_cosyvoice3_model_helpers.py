@@ -373,23 +373,6 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
     assert "rid-stream" not in model._stream_vocoder_cache_by_req
 
 
-def test_on_requests_finished_clears_streaming_cache():
-    model = _make_code2wav_model()
-    model._stream_vocoder_cache_by_req["rid-aborted"] = {
-        "mel": torch.ones((1, 80, 3), dtype=torch.float32),
-        "speech_offset": 4,
-    }
-    model._stream_vocoder_cache_by_req["rid-active"] = {
-        "mel": torch.ones((1, 80, 5), dtype=torch.float32),
-        "speech_offset": 6,
-    }
-
-    model.on_requests_finished({"rid-aborted", "rid-missing"})
-
-    assert "rid-aborted" not in model._stream_vocoder_cache_by_req
-    assert "rid-active" in model._stream_vocoder_cache_by_req
-
-
 def test_sample_uses_ras_rejection_for_recent_repetition():
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])

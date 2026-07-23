@@ -529,16 +529,6 @@ class CosyVoice3Model(
                 self._stream_vocoder_cache_by_req.pop(req_id, None)
         return audio
 
-    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
-        """Release request-scoped code2wav streaming state."""
-        cache = getattr(self, "_stream_vocoder_cache_by_req", None)
-        lock = getattr(self, "_stream_audio_cache_lock", None)
-        if cache is None or lock is None:
-            return
-        with lock:
-            for req_id in finished_req_ids:
-                cache.pop(req_id, None)
-
     @staticmethod
     def _split_request_ids(ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
         """Split concatenated input_ids into per-request segments."""
