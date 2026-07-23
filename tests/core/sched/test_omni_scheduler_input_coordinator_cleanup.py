@@ -82,7 +82,7 @@ def test_ar_free_request_cleans_input_coordinator_on_normal_free() -> None:
 
     result = OmniARScheduler._free_request(scheduler, DummyRequest())
 
-    assert result is None
+    assert result == (None, None)
     assert coordinator.freed == ["req-free"]
     assert scheduler._omits_kv_transfer_cache == {}
     assert scheduler._new_prompt_len_snapshot == {}

@@ -386,7 +386,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._free_input_coordinator_request(request_id)
         return finished
 
-    def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
