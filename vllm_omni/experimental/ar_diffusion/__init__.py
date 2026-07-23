@@ -14,11 +14,21 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     SupportsARDiffusionWarmup,
 )
 from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
+from vllm_omni.experimental.ar_diffusion.tick_protocol import (
+    AR_DIFFUSION_TICK_KEY,
+    ARDiffusionChunkMetadata,
+    ARDiffusionControlInput,
+    ARDiffusionTickRequest,
+)
 
 __all__ = [
     "ARDiffusionKVBranchSpec",
     "ARDiffusionCrossAttentionKVSpec",
     "ARDiffusionEngine",
+    "AR_DIFFUSION_TICK_KEY",
+    "ARDiffusionChunkMetadata",
+    "ARDiffusionControlInput",
+    "ARDiffusionTickRequest",
     "ARDiffusionKVCacheSpec",
     "SupportsARDiffusionPipeline",
     "SupportsARDiffusionWarmup",
