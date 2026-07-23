@@ -649,6 +649,10 @@ steps:
             tests/e2e/online_serving/test_qwen_image_expansion.py
             tests/e2e/online_serving/test_qwen_image_edit_expansion.py
             tests/e2e/online_serving/test_qwen_image_layered_expansion.py
+            tests/e2e/online_serving/test_boogu_image.py
+            tests/e2e/online_serving/test_boogu_image_edit.py
+            tests/e2e/online_serving/test_boogu_image_expansion.py
+            tests/e2e/online_serving/test_boogu_image_edit_expansion.py
             tests/e2e/online_serving/test_bagel_expansion.py
             tests/e2e/online_serving/test_krea2_expansion.py
             tests/e2e/offline_inference/test_krea2_expansion.py

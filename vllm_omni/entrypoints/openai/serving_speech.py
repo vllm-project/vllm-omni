@@ -67,6 +67,7 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
+from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
@@ -1396,8 +1397,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         emb_dim = len(embedding)
         if self._tts_model_type == "ming_tts":
-            if emb_dim != 192:
-                raise ValueError(f"Ming speaker embedding must have 192 dims, got {emb_dim}")
+            if emb_dim != SPEAKER_EMBEDDING_DIM:
+                raise ValueError(f"Ming speaker embedding must have {SPEAKER_EMBEDDING_DIM} dims, got {emb_dim}")
         else:
             dim_err = self._validate_qwen_tts_speaker_embedding_dim(emb_dim)
             if dim_err is not None:
@@ -2148,8 +2149,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             waveform = torch.as_tensor(wav_samples, dtype=torch.float32).reshape(1, -1)
             embedding = extractor.extract_from_waveform(waveform, int(sr))
             flat = embedding.detach().reshape(-1).to(torch.float32).cpu()
-            if int(flat.numel()) != 192:
-                raise ValueError(f"Ming speaker extractor returned {int(flat.numel())} dims; expected 192")
+            if int(flat.numel()) != SPEAKER_EMBEDDING_DIM:
+                raise ValueError(
+                    f"Ming speaker extractor returned {int(flat.numel())} dims; expected {SPEAKER_EMBEDDING_DIM}"
+                )
             embeddings.append(flat.tolist())
         return embeddings
 

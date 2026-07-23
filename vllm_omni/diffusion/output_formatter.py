@@ -28,14 +28,6 @@ from vllm_omni.outputs.output_metadata import (
 
 
 @dataclass(frozen=True)
-class DiffusionStepTimings:
-    preprocess_time_s: float
-    exec_time_s: float
-    postprocess_time_s: float
-    total_time_ms: float
-
-
-@dataclass(frozen=True)
 class DiffusionPostprocessOutput:
     outputs: DiffusionPayload
     metadata: DiffusionMetadata = field(default_factory=dict)
@@ -134,25 +126,23 @@ def format_diffusion_outputs(
     diffusion_output: DiffusionOutput,
     output_data: DiffusionPostprocessRawOutput,
     postprocess_output: DiffusionPostprocessOutput,
-    timings: DiffusionStepTimings,
 ) -> list[OmniRequestOutput]:
     """Convert a finished diffusion model output into API-facing outputs."""
 
     primary_payload = _primary_payload(postprocess_output)
     outputs = _ensure_list(primary_payload)
     metrics = {
-        "preprocess_time_ms": timings.preprocess_time_s * 1000,
-        "diffusion_engine_exec_time_ms": timings.exec_time_s * 1000,
-        "diffusion_engine_total_time_ms": timings.total_time_ms,
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
-        "resolution": int(request.sampling_params.resolution),
-        "postprocess_time_ms": timings.postprocess_time_s * 1000,
+        "resolution": (
+            int(request.sampling_params.resolution) if request.sampling_params.resolution is not None else None
+        ),
+        "width": request.sampling_params.width,
+        "height": request.sampling_params.height,
     }
 
-    # Detect text output: when the pipeline returns a string (e.g.,
-    # SenseNova-U1 / BAGEL single-stage img2text / text2text), wrap it
-    # as a text-type response instead of an image.
-    is_text_output = postprocess_output.primary_key == "text" or "text" in postprocess_output.metadata
+    # Only the primary payload determines the response type. Some image models
+    # include reasoning text in metadata, but their final output is still an image.
+    is_text_output = postprocess_output.primary_key == "text"
 
     is_audio_output = supports_audio_output(od_config.model_class_name)
     audio_sample_rate = _metadata_audio_sample_rate(postprocess_output.metadata)

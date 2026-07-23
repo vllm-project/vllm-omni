@@ -15,6 +15,14 @@ error, and abort state. The scheduler decides which requests can run together.
 
 ## Enablement
 
+Request-level execution is the default diffusion request mode when
+`step_execution=False`. `max_num_seqs` controls the maximum number of compatible
+requests in one scheduler wave:
+
+- `max_num_seqs=1` is the serial request path.
+- `max_num_seqs>1` allows fused request-level batching for pipelines that
+  declare request-batch support.
+
 Increase `max_num_seqs` above `1` to allow the request scheduler to keep more
 than one compatible request active:
 
@@ -51,11 +59,11 @@ stage_args:
 
 ## Compatibility
 
-Only pipelines that declare request-batch support use the fused request-batch
-path. The engine validates that the pipeline `forward()` uses the request-batch
-contract and returns `list[DiffusionOutput]`. Pipelines that do not support this
-contract do not use fused `pipeline.forward(batch)`; scheduled requests are
-executed through per-request worker calls.
+Only pipelines that declare request-batch support can use the fused
+multi-request `pipeline.forward(batch)` path. Pipelines that do not support this
+contract can still use request-level execution with `max_num_seqs=1`, which is
+the serial request path. Setting `max_num_seqs>1` for a pipeline without
+request-batch support fails early during engine initialization.
 
 The scheduler batches only compatible requests. Compatibility is based on
 shape-sensitive and guidance-sensitive sampling fields, including resolution,
@@ -69,7 +77,8 @@ step-wise runtime, see [Step Execution](step_execution.md).
 ## Tuning
 
 - `max_num_seqs` caps the number of active compatible requests in one scheduler
-  wave.
+  wave. `1` means serial request execution; values above `1` enable fused
+  request-level batching when the pipeline supports it.
 - `request_batch_max_wait_ms` is an upper bound on extra admission wait before a
   new wave starts. Keep it small for latency-sensitive serving; values such as
   `10` to `50` ms are a practical starting range for bursty HTTP ingress.

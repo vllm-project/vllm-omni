@@ -323,7 +323,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         }
         if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
-                vllm_config=self.vllm_config,
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,
             )
@@ -1058,7 +1057,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         output.kv_extracted_req_ids = kv_ids
                     return self.attach_omni_connector_output(output)
 
-            if not num_scheduled_tokens:
+            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+            if num_scheduled_tokens <= 0:
                 if (
                     self.parallel_config.distributed_executor_backend == "external_launcher"
                     and self.parallel_config.data_parallel_size > 1

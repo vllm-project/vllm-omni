@@ -258,7 +258,6 @@ def main(args):
         "init_sleep_seconds": args.init_sleep_seconds,
         "batch_timeout": args.batch_timeout,
         "init_timeout": args.init_timeout,
-        "shm_threshold_bytes": args.shm_threshold_bytes,
         "worker_backend": args.worker_backend,
         "ray_address": args.ray_address,
         "trust_remote_code": True,

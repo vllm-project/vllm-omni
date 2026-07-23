@@ -821,7 +821,6 @@ class VllmOmniOrchestratorConfig:
     omni_dp_size_local: int = Field(default=1, ge=1)
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = Field(default=30.0, gt=0.0)
-    shm_threshold_bytes: int = Field(default=65536, ge=0)
     batch_timeout: int = Field(default=10, ge=0)
 
 

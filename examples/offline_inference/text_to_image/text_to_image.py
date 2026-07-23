@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import logger
+from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
@@ -601,11 +602,8 @@ def main():
         if images:
             break
 
-    # Fallback: generation-stage pipelines (e.g. MammothModa2's AR->DiT) return the
-    # generated image as a tensor under multimodal_output instead of populating the
-    # `images` field that diffusion-stage pipelines fill.
     if not images:
-        images = _images_from_multimodal_output(outputs)
+        images = extract_images_from_outputs(outputs)
 
     if not images:
         raise ValueError("No images found in request_output")
@@ -622,37 +620,6 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
-
-
-def _images_from_multimodal_output(outputs: list[Any]) -> list[Any]:
-    """Extract PIL images from multimodal_output tensors.
-
-    Generation-stage pipelines (e.g. MammothModa2's AR->DiT) return the generated
-    image as a tensor (normalized to [-1, 1], CHW) under ``multimodal_output``
-    rather than populating the ``images`` field. Convert any such tensors to PIL.
-    """
-    from PIL import Image
-
-    pil_images: list[Any] = []
-    for output in outputs:
-        req_out = getattr(output, "request_output", output)
-        for completion in getattr(req_out, "outputs", None) or []:
-            # multimodal_output is a MultimodalPayload (a Mapping) keyed by modality,
-            # matching how omni examples (ming_flash_omni / magi_human / dynin) read it.
-            mm = getattr(completion, "multimodal_output", None) or {}
-            if "image" not in mm:
-                continue
-            payload = mm["image"]
-            for tensor in payload if isinstance(payload, list) else [payload]:
-                if not isinstance(tensor, torch.Tensor):
-                    continue
-                img = tensor.detach().to("cpu", dtype=torch.float32)
-                if img.ndim == 4:
-                    img = img[0]
-                img = (img / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
-                img = img.permute(1, 2, 0).contiguous().numpy()
-                pil_images.append(Image.fromarray(img))
-    return pil_images
 
 
 if __name__ == "__main__":
