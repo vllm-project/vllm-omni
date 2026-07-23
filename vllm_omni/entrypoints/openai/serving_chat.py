@@ -79,7 +79,7 @@ from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
 from vllm.tokenizers.mistral import (
@@ -186,6 +186,63 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # parser_cls may be None (no tool parser configured); guard accordingly
         tp_cls = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
         return request.tools and tp_cls is not None and self.enable_auto_tools and request.tool_choice in ["auto", None]
+
+    @staticmethod
+    def _stage_get(obj: Any, key: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if hasattr(obj, "get"):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _has_minicpmo45_stage(self) -> bool:
+        for stage in getattr(self.engine_client, "stage_configs", []) or []:
+            engine_args = self._stage_get(stage, "engine_args")
+            model_arch = self._stage_get(engine_args, "model_arch")
+            if model_arch == "MiniCPMO45OmniForConditionalGeneration":
+                return True
+        return False
+
+    def _fix_minicpmo45_audio_stream_output_kinds(
+        self,
+        sampling_params_list: list[Any],
+        output_modalities: list[str] | tuple[str, ...] | None,
+    ) -> list[Any]:
+        """Keep MiniCPM-o 4.5's thinker final-only during audio streaming.
+
+        Chat ``stream=true`` normally coerces every AR stage to DELTA output.
+        That is correct for token-level text streaming, but MiniCPM-o 4.5's
+        Talker consumes the completed TTS span plus aligned thinker hidden
+        states. If Stage0 is DELTA, llm2tts receives one generated token at a
+        time and repeatedly starts tiny, independent TTS streams. The API then
+        never represents one coherent audio response.
+
+        For this model, stream the audio stage, not the thinker-to-talker
+        boundary.
+        """
+        if not output_modalities or "audio" not in output_modalities:
+            return sampling_params_list
+        if not self._has_minicpmo45_stage():
+            return sampling_params_list
+
+        stage_configs = getattr(self.engine_client, "stage_configs", []) or []
+        for idx, stage in enumerate(stage_configs):
+            if idx >= len(sampling_params_list):
+                break
+            sp = sampling_params_list[idx]
+            if not hasattr(sp, "output_kind"):
+                continue
+
+            engine_args = self._stage_get(stage, "engine_args")
+            if self._stage_get(engine_args, "model_arch") != "MiniCPMO45OmniForConditionalGeneration":
+                continue
+
+            model_stage = self._stage_get(engine_args, "model_stage")
+            if model_stage == "llm":
+                sp.output_kind = RequestOutputKind.FINAL_ONLY
+            elif model_stage == "tts":
+                sp.output_kind = RequestOutputKind.DELTA
+        return sampling_params_list
 
     @classmethod
     def for_diffusion(
@@ -605,6 +662,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+                if request.stream:
+                    sampling_params_list = self._fix_minicpmo45_audio_stream_output_kinds(
+                        sampling_params_list,
+                        output_modalities,
+                    )
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):

@@ -26,6 +26,17 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
     }
 )
 
+_CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
+    {
+        "audio_text_total_chars",
+        "duplex_epoch",
+        "duplex_turn_id",
+        "llm_output_text_utf8",
+        "tts_is_last_chunk",
+        "turn_end",
+    }
+)
+
 
 def partition_flat_payload(
     payload: Mapping[str, object],
@@ -38,6 +49,13 @@ def partition_flat_payload(
     for key, value in payload.items():
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
+            client_mm[key] = value
+        elif root == "meta" and "." in key and key.split(".", 1)[1] in _CLIENT_MM_META_KEYS:
+            # Small final-output metadata needed by serving (for example
+            # transcript text attached to audio) must ride with client MM
+            # output. Keep it in inter-stage too so downstream stages that read
+            # metadata from the full payload are not starved.
+            inter_stage[key] = value
             client_mm[key] = value
         else:
             inter_stage[key] = value

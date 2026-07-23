@@ -94,6 +94,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
@@ -793,6 +794,7 @@ async def omni_init_app_state(
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
         )
+        state.openai_serving_duplex = None
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
@@ -1112,6 +1114,18 @@ async def omni_init_app_state(
         if state.openai_serving_chat is not None
         else None
     )
+    state.openai_serving_duplex = None
+    if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
+        state.stage_configs,
+        config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+    ):
+        from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
+
+        state.openai_serving_duplex = OmniDuplexSessionHandler(
+            chat_service=state.openai_serving_chat,
+            duplex_session_config=getattr(engine_client, "duplex_session_config", None),
+            serving_runtime_adapter_path=getattr(engine_client, "duplex_serving_adapter_path", None),
+        )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,
         models=state.openai_serving_models,
@@ -1612,6 +1626,31 @@ async def streaming_video_output(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
+    duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    duplex_query = websocket.query_params.get("duplex")
+    use_duplex_realtime = (
+        duplex_handler is not None and isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
+    )
+    if use_duplex_realtime and duplex_handler is not None:
+        await duplex_handler.handle_realtime_session(websocket)
+        return
+
+    engine_client = getattr(websocket.app.state, "engine_client", None)
+    if engine_client is not None and getattr(engine_client, "async_chunk", False):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": (
+                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
+                    "Use a stage configuration with async_chunk disabled and restart the server before using "
+                    "this endpoint."
+                ),
+                "code": "unsupported",
+            }
+        )
+        await websocket.close()
+        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
@@ -1637,6 +1676,18 @@ async def realtime_robot_openpi(websocket: WebSocket):
         return
     connection = RobotRealtimeConnection(websocket, serving)
     await connection.handle_connection()
+
+
+@router.websocket("/v1/duplex")
+async def duplex_websocket(websocket: WebSocket):
+    """WebSocket endpoint for vLLM-Omni duplex session control."""
+    handler = getattr(websocket.app.state, "openai_serving_duplex", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Duplex API is not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
 
 
 # Health and Model endpoints for diffusion mode

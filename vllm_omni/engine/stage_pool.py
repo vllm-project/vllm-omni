@@ -97,6 +97,7 @@ class StagePool:
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        self._unavailable_replicas: set[int] = set()
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
         self._output_timestamps_by_request: dict[str, list[float]] = {}
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
@@ -206,27 +207,41 @@ class StagePool:
                 return addr
         return None
 
-    def add_client(self, input_addr: str, client: Any) -> int:
+    def add_client(self, input_addr: str, client: Any, *, replica_id: int | None = None) -> int:
         """Register a head-side client for ``input_addr``.
 
         Returns the assigned ``replica_id`` (index into :attr:`clients`).
-        If the address is already known, replaces the existing client and
-        returns its existing id (this should not happen in practice — the
-        master server assigns unique slots — but the contract is idempotent
-        to keep the dispatch layer robust).
+        A coordinator-provided ``replica_id`` restores that exact slot after
+        unregister/re-register. Without one, a known address keeps its slot
+        and a new address takes the first vacant slot.
         """
         if not input_addr:
             raise ValueError("input_addr must be a non-empty string")
+        if replica_id is not None and replica_id < 0:
+            raise ValueError("replica_id must be non-negative")
 
         existing = self._addr_to_replica_id.get(input_addr)
-        if existing is not None:
-            self.clients[existing] = client
-            return existing
+        if replica_id is not None and existing is not None and existing != replica_id:
+            raise ValueError(
+                f"input address {input_addr!r} is already assigned to replica {existing}, not {replica_id}"
+            )
+        if replica_id is None:
+            replica_id = existing
+        if replica_id is None:
+            replica_id = next(
+                (index for index, existing_client in enumerate(self.clients) if existing_client is None),
+                len(self.clients),
+            )
 
-        replica_id = len(self.clients)
-        self.clients.append(client)
+        while len(self.clients) <= replica_id:
+            self.clients.append(None)
+            self._replica_metrics.append(_ReplicaMetrics())
+        for known_addr, known_replica_id in list(self._addr_to_replica_id.items()):
+            if known_replica_id == replica_id and known_addr != input_addr:
+                self._addr_to_replica_id.pop(known_addr, None)
+        self.clients[replica_id] = client
         self._addr_to_replica_id[input_addr] = replica_id
-        self._replica_metrics.append(_ReplicaMetrics())
+        self._unavailable_replicas.discard(replica_id)
         return replica_id
 
     def remove_client(self, input_addr: str) -> Any | None:
@@ -234,7 +249,7 @@ class StagePool:
 
         Slot is marked ``None`` to preserve indices for outstanding bindings.
         """
-        replica_id = self._addr_to_replica_id.pop(input_addr, None)
+        replica_id = self._addr_to_replica_id.get(input_addr)
         if replica_id is None:
             return None
         client = self.clients[replica_id]
@@ -475,6 +490,39 @@ class StagePool:
         for request_id in request_ids:
             self.release_binding(request_id)
 
+    def release_replica_bindings(self, replica_id: int) -> list[str]:
+        """Drop all route/session bindings owned by one physical replica."""
+        released_request_ids = [
+            request_id
+            for request_id, bound_replica_id in list(self._request_bindings.items())
+            if bound_replica_id == replica_id
+        ]
+        released_request_ids.extend(
+            request_id
+            for request_id, input_addr in list(self._affinity.items())
+            if self._addr_to_replica_id.get(input_addr) == replica_id
+        )
+        released_request_ids = list(dict.fromkeys(released_request_ids))
+        for request_id in released_request_ids:
+            self.release_binding(request_id)
+        return released_request_ids
+
+    def mark_replica_unavailable(self, replica_id: int) -> list[str]:
+        """Evict a failed replica from admission and release its bindings."""
+        if 0 <= replica_id < self.num_replicas:
+            self._unavailable_replicas.add(replica_id)
+        return self.release_replica_bindings(replica_id)
+
+    def is_replica_available(self, replica_id: int) -> bool:
+        return (
+            0 <= replica_id < self.num_replicas
+            and self.clients[replica_id] is not None
+            and replica_id not in self._unavailable_replicas
+        )
+
+    def available_replica_ids(self) -> list[int]:
+        return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
+
     def select_replica_id(
         self,
         request_id: str,
@@ -483,23 +531,27 @@ class StagePool:
     ) -> int:
         """Pick a replica id for *request_id* and cache the choice (legacy path)."""
         cached = self.get_bound_replica_id(request_id)
-        if cached is not None and self.clients[cached] is not None:
+        if cached is not None and self.clients[cached] is not None and self.is_replica_available(cached):
             return cached
+        if cached is not None:
+            # Cached replica is dead/unavailable: drop the stale binding.
+            self.release_binding(request_id)
 
         chosen: int | None = None
         if affinity_request_id is not None:
             parent = self.get_bound_replica_id(affinity_request_id)
-            if parent is not None and self.clients[parent] is not None:
+            if parent is not None and self.clients[parent] is not None and self.is_replica_available(parent):
                 chosen = parent
 
         if chosen is None:
-            live = self.live_replica_ids()
+            # Prefer replicas that are both live (client up) and available.
+            live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
                 raise RuntimeError(f"stage {self.stage_id} has no live replicas")
             if len(live) == 1:
                 chosen = live[0]
             else:
-                # Round-robin over live replicas only.
+                # Round-robin over live, available replicas only.
                 start = self._next_replica_id % len(live)
                 chosen = live[start]
                 self._next_replica_id = (self._next_replica_id + 1) % len(live)
@@ -539,18 +591,23 @@ class StagePool:
         non_empty_first_output_ts = (
             self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
         )
-        num_tokens_out = count_tokens_from_outputs(request_outputs)
+        native_text_metrics = {}
+        if request_id:
+            pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
+            if callable(pop_native_text_metrics):
+                native_text_metrics = pop_native_text_metrics(request_id)
+        native_generation_tokens = native_text_metrics.get("num_generation_tokens")
+        num_tokens_out = (
+            max(int(native_generation_tokens), 0)
+            if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
+            else count_tokens_from_outputs(request_outputs)
+        )
         output_unit_type = self._infer_output_unit_type(request_outputs, token_count=num_tokens_out)
         output_unit_count = self._count_output_units(
             request_outputs,
             unit_type=output_unit_type,
             fallback_token_count=num_tokens_out,
         )
-        native_text_metrics = {}
-        if request_id:
-            pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
-            if callable(pop_native_text_metrics):
-                native_text_metrics = pop_native_text_metrics(request_id)
         current_audio_frames, current_audio_sample_rate, _ = self._collect_audio_metrics(request_outputs)
         accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
         accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
@@ -1029,14 +1086,28 @@ class StagePool:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
             # prompt/token metadata.
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-            await self._llm_client(replica_id).add_request_async(request)
+            try:
+                self.output_processor.add_request(
+                    request=request,
+                    prompt=prompt_text,
+                    parent_req=None,
+                    request_index=0,
+                    queue=None,
+                )
+                await self._llm_client(replica_id).add_request_async(request)
+            except Exception:
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor update for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
+                raise
         return replica_id
 
     async def _pick_or_select(
@@ -1097,6 +1168,8 @@ class StagePool:
         timeout_s: float = 0.001,
     ) -> EngineCoreOutputs | None:
         """Poll raw EngineCore outputs from one LLM replica once."""
+        if not self.is_replica_available(replica_id):
+            return None
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None
@@ -1120,6 +1193,8 @@ class StagePool:
 
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""
+        if not self.is_replica_available(replica_id):
+            return None
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None

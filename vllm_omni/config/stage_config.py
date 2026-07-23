@@ -270,6 +270,15 @@ class PipelineConfig:
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Optional model-owned duplex planner loaded by the stable engine runtime.
+    duplex_runtime_extension: str | None = None
+    # Optional model-owned Serving adapter loaded only when the Realtime duplex
+    # endpoint is enabled. Generic OpenAI modules must not select a model.
+    duplex_serving_adapter: str | None = None
+    # Explicitly enable the stable duplex control mechanism. This is separate
+    # from the optional model extension because turn-commit-only deployments
+    # do not require a model planner.
+    duplex_control_enabled: bool = False
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
@@ -406,6 +415,38 @@ class StageDeployConfig:
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class DuplexSessionRuntimeConfig:
+    """Server-owned lifecycle and per-session buffering limits."""
+
+    idle_ttl_s: float | None = 300.0
+    disconnect_grace_s: float = 30.0
+    reaper_interval_s: float = 5.0
+    resume_replay_ttl_s: float = 60.0
+    resume_replay_max_bytes_per_session: int = 8 * 1024 * 1024
+    max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
+    max_pending_turns_per_session: int = 4
+    max_sessions: int = 1
+    completed_append_cache_size: int = 256
+
+    def __post_init__(self) -> None:
+        positive = {
+            "disconnect_grace_s": self.disconnect_grace_s,
+            "reaper_interval_s": self.reaper_interval_s,
+            "resume_replay_ttl_s": self.resume_replay_ttl_s,
+            "resume_replay_max_bytes_per_session": self.resume_replay_max_bytes_per_session,
+            "max_pending_input_bytes_per_session": self.max_pending_input_bytes_per_session,
+            "max_pending_turns_per_session": self.max_pending_turns_per_session,
+            "max_sessions": self.max_sessions,
+            "completed_append_cache_size": self.completed_append_cache_size,
+        }
+        if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
+            raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"duplex_session.{name} must be positive")
+
+
 @dataclass
 class DeployConfig:
     """Loaded from deploy/<model>.yaml — the only config file users edit.
@@ -419,8 +460,10 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    session_mode: str = "turn"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -610,7 +653,9 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "session_mode": raw_dict.get("session_mode", "turn"),
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
+        "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -896,6 +941,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
                 custom_process_input_func=input_proc,
@@ -922,6 +968,7 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
     custom_process_input_func: str | None = None
@@ -984,6 +1031,7 @@ class StageConfig:
         config_dict: dict[str, Any] = {
             "stage_id": self.stage_id,
             "stage_type": StageType(self.stage_type).value,
+            "session_mode": self.session_mode,
             "engine_args": create_config(engine_args),
             "runtime": create_config(runtime),
             "engine_input_source": self.input_sources,  # Legacy field name

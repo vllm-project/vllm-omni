@@ -38,6 +38,7 @@ class FakeStageClient:
         self.custom_process_input_func = None
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
+        self.decoded_source_tokens: str | None = None
         self._engine_core_outputs = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
@@ -50,6 +51,9 @@ class FakeStageClient:
             return SimpleNamespace(outputs=[])
 
     def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
+        decoder = getattr(streaming_context, "source_token_decoder", None)
+        if callable(decoder):
+            self.decoded_source_tokens = decoder([11, 12], skip_special_tokens=True)
         return list(self.next_inputs)
 
     async def abort_requests_async(self, _request_ids: list[str]) -> None:
@@ -66,6 +70,9 @@ class FakeStageClient:
 
 
 class FakeOutputProcessor:
+    def __init__(self, tokenizer=None) -> None:
+        self.tokenizer = tokenizer
+
     def add_request(self, *args, **kwargs) -> None:
         return None
 
@@ -108,6 +115,11 @@ def _request_output(request_id: str) -> RequestOutput:
 
 @pytest.mark.asyncio
 async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
+    class SourceTokenizer:
+        def decode(self, token_ids, *, skip_special_tokens):
+            assert skip_special_tokens is True
+            return ":".join(str(token_id) for token_id in token_ids)
+
     stage0 = FakeStageClient(final_output=True)
     stage1 = FakeStageClient(
         final_output=True,
@@ -117,7 +129,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         StagePool(
             0,
             [stage0],
-            output_processor=FakeOutputProcessor(),
+            output_processor=FakeOutputProcessor(tokenizer=SourceTokenizer()),
             stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
         ),
         StagePool(
@@ -150,6 +162,8 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
 
     assert input_processor.calls
     assert input_processor.calls[0]["prompt"] == {"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}
+    assert stage1.decoded_source_tokens == "11:12"
+    assert req_state.streaming.source_token_decoder is None
     assert stage1.add_request_calls
     submitted_request = stage1.add_request_calls[0][0]
     assert submitted_request.prompt_token_ids == [101, 102]
