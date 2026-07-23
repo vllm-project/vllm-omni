@@ -61,6 +61,8 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
+@pytest.mark.advanced_model
+@pytest.mark.core_model
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),

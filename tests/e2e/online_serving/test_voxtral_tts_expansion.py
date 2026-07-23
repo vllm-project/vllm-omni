@@ -25,6 +25,8 @@ _MIN_AUDIO_BYTES_BASIC = 10000
 
 pytestmark = [
     pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True),
+    pytest.mark.core_model,
+    pytest.mark.advanced_model,
     pytest.mark.slow,
     pytest.mark.tts,
 ]
