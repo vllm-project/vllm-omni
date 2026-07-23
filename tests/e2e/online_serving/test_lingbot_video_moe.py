@@ -45,7 +45,7 @@ def _get_server_cases(model: str):
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_server_cases(MODEL), indirect=True)
 def test_text_to_image_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    responses = openai_client.send_images_generations_http_request(
+    openai_client.send_images_generations_request(
         {
             "json": {
                 "model": omni_server.model,
@@ -61,11 +61,6 @@ def test_text_to_image_moe(omni_server: OmniServer, openai_client: OpenAIClientH
             }
         }
     )
-    response = responses[0]
-    assert response.success, response.error_message
-    payload = response.json_body
-    assert isinstance(payload, dict)
-    assert payload["data"][0]["b64_json"]
 
 
 @pytest.mark.full_model

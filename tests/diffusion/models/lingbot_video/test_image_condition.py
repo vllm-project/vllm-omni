@@ -33,12 +33,38 @@ def _gradient_image(width: int, height: int) -> Image.Image:
 
 
 @pytest.mark.parametrize("source_size", [(160, 64), (64, 160), (96, 96)])
-def test_geometry_align_image_resizes_and_center_crops(source_size):
+def test_geometry_align_image_supports_source_aspect_ratios(source_size):
     pixel = geometry_align_image(_gradient_image(*source_size), 64, 96)
 
     assert pixel.shape == (1, 3, 1, 64, 96)
     assert pixel.dtype == torch.float32
     assert 0 <= pixel.min() <= pixel.max() <= 1
+
+
+@pytest.mark.parametrize(
+    ("source_size", "target_size"),
+    [((160, 64), (64, 96)), ((64, 160), (96, 64))],
+)
+def test_geometry_align_image_center_crops_without_stretching(source_size, target_size):
+    width, height = source_size
+    target_height, target_width = target_size
+    rgb = np.full((height, width, 3), (255, 0, 0), dtype=np.uint8)
+    if width > target_width:
+        left = (width - target_width) // 2
+        rgb[:, left : left + target_width] = (0, 255, 0)
+    else:
+        top = (height - target_height) // 2
+        rgb[top : top + target_height] = (0, 255, 0)
+
+    pixel = geometry_align_image(
+        Image.fromarray(rgb, mode="RGB"),
+        target_height,
+        target_width,
+    )
+
+    assert pixel.shape == (1, 3, 1, target_height, target_width)
+    expected_green = torch.tensor((0.0, 1.0, 0.0)).view(1, 3, 1, 1, 1)
+    assert torch.equal(pixel, expected_green.expand_as(pixel))
 
 
 class _LatentDistribution:
@@ -85,7 +111,6 @@ def test_ti2v_vlm_and_vae_paths_share_geometry_aligned_image():
         rtol=0,
         atol=1,
     )
-    assert condition.prefix_length == 1
 
 
 def test_apply_clean_prefix_only_overwrites_condition_frames():

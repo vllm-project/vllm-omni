@@ -21,7 +21,6 @@ SPATIAL_MERGE_SIZE = 2
 class LingBotImageCondition:
     vlm_image: Image.Image
     clean_latent: torch.Tensor
-    prefix_length: int
 
 
 def _round_by_factor(number: float, factor: int) -> int:
@@ -180,7 +179,6 @@ def prepare_ti2v_image_condition(
     return LingBotImageCondition(
         vlm_image=vlm_image,
         clean_latent=clean_latent,
-        prefix_length=int(clean_latent.shape[2]),
     )
 
 

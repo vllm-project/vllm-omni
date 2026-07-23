@@ -2,28 +2,42 @@
 
 set -euo pipefail
 
-if [ -z "${INPUT_IMAGE:-}" ] || [ ! -f "${INPUT_IMAGE}" ]; then
-    echo "Set INPUT_IMAGE to an existing first-frame image."
+if [ -n "${INPUT_IMAGE:-}" ] && [ ! -f "${INPUT_IMAGE}" ]; then
+    echo "INPUT_IMAGE does not exist: ${INPUT_IMAGE}"
     exit 1
 fi
 
 BASE_URL="${BASE_URL:-http://localhost:8099}"
-MODEL="${MODEL:-robbyant/lingbot-video-dense-1.3b}"
-OUTPUT_PATH="${OUTPUT_PATH:-lingbot_ti2v.mp4}"
 POLL_INTERVAL="${POLL_INTERVAL:-2}"
 
-create_response="$(curl -sS -X POST "${BASE_URL}/v1/videos" \
-    -H "Accept: application/json" \
-    -F "model=${MODEL}" \
-    -F "prompt=the subject turns toward the camera with smooth natural motion" \
-    -F "input_reference=@${INPUT_IMAGE}" \
-    -F 'extra_params={"size":"320x192"}' \
-    -F "num_frames=9" \
-    -F "fps=24" \
-    -F "num_inference_steps=2" \
-    -F "guidance_scale=3.0" \
-    -F "flow_shift=3.0" \
-    -F "seed=42")"
+if [ -n "${INPUT_IMAGE:-}" ]; then
+    default_output="lingbot_ti2v.mp4"
+else
+    default_output="lingbot_t2v.mp4"
+fi
+OUTPUT_PATH="${OUTPUT_PATH:-${default_output}}"
+
+curl_args=(
+    -sS -X POST "${BASE_URL}/v1/videos"
+    -H "Accept: application/json"
+    -F "prompt=the subject turns toward the camera with smooth natural motion"
+    -F "num_frames=9"
+    -F "fps=24"
+    -F "num_inference_steps=2"
+    -F "guidance_scale=3.0"
+    -F "flow_shift=3.0"
+    -F "seed=42"
+)
+if [ -n "${INPUT_IMAGE:-}" ]; then
+    curl_args+=(
+        -F "input_reference=@${INPUT_IMAGE}"
+        -F 'extra_params={"size":"320x192"}'
+    )
+else
+    curl_args+=(-F "width=320" -F "height=192")
+fi
+
+create_response="$(curl "${curl_args[@]}")"
 
 video_id="$(echo "${create_response}" | jq -er '.id')"
 echo "Created video job ${video_id}"

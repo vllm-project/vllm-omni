@@ -10,9 +10,12 @@ and MoE checkpoints use the same request format.
 MODEL=robbyant/lingbot-video-dense-1.3b bash run_server.sh
 ```
 
-The MoE checkpoint can be selected with
-`MODEL=robbyant/lingbot-video-moe-30b-a3b`. It requires substantially more GPU
-memory than the dense checkpoint.
+The MoE checkpoint uses the same server and request scripts, but requires
+substantially more GPU memory:
+
+```bash
+MODEL=robbyant/lingbot-video-moe-30b-a3b bash run_server.sh
+```
 
 ## Text to image
 
@@ -27,14 +30,21 @@ The script sends a `320x192`, two-step smoke request and writes
 
 ## Text or text-image to video
 
-Pass a first-frame image to select TI2V mode:
+Run the video script without an image to select T2V mode:
+
+```bash
+bash run_curl_text_image_to_video.sh
+```
+
+Pass a first-frame image to the same script to select TI2V mode:
 
 ```bash
 INPUT_IMAGE=/path/to/input.png bash run_curl_text_image_to_video.sh
 ```
 
-Remove the `input_reference` form field from the create request to select T2V.
-The example uses the lightweight `320x192`, 9-frame, two-step configuration.
+The client scripts omit the optional `model` request field, so they target
+whichever dense or MoE checkpoint the server loaded. The video example uses the
+lightweight `320x192`, 9-frame, two-step configuration.
 
 Until the shared `/v1/videos` reference-image resizing is removed, TI2V target
 dimensions must be sent through `extra_params`, for example

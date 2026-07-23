@@ -20,6 +20,7 @@ from PIL import Image
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
+    decode_b64_image,
     preprocess_text,
 )
 
@@ -111,6 +112,34 @@ def assert_image_diffusion_response(
                         width=_maybe_int(width) if width is not None else None,
                         height=_maybe_int(height) if height is not None else None,
                     )
+
+
+def assert_images_generations_response(
+    response: dict[str, Any],
+    request_config: dict[str, Any],
+    run_level: str | None = None,
+) -> None:
+    """Validate a successful ``/v1/images/generations`` JSON response."""
+    del run_level
+    request_body = request_config.get("json") or {}
+    data = response.get("data")
+    assert isinstance(data, list), "Image generation response is missing data[]"
+
+    expected_count = int(request_body.get("n", 1))
+    assert len(data) == expected_count, f"Expected {expected_count} images, got {len(data)}"
+
+    width = height = None
+    size = request_body.get("size")
+    if isinstance(size, str) and "x" in size:
+        width_value, height_value = size.lower().split("x", 1)
+        width, height = int(width_value), int(height_value)
+
+    for item in data:
+        assert isinstance(item, dict), "Image generation data entries must be objects"
+        b64_json = item.get("b64_json")
+        assert isinstance(b64_json, str) and b64_json, "Image generation response is missing b64_json"
+        image = decode_b64_image(b64_json)
+        assert_image_valid(image, width=width, height=height)
 
 
 def assert_video_diffusion_response(

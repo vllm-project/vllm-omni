@@ -3,13 +3,11 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8099}"
-MODEL="${MODEL:-robbyant/lingbot-video-dense-1.3b}"
 OUTPUT_PATH="${OUTPUT_PATH:-lingbot_t2i.png}"
 
 curl -sS -X POST "${BASE_URL}/v1/images/generations" \
     -H "Content-Type: application/json" \
     -d "{
-        \"model\": \"${MODEL}\",
         \"prompt\": \"a red fox standing in fresh snow\",
         \"size\": \"320x192\",
         \"num_inference_steps\": 2,

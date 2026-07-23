@@ -46,16 +46,18 @@ Default model: `Qwen/Qwen-Image`
 ### LingBot-Video
 
 LingBot-Video uses the same checkpoint for image and video generation. Run the
-dedicated minimal T2I example with:
+shared T2I entry point with:
 
 ```bash
-python examples/offline_inference/text_to_image/text_to_image_lingbot.py \
+python examples/offline_inference/text_to_image/text_to_image.py \
   --model robbyant/lingbot-video-dense-1.3b \
+  --prompt "a red fox standing in fresh snow" \
   --height 192 --width 320 --num-inference-steps 2 \
+  --guidance-scale 3.0 --extra-body '{"flow_shift":3.0}' \
   --output lingbot_t2i.png
 ```
 
-The example explicitly selects the `image` output modality and requests one
+The LingBot prompt builder selects the `image` output modality and requests one
 frame. Passing an input image is not supported in LingBot T2I mode.
 
 ## Quick Start

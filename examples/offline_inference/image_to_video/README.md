@@ -39,10 +39,13 @@ LingBot-Video accepts exactly one first-frame image and uses the same dense or
 MoE checkpoint as its T2I and T2V modes:
 
 ```bash
-python examples/offline_inference/image_to_video/image_to_video_lingbot.py \
+python examples/offline_inference/image_to_video/image_to_video.py \
   --model robbyant/lingbot-video-dense-1.3b \
+  --model-class-name LingBotVideoPipeline \
   --image /path/to/input.png \
+  --prompt "the fox looks toward the camera" \
   --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --guidance-scale 3.0 --flow-shift 3.0 --fps 24 \
   --output lingbot_ti2v.mp4
 ```
 

@@ -7,7 +7,6 @@ import pytest
 from PIL import Image
 
 from vllm_omni.diffusion.models.lingbot_video.request_utils import (
-    LINGBOT_RESOLUTION_PRESETS,
     LingBotGenerationMode,
     caption_from_lingbot_prompt,
     normalize_lingbot_num_frames,
@@ -128,10 +127,43 @@ def test_resolve_lingbot_num_frames_rejects_non_positive_or_empty_results(durati
         resolve_lingbot_num_frames(duration, fps)
 
 
-def test_resolve_lingbot_size_supports_all_official_presets():
-    for resolution, ratios in LINGBOT_RESOLUTION_PRESETS.items():
-        for ratio, expected in ratios.items():
-            assert resolve_lingbot_size(resolution=resolution, ratio=ratio) == expected
+@pytest.mark.parametrize(
+    ("resolution", "ratio", "expected"),
+    [
+        ("192p", "1:1", (192, 192)),
+        ("192p", "9:16", (192, 320)),
+        ("192p", "16:9", (320, 192)),
+        ("192p", "3:4", (192, 256)),
+        ("192p", "4:3", (256, 192)),
+        ("480p", "1:1", (480, 480)),
+        ("480p", "9:16", (480, 832)),
+        ("480p", "16:9", (832, 480)),
+        ("480p", "3:4", (480, 640)),
+        ("480p", "4:3", (640, 480)),
+        ("720p", "1:1", (736, 736)),
+        ("720p", "9:16", (736, 1280)),
+        ("720p", "16:9", (1280, 736)),
+        ("720p", "3:4", (736, 960)),
+        ("720p", "4:3", (960, 736)),
+        ("1080p", "1:1", (1088, 1088)),
+        ("1080p", "9:16", (1088, 1920)),
+        ("1080p", "16:9", (1920, 1088)),
+        ("1080p", "3:4", (1088, 1440)),
+        ("1080p", "4:3", (1440, 1088)),
+        ("2k", "1:1", (1440, 1440)),
+        ("2k", "9:16", (1440, 2560)),
+        ("2k", "16:9", (2560, 1440)),
+        ("2k", "3:4", (1440, 1920)),
+        ("2k", "4:3", (1920, 1440)),
+        ("4k", "1:1", (2176, 2176)),
+        ("4k", "9:16", (2176, 3840)),
+        ("4k", "16:9", (3840, 2176)),
+        ("4k", "3:4", (2176, 2880)),
+        ("4k", "4:3", (2880, 2176)),
+    ],
+)
+def test_resolve_lingbot_size_supports_all_official_presets(resolution, ratio, expected):
+    assert resolve_lingbot_size(resolution=resolution, ratio=ratio) == expected
 
 
 def test_resolve_lingbot_size_validates_sources_and_alignment():

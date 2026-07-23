@@ -41,6 +41,7 @@ from tests.helpers.assertions import (
     assert_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
+    assert_images_generations_response,
     assert_omni_response,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
@@ -1483,6 +1484,19 @@ class OpenAIClientHandler:
             err_message=cfg.get("err_message"),
         )
         return [resp]
+
+    def send_images_generations_request(
+        self,
+        request_config: dict[str, Any],
+    ) -> list[HttpResponse]:
+        """POST and validate a successful ``/v1/images/generations`` request."""
+        responses = self.send_images_generations_http_request(request_config)
+        for response in responses:
+            assert response.success, response.error_message
+            payload = response.json_body
+            assert isinstance(payload, dict)
+            assert_images_generations_response(payload, request_config, run_level=self.run_level)
+        return responses
 
     def send_images_edits_http_request(
         self,

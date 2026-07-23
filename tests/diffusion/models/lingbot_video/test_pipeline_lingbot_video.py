@@ -433,7 +433,6 @@ def test_ti2v_reinjects_clean_prefix_and_conditions_both_cfg_branches():
     condition = LingBotImageCondition(
         vlm_image=vlm_image,
         clean_latent=torch.full((1, 1, 1, 1, 1), 5.0),
-        prefix_length=1,
     )
     pipeline.prepare_ti2v_image_condition = lambda *args, **kwargs: condition
     encode_calls = []
