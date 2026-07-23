@@ -261,7 +261,7 @@ def test_session_churn_does_not_exhaust_pool(monkeypatch):
     runner.device = None
     runner._perf_e2e_times = []
 
-    def fill_window(self, req, kv_prefetch_jobs=None):
+    def fill_window(self, req, kv_prefetch_job=None):
         # A real forward leaves the session holding its resident window blocks.
         _prepare_and_commit(self.pipeline._ar_diffusion_kv_state, False, 2)
         return SimpleNamespace()
