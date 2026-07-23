@@ -13,11 +13,11 @@ inside an HTTP 200 SSE stream. Other server errors and partial responses remain
 failed requests. Request latency and time to first output include failed
 attempts and retry delays.
 
-Currently these endpoints are available for `vllm bench serve --omni`: 
- Endpoint | Example models
- - | -
- /v1/chat/completions | Qwen3-Omni-30B-A3B-Instruct<br>BAGEL-7B-MoT<br>...
- /v1/images/edits | HunyuanImage-3.0-Instruct<br>...
+Currently these endpoints are available for `vllm bench serve --omni`:
+| Endpoint | Example models |
+| --- | --- |
+| /v1/chat/completions | Qwen3-Omni-30B-A3B-Instruct<br>BAGEL-7B-MoT<br>... |
+| /v1/images/edits | HunyuanImage-3.0-Instruct<br>... |
 
  More endpoints are on the way.
 
