@@ -214,8 +214,8 @@ class LTXRuntime(
             pipeline_name=self.__class__.__name__,
             request_sigmas=request_sigmas,
         )
-        phase_lora_controller = getattr(self, "_phase_lora_controller", None)
-        if phase_lora_controller is not None and any(
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is not None and any(
             getattr(sampling, "lora_request", None) is not None for sampling in req.sampling_params_list
         ):
             raise ValueError(
@@ -340,9 +340,9 @@ class LTXRuntime(
 
     @property
     def denoise_transformer(self) -> nn.Module:
-        controller = getattr(self, "_phase_lora_controller", None)
-        if controller is not None:
-            return controller.transformer
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is not None:
+            return phase_adapter.transformer
         return self.transformer
 
     def _transformer_cache_context(self, context_name: str):

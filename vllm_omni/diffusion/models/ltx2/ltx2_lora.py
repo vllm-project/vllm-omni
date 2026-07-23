@@ -11,27 +11,12 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from safetensors import safe_open
 from vllm.logger import init_logger
 
+from .ltx2_adapter_parser import LTXAdapterParser, iter_adapter_tensors
 from .ltx2_components import create_transformer_from_config
 
 logger = init_logger(__name__)
-
-_IGNORED_OFFICIAL_LORA_MODULES = {"text_embedding_projection.aggregate_embed"}
-_OFFICIAL_TO_DIFFUSERS_PREFIXES = (
-    ("audio_prompt_adaln_single.", "audio_prompt_adaln."),
-    ("prompt_adaln_single.", "prompt_adaln."),
-    ("audio_adaln_single.", "audio_time_embed."),
-    ("adaln_single.", "time_embed."),
-    ("audio_patchify_proj", "audio_proj_in"),
-    ("patchify_proj", "proj_in"),
-    ("av_ca_video_scale_shift_adaln_single.", "av_cross_attn_video_scale_shift."),
-    ("av_ca_audio_scale_shift_adaln_single.", "av_cross_attn_audio_scale_shift."),
-    ("av_ca_a2v_gate_adaln_single.", "av_cross_attn_video_a2v_gate."),
-    ("av_ca_v2a_gate_adaln_single.", "av_cross_attn_audio_v2a_gate."),
-)
-
 
 @dataclass(frozen=True)
 class _LTXLoRAEntry:
@@ -72,71 +57,19 @@ def _uses_serialized_quantization(quant_config: Any) -> bool:
     )
 
 
-def _to_diffusers_module_name(name: str) -> str:
-    for official_prefix, diffusers_prefix in _OFFICIAL_TO_DIFFUSERS_PREFIXES:
-        if name.startswith(official_prefix):
-            return diffusers_prefix + name[len(official_prefix) :]
-    return name
-
-
-def _resolve_lora_target(transformer: nn.Module, module_name: str) -> tuple[str, str | int | None] | None:
-    modules = dict(transformer.named_modules())
-    if module_name in modules:
-        return module_name, None
-    for packed_suffix, sub_suffix, shard_id in getattr(transformer, "stacked_params_mapping", ()):
-        if sub_suffix in module_name:
-            packed_name = module_name.replace(sub_suffix, packed_suffix)
-            if packed_name in modules:
-                return packed_name, shard_id
-    return None
-
-
-def _load_lora_entries(transformer: nn.Module, path: str, dtype: torch.dtype) -> list[_LTXLoRAEntry]:
-    entries: list[_LTXLoRAEntry] = []
-    unresolved: list[str] = []
-    with safe_open(path, framework="pt", device="cpu") as handle:
-        tensor_names = set(handle.keys())
-        module_names = sorted(
-            name.removeprefix("diffusion_model.").rsplit(".lora_", 1)[0]
-            for name in tensor_names
-            if name.endswith(".lora_A.weight")
+def _load_resident_lora_entries(transformer: nn.Module, path: str, dtype: torch.dtype) -> list[_LTXLoRAEntry]:
+    """Materialize parser output only for the resident pre-merge path."""
+    manifest = LTXAdapterParser(transformer).parse(path)
+    return [
+        _LTXLoRAEntry(
+            module_name=target.source_module,
+            target_name=target.module,
+            shard_id=target.slice,
+            lora_a=lora_a.to(dtype=dtype),
+            lora_b=lora_b.to(dtype=dtype),
         )
-        for official_name in module_names:
-            if official_name in _IGNORED_OFFICIAL_LORA_MODULES:
-                continue
-            key_prefix = f"diffusion_model.{official_name}"
-            key_a = f"{key_prefix}.lora_A.weight"
-            key_b = f"{key_prefix}.lora_B.weight"
-            if key_b not in tensor_names:
-                raise ValueError(f"Missing paired LoRA tensor {key_b!r} in {path}.")
-
-            module_name = _to_diffusers_module_name(official_name)
-            target = _resolve_lora_target(transformer, module_name)
-            if target is None:
-                unresolved.append(official_name)
-                continue
-
-            lora_a = handle.get_tensor(key_a).to(dtype=dtype)
-            lora_b = handle.get_tensor(key_b).to(dtype=dtype)
-            if lora_b.shape[1] != lora_a.shape[0]:
-                raise ValueError(
-                    f"Invalid LoRA pair for {official_name}: A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}."
-                )
-            entries.append(
-                _LTXLoRAEntry(
-                    module_name=module_name,
-                    target_name=target[0],
-                    shard_id=target[1],
-                    lora_a=lora_a,
-                    lora_b=lora_b,
-                )
-            )
-
-    if unresolved:
-        raise ValueError(f"Official LTX LoRA contains unmapped modules: {unresolved}.")
-    if not entries:
-        raise ValueError(f"No Transformer LoRA tensors were loaded from {path}.")
-    return entries
+        for target, lora_a, lora_b in iter_adapter_tensors(manifest)
+    ]
 
 
 class LTXResidentLoRAController:
@@ -182,7 +115,7 @@ class LTXResidentLoRAController:
         if self._merged:
             raise RuntimeError("LTX resident LoRA weights have already been merged.")
 
-        entries = _load_lora_entries(
+        entries = _load_resident_lora_entries(
             self.pipeline.transformer_2,
             self.adapter_path,
             self.pipeline.od_config.dtype,
@@ -236,3 +169,12 @@ class LTXResidentLoRAController:
             self.active_transformer_name = "transformer_2"
         else:
             raise ValueError(f"Unsupported LTX Transformer phase: {transformer_phase!r}.")
+
+    def set_active(self, adapter_name: str | None) -> None:
+        """Match the fixed-slot API used by the dynamic phase adapter."""
+        if adapter_name is None:
+            self.enter("base")
+        elif adapter_name == "ltx_distilled":
+            self.enter("distilled_lora")
+        else:
+            raise ValueError(f"Unknown LTX phase adapter slot {adapter_name!r}.")

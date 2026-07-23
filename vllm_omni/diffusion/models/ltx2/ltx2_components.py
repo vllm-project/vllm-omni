@@ -147,8 +147,20 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
 }
 
 
-def resolve_ltx_artifact(model: str, repo_id: str, filename: str) -> str:
-    """Resolve an official LTX sidecar from a local path or the Hub."""
+def resolve_ltx_artifact(
+    model: str,
+    repo_id: str,
+    filename: str,
+    *,
+    explicit_path: str | None = None,
+) -> str:
+    """Resolve an official LTX sidecar from an explicit local path or the Hub."""
+    if explicit_path is not None:
+        candidate = Path(explicit_path)
+        if candidate.is_file():
+            return str(candidate)
+        raise FileNotFoundError(f"Configured LTX artifact {filename!r} does not exist: {candidate}")
+
     candidates = [Path(model) / filename]
     artifacts_dir = os.getenv(_LTX_ARTIFACTS_DIR_ENV)
     if artifacts_dir:
@@ -413,6 +425,8 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     pipeline.device = get_local_device()
     dtype = getattr(od_config, "dtype", torch.bfloat16)
     model = od_config.model
+    model_paths = getattr(od_config, "model_paths", {}) or {}
+    explicit_upsampler_path = model_paths.get("latent_upsampler")
     local_files_only = os.path.exists(model)
 
     pipeline.weights_sources = [
@@ -482,7 +496,17 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
 
     if profile.latent_upsampler_cls is not None:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
-        if os.path.isfile(upsampler_config) or not local_files_only:
+        if explicit_upsampler_path is not None:
+            if profile.latent_upsampler_filename is None or profile.artifact_repo_id is None:
+                raise FileNotFoundError(f"LTX latent upsampler component not configured for {profile.name}.")
+            upsampler_path = resolve_ltx_artifact(
+                model,
+                profile.artifact_repo_id,
+                profile.latent_upsampler_filename,
+                explicit_path=explicit_upsampler_path,
+            )
+            pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
+        elif os.path.isfile(upsampler_config) or not local_files_only:
             try:
                 pipeline.latent_upsampler = _load_component(
                     profile.latent_upsampler_cls,
@@ -498,6 +522,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
                     model,
                     profile.artifact_repo_id,
                     profile.latent_upsampler_filename,
+                    explicit_path=explicit_upsampler_path,
                 )
                 pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
         else:
@@ -507,6 +532,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
                 model,
                 profile.artifact_repo_id,
                 profile.latent_upsampler_filename,
+                explicit_path=explicit_upsampler_path,
             )
             pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
 
