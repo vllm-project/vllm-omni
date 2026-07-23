@@ -30,7 +30,6 @@ from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     _build_terminal_empty_output,
-    _infer_stage_audio_sample_rate,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
@@ -201,12 +200,12 @@ class FakeStageClient:
 def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
     final_stage = FakeStageClient(final_output=True, final_output_type="audio")
     final_stage.sample_rate = 44100
-    final_pool = SimpleNamespace(stage_client=final_stage, _stage_vllm_config=None)
+    final_pool = StagePool(0, [final_stage])
 
     terminal_output = _build_terminal_empty_output(
         "req-1",
         final_output_type="audio",
-        audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
+        audio_sample_rate=final_pool._infer_audio_sample_rate(),
     )
 
     assert terminal_output.outputs[0].multimodal_output["sr"] == 44100
