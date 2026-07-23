@@ -10,6 +10,7 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
+    _snapshot_tensor_payload_to_cpu_async,
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
@@ -539,6 +540,22 @@ def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
 
     assert set(payload.keys()) == {"multimodal_outputs"}
     assert payload["multimodal_outputs"]["codes"]["audio"].tolist() == [[1]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")
+def test_async_snapshot_no_cuda_payload_records_sentinel_event():
+    copy_stream = torch.cuda.Stream()
+
+    snapshot = _snapshot_tensor_payload_to_cpu_async(
+        {"multimodal_outputs": None},
+        copy_stream=copy_stream,
+        pin_memory=False,
+    )
+
+    assert snapshot.payload == {"multimodal_outputs": None}
+    assert snapshot._ready_event is not None
+    snapshot.wait()
+    assert snapshot._waited
 
 
 def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():

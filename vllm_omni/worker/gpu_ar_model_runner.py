@@ -126,11 +126,17 @@ def _snapshot_tensor_payload_to_cpu_async(
 ) -> _AsyncCPUPayloadSnapshot:
     cuda_sources: list[torch.Tensor] = []
     cloned = _clone_cuda_tensor_payload(value, cuda_sources)
-    if not cuda_sources:
-        return _AsyncCPUPayloadSnapshot(cloned, None, cuda_sources)
-
     source_stream = torch.cuda.current_stream()
     ready_event = torch.cuda.Event()
+    if not cuda_sources:
+        # Some models only need non-tensor metadata in the Omni async payload.
+        # Still give the background builder an event to wait on so it drains the
+        # compute stream before the main thread waits for sampled-token feedback.
+        with torch.cuda.stream(copy_stream):
+            copy_stream.wait_stream(source_stream)
+            ready_event.record(copy_stream)
+        return _AsyncCPUPayloadSnapshot(cloned, ready_event, cuda_sources)
+
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(source_stream)
         cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory)
