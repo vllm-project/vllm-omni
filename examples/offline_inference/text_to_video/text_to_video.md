@@ -67,7 +67,8 @@ python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
 ```
 
 Use the same command with `robbyant/lingbot-video-moe-30b-a3b` for the MoE
-checkpoint. Frame counts must be `1` or `4n+1`.
+checkpoint. Requested frame counts are rounded upward to the causal
+VAE's `4n+1` grid.
 
 ### LTX-2
 

@@ -196,11 +196,11 @@ def _positive_int(value: Any, name: str) -> int:
     return parsed
 
 
-def validate_lingbot_num_frames(value: Any) -> int:
+def normalize_lingbot_num_frames(value: Any) -> int:
+    """Round a video length up to LingBot's causal VAE ``4n+1`` grid."""
     num_frames = _positive_int(value, "num_frames")
-    if num_frames != 1 and (num_frames - 1) % 4 != 0:
-        raise ValueError(f"LingBot `num_frames` must be 1 or 4n+1, got {value!r}.")
-    return num_frames
+    latent_frames = math.ceil((num_frames - 1) / 4)
+    return latent_frames * 4 + 1
 
 
 def resolve_lingbot_num_frames(duration: Any, fps: Any) -> int:
@@ -216,7 +216,7 @@ def resolve_lingbot_num_frames(duration: Any, fps: Any) -> int:
         raise ValueError(
             f"LingBot `duration` and `fps` must produce at least one frame, got duration={duration!r}, fps={fps!r}."
         )
-    return ((raw_frames - 1) // 4 + 1) * 4 + 1
+    return normalize_lingbot_num_frames(raw_frames)
 
 
 def _parse_size(value: Any) -> tuple[int, int]:
@@ -285,13 +285,6 @@ def _runtime_prompt_fields(prompt_obj: Any) -> Mapping[str, Any]:
     return prompt_value if isinstance(prompt_value, Mapping) else {}
 
 
-def _request_context(extra_args: Mapping[str, Any]) -> Mapping[str, Any]:
-    context = extra_args.get("_vllm_request_context") or {}
-    if not isinstance(context, Mapping):
-        raise TypeError("LingBot internal `_vllm_request_context` must be a mapping.")
-    return context
-
-
 def _pick(mapping: Mapping[str, Any], key: str) -> Any:
     value = mapping.get(key)
     return value if value is not None else None
@@ -320,8 +313,6 @@ def normalize_lingbot_request(
     prompt_fields = _runtime_prompt_fields(prompt_obj)
     sampling = request.sampling_params
     extra_args = dict(sampling.extra_args or {})
-    context = _request_context(extra_args)
-    context_present = "_vllm_request_context" in extra_args
 
     mode = resolve_lingbot_mode(prompt_obj)
     prompt = caption_from_lingbot_prompt(_prompt_value(prompt_obj))
@@ -342,90 +333,53 @@ def normalize_lingbot_request(
     if not isinstance(negative_prompt, str):
         raise TypeError(f"LingBot `negative_prompt` must be a string, got {type(negative_prompt)!r}.")
 
-    sampling_fps = sampling.resolved_frame_rate
-    sampling_fps_explicit = bool(context.get("fps_explicit")) if context_present else sampling_fps is not None
-    fps_raw = (
-        sampling_fps
-        if sampling_fps_explicit
-        else _first_not_none(
-            _pick(extra_args, "fps"),
-            _pick(prompt_fields, "fps"),
-            sampling_fps,
-            default_fps,
-        )
+    fps_raw = _first_not_none(
+        _pick(extra_args, "fps"),
+        _pick(prompt_fields, "fps"),
+        sampling.resolved_frame_rate,
+        default_fps,
     )
     fps = _positive_int(fps_raw, "fps")
 
-    seconds_value = context.get("seconds") if context_present else None
     extra_seconds = _pick(extra_args, "seconds")
     prompt_seconds = _pick(prompt_fields, "seconds")
     duration_value = _pick(extra_args, "duration")
     prompt_duration = _pick(prompt_fields, "duration")
-    if any(value is not None for value in (seconds_value, extra_seconds, prompt_seconds)) and any(
+    if any(value is not None for value in (extra_seconds, prompt_seconds)) and any(
         value is not None for value in (duration_value, prompt_duration)
     ):
         raise ValueError("LingBot `seconds` and `duration` cannot be provided together.")
     duration = next(
-        (
-            value
-            for value in (seconds_value, extra_seconds, prompt_seconds, duration_value, prompt_duration)
-            if value is not None
-        ),
+        (value for value in (extra_seconds, prompt_seconds, duration_value, prompt_duration) if value is not None),
         None,
     )
 
-    sampling_num_frames_explicit = (
-        bool(context.get("num_frames_explicit")) if context_present else sampling.num_frames is not None
+    requested_num_frames = _first_not_none(
+        _pick(extra_args, "num_frames"),
+        _pick(prompt_fields, "num_frames"),
+        sampling.num_frames,
+        default_num_frames,
     )
-    if sampling_num_frames_explicit:
-        explicit_num_frames = sampling.num_frames
-    elif _pick(extra_args, "num_frames") is not None:
-        explicit_num_frames = extra_args["num_frames"]
-    else:
-        explicit_num_frames = _pick(prompt_fields, "num_frames")
-
     if mode is LingBotGenerationMode.T2I:
         if duration is not None:
             raise ValueError(f"LingBot text-to-image does not accept `seconds` or `duration`, got {duration!r}.")
-        if explicit_num_frames is not None and validate_lingbot_num_frames(explicit_num_frames) != 1:
-            raise ValueError(f"LingBot text-to-image requires `num_frames=1`, got {explicit_num_frames!r}.")
+        if _positive_int(requested_num_frames, "num_frames") != 1:
+            raise ValueError(f"LingBot text-to-image requires `num_frames=1`, got {requested_num_frames!r}.")
         num_frames = 1
-    elif explicit_num_frames is not None:
-        num_frames = validate_lingbot_num_frames(explicit_num_frames)
     elif duration is not None:
         num_frames = resolve_lingbot_num_frames(duration, fps)
     else:
-        num_frames = validate_lingbot_num_frames(default_num_frames)
+        num_frames = normalize_lingbot_num_frames(requested_num_frames)
 
-    if context_present:
-        size_explicit = bool(context.get("size_explicit"))
-        width_explicit = bool(context.get("width_explicit"))
-        height_explicit = bool(context.get("height_explicit"))
-        if width_explicit != height_explicit:
-            raise ValueError(
-                "LingBot `width` and `height` must be provided together, "
-                f"got width_explicit={width_explicit}, height_explicit={height_explicit}."
-            )
-        sampling_size = (sampling.width, sampling.height) if size_explicit else None
-        sampling_width = sampling.width if width_explicit else None
-        sampling_height = sampling.height if height_explicit else None
-    else:
-        sampling_size = None
-        sampling_width = sampling.width
-        sampling_height = sampling.height
-
-    width = _first_not_none(
-        sampling_width,
+    requested_width = _first_not_none(
         _pick(extra_args, "width"),
         _pick(prompt_fields, "width"),
     )
-    height = _first_not_none(
-        sampling_height,
+    requested_height = _first_not_none(
         _pick(extra_args, "height"),
         _pick(prompt_fields, "height"),
     )
     size = _first_not_none(
-        sampling_size,
         _pick(extra_args, "size"),
         _pick(prompt_fields, "size"),
     )
@@ -437,6 +391,12 @@ def normalize_lingbot_request(
         _pick(extra_args, "ratio"),
         _pick(prompt_fields, "ratio"),
     )
+    if requested_width is not None or requested_height is not None:
+        width, height = requested_width, requested_height
+    elif size is not None or resolution is not None or ratio is not None:
+        width = height = None
+    else:
+        width, height = sampling.width, sampling.height
     if width is None and height is None and size is None and resolution is None and ratio is None:
         width, height = default_width, default_height
     height, width = resolve_lingbot_size(
@@ -446,7 +406,6 @@ def normalize_lingbot_request(
         resolution=resolution,
         ratio=ratio,
     )
-
     num_inference_steps = sampling.num_inference_steps
     if num_inference_steps is None:
         num_inference_steps = _first_not_none(_pick(extra_args, "num_inference_steps"), default_num_inference_steps)

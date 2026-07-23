@@ -36,9 +36,10 @@ INPUT_IMAGE=/path/to/input.png bash run_curl_text_image_to_video.sh
 Remove the `input_reference` form field from the create request to select T2V.
 The example uses the lightweight `320x192`, 9-frame, two-step configuration.
 
-LingBot video frame counts must be `1` or `4n+1`. An explicit `num_frames`
-takes precedence over `seconds`. When only `seconds` is supplied, the server
-converts `seconds * fps` upward to the next valid `4n+1` frame count.
+LingBot video frame counts use the causal VAE `4n+1` grid. The pipeline rounds
+any requested frame count upward to the next valid value. An explicit
+`num_frames` takes precedence over `seconds`; otherwise, the server first
+resolves `seconds * fps` and the pipeline applies the same alignment.
 
 Official `resolution`/`ratio` presets can be sent through `extra_params`, for
 example `{"resolution":"720p","ratio":"16:9"}`. The `2k` and `4k` entries

@@ -10,11 +10,11 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
     LINGBOT_RESOLUTION_PRESETS,
     LingBotGenerationMode,
     caption_from_lingbot_prompt,
+    normalize_lingbot_num_frames,
     normalize_lingbot_request,
     resolve_lingbot_mode,
     resolve_lingbot_num_frames,
     resolve_lingbot_size,
-    validate_lingbot_num_frames,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -100,15 +100,18 @@ def test_caption_from_lingbot_prompt_rejects_empty_caption(prompt):
         caption_from_lingbot_prompt(prompt)
 
 
-@pytest.mark.parametrize("num_frames", [1, 5, 9, 121])
-def test_validate_lingbot_num_frames_accepts_4n_plus_1(num_frames):
-    assert validate_lingbot_num_frames(num_frames) == num_frames
+@pytest.mark.parametrize(
+    ("num_frames", "expected"),
+    [(1, 1), (2, 5), (4, 5), (5, 5), (96, 97), (98, 101), (121, 121)],
+)
+def test_normalize_lingbot_num_frames_rounds_up_to_4n_plus_1(num_frames, expected):
+    assert normalize_lingbot_num_frames(num_frames) == expected
 
 
-@pytest.mark.parametrize("num_frames", [0, 2, 4, 120, 122])
-def test_validate_lingbot_num_frames_rejects_invalid_values(num_frames):
+@pytest.mark.parametrize("num_frames", [0, -1, 1.5, "invalid"])
+def test_normalize_lingbot_num_frames_rejects_invalid_values(num_frames):
     with pytest.raises(ValueError, match="num_frames"):
-        validate_lingbot_num_frames(num_frames)
+        normalize_lingbot_num_frames(num_frames)
 
 
 @pytest.mark.parametrize(
@@ -186,15 +189,7 @@ def test_normalize_lingbot_request_rejects_explicit_zero_width():
         )
 
 
-def test_normalize_lingbot_request_recomputes_seconds_and_prefers_explicit_frames():
-    context = {
-        "seconds": "4",
-        "num_frames_explicit": False,
-        "fps_explicit": True,
-        "width_explicit": True,
-        "height_explicit": True,
-        "size_explicit": False,
-    }
+def test_normalize_lingbot_request_rounds_all_video_frame_counts():
     config = _normalize(
         {"prompt": "motion", "modalities": ["video"]},
         width=320,
@@ -202,11 +197,9 @@ def test_normalize_lingbot_request_recomputes_seconds_and_prefers_explicit_frame
         num_frames=96,
         fps=24,
         frame_rate=24,
-        extra_args={"_vllm_request_context": context},
     )
     assert config.num_frames == 97
 
-    context["num_frames_explicit"] = True
     config = _normalize(
         {"prompt": "motion", "modalities": ["video"]},
         width=320,
@@ -214,7 +207,6 @@ def test_normalize_lingbot_request_recomputes_seconds_and_prefers_explicit_frame
         num_frames=121,
         fps=24,
         frame_rate=24,
-        extra_args={"_vllm_request_context": context},
     )
     assert config.num_frames == 121
 
@@ -240,38 +232,17 @@ def test_normalize_lingbot_request_rejects_contract_conflicts():
             width=320,
             height=192,
             num_frames=96,
-            extra_args={
-                "duration": 4,
-                "_vllm_request_context": {
-                    "seconds": "4",
-                    "num_frames_explicit": False,
-                    "fps_explicit": False,
-                    "width_explicit": True,
-                    "height_explicit": True,
-                    "size_explicit": False,
-                },
-            },
+            extra_args={"seconds": 4, "duration": 4},
         )
 
 
-def test_normalize_lingbot_request_lets_preset_override_serving_defaults_only():
+def test_normalize_lingbot_request_model_size_overrides_sampling_dimensions():
     config = _normalize(
         {"prompt": "motion", "modalities": ["video"]},
         width=480,
         height=480,
         num_frames=81,
-        extra_args={
-            "resolution": "192p",
-            "ratio": "9:16",
-            "_vllm_request_context": {
-                "seconds": None,
-                "num_frames_explicit": False,
-                "fps_explicit": False,
-                "width_explicit": False,
-                "height_explicit": False,
-                "size_explicit": False,
-            },
-        },
+        extra_args={"resolution": "192p", "ratio": "9:16"},
     )
     assert (config.height, config.width) == (192, 320)
 
@@ -282,15 +253,9 @@ def test_normalize_lingbot_request_lets_preset_override_serving_defaults_only():
             height=480,
             num_frames=81,
             extra_args={
+                "width": 480,
+                "height": 480,
                 "resolution": "192p",
                 "ratio": "9:16",
-                "_vllm_request_context": {
-                    "seconds": None,
-                    "num_frames_explicit": False,
-                    "fps_explicit": False,
-                    "width_explicit": True,
-                    "height_explicit": True,
-                    "size_explicit": False,
-                },
             },
         )
