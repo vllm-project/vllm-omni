@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer i
     create_quantized_avatar_dit,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -787,8 +788,8 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
     def _clear_cache(self) -> None:
         self.kv_cache_dict = {}
-        if self.device.type == "cuda":
-            torch.accelerator.empty_cache()
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
 
     def normalize_latents(self, latents):
         latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1)
