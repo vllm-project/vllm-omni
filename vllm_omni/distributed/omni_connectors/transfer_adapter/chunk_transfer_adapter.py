@@ -411,6 +411,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        moss_raw_states = getattr(self, "_moss_tts_raw_chunk_states", None)
+        if moss_raw_states is not None:
+            moss_raw_states.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:

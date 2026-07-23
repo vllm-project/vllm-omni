@@ -87,9 +87,7 @@ class OmniMsgpackEncoder:
         # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
         if t.dim() == 0:
             t = t.reshape(1)
-        if not t.is_contiguous():
-            t = t.contiguous()
-        t = t.view(torch.uint8)
+        t = t.reshape(-1).view(torch.uint8)
         return {
             _TENSOR_MARKER: True,
             "dtype": str(tensor.dtype).removeprefix("torch."),

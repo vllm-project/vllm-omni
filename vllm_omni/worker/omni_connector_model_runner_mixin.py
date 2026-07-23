@@ -283,6 +283,7 @@ class OmniConnectorModelRunnerMixin:
                 self._send_side_request_payload.pop(k, None)
                 self._code_prompt_token_ids.pop(k, None)
                 self._cached_ic.pop(k, None)
+                self._drop_moss_raw_chunk_state(k)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
@@ -303,8 +304,15 @@ class OmniConnectorModelRunnerMixin:
         if ext_id is not None:
             self._send_side_request_payload.pop(ext_id, None)
             self._cached_ic.pop(ext_id, None)
+            self._drop_moss_raw_chunk_state(ext_id)
         self._send_side_request_payload.pop(req_id, None)
         self._cached_ic.pop(req_id, None)
+        self._drop_moss_raw_chunk_state(req_id)
+
+    def _drop_moss_raw_chunk_state(self, req_id: str) -> None:
+        moss_raw_states = getattr(self, "_moss_tts_raw_chunk_states", None)
+        if moss_raw_states is not None:
+            moss_raw_states.pop(req_id, None)
 
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
         """Clear recv-side delivery-cycle state."""
@@ -1964,6 +1972,7 @@ class OmniConnectorModelRunnerMixin:
                 self._send_side_request_payload.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
                 self._cached_ic.pop(cleanup_req_id, None)
+                self._drop_moss_raw_chunk_state(cleanup_req_id)
 
     # ------------------------------------------------------------------ #
     #  Payload accumulation  (ported from OmniChunkTransferAdapter)

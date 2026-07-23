@@ -35,6 +35,8 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
+_MOSS_LOCAL_REP_WINDOW = 50
+
 
 def _maybe_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
@@ -72,6 +74,134 @@ def _iter_state_row_spans(
         "MOSS-TTS compute_logits requires request_token_spans or one-row-per-request logits; "
         f"got {num_rows} rows for {len(states)} request states"
     )
+
+
+def _moss_local_history_capacity(required_length: int, rep_window: int) -> int:
+    capacity = max(64, int(rep_window), 1)
+    while capacity < required_length:
+        capacity *= 2
+    return capacity
+
+
+def _moss_local_empty_history(capacity: int, n_vq: int) -> dict[str, Any]:
+    return {"buffer": torch.empty((capacity, n_vq), dtype=torch.long, device="cpu"), "length": 0}
+
+
+def _moss_local_normalize_history(
+    audio_codes: dict[str, Any],
+    n_vq: int,
+    rep_window: int,
+    required_length: int = 0,
+) -> dict[str, Any]:
+    """Return MOSS Local's CPU history buffer, converting legacy tensors once."""
+    accumulated = audio_codes.get("accumulated")
+    history: torch.Tensor
+
+    if isinstance(accumulated, dict):
+        buffer = accumulated.get("buffer")
+        length = int(accumulated.get("length", 0) or 0)
+        if isinstance(buffer, torch.Tensor) and buffer.dim() == 2 and buffer.shape[1] == n_vq:
+            length = max(0, min(length, int(buffer.shape[0])))
+            if buffer.device.type == "cpu" and buffer.dtype == torch.long and buffer.shape[0] >= required_length:
+                accumulated["length"] = length
+                return accumulated
+            history = buffer[:length].detach().to(device="cpu", dtype=torch.long)
+        else:
+            history = torch.empty((0, n_vq), dtype=torch.long, device="cpu")
+            length = 0
+    elif isinstance(accumulated, torch.Tensor) and accumulated.numel() > 0:
+        history = accumulated.detach().to(device="cpu", dtype=torch.long)
+        if history.dim() == 1 and history.numel() % n_vq == 0:
+            history = history.view(-1, n_vq)
+        elif history.dim() != 2 or history.shape[1] != n_vq:
+            raise ValueError(
+                f"MOSS Local accumulated audio history must have shape (T, {n_vq}); got {tuple(history.shape)}"
+            )
+        length = int(history.shape[0])
+    else:
+        history = torch.empty((0, n_vq), dtype=torch.long, device="cpu")
+        length = 0
+
+    capacity = _moss_local_history_capacity(max(length, required_length), rep_window)
+    state = _moss_local_empty_history(capacity, n_vq)
+    if length > 0:
+        state["buffer"][:length].copy_(history[:length])
+        state["length"] = length
+    audio_codes["accumulated"] = state
+    return state
+
+
+def _moss_local_get_history_tail_per_codebook(
+    audio_codes: dict[str, Any],
+    n_vq: int,
+    rep_window: int,
+) -> list[list[int]]:
+    accumulated = audio_codes.get("accumulated")
+    if accumulated is None:
+        return [[] for _ in range(n_vq)]
+
+    state = _moss_local_normalize_history(audio_codes, n_vq=n_vq, rep_window=rep_window)
+    length = int(state["length"])
+    if length <= 0:
+        return [[] for _ in range(n_vq)]
+    tail = state["buffer"][max(0, length - rep_window) : length].tolist()
+    return [[row[cb] for row in tail] for cb in range(n_vq)]
+
+
+def _moss_local_append_history_frame(
+    audio_codes: dict[str, Any],
+    new_codes: torch.Tensor,
+    n_vq: int,
+) -> dict[str, Any]:
+    accumulated = audio_codes.get("accumulated")
+    if isinstance(accumulated, dict):
+        current_length = int(accumulated.get("length", 0) or 0)
+    elif isinstance(accumulated, torch.Tensor):
+        current_length = int(accumulated.numel() // n_vq) if accumulated.numel() > 0 else 0
+    else:
+        current_length = 0
+    state = _moss_local_normalize_history(
+        audio_codes,
+        n_vq=n_vq,
+        rep_window=_MOSS_LOCAL_REP_WINDOW,
+        required_length=current_length + 1,
+    )
+
+    frame = new_codes.detach().to(device="cpu", dtype=torch.long)
+    if frame.dim() == 2:
+        if frame.shape[1] != n_vq or frame.shape[0] != 1:
+            raise ValueError(f"MOSS Local new audio frame must have shape ({n_vq},) or (1, {n_vq})")
+        frame = frame[0]
+    elif frame.dim() != 1 or frame.numel() != n_vq:
+        raise ValueError(f"MOSS Local new audio frame must have shape ({n_vq},) or (1, {n_vq})")
+
+    length = int(state["length"])
+    buffer = state["buffer"]
+    if length >= int(buffer.shape[0]):
+        next_state = _moss_local_empty_history(max(int(buffer.shape[0]) * 2, 1), n_vq)
+        if length > 0:
+            next_state["buffer"][:length].copy_(buffer[:length])
+        next_state["length"] = length
+        state = next_state
+        audio_codes["accumulated"] = state
+        buffer = state["buffer"]
+
+    buffer[length].copy_(frame)
+    state["length"] = length + 1
+    return state
+
+
+def _moss_local_materialize_history(accumulated: Any) -> torch.Tensor:
+    if isinstance(accumulated, dict):
+        buffer = accumulated.get("buffer")
+        length = int(accumulated.get("length", 0) or 0)
+        if isinstance(buffer, torch.Tensor) and buffer.dim() == 2:
+            length = max(0, min(length, int(buffer.shape[0])))
+            return buffer[:length].detach().to(device="cpu", dtype=torch.long)
+        return torch.empty((0, 0), dtype=torch.long, device="cpu")
+    if isinstance(accumulated, torch.Tensor):
+        return accumulated.detach().to(device="cpu", dtype=torch.long)
+    return torch.empty((0, 0), dtype=torch.long, device="cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -1325,7 +1455,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
-            ("audio_codes", "accumulated"),
             ("hidden_states", "last"),
         }
 
@@ -1531,7 +1660,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             state = dict(info.get("audio_state", {}) or {})
             step = int(state.get("step", 0))
             max_new_frames = int(state.get("max_new_frames", -1))
-            acc = (info.get("audio_codes", {}) or {}).get("accumulated")
+            audio_codes = info.setdefault("audio_codes", {})
 
             if state.get("is_stopping"):
                 write_update(
@@ -1540,18 +1669,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                         "audio_state": state,
                         "audio_codes": {
                             "current": input_embeds.new_empty((0, self.n_vq), dtype=torch.long),
+                            "accumulated": audio_codes.get("accumulated"),
                             "emit": False,
                         },
                     },
                 )
                 continue
 
-            rep_window = 50
-            if isinstance(acc, torch.Tensor) and acc.numel() > 0:
-                tail = acc[-rep_window:].long().cpu().tolist()
-                hist_per_cb = [[row[cb] for row in tail] for cb in range(self.n_vq)]
-            else:
-                hist_per_cb = [[] for _ in range(self.n_vq)]
+            hist_per_cb = _moss_local_get_history_tail_per_codebook(audio_codes, self.n_vq, _MOSS_LOCAL_REP_WINDOW)
 
             should_continue_t, new_codes_b = self.local_transformer.generate_frame(
                 last_talker_hidden[i : i + 1],
@@ -1579,17 +1704,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                         "audio_state": state,
                         "audio_codes": {
                             "current": input_embeds.new_empty((0, self.n_vq), dtype=torch.long),
-                            "accumulated": acc,
+                            "accumulated": audio_codes.get("accumulated"),
                             "emit": False,
                         },
                     },
                 )
                 continue
 
-            if isinstance(acc, torch.Tensor) and acc.numel() > 0:
-                updated_acc = torch.cat([acc.to(dev), new_codes.unsqueeze(0)], dim=0)
-            else:
-                updated_acc = new_codes.unsqueeze(0)
+            updated_acc = _moss_local_append_history_frame(audio_codes, new_codes, self.n_vq)
 
             state["step"] = step + 1
             current = new_codes.unsqueeze(0)

@@ -47,6 +47,20 @@ def test_noncontiguous_tensor_serialization():
     assert torch.equal(tensor, deserialized["codes"])
 
 
+def test_size_one_trailing_dim_tensor_serialization():
+    """Test tensors whose last-dim stride is not byte-view compatible."""
+    import torch
+
+    tensor = torch.arange(4, dtype=torch.long).reshape(1, 4).transpose(0, 1)
+    assert tensor.is_contiguous()
+    assert tensor.stride(-1) != 1
+
+    serialized = OmniSerializer.serialize({"codes": tensor})
+    deserialized = OmniSerializer.deserialize(serialized)
+
+    assert torch.equal(tensor, deserialized["codes"])
+
+
 def test_ndarray_serialization():
     """Test numpy.ndarray serialization."""
     import numpy as np

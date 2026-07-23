@@ -37,6 +37,64 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 logger = init_logger(__name__)
 
 
+def _moss_codec_codes_from_payload_or_input(
+    input_seg: torch.Tensor,
+    runtime_info: dict[str, Any] | None,
+    n_vq: int,
+    device: torch.device | str,
+) -> torch.Tensor | None:
+    """Return codec codes in codec-native ``[n_vq, T]`` layout.
+
+    New async MOSS raw chunks carry the real codec ids in
+    ``runtime_info["codes"]["audio"]`` while ``input_seg`` is only a scheduler
+    placeholder.  Legacy producers still send a flat codebook-major token
+    segment through ``input_ids``.  This helper accepts both forms.
+    """
+    payload: Any = None
+    if isinstance(runtime_info, dict):
+        codes = runtime_info.get("codes")
+        if isinstance(codes, dict):
+            payload = codes.get("audio")
+
+    has_payload = payload is not None
+    source = payload if has_payload else input_seg
+    if isinstance(source, torch.Tensor):
+        codes_tensor = source
+    elif isinstance(source, (list, tuple)):
+        codes_tensor = torch.tensor(source, dtype=torch.long)
+    else:
+        return None
+
+    if codes_tensor.ndim == 2:
+        if not has_payload:
+            logger.warning(
+                "MossTTS codec input_ids must be flat codebook-major tokens; got 2-D shape %s.",
+                tuple(codes_tensor.shape),
+            )
+            return None
+        if int(codes_tensor.shape[0]) != int(n_vq):
+            logger.warning(
+                "MossTTS codec payload must use codec-native shape (n_vq, T); got %s for n_vq=%d.",
+                tuple(codes_tensor.shape),
+                n_vq,
+            )
+            return None
+        return codes_tensor.to(device=device, dtype=torch.long).contiguous()
+
+    flat = codes_tensor.reshape(-1)
+    if flat.numel() == 0:
+        return torch.empty((int(n_vq), 0), device=device, dtype=torch.long)
+    if int(flat.numel()) % int(n_vq) != 0:
+        logger.warning(
+            "MossTTS codec input length %d not divisible by n_vq %d; skipping.",
+            int(flat.numel()),
+            n_vq,
+        )
+        return None
+    t_chunk = int(flat.numel() // int(n_vq))
+    return flat.to(device=device, dtype=torch.long).reshape(int(n_vq), t_chunk).contiguous()
+
+
 class _MossCodecStreamSession:
     """Persistent streaming decode session for vendored MOSS-Audio-Tokenizer-v2."""
 
@@ -246,13 +304,12 @@ class MossTTSCodecDecoder(nn.Module):
     ) -> OmniOutput:
         """Decode audio VQ codes to waveform.
 
-        Stage 0 emits flat codebook-major ``[NQ * T_chunk]`` audio codes. The
-        chunk transfer adapter assigns those to ``request.prompt_token_ids``,
-        which arrives here as ``input_ids`` concatenated across all requests.
-        Per-request slice boundaries are computed from
-        ``kwargs["seq_token_counts"]`` (token counts, one per request).
-        ``runtime_additional_information`` carries per-request metadata such as
-        ``left_context_size``.
+        Stage 0 may emit codec ids through the connector tensor payload
+        ``runtime_additional_information[i]["codes"]["audio"]`` while
+        ``input_ids`` only contains a scheduler placeholder. Legacy paths still
+        emit flat codebook-major ``[NQ * T_chunk]`` ids through ``input_ids``.
+        Per-request slice boundaries are computed from ``kwargs["seq_token_counts"]``
+        for request counting and legacy fallback slicing.
 
         Returns
         -------
@@ -343,15 +400,9 @@ class MossTTSCodecDecoder(nn.Module):
                 for _, wav in self._finish_empty_streaming_requests([info]).items():
                     audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
                 continue
-            if seg.numel() % self._n_vq != 0:
-                logger.warning(
-                    "MossTTS codec input length %d not divisible by n_vq %d; skipping.",
-                    int(seg.numel()),
-                    self._n_vq,
-                )
+            codes_nq_t = _moss_codec_codes_from_payload_or_input(seg, info, self._n_vq, device)
+            if codes_nq_t is None or codes_nq_t.numel() == 0:
                 continue
-            t_chunk = int(seg.numel() // self._n_vq)
-            codes_nq_t = seg.reshape(self._n_vq, t_chunk).to(device=device)
             # Clamp out-of-range codes: the talker uses ``audio_pad_code``
             # (= ``codebook_size``) for delay-pattern padding.  The stage input
             # processor de-delays and drops pad rows before forwarding here, but

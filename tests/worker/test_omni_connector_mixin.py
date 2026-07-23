@@ -594,6 +594,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._send_side_request_payload[ext_id] = {"some": "data"}
         host._code_prompt_token_ids[ext_id] = [[1, 2, 3]]
         host._cached_ic[ext_id] = 16
+        host._moss_tts_raw_chunk_states = {ext_id: SimpleNamespace(pending_frames=[torch.tensor([1, 2])])}
         host._chunk_stream_completed.add(req_id)
         host._stage_recv_req_ids.add(req_id)
         host._local_stage_payload_cache[req_id] = {"engine_inputs": {}}
@@ -609,6 +610,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         self.assertNotIn(ext_id, host._send_side_request_payload)
         self.assertNotIn(ext_id, host._code_prompt_token_ids)
         self.assertNotIn(ext_id, host._cached_ic)
+        self.assertNotIn(ext_id, host._moss_tts_raw_chunk_states)
         self.assertNotIn(req_id, host._chunk_stream_completed)
         self.assertNotIn(req_id, host._stage_recv_req_ids)
         self.assertNotIn(req_id, host._local_stage_payload_cache)

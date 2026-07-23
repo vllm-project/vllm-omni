@@ -507,6 +507,7 @@ def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     adapter.put_req_chunk[ext_id] = 5
     adapter.request_payload[ext_id] = {"hidden": [1, 2]}
     adapter.code_prompt_token_ids[ext_id] = [[10, 20]]
+    adapter._moss_tts_raw_chunk_states = {ext_id: SimpleNamespace(pending_frames=[torch.tensor([1, 2])])}
 
 
 def test_cleanup_clears_all_state(build_adapter):
@@ -528,6 +529,7 @@ def test_cleanup_clears_all_state(build_adapter):
     assert ext_id not in adapter.put_req_chunk
     assert ext_id not in adapter.request_payload
     assert ext_id not in adapter.code_prompt_token_ids
+    assert ext_id not in adapter._moss_tts_raw_chunk_states
 
 
 def test_cleanup_infers_external_id(build_adapter):

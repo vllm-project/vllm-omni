@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -18,6 +19,15 @@ from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 logger = init_logger(__name__)
 
 _MOSS_AUDIO_PAD_CODE = 1024
+
+
+@dataclass
+class _MossRawChunkState:
+    pending_frames: list[torch.Tensor] = field(default_factory=list)
+    emitted_frame_count: int = 0
+    finish_seen: bool = False
+    final_flushed: bool = False
+    sent_control_sentinel: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +50,52 @@ def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
                 return ac
 
     return None
+
+
+def _get_moss_raw_chunk_state(transfer_manager: Any, req_id: str) -> _MossRawChunkState:
+    if not hasattr(transfer_manager, "_moss_tts_raw_chunk_states"):
+        transfer_manager._moss_tts_raw_chunk_states = {}
+
+    states = transfer_manager._moss_tts_raw_chunk_states
+    state = states.get(req_id)
+    if state is None:
+        state = _MossRawChunkState()
+        states[req_id] = state
+    return state
+
+
+def _prune_moss_raw_finalized_states(transfer_manager: Any, max_finalized: int = 4096) -> None:
+    states = getattr(transfer_manager, "_moss_tts_raw_chunk_states", None)
+    if not states:
+        return
+
+    finalized_keys = [req_id for req_id, state in states.items() if state.final_flushed and not state.pending_frames]
+    overflow = len(finalized_keys) - max_finalized
+    if overflow <= 0:
+        return
+
+    for req_id in finalized_keys[:overflow]:
+        states.pop(req_id, None)
+
+
+def _moss_raw_control_sentinel(req_id: str) -> OmniPayloadStruct:
+    return OmniPayloadStruct(
+        # A non-empty sentinel is required so Stage-1 is scheduled.
+        # ``code_flat_numel=0`` tells the codec this is a control-only
+        # finish packet, not an audio code.
+        codes=CodesStruct(audio=torch.tensor([0], dtype=torch.long)),
+        meta=MetaStruct(
+            req_id=[req_id],
+            left_context_size=0,
+            codec_streaming=True,
+            codec_chunk_frames=0,
+            codec_left_context_frames=0,
+            code_flat_numel=0,
+            stream_finished=torch.tensor(True, dtype=torch.bool),
+            finished=torch.tensor(True, dtype=torch.bool),
+        ),
+        request_id=req_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +301,7 @@ def talker2codec_raw_async_chunk(
     if not hasattr(transfer_manager, "put_req_chunk"):
         transfer_manager.put_req_chunk = defaultdict(int)
 
-    pending_frames = transfer_manager.code_prompt_token_ids[req_id]
-
+    new_frames_cpu: list[torch.Tensor] = []
     if isinstance(multimodal_output, Mapping):
         codes_dict = multimodal_output.get("codes", {}) or {}
         new_frames = codes_dict.get("audio")
@@ -258,12 +313,23 @@ def talker2codec_raw_async_chunk(
                 raise ValueError(f"MOSS raw codec frames must be 2-D, got {tuple(frames_cpu.shape)}")
             valid_rows = frames_cpu.ne(_MOSS_AUDIO_PAD_CODE).any(dim=1)
             for frame in frames_cpu[valid_rows]:
-                pending_frames.append(frame.clone())
+                new_frames_cpu.append(frame.clone().contiguous())
         # Raw/local streaming should mirror the non-streaming path: the codec
         # decodes only generated audio rows. Reference audio conditions the
         # talker, but feeding its codes into the codec streaming state adds a
         # long first-packet prime step and changes the decoder state relative
         # to non-streaming output.
+
+    state = _get_moss_raw_chunk_state(transfer_manager, req_id)
+    if state.final_flushed:
+        if is_finished:
+            return None
+        if not new_frames_cpu:
+            return None
+        state = _MossRawChunkState()
+        transfer_manager._moss_tts_raw_chunk_states[req_id] = state
+
+    state.pending_frames.extend(new_frames_cpu)
 
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
@@ -283,58 +349,56 @@ def talker2codec_raw_async_chunk(
         )
         initial_chunk_frames = chunk_frames
 
-    pending = len(pending_frames)
-    emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
+    pending = len(state.pending_frames)
+    emitted_any = state.emitted_frame_count > 0
     threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
-    if pending <= 0:
-        if is_finished:
+
+    if is_finished:
+        state.finish_seen = True
+        if pending <= 0:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)
             transfer_manager.request_payload.pop(req_id, None)
-            return OmniPayloadStruct(
-                # A non-empty sentinel is required so Stage-1 is scheduled.
-                # ``code_flat_numel=0`` tells the codec this is a control-only
-                # finish packet, not an audio code.
-                codes=CodesStruct(audio=torch.tensor([0], dtype=torch.long)),
-                meta=MetaStruct(
-                    req_id=[req_id],
-                    left_context_size=0,
-                    codec_streaming=True,
-                    codec_chunk_frames=0,
-                    codec_left_context_frames=0,
-                    code_flat_numel=0,
-                    stream_finished=torch.tensor(True, dtype=torch.bool),
-                    finished=torch.tensor(True, dtype=torch.bool),
-                ),
-                request_id=req_id,
-            )
+            if state.sent_control_sentinel:
+                state.final_flushed = True
+                _prune_moss_raw_finalized_states(transfer_manager)
+                return None
+            state.sent_control_sentinel = True
+            state.final_flushed = True
+            _prune_moss_raw_finalized_states(transfer_manager)
+            return _moss_raw_control_sentinel(req_id)
+
+    if pending <= 0:
         return None
     if not is_finished and pending < threshold:
         return None
 
     emit_frames = pending if is_finished else threshold
-    chunk_rows = pending_frames[:emit_frames]
-    del pending_frames[:emit_frames]
+    chunk_rows = state.pending_frames[:emit_frames]
+    del state.pending_frames[:emit_frames]
     chunk_codes = torch.stack(
         [row.to(torch.long).cpu() for row in chunk_rows],
         dim=0,
     ).contiguous()
-    finished = bool(is_finished and len(pending_frames) == 0)
-
-    codec_flat = chunk_codes.transpose(0, 1).contiguous().reshape(-1).to(torch.long)
+    state.emitted_frame_count += emit_frames
+    finished = bool(is_finished and len(state.pending_frames) == 0)
 
     if finished:
+        state.final_flushed = True
         transfer_manager.code_prompt_token_ids.pop(req_id, None)
         transfer_manager.request_payload.pop(req_id, None)
+        _prune_moss_raw_finalized_states(transfer_manager)
+
+    codec_codes = chunk_codes.transpose(0, 1).contiguous().to(torch.long)
 
     return OmniPayloadStruct(
-        codes=CodesStruct(audio=codec_flat),
+        codes=CodesStruct(audio=codec_codes),
         meta=MetaStruct(
             req_id=[req_id],
             left_context_size=0,
             codec_streaming=True,
             codec_chunk_frames=int(chunk_codes.shape[0]),
             codec_left_context_frames=0,
-            code_flat_numel=int(codec_flat.numel()),
+            code_flat_numel=int(codec_codes.numel()),
             stream_finished=torch.tensor(finished, dtype=torch.bool),
             finished=torch.tensor(finished, dtype=torch.bool),
         ),
