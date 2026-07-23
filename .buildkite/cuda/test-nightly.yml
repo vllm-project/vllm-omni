@@ -427,14 +427,7 @@ steps:
           - python -c "import OpenImageIO, cloudpickle" || uv pip install "openimageio>=3" "cloudpickle>=3.1"
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m full_model --run-level full_model
-          - |
-            set +e
-            pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_one_stage_matches_official[ltx2_3]' -m full_model --run-level full_model
-            STATUS=$$?
-            buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/ltx_official/**/metrics.json" || true
-            buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/ltx_official/**/*.log" || true
-            buildkite-agent artifact upload "tests/e2e/accuracy/artifacts/ltx_official/**/frame_*.png" || true
-            exit $$STATUS
+          - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_one_stage_matches_official[ltx2_3]' -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_video_streaming_output_similarity.py -m full_model --run-level full_model
         mirror_hardwares: h100_2
 
