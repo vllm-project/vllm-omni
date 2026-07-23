@@ -35,6 +35,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
     apply_interleaved_rotary_emb,
@@ -78,6 +79,7 @@ class LTXComponentProfile:
     artifact_repo_id: str | None = None
     latent_upsampler_filename: str | None = None
     distilled_lora_filename: str | None = None
+    checkpoint_kind: LTXCheckpointKind | None = None
 
 
 LTX2_COMPONENT_PROFILE = LTXComponentProfile(
@@ -108,6 +110,7 @@ LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     resident_modules=("vocoder", "latent_upsampler"),
     video_vae_cls=DistributedAutoencoderKLLTX2Video,
     latent_upsampler_cls=LTX2LatentUpsamplerModel,
+    checkpoint_kind="distilled",
 )
 
 LTX2_TWO_STAGE_COMPONENT_PROFILE = replace(
@@ -118,6 +121,7 @@ LTX2_TWO_STAGE_COMPONENT_PROFILE = replace(
     artifact_repo_id="Lightricks/LTX-2",
     latent_upsampler_filename="ltx-2-spatial-upscaler-x2-1.0.safetensors",
     distilled_lora_filename="ltx-2-19b-distilled-lora-384.safetensors",
+    checkpoint_kind="regular",
 )
 
 LTX23_TWO_STAGE_COMPONENT_PROFILE = replace(
@@ -128,6 +132,7 @@ LTX23_TWO_STAGE_COMPONENT_PROFILE = replace(
     artifact_repo_id="Lightricks/LTX-2.3",
     latent_upsampler_filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
     distilled_lora_filename="ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+    checkpoint_kind="regular",
 )
 
 
@@ -519,6 +524,11 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         model,
         subfolder="scheduler",
         local_files_only=local_files_only,
+    )
+    validate_ltx_checkpoint(
+        pipeline.scheduler.config,
+        expected_kind=profile.checkpoint_kind,
+        pipeline_name=type(pipeline).__name__,
     )
 
     pipeline.vae_spatial_compression_ratio = pipeline.vae.spatial_compression_ratio

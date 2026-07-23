@@ -53,7 +53,11 @@ from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX_DEFAULT_NEGATIVE_PROMPT,
     LTX_POSITIVE_ONLY_RECIPE,
 )
-from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs, validate_pipeline_request
+from vllm_omni.diffusion.models.ltx2.ltx2_request import (
+    LTXRequestInputs,
+    validate_ltx_checkpoint,
+    validate_pipeline_request,
+)
 from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2I2VDMD2Pipeline,
@@ -123,6 +127,9 @@ def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
     assert LTX2TwoStagePipeline.component_profile is LTX2_TWO_STAGE_COMPONENT_PROFILE
     assert LTX2TwoStagePipeline.pipeline_recipe is LTX2_TWO_STAGE_RECIPE
     assert LTX2DistilledPipeline.component_profile is LTX2_DISTILLED_COMPONENT_PROFILE
+    assert LTX2_DISTILLED_COMPONENT_PROFILE.checkpoint_kind == "distilled"
+    assert LTX2_TWO_STAGE_COMPONENT_PROFILE.checkpoint_kind == "regular"
+    assert LTX23_TWO_STAGE_COMPONENT_PROFILE.checkpoint_kind == "regular"
     assert LTX2_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
     assert LTX23_COMPONENT_PROFILE.video_vae_cls is DistributedAutoencoderKLLTX2Video
 
@@ -136,6 +143,37 @@ def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
 
     (tmp_path / "model_index.json").write_text(json.dumps({"vocoder": ["ltx2", "LTX2Vocoder"]}))
     assert detect_ltx_model_version(str(tmp_path)) == "2"
+
+
+@pytest.mark.parametrize(
+    ("expected_kind", "scheduler_config"),
+    [
+        ("regular", {"use_dynamic_shifting": True, "shift_terminal": 0.1}),
+        ("distilled", {"use_dynamic_shifting": False, "shift_terminal": None}),
+    ],
+)
+def test_ltx_checkpoint_validation_accepts_matching_scheduler_metadata(expected_kind, scheduler_config):
+    validate_ltx_checkpoint(
+        scheduler_config,
+        expected_kind=expected_kind,
+        pipeline_name="TestLTXPipeline",
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected_kind", "scheduler_config", "error"),
+    [
+        ("regular", {"use_dynamic_shifting": False, "shift_terminal": None}, "regular non-distilled"),
+        ("distilled", {"use_dynamic_shifting": True, "shift_terminal": 0.1}, "merged distilled"),
+    ],
+)
+def test_ltx_checkpoint_validation_rejects_mismatched_scheduler_metadata(expected_kind, scheduler_config, error):
+    with pytest.raises(ValueError, match=error):
+        validate_ltx_checkpoint(
+            scheduler_config,
+            expected_kind=expected_kind,
+            pipeline_name="TestLTXPipeline",
+        )
 
 
 def test_ltx23_checkpoint_selects_version_specific_one_stage_profile(tmp_path, monkeypatch):
