@@ -278,6 +278,41 @@ def _git(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+# TEMP: hide noisy PR paths from skip-ci / step-filter diffs while validating
+# yaml-gated targeting. REMOVE this block before merge.
+_TEMP_IGNORE_PREFIXES = (
+    ".buildkite/",
+    "docs/",
+    ".claude/skills/",
+    ".cursor/skills/",
+    "skills/",
+    "tests/buildkite/",
+)
+_TEMP_KEEP_BASENAMES = frozenset(
+    {
+        "test-ready.yml",
+        "test-amd-merge.yml",
+    }
+)
+
+
+def _temp_filter_changed_files(files: list[str]) -> list[str]:
+    """Drop TEMP-ignored paths; keep basename exceptions and everything else."""
+    kept: list[str] = []
+    dropped = 0
+    for path in files:
+        if Path(path).name in _TEMP_KEEP_BASENAMES:
+            kept.append(path)
+            continue
+        if any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in _TEMP_IGNORE_PREFIXES):
+            dropped += 1
+            continue
+        kept.append(path)
+    if dropped:
+        _log(f"TEMP ignore: removed {dropped} path(s); kept {len(kept)}")
+    return kept
+
+
 # --- Diff helpers ---
 
 
@@ -323,6 +358,7 @@ def _changed_files_for_diff_range(diff_range: str | None) -> list[str] | None:
         return None
 
     files = [line for line in result.stdout.splitlines() if line.strip()]
+    files = _temp_filter_changed_files(files)
     _log(f"{len(files)} changed file(s)")
     return files
 
