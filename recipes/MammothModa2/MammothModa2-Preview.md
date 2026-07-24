@@ -6,7 +6,8 @@
 
 - Vendor: ByteDance Research
 - Model: `bytedance-research/MammothModa2-Preview`
-- Task: Text-to-image generation (AR → DiT two-stage pipeline)
+- Task: Text-to-image generation (AR → DiT two-stage pipeline), plus
+  image-to-text understanding (AR stage)
 - Mode: Offline inference
 - Maintainer: Community
 
@@ -107,4 +108,48 @@ exists and is a valid image:
 ```bash
 ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
+```
+
+### Image-to-Text (I2T, simplest)
+
+For the simplest offline image-understanding run, use a short inline Python
+snippet from the repository root:
+
+```python
+from PIL import Image
+from vllm import SamplingParams
+from vllm.multimodal.image import convert_image_mode
+from vllm_omni import Omni
+
+def main():
+    prompt = (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+        "Summarize this image.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+    omni = Omni(
+        model="./MammothModa2-Preview",
+        deploy_config="vllm_omni/deploy/mammoth_moda2_ar.yaml",
+    )
+    try:
+        outputs = list(
+            omni.generate(
+                [{
+                    "prompt": prompt,
+                    "multi_modal_data": {"image": convert_image_mode(Image.open("./image.png"), "RGB")},
+                    "additional_information": {"omni_task": ["chat"]},
+                }],
+                [SamplingParams(temperature=0.2, top_p=0.9, top_k=-1, max_tokens=512, seed=42)],
+            )
+        )
+    finally:
+        omni.close()
+
+    ro = getattr(outputs[-1], "request_output", outputs[-1])
+    print(ro.outputs[0].text.strip())
+
+if __name__ == "__main__":
+    main()
 ```
