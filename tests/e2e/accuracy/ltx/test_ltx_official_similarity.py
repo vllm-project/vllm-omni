@@ -32,10 +32,6 @@ from tests.helpers.mark import hardware_test
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 OFFICIAL_REVISION = "9377758131b1ffde4b7f766804590a6617bf2ab9"
 PROMPT = (
-    "Floating crystal islands in cosmic starry sky, glowing nebula, soft luminous particles flowing around, "
-    "slow camera rotation, dreamlike atmosphere, ultra-detailed, surreal fantasy scene"
-)
-I2V_PROMPT = (
     "A space shuttle launches vertically above a desert launch pad. Bright exhaust flames and a dense white "
     "plume billow beneath it while the camera remains fixed."
 )
@@ -106,7 +102,6 @@ CASES = (
         checkpoint_env="VLLM_TEST_LTX23_OFFICIAL_CHECKPOINT",
         stg_block=28,
     ),
-    # Manual I2V guard; the nightly job intentionally selects only ltx2_3.
     LTXAccuracyCase(
         name="ltx2_3_i2v",
         model_id="diffusers/LTX-2.3-Diffusers",
@@ -118,7 +113,6 @@ CASES = (
         checkpoint_revision="4229404625088d21c4f112eb640fb04a0900ee25",
         checkpoint_env="VLLM_TEST_LTX23_OFFICIAL_CHECKPOINT",
         stg_block=28,
-        prompt=I2V_PROMPT,
         image_repo="huggingface/documentation-images",
         image_filename="diffusers/svd/rocket.png",
         image_revision="645d8364f0c7a101180b364811b5a11a362e4010",
