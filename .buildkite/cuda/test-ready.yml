@@ -8,8 +8,8 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
-      # Same CI image as other ready/nightly jobs; print layout + find_spec before
-      # relying on PYTHONPATH / editable for off-cwd imports (#5364).
+      # H100 + k8s (same pool/plugin as failing nightly jobs); compare PYTHONPATH vs
+      # editable-only find_spec off-repo-cwd (#5364).
       - label: "Simple · vllm_omni import diag"
         commands:
           - |
@@ -122,17 +122,33 @@ steps:
             print("diag ok (PYTHONPATH path verified; see editable_only above)")
             PY
         agents:
-          queue: "gpu_1_queue"
+          queue: "mithril-h100-pool"
         plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
 
   #     - label: "Simple · Diffusion & Model Executor Test"
   #       commands:
