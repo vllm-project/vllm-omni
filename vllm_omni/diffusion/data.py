@@ -579,6 +579,10 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
         from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
         return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamx_cam
+
+    if _looks_like_dreamx_cam(model, cfg):
+        return "WanCameraPipeline"
     if len(architectures) == 1:
         return architectures[0]
     return None
@@ -1142,6 +1146,8 @@ class OmniDiffusionConfig:
                     "that require additional inputs."
                 )
             else:
+                from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamx_cam
+
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
                     # Lance ships its top-level config.json one directory above
@@ -1214,6 +1220,10 @@ class OmniDiffusionConfig:
                         self.update_multimodal_support()
                     else:
                         raise
+                elif self.model_class_name == "WanCameraPipeline" or _looks_like_dreamx_cam(self.model, cfg):
+                    if self.model_class_name is None:
+                        self.model_class_name = "WanCameraPipeline"
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry

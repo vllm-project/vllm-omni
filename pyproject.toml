@@ -61,7 +61,6 @@ dev = [
     "jiwer>=3.0.0",
     "zhon>=2.0.0",
     "zhconv>=1.4.2",
-    "scipy>=1.10.0",
     "funasr>=1.0.0",
     "lpips>=0.1.4", # for quantization fp8
     "orjson>=3.11.7", # to make v1/embeddings API fast
@@ -196,6 +195,9 @@ ignore = [
 # argument names) so they stay easy to diff against upstream releases.
 "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
 "vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
+# PRoPE attention math vendored from the MIT-licensed reference (via DreamX-World).
+# Keeps upstream math-symbol argument names (e.g. ``Ks``) for easy diffing.
+"vllm_omni/diffusion/models/wan2_2/prope_utils.py" = ["N803"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"

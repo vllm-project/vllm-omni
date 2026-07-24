@@ -34,3 +34,7 @@ pydantic-settings>=2.0.0
 # base image does not ship it, so declare it explicitly. The loader also guards
 # this import so a missing gguf no longer breaks all diffusion model loading.
 gguf>=0.10.0
+# Imported directly at runtime (DreamX camera pose interpolation in
+# wan2_2/camera_pose_utils.py, plus gr00t, soulx_singer, magi_human and
+# cosyvoice3 modules); previously only a transitive dependency via torchsde.
+scipy>=1.10.0

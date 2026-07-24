@@ -27,6 +27,7 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
 | LTX2 (local path + `--model-class-name LTX2ImageToVideoPipeline`) | 512 x 768 | 121 | 40 | 4.0 | Memory use depends on frame count and tensor parallelism |
+| `GD-ML/DreamX-World-5B-Cam` | 704 x 1280 | 121 | 50 | 3.0 | Around 50 GiB BF16 for basic single-card usage |
 
 !!! info
     Peak VRAM: based on basic single-card usage, batch size = 1, without any acceleration/optimization features. Some model weights cannot fit into one card with 80 GiB VRAM, which may need to use CPU offloading.
@@ -271,6 +272,24 @@ python image_to_video.py \
   --extra-body '{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false}' \
   --output cosmos3_i2v.mp4
 ```
+
+### DreamX-World-5B-Cam
+
+Camera action tokens (composable, e.g. `"wj"` = push in + pan left):
+`w` push in · `s` pull out · `a` move left · `d` move right ·
+`i` tilt up · `k` tilt down · `j` pan left · `l` pan right.
+
+```bash
+python image_to_video.py \
+  --model GD-ML/DreamX-World-5B-Cam \
+  --image /path/to/DreamX-World/demo/007.jpg \
+  --prompt "Style: Minecraft. A serene Minecraft landscape at sunset, featuring a blocky cliffside overlooking a calm ocean. In the foreground, grassy terrain with yellow flowers and red soil leads up to a rugged cliff composed of layered red and gray blocks. Sparse trees grow on rocky outcrops, adding life to the structured environment. The midground reveals the cliff's dramatic descent into the water, while the background showcases a vast ocean reflecting the warm hues of the setting sun. The sky is painted in gradients of orange, pink, and pale blue, with pixelated clouds drifting above. The lighting casts soft shadows and enhances the textured, cubic surfaces, creating a peaceful and immersive atmosphere that blends natural beauty with digital artistry." \
+  --height 704 --width 1280 --num-frames 121 --fps 24 \
+  --num-inference-steps 50 --guidance-scale 3.0 --flow-shift 3.0 --seed 42 \
+  --extra-body '{"action_seq": ["w", "wj"], "action_speed_list": [4, 6]}' \
+  --output dreamx_i2v.mp4
+```
+
 
 Key arguments:
 

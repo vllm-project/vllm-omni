@@ -11,6 +11,11 @@ from .pipeline_wan2_2 import (
     load_transformer_config,
     retrieve_latents,
 )
+from .pipeline_wan2_2_camera import (
+    Wan22CameraPipeline,
+    get_wan22_camera_post_process_func,
+    get_wan22_camera_pre_process_func,
+)
 from .pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
     WanI2VDMD2Pipeline,
@@ -26,6 +31,12 @@ from .pipeline_wan2_2_vace import (
     Wan22VACEPipeline,
     get_wan22_vace_post_process_func,
     get_wan22_vace_pre_process_func,
+)
+from .wan2_2_camera_transformer import (
+    CameraSelfAttention,
+    WanCameraTransformer3DModel,
+    WanCameraTransformerBlock,
+    create_camera_transformer_from_config,
 )
 from .wan2_2_transformer import WanTransformer3DModel
 from .wan2_2_vace_transformer import VaceWanTransformerBlock, WanVACETransformer3DModel
@@ -48,6 +59,13 @@ __all__ = [
     "Wan22VACEPipeline",
     "get_wan22_vace_post_process_func",
     "get_wan22_vace_pre_process_func",
+    "Wan22CameraPipeline",
+    "get_wan22_camera_post_process_func",
+    "get_wan22_camera_pre_process_func",
+    "CameraSelfAttention",
+    "WanCameraTransformerBlock",
+    "WanCameraTransformer3DModel",
+    "create_camera_transformer_from_config",
     "WanTransformer3DModel",
     "VaceWanTransformerBlock",
     "WanVACETransformer3DModel",

@@ -112,6 +112,19 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_dreamx_world_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("WanCameraPipeline") == frozenset(
+        {
+            "action_seq",
+            "action_speed_list",
+        }
+    )
+    assert get_extra_output_params("WanCameraPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("WanCameraPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_magi_human_extra_registry_declares_request_and_response_params() -> None:
     assert get_extra_body_params("MagiHumanPipeline") == frozenset(
         {

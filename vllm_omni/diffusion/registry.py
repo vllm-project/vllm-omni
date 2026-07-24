@@ -66,6 +66,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_vace",
         "Wan22VACEPipeline",
     ),
+    "WanCameraPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_camera",
+        "Wan22CameraPipeline",
+    ),
     "LTX2Pipeline": (
         "ltx2",
         "pipeline_ltx2",
@@ -343,6 +348,8 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    # cache_dit freezes the camera trajectory; tea_cache lacks Wan coefficients.
+    "WanCameraPipeline",
 }
 
 
@@ -518,6 +525,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "BooguImagePipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
+    "WanCameraPipeline": "get_wan22_camera_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
@@ -586,6 +594,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
+    "WanCameraPipeline": "get_wan22_camera_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
